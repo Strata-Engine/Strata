@@ -1,0 +1,271 @@
+-- strata_demo — the voxel core end to end with no window: register blocks,
+-- stream a world around a walking focus, edit it, mesh it, and report what
+-- it cost. Two runs: metre voxels with a wide box, and 10 cm voxels with a
+-- small one. Writes surface_a.ppm, a top-down picture of the first run.
+mod StrataDemo do
+
+  needs IO
+  needs IO.Spawn
+  needs IO.Clock
+  needs IO.FileSystem
+
+  alias Strata.Blocks as Bd
+  alias Strata.Chunk as Cd2
+  alias Strata.Coord as Kd2
+  alias Strata.World as Wd2
+  alias Strata.Stream as Sd
+  alias Strata.Edit as Ed2
+  alias Strata.Mesh as Md
+  alias Strata.Store as Std
+  alias Strata.Noise as Nd
+
+  -- ── Blocks ───────────────────────────────────────────────────────────────
+  -- 1 stone, 2 soil, 3..10 liquid (a family of eight levels), 11 leaf,
+  -- 12 lamp (emits light), 13 plant (a cross)
+  pfn add(r : Strata.Blocks.Registry, d : Strata.Blocks.Def) : Strata.Blocks.Registry do
+    match Bd.register(r, d) do
+      Ok((r2, _)) -> r2
+      Err(_) -> r
+    end
+  end
+  pfn add_family(r : Strata.Blocks.Registry, d : Strata.Blocks.Def, n : Int) : Strata.Blocks.Registry do
+    match Bd.register_family(r, d, n) do
+      Ok((r2, _)) -> r2
+      Err(_) -> r
+    end
+  end
+
+  pfn registry() : Strata.Blocks.Registry do
+    let stone = Bd.with_faces(Bd.def(), 1, 1, 1)
+    let soil = Bd.with_faces(Bd.def(), 2, 3, 3)
+    let liquid = Bd.with_faces(Bd.with_collide(Bd.with_layer(Bd.with_opacity(Bd.def(), Strata.Blocks.SeeThrough), Strata.Blocks.Translucent), false), 4, 4, 4)
+    let leaf = Bd.with_faces(Bd.with_layer(Bd.with_opacity(Bd.def(), Strata.Blocks.SeeThrough), Strata.Blocks.Cutout), 5, 5, 5)
+    let lamp = Bd.with_emission(Bd.with_faces(Bd.def(), 6, 6, 6), 255, 200, 120, 220)
+    let plant = Bd.with_collide(Bd.with_style(Bd.with_opacity(Bd.def(), Strata.Blocks.Clear), Strata.Blocks.Cross), false)
+    add(add(add(add_family(add(add(Bd.empty(), stone), soil), liquid, 8), leaf), lamp), plant)
+  end
+
+  -- ── Terrain ──────────────────────────────────────────────────────────────
+  pfn level() : Int do 34 end
+
+  pfn height(wx : Int, wz : Int, seed : Int) : Int do
+    let x = int_to_float(wx)
+    let z = int_to_float(wz)
+    let base = Nd.fbm(x *. 0.006, z *. 0.006, seed)
+    let ridge = Nd.ridged_fbm(x *. 0.011, z *. 0.011, seed + 20)
+    float_to_int(18.0 +. base *. 36.0 +. Nd.fbm(x *. 0.03, z *. 0.03, seed + 5) *. 8.0 +. ridge *. Nd.clamp01((base -. 0.5) *. 4.0) *. 40.0)
+  end
+
+  pfn block_at(wx : Int, wy : Int, wz : Int, h : Int, seed : Int) : Int do
+    if wy > h + 1 do (if wy <= level() do 3 else 0 end)
+    else if wy == h + 1 do
+      (if wy <= level() do 3
+       else if Nd.hash2(wx, wz, seed + 900) > 0.93 do 13
+       else if Nd.hash2(wx, wz, seed + 901) > 0.998 do 12
+       else 0 end end end)
+    else if wy >= h - 2 do 2
+    else 1 end end end
+  end
+
+  pfn fill_go(a : NativeI32Arr, x0 : Int, y0 : Int, z0 : Int, seed : Int, hs : NativeIntArr, i : Int) : NativeI32Arr do
+    if i >= 32768 do a
+    else
+      let x = i % 32
+      let z = (i / 32) % 32
+      fill_go(NativeArray.set_i32(a, i, block_at(x0 + x, y0 + i / 1024, z0 + z, NativeArray.get_int(hs, x + 32 * z), seed)), x0, y0, z0, seed, hs, i + 1)
+    end
+  end
+  pfn heights_go(hs : NativeIntArr, x0 : Int, z0 : Int, seed : Int, i : Int) : NativeIntArr do
+    if i >= 1024 do hs else heights_go(NativeArray.set_int(hs, i, height(x0 + i % 32, z0 + i / 32, seed)), x0, z0, seed, i + 1) end
+  end
+  pfn span_go(hs : NativeIntArr, i : Int, lo : Int, hi : Int) : (Int, Int) do
+    if i >= 1024 do (lo, hi)
+    else
+      let h = NativeArray.get_int(hs, i)
+      span_go(hs, i + 1, if h < lo do h else lo end, if h > hi do h else hi end)
+    end
+  end
+
+  pfn chunk_for(k : Strata.Coord.Key, seed : Int) : Strata.Chunk.Chunk do
+    let x0 = 32 * Kd2.kx(k)
+    let y0 = 32 * Kd2.ky(k)
+    let z0 = 32 * Kd2.kz(k)
+    let hs = heights_go(NativeArray.make_int(1024, 0), x0, z0, seed, 0)
+    match span_go(hs, 0, 100000, -100000) do
+      (lo, hi) ->
+        if y0 > (if hi + 1 > level() do hi + 1 else level() end) do Cd2.uniform(0)
+        else if y0 + 31 < lo - 2 do Cd2.uniform(1)
+        else Cd2.from_flat(fill_go(NativeArray.make_i32(32768, 0), x0, y0, z0, seed, hs, 0)) end end
+    end
+  end
+
+  pfn terrain() : Strata.Terrain.Gen do Strata.Terrain.gen(fn (k, seed) -> chunk_for(k, seed)) end
+
+  -- ── Measuring ────────────────────────────────────────────────────────────
+  pfn fixed1(v : Float) : String do float_to_string(Math.round(v *. 100.0) /. 100.0) end
+  pfn per(total_ms : Int, n : Int) : String do fixed1(int_to_float(total_ms) /. int_to_float(if n < 1 do 1 else n end)) ++ " ms" end
+
+  -- (total ms, worst ms, count) of generating each chunk of a box, one at a time
+  pfn bench_gen(g : Strata.Terrain.Gen, seed : Int, cx : Int, cy : Int, cz : Int, h : Int, v : Int, i : Int, total : Int, worst : Int) : (Int, Int, Int) do
+    let nh = 2 * h + 1
+    let nv = 2 * v + 1
+    if i >= nh * nh * nv do (total, worst, i)
+    else
+      let t0 = unix_time_ms()
+      let c = Strata.Terrain.run(g, Kd2.key(cx + i % nh - h, cy + i / (nh * nh) - v, cz + (i / nh) % nh - h), seed)
+      let dt = unix_time_ms() - t0 + (if Cd2.form(c) < 0 do 1 else 0 end)
+      bench_gen(g, seed, cx, cy, cz, h, v, i + 1, total + dt, if dt > worst do dt else worst end)
+    end
+  end
+
+  -- meshes built, quads, instances, mesh bytes, total ms, worst ms, meshes with something to draw, ms spent on those
+  type MeshStat = MeshStat(Int, Int, Int, Int, Int, Int, Int, Int)
+
+  pfn bench_mesh(w : Strata.World.World, ks : List(Strata.Coord.Key), st : MeshStat) : MeshStat do
+    match ks do
+      Nil -> st
+      Cons(k, t) ->
+        if !Md.has_all(Wd2.chunks(w), k) do bench_mesh(w, t, st)
+        else
+          let t0 = unix_time_ms()
+          let m = Md.build(Wd2.registry(w), Md.around_of(Wd2.chunks(w), k))
+          let q = Md.quad_count_at(m, 0) + Md.quad_count_at(m, 1) + Md.quad_count_at(m, 2)
+          let dt = unix_time_ms() - t0
+          match st do
+            MeshStat(n, qs, ins, nb, total, worst, full, full_ms) -> bench_mesh(w, t, MeshStat(n + 1, qs + q, ins + Md.instance_count(m), nb + Md.bytes(m), total + dt, if dt > worst do dt else worst end, if q > 0 do full + 1 else full end, if q > 0 do full_ms + dt else full_ms end))
+          end
+        end
+    end
+  end
+
+  -- uniform, paletted, direct, bytes
+  pfn forms(w : Strata.World.World) : (Int, Int, Int, Int) do
+    Std.fold(Wd2.chunks(w), (0, 0, 0, 0), fn (acc, k, c) ->
+      match acc do
+        (u, p, d, b) ->
+          let f = Cd2.form(c)
+          (if f == 0 do u + 1 else u end, if f == 1 do p + 1 else p end, if f == 2 do d + 1 else d end, b + Cd2.bytes(c))
+      end)
+  end
+
+  pfn surface(w : Strata.World.World, x : Int, z : Int, y : Int, floor : Int) : Int do
+    if y < floor do floor
+    else if Wd2.get_block(w, x, y, z) != 0 do y
+    else surface(w, x, z, y - 1, floor) end end
+  end
+
+  pfn settle(s : Strata.Stream.Stream, x : Float, y : Float, z : Float) : Strata.Stream.Stream do
+    Sd.run_until_settled(Sd.set_focus(s, Cons((x, y, z), Nil)), 1000000)
+  end
+
+  pfn walk(s : Strata.Stream.Stream, step : Int, steps : Int, y : Float, stride : Float) : Strata.Stream.Stream do
+    if step > steps do s else walk(settle(s, int_to_float(step) *. stride, y, 0.5), step + 1, steps, y, stride) end
+  end
+
+  -- apply an edit and time how long until its meshes are back
+  pfn timed_edit(s : Strata.Stream.Stream, o : Strata.Edit.Outcome) : (Strata.Stream.Stream, Int, Int) do
+    let t0 = unix_time_ms()
+    let s2 = Sd.run_until_settled(Sd.apply(s, o), 1000000)
+    (s2, unix_time_ms() - t0, List.length(Ed2.dirty(o)))
+  end
+
+  pfn report(name : String, s : Strata.Stream.Stream, seed : Int, cx : Int, cy : Int, cz : Int, h : Int, v : Int) : Unit do
+    let w = Sd.world(s)
+    match forms(w) do
+      (u, p, d, bytes) ->
+        let n = Wd2.loaded_count(w)
+        println(name ++ ": " ++ int_to_string(n) ++ " chunks loaded (" ++ int_to_string(u) ++ " uniform, " ++ int_to_string(p) ++ " paletted, " ++ int_to_string(d) ++ " direct)")
+        println("  voxel storage " ++ int_to_string(bytes / 1024) ++ " KB, " ++ int_to_string(bytes / (if n < 1 do 1 else n end)) ++ " bytes a chunk on average (a flat byte array would be 32768)")
+    end
+    match bench_gen(Wd2.terrain(w), seed, cx, cy, cz, h, v, 0, 0, 0) do
+      (total, worst, count) -> println("  terrain: " ++ per(total, count) ++ " a chunk over " ++ int_to_string(count) ++ " chunks, worst " ++ int_to_string(worst) ++ " ms")
+    end
+    match bench_mesh(w, Std.keys(Wd2.chunks(w)), MeshStat(0, 0, 0, 0, 0, 0, 0, 0)) do
+      MeshStat(n, qs, ins, nb, total, worst, full, full_ms) ->
+        println("  mesh: " ++ per(total, n) ++ " a chunk over " ++ int_to_string(n) ++ " chunks, worst " ++ int_to_string(worst) ++ " ms; " ++ per(full_ms, full) ++ " over the " ++ int_to_string(full) ++ " that have something to draw")
+        println("  " ++ int_to_string(qs) ++ " quads and " ++ int_to_string(ins) ++ " instances in " ++ int_to_string(nb / 1024) ++ " KB: " ++ int_to_string(nb / (if qs + ins < 1 do 1 else qs + ins end)) ++ " bytes each")
+    end
+    println("  edited chunks in the cache: " ++ int_to_string(Wd2.cache_size(w)) ++ "; world hash " ++ int_to_string(Sd.world_hash(s)))
+  end
+
+  -- ── The picture ──────────────────────────────────────────────────────────
+  pfn shade(c : Int, y : Int) : Int do
+    let v = c * (60 + y) / 130
+    if v > 255 do 255 else if v < 0 do 0 else v end end
+  end
+  pfn pixel(id : Int, y : Int) : String do
+    let rgb = if id == 0 do (20, 20, 30)
+      else if id == 1 do (150, 150, 155)
+      else if id == 2 do (90, 160, 70)
+      else if id >= 3 && id <= 10 do (50, 110, 200)
+      else if id == 12 do (255, 220, 120)
+      else if id == 13 do (40, 120, 40)
+      else (200, 80, 200) end end end end end end
+    match rgb do
+      (r, g, b) -> int_to_string(shade(r, y)) ++ " " ++ int_to_string(shade(g, y)) ++ " " ++ int_to_string(shade(b, y))
+    end
+  end
+  pfn row_go(w : Strata.World.World, x : Int, x1 : Int, z : Int, top : Int, floor : Int, acc : List(String)) : List(String) do
+    if x < x1 do List.reverse(acc)
+    else
+      let y = surface(w, x, z, top, floor)
+      row_go(w, x - 1, x1, z, top, floor, Cons(pixel(Wd2.get_block(w, x, y, z), y), acc))
+    end
+  end
+  pfn rows_go(w : Strata.World.World, x0 : Int, x1 : Int, z : Int, z1 : Int, top : Int, floor : Int, acc : List(String)) : List(String) do
+    if z > z1 do List.reverse(acc)
+    else rows_go(w, x0, x1, z + 1, z1, top, floor, Cons(String.join(List.reverse(row_go(w, x1, x0, z, top, floor, Nil)), " "), acc)) end
+  end
+  pfn picture(w : Strata.World.World, cx : Int, cz : Int, half : Int, top : Int, floor : Int) : String do
+    let side = 2 * half + 1
+    "P3\n" ++ int_to_string(side) ++ " " ++ int_to_string(side) ++ "\n255\n" ++ String.join(rows_go(w, cx - half, cx + half, cz - half, cz + half, top, floor, Nil), "\n") ++ "\n"
+  end
+
+  -- ── The two runs ─────────────────────────────────────────────────────────
+  pfn run_a(seed : Int) : Unit do
+    let t0 = unix_time_ms()
+    let s0 = Sd.start(Wd2.new(registry(), terrain(), seed, 1.0), Sd.config(6, 3, 8, 4))
+    let s1 = walk(s0, 0, 64, 40.5, 4.0)
+    let t1 = unix_time_ms()
+    println("run A (1 m voxels, radius 6 x 3): walked 256 m in 64 steps, " ++ int_to_string(t1 - t0) ++ " ms streaming")
+    let w1 = Sd.world(s1)
+    let gy = surface(w1, 256, 0, 127, -64)
+    match timed_edit(s1, Ed2.set_block(w1, 256, gy, 0, 0)) do
+      (s2, ms1, d1) ->
+        println("  one block removed at (256, " ++ int_to_string(gy) ++ ", 0): " ++ int_to_string(d1) ++ " chunk(s) remeshed, visible after " ++ int_to_string(ms1) ++ " ms")
+        match timed_edit(s2, Ed2.fill_sphere(Sd.world(s2), 240, gy, 20, 12, 0)) do
+          (s3, ms2, d2) ->
+            println("  sphere of radius 12 carved at (240, " ++ int_to_string(gy) ++ ", 20): " ++ int_to_string(d2) ++ " chunk(s) remeshed, visible after " ++ int_to_string(ms2) ++ " ms")
+            report("  after edits", s3, seed, 8, 1, 0, 6, 3)
+            let pic = picture(Sd.world(s3), 256, 0, 120, 127, -64)
+            match File.write("surface_a.ppm", pic) do
+              Ok(_) -> println("  wrote surface_a.ppm (241 x 241, centred on the walk's end)")
+              Err(_) -> println("  could not write surface_a.ppm")
+            end
+            Sd.stop(s3)
+        end
+    end
+  end
+
+  pfn run_b(seed : Int) : Unit do
+    let t0 = unix_time_ms()
+    let s0 = Sd.start(Wd2.new(registry(), terrain(), seed, 0.1), Sd.config(3, 2, 8, 4))
+    let gy0 = height(0, 0, seed)
+    let s1 = settle(s0, 0.05, int_to_float(gy0) *. 0.1, 0.05)
+    println("run B (10 cm voxels, radius 3 x 2): settled in " ++ int_to_string(unix_time_ms() - t0) ++ " ms")
+    let w1 = Sd.world(s1)
+    let gy = surface(w1, 0, 0, gy0 + 40, gy0 - 60)
+    match timed_edit(s1, Ed2.fill_sphere(w1, 0, gy, 0, 20, 0)) do
+      (s2, ms, d) ->
+        println("  sphere of radius 20 voxels (2 m) carved at the surface: " ++ int_to_string(d) ++ " chunk(s) remeshed, visible after " ++ int_to_string(ms) ++ " ms")
+        report("  after the edit", s2, seed, 0, Kd2.chunk_of(gy0), 0, 3, 2)
+        Sd.stop(s2)
+    end
+  end
+
+  fn main(_cap : Cap(IO)) : Unit do
+    println("strata_demo, seed 7")
+    run_a(7)
+    run_b(7)
+  end
+end

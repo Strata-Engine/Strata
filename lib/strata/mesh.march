@@ -138,18 +138,66 @@ mod Strata.Mesh do
   pfn pvol() : Int do 39304 end
   pfn porigin() : Int do 1191 end
 
-  pfn pad_go(ids : NativeIntArr, a : Around, i : Int) : NativeIntArr do
-    if i >= pvol() do ids
-    else pad_go(NativeArray.set_int(ids, i, around_get(a, i % 34 - 1, i / 1156 - 1, (i / 34) % 34 - 1)), a, i + 1) end
+  @[no_alloc]
+  pfn inside(p : Int) : Bool do p >= 1 && p <= 32 end
+
+  -- The centre chunk's ids into the grid's interior.
+  pfn centre_go(ids : NativeIntArr, c : Strata.Chunk.Chunk, i : Int) : NativeIntArr do
+    if i < 0 || i >= 32768 do ids
+    else centre_go(NativeArray.set_int(ids, porigin() + i % 32 + 34 * ((i / 32) % 32) + 1156 * (i / 1024), C.get_idx(c, i)), c, i + 1) end
   end
 
-  pfn kind_go(kind : NativeU8Arr, ids : NativeIntArr, r : Strata.Blocks.Registry, i : Int) : NativeU8Arr do
-    if i >= pvol() do kind
+  -- The one-voxel shell, from the neighbours.
+  pfn shell_go(ids : NativeIntArr, a : Around, i : Int) : NativeIntArr do
+    if i >= pvol() do ids
     else
-      let id = NativeArray.get_int(ids, i)
-      let k = (if B.is_solid_opaque(r, id) do 1 else 0 end) + 2 * B.style_index(r, id) + 8 * B.layer_index(r, id)
-      kind_go(NativeArray.set_u8(kind, i, k), ids, r, i + 1)
+      let px = i % 34
+      let pz = (i / 34) % 34
+      let py = i / 1156
+      if inside(px) && inside(py) && inside(pz) do shell_go(ids, a, i + 1)
+      else shell_go(NativeArray.set_int(ids, i, around_get(a, px - 1, py - 1, pz - 1)), a, i + 1) end
     end
+  end
+
+  pfn pad(a : Around, centre : Strata.Chunk.Chunk) : NativeIntArr do
+    let u = C.uniform_id(centre)
+    if u >= 0 do shell_go(NativeArray.make_int(pvol(), u), a, 0)
+    else shell_go(centre_go(NativeArray.make_int(pvol(), 0), centre, 0), a, 0) end
+  end
+
+  -- Per-layer tallies that let whole slices be skipped. Six runs of 34,
+  -- indexed by padded layer: cube blocks in the layer (interior cells only)
+  -- by y, x, z at 0, 34, 68; solid-opaque cells among the layer's 32 x 32
+  -- cells that face the interior, by y, x, z at 102, 136, 170.
+  pfn bump(t : NativeIntArr, i : Int) : NativeIntArr do NativeArray.set_int(t, i, NativeArray.get_int(t, i) + 1) end
+
+  type Kinds = Kinds(NativeU8Arr, NativeIntArr)
+
+  pfn kind_go(kind : NativeU8Arr, tally : NativeIntArr, ids : NativeIntArr, r : Strata.Blocks.Registry, i : Int) : Kinds do
+    if i >= pvol() do Kinds(kind, tally)
+    else
+      let k = B.mesh_kind(r, NativeArray.get_int(ids, i))
+      let px = i % 34
+      let pz = (i / 34) % 34
+      let py = i / 1156
+      let ix = inside(px)
+      let iy = inside(py)
+      let iz = inside(pz)
+      let t1 = if int_and(k / 2, 3) == 0 && ix && iy && iz do bump(bump(bump(tally, py), 34 + px), 68 + pz) else tally end
+      let solid = int_and(k, 1) == 1
+      let t2 = if solid && ix && iz do bump(t1, 102 + py) else t1 end
+      let t3 = if solid && iy && iz do bump(t2, 136 + px) else t2 end
+      let t4 = if solid && ix && iy do bump(t3, 170 + pz) else t3 end
+      kind_go(NativeArray.set_u8(kind, i, k), t4, ids, r, i + 1)
+    end
+  end
+
+  -- Can slice n of face f hold a face at all? Not if the layer has no cube
+  -- block, nor if every cell it looks into is solid.
+  pfn slice_live(tally : NativeIntArr, f : Int, n : Int) : Bool do
+    let axis = if f < 2 do 0 else if f < 4 do 34 else 68 end end
+    let front = if f == 0 || f == 2 || f == 4 do n + 2 else n end
+    NativeArray.get_int(tally, axis + n + 1) > 0 && NativeArray.get_int(tally, 102 + axis + front) < 1024
   end
 
   -- Padded-index strides of a face's normal and in-plane axes.
@@ -247,26 +295,27 @@ mod Strata.Mesh do
     end end
   end
 
-  pfn slices(bufs : Bufs, mask : NativeIntArr, ids : NativeIntArr, kind : NativeU8Arr, r : Strata.Blocks.Registry, f : Int, n : Int) : Greedy do
+  pfn slices(bufs : Bufs, mask : NativeIntArr, ids : NativeIntArr, kind : NativeU8Arr, tally : NativeIntArr, r : Strata.Blocks.Registry, f : Int, n : Int) : Greedy do
     if n >= 32 do Greedy(bufs, mask)
+    else if !slice_live(tally, f, n) do slices(bufs, mask, ids, kind, tally, r, f, n + 1)
     else
       match mask_go(mask, ids, kind, f, porigin() + n * sn(f), 0, 0) do
         MaskRes(m2, found) ->
-          if found == 0 do slices(bufs, m2, ids, kind, r, f, n + 1)
+          if found == 0 do slices(bufs, m2, ids, kind, tally, r, f, n + 1)
           else
             match greedy(bufs, m2, r, f, n, 0, 0) do
-              Greedy(b2, m3) -> slices(b2, m3, ids, kind, r, f, n + 1)
+              Greedy(b2, m3) -> slices(b2, m3, ids, kind, tally, r, f, n + 1)
             end
           end
       end
-    end
+    end end
   end
 
-  pfn faces(bufs : Bufs, mask : NativeIntArr, ids : NativeIntArr, kind : NativeU8Arr, r : Strata.Blocks.Registry, f : Int) : Bufs do
+  pfn faces(bufs : Bufs, mask : NativeIntArr, ids : NativeIntArr, kind : NativeU8Arr, tally : NativeIntArr, r : Strata.Blocks.Registry, f : Int) : Bufs do
     if f >= 6 do bufs
     else
-      match slices(bufs, mask, ids, kind, r, f, 0) do
-        Greedy(b2, m2) -> faces(b2, m2, ids, kind, r, f + 1)
+      match slices(bufs, mask, ids, kind, tally, r, f, 0) do
+        Greedy(b2, m2) -> faces(b2, m2, ids, kind, tally, r, f + 1)
       end
     end
   end
@@ -303,10 +352,12 @@ mod Strata.Mesh do
     if u >= 0 && B.style_index(r, u) == 3 do no_mesh(occ)
     else if u >= 0 && B.is_solid_opaque(r, u) && wall(r, a, 1, 0, 0) && wall(r, a, -1, 0, 0) && wall(r, a, 0, 1, 0) && wall(r, a, 0, -1, 0) && wall(r, a, 0, 0, 1) && wall(r, a, 0, 0, -1) do no_mesh(occ)
     else
-      let ids = pad_go(NativeArray.make_int(pvol(), 0), a, 0)
-      let kind = kind_go(NativeArray.make_u8(pvol(), 0), ids, r, 0)
-      match faces(Bufs(qb_new(), qb_new(), qb_new()), NativeArray.make_int(1024, 0), ids, kind, r, 0) do
-        Bufs(q0, q1, q2) -> Meshed(q0, q1, q2, instances_go(qb_new(), ids, kind, r, 0), occ)
+      let ids = pad(a, centre)
+      match kind_go(NativeArray.make_u8(pvol(), 0), NativeArray.make_int(204, 0), ids, r, 0) do
+        Kinds(kind, tally) ->
+          match faces(Bufs(qb_new(), qb_new(), qb_new()), NativeArray.make_int(1024, 0), ids, kind, tally, r, 0) do
+            Bufs(q0, q1, q2) -> Meshed(q0, q1, q2, instances_go(qb_new(), ids, kind, r, 0), occ)
+          end
       end
     end end
   end
