@@ -66,3 +66,13 @@ accepts it (cube_forge G23). Workaround: the full module path.
 
 Still true on main (1a4251bc8). A consumer lists `native/strata_vk.c` in
 its own `[ffi]` block; see `viewer/forge.toml`.
+
+## S12 — no way to ask "is this task finished?", and `Actor.call` fails in tests
+
+`task_await` blocks, and there is no poll or timed await that returns
+early. The alternative, worker actors with a collector actor polled by
+`Actor.call`, returns `Err("actor_call: not in scheduler context")` under
+`forge test` (cube_forge G49), so it cannot be tested. Workaround in
+`Strata.Stream`: work started on one tick is awaited on the next, so it has
+a whole frame to finish and the wait is normally zero. A real
+`task_poll(t) : Option(a)` would let `tick` never wait at all.

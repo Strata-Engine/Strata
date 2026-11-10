@@ -1,0 +1,166 @@
+-- Stream: loading around focus points, worker-built meshes, unloading,
+-- determinism, and edits that outlive a chunk's absence.
+mod Strata.Test.Stream do
+
+  needs IO.Clock      -- charged to every test module once any uses Check.all (GAPS S3)
+  needs IO.Process
+  needs IO.Spawn
+  import Test
+  alias Strata.Stream as Sm
+  alias Strata.World as Wd
+  alias Strata.Edit as Ed
+  alias Strata.Coord as Cd
+  alias Strata.Chunk as C
+  alias Strata.Blocks as B
+
+  -- stone below y = 0 with a seeded pillar in every chunk column, air above
+  pfn terrain() : Strata.Terrain.Gen do
+    Strata.Terrain.gen(fn (k, seed) ->
+      if Cd.ky(k) < 0 do C.uniform(1)
+      else if Cd.ky(k) == 0 do C.fill_box(C.uniform(0), 3, 0, 3, 3, (Cd.kx(k) * 7 + Cd.kz(k) * 13 + seed) % 9 + 9, 3, 1)
+      else C.uniform(0) end end)
+  end
+  pfn reg() : Strata.Blocks.Registry do
+    match B.register(B.empty(), B.def()) do
+      Ok((r, _)) -> r
+      Err(_) -> B.empty()
+    end
+  end
+  pfn begin(budget : Int, workers : Int) : Strata.Stream.Stream do
+    Sm.start(Wd.new(reg(), terrain(), 7, 1.0), Sm.config(2, 1, budget, workers))
+  end
+  pfn at(s : Strata.Stream.Stream, x : Float, y : Float, z : Float) : Strata.Stream.Stream do
+    Sm.run_until_settled(Sm.set_focus(s, Cons((x, y, z), Nil)), 20000)
+  end
+
+  pfn has_key(l : List(Strata.Coord.Key), k : Strata.Coord.Key) : Bool do
+    match l do
+      Nil -> false
+      Cons(h, t) -> if Cd.key_eq(h, k) do true else has_key(t, k) end
+    end
+  end
+  pfn mesh_keys(l : List((Strata.Coord.Key, Strata.Mesh.Meshed))) : List(Strata.Coord.Key) do
+    match l do
+      Nil -> Nil
+      Cons((k, _), t) -> Cons(k, mesh_keys(t))
+    end
+  end
+  pfn mesh_of(l : List((Strata.Coord.Key, Strata.Mesh.Meshed)), k : Strata.Coord.Key) : Int do
+    match l do
+      Nil -> -1
+      Cons((k2, m), t) -> if Cd.key_eq(k2, k) do Strata.Mesh.quad_count_at(m, 0) else mesh_of(t, k) end
+    end
+  end
+
+  -- the walk both determinism runs take
+  pfn walk(budget : Int, workers : Int) : Int do
+    let s1 = at(begin(budget, workers), 0.5, 0.5, 0.5)
+    let s2 = at(s1, 64.5, 0.5, 0.5)
+    let s3 = at(s2, 64.5, 0.5, 64.5)
+    let s4 = at(s3, 0.5, 40.5, 64.5)
+    let h = Sm.world_hash(s4)
+    Sm.stop(s4)
+    h
+  end
+
+  describe "Stream" do
+    test "loads the box around the focus and meshes every chunk with all its neighbours" do
+      let s = at(begin(8, 2), 0.5, 0.5, 0.5)
+      Test.assert_true(Sm.settled(s), "settled")
+      Test.assert_eq_int(Sm.loaded_count(s), 75, "5 x 3 x 5 chunks")
+      Test.assert_eq_int(Wd.get_block(Sm.world(s), 5, -5, 5), 1, "terrain is there")
+      match Sm.take_meshes(s) do
+        (s2, ms) ->
+          Test.assert_eq_int(List.length(ms), 9, "the 3 x 1 x 3 chunks one inside the edge")
+          Test.assert_true(has_key(mesh_keys(ms), Cd.key(0, 0, 0)), "the focus chunk among them")
+          Test.assert_true(has_key(mesh_keys(ms), Cd.key(-1, 0, 1)), "and a corner of the inner box")
+          Test.assert_false(has_key(mesh_keys(ms), Cd.key(2, 0, 0)), "but not a chunk on the edge")
+          Test.assert_true(mesh_of(ms, Cd.key(0, 0, 0)) > 0, "the focus chunk's mesh has quads")
+          match Sm.take_meshes(s2) do
+            (s3, again) ->
+              Test.assert_eq_int(List.length(again), 0, "a second take is empty")
+              Sm.stop(s3)
+          end
+      end
+    end
+
+    test "moving the focus loads ahead and unloads behind, one chunk late" do
+      let s = at(begin(8, 2), 0.5, 0.5, 0.5)
+      match Sm.take_unloads(s) do
+        (s1, none) ->
+          Test.assert_eq_int(List.length(none), 0, "nothing unloaded yet")
+          let s2 = at(s1, 64.5, 0.5, 0.5)
+          Test.assert_true(Wd.is_loaded(Sm.world(s2), Cd.key(4, 0, 0)), "the new edge is loaded")
+          Test.assert_true(Wd.is_loaded(Sm.world(s2), Cd.key(-1, 0, 0)), "one chunk behind the box is kept")
+          Test.assert_false(Wd.is_loaded(Sm.world(s2), Cd.key(-2, 0, 0)), "two behind is not")
+          Test.assert_eq_int(Sm.loaded_count(s2), 90, "the box plus the kept slab")
+          match Sm.take_unloads(s2) do
+            (s3, gone) ->
+              Test.assert_eq_int(List.length(gone), 15, "the far slab: 1 x 3 x 5")
+              Test.assert_true(has_key(gone, Cd.key(-2, 0, 0)), "named in the unloads")
+              Sm.stop(s3)
+          end
+      end
+    end
+
+    test "the same seed and path give the same world whatever the workers and budget" do
+      Test.assert_eq_int(walk(1, 1), walk(64, 4), "world hash")
+    end
+
+    test "an edit survives its chunk leaving and returning" do
+      let s = at(begin(8, 2), 0.5, 0.5, 0.5)
+      let s2 = Sm.apply(s, Ed.set_block(Sm.world(s), 5, -5, 5, 0))
+      let far = at(s2, 2000.5, 0.5, 0.5)
+      Test.assert_false(Wd.is_loaded(Sm.world(far), Cd.key(0, -1, 0)), "the chunk is gone")
+      Test.assert_eq_int(Wd.cache_size(Sm.world(far)), 1, "but cached")
+      let back = at(far, 0.5, 0.5, 0.5)
+      Test.assert_eq_int(Wd.get_block(Sm.world(back), 5, -5, 5), 0, "the edit is still there")
+      Test.assert_eq_int(Wd.get_block(Sm.world(back), 6, -5, 5), 1, "and only the edit")
+      Sm.stop(back)
+    end
+
+    test "applying an edit remeshes exactly its dirty chunks, with the edit in the mesh" do
+      let s = at(begin(8, 2), 0.5, 0.5, 0.5)
+      match Sm.take_meshes(s) do
+        (s1, _) ->
+          let o = Ed.set_block(Sm.world(s1), 20, 20, 20, 1)
+          Test.assert_eq_int(List.length(Ed.dirty(o)), 1, "an interior edit")
+          let s2 = Sm.run_until_settled(Sm.apply(s1, o), 20000)
+          match Sm.take_meshes(s2) do
+            (s3, ms) ->
+              Test.assert_eq_int(List.length(ms), 1, "one mesh came back")
+              Test.assert_true(has_key(mesh_keys(ms), Cd.key(0, 0, 0)), "the edited chunk's")
+              Test.assert_true(mesh_of(ms, Cd.key(0, 0, 0)) >= 6 + 5, "the pillar and the new block")
+              Sm.stop(s3)
+          end
+      end
+    end
+
+    test "a teleport mid-load ends in the same world as going straight there, and a queued edit waits" do
+      let s0 = Sm.tick(Sm.set_focus(begin(8, 2), Cons((0.5, 0.5, 0.5), Nil)))
+      let s1 = Sm.apply(s0, Ed.set_block(Sm.world(s0), 5, -5, 5, 0))
+      let far = at(s1, 3200.5, 0.5, 0.5)
+      Test.assert_eq_int(Sm.loaded_count(far), 75, "one box at the far point, nothing left behind")
+      let direct = at(begin(8, 2), 3200.5, 0.5, 0.5)
+      Test.assert_eq_int(Sm.world_hash(far), Sm.world_hash(direct), "same world as going straight there")
+      Sm.stop(direct)
+      let back = at(far, 0.5, 0.5, 0.5)
+      Test.assert_eq_int(Wd.get_block(Sm.world(back), 5, -5, 5), 0, "the edit made before leaving is applied")
+      Sm.stop(back)
+    end
+
+    test "no focus unloads everything" do
+      let s = at(begin(8, 2), 0.5, 0.5, 0.5)
+      let s2 = Sm.run_until_settled(Sm.set_focus(s, Nil), 20000)
+      Test.assert_eq_int(Sm.loaded_count(s2), 0, "nothing loaded")
+      Test.assert_true(Sm.settled(s2), "and settled")
+      Sm.stop(s2)
+    end
+
+    test "two focus points load the union of their boxes" do
+      let s = Sm.run_until_settled(Sm.set_focus(begin(8, 2), Cons((0.5, 0.5, 0.5), Cons((640.5, 0.5, 0.5), Nil))), 20000)
+      Test.assert_eq_int(Sm.loaded_count(s), 150, "two boxes that do not touch")
+      Sm.stop(s)
+    end
+  end
+end
