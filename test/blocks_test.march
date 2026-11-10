@@ -1,0 +1,134 @@
+-- The block registry: registration, state families, models, total lookups.
+mod Strata.Test.Blocks do
+
+  needs IO.Clock      -- charged to every test module once any uses Check.all (GAPS S3)
+  needs IO.Process
+  import Test
+  alias Strata.Blocks as B
+
+  pfn reg1(r : Strata.Blocks.Registry, d : Strata.Blocks.Def) : (Strata.Blocks.Registry, Int) do
+    match B.register(r, d) do
+      Ok(p) -> p
+      Err(_) -> (r, -1)
+    end
+  end
+
+  pfn fam(r : Strata.Blocks.Registry, d : Strata.Blocks.Def, n : Int) : (Strata.Blocks.Registry, Int) do
+    match B.register_family(r, d, n) do
+      Ok(p) -> p
+      Err(_) -> (r, -1)
+    end
+  end
+
+  pfn is_air(r : Strata.Blocks.Registry, id : Int) : Bool do
+    let no_collide = !B.collides(r, id)
+    let empty = B.opacity_index(r, id) == 0
+    let no_mesh = B.style_index(r, id) == 3
+    no_collide && empty && no_mesh && !B.is_solid_opaque(r, id) && B.emission(r, id) == 0 && B.face_tex(r, id, 0) == 0
+  end
+
+  describe "Blocks.empty" do
+    test "holds air as id 0" do
+      let r = B.empty()
+      Test.assert_eq_int(B.count(r), 1, "one block: air")
+      Test.assert_true(is_air(r, 0), "id 0 has the air values")
+    end
+  end
+
+  describe "Blocks.register" do
+    test "the default definition is a solid opaque collidable cube" do
+      let (r, id) = reg1(B.empty(), B.def())
+      Test.assert_eq_int(id, 1, "first registered id")
+      Test.assert_eq_int(B.count(r), 2, "air + one")
+      Test.assert_true(B.collides(r, id), "collides")
+      Test.assert_true(B.is_solid_opaque(r, id), "solid opaque")
+      Test.assert_eq_int(B.style_index(r, id), 0, "style Cube")
+      Test.assert_eq_int(B.layer_index(r, id), 0, "layer Opaque")
+      Test.assert_eq_int(B.opacity_index(r, id), 1, "opacity Solid")
+    end
+
+    test "with_faces sets top, bottom and the four sides" do
+      let (r, id) = reg1(B.empty(), B.with_faces(B.def(), 3, 4, 5))
+      Test.assert_eq_int(B.face_tex(r, id, 0), 3, "top")
+      Test.assert_eq_int(B.face_tex(r, id, 1), 4, "bottom")
+      Test.assert_eq_int(B.face_tex(r, id, 2), 5, "+x")
+      Test.assert_eq_int(B.face_tex(r, id, 3), 5, "-x")
+      Test.assert_eq_int(B.face_tex(r, id, 4), 5, "+z")
+      Test.assert_eq_int(B.face_tex(r, id, 5), 5, "-z")
+      Test.assert_eq_int(B.face_tex(r, id, 9), 0, "a face that does not exist")
+      Test.assert_eq_int(B.face_tex(r, id, -1), 0, "nor a negative one")
+    end
+
+    test "with_face overrides one face" do
+      let (r, id) = reg1(B.empty(), B.with_face(B.with_faces(B.def(), 3, 4, 5), 2, 9))
+      Test.assert_eq_int(B.face_tex(r, id, 2), 9, "+x overridden")
+      Test.assert_eq_int(B.face_tex(r, id, 3), 5, "-x kept")
+    end
+
+    test "carries opacity, layer, style, collision, light and material" do
+      let d0 = B.with_material(B.with_emission(B.with_collide(B.with_style(B.with_layer(B.with_opacity(B.def(), Strata.Blocks.SeeThrough), Strata.Blocks.Translucent), Strata.Blocks.Model(4)), false), 10, 20, 30, 200), 77, 5)
+      let (r, id) = reg1(B.empty(), d0)
+      Test.assert_false(B.collides(r, id), "no collision")
+      Test.assert_false(B.is_solid_opaque(r, id), "see-through is not solid opaque")
+      Test.assert_eq_int(B.opacity_index(r, id), 2, "SeeThrough")
+      Test.assert_eq_int(B.layer_index(r, id), 2, "Translucent")
+      Test.assert_eq_int(B.style_index(r, id), 2, "a Model")
+      Test.assert_eq_int(B.model_of(r, id), 4, "Model(4)")
+      Test.assert_eq_int(B.emission(r, id), 10 + 20 * 256 + 30 * 65536 + 200 * 16777216, "r | g<<8 | b<<16 | strength<<24")
+      Test.assert_eq_int(B.roughness(r, id), 77, "roughness")
+      Test.assert_eq_int(B.emissive(r, id), 5, "emissive")
+    end
+  end
+
+  describe "Blocks.register_family" do
+    test "registers contiguous states and maps between base and state" do
+      let (r0, _) = reg1(B.empty(), B.def())
+      let (r, b) = fam(r0, B.def(), 8)
+      Test.assert_eq_int(b, 2, "base follows the block before it")
+      Test.assert_eq_int(B.count(r), 10, "air + 1 + 8")
+      Test.assert_eq_int(B.state_of(r, b + 5), 5, "state of the sixth")
+      Test.assert_eq_int(B.base_of(r, b + 5), b, "its base")
+      Test.assert_eq_int(B.with_state(r, b, 7), b + 7, "last state")
+      Test.assert_eq_int(B.with_state(r, b + 3, 0), b, "back to the base from any member")
+      Test.assert_eq_int(B.with_state(r, b, 8), b, "a state past the family leaves the id alone")
+      Test.assert_eq_int(B.with_state(r, b, -1), b, "as does a negative one")
+      Test.assert_eq_int(B.base_of(r, 1), 1, "a plain block is its own base")
+      Test.assert_eq_int(B.state_of(r, 1), 0, "in state 0")
+    end
+    test "a family of no states is an error" do
+      let bad = match B.register_family(B.empty(), B.def(), 0) do
+        Ok(_) -> false
+        Err(_) -> true
+      end
+      Test.assert_true(bad, "Err")
+    end
+  end
+
+  describe "Blocks lookups on ids nobody registered" do
+    test "answer as air" do
+      let (r, _) = reg1(B.empty(), B.def())
+      Test.assert_true(is_air(r, -1), "negative")
+      Test.assert_true(is_air(r, B.count(r)), "one past the end")
+      Test.assert_true(is_air(r, 70000), "past sixteen bits")
+      Test.assert_eq_int(B.base_of(r, 70000), 0, "base of garbage is air")
+      Test.assert_eq_int(B.state_of(r, -5), 0, "state of garbage is 0")
+      Test.assert_eq_int(B.with_state(r, 70000, 2), 70000, "with_state leaves garbage alone")
+    end
+  end
+
+  describe "Blocks models" do
+    test "a model keeps its quads and boxes" do
+      let q = NativeArray.make_f32(12, 0.5)
+      let (r, m) = B.add_model(B.empty(), q, Cons(Strata.Blocks.Box(0.0, 0.0, 0.0, 1.0, 0.5, 1.0), Nil))
+      Test.assert_eq_int(m, 0, "first model index")
+      Test.assert_eq_int(NativeArray.length_f32(B.model_quads(r, m)), 12, "quads kept")
+      Test.assert_eq_int(List.length(B.model_boxes(r, m)), 1, "one box")
+    end
+    test "an unknown model has no quads and no boxes" do
+      let r = B.empty()
+      Test.assert_eq_int(NativeArray.length_f32(B.model_quads(r, 3)), 0, "empty quads")
+      Test.assert_eq_int(List.length(B.model_boxes(r, 3)), 0, "no boxes")
+      Test.assert_eq_int(List.length(B.model_boxes(r, -1)), 0, "negative index too")
+    end
+  end
+end

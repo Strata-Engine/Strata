@@ -1,0 +1,307 @@
+-- Blocks — the block registry a game builds once and the engine reads.
+--
+-- Constructor patterns do not resolve reliably outside their own module
+-- (cube_forge GAPS G24/G25), so every sum type here has an `_index` reader
+-- and other modules match on the number.
+--
+-- A registry is flat native arrays indexed by block id, so the hot paths
+-- (meshing, collision, ray casting) answer with one read and never call back
+-- into game code. Id 0 is air and is always registered. Every lookup is
+-- total: an id that is negative, unregistered or past sixteen bits answers
+-- with air's values.
+--
+-- A block STATE is its own id. `register_family` registers a run of
+-- contiguous ids that share a definition (a fluid's levels, a log's
+-- orientations) and `base_of` / `state_of` / `with_state` map between them.
+mod Strata.Blocks do
+
+  type Opacity = Clear | Solid | SeeThrough
+  type Layer = Opaque | Cutout | Translucent
+  type Style = Cube | Cross | Model(Int) | NoMesh
+  -- A collision box inside one cell: min x, y, z then max x, y, z, in 0..1.
+  type Box = Box(Float, Float, Float, Float, Float, Float)
+
+  -- flags, model index, emission, material, six face textures
+  type Def = Def(Int, Int, Int, Int, Int, Int, Int, Int, Int, Int)
+
+  -- The flags byte: bit 0 collides; bits 1-2 opacity (0 empty, 1 solid,
+  -- 2 see-through); bits 3-4 layer (0 opaque, 1 cutout, 2 translucent);
+  -- bits 5-6 style (0 cube, 1 cross, 2 model, 3 no mesh).
+  pfn air_flags() : Int do 96 end
+  pfn stride() : Int do 11 end
+  doc "The most block ids a registry holds: ids are sixteen bits."
+  fn max_ids() : Int do 65536 end
+
+  pfn clamp8(v : Int) : Int do if v < 0 do 0 else if v > 255 do 255 else v end end end
+  pfn clamp16(v : Int) : Int do if v < 0 do 0 else if v > 65535 do 65535 else v end end end
+
+  doc "A collidable, solid, opaque cube with texture 0 on every face and no light."
+  fn def() : Def do Def(3, 0, 0, 0, 0, 0, 0, 0, 0, 0) end
+
+  pfn d_flags(d : Def) : Int do match d do Def(f, _, _, _, _, _, _, _, _, _) -> f end end
+  pfn set_flags(d : Def, f : Int) : Def do match d do Def(_, m, e, mt, t0, t1, t2, t3, t4, t5) -> Def(f, m, e, mt, t0, t1, t2, t3, t4, t5) end end
+  pfn put_bits(flags : Int, shift : Int, mask : Int, v : Int) : Int do
+    flags - int_and(flags, mask * shift) + v * shift
+  end
+
+  fn with_collide(d : Def, yes : Bool) : Def do set_flags(d, put_bits(d_flags(d), 1, 1, if yes do 1 else 0 end)) end
+
+  fn with_opacity(d : Def, o : Opacity) : Def do
+    let v = match o do
+      Clear -> 0
+      Solid -> 1
+      SeeThrough -> 2
+    end
+    set_flags(d, put_bits(d_flags(d), 2, 3, v))
+  end
+
+  fn with_layer(d : Def, l : Layer) : Def do
+    let v = match l do
+      Opaque -> 0
+      Cutout -> 1
+      Translucent -> 2
+    end
+    set_flags(d, put_bits(d_flags(d), 8, 3, v))
+  end
+
+  fn with_style(d : Def, s : Style) : Def do
+    match s do
+      Cube -> set_flags(d, put_bits(d_flags(d), 32, 3, 0))
+      Cross -> set_flags(d, put_bits(d_flags(d), 32, 3, 1))
+      NoMesh -> set_flags(d, put_bits(d_flags(d), 32, 3, 3))
+      Model(k) ->
+        match set_flags(d, put_bits(d_flags(d), 32, 3, 2)) do
+          Def(f, _, e, mt, t0, t1, t2, t3, t4, t5) -> Def(f, if k < 0 do 0 else k end, e, mt, t0, t1, t2, t3, t4, t5)
+        end
+    end
+  end
+
+  doc "Texture ids for the top face, the bottom face and the four sides."
+  fn with_faces(d : Def, top : Int, bottom : Int, side : Int) : Def do
+    match d do
+      Def(f, m, e, mt, _, _, _, _, _, _) -> Def(f, m, e, mt, clamp16(top), clamp16(bottom), clamp16(side), clamp16(side), clamp16(side), clamp16(side))
+    end
+  end
+
+  doc "Texture id for one face (0 +y, 1 -y, 2 +x, 3 -x, 4 +z, 5 -z). Another face number changes nothing."
+  fn with_face(d : Def, face : Int, tex : Int) : Def do
+    let t = clamp16(tex)
+    match d do
+      Def(f, m, e, mt, t0, t1, t2, t3, t4, t5) ->
+        if face == 0 do Def(f, m, e, mt, t, t1, t2, t3, t4, t5)
+        else if face == 1 do Def(f, m, e, mt, t0, t, t2, t3, t4, t5)
+        else if face == 2 do Def(f, m, e, mt, t0, t1, t, t3, t4, t5)
+        else if face == 3 do Def(f, m, e, mt, t0, t1, t2, t, t4, t5)
+        else if face == 4 do Def(f, m, e, mt, t0, t1, t2, t3, t, t5)
+        else if face == 5 do Def(f, m, e, mt, t0, t1, t2, t3, t4, t)
+        else d end end end end end end
+    end
+  end
+
+  doc "Emitted light: colour and strength, each 0..255."
+  fn with_emission(d : Def, r : Int, g : Int, b : Int, strength : Int) : Def do
+    let em = clamp8(r) + 256 * clamp8(g) + 65536 * clamp8(b) + 16777216 * clamp8(strength)
+    match d do
+      Def(f, m, _, mt, t0, t1, t2, t3, t4, t5) -> Def(f, m, em, mt, t0, t1, t2, t3, t4, t5)
+    end
+  end
+
+  doc "Surface values the lighting reads: roughness and emissive, each 0..255."
+  fn with_material(d : Def, roughness : Int, emissive : Int) : Def do
+    match d do
+      Def(f, m, e, _, t0, t1, t2, t3, t4, t5) -> Def(f, m, e, clamp8(roughness) + 256 * clamp8(emissive), t0, t1, t2, t3, t4, t5)
+    end
+  end
+
+  -- A model: quads for drawing (passed through untouched) and boxes for
+  -- collision and ray casting.
+  type ModelDef = ModelDef(NativeF32Arr, List(Box))
+
+  -- count, capacity, flags (one byte per id), ints (stride() per id: model,
+  -- emission, material, family base, family size, six face textures),
+  -- models (newest first), model count
+  type Registry = Registry(Int, Int, NativeU8Arr, NativeIntArr, List(ModelDef), Int)
+
+  doc "A registry holding only air, as id 0."
+  fn empty() : Registry do
+    let cap = 64
+    let flags = NativeArray.set_u8(NativeArray.make_u8(cap, air_flags()), 0, air_flags())
+    let ints = NativeArray.set_int(NativeArray.make_int(cap * stride(), 0), 4, 1)
+    Registry(1, cap, flags, ints, Nil, 0)
+  end
+
+  doc "How many ids are registered, air included."
+  fn count(r : Registry) : Int do match r do Registry(n, _, _, _, _, _) -> n end end
+
+  pfn copy_u8(dst : NativeU8Arr, src : NativeU8Arr, i : Int, n : Int) : NativeU8Arr do
+    if i >= n do dst else copy_u8(NativeArray.set_u8(dst, i, NativeArray.get_u8(src, i)), src, i + 1, n) end
+  end
+  pfn copy_int(dst : NativeIntArr, src : NativeIntArr, i : Int, n : Int) : NativeIntArr do
+    if i >= n do dst else copy_int(NativeArray.set_int(dst, i, NativeArray.get_int(src, i)), src, i + 1, n) end
+  end
+
+  pfn grown(r : Registry, need : Int) : Registry do
+    match r do
+      Registry(n, cap, flags, ints, ms, mc) ->
+        if need <= cap do r
+        else
+          let cap2 = if cap * 2 >= need do cap * 2 else need end
+          let f2 = copy_u8(NativeArray.make_u8(cap2, air_flags()), flags, 0, n)
+          let i2 = copy_int(NativeArray.make_int(cap2 * stride(), 0), ints, 0, n * stride())
+          Registry(n, cap2, f2, i2, ms, mc)
+        end
+    end
+  end
+
+  pfn put_def(r : Registry, d : Def, base : Int, size : Int) : Registry do
+    match r do
+      Registry(n, cap, flags, ints, ms, mc) ->
+        match d do
+          Def(f, m, e, mt, t0, t1, t2, t3, t4, t5) ->
+            let o = n * stride()
+            let i0 = NativeArray.set_int(ints, o, m)
+            let i1 = NativeArray.set_int(i0, o + 1, e)
+            let i2 = NativeArray.set_int(i1, o + 2, mt)
+            let i3 = NativeArray.set_int(i2, o + 3, base)
+            let i4 = NativeArray.set_int(i3, o + 4, size)
+            let i5 = NativeArray.set_int(i4, o + 5, t0)
+            let i6 = NativeArray.set_int(i5, o + 6, t1)
+            let i7 = NativeArray.set_int(i6, o + 7, t2)
+            let i8 = NativeArray.set_int(i7, o + 8, t3)
+            let i9 = NativeArray.set_int(i8, o + 9, t4)
+            let i10 = NativeArray.set_int(i9, o + 10, t5)
+            Registry(n + 1, cap, NativeArray.set_u8(flags, n, f), i10, ms, mc)
+        end
+    end
+  end
+
+  pfn put_family(r : Registry, d : Def, base : Int, size : Int, k : Int) : Registry do
+    if k >= size do r else put_family(put_def(r, d, base, size), d, base, size, k + 1) end
+  end
+
+  doc "Register [states] contiguous ids sharing [d]; the result carries the first (base) id."
+  fn register_family(r : Registry, d : Def, states : Int) : Result((Registry, Int), String) do
+    let base = count(r)
+    if states < 1 do Err("a block family needs at least one state")
+    else if base + states > max_ids() do Err("the registry is full: block ids are sixteen bits")
+    else Ok((put_family(grown(r, base + states), d, base, states, 0), base)) end end
+  end
+
+  doc "Register one block; the result carries its id."
+  fn register(r : Registry, d : Def) : Result((Registry, Int), String) do register_family(r, d, 1) end
+
+  @[no_alloc]
+  pfn flags_of(r : Registry, id : Int) : Int do
+    match r do
+      Registry(n, _, flags, _, _, _) -> if id < 0 || id >= n do air_flags() else NativeArray.get_u8(flags, id) end
+    end
+  end
+
+  -- Field [k] of id's int row, or [default] for an id nobody registered.
+  pfn int_of(r : Registry, id : Int, k : Int, default : Int) : Int do
+    match r do
+      Registry(n, _, _, ints, _, _) -> if id < 0 || id >= n do default else NativeArray.get_int(ints, id * stride() + k) end
+    end
+  end
+
+  doc "Does the block stop a moving body?"
+  fn collides(r : Registry, id : Int) : Bool do int_and(flags_of(r, id), 1) == 1 end
+
+  fn opacity(r : Registry, id : Int) : Opacity do
+    let v = int_and(flags_of(r, id) / 2, 3)
+    if v == 1 do Solid else if v == 2 do SeeThrough else Clear end end
+  end
+
+  doc "The opacity as a number: 0 clear, 1 solid, 2 see-through."
+  fn opacity_index(r : Registry, id : Int) : Int do
+    let v = int_and(flags_of(r, id) / 2, 3)
+    if v > 2 do 0 else v end
+  end
+
+  doc "Is the block solid and opaque: does it hide the faces behind it and occlude light? The hot-path form of `opacity`."
+  fn is_solid_opaque(r : Registry, id : Int) : Bool do int_and(flags_of(r, id) / 2, 3) == 1 end
+
+  fn layer(r : Registry, id : Int) : Layer do
+    let v = int_and(flags_of(r, id) / 8, 3)
+    if v == 1 do Cutout else if v == 2 do Translucent else Opaque end end
+  end
+
+  doc "The layer as a number: 0 opaque, 1 cutout, 2 translucent."
+  fn layer_index(r : Registry, id : Int) : Int do
+    let v = int_and(flags_of(r, id) / 8, 3)
+    if v > 2 do 0 else v end
+  end
+
+  fn style(r : Registry, id : Int) : Style do
+    let v = int_and(flags_of(r, id) / 32, 3)
+    if v == 0 do Cube else if v == 1 do Cross else if v == 2 do Model(int_of(r, id, 0, 0)) else NoMesh end end end
+  end
+
+  doc "The style as a number: 0 cube, 1 cross, 2 model, 3 no mesh."
+  fn style_index(r : Registry, id : Int) : Int do int_and(flags_of(r, id) / 32, 3) end
+
+  doc "The model index of a Model block, 0 otherwise."
+  fn model_of(r : Registry, id : Int) : Int do int_of(r, id, 0, 0) end
+
+  doc "Texture id of one face (0..5); 0 for a face that does not exist."
+  fn face_tex(r : Registry, id : Int, face : Int) : Int do
+    if face < 0 || face > 5 do 0 else int_of(r, id, 5 + face, 0) end
+  end
+
+  doc "Emitted light packed as r | g<<8 | b<<16 | strength<<24."
+  fn emission(r : Registry, id : Int) : Int do int_of(r, id, 1, 0) end
+  fn roughness(r : Registry, id : Int) : Int do int_and(int_of(r, id, 2, 0), 255) end
+  fn emissive(r : Registry, id : Int) : Int do int_and(int_of(r, id, 2, 0) / 256, 255) end
+
+  doc "The first id of the family [id] belongs to; an unregistered id answers 0 (air)."
+  fn base_of(r : Registry, id : Int) : Int do int_of(r, id, 3, 0) end
+
+  doc "Which state of its family [id] is: 0 for the base and for a plain block."
+  fn state_of(r : Registry, id : Int) : Int do
+    if id < 0 || id >= count(r) do 0 else id - base_of(r, id) end
+  end
+
+  doc "The id of state [s] in [id]'s family. A state outside the family, or an unregistered id, returns [id] unchanged."
+  fn with_state(r : Registry, id : Int, s : Int) : Int do
+    if id < 0 || id >= count(r) do id
+    else if s < 0 || s >= int_of(r, id, 4, 1) do id
+    else base_of(r, id) + s end end
+  end
+
+  doc "Add a model: [quads] for drawing, [boxes] for collision and ray casting. Returns its index."
+  fn add_model(r : Registry, quads : NativeF32Arr, boxes : List(Box)) : (Registry, Int) do
+    match r do
+      Registry(n, cap, flags, ints, ms, mc) -> (Registry(n, cap, flags, ints, Cons(ModelDef(quads, boxes), ms), mc + 1), mc)
+    end
+  end
+
+  -- Models are stored newest first: index m is at position (count - 1 - m).
+  pfn model_at(ms : List(ModelDef), i : Int) : Option(ModelDef) do
+    match ms do
+      Nil -> None
+      Cons(h, t) -> if i == 0 do Some(h) else model_at(t, i - 1) end
+    end
+  end
+
+  pfn find_model(r : Registry, m : Int) : Option(ModelDef) do
+    match r do
+      Registry(_, _, _, _, ms, mc) -> if m < 0 || m >= mc do None else model_at(ms, mc - 1 - m) end
+    end
+  end
+
+  doc "A model's drawing quads; an empty array for an unknown model."
+  fn model_quads(r : Registry, m : Int) : NativeF32Arr do
+    match find_model(r, m) do
+      Some(ModelDef(q, _)) -> q
+      None -> NativeArray.make_f32(0, 0.0)
+    end
+  end
+
+  doc "A model's collision boxes; none for an unknown model."
+  fn model_boxes(r : Registry, m : Int) : List(Box) do
+    match find_model(r, m) do
+      Some(ModelDef(_, b)) -> b
+      None -> Nil
+    end
+  end
+end

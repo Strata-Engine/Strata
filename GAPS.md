@@ -17,5 +17,20 @@ A pattern variable named `by` is a parse error reported only as
 ## S3 — a test using `Check.all` must declare `needs IO.Clock` and `needs IO.Process`
 
 The property runner seeds from the clock and reads `MARCH_PROP_SEED`, and the
-capability ceiling charges both to the calling test module. Workaround: add
-the two `needs` lines to every test module with a property.
+capability ceiling charges both to the calling test module. The charge lands on
+EVERY test module in the suite, not only the one with the property (the
+suite compiles as one program). Workaround: add the two `needs` lines to
+every test module.
+
+## S4 — `on` cannot be a parameter name
+
+`fn f(d : Def, on : Bool)` is a bare "parse error" at the `fn` line; `on` is
+the actor handler keyword. Workaround: another name.
+
+## S5 — constructors do not resolve through a module alias
+
+With `alias Strata.Blocks as B`, `B.SeeThrough` is "Unknown module B" both
+as an expression and as a pattern. The full path works as an expression
+(`Strata.Blocks.SeeThrough`); as a pattern it does not parse (cube_forge
+G24) or resolves against the wrong type (G25). Workaround: every sum type a
+consumer must inspect has an `_index` reader returning a number.
