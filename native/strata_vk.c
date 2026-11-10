@@ -434,6 +434,8 @@ void sv_close(void) {
 int64_t sv_should_close(void) { return (!g.win || glfwWindowShouldClose(g.win)) ? 1 : 0; }
 void sv_poll(void) { g.mdx = 0; g.mdy = 0; if (g.win) glfwPollEvents(); }
 int64_t sv_key(int64_t k) { return (k >= 0 && k < SV_MAX_KEYS) ? g.keys[k] : 0; }
+/* Is mouse button b (0 left, 1 right, 2 middle) held? */
+int64_t sv_mouse_button(int64_t b) { return (g.win && b >= 0 && b <= 7 && glfwGetMouseButton(g.win, (int)b) == GLFW_PRESS) ? 1 : 0; }
 double sv_mouse_dx(void) { return g.mdx; }
 double sv_mouse_dy(void) { return g.mdy; }
 double sv_time(void) { return glfwGetTime(); }

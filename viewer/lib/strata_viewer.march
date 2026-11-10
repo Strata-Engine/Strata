@@ -4,14 +4,20 @@
 --
 --   W A S D   move        mouse / arrows   look
 --   space     up          left shift       down        escape   quit
+--   left click   carve a sphere out of what you are looking at
+--   right click  build a sphere of stone onto it
 --
--- STRATA_RADIUS=n   horizontal radius in chunks (default 6)
+-- The world streams in around the camera and has no edge.
+--
+-- STRATA_RADIUS=n   horizontal radius in chunks (default 10)
 -- STRATA_FRAMES=n   draw n frames, save a screenshot, exit (for scripts)
 -- STRATA_SHOT=path  where the screenshot goes (a PPM)
+-- STRATA_DIG=1      carve once at frame 10, as a left click would (for scripts)
 mod StrataViewer do
 
   needs IO
   needs IO.Process
+  needs IO.Spawn
 
   alias Strata.Blocks as Bk
   alias Strata.Chunk as Ch
@@ -147,88 +153,138 @@ mod StrataViewer do
     else Ch.from_flat(trees_go(ground_go(NativeArray.make_i32(32768, 0), hs, y0, 0), hs, cx * 32, y0, cz * 32, seed, 0)) end end
   end
 
-  -- ── The world: a fixed box of chunks ─────────────────────────────────────
-  -- (2r + 1) x ny x (2r + 1) chunks, index (cx + r) + n * ((cz + r) + n * cy)
-  pfn ny() : Int do 4 end
+  -- ── Chunk slots on the GPU ───────────────────────────────────────────────
+  -- Each loaded chunk with a mesh owns one renderer slot: key -> slot, the
+  -- slots handed back by unloaded chunks, and the next never-used slot.
+  type Slots = Slots(Strata.Store.Store(Int), List(Int), Int)
 
-  pfn gen_go(r : Int, seed : Int, i : Int, acc : List(Strata.Chunk.Chunk)) : List(Strata.Chunk.Chunk) do
-    if i < 0 do acc
-    else
-      let n = 2 * r + 1
-      gen_go(r, seed, i - 1, Cons(terrain(i % n - r, i / (n * n), (i / n) % n - r, seed), acc))
+  pfn slot_for(sl : Slots, k : Strata.Coord.Key) : (Slots, Int) do
+    match sl do
+      Slots(owned, free, next) ->
+        let have = Strata.Store.get(owned, k)
+        if have >= 0 do (sl, have)
+        else
+          match free do
+            Cons(f, rest) -> (Slots(Strata.Store.put(owned, k, f), rest, next), f)
+            Nil -> (Slots(Strata.Store.put(owned, k, next), Nil, next + 1), next)
+          end
+        end
     end
   end
 
-  pfn chunk_of(world : Strata.Tree.Tree(Strata.Chunk.Chunk), r : Int, cx : Int, cy : Int, cz : Int) : Strata.Chunk.Chunk do
-    let n = 2 * r + 1
-    if cx < 0 - r || cx > r || cz < 0 - r || cz > r || cy < 0 || cy >= ny() do Ch.uniform(0)
-    else Strata.Tree.get(world, (cx + r) + n * ((cz + r) + n * cy)) end
+  pfn upload_layer(slot : Int, m : Strata.Mesh.Meshed, l : Int, k : Strata.Coord.Key) : Int do
+    -- an empty layer is uploaded too: it clears what the slot held before
+    if Strata.Ffi.Vk.chunk_upload(slot, l, Mh.quads_at(m, l), Mh.quad_count_at(m, l), 32 * Strata.Coord.kx(k), 32 * Strata.Coord.ky(k), 32 * Strata.Coord.kz(k)) do 0 else 1 end
   end
 
-  type Totals = Totals(Int, Int, Int)   -- chunks with a mesh, quads, uploads refused
-
-  pfn upload_layer(slot : Int, m : Strata.Mesh.Meshed, l : Int, cx : Int, cy : Int, cz : Int) : Int do
-    let n = Mh.quad_count_at(m, l)
-    if n == 0 do 0
-    else if Strata.Ffi.Vk.chunk_upload(slot, l, Mh.quads_at(m, l), n, cx * 32, cy * 32, cz * 32) do 0 else 1 end end
+  pfn upload_all(sl : Slots, ms : List((Strata.Coord.Key, Strata.Mesh.Meshed)), refused : Int) : (Slots, Int) do
+    match ms do
+      Nil -> (sl, refused)
+      Cons((k, m), t) ->
+        match slot_for(sl, k) do
+          (sl2, slot) -> upload_all(sl2, t, refused + upload_layer(slot, m, 0, k) + upload_layer(slot, m, 1, k) + upload_layer(slot, m, 2, k))
+        end
+    end
   end
 
-  pfn mesh_go(world : Strata.Tree.Tree(Strata.Chunk.Chunk), reg : Strata.Blocks.Registry, r : Int, i : Int, t : Totals) : Totals do
-    let n = 2 * r + 1
-    if i >= n * n * ny() do t
-    else
-      let cx = i % n - r
-      let cz = (i / n) % n - r
-      let cy = i / (n * n)
-      let m = Mh.build(reg, Mh.around_from(fn (dx, dy, dz) -> chunk_of(world, r, cx + dx, cy + dy, cz + dz)))
-      let q = Mh.quad_count_at(m, 0) + Mh.quad_count_at(m, 1) + Mh.quad_count_at(m, 2)
-      let bad = upload_layer(i, m, 0, cx, cy, cz) + upload_layer(i, m, 1, cx, cy, cz) + upload_layer(i, m, 2, cx, cy, cz)
-      match t do
-        Totals(c, qs, refused) -> mesh_go(world, reg, r, i + 1, Totals(if q > 0 do c + 1 else c end, qs + q, refused + bad))
-      end
+  pfn free_all(sl : Slots, gone : List(Strata.Coord.Key)) : Slots do
+    match gone do
+      Nil -> sl
+      Cons(k, t) ->
+        match sl do
+          Slots(owned, free, next) ->
+            let slot = Strata.Store.get(owned, k)
+            if slot < 0 do free_all(sl, t)
+            else
+              Strata.Ffi.Vk.chunk_free(slot)
+              free_all(Slots(Strata.Store.remove(owned, k), Cons(slot, free), next), t)
+            end
+        end
+    end
+  end
+
+  -- Move finished meshes and unloads from the stream to the renderer.
+  pfn sync(s : Strata.Stream.Stream, sl : Slots) : (Strata.Stream.Stream, Slots) do
+    match Strata.Stream.take_meshes(s) do
+      (s2, ms) ->
+        match Strata.Stream.take_unloads(s2) do
+          (s3, gone) ->
+            match upload_all(free_all(sl, gone), ms, 0) do
+              (sl2, _) -> (s3, sl2)
+            end
+        end
     end
   end
 
   -- ── The camera and the frame loop ────────────────────────────────────────
-  pfn ms(sec : Float) : String do float_to_string(Math.round(sec *. 10000.0) /. 10.0) ++ " ms" end
   pfn axis(pos : Bool, neg : Bool) : Float do (if pos do 1.0 else 0.0 end) -. (if neg do 1.0 else 0.0 end) end
   pfn clampf(v : Float, lo : Float, hi : Float) : Float do if v < lo do lo else if v > hi do hi else v end end end
 
-  pfn frame_loop(x : Float, y : Float, z : Float, yaw : Float, pitch : Float, frame : Int, frames : Int, t_prev : Float, t_mark : Float, vp : NativeF32Arr) : Unit do
-    Strata.Ffi.Vk.poll()
-    if Strata.Ffi.Vk.should_close() || Strata.Ffi.Vk.key(256) || (frames > 0 && frame >= frames) do ()
+  -- Left click carves, right click builds, each once per press.
+  pfn act(s : Strata.Stream.Stream, reg : Strata.Blocks.Registry, x : Float, y : Float, z : Float, fx : Float, fy : Float, fz : Float, dig : Bool, build : Bool) : Strata.Stream.Stream do
+    if !dig && !build do s
     else
-      let now = Strata.Ffi.Vk.time()
-      let dt = clampf(now -. t_prev, 0.0, 0.1)
-      let yaw2 = yaw +. Strata.Ffi.Vk.mouse_dx() *. 0.0025 +. axis(Strata.Ffi.Vk.key(262), Strata.Ffi.Vk.key(263)) *. dt *. 1.6
-      let pitch2 = clampf(pitch -. Strata.Ffi.Vk.mouse_dy() *. 0.0025 +. axis(Strata.Ffi.Vk.key(265), Strata.Ffi.Vk.key(264)) *. dt *. 1.2, -1.5, 1.5)
-      let fx = Math.sin(yaw2) *. Math.cos(pitch2)
-      let fy = Math.sin(pitch2)
-      let fz = 0.0 -. Math.cos(yaw2) *. Math.cos(pitch2)
-      let speed = 40.0 *. dt
-      let fwd = axis(Strata.Ffi.Vk.key(87), Strata.Ffi.Vk.key(83)) *. speed
-      let side = axis(Strata.Ffi.Vk.key(68), Strata.Ffi.Vk.key(65)) *. speed
-      let up = axis(Strata.Ffi.Vk.key(32), Strata.Ffi.Vk.key(340)) *. speed
-      let x2 = x +. fx *. fwd +. Math.cos(yaw2) *. side
-      let y2 = y +. fy *. fwd +. up
-      let z2 = z +. fz *. fwd +. Math.sin(yaw2) *. side
-      let aspect = int_to_float(Strata.Ffi.Vk.fb_w()) /. int_to_float(if Strata.Ffi.Vk.fb_h() < 1 do 1 else Strata.Ffi.Vk.fb_h() end)
-      let view = M4.look_at(V3.new(x2, y2, z2), V3.new(x2 +. fx, y2 +. fy, z2 +. fz), V3.new(0.0, 1.0, 0.0))
-      let vp2 = M4.mul_into_f32(M4.perspective(1.15, aspect, 0.1, 1200.0), view, vp)
-      Strata.Ffi.Vk.set_camera(vp2)
-      Strata.Ffi.Vk.set_eye(x2, y2, z2, 1.0)
-      if frames > 0 && frame == frames - 3 do Strata.Ffi.Vk.request_shot() else () end
-      -- the result is used, not dropped: a zero-argument extern bound to an unused name is optimised away (cube_forge GAPS G16)
-      let next = if Strata.Ffi.Vk.frame() do frame + 1 else frame end
-      if next != frame && frame % 240 == 239 do
-        println("  " ++ float_to_string(Math.round(240.0 /. (now -. t_mark))) ++ " fps, " ++ int_to_string(Strata.Ffi.Vk.drawn_chunks()) ++ " chunks and " ++ int_to_string(Strata.Ffi.Vk.drawn_quads()) ++ " quads drawn")
-        frame_loop(x2, y2, z2, yaw2, pitch2, next, frames, now, now, vp2)
-      else frame_loop(x2, y2, z2, yaw2, pitch2, next, frames, now, t_mark, vp2) end
+      let w = Strata.Stream.world(s)
+      let h = Strata.Query.raycast(w, x, y, z, fx, fy, fz, 250.0, Strata.Query.targetable(reg))
+      if !Strata.Query.is_hit(h) do s
+      else if dig do Strata.Stream.apply(s, Strata.Edit.fill_sphere(w, Strata.Query.hit_x(h), Strata.Query.hit_y(h), Strata.Query.hit_z(h), 6, 0))
+      else Strata.Stream.apply(s, Strata.Edit.fill_sphere(w, Strata.Query.hit_x(h), Strata.Query.hit_y(h) + 2, Strata.Query.hit_z(h), 2, 1)) end end
+    end
+  end
+
+  -- position, yaw, pitch, the chunk the camera was last in, mouse buttons last frame
+  type Cam = Cam(Float, Float, Float, Float, Float, Int, Int, Int, Bool, Bool)
+
+  pfn frame_loop(s : Strata.Stream.Stream, sl : Slots, reg : Strata.Blocks.Registry, cam : Cam, frame : Int, frames : Int, t_prev : Float, t_mark : Float, vp : NativeF32Arr) : Unit do
+    Strata.Ffi.Vk.poll()
+    if Strata.Ffi.Vk.should_close() || Strata.Ffi.Vk.key(256) || (frames > 0 && frame >= frames) do Strata.Stream.stop(s)
+    else
+      match cam do
+        Cam(x, y, z, yaw, pitch, kx0, ky0, kz0, lb0, rb0) ->
+          let now = Strata.Ffi.Vk.time()
+          let dt = clampf(now -. t_prev, 0.0, 0.1)
+          let yaw2 = yaw +. Strata.Ffi.Vk.mouse_dx() *. 0.0025 +. axis(Strata.Ffi.Vk.key(262), Strata.Ffi.Vk.key(263)) *. dt *. 1.6
+          let pitch2 = clampf(pitch -. Strata.Ffi.Vk.mouse_dy() *. 0.0025 +. axis(Strata.Ffi.Vk.key(265), Strata.Ffi.Vk.key(264)) *. dt *. 1.2, -1.5, 1.5)
+          let fx = Math.sin(yaw2) *. Math.cos(pitch2)
+          let fy = Math.sin(pitch2)
+          let fz = 0.0 -. Math.cos(yaw2) *. Math.cos(pitch2)
+          let speed = 40.0 *. dt
+          let fwd = axis(Strata.Ffi.Vk.key(87), Strata.Ffi.Vk.key(83)) *. speed
+          let side = axis(Strata.Ffi.Vk.key(68), Strata.Ffi.Vk.key(65)) *. speed
+          let up = axis(Strata.Ffi.Vk.key(32), Strata.Ffi.Vk.key(340)) *. speed
+          let x2 = x +. fx *. fwd +. Math.cos(yaw2) *. side
+          let y2 = y +. fy *. fwd +. up
+          let z2 = z +. fz *. fwd +. Math.sin(yaw2) *. side
+          -- the stream: refocus when the camera enters another chunk, then one tick
+          let kx = Strata.Coord.chunk_of(float_to_int(Math.floor(x2)))
+          let ky = Strata.Coord.chunk_of(float_to_int(Math.floor(y2)))
+          let kz = Strata.Coord.chunk_of(float_to_int(Math.floor(z2)))
+          let s1 = if kx != kx0 || ky != ky0 || kz != kz0 do Strata.Stream.set_focus(s, Cons((x2, y2, z2), Nil)) else s end
+          let lb = Strata.Ffi.Vk.mouse_button(0)
+          let rb = Strata.Ffi.Vk.mouse_button(1)
+          let s2 = Strata.Stream.tick(act(s1, reg, x2, y2, z2, fx, fy, fz, (lb && !lb0) || (frame == 10 && Env.get_int("STRATA_DIG", 0) == 1), rb && !rb0))
+          match sync(s2, sl) do
+            (s3, sl2) ->
+              let aspect = int_to_float(Strata.Ffi.Vk.fb_w()) /. int_to_float(if Strata.Ffi.Vk.fb_h() < 1 do 1 else Strata.Ffi.Vk.fb_h() end)
+              let view = M4.look_at(V3.new(x2, y2, z2), V3.new(x2 +. fx, y2 +. fy, z2 +. fz), V3.new(0.0, 1.0, 0.0))
+              let vp2 = M4.mul_into_f32(M4.perspective(1.15, aspect, 0.1, 1200.0), view, vp)
+              Strata.Ffi.Vk.set_camera(vp2)
+              Strata.Ffi.Vk.set_eye(x2, y2, z2, 1.0)
+              if frames > 0 && frame == frames - 3 do Strata.Ffi.Vk.request_shot() else () end
+              -- the result is used, not dropped: a zero-argument extern bound to an unused name is optimised away (cube_forge GAPS G16)
+              let next = if Strata.Ffi.Vk.frame() do frame + 1 else frame end
+              let cam2 = Cam(x2, y2, z2, yaw2, pitch2, kx, ky, kz, lb, rb)
+              if next != frame && frame % 240 == 239 do
+                println("  " ++ float_to_string(Math.round(240.0 /. (now -. t_mark))) ++ " fps, " ++ int_to_string(Strata.Ffi.Vk.drawn_chunks()) ++ " chunks and " ++ int_to_string(Strata.Ffi.Vk.drawn_quads()) ++ " quads drawn, " ++ int_to_string(Strata.Stream.loaded_count(s3)) ++ " chunks loaded")
+                frame_loop(s3, sl2, reg, cam2, next, frames, now, now, vp2)
+              else frame_loop(s3, sl2, reg, cam2, next, frames, now, t_mark, vp2) end
+          end
+      end
     end
   end
 
   fn main(_cap : Cap(IO)) : Unit do
-    let r = Env.get_int("STRATA_RADIUS", 6)
+    let r = Env.get_int("STRATA_RADIUS", 10)
     let frames = Env.get_int("STRATA_FRAMES", 0)
     let seed = Env.get_int("STRATA_SEED", 7)
     if !Strata.Ffi.Vk.open(1280, 800, frames == 0) do println("strata_viewer: could not open a Vulkan window")
@@ -237,23 +293,20 @@ mod StrataViewer do
       palette()
       Strata.Ffi.Vk.set_sun(0.45, 0.80, 0.35, 0.30)
       Strata.Ffi.Vk.set_sky(0.53, 0.72, 0.92)
-      Strata.Ffi.Vk.set_fog(int_to_float(r) *. 32.0 *. 0.7, int_to_float(r) *. 32.0 *. 1.15)
-      let n = 2 * r + 1
-      let count = n * n * ny()
+      -- chunks are meshed out to one short of the radius, so the fog closes there
+      Strata.Ffi.Vk.set_fog(int_to_float(r - 1) *. 32.0 *. 0.55, int_to_float(r - 1) *. 32.0)
+      let ex = -70.0
+      let ey = int_to_float(height(0, 0, seed)) +. 46.0
+      let ez = 96.0
+      let world = Strata.World.new(reg, Strata.Terrain.gen(fn (k, sd) -> terrain(Strata.Coord.kx(k), Strata.Coord.ky(k), Strata.Coord.kz(k), sd)), seed, 1.0)
       let t0 = Strata.Ffi.Vk.time()
-      let world = Strata.Tree.from_list(gen_go(r, seed, count - 1, Nil), Ch.uniform(0))
+      let s0 = Strata.Stream.run_until_settled(Strata.Stream.set_focus(Strata.Stream.start(world, Strata.Stream.config(r, 3, 32, 8)), Cons((ex, ey, ez), Nil)), 1000000)
       let t1 = Strata.Ffi.Vk.time()
-      match mesh_go(world, reg, r, 0, Totals(0, 0, 0)) do
-        Totals(meshed, quads, refused) ->
-          let t2 = Strata.Ffi.Vk.time()
-          println("strata_viewer: " ++ int_to_string(count) ++ " chunks (" ++ int_to_string(n * 32) ++ " x " ++ int_to_string(ny() * 32) ++ " x " ++ int_to_string(n * 32) ++ " voxels)")
-          println("  terrain " ++ ms(t1 -. t0) ++ " total, " ++ ms((t1 -. t0) /. int_to_float(count)) ++ " a chunk")
-          println("  mesh + upload " ++ ms(t2 -. t1) ++ " total, " ++ ms((t2 -. t1) /. int_to_float(count)) ++ " a chunk")
-          println("  " ++ int_to_string(meshed) ++ " chunks have a mesh; " ++ int_to_string(quads) ++ " quads, " ++ int_to_string(quads * 8 / 1024) ++ " KB on the GPU (" ++ int_to_string(refused) ++ " uploads refused)")
-          let ex = -70.0
-          let ey = int_to_float(height(0, 0, seed)) +. 46.0
-          let ez = 96.0
-          frame_loop(ex, ey, ez, 0.62, -0.42, 0, frames, Strata.Ffi.Vk.time(), Strata.Ffi.Vk.time(), NativeArray.make_f32(16, 0.0))
+      match sync(s0, Slots(Strata.Store.empty(-1), Nil, 0)) do
+        (s1, sl) ->
+          println("strata_viewer: " ++ int_to_string(Strata.Stream.loaded_count(s1)) ++ " chunks streamed in " ++ float_to_string(Math.round((t1 -. t0) *. 1000.0)) ++ " ms; " ++ int_to_string(Strata.Ffi.Vk.live_quads()) ++ " quads, " ++ int_to_string(Strata.Ffi.Vk.live_quads() * 8 / 1024) ++ " KB on the GPU")
+          let cam = Cam(ex, ey, ez, 0.62, -0.42, Strata.Coord.chunk_of(float_to_int(Math.floor(ex))), Strata.Coord.chunk_of(float_to_int(Math.floor(ey))), Strata.Coord.chunk_of(float_to_int(Math.floor(ez))), false, false)
+          frame_loop(s1, sl, reg, cam, 0, frames, Strata.Ffi.Vk.time(), Strata.Ffi.Vk.time(), NativeArray.make_f32(16, 0.0))
       end
       Strata.Ffi.Vk.close()
     end

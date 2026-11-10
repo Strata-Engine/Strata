@@ -30,19 +30,19 @@ crater the sphere edit leaves.
 A flat byte array would be 32 768 bytes a chunk; uniform chunks bring the
 average to a fifth of that at metre scale.
 
-## The viewer (`viewer/`, radius 6, 676 chunks, 22 million voxels)
+## The viewer (`viewer/`, radius 10 x 3, streamed)
 
 | | |
 |---|---|
-| terrain | 0.3 ms a chunk |
-| mesh and upload | 2.3 ms a chunk, sequential, at startup |
-| quads on the GPU | 153 595 in 1.2 MB |
-| drawn after culling | 220 chunks, 94 874 quads |
+| chunks streamed at startup | 3087 (101 million voxels) in 1.27 s, generation and meshing on tasks |
+| quads on the GPU | 361 819 in 2.8 MB |
+| drawn after culling, opening view | 117 chunks, 94 392 quads |
 | frame rate | 118-120 fps, the display's vsync cap |
 
-The frame rate is capped by presentation, so it says only that the frame
-fits in 8.3 ms with room to spare; an uncapped figure needs a present mode
-the first slice does not offer.
+`docs/streamed-world.png` is that opening view, with one sphere carved by
+a scripted click. The frame rate is capped by presentation, so it says
+only that the frame fits in 8.3 ms with room to spare; an uncapped figure
+needs a present mode the first slice does not offer.
 
 ## Against cube_forge
 
