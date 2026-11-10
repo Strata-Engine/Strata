@@ -1,0 +1,222 @@
+-- Chunk — 32 x 32 x 32 block ids behind one get and set, in three forms:
+--
+--   uniform   one id and no array. With cubic chunks most of a world is
+--             this: all air above the ground, all stone below it.
+--   paletted  32768 one-byte indices into a palette of up to 256 ids.
+--   direct    32768 ids in 32-bit entries (March has no 16-bit native
+--             array), for the rare chunk with more than 256 distinct ids.
+--
+-- The form is private. Ids are 0..65535; anything else is stored as 0 (air).
+-- The flat index is Coord.index: x + 32 * (z + 32 * y).
+mod Strata.Chunk do
+
+  -- uniform id | indices, palette (256 ids), ids in the palette | ids
+  type Chunk = ChUniform(Int) | ChPaletted(NativeU8Arr, NativeIntArr, Int) | ChDirect(NativeI32Arr)
+
+  pfn vol() : Int do 32768 end
+  pfn clean(id : Int) : Int do if id < 0 || id > 65535 do 0 else id end end
+
+  doc "A chunk holding [id] in every voxel."
+  fn uniform(id : Int) : Chunk do ChUniform(clean(id)) end
+
+  doc "0 uniform, 1 paletted, 2 direct."
+  fn form(c : Chunk) : Int do
+    match c do
+      ChUniform(_) -> 0
+      ChPaletted(_, _, _) -> 1
+      ChDirect(_) -> 2
+    end
+  end
+
+  doc "The id of a uniform chunk, or -1 when the chunk is not in the uniform form."
+  fn uniform_id(c : Chunk) : Int do
+    match c do
+      ChUniform(id) -> id
+      _ -> -1
+    end
+  end
+
+  doc "Bytes of voxel storage behind the chunk."
+  fn bytes(c : Chunk) : Int do
+    match c do
+      ChUniform(_) -> 16
+      ChPaletted(_, _, _) -> 32768 + 256 * 8
+      ChDirect(_) -> 32768 * 4
+    end
+  end
+
+  doc "The id at flat index [i]."
+  @[no_alloc]
+  fn get_idx(c : Chunk, i : {Int | 0 <= _ && _ < 32768}) : Int do
+    match c do
+      ChUniform(id) -> id
+      ChPaletted(ix, pal, _) -> NativeArray.get_int(pal, NativeArray.get_u8(ix, i))
+      ChDirect(a) -> NativeArray.get_i32(a, i)
+    end
+  end
+
+  @[no_alloc]
+  fn get(c : Chunk, x : {Int | 0 <= _ && _ < 32}, y : {Int | 0 <= _ && _ < 32}, z : {Int | 0 <= _ && _ < 32}) : Int do
+    get_idx(c, Strata.Coord.index(x, y, z))
+  end
+
+  doc "The id at local (x, y, z), or [default] when the coordinate is outside the chunk."
+  @[no_alloc]
+  fn get_or(c : Chunk, x : Int, y : Int, z : Int, default : Int) : Int do
+    if x < 0 || x >= 32 || y < 0 || y >= 32 || z < 0 || z >= 32 do default
+    else get_idx(c, x + 32 * (z + 32 * y)) end
+  end
+
+  -- Position of [id] in the first [n] palette entries, or -1.
+  pfn pal_find(pal : NativeIntArr, n : Int, id : Int, k : Int) : Int do
+    if k >= n do -1 else if NativeArray.get_int(pal, k) == id do k else pal_find(pal, n, id, k + 1) end end
+  end
+
+  pfn expand_go(dst : NativeI32Arr, ix : NativeU8Arr, pal : NativeIntArr, i : Int) : NativeI32Arr do
+    if i >= vol() do dst
+    else expand_go(NativeArray.set_i32(dst, i, NativeArray.get_int(pal, NativeArray.get_u8(ix, i))), ix, pal, i + 1) end
+  end
+
+  doc "Every id by flat index, 32768 entries: what the mesher reads. The array may be shared with the chunk; treat it as read-only."
+  fn to_flat(c : Chunk) : NativeI32Arr do
+    match c do
+      ChUniform(id) -> NativeArray.make_i32(vol(), id)
+      ChPaletted(ix, pal, _) -> expand_go(NativeArray.make_i32(vol(), 0), ix, pal, 0)
+      ChDirect(a) -> a
+    end
+  end
+
+  doc "Set flat index [i] to [id]."
+  fn set_idx(c : Chunk, i : {Int | 0 <= _ && _ < 32768}, id0 : Int) : Chunk do
+    let id = clean(id0)
+    match c do
+      ChUniform(u) ->
+        if u == id do c
+        else
+          let pal = NativeArray.set_int(NativeArray.set_int(NativeArray.make_int(256, 0), 0, u), 1, id)
+          ChPaletted(NativeArray.set_u8(NativeArray.make_u8(vol(), 0), i, 1), pal, 2)
+        end
+      ChPaletted(ix, pal, n) ->
+        let k = pal_find(pal, n, id, 0)
+        if k >= 0 do ChPaletted(NativeArray.set_u8(ix, i, k), pal, n)
+        else if n < 256 do ChPaletted(NativeArray.set_u8(ix, i, n), NativeArray.set_int(pal, n, id), n + 1)
+        else ChDirect(NativeArray.set_i32(expand_go(NativeArray.make_i32(vol(), 0), ix, pal, 0), i, id)) end end
+      ChDirect(a) -> ChDirect(NativeArray.set_i32(a, i, id))
+    end
+  end
+
+  fn set(c : Chunk, x : {Int | 0 <= _ && _ < 32}, y : {Int | 0 <= _ && _ < 32}, z : {Int | 0 <= _ && _ < 32}, id : Int) : Chunk do
+    set_idx(c, Strata.Coord.index(x, y, z), id)
+  end
+
+  -- ── Building from a flat array ───────────────────────────────────────────
+
+  pfn all_same(a : NativeI32Arr, i : Int, v : Int) : Bool do
+    if i >= vol() do true else if NativeArray.get_i32(a, i) == v do all_same(a, i + 1, v) else false end end
+  end
+
+  -- Fill a palette and its indices from [a]; stops with n = 257 once a 257th
+  -- distinct id turns up.
+  type PalBuild = PalBuild(NativeU8Arr, NativeIntArr, Int)
+  pfn pal_build(a : NativeI32Arr, ix : NativeU8Arr, pal : NativeIntArr, n : Int, i : Int) : PalBuild do
+    if i >= vol() do PalBuild(ix, pal, n)
+    else
+      let id = clean(NativeArray.get_i32(a, i))
+      let k = pal_find(pal, n, id, 0)
+      if k >= 0 do pal_build(a, NativeArray.set_u8(ix, i, k), pal, n, i + 1)
+      else if n >= 256 do PalBuild(ix, pal, 257)
+      else pal_build(a, NativeArray.set_u8(ix, i, n), NativeArray.set_int(pal, n, id), n + 1, i + 1) end end
+    end
+  end
+
+  pfn clean_go(dst : NativeI32Arr, a : NativeI32Arr, i : Int) : NativeI32Arr do
+    if i >= vol() do dst else clean_go(NativeArray.set_i32(dst, i, clean(NativeArray.get_i32(a, i))), a, i + 1) end
+  end
+
+  doc "A chunk from 32768 ids by flat index, in the smallest form that holds them. An array of any other length gives an air chunk."
+  fn from_flat(a : NativeI32Arr) : Chunk do
+    if NativeArray.length_i32(a) != vol() do ChUniform(0)
+    else
+      let first = clean(NativeArray.get_i32(a, 0))
+      if all_same(a, 0, NativeArray.get_i32(a, 0)) do ChUniform(first)
+      else
+        match pal_build(a, NativeArray.make_u8(vol(), 0), NativeArray.make_int(256, 0), 0, 0) do
+          PalBuild(ix, pal, n) ->
+            if n <= 256 do ChPaletted(ix, pal, n)
+            else ChDirect(clean_go(NativeArray.make_i32(vol(), 0), a, 0)) end
+        end
+      end
+    end
+  end
+
+  doc "The same content in the smallest form that holds it."
+  fn compact(c : Chunk) : Chunk do
+    match c do
+      ChUniform(_) -> c
+      _ -> from_flat(to_flat(c))
+    end
+  end
+
+  -- ── Box fill ─────────────────────────────────────────────────────────────
+
+  pfn clamp31(v : Int) : Int do if v < 0 do 0 else if v > 31 do 31 else v end end end
+
+  pfn fill_x(c : Chunk, x : Int, x1 : Int, row : Int, id : Int) : Chunk do
+    if x > x1 do c
+    else
+      let i = row + x
+      if i < 0 || i >= 32768 do c else fill_x(set_idx(c, i, id), x + 1, x1, row, id) end
+    end
+  end
+  pfn fill_z(c : Chunk, x0 : Int, x1 : Int, y : Int, z : Int, z1 : Int, id : Int) : Chunk do
+    if z > z1 do c else fill_z(fill_x(c, x0, x1, 32 * (z + 32 * y), id), x0, x1, y, z + 1, z1, id) end
+  end
+  pfn fill_y(c : Chunk, x0 : Int, x1 : Int, y : Int, y1 : Int, z0 : Int, z1 : Int, id : Int) : Chunk do
+    if y > y1 do c else fill_y(fill_z(c, x0, x1, y, z0, z1, id), x0, x1, y + 1, y1, z0, z1, id) end
+  end
+
+  doc "Set every voxel in the box with inclusive corners (x0, y0, z0)..(x1, y1, z1), clipped to the chunk. An empty box changes nothing."
+  fn fill_box(c : Chunk, x0 : Int, y0 : Int, z0 : Int, x1 : Int, y1 : Int, z1 : Int, id : Int) : Chunk do
+    if x1 < x0 || y1 < y0 || z1 < z0 || x1 < 0 || y1 < 0 || z1 < 0 || x0 > 31 || y0 > 31 || z0 > 31 do c
+    else
+      let ax = clamp31(x0)
+      let bx = clamp31(x1)
+      let ay = clamp31(y0)
+      let cy = clamp31(y1)
+      let az = clamp31(z0)
+      let bz = clamp31(z1)
+      if ax == 0 && bx == 31 && ay == 0 && cy == 31 && az == 0 && bz == 31 do uniform(id)
+      else fill_y(c, ax, bx, ay, cy, az, bz, id) end
+    end
+  end
+
+  -- ── Hash ─────────────────────────────────────────────────────────────────
+  -- A position-weighted sum modulo the Mersenne prime 2^61 - 1:
+  --   H = sum over i of (id_i + 1) * w_i,   w_i = ((i + 1) * 2654435761 mod 2^32) + 1
+  -- It depends on content alone, and a uniform chunk has the closed form
+  -- (id + 1) * W, W being the sum of the weights, so hashing the commonest
+  -- chunk touches no array.
+  pfn prime() : Int do 2305843009213693951 end
+  pfn weight_sum() : Int do 70368717750272 end
+  pfn weight(i : Int) : Int do int_and((i + 1) * 2654435761, 4294967295) + 1 end
+
+  pfn hash_go(c : Chunk, i : Int, h : Int) : Int do
+    if i >= vol() do h
+    else
+      let id = match c do
+        ChUniform(u) -> u
+        ChPaletted(ix, pal, _) -> NativeArray.get_int(pal, NativeArray.get_u8(ix, i))
+        ChDirect(a) -> NativeArray.get_i32(a, i)
+      end
+      hash_go(c, i + 1, (h + (id + 1) * weight(i)) % prime())
+    end
+  end
+
+  doc "A hash of the chunk's content: equal for equal content whatever the form or the order it was built in."
+  fn hash(c : Chunk) : Int do
+    match c do
+      ChUniform(id) -> ((id + 1) * weight_sum()) % prime()
+      _ -> hash_go(c, 0, 0)
+    end
+  end
+end

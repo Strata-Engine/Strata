@@ -1,0 +1,162 @@
+-- Chunk: the three storage forms behind one get and set.
+mod Strata.Test.Chunk do
+
+  needs IO.Clock      -- charged to every test module once any uses Check.all (GAPS S3)
+  needs IO.Process
+  import Test
+  alias Strata.Chunk as C
+
+  -- set voxel index i to id base + i, for i in [0, n)
+  pfn distinct_go(c : Strata.Chunk.Chunk, i : Int, n : Int, base : Int) : Strata.Chunk.Chunk do
+    if i >= n do c else distinct_go(C.set_idx(c, i, base + i), i + 1, n, base) end
+  end
+  pfn distinct_ok(c : Strata.Chunk.Chunk, i : Int, n : Int, base : Int) : Bool do
+    if i >= n do true else if C.get_idx(c, i) == base + i do distinct_ok(c, i + 1, n, base) else false end end
+  end
+  pfn all_are(c : Strata.Chunk.Chunk, i : Int, from : Int, id : Int) : Bool do
+    if i >= 32768 do true
+    else if i >= from && C.get_idx(c, i) != id do false
+    else all_are(c, i + 1, from, id) end end
+  end
+  pfn fill_all(c : Strata.Chunk.Chunk, i : Int, id : Int) : Strata.Chunk.Chunk do
+    if i >= 32768 do c else fill_all(C.set_idx(c, i, id), i + 1, id) end
+  end
+
+  -- a random edit list applied to a chunk and to a plain reference array
+  pfn apply_chunk(c : Strata.Chunk.Chunk, es : List((Int, Int))) : Strata.Chunk.Chunk do
+    match es do
+      Nil -> c
+      Cons((i, id), t) -> apply_chunk(C.set_idx(c, i, id), t)
+    end
+  end
+  pfn apply_ref(a : NativeIntArr, es : List((Int, Int))) : NativeIntArr do
+    match es do
+      Nil -> a
+      Cons((i, id), t) -> apply_ref(NativeArray.set_int(a, i, id), t)
+    end
+  end
+  pfn agree(c : Strata.Chunk.Chunk, a : NativeIntArr, i : Int) : Bool do
+    if i >= 32768 do true else if C.get_idx(c, i) == NativeArray.get_int(a, i) do agree(c, a, i + 1) else false end end
+  end
+
+  describe "Chunk.uniform" do
+    test "reads the same id everywhere and stores no array" do
+      let c = C.uniform(7)
+      Test.assert_eq_int(C.get(c, 0, 0, 0), 7, "origin")
+      Test.assert_eq_int(C.get(c, 31, 31, 31), 7, "far corner")
+      Test.assert_eq_int(C.form(c), 0, "uniform form")
+      Test.assert_eq_int(C.uniform_id(c), 7, "its id")
+      Test.assert_true(C.bytes(c) < 64, "no array behind it")
+    end
+    test "get_or answers the default outside the chunk" do
+      let c = C.uniform(7)
+      Test.assert_eq_int(C.get_or(c, -1, 0, 0, 99), 99, "x below")
+      Test.assert_eq_int(C.get_or(c, 0, 32, 0, 99), 99, "y above")
+      Test.assert_eq_int(C.get_or(c, 5, 5, 5, 99), 7, "inside")
+    end
+  end
+
+  describe "Chunk.set" do
+    test "one different voxel makes a paletted chunk and leaves the rest alone" do
+      let c = C.set(C.uniform(7), 3, 4, 5, 9)
+      Test.assert_eq_int(C.form(c), 1, "paletted")
+      Test.assert_eq_int(C.uniform_id(c), -1, "no longer uniform")
+      Test.assert_eq_int(C.get(c, 3, 4, 5), 9, "the voxel reads back")
+      Test.assert_eq_int(C.get(c, 3, 4, 6), 7, "its neighbour is untouched")
+      Test.assert_eq_int(C.get(c, 0, 0, 0), 7, "as is the origin")
+    end
+    test "setting the id already there changes neither form nor hash" do
+      let u = C.uniform(7)
+      Test.assert_eq_int(C.form(C.set(u, 1, 2, 3, 7)), 0, "a uniform chunk stays uniform")
+      let p = C.set(u, 3, 4, 5, 9)
+      let p2 = C.set(p, 3, 4, 5, 9)
+      Test.assert_eq_int(C.form(p2), 1, "a paletted chunk stays paletted")
+      Test.assert_true(C.hash(p2) == C.hash(p), "hash unchanged")
+    end
+    test "the 257th distinct id promotes to the direct form without losing a voxel" do
+      let c256 = distinct_go(C.uniform(0), 1, 256, 1000)
+      Test.assert_eq_int(C.form(c256), 1, "256 distinct ids (air + 255) still fit a palette")
+      let c257 = C.set_idx(c256, 256, 1256)
+      Test.assert_eq_int(C.form(c257), 2, "one more does not")
+      Test.assert_true(distinct_ok(c257, 1, 257, 1000), "every id reads back")
+      Test.assert_eq_int(C.get_idx(c257, 0), 0, "the untouched voxel too")
+      Test.assert_true(all_are(c257, 0, 257, 0), "and the rest is still air")
+    end
+    test "ids outside sixteen bits are stored as air" do
+      let c = C.set(C.set(C.uniform(5), 1, 1, 1, 70000), 2, 2, 2, -3)
+      Test.assert_eq_int(C.get(c, 1, 1, 1), 0, "70000 is air")
+      Test.assert_eq_int(C.get(c, 2, 2, 2), 0, "-3 is air")
+      Test.assert_eq_int(C.uniform_id(C.uniform(70000)), 0, "a uniform chunk of garbage is air")
+    end
+    test "agrees with a plain array over a random edit sequence" do
+      Check.all(Gen.list(Gen.tuple2(Gen.int(0, 32767), Gen.int(0, 400))), fn es ->
+        agree(apply_chunk(C.uniform(0), es), apply_ref(NativeArray.make_int(32768, 0), es), 0)
+      )
+    end
+  end
+
+  describe "Chunk.compact" do
+    test "shrinks to the smallest form that holds the content" do
+      let d = C.set_idx(distinct_go(C.uniform(0), 1, 256, 1000), 256, 1256)
+      Test.assert_eq_int(C.form(d), 2, "starts direct")
+      let flat = fill_all(d, 0, 4)
+      Test.assert_eq_int(C.form(C.compact(flat)), 0, "one id everywhere compacts to uniform")
+      Test.assert_eq_int(C.uniform_id(C.compact(flat)), 4, "of that id")
+      let two = C.set_idx(flat, 9, 5)
+      Test.assert_eq_int(C.form(C.compact(two)), 1, "two ids compact to a palette")
+      Test.assert_eq_int(C.get_idx(C.compact(two), 9), 5, "content kept")
+      Test.assert_eq_int(C.get_idx(C.compact(two), 10), 4, "content kept")
+    end
+  end
+
+  describe "Chunk.hash" do
+    test "depends on content, not on form or build order" do
+      let a = C.set(C.set(C.uniform(1), 1, 1, 1, 2), 2, 2, 2, 3)
+      let b = C.set(C.set(C.uniform(1), 2, 2, 2, 3), 1, 1, 1, 2)
+      Test.assert_true(C.hash(a) == C.hash(b), "build order")
+      let direct = C.set_idx(distinct_go(C.uniform(0), 1, 257, 1000), 300, 1)
+      let back = fill_all(direct, 0, 6)
+      Test.assert_eq_int(C.form(back), 2, "still direct")
+      Test.assert_true(C.hash(back) == C.hash(C.uniform(6)), "a direct chunk of one id hashes as the uniform one")
+      Test.assert_true(C.hash(C.set(C.uniform(6), 0, 0, 0, 7)) != C.hash(C.uniform(6)), "and a changed voxel changes it")
+      Test.assert_true(C.hash(C.set(C.uniform(0), 1, 0, 0, 7)) != C.hash(C.set(C.uniform(0), 0, 0, 1, 7)), "as does where it is")
+    end
+  end
+
+  describe "Chunk.fill_box" do
+    test "fills inclusive corners" do
+      let c = C.fill_box(C.uniform(0), 1, 2, 3, 2, 3, 4, 8)
+      Test.assert_eq_int(C.get(c, 1, 2, 3), 8, "low corner")
+      Test.assert_eq_int(C.get(c, 2, 3, 4), 8, "high corner")
+      Test.assert_eq_int(C.get(c, 0, 2, 3), 0, "outside in x")
+      Test.assert_eq_int(C.get(c, 3, 3, 4), 0, "outside in x, high")
+      Test.assert_eq_int(C.get(c, 1, 4, 3), 0, "outside in y")
+    end
+    test "clips to the chunk, and a box covering it leaves a uniform chunk" do
+      let c = C.fill_box(C.set(C.uniform(1), 5, 5, 5, 2), -5, -5, -5, 40, 40, 40, 8)
+      Test.assert_eq_int(C.uniform_id(c), 8, "uniform 8")
+    end
+    test "an empty box changes nothing" do
+      let c = C.fill_box(C.uniform(1), 5, 5, 5, 4, 9, 9, 8)
+      Test.assert_eq_int(C.uniform_id(c), 1, "x1 < x0")
+    end
+  end
+
+  describe "Chunk.to_flat / from_flat" do
+    test "to_flat lists every id by flat index" do
+      let a = C.to_flat(C.set(C.uniform(3), 1, 0, 0, 9))
+      Test.assert_eq_int(NativeArray.length_i32(a), 32768, "one entry per voxel")
+      Test.assert_eq_int(NativeArray.get_i32(a, 0), 3, "voxel 0")
+      Test.assert_eq_int(NativeArray.get_i32(a, 1), 9, "voxel 1")
+    end
+    test "from_flat builds the smallest form" do
+      let a = NativeArray.make_i32(32768, 4)
+      Test.assert_eq_int(C.uniform_id(C.from_flat(a)), 4, "one id is uniform")
+      let b = NativeArray.set_i32(NativeArray.make_i32(32768, 4), 77, 5)
+      let c = C.from_flat(b)
+      Test.assert_eq_int(C.form(c), 1, "two ids are paletted")
+      Test.assert_eq_int(C.get_idx(c, 77), 5, "content kept")
+      Test.assert_eq_int(C.uniform_id(C.from_flat(NativeArray.make_i32(5, 4))), 0, "an array of the wrong size is air")
+    end
+  end
+end
