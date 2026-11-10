@@ -1,0 +1,158 @@
+-- Store — a persistent map from chunk keys to values: the world's chunks.
+--
+-- A binary trie over the bits of Coord.key_hash. A leaf holds a short list
+-- of bindings and splits when it grows past four; at the last hash bit it
+-- simply holds whatever collides. A get is a handful of matches, a put
+-- rebuilds one path. Lookups are total: an absent key answers the store's
+-- fill value.
+mod Strata.Store do
+
+  alias Strata.Coord as K
+
+  type Node(a) = StEmpty | StLeaf(List((Strata.Coord.Key, a))) | StFork(Node(a), Node(a))
+  -- fill, size, root
+  type Store(a) = Store(a, Int, Node(a))
+
+  pfn max_depth() : Int do 30 end
+  pfn split_at() : Int do 4 end
+
+  doc "An empty store whose absent keys read as [fill]."
+  fn empty(fill : a) : Store(a) do Store(fill, 0, StEmpty) end
+
+  fn size(s : Store(a)) : Int do match s do Store(_, n, _) -> n end end
+
+  pfn find(l : List((Strata.Coord.Key, a)), k : Strata.Coord.Key) : Option(a) do
+    match l do
+      Nil -> None
+      Cons((k2, v), t) -> if K.key_eq(k2, k) do Some(v) else find(t, k) end
+    end
+  end
+
+  pfn get_go(nd : Node(a), k : Strata.Coord.Key, h : Int) : Option(a) do
+    match nd do
+      StEmpty -> None
+      StLeaf(l) -> find(l, k)
+      StFork(lo, hi) -> if h % 2 == 0 do get_go(lo, k, h / 2) else get_go(hi, k, h / 2) end
+    end
+  end
+
+  doc "The value at [k], or the fill."
+  fn get(s : Store(a), k : Strata.Coord.Key) : a do
+    match s do
+      Store(fill, _, root) ->
+        match get_go(root, k, K.key_hash(k)) do
+          Some(v) -> v
+          None -> fill
+        end
+    end
+  end
+
+  fn has(s : Store(a), k : Strata.Coord.Key) : Bool do
+    match s do
+      Store(_, _, root) ->
+        match get_go(root, k, K.key_hash(k)) do
+          Some(_) -> true
+          None -> false
+        end
+    end
+  end
+
+  pfn without(l : List((Strata.Coord.Key, a)), k : Strata.Coord.Key) : List((Strata.Coord.Key, a)) do
+    match l do
+      Nil -> Nil
+      Cons((k2, v), t) -> if K.key_eq(k2, k) do t else Cons((k2, v), without(t, k)) end
+    end
+  end
+
+  pfn len(l : List((Strata.Coord.Key, a)), n : Int) : Int do
+    match l do
+      Nil -> n
+      Cons(_, t) -> len(t, n + 1)
+    end
+  end
+
+  -- Put one binding into a node [depth] bits down; [h] is the key's hash
+  -- with those bits already shifted off.
+  pfn put_go(nd : Node(a), k : Strata.Coord.Key, v : a, h : Int, depth : Int) : Node(a) do
+    match nd do
+      StEmpty -> StLeaf(Cons((k, v), Nil))
+      StFork(lo, hi) -> if h % 2 == 0 do StFork(put_go(lo, k, v, h / 2, depth + 1), hi) else StFork(lo, put_go(hi, k, v, h / 2, depth + 1)) end
+      StLeaf(l) ->
+        let l2 = Cons((k, v), without(l, k))
+        if depth >= max_depth() || len(l2, 0) <= split_at() do StLeaf(l2)
+        else spread(l2, StFork(StEmpty, StEmpty), depth) end
+    end
+  end
+
+  -- Re-insert a split leaf's bindings below the fork that replaces it.
+  pfn spread(l : List((Strata.Coord.Key, a)), nd : Node(a), depth : Int) : Node(a) do
+    match l do
+      Nil -> nd
+      Cons((k, v), t) -> spread(t, put_go(nd, k, v, shifted(K.key_hash(k), depth), depth), depth)
+    end
+  end
+
+  pfn shifted(h : Int, depth : Int) : Int do if depth <= 0 do h else shifted(h / 2, depth - 1) end end
+
+  doc "The store with [k] bound to [v], replacing any earlier binding."
+  fn put(s : Store(a), k : Strata.Coord.Key, v : a) : Store(a) do
+    match s do
+      Store(fill, n, root) ->
+        let h = K.key_hash(k)
+        let grew = match get_go(root, k, h) do
+          Some(_) -> 0
+          None -> 1
+        end
+        Store(fill, n + grew, put_go(root, k, v, h, 0))
+    end
+  end
+
+  pfn remove_go(nd : Node(a), k : Strata.Coord.Key, h : Int) : Node(a) do
+    match nd do
+      StEmpty -> StEmpty
+      StLeaf(l) ->
+        match without(l, k) do
+          Nil -> StEmpty
+          rest -> StLeaf(rest)
+        end
+      StFork(lo, hi) -> if h % 2 == 0 do StFork(remove_go(lo, k, h / 2), hi) else StFork(lo, remove_go(hi, k, h / 2)) end
+    end
+  end
+
+  doc "The store without [k]. Removing an absent key changes nothing."
+  fn remove(s : Store(a), k : Strata.Coord.Key) : Store(a) do
+    match s do
+      Store(fill, n, root) ->
+        let h = K.key_hash(k)
+        match get_go(root, k, h) do
+          None -> s
+          Some(_) -> Store(fill, n - 1, remove_go(root, k, h))
+        end
+    end
+  end
+
+  pfn fold_list(l : List((Strata.Coord.Key, a)), acc : b, f) : b do
+    match l do
+      Nil -> acc
+      Cons((k, v), t) -> fold_list(t, f(acc, k, v), f)
+    end
+  end
+
+  pfn fold_go(nd : Node(a), acc : b, f) : b do
+    match nd do
+      StEmpty -> acc
+      StLeaf(l) -> fold_list(l, acc, f)
+      StFork(lo, hi) -> fold_go(hi, fold_go(lo, acc, f), f)
+    end
+  end
+
+  doc "Fold f(acc, key, value) over every binding, in no particular order."
+  fn fold(s : Store(a), acc : b, f) : b do
+    match s do Store(_, _, root) -> fold_go(root, acc, f) end
+  end
+
+  doc "Every key, in no particular order."
+  fn keys(s : Store(a)) : List(Strata.Coord.Key) do
+    fold(s, Nil, fn (acc, k, _) -> Cons(k, acc))
+  end
+end

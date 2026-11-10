@@ -1,0 +1,110 @@
+-- Store: the persistent chunk map keyed by Coord.Key.
+mod Strata.Test.Store do
+
+  needs IO.Clock      -- charged to every test module once any uses Check.all (GAPS S3)
+  needs IO.Process
+  import Test
+  alias Strata.Store as St
+  alias Strata.Coord as Cd
+
+  -- a reference: an association list, newest binding first
+  pfn ref_get(l : List((Int, Int)), k : Int) : Int do
+    match l do
+      Nil -> -1
+      Cons((k2, v), t) -> if k2 == k do v else ref_get(t, k) end
+    end
+  end
+  pfn ref_del(l : List((Int, Int)), k : Int) : List((Int, Int)) do
+    match l do
+      Nil -> Nil
+      Cons((k2, v), t) -> if k2 == k do ref_del(t, k) else Cons((k2, v), ref_del(t, k)) end
+    end
+  end
+  pfn ref_size(l : List((Int, Int))) : Int do
+    match l do
+      Nil -> 0
+      Cons((k, _), t) -> 1 + ref_size(ref_del(t, k))
+    end
+  end
+
+  -- key number n in -40..40 spread over the three axes, signs included
+  pfn key_n(n : Int) : Strata.Coord.Key do Cd.key(n % 7 - 3, n / 7 - 5, (n * 3) % 5 - 2 + n / 20) end
+
+  -- ops: (key number 0..80, value); a value of 0 means remove
+  pfn run_store(s : Strata.Store.Store(Int), ops : List((Int, Int))) : Strata.Store.Store(Int) do
+    match ops do
+      Nil -> s
+      Cons((n, v), t) -> run_store(if v == 0 do St.remove(s, key_n(n)) else St.put(s, key_n(n), v) end, t)
+    end
+  end
+  pfn run_ref(l : List((Int, Int)), ops : List((Int, Int))) : List((Int, Int)) do
+    match ops do
+      Nil -> l
+      Cons((n, v), t) -> run_ref(if v == 0 do ref_del(l, n) else Cons((n, v), ref_del(l, n)) end, t)
+    end
+  end
+  pfn same_go(s : Strata.Store.Store(Int), l : List((Int, Int)), n : Int) : Bool do
+    if n > 80 do true
+    else
+      let want = ref_get(l, n)
+      if St.get(s, key_n(n)) == want && St.has(s, key_n(n)) == (want != -1) do same_go(s, l, n + 1) else false end
+    end
+  end
+
+  pfn fill_go(s : Strata.Store.Store(Int), i : Int, n : Int) : Strata.Store.Store(Int) do
+    if i >= n do s else fill_go(St.put(s, Cd.key(i % 32 - 16, (i / 32) % 32 - 16, i / 1024 - 2), i), i + 1, n) end
+  end
+  pfn check_go(s : Strata.Store.Store(Int), i : Int, n : Int) : Bool do
+    if i >= n do true else if St.get(s, Cd.key(i % 32 - 16, (i / 32) % 32 - 16, i / 1024 - 2)) == i do check_go(s, i + 1, n) else false end end
+  end
+
+  describe "Store" do
+    test "an absent key answers the fill" do
+      let s = St.empty(-1)
+      Test.assert_eq_int(St.get(s, Cd.key(1, 2, 3)), -1, "fill")
+      Test.assert_false(St.has(s, Cd.key(1, 2, 3)), "not there")
+      Test.assert_eq_int(St.size(s), 0, "empty")
+    end
+    test "put then get; putting twice keeps one entry" do
+      let s = St.put(St.put(St.empty(-1), Cd.key(1, 2, 3), 10), Cd.key(1, 2, 3), 11)
+      Test.assert_eq_int(St.get(s, Cd.key(1, 2, 3)), 11, "the newer value")
+      Test.assert_true(St.has(s, Cd.key(1, 2, 3)), "there")
+      Test.assert_eq_int(St.size(s), 1, "one entry")
+    end
+    test "keys that differ only in sign are distinct" do
+      let s = St.put(St.put(St.empty(-1), Cd.key(1, 2, 3), 10), Cd.key(-1, 2, 3), 20)
+      Test.assert_eq_int(St.get(s, Cd.key(1, 2, 3)), 10, "+x")
+      Test.assert_eq_int(St.get(s, Cd.key(-1, 2, 3)), 20, "-x")
+      Test.assert_eq_int(St.get(s, Cd.key(1, -2, 3)), -1, "-y was never put")
+      Test.assert_eq_int(St.size(s), 2, "two entries")
+    end
+    test "remove drops a key and ignores an absent one" do
+      let s = St.put(St.put(St.empty(-1), Cd.key(1, 2, 3), 10), Cd.key(4, 5, 6), 20)
+      let s2 = St.remove(s, Cd.key(1, 2, 3))
+      Test.assert_eq_int(St.get(s2, Cd.key(1, 2, 3)), -1, "gone")
+      Test.assert_eq_int(St.get(s2, Cd.key(4, 5, 6)), 20, "the other stays")
+      Test.assert_eq_int(St.size(s2), 1, "one left")
+      Test.assert_eq_int(St.size(St.remove(s2, Cd.key(9, 9, 9))), 1, "removing nothing changes nothing")
+    end
+    test "an older version is unchanged by a later put" do
+      let s1 = St.put(St.empty(-1), Cd.key(1, 2, 3), 10)
+      let s2 = St.put(s1, Cd.key(1, 2, 3), 99)
+      Test.assert_eq_int(St.get(s1, Cd.key(1, 2, 3)), 10, "the old store still reads 10")
+      Test.assert_eq_int(St.get(s2, Cd.key(1, 2, 3)), 99, "the new one 99")
+    end
+    test "holds thousands of keys" do
+      let s = fill_go(St.empty(-1), 0, 5000)
+      Test.assert_eq_int(St.size(s), 5000, "all in")
+      Test.assert_true(check_go(s, 0, 5000), "all read back")
+      Test.assert_eq_int(List.length(St.keys(s)), 5000, "keys lists each once")
+      Test.assert_eq_int(St.fold(s, 0, fn (acc, k, v) -> acc + v), 12497500, "fold visits every value once")
+    end
+    test "agrees with an association list over random puts and removes" do
+      Check.all(Gen.list(Gen.tuple2(Gen.int(0, 80), Gen.int(0, 5))), fn ops ->
+        let s = run_store(St.empty(-1), ops)
+        let l = run_ref(Nil, ops)
+        same_go(s, l, 0) && St.size(s) == ref_size(l)
+      )
+    end
+  end
+end
