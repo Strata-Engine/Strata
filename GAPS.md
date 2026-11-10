@@ -41,3 +41,28 @@ consumer must inspect has an `_index` reader returning a number.
 in another resolve to the same target: `M.around_from` was reported as
 `Strata.Math.Mat4.around_from ... is not a function in scope`. Workaround:
 every alias across the test suite (and the library) is unique per target.
+
+## S7 — `loop` cannot be a function name
+
+`pfn loop(...)` is a syntax error at the name. Workaround: another name.
+
+## S8 — GLFW needs `MARCH_PIN_MAIN=1`
+
+Without it `main` runs on a scheduler thread and the first window call dies
+with SIGTRAP on macOS (cube_forge G15). `viewer/run.sh` sets it.
+
+## S9 — an extern call whose result is bound to `_` is dropped
+
+`let _ = Vk.frame()` drew nothing: the call was optimised away (cube_forge
+G16). Workaround: use the result.
+
+## S10 — `forge check` rejects a Unit call made through an alias
+
+`Vk.set_palette(...)` as a statement, with `alias Strata.Ffi.Vk as Vk`, fails
+`forge check` with "expected `()` but got `Unit`" while `forge build`
+accepts it (cube_forge G23). Workaround: the full module path.
+
+## S11 — forge does not build a dependency's C sources
+
+Still true on main (1a4251bc8). A consumer lists `native/strata_vk.c` in
+its own `[ffi]` block; see `viewer/forge.toml`.

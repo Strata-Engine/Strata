@@ -1,0 +1,261 @@
+-- strata_viewer — fly through a generated world. The first rendering slice:
+-- a block registry, a pure terrain function, the greedy mesher, and the
+-- Vulkan quad renderer, end to end.
+--
+--   W A S D   move        mouse / arrows   look
+--   space     up          left shift       down        escape   quit
+--
+-- STRATA_RADIUS=n   horizontal radius in chunks (default 6)
+-- STRATA_FRAMES=n   draw n frames, save a screenshot, exit (for scripts)
+-- STRATA_SHOT=path  where the screenshot goes (a PPM)
+mod StrataViewer do
+
+  needs IO
+  needs IO.Process
+
+  alias Strata.Blocks as Bk
+  alias Strata.Chunk as Ch
+  alias Strata.Mesh as Mh
+  alias Strata.Noise as Ns
+  alias Strata.Math.Mat4 as M4
+  alias Strata.Math.Vec3 as V3
+
+  -- ── Blocks ───────────────────────────────────────────────────────────────
+  -- ids: 1 stone, 2 dirt, 3 grass, 4 sand, 5 water, 6 snow, 7 wood, 8 leaves
+  -- texture ids index the palette: the block id, plus 9 for a grass side
+  pfn add(r : Strata.Blocks.Registry, d : Strata.Blocks.Def) : Strata.Blocks.Registry do
+    match Bk.register(r, d) do
+      Ok((r2, _)) -> r2
+      Err(_) -> r
+    end
+  end
+
+  pfn registry() : Strata.Blocks.Registry do
+    let stone = Bk.with_faces(Bk.def(), 1, 1, 1)
+    let dirt = Bk.with_faces(Bk.def(), 2, 2, 2)
+    let grass = Bk.with_faces(Bk.def(), 3, 2, 9)
+    let sand = Bk.with_faces(Bk.def(), 4, 4, 4)
+    let water = Bk.with_faces(Bk.with_collide(Bk.with_layer(Bk.with_opacity(Bk.def(), Strata.Blocks.SeeThrough), Strata.Blocks.Translucent), false), 5, 5, 5)
+    let snow = Bk.with_faces(Bk.def(), 6, 6, 6)
+    let wood = Bk.with_faces(Bk.def(), 7, 7, 7)
+    let leaves = Bk.with_faces(Bk.with_layer(Bk.with_opacity(Bk.def(), Strata.Blocks.SeeThrough), Strata.Blocks.Cutout), 8, 8, 8)
+    add(add(add(add(add(add(add(add(Bk.empty(), stone), dirt), grass), sand), water), snow), wood), leaves)
+  end
+
+  pfn palette() : Unit do
+    Strata.Ffi.Vk.set_palette(1, 0.52, 0.53, 0.55, 1.0)
+    Strata.Ffi.Vk.set_palette(2, 0.47, 0.34, 0.22, 1.0)
+    Strata.Ffi.Vk.set_palette(3, 0.36, 0.62, 0.24, 1.0)
+    Strata.Ffi.Vk.set_palette(4, 0.76, 0.70, 0.48, 1.0)
+    Strata.Ffi.Vk.set_palette(5, 0.16, 0.42, 0.72, 0.72)
+    Strata.Ffi.Vk.set_palette(6, 0.90, 0.92, 0.95, 1.0)
+    Strata.Ffi.Vk.set_palette(7, 0.40, 0.28, 0.16, 1.0)
+    Strata.Ffi.Vk.set_palette(8, 0.20, 0.47, 0.17, 1.0)
+    Strata.Ffi.Vk.set_palette(9, 0.40, 0.42, 0.22, 1.0)
+  end
+
+  -- ── Terrain: a pure function of chunk coordinates and seed ───────────────
+  pfn sea() : Int do 40 end
+
+  pfn height(wx : Int, wz : Int, seed : Int) : Int do
+    let x = int_to_float(wx)
+    let z = int_to_float(wz)
+    let base = Ns.fbm(x *. 0.005, z *. 0.005, seed)
+    let hills = Ns.fbm(x *. 0.021, z *. 0.021, seed + 10)
+    let ridge = Ns.ridged_fbm(x *. 0.009, z *. 0.009, seed + 20)
+    let mount = Ns.clamp01((base -. 0.5) *. 4.0)
+    float_to_int(22.0 +. base *. 34.0 +. hills *. 12.0 +. ridge *. mount *. 52.0)
+  end
+
+  pfn heights_go(hs : NativeIntArr, x0 : Int, z0 : Int, seed : Int, i : Int) : NativeIntArr do
+    if i >= 1024 do hs else heights_go(NativeArray.set_int(hs, i, height(x0 + i % 32, z0 + i / 32, seed)), x0, z0, seed, i + 1) end
+  end
+  pfn min_go(hs : NativeIntArr, i : Int, m : Int) : Int do
+    if i >= 1024 do m else min_go(hs, i + 1, if NativeArray.get_int(hs, i) < m do NativeArray.get_int(hs, i) else m end) end
+  end
+  pfn max_go(hs : NativeIntArr, i : Int, m : Int) : Int do
+    if i >= 1024 do m else max_go(hs, i + 1, if NativeArray.get_int(hs, i) > m do NativeArray.get_int(hs, i) else m end) end
+  end
+
+  pfn block_at(wy : Int, h : Int) : Int do
+    if wy > h do (if wy <= sea() do 5 else 0 end)
+    else if wy == h do (if h <= sea() + 1 do 4 else if h > 84 do 6 else if h > 72 do 1 else 3 end end end)
+    else if wy >= h - 3 do (if h <= sea() + 1 do 4 else if h > 72 do 1 else 2 end end)
+    else 1 end end end
+  end
+
+  pfn ground_go(a : NativeI32Arr, hs : NativeIntArr, y0 : Int, i : Int) : NativeI32Arr do
+    if i >= 32768 do a
+    else ground_go(NativeArray.set_i32(a, i, block_at(y0 + i / 1024, NativeArray.get_int(hs, i % 1024))), hs, y0, i + 1) end
+  end
+
+  -- A tree stands on a grass column well inside the chunk's footprint, so
+  -- its canopy never crosses a chunk's sides; it may cross the top, and each
+  -- chunk in the column draws the part of it that falls in its own y range.
+  pfn has_tree(wx : Int, wz : Int, h : Int, seed : Int) : Bool do
+    h > sea() + 1 && h <= 72 && Ns.hash2(wx, wz, seed + 500) > 0.988
+  end
+
+  pfn put(a : NativeI32Arr, x : Int, wy : Int, z : Int, y0 : Int, id : Int, over : Bool) : NativeI32Arr do
+    let ly = wy - y0
+    if x < 0 || x > 31 || z < 0 || z > 31 || ly < 0 || ly > 31 do a
+    else
+      let i = x + 32 * (z + 32 * ly)
+      if over || NativeArray.get_i32(a, i) == 0 do NativeArray.set_i32(a, i, id) else a end
+    end
+  end
+
+  pfn canopy_go(a : NativeI32Arr, x : Int, z : Int, top : Int, y0 : Int, k : Int) : NativeI32Arr do
+    -- 5 x 5 x 3 of leaves under a 3 x 3 cap; k walks the 100 cells
+    if k >= 100 do a
+    else
+      let layer = k / 25
+      let dx = k % 5 - 2
+      let dz = (k / 5) % 5 - 2
+      let cap = layer == 3
+      let skip = (cap && (dx < -1 || dx > 1 || dz < -1 || dz > 1)) || (!cap && (dx == -2 || dx == 2) && (dz == -2 || dz == 2) && layer == 2)
+      canopy_go(if skip do a else put(a, x + dx, top - 2 + layer, z + dz, y0, 8, false) end, x, z, top, y0, k + 1)
+    end
+  end
+
+  pfn trunk_go(a : NativeI32Arr, x : Int, z : Int, wy : Int, top : Int, y0 : Int) : NativeI32Arr do
+    if wy > top do a else trunk_go(put(a, x, wy, z, y0, 7, true), x, z, wy + 1, top, y0) end
+  end
+
+  pfn trees_go(a : NativeI32Arr, hs : NativeIntArr, x0 : Int, y0 : Int, z0 : Int, seed : Int, i : Int) : NativeI32Arr do
+    if i >= 1024 do a
+    else
+      let x = i % 32
+      let z = i / 32
+      let h = NativeArray.get_int(hs, i)
+      if x >= 2 && x <= 29 && z >= 2 && z <= 29 && has_tree(x0 + x, z0 + z, h, seed) do
+        let top = h + 5
+        trees_go(trunk_go(canopy_go(a, x, z, top, y0, 0), x, z, h + 1, top, y0), hs, x0, y0, z0, seed, i + 1)
+      else trees_go(a, hs, x0, y0, z0, seed, i + 1) end
+    end
+  end
+
+  doc "The chunk at chunk coordinates (cx, cy, cz) for [seed]. Pure: the same inputs give the same chunk."
+  fn terrain(cx : Int, cy : Int, cz : Int, seed : Int) : Strata.Chunk.Chunk do
+    let y0 = cy * 32
+    let hs = heights_go(NativeArray.make_int(1024, 0), cx * 32, cz * 32, seed, 0)
+    let lo = min_go(hs, 0, 100000)
+    let hi = max_go(hs, 0, -100000)
+    let roof = (if hi > sea() do hi else sea() end) + 8
+    if y0 > roof do Ch.uniform(0)
+    else if y0 + 31 < lo - 3 do Ch.uniform(1)
+    else Ch.from_flat(trees_go(ground_go(NativeArray.make_i32(32768, 0), hs, y0, 0), hs, cx * 32, y0, cz * 32, seed, 0)) end end
+  end
+
+  -- ── The world: a fixed box of chunks ─────────────────────────────────────
+  -- (2r + 1) x ny x (2r + 1) chunks, index (cx + r) + n * ((cz + r) + n * cy)
+  pfn ny() : Int do 4 end
+
+  pfn gen_go(r : Int, seed : Int, i : Int, acc : List(Strata.Chunk.Chunk)) : List(Strata.Chunk.Chunk) do
+    if i < 0 do acc
+    else
+      let n = 2 * r + 1
+      gen_go(r, seed, i - 1, Cons(terrain(i % n - r, i / (n * n), (i / n) % n - r, seed), acc))
+    end
+  end
+
+  pfn chunk_of(world : Strata.Tree.Tree(Strata.Chunk.Chunk), r : Int, cx : Int, cy : Int, cz : Int) : Strata.Chunk.Chunk do
+    let n = 2 * r + 1
+    if cx < 0 - r || cx > r || cz < 0 - r || cz > r || cy < 0 || cy >= ny() do Ch.uniform(0)
+    else Strata.Tree.get(world, (cx + r) + n * ((cz + r) + n * cy)) end
+  end
+
+  type Totals = Totals(Int, Int, Int)   -- chunks with a mesh, quads, uploads refused
+
+  pfn upload_layer(slot : Int, m : Strata.Mesh.Meshed, l : Int, cx : Int, cy : Int, cz : Int) : Int do
+    let n = Mh.quad_count_at(m, l)
+    if n == 0 do 0
+    else if Strata.Ffi.Vk.chunk_upload(slot, l, Mh.quads_at(m, l), n, cx * 32, cy * 32, cz * 32) do 0 else 1 end end
+  end
+
+  pfn mesh_go(world : Strata.Tree.Tree(Strata.Chunk.Chunk), reg : Strata.Blocks.Registry, r : Int, i : Int, t : Totals) : Totals do
+    let n = 2 * r + 1
+    if i >= n * n * ny() do t
+    else
+      let cx = i % n - r
+      let cz = (i / n) % n - r
+      let cy = i / (n * n)
+      let m = Mh.build(reg, Mh.around_from(fn (dx, dy, dz) -> chunk_of(world, r, cx + dx, cy + dy, cz + dz)))
+      let q = Mh.quad_count_at(m, 0) + Mh.quad_count_at(m, 1) + Mh.quad_count_at(m, 2)
+      let bad = upload_layer(i, m, 0, cx, cy, cz) + upload_layer(i, m, 1, cx, cy, cz) + upload_layer(i, m, 2, cx, cy, cz)
+      match t do
+        Totals(c, qs, refused) -> mesh_go(world, reg, r, i + 1, Totals(if q > 0 do c + 1 else c end, qs + q, refused + bad))
+      end
+    end
+  end
+
+  -- ── The camera and the frame loop ────────────────────────────────────────
+  pfn ms(sec : Float) : String do float_to_string(Math.round(sec *. 10000.0) /. 10.0) ++ " ms" end
+  pfn axis(pos : Bool, neg : Bool) : Float do (if pos do 1.0 else 0.0 end) -. (if neg do 1.0 else 0.0 end) end
+  pfn clampf(v : Float, lo : Float, hi : Float) : Float do if v < lo do lo else if v > hi do hi else v end end end
+
+  pfn frame_loop(x : Float, y : Float, z : Float, yaw : Float, pitch : Float, frame : Int, frames : Int, t_prev : Float, t_mark : Float, vp : NativeF32Arr) : Unit do
+    Strata.Ffi.Vk.poll()
+    if Strata.Ffi.Vk.should_close() || Strata.Ffi.Vk.key(256) || (frames > 0 && frame >= frames) do ()
+    else
+      let now = Strata.Ffi.Vk.time()
+      let dt = clampf(now -. t_prev, 0.0, 0.1)
+      let yaw2 = yaw +. Strata.Ffi.Vk.mouse_dx() *. 0.0025 +. axis(Strata.Ffi.Vk.key(262), Strata.Ffi.Vk.key(263)) *. dt *. 1.6
+      let pitch2 = clampf(pitch -. Strata.Ffi.Vk.mouse_dy() *. 0.0025 +. axis(Strata.Ffi.Vk.key(265), Strata.Ffi.Vk.key(264)) *. dt *. 1.2, -1.5, 1.5)
+      let fx = Math.sin(yaw2) *. Math.cos(pitch2)
+      let fy = Math.sin(pitch2)
+      let fz = 0.0 -. Math.cos(yaw2) *. Math.cos(pitch2)
+      let speed = 40.0 *. dt
+      let fwd = axis(Strata.Ffi.Vk.key(87), Strata.Ffi.Vk.key(83)) *. speed
+      let side = axis(Strata.Ffi.Vk.key(68), Strata.Ffi.Vk.key(65)) *. speed
+      let up = axis(Strata.Ffi.Vk.key(32), Strata.Ffi.Vk.key(340)) *. speed
+      let x2 = x +. fx *. fwd +. Math.cos(yaw2) *. side
+      let y2 = y +. fy *. fwd +. up
+      let z2 = z +. fz *. fwd +. Math.sin(yaw2) *. side
+      let aspect = int_to_float(Strata.Ffi.Vk.fb_w()) /. int_to_float(if Strata.Ffi.Vk.fb_h() < 1 do 1 else Strata.Ffi.Vk.fb_h() end)
+      let view = M4.look_at(V3.new(x2, y2, z2), V3.new(x2 +. fx, y2 +. fy, z2 +. fz), V3.new(0.0, 1.0, 0.0))
+      let vp2 = M4.mul_into_f32(M4.perspective(1.15, aspect, 0.1, 1200.0), view, vp)
+      Strata.Ffi.Vk.set_camera(vp2)
+      Strata.Ffi.Vk.set_eye(x2, y2, z2, 1.0)
+      if frames > 0 && frame == frames - 3 do Strata.Ffi.Vk.request_shot() else () end
+      -- the result is used, not dropped: a zero-argument extern bound to an unused name is optimised away (cube_forge GAPS G16)
+      let next = if Strata.Ffi.Vk.frame() do frame + 1 else frame end
+      if next != frame && frame % 240 == 239 do
+        println("  " ++ float_to_string(Math.round(240.0 /. (now -. t_mark))) ++ " fps, " ++ int_to_string(Strata.Ffi.Vk.drawn_chunks()) ++ " chunks and " ++ int_to_string(Strata.Ffi.Vk.drawn_quads()) ++ " quads drawn")
+        frame_loop(x2, y2, z2, yaw2, pitch2, next, frames, now, now, vp2)
+      else frame_loop(x2, y2, z2, yaw2, pitch2, next, frames, now, t_mark, vp2) end
+    end
+  end
+
+  fn main(_cap : Cap(IO)) : Unit do
+    let r = Env.get_int("STRATA_RADIUS", 6)
+    let frames = Env.get_int("STRATA_FRAMES", 0)
+    let seed = Env.get_int("STRATA_SEED", 7)
+    if !Strata.Ffi.Vk.open(1280, 800, frames == 0) do println("strata_viewer: could not open a Vulkan window")
+    else
+      let reg = registry()
+      palette()
+      Strata.Ffi.Vk.set_sun(0.45, 0.80, 0.35, 0.30)
+      Strata.Ffi.Vk.set_sky(0.53, 0.72, 0.92)
+      Strata.Ffi.Vk.set_fog(int_to_float(r) *. 32.0 *. 0.7, int_to_float(r) *. 32.0 *. 1.15)
+      let n = 2 * r + 1
+      let count = n * n * ny()
+      let t0 = Strata.Ffi.Vk.time()
+      let world = Strata.Tree.from_list(gen_go(r, seed, count - 1, Nil), Ch.uniform(0))
+      let t1 = Strata.Ffi.Vk.time()
+      match mesh_go(world, reg, r, 0, Totals(0, 0, 0)) do
+        Totals(meshed, quads, refused) ->
+          let t2 = Strata.Ffi.Vk.time()
+          println("strata_viewer: " ++ int_to_string(count) ++ " chunks (" ++ int_to_string(n * 32) ++ " x " ++ int_to_string(ny() * 32) ++ " x " ++ int_to_string(n * 32) ++ " voxels)")
+          println("  terrain " ++ ms(t1 -. t0) ++ " total, " ++ ms((t1 -. t0) /. int_to_float(count)) ++ " a chunk")
+          println("  mesh + upload " ++ ms(t2 -. t1) ++ " total, " ++ ms((t2 -. t1) /. int_to_float(count)) ++ " a chunk")
+          println("  " ++ int_to_string(meshed) ++ " chunks have a mesh; " ++ int_to_string(quads) ++ " quads, " ++ int_to_string(quads * 8 / 1024) ++ " KB on the GPU (" ++ int_to_string(refused) ++ " uploads refused)")
+          let ex = -70.0
+          let ey = int_to_float(height(0, 0, seed)) +. 46.0
+          let ez = 96.0
+          frame_loop(ex, ey, ez, 0.62, -0.42, 0, frames, Strata.Ffi.Vk.time(), Strata.Ffi.Vk.time(), NativeArray.make_f32(16, 0.0))
+      end
+      Strata.Ffi.Vk.close()
+    end
+  end
+end

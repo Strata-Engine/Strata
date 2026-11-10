@@ -488,7 +488,7 @@ void sv_set_sun(double x, double y, double z, double ambient) {
 }
 void sv_set_sky(double r, double gr, double b) {
     if (!g.ok) return;
-    g.ubo_map[20] = (float)r; g.ubo_map[21] = (float)gr; g.ubo_map[22] = (float)b; g.ubo_map[23] = 1.0f;
+    g.ubo_map[20] = (float)pow(r, 2.2); g.ubo_map[21] = (float)pow(gr, 2.2); g.ubo_map[22] = (float)pow(b, 2.2); g.ubo_map[23] = 1.0f;
 }
 void sv_set_fog(double start, double end, double cam_x, double cam_y) {
     (void)cam_x; (void)cam_y;
@@ -499,11 +499,13 @@ void sv_set_eye(double x, double y, double z, double scale) {
     if (!g.ok) return;
     g.ubo_map[28] = (float)x; g.ubo_map[29] = (float)y; g.ubo_map[30] = (float)z; g.ubo_map[31] = (float)scale;
 }
-/* Colour of texture id [i] (0..255): linear rgb plus alpha. */
+/* Colour of texture id [i] (0..255): sRGB rgb as an artist would pick it,
+ * plus alpha. Stored linear, since the swapchain encodes on write. */
+static float to_linear(double c) { return (float)pow(c < 0 ? 0 : c, 2.2); }
 void sv_set_palette(int64_t i, double r, double gr, double b, double a) {
     if (!g.ok || i < 0 || i >= 256) return;
     float *p = g.ubo_map + 32 + i * 4;
-    p[0] = (float)r; p[1] = (float)gr; p[2] = (float)b; p[3] = (float)a;
+    p[0] = to_linear(r); p[1] = to_linear(gr); p[2] = to_linear(b); p[3] = (float)a;
 }
 
 /* ── Culling ──────────────────────────────────────────────────────────────── */
