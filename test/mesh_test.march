@@ -1,0 +1,309 @@
+-- The greedy mesher, checked case by case and against a naive per-face oracle.
+mod Strata.Test.Mesh do
+
+  needs IO.Clock      -- charged to every test module once any uses Check.all (GAPS S3)
+  needs IO.Process
+  import Test
+  alias Strata.Chunk as C
+  alias Strata.Blocks as B
+  alias Strata.Mesh as Ms
+  alias Strata.Quad as Q
+
+  pfn add(r : Strata.Blocks.Registry, d : Strata.Blocks.Def) : Strata.Blocks.Registry do
+    match B.register(r, d) do
+      Ok((r2, _)) -> r2
+      Err(_) -> r
+    end
+  end
+
+  -- 1 stone: opaque cube.  2 leaf: see-through cube on the cutout layer.
+  -- 3 water, 4 glass: see-through cubes on the translucent layer.
+  -- 5 plant: a cross.  6 lamp: a model.  Texture id = block id * 10.
+  pfn reg() : Strata.Blocks.Registry do
+    let stone = B.with_faces(B.def(), 10, 10, 10)
+    let leaf = B.with_faces(B.with_layer(B.with_opacity(B.def(), Strata.Blocks.SeeThrough), Strata.Blocks.Cutout), 20, 20, 20)
+    let water = B.with_faces(B.with_collide(B.with_layer(B.with_opacity(B.def(), Strata.Blocks.SeeThrough), Strata.Blocks.Translucent), false), 30, 30, 30)
+    let glass = B.with_faces(B.with_layer(B.with_opacity(B.def(), Strata.Blocks.SeeThrough), Strata.Blocks.Translucent), 40, 40, 40)
+    let plant = B.with_collide(B.with_style(B.with_opacity(B.def(), Strata.Blocks.Clear), Strata.Blocks.Cross), false)
+    let lamp = B.with_style(B.with_opacity(B.def(), Strata.Blocks.Clear), Strata.Blocks.Model(0))
+    add(add(add(add(add(add(B.empty(), stone), leaf), water), glass), plant), lamp)
+  end
+
+  pfn air() : Strata.Chunk.Chunk do C.uniform(0) end
+  pfn alone(c : Strata.Chunk.Chunk) : Strata.Mesh.Around do
+    Ms.around_from(fn (dx, dy, dz) -> if dx == 0 && dy == 0 && dz == 0 do c else C.uniform(0) end)
+  end
+  pfn total(m : Strata.Mesh.Meshed) : Int do Ms.quad_count_at(m, 0) + Ms.quad_count_at(m, 1) + Ms.quad_count_at(m, 2) end
+
+  -- ── Reading a mesh ───────────────────────────────────────────────────────
+  pfn w0_at(m : Strata.Mesh.Meshed, l : Int, k : Int) : Int do NativeArray.get_i32(Ms.quads_at(m, l), 2 * k) end
+  pfn w1_at(m : Strata.Mesh.Meshed, l : Int, k : Int) : Int do NativeArray.get_i32(Ms.quads_at(m, l), 2 * k + 1) end
+
+  -- index of the first quad on layer l with face f, or -1
+  pfn find_face(m : Strata.Mesh.Meshed, l : Int, f : Int, k : Int) : Int do
+    if k >= Ms.quad_count_at(m, l) do -1
+    else if Q.face_of(w0_at(m, l, k)) == f do k
+    else find_face(m, l, f, k + 1) end end
+  end
+  pfn count_face(m : Strata.Mesh.Meshed, l : Int, f : Int, k : Int, acc : Int) : Int do
+    if k >= Ms.quad_count_at(m, l) do acc
+    else count_face(m, l, f, k + 1, if Q.face_of(w0_at(m, l, k)) == f do acc + 1 else acc end) end
+  end
+  pfn all_unit_lit(m : Strata.Mesh.Meshed, k : Int) : Bool do
+    if k >= Ms.quad_count_at(m, 0) do true
+    else if Q.w_of(w0_at(m, 0, k)) == 1 && Q.h_of(w0_at(m, 0, k)) == 1 && Q.ao_of(w1_at(m, 0, k)) == 255 do all_unit_lit(m, k + 1)
+    else false end end
+  end
+
+  -- ── The oracle: the face rule applied voxel by voxel ─────────────────────
+  pfn nx(f : Int) : Int do if f == 2 do 1 else if f == 3 do -1 else 0 end end end
+  pfn ny(f : Int) : Int do if f == 0 do 1 else if f == 1 do -1 else 0 end end end
+  pfn nz(f : Int) : Int do if f == 4 do 1 else if f == 5 do -1 else 0 end end end
+  -- in-plane axes: +-y (x, z), +-x (z, y), +-z (x, y)
+  pfn ux(f : Int) : Int do if f == 2 || f == 3 do 0 else 1 end end
+  pfn uz(f : Int) : Int do if f == 2 || f == 3 do 1 else 0 end end
+  pfn vy(f : Int) : Int do if f < 2 do 0 else 1 end end
+  pfn vz(f : Int) : Int do if f < 2 do 1 else 0 end end
+
+  pfn solid(r : Strata.Blocks.Registry, a : Strata.Mesh.Around, x : Int, y : Int, z : Int) : Bool do
+    B.is_solid_opaque(r, Ms.around_get(a, x, y, z))
+  end
+
+  pfn corner(r : Strata.Blocks.Registry, a : Strata.Mesh.Around, fx : Int, fy : Int, fz : Int, f : Int, cu : Int, cv : Int) : Int do
+    let du = if cu == 1 do 1 else -1 end
+    let dv = if cv == 1 do 1 else -1 end
+    let s1 = solid(r, a, fx + du * ux(f), fy, fz + du * uz(f))
+    let s2 = solid(r, a, fx, fy + dv * vy(f), fz + dv * vz(f))
+    let cn = solid(r, a, fx + du * ux(f), fy + dv * vy(f), fz + du * uz(f) + dv * vz(f))
+    if s1 && s2 do 0
+    else 3 - ((if s1 do 1 else 0 end) + (if s2 do 1 else 0 end) + (if cn do 1 else 0 end)) end
+  end
+
+  -- -1 for no face, else layer * 1000 + ao byte
+  pfn oracle(r : Strata.Blocks.Registry, a : Strata.Mesh.Around, x : Int, y : Int, z : Int, f : Int) : Int do
+    let id = Ms.around_get(a, x, y, z)
+    let fx = x + nx(f)
+    let fy = y + ny(f)
+    let fz = z + nz(f)
+    let nb = Ms.around_get(a, fx, fy, fz)
+    if B.style_index(r, id) != 0 || B.is_solid_opaque(r, nb) || nb == id do -1
+    else
+      let ao = corner(r, a, fx, fy, fz, f, 0, 0) + 4 * corner(r, a, fx, fy, fz, f, 1, 0) + 16 * corner(r, a, fx, fy, fz, f, 0, 1) + 64 * corner(r, a, fx, fy, fz, f, 1, 1)
+      B.layer_index(r, id) * 1000 + ao
+    end
+  end
+
+  -- ── Rasterising the greedy quads back to unit faces ──────────────────────
+  -- cover[(l * 6 + f) * 32768 + voxel index] = 0 uncovered, 1000 + ao covered
+  -- once, -1 covered twice or outside the chunk.
+  pfn mark_row(cov : NativeIntArr, base : Int, x : Int, y : Int, z : Int, f : Int, i : Int, w : Int, ao : Int) : NativeIntArr do
+    if i >= w do cov
+    else
+      let px = x + i * ux(f)
+      let pz = z + i * uz(f)
+      if px < 0 || px > 31 || y < 0 || y > 31 || pz < 0 || pz > 31 do NativeArray.set_int(cov, 0, -1)
+      else
+        let at = base + px + 32 * (pz + 32 * y)
+        let v = if NativeArray.get_int(cov, at) == 0 do 1000 + ao else -1 end
+        mark_row(NativeArray.set_int(cov, at, v), base, x, y, z, f, i + 1, w, ao)
+      end
+    end
+  end
+  pfn mark_quad(cov : NativeIntArr, base : Int, x : Int, y : Int, z : Int, f : Int, j : Int, w : Int, h : Int, ao : Int) : NativeIntArr do
+    if j >= h do cov
+    else mark_quad(mark_row(cov, base, x, y + j * vy(f), z + j * vz(f), f, 0, w, ao), base, x, y, z, f, j + 1, w, h, ao) end
+  end
+  pfn mark_layer(cov : NativeIntArr, m : Strata.Mesh.Meshed, l : Int, k : Int) : NativeIntArr do
+    if k >= Ms.quad_count_at(m, l) do cov
+    else
+      let w0 = w0_at(m, l, k)
+      let f = Q.face_of(w0)
+      let c2 = mark_quad(cov, (l * 6 + f) * 32768, Q.x_of(w0), Q.y_of(w0), Q.z_of(w0), f, 0, Q.w_of(w0), Q.h_of(w0), Q.ao_of(w1_at(m, l, k)))
+      mark_layer(c2, m, l, k + 1)
+    end
+  end
+  pfn raster(m : Strata.Mesh.Meshed) : NativeIntArr do
+    mark_layer(mark_layer(mark_layer(NativeArray.make_int(3 * 6 * 32768, 0), m, 0, 0), m, 1, 0), m, 2, 0)
+  end
+
+  -- does the raster hold exactly the oracle's faces, with the oracle's shading?
+  pfn same_at(r : Strata.Blocks.Registry, a : Strata.Mesh.Around, cov : NativeIntArr, i : Int, f : Int) : Bool do
+    let want = oracle(r, a, i % 32, i / 1024, (i / 32) % 32, f)
+    let wl = if want < 0 do -1 else want / 1000 end
+    let wv = if want < 0 do 0 else 1000 + want % 1000 end
+    let g0 = NativeArray.get_int(cov, (0 * 6 + f) * 32768 + i)
+    let g1 = NativeArray.get_int(cov, (1 * 6 + f) * 32768 + i)
+    let g2 = NativeArray.get_int(cov, (2 * 6 + f) * 32768 + i)
+    g0 == (if wl == 0 do wv else 0 end) && g1 == (if wl == 1 do wv else 0 end) && g2 == (if wl == 2 do wv else 0 end)
+  end
+  pfn same_go(r : Strata.Blocks.Registry, a : Strata.Mesh.Around, cov : NativeIntArr, i : Int, f : Int) : Bool do
+    if i >= 32768 do true
+    else if f >= 6 do same_go(r, a, cov, i + 1, 0)
+    else if same_at(r, a, cov, i, f) do same_go(r, a, cov, i, f + 1)
+    else false end end end
+  end
+  pfn matches_oracle(r : Strata.Blocks.Registry, a : Strata.Mesh.Around) : Bool do
+    same_go(r, a, raster(Ms.build(r, a)), 0, 0)
+  end
+
+  -- every texture id is the block's (id * 10 here), read back through the quad
+  pfn tex_ok(r : Strata.Blocks.Registry, a : Strata.Mesh.Around, m : Strata.Mesh.Meshed, l : Int, k : Int) : Bool do
+    if k >= Ms.quad_count_at(m, l) do true
+    else
+      let w0 = w0_at(m, l, k)
+      let id = Ms.around_get(a, Q.x_of(w0), Q.y_of(w0), Q.z_of(w0))
+      if Q.tex_of(w1_at(m, l, k)) == id * 10 do tex_ok(r, a, m, l, k + 1) else false end
+    end
+  end
+
+  -- ── Chunks for the tests ─────────────────────────────────────────────────
+  -- a deterministic scatter: about half air, the rest every kind of block,
+  -- with an unregistered id thrown in
+  pfn pick(n : Int) : Int do
+    let k = n % 16
+    if k < 7 do 0 else if k < 11 do 1 else if k == 11 do 2 else if k == 12 do 3 else if k == 13 do 4 else if k == 14 do 5 else 60000 end end end end end end
+  end
+  pfn lcg(s : Int) : Int do int_and(s * 1103515245 + 12345, 2147483647) end
+  pfn noise_go(a : NativeI32Arr, i : Int, s : Int) : NativeI32Arr do
+    if i >= 32768 do a else noise_go(NativeArray.set_i32(a, i, pick(s / 65536)), i + 1, lcg(s)) end
+  end
+  pfn noise(seed : Int) : Strata.Chunk.Chunk do C.from_flat(noise_go(NativeArray.make_i32(32768, 0), 0, lcg(seed + 77))) end
+  pfn noise_around(seed : Int) : Strata.Mesh.Around do
+    Ms.around_from(fn (dx, dy, dz) -> noise(seed + (dx + 1) + 3 * (dy + 1) + 9 * (dz + 1)))
+  end
+
+  pfn edits(c : Strata.Chunk.Chunk, es : List((Int, Int))) : Strata.Chunk.Chunk do
+    match es do
+      Nil -> c
+      Cons((i, id), t) -> edits(C.set_idx(c, i, id), t)
+    end
+  end
+
+  describe "Mesh.build, case by case" do
+    test "one block alone in air is six unit quads, fully lit" do
+      let m = Ms.build(reg(), alone(C.set(air(), 4, 5, 6, 1)))
+      Test.assert_eq_int(Ms.quad_count_at(m, 0), 6, "six faces on the opaque layer")
+      Test.assert_eq_int(total(m), 6, "and nowhere else")
+      Test.assert_true(all_unit_lit(m, 0), "each 1 by 1 with every corner at 3")
+      Test.assert_eq_int(Q.x_of(w0_at(m, 0, 0)), 4, "at the block: x")
+      Test.assert_eq_int(Q.y_of(w0_at(m, 0, 0)), 5, "y")
+      Test.assert_eq_int(Q.z_of(w0_at(m, 0, 0)), 6, "z")
+      Test.assert_eq_int(Q.tex_of(w1_at(m, 0, 0)), 10, "carrying the block's texture")
+    end
+
+    test "a floor one block thick merges its top and its bottom into one quad each" do
+      let m = Ms.build(reg(), alone(C.fill_box(air(), 0, 3, 0, 31, 3, 31, 1)))
+      Test.assert_eq_int(count_face(m, 0, 0, 0, 0), 1, "one top quad")
+      Test.assert_eq_int(count_face(m, 0, 1, 0, 0), 1, "one bottom quad")
+      let t = find_face(m, 0, 0, 0)
+      Test.assert_eq_int(Q.w_of(w0_at(m, 0, t)), 32, "the top is 32 wide")
+      Test.assert_eq_int(Q.h_of(w0_at(m, 0, t)), 32, "and 32 deep")
+      Test.assert_eq_int(Q.y_of(w0_at(m, 0, t)), 3, "at the floor's height")
+      Test.assert_eq_int(count_face(m, 0, 2, 0, 0), 1, "each side is one strip")
+    end
+
+    test "stone buried in stone has no faces" do
+      let m = Ms.build(reg(), Ms.around_from(fn (dx, dy, dz) -> C.uniform(1)))
+      Test.assert_eq_int(total(m), 0, "nothing to draw")
+    end
+
+    test "stone with air above shows exactly one top quad" do
+      let m = Ms.build(reg(), Ms.around_from(fn (dx, dy, dz) -> if dy == 1 do C.uniform(0) else C.uniform(1) end))
+      Test.assert_eq_int(total(m), 1, "one quad")
+      Test.assert_eq_int(Q.face_of(w0_at(m, 0, 0)), 0, "facing up")
+      Test.assert_eq_int(Q.w_of(w0_at(m, 0, 0)) * Q.h_of(w0_at(m, 0, 0)), 1024, "covering the chunk")
+      Test.assert_eq_int(Q.y_of(w0_at(m, 0, 0)), 31, "on the top layer")
+    end
+
+    test "an air chunk has no faces whatever surrounds it" do
+      let m = Ms.build(reg(), Ms.around_from(fn (dx, dy, dz) -> if dx == 0 && dy == 0 && dz == 0 do C.uniform(0) else C.uniform(1) end))
+      Test.assert_eq_int(total(m), 0, "the neighbours draw their own faces")
+    end
+
+    test "two see-through blocks of one id share no face; of two ids, a face each" do
+      let same = Ms.build(reg(), alone(C.set(C.set(air(), 4, 4, 4, 3), 5, 4, 4, 3)))
+      Test.assert_eq_int(Ms.quad_count_at(same, 2), 6, "water beside water: the outside of the pair, merged")
+      Test.assert_eq_int(count_face(same, 2, 2, 0, 0), 1, "one +x face, at the end of the pair")
+      let mixed = Ms.build(reg(), alone(C.set(C.set(air(), 4, 4, 4, 3), 5, 4, 4, 4)))
+      Test.assert_eq_int(count_face(mixed, 2, 2, 0, 0), 2, "water beside glass: both blocks keep their +x face")
+      Test.assert_eq_int(count_face(mixed, 2, 3, 0, 0), 2, "and their -x face")
+    end
+
+    test "a see-through block does not hide the stone behind it" do
+      let m = Ms.build(reg(), alone(C.set(C.set(air(), 4, 4, 4, 1), 5, 4, 4, 4)))
+      Test.assert_eq_int(count_face(m, 0, 2, 0, 0), 1, "stone keeps its +x face behind glass")
+      Test.assert_eq_int(count_face(m, 2, 3, 0, 0), 0, "glass drops its face against the stone")
+    end
+
+    test "layers follow the block" do
+      let m = Ms.build(reg(), alone(C.set(C.set(C.set(air(), 1, 1, 1, 1), 5, 5, 5, 2), 9, 9, 9, 3)))
+      Test.assert_eq_int(Ms.quad_count_at(m, 0), 6, "stone on the opaque layer")
+      Test.assert_eq_int(Ms.quad_count_at(m, 1), 6, "leaf on the cutout layer")
+      Test.assert_eq_int(Ms.quad_count_at(m, 2), 6, "water on the translucent layer")
+      Test.assert_eq_int(Q.tex_of(w1_at(m, 1, 0)), 20, "leaf texture")
+    end
+
+    test "cross and model blocks are instances, not quads" do
+      let m = Ms.build(reg(), alone(C.set(C.set(air(), 4, 5, 6, 5), 7, 8, 9, 6)))
+      Test.assert_eq_int(total(m), 0, "no quads")
+      Test.assert_eq_int(Ms.instance_count(m), 2, "two instances")
+      let i0 = NativeArray.get_i32(Ms.instances(m), 0)
+      Test.assert_eq_int(Q.x_of(i0), 4, "the plant's cell: x")
+      Test.assert_eq_int(Q.y_of(i0), 5, "y")
+      Test.assert_eq_int(Q.z_of(i0), 6, "z")
+      Test.assert_eq_int(Q.instance_model(i0), -1, "a cross has no model")
+      Test.assert_eq_int(Q.instance_id(NativeArray.get_i32(Ms.instances(m), 1)), 5, "and carries its block id")
+      Test.assert_eq_int(Q.instance_model(NativeArray.get_i32(Ms.instances(m), 2)), 0, "the lamp is model 0")
+    end
+
+    test "a block in a diagonal neighbour chunk darkens the shared corner" do
+      -- stone at local (0, 0, 0); stone in the (-1, +0, -1) chunk at its (31, 1, 31): diagonal to the top face's low corner
+      let a = Ms.around_from(fn (dx, dy, dz) ->
+        if dx == 0 && dy == 0 && dz == 0 do C.set(C.uniform(0), 0, 0, 0, 1)
+        else if dx == -1 && dy == 0 && dz == -1 do C.set(C.uniform(0), 31, 1, 31, 1)
+        else C.uniform(0) end end)
+      let m = Ms.build(reg(), a)
+      let t = find_face(m, 0, 0, 0)
+      Test.assert_true(t >= 0, "the top face exists")
+      Test.assert_eq_int(Q.ao_corner(Q.ao_of(w1_at(m, 0, t)), 0), 2, "its (0, 0) corner sees the diagonal block")
+      Test.assert_eq_int(Q.ao_corner(Q.ao_of(w1_at(m, 0, t)), 3), 3, "the far corner does not")
+    end
+
+    test "a chunk of an unregistered id draws nothing" do
+      let m = Ms.build(reg(), alone(C.uniform(60000)))
+      Test.assert_eq_int(total(m), 0, "no quads")
+      Test.assert_eq_int(Ms.instance_count(m), 0, "no instances")
+    end
+
+    test "the mesh carries the centre chunk's occupancy and level 0" do
+      let m = Ms.build(reg(), alone(C.set(air(), 4, 5, 6, 1)))
+      Test.assert_eq_int(Strata.Occupancy.count(Ms.occupancy(m)), 1, "one solid voxel")
+      Test.assert_true(Strata.Occupancy.bit(Ms.occupancy(m), 4, 5, 6), "where the block is")
+      Test.assert_eq_int(Ms.level(m), 0, "level")
+      Test.assert_eq_int(Ms.bytes(m), 6 * 8, "eight bytes a quad")
+    end
+  end
+
+  describe "Mesh.build against the oracle" do
+    test "a scatter of every block kind, in a scattered neighbourhood" do
+      let a = noise_around(1)
+      Test.assert_true(matches_oracle(reg(), a), "same unit faces, same layers, same corner shading, none twice")
+      let m = Ms.build(reg(), a)
+      Test.assert_true(tex_ok(reg(), a, m, 0, 0) && tex_ok(reg(), a, m, 1, 0) && tex_ok(reg(), a, m, 2, 0), "every quad carries its block's texture")
+    end
+    test "a second scatter" do
+      Test.assert_true(matches_oracle(reg(), noise_around(9001)), "matches")
+    end
+    test "terrain-like: a stone half with a pond, air above, stone below and beside" do
+      let c = C.fill_box(C.fill_box(C.uniform(0), 0, 0, 0, 31, 15, 31, 1), 8, 14, 8, 20, 15, 20, 3)
+      let a = Ms.around_from(fn (dx, dy, dz) -> if dx == 0 && dy == 0 && dz == 0 do c else if dy < 0 do C.uniform(1) else if dy > 0 do C.uniform(0) else c end end end)
+      Test.assert_true(matches_oracle(reg(), a), "matches")
+    end
+    test "random edits over a half-stone chunk" do
+      Check.all(Gen.list(Gen.tuple2(Gen.int(0, 32767), Gen.int(0, 6))), fn es ->
+        let c = edits(C.fill_box(C.uniform(0), 0, 0, 0, 31, 15, 31, 1), es)
+        matches_oracle(reg(), Ms.around_from(fn (dx, dy, dz) -> if dx == 0 && dy == 0 && dz == 0 do c else if dy < 0 do C.uniform(1) else C.uniform(0) end end))
+      )
+    end
+  end
+end

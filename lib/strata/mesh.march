@@ -1,0 +1,294 @@
+-- Mesh — the greedy mesher. One chunk in, packed quads out (Strata.Quad),
+-- one buffer per render layer, plus one instance per cross or model block
+-- and the chunk's occupancy mask.
+--
+-- The rules:
+--   * A face of block A toward neighbour B is drawn when A is a Cube and B
+--     is not solid-opaque, unless A and B are the same id (a body of water
+--     has no inner faces). The face goes to A's layer.
+--   * Each face corner is shaded 0..3 from the three cells around it in the
+--     layer the face looks into; only solid-opaque blocks shade, including
+--     those in neighbouring chunks.
+--   * Two faces merge only when block id, direction and all four corner
+--     shades agree.
+--   * Cross and Model blocks are one instance each. NoMesh blocks and ids
+--     nobody registered draw nothing.
+--
+-- Meshing reads the chunk's 26 neighbours, so the mesher takes an `Around`:
+-- the 27 chunks centred on the one being meshed.
+mod Strata.Mesh do
+
+  alias Strata.Chunk as C
+  alias Strata.Blocks as B
+  alias Strata.Quad as Q
+
+  -- 27 chunks, index (dx + 1) + 3 * ((dz + 1) + 3 * (dy + 1))
+  type Around = Around(Strata.Tree.Tree(Strata.Chunk.Chunk))
+
+  pfn around_list(f, i : Int, acc : List(Strata.Chunk.Chunk)) : List(Strata.Chunk.Chunk) do
+    if i < 0 do acc else around_list(f, i - 1, Cons(f(i % 3 - 1, i / 9 - 1, (i / 3) % 3 - 1), acc)) end
+  end
+
+  doc "The neighbourhood whose chunk at offset (dx, dy, dz), each -1..1, is f(dx, dy, dz); (0, 0, 0) is the chunk to mesh."
+  fn around_from(f) : Around do Around(Strata.Tree.from_list(around_list(f, 26, Nil), C.uniform(0))) end
+
+  doc "The chunk at offset (dx, dy, dz), each -1..1; air outside that."
+  fn around_chunk(a : Around, dx : Int, dy : Int, dz : Int) : Strata.Chunk.Chunk do
+    if dx < -1 || dx > 1 || dy < -1 || dy > 1 || dz < -1 || dz > 1 do C.uniform(0)
+    else
+      match a do
+        Around(t) -> Strata.Tree.get(t, (dx + 1) + 3 * ((dz + 1) + 3 * (dy + 1)))
+      end
+    end
+  end
+
+  pfn off(v : Int) : Int do if v < 0 do -1 else if v > 31 do 1 else 0 end end end
+
+  doc "The block id at (x, y, z) local to the centre chunk; each coordinate may run into the neighbours (-32..63). Air beyond them."
+  fn around_get(a : Around, x : Int, y : Int, z : Int) : Int do
+    let dx = off(x)
+    let dy = off(y)
+    let dz = off(z)
+    C.get_or(around_chunk(a, dx, dy, dz), x - 32 * dx, y - 32 * dy, z - 32 * dz, 0)
+  end
+
+  doc "Shade 0..3 of a face corner from its two edge neighbours and the diagonal: two solid edges close the corner whatever the diagonal is."
+  fn corner_ao(s1 : Bool, s2 : Bool, cn : Bool) : Int do
+    if s1 && s2 do 0
+    else 3 - ((if s1 do 1 else 0 end) + (if s2 do 1 else 0 end) + (if cn do 1 else 0 end)) end
+  end
+
+  -- ── Growable word buffers ────────────────────────────────────────────────
+  type QBuf = QBuf(NativeI32Arr, Int)
+
+  pfn qb_new() : QBuf do QBuf(NativeArray.make_i32(0, 0), 0) end
+  pfn qb_copy(dst : NativeI32Arr, src : NativeI32Arr, i : Int, n : Int) : NativeI32Arr do
+    if i >= n do dst else qb_copy(NativeArray.set_i32(dst, i, NativeArray.get_i32(src, i)), src, i + 1, n) end
+  end
+  pfn qb_push2(q : QBuf, a : Int, b : Int) : QBuf do
+    match q do
+      QBuf(arr, n) ->
+        let cap = NativeArray.length_i32(arr)
+        if n + 2 <= cap do QBuf(NativeArray.set_i32(NativeArray.set_i32(arr, n, a), n + 1, b), n + 2)
+        else
+          let cap2 = if cap < 64 do 128 else cap * 2 end
+          let grown = qb_copy(NativeArray.make_i32(cap2, 0), arr, 0, n)
+          QBuf(NativeArray.set_i32(NativeArray.set_i32(grown, n, a), n + 1, b), n + 2)
+        end
+    end
+  end
+  pfn qb_arr(q : QBuf) : NativeI32Arr do match q do QBuf(a, _) -> a end end
+  pfn qb_len(q : QBuf) : Int do match q do QBuf(_, n) -> n end end
+
+  -- opaque, cutout, translucent quads; instances; the centre's occupancy
+  type Meshed = Meshed(QBuf, QBuf, QBuf, QBuf, NativeU8Arr)
+
+  pfn layer_buf(m : Meshed, l : Int) : QBuf do
+    match m do
+      Meshed(q0, q1, q2, _, _) -> if l == 1 do q1 else if l == 2 do q2 else q0 end end
+    end
+  end
+
+  doc "The quads of layer [l] (0 opaque, 1 cutout, 2 translucent): two words a quad. The array may be longer than the quads in it; read `quad_count_at`."
+  fn quads_at(m : Meshed, l : Int) : NativeI32Arr do qb_arr(layer_buf(m, l)) end
+  doc "How many quads layer [l] holds."
+  fn quad_count_at(m : Meshed, l : Int) : Int do qb_len(layer_buf(m, l)) / 2 end
+  fn quads(m : Meshed, l : Strata.Blocks.Layer) : NativeI32Arr do quads_at(m, B.layer_number(l)) end
+  fn quad_count(m : Meshed, l : Strata.Blocks.Layer) : Int do quad_count_at(m, B.layer_number(l)) end
+  doc "The cross and model instances: two words each. Read `instance_count`."
+  fn instances(m : Meshed) : NativeI32Arr do match m do Meshed(_, _, _, qi, _) -> qb_arr(qi) end end
+  fn instance_count(m : Meshed) : Int do match m do Meshed(_, _, _, qi, _) -> qb_len(qi) / 2 end end
+  doc "The centre chunk's occupancy mask (Strata.Occupancy)."
+  fn occupancy(m : Meshed) : NativeU8Arr do match m do Meshed(_, _, _, _, o) -> o end end
+  doc "The level of detail the mesh was built at. Always 0 for now."
+  fn level(m : Meshed) : Int do
+    match m do Meshed(_, _, _, _, _) -> 0 end
+  end
+  doc "Bytes of mesh: eight per quad and per instance."
+  fn bytes(m : Meshed) : Int do
+    (quad_count_at(m, 0) + quad_count_at(m, 1) + quad_count_at(m, 2) + instance_count(m)) * 8
+  end
+
+  pfn no_mesh(occ : NativeU8Arr) : Meshed do Meshed(qb_new(), qb_new(), qb_new(), qb_new(), occ) end
+
+  -- ── The padded grids ─────────────────────────────────────────────────────
+  -- The centre chunk and a one-voxel shell of its neighbours: 34 x 34 x 34,
+  -- index (x + 1) + 34 * ((z + 1) + 34 * (y + 1)). `ids` holds block ids;
+  -- `kind` holds, per cell, bit 0 solid-opaque, bits 1-2 the style index,
+  -- bits 3-4 the layer index.
+  pfn pvol() : Int do 39304 end
+  pfn porigin() : Int do 1191 end
+
+  pfn pad_go(ids : NativeIntArr, a : Around, i : Int) : NativeIntArr do
+    if i >= pvol() do ids
+    else pad_go(NativeArray.set_int(ids, i, around_get(a, i % 34 - 1, i / 1156 - 1, (i / 34) % 34 - 1)), a, i + 1) end
+  end
+
+  pfn kind_go(kind : NativeU8Arr, ids : NativeIntArr, r : Strata.Blocks.Registry, i : Int) : NativeU8Arr do
+    if i >= pvol() do kind
+    else
+      let id = NativeArray.get_int(ids, i)
+      let k = (if B.is_solid_opaque(r, id) do 1 else 0 end) + 2 * B.style_index(r, id) + 8 * B.layer_index(r, id)
+      kind_go(NativeArray.set_u8(kind, i, k), ids, r, i + 1)
+    end
+  end
+
+  -- Padded-index strides of a face's normal and in-plane axes.
+  pfn sn(f : Int) : Int do if f < 2 do 1156 else if f < 4 do 1 else 34 end end end
+  pfn su(f : Int) : Int do if f == 2 || f == 3 do 34 else 1 end end
+  pfn sv(f : Int) : Int do if f < 2 do 34 else 1156 end end
+  pfn toward(f : Int) : Int do if f == 0 || f == 2 || f == 4 do sn(f) else 0 - sn(f) end end
+
+  @[no_alloc]
+  pfn solid_at(kind : NativeU8Arr, i : Int) : Bool do int_and(NativeArray.get_u8(kind, i), 1) == 1 end
+
+  pfn corner_at(kind : NativeU8Arr, front : Int, du : Int, dv : Int) : Int do
+    corner_ao(solid_at(kind, front + du), solid_at(kind, front + dv), solid_at(kind, front + du + dv))
+  end
+
+  -- The merge key of the face of [cell] looking along face f, or 0 for no
+  -- face: 1 + id + 65536 * shading.
+  pfn face_key(ids : NativeIntArr, kind : NativeU8Arr, f : Int, cell : Int) : Int do
+    let k = NativeArray.get_u8(kind, cell)
+    if int_and(k / 2, 3) != 0 do 0
+    else
+      let front = cell + toward(f)
+      let id = NativeArray.get_int(ids, cell)
+      if solid_at(kind, front) || NativeArray.get_int(ids, front) == id do 0
+      else
+        let u = su(f)
+        let v = sv(f)
+        1 + id + 65536 * Q.ao4(corner_at(kind, front, 0 - u, 0 - v), corner_at(kind, front, u, 0 - v), corner_at(kind, front, 0 - u, v), corner_at(kind, front, u, v))
+      end
+    end
+  end
+
+  -- One slice's face keys, 32 x 32 at a + 32 * b, and how many are non-zero.
+  type MaskRes = MaskRes(NativeIntArr, Int)
+  pfn mask_go(mask : NativeIntArr, ids : NativeIntArr, kind : NativeU8Arr, f : Int, base : Int, i : Int, found : Int) : MaskRes do
+    if i >= 1024 do MaskRes(mask, found)
+    else
+      let key = face_key(ids, kind, f, base + (i % 32) * su(f) + (i / 32) * sv(f))
+      mask_go(NativeArray.set_int(mask, i, key), ids, kind, f, base, i + 1, if key == 0 do found else found + 1 end)
+    end
+  end
+
+  -- ── Greedy merge of one slice ────────────────────────────────────────────
+  @[no_alloc]
+  pfn run_w(mask : NativeIntArr, key : Int, a : Int, b : Int) : Int do
+    if a >= 32 do a else if NativeArray.get_int(mask, a + 32 * b) != key do a else run_w(mask, key, a + 1, b) end end
+  end
+  @[no_alloc]
+  pfn row_is(mask : NativeIntArr, key : Int, a : Int, a1 : Int, b : Int) : Bool do
+    if a >= a1 do true else if NativeArray.get_int(mask, a + 32 * b) != key do false else row_is(mask, key, a + 1, a1, b) end end
+  end
+  @[no_alloc]
+  pfn run_h(mask : NativeIntArr, key : Int, a : Int, a1 : Int, b : Int) : Int do
+    if b >= 32 do b else if row_is(mask, key, a, a1, b) do run_h(mask, key, a, a1, b + 1) else b end end
+  end
+  pfn clear_row(mask : NativeIntArr, a : Int, a1 : Int, b : Int) : NativeIntArr do
+    if a >= a1 do mask else clear_row(NativeArray.set_int(mask, a + 32 * b, 0), a + 1, a1, b) end
+  end
+  pfn clear_box(mask : NativeIntArr, a : Int, a1 : Int, b : Int, b1 : Int) : NativeIntArr do
+    if b >= b1 do mask else clear_box(clear_row(mask, a, a1, b), a, a1, b + 1, b1) end
+  end
+
+  type Bufs = Bufs(QBuf, QBuf, QBuf)
+
+  pfn emit(bufs : Bufs, r : Strata.Blocks.Registry, f : Int, n : Int, a : Int, b : Int, w : Int, h : Int, key : Int) : Bufs do
+    let id = int_and(key - 1, 65535)
+    let ao = int_and((key - 1) / 65536, 255)
+    let x = if f == 2 || f == 3 do n else a end
+    let y = if f < 2 do n else b end
+    let z = if f < 2 do b else if f < 4 do a else n end end
+    let w0 = Q.pack0(x, y, z, w, h, f)
+    let w1 = Q.pack1(B.face_tex(r, id, f), ao, 0)
+    let l = B.layer_index(r, id)
+    match bufs do
+      Bufs(q0, q1, q2) ->
+        if l == 1 do Bufs(q0, qb_push2(q1, w0, w1), q2)
+        else if l == 2 do Bufs(q0, q1, qb_push2(q2, w0, w1))
+        else Bufs(qb_push2(q0, w0, w1), q1, q2) end end
+    end
+  end
+
+  type Greedy = Greedy(Bufs, NativeIntArr)
+  pfn greedy(bufs : Bufs, mask : NativeIntArr, r : Strata.Blocks.Registry, f : Int, n : Int, a : Int, b : Int) : Greedy do
+    if b >= 32 do Greedy(bufs, mask)
+    else if a >= 32 do greedy(bufs, mask, r, f, n, 0, b + 1)
+    else
+      let key = NativeArray.get_int(mask, a + 32 * b)
+      if key == 0 do greedy(bufs, mask, r, f, n, a + 1, b)
+      else
+        let a1 = run_w(mask, key, a + 1, b)
+        let b1 = run_h(mask, key, a, a1, b + 1)
+        let bufs2 = emit(bufs, r, f, n, a, b, a1 - a, b1 - b, key)
+        greedy(bufs2, clear_box(mask, a, a1, b, b1), r, f, n, a1, b)
+      end
+    end end
+  end
+
+  pfn slices(bufs : Bufs, mask : NativeIntArr, ids : NativeIntArr, kind : NativeU8Arr, r : Strata.Blocks.Registry, f : Int, n : Int) : Greedy do
+    if n >= 32 do Greedy(bufs, mask)
+    else
+      match mask_go(mask, ids, kind, f, porigin() + n * sn(f), 0, 0) do
+        MaskRes(m2, found) ->
+          if found == 0 do slices(bufs, m2, ids, kind, r, f, n + 1)
+          else
+            match greedy(bufs, m2, r, f, n, 0, 0) do
+              Greedy(b2, m3) -> slices(b2, m3, ids, kind, r, f, n + 1)
+            end
+          end
+      end
+    end
+  end
+
+  pfn faces(bufs : Bufs, mask : NativeIntArr, ids : NativeIntArr, kind : NativeU8Arr, r : Strata.Blocks.Registry, f : Int) : Bufs do
+    if f >= 6 do bufs
+    else
+      match slices(bufs, mask, ids, kind, r, f, 0) do
+        Greedy(b2, m2) -> faces(b2, m2, ids, kind, r, f + 1)
+      end
+    end
+  end
+
+  pfn instances_go(qi : QBuf, ids : NativeIntArr, kind : NativeU8Arr, r : Strata.Blocks.Registry, i : Int) : QBuf do
+    if i >= 32768 do qi
+    else
+      let x = i % 32
+      let z = (i / 32) % 32
+      let y = i / 1024
+      let p = porigin() + x + 34 * z + 1156 * y
+      let st = int_and(NativeArray.get_u8(kind, p) / 2, 3)
+      if st == 1 || st == 2 do
+        let id = NativeArray.get_int(ids, p)
+        let model = if st == 2 do B.model_of(r, id) else -1 end
+        instances_go(qb_push2(qi, Q.pack_instance0(x, y, z, model), Q.pack_instance1(id)), ids, kind, r, i + 1)
+      else instances_go(qi, ids, kind, r, i + 1) end
+    end
+  end
+
+  -- Is the chunk at this offset uniform and solid-opaque?
+  pfn wall(r : Strata.Blocks.Registry, a : Around, dx : Int, dy : Int, dz : Int) : Bool do
+    let u = C.uniform_id(around_chunk(a, dx, dy, dz))
+    u >= 0 && B.is_solid_opaque(r, u)
+  end
+
+  doc "Mesh the centre chunk of [a]."
+  fn build(r : Strata.Blocks.Registry, a : Around) : Meshed do
+    let centre = around_chunk(a, 0, 0, 0)
+    let occ = Strata.Occupancy.of_chunk(r, centre)
+    let u = C.uniform_id(centre)
+    -- the two commonest chunks touch no array: nothing to draw at all, and
+    -- solid rock walled in by solid rock
+    if u >= 0 && B.style_index(r, u) == 3 do no_mesh(occ)
+    else if u >= 0 && B.is_solid_opaque(r, u) && wall(r, a, 1, 0, 0) && wall(r, a, -1, 0, 0) && wall(r, a, 0, 1, 0) && wall(r, a, 0, -1, 0) && wall(r, a, 0, 0, 1) && wall(r, a, 0, 0, -1) do no_mesh(occ)
+    else
+      let ids = pad_go(NativeArray.make_int(pvol(), 0), a, 0)
+      let kind = kind_go(NativeArray.make_u8(pvol(), 0), ids, r, 0)
+      match faces(Bufs(qb_new(), qb_new(), qb_new()), NativeArray.make_int(1024, 0), ids, kind, r, 0) do
+        Bufs(q0, q1, q2) -> Meshed(q0, q1, q2, instances_go(qb_new(), ids, kind, r, 0), occ)
+      end
+    end end
+  end
+end

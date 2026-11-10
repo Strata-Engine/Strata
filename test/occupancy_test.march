@@ -1,0 +1,58 @@
+-- Occupancy: one bit per voxel, set where the block is solid and opaque.
+mod Strata.Test.Occupancy do
+
+  needs IO.Clock      -- charged to every test module once any uses Check.all (GAPS S3)
+  needs IO.Process
+  import Test
+  alias Strata.Chunk as C
+  alias Strata.Blocks as B
+  alias Strata.Occupancy as O
+
+  -- 1 stone (solid opaque), 2 glass (see-through)
+  pfn reg() : Strata.Blocks.Registry do
+    let r1 = match B.register(B.empty(), B.def()) do
+      Ok((r, _)) -> r
+      Err(_) -> B.empty()
+    end
+    match B.register(r1, B.with_opacity(B.def(), Strata.Blocks.SeeThrough)) do
+      Ok((r, _)) -> r
+      Err(_) -> r1
+    end
+  end
+
+  -- a deterministic scatter of air, stone and glass
+  pfn scatter(c : Strata.Chunk.Chunk, i : Int) : Strata.Chunk.Chunk do
+    if i >= 32768 do c else scatter(C.set_idx(c, i, (i * 7 + i / 13) % 3), i + 1) end
+  end
+  pfn bits_match(r : Strata.Blocks.Registry, c : Strata.Chunk.Chunk, o : NativeU8Arr, i : Int) : Bool do
+    if i >= 32768 do true
+    else
+      let x = i % 32
+      let z = (i / 32) % 32
+      let y = i / 1024
+      if O.bit(o, x, y, z) == B.is_solid_opaque(r, C.get_idx(c, i)) do bits_match(r, c, o, i + 1) else false end
+    end
+  end
+
+  describe "Occupancy.of_chunk" do
+    test "is 4096 bytes, one bit per voxel" do
+      Test.assert_eq_int(NativeArray.length_u8(O.of_chunk(reg(), C.uniform(0))), 4096, "32768 bits")
+    end
+    test "a bit is set exactly where the block is solid and opaque" do
+      let c = scatter(C.uniform(0), 0)
+      Test.assert_true(bits_match(reg(), c, O.of_chunk(reg(), c), 0), "every voxel")
+    end
+    test "uniform chunks are all set or all clear" do
+      Test.assert_eq_int(O.count(O.of_chunk(reg(), C.uniform(1))), 32768, "stone")
+      Test.assert_eq_int(O.count(O.of_chunk(reg(), C.uniform(0))), 0, "air")
+      Test.assert_eq_int(O.count(O.of_chunk(reg(), C.uniform(2))), 0, "glass is see-through")
+      Test.assert_eq_int(O.count(O.of_chunk(reg(), C.uniform(60000))), 0, "an unregistered id is air")
+    end
+    test "bit answers false outside the chunk" do
+      let o = O.of_chunk(reg(), C.uniform(1))
+      Test.assert_false(O.bit(o, -1, 0, 0), "x below")
+      Test.assert_false(O.bit(o, 0, 32, 0), "y above")
+      Test.assert_true(O.bit(o, 31, 31, 31), "the last voxel")
+    end
+  end
+end

@@ -34,3 +34,10 @@ as an expression and as a pattern. The full path works as an expression
 (`Strata.Blocks.SeeThrough`); as a pattern it does not parse (cube_forge
 G24) or resolves against the wrong type (G25). Workaround: every sum type a
 consumer must inspect has an `_index` reader returning a number.
+
+## S6 — test modules share one alias namespace
+
+`alias Strata.Mesh as M` in one test module and `alias Strata.Math.Mat4 as M`
+in another resolve to the same target: `M.around_from` was reported as
+`Strata.Math.Mat4.around_from ... is not a function in scope`. Workaround:
+every alias across the test suite (and the library) is unique per target.
