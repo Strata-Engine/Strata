@@ -1,0 +1,242 @@
+-- World and Edit: loading, caching edited chunks, single and bulk edits,
+-- dirty sets, change records, and edits queued for chunks not yet loaded.
+mod Strata.Test.World do
+
+  needs IO.Clock      -- charged to every test module once any uses Check.all (GAPS S3)
+  needs IO.Process
+  import Test
+  alias Strata.World as Wd
+  alias Strata.Edit as Ed
+  alias Strata.Coord as Cd
+  alias Strata.Chunk as C
+  alias Strata.Blocks as B
+
+  -- stone (id 1) below y = 0, air above
+  pfn flat() : Strata.Terrain.Gen do
+    Strata.Terrain.gen(fn (k, seed) -> if Cd.ky(k) < 0 do C.uniform(1) else C.uniform(0) end)
+  end
+  pfn reg() : Strata.Blocks.Registry do
+    match B.register(B.empty(), B.def()) do
+      Ok((r, _)) -> r
+      Err(_) -> B.empty()
+    end
+  end
+  pfn fresh() : Strata.World.World do Wd.new(reg(), flat(), 7, 1.0) end
+
+  pfn load(w : Strata.World.World, cx : Int, cy : Int, cz : Int) : Strata.World.World do
+    let k = Cd.key(cx, cy, cz)
+    Wd.insert(w, k, Strata.Terrain.run(Wd.terrain(w), k, Wd.seed(w)))
+  end
+  -- load the 4 x 4 x 4 box of chunks -2..1 on each axis
+  pfn load_box(w : Strata.World.World, i : Int) : Strata.World.World do
+    if i >= 64 do w else load_box(load(w, i % 4 - 2, (i / 4) % 4 - 2, i / 16 - 2), i + 1) end
+  end
+  pfn has_key(l : List(Strata.Coord.Key), k : Strata.Coord.Key) : Bool do
+    match l do
+      Nil -> false
+      Cons(h, t) -> if Cd.key_eq(h, k) do true else has_key(t, k) end
+    end
+  end
+  pfn no_dups(l : List(Strata.Coord.Key)) : Bool do
+    match l do
+      Nil -> true
+      Cons(h, t) -> if has_key(t, h) do false else no_dups(t) end
+    end
+  end
+
+  pfn apply_each(w : Strata.World.World, cells : List((Int, Int, Int, Int))) : Strata.World.World do
+    match cells do
+      Nil -> w
+      Cons((x, y, z, id), t) -> apply_each(Ed.world(Ed.set_block(w, x, y, z, id)), t)
+    end
+  end
+  pfn same_blocks(a : Strata.World.World, b : Strata.World.World, cells : List((Int, Int, Int, Int))) : Bool do
+    match cells do
+      Nil -> true
+      Cons((x, y, z, _), t) -> if Wd.get_block(a, x, y, z) == Wd.get_block(b, x, y, z) do same_blocks(a, b, t) else false end
+    end
+  end
+
+  pfn head_kind(l : List(Strata.Edit.Change)) : Int do
+    match l do
+      Nil -> -1
+      Cons(c, _) -> Ed.kind(c)
+    end
+  end
+  pfn head_old(l : List(Strata.Edit.Change)) : Int do
+    match l do
+      Nil -> -1
+      Cons(c, _) -> Ed.old_id(c)
+    end
+  end
+  pfn head_new(l : List(Strata.Edit.Change)) : Int do
+    match l do
+      Nil -> -1
+      Cons(c, _) -> Ed.new_id(c)
+    end
+  end
+
+  pfn flat4(p : ((Int, Int), (Int, Int))) : (Int, Int, Int, Int) do
+    match p do
+      ((x, y), (z, id)) -> (x, y, z, id)
+    end
+  end
+
+  describe "World" do
+    test "a block reads as air until its chunk is inserted" do
+      let w = fresh()
+      Test.assert_eq_int(Wd.get_block(w, 5, -5, 5), 0, "not loaded")
+      Test.assert_false(Wd.is_loaded(w, Cd.key(0, -1, 0)), "not loaded")
+      let w2 = load(w, 0, -1, 0)
+      Test.assert_true(Wd.is_loaded(w2, Cd.key(0, -1, 0)), "loaded")
+      Test.assert_eq_int(Wd.get_block(w2, 5, -5, 5), 1, "stone below zero")
+      Test.assert_eq_int(Wd.get_block(w2, 5, 5, 5), 0, "the chunk above is not loaded")
+    end
+    test "carries what it was made with" do
+      let w = fresh()
+      Test.assert_eq_int(Wd.seed(w), 7, "seed")
+      Test.assert_true(Wd.scale(w) == 1.0, "scale")
+      Test.assert_eq_int(B.count(Wd.registry(w)), 2, "registry")
+    end
+    test "unloading an untouched chunk drops it; an edited one is cached and comes back" do
+      let w = load(fresh(), 0, -1, 0)
+      Test.assert_eq_int(Wd.cache_size(Wd.unload(w, Cd.key(0, -1, 0))), 0, "untouched: dropped")
+      let e = Ed.world(Ed.set_block(w, 5, -5, 5, 0))
+      Test.assert_true(Wd.is_edited(e, Cd.key(0, -1, 0)), "edited")
+      let u = Wd.unload(e, Cd.key(0, -1, 0))
+      Test.assert_false(Wd.is_loaded(u, Cd.key(0, -1, 0)), "unloaded")
+      Test.assert_eq_int(Wd.cache_size(u), 1, "edited: cached")
+      Test.assert_true(Wd.is_edited(u, Cd.key(0, -1, 0)), "still counted as edited while cached")
+      let back = load(u, 0, -1, 0)
+      Test.assert_eq_int(Wd.get_block(back, 5, -5, 5), 0, "the edit survives the round trip")
+      Test.assert_eq_int(Wd.get_block(back, 6, -5, 5), 1, "the rest is as generated")
+      Test.assert_eq_int(Wd.cache_size(back), 0, "and the cache entry is gone")
+    end
+    test "a chunk edited back to its generated state is no longer edited" do
+      let w = load(fresh(), 0, -1, 0)
+      let e = Ed.world(Ed.set_block(Ed.world(Ed.set_block(w, 5, -5, 5, 0)), 5, -5, 5, 1))
+      Test.assert_false(Wd.is_edited(e, Cd.key(0, -1, 0)), "back to generated")
+      Test.assert_eq_int(Wd.cache_size(Wd.unload(e, Cd.key(0, -1, 0))), 0, "so unloading drops it")
+    end
+    test "unloading a chunk that is not loaded changes nothing" do
+      Test.assert_eq_int(Wd.cache_size(Wd.unload(fresh(), Cd.key(9, 9, 9))), 0, "nothing cached")
+    end
+  end
+
+  describe "Edit.set_block" do
+    test "an interior edit dirties its own chunk and records the change" do
+      let o = Ed.set_block(load_box(fresh(), 0), 5, 5, 5, 1)
+      Test.assert_eq_int(List.length(Ed.dirty(o)), 1, "one dirty chunk")
+      Test.assert_true(has_key(Ed.dirty(o), Cd.key(0, 0, 0)), "its own")
+      Test.assert_eq_int(Wd.get_block(Ed.world(o), 5, 5, 5), 1, "the block is set")
+      Test.assert_eq_int(List.length(Ed.changes(o)), 1, "one change")
+      Test.assert_eq_int(head_old(Ed.changes(o)), 0, "old id")
+      Test.assert_eq_int(head_new(Ed.changes(o)), 1, "new id")
+      Test.assert_eq_int(List.length(Ed.deferred(o)), 0, "nothing deferred")
+    end
+    test "setting the id already there is not an edit" do
+      let o = Ed.set_block(load_box(fresh(), 0), 5, -5, 5, 1)
+      Test.assert_eq_int(List.length(Ed.dirty(o)), 0, "nothing dirty")
+      Test.assert_eq_int(List.length(Ed.changes(o)), 0, "no change")
+    end
+    test "an edit on a chunk face also dirties the chunk across it" do
+      let o = Ed.set_block(load_box(fresh(), 0), 0, 5, 5, 1)
+      Test.assert_eq_int(List.length(Ed.dirty(o)), 2, "two chunks")
+      Test.assert_true(has_key(Ed.dirty(o), Cd.key(0, 0, 0)) && has_key(Ed.dirty(o), Cd.key(-1, 0, 0)), "its own and -x")
+    end
+    test "an edit on a chunk corner dirties all eight chunks around the corner" do
+      let o = Ed.set_block(load_box(fresh(), 0), 0, 0, 0, 1)
+      Test.assert_eq_int(List.length(Ed.dirty(o)), 8, "eight chunks")
+      Test.assert_true(has_key(Ed.dirty(o), Cd.key(-1, -1, -1)), "the diagonal one included")
+      Test.assert_true(no_dups(Ed.dirty(o)), "each once")
+    end
+    test "only loaded neighbours are dirtied" do
+      let o = Ed.set_block(load(fresh(), 0, 0, 0), 0, 0, 0, 1)
+      Test.assert_eq_int(List.length(Ed.dirty(o)), 1, "the neighbours are not loaded")
+    end
+    test "negative coordinates land in negative chunks" do
+      let o = Ed.set_block(load_box(fresh(), 0), -1, -1, -1, 0)
+      Test.assert_eq_int(Wd.get_block(Ed.world(o), -1, -1, -1), 0, "set")
+      Test.assert_eq_int(C.get(Strata.Store.get(Wd.chunks(Ed.world(o)), Cd.key(-1, -1, -1)), 31, 31, 31), 0, "at local (31, 31, 31) of chunk (-1, -1, -1)")
+      Test.assert_eq_int(Wd.get_block(Ed.world(o), 0, -1, 0), 1, "the voxel across the origin is untouched")
+    end
+    test "an edit to an unloaded chunk is queued and applied when the chunk arrives" do
+      let o = Ed.set_block(fresh(), 5, -5, 5, 0)
+      Test.assert_eq_int(List.length(Ed.dirty(o)), 0, "nothing loaded to dirty")
+      Test.assert_true(has_key(Ed.deferred(o), Cd.key(0, -1, 0)), "deferred on its chunk")
+      Test.assert_eq_int(Wd.pending_size(Ed.world(o)), 1, "one chunk has queued edits")
+      Test.assert_true(Wd.is_edited(Ed.world(o), Cd.key(0, -1, 0)), "which counts as edited")
+      let w2 = load(Ed.world(o), 0, -1, 0)
+      Test.assert_eq_int(Wd.get_block(w2, 5, -5, 5), 0, "applied on arrival")
+      Test.assert_eq_int(Wd.pending_size(w2), 0, "and the queue is empty")
+      Test.assert_true(Wd.is_edited(w2, Cd.key(0, -1, 0)), "the chunk now differs from its generation")
+    end
+  end
+
+  describe "Edit.fill_sphere" do
+    test "fills voxels within the radius, across eight chunks, as one change" do
+      let o = Ed.fill_sphere(load_box(fresh(), 0), 0, 0, 0, 12, 1)
+      let w = Ed.world(o)
+      Test.assert_eq_int(Wd.get_block(w, 0, 0, 0), 1, "the centre")
+      Test.assert_eq_int(Wd.get_block(w, 12, 0, 0), 1, "distance 12 on +x")
+      Test.assert_eq_int(Wd.get_block(w, 0, 12, 0), 1, "distance 12 on +y")
+      Test.assert_eq_int(Wd.get_block(w, 13, 0, 0), 0, "distance 13 is outside")
+      Test.assert_eq_int(Wd.get_block(w, 9, 9, 0), 0, "(9, 9, 0) is 12.7 away: outside")
+      Test.assert_eq_int(Wd.get_block(w, 8, 8, 0), 1, "(8, 8, 0) is 11.3 away: inside")
+      Test.assert_eq_int(List.length(Ed.dirty(o)), 8, "eight chunks")
+      Test.assert_true(no_dups(Ed.dirty(o)), "each once")
+      Test.assert_eq_int(List.length(Ed.changes(o)), 1, "one SphereFill record")
+      Test.assert_eq_int(head_kind(Ed.changes(o)), 2, "of the sphere kind")
+    end
+    test "radius 0 changes one voxel; a negative radius changes nothing" do
+      let o = Ed.fill_sphere(load_box(fresh(), 0), 5, 5, 5, 0, 1)
+      Test.assert_eq_int(Wd.get_block(Ed.world(o), 5, 5, 5), 1, "the centre")
+      Test.assert_eq_int(Wd.get_block(Ed.world(o), 6, 5, 5), 0, "and no more")
+      let n = Ed.fill_sphere(load_box(fresh(), 0), 5, 5, 5, -1, 1)
+      Test.assert_eq_int(Wd.get_block(Ed.world(n), 5, 5, 5), 0, "nothing")
+      Test.assert_eq_int(List.length(Ed.dirty(n)), 0, "nothing dirty")
+      Test.assert_eq_int(List.length(Ed.changes(n)), 0, "no change record")
+    end
+  end
+
+  describe "Edit.fill_box" do
+    test "fills inclusive corners in either order, as one change" do
+      let o = Ed.fill_box(load_box(fresh(), 0), 3, 3, 3, -2, 1, 1, 1)
+      let w = Ed.world(o)
+      Test.assert_eq_int(Wd.get_block(w, -2, 1, 1), 1, "low corner")
+      Test.assert_eq_int(Wd.get_block(w, 3, 3, 3), 1, "high corner")
+      Test.assert_eq_int(Wd.get_block(w, 4, 3, 3), 0, "outside")
+      Test.assert_eq_int(List.length(Ed.changes(o)), 1, "one BoxFill record")
+      Test.assert_eq_int(head_kind(Ed.changes(o)), 1, "of the box kind")
+    end
+    test "the part in an unloaded chunk is deferred and applied on arrival" do
+      -- chunks (0,0,0) loaded, (1,0,0) not; the box spans both
+      let o = Ed.fill_box(load(fresh(), 0, 0, 0), 30, 5, 5, 34, 5, 5, 1)
+      Test.assert_eq_int(Wd.get_block(Ed.world(o), 31, 5, 5), 1, "the loaded part is set")
+      Test.assert_true(has_key(Ed.deferred(o), Cd.key(1, 0, 0)), "the unloaded chunk is deferred")
+      Test.assert_eq_int(List.length(Ed.deferred(o)), 1, "only that one")
+      Test.assert_eq_int(Wd.pending_size(Ed.world(o)), 1, "one chunk queued")
+      let w2 = load(Ed.world(o), 1, 0, 0)
+      Test.assert_eq_int(Wd.get_block(w2, 34, 5, 5), 1, "inside the box")
+      Test.assert_eq_int(Wd.get_block(w2, 35, 5, 5), 0, "outside it")
+      Test.assert_eq_int(Wd.pending_size(w2), 0, "queue drained")
+    end
+    test "queued edits apply in the order they were made" do
+      let o1 = Ed.fill_box(fresh(), 0, 0, 0, 5, 5, 5, 1)
+      let o2 = Ed.set_block(Ed.world(o1), 2, 2, 2, 0)
+      let w = load(Ed.world(o2), 0, 0, 0)
+      Test.assert_eq_int(Wd.get_block(w, 2, 2, 2), 0, "the later single edit wins")
+      Test.assert_eq_int(Wd.get_block(w, 3, 2, 2), 1, "over the earlier box")
+    end
+  end
+
+  describe "Edit.set_many" do
+    test "agrees with setting each cell in turn" do
+      Check.all(Gen.list(Gen.map(Gen.tuple2(Gen.tuple2(Gen.int(-40, 40), Gen.int(-40, 40)), Gen.tuple2(Gen.int(-40, 40), Gen.int(0, 1))), fn p -> flat4(p))), fn cells ->
+        let base = load_box(fresh(), 0)
+        let o = Ed.set_many(base, cells)
+        same_blocks(Ed.world(o), apply_each(base, cells), cells) && no_dups(Ed.dirty(o))
+      )
+    end
+  end
+end

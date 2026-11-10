@@ -1,0 +1,186 @@
+-- Edit — changing blocks: one, a list, a box, a sphere.
+--
+-- An edit never calls back into game code and never waits for a chunk. It
+-- returns an Outcome: the new world, the loaded chunks whose meshes must be
+-- rebuilt, a record of what changed for a game's simulation to read, and
+-- the chunks whose part of the edit had to be queued because they were not
+-- loaded (World applies those when the chunk arrives).
+--
+-- A chunk is dirty when the edit's bounds, grown by one voxel, reach into
+-- it: a changed block on a chunk boundary changes the faces and the corner
+-- shading of the chunks across the boundary too. For a box or a sphere the
+-- bounds are the shape's bounding box, so a chunk may be dirtied without a
+-- voxel of it changing; that costs a remesh, never correctness.
+mod Strata.Edit do
+
+  alias Strata.World as Wl
+  alias Strata.Coord as Kc
+
+  type Change = Cell(Int, Int, Int, Int, Int)             -- x, y, z, old id, new id
+              | BoxFill(Int, Int, Int, Int, Int, Int, Int)   -- inclusive corners (low, high), new id
+              | SphereFill(Int, Int, Int, Int, Int)          -- centre, radius in voxels, new id
+
+  doc "0 for a single cell, 1 for a box fill, 2 for a sphere fill."
+  fn kind(c : Change) : Int do
+    match c do
+      Cell(_, _, _, _, _) -> 0
+      BoxFill(_, _, _, _, _, _, _) -> 1
+      SphereFill(_, _, _, _, _) -> 2
+    end
+  end
+  doc "The id written."
+  fn new_id(c : Change) : Int do
+    match c do
+      Cell(_, _, _, _, id) -> id
+      BoxFill(_, _, _, _, _, _, id) -> id
+      SphereFill(_, _, _, _, id) -> id
+    end
+  end
+  doc "The id a single cell held before; -1 for a bulk change, which does not record what it overwrote."
+  fn old_id(c : Change) : Int do
+    match c do
+      Cell(_, _, _, old, _) -> old
+      _ -> -1
+    end
+  end
+  doc "The low corner of the change's bounds, as (x, y, z)."
+  fn low(c : Change) : (Int, Int, Int) do
+    match c do
+      Cell(x, y, z, _, _) -> (x, y, z)
+      BoxFill(x0, y0, z0, _, _, _, _) -> (x0, y0, z0)
+      SphereFill(cx, cy, cz, r, _) -> (cx - r, cy - r, cz - r)
+    end
+  end
+  doc "The high corner of the change's bounds, as (x, y, z)."
+  fn high(c : Change) : (Int, Int, Int) do
+    match c do
+      Cell(x, y, z, _, _) -> (x, y, z)
+      BoxFill(_, _, _, x1, y1, z1, _) -> (x1, y1, z1)
+      SphereFill(cx, cy, cz, r, _) -> (cx + r, cy + r, cz + r)
+    end
+  end
+  doc "A sphere fill's radius in voxels; 0 for any other change."
+  fn radius(c : Change) : Int do
+    match c do
+      SphereFill(_, _, _, r, _) -> r
+      _ -> 0
+    end
+  end
+
+  -- world, dirty chunks, changes (newest first), deferred chunks
+  type Outcome = Outcome(Strata.World.World, List(Strata.Coord.Key), List(Change), List(Strata.Coord.Key))
+
+  fn world(o : Outcome) : Strata.World.World do match o do Outcome(w, _, _, _) -> w end end
+  doc "Loaded chunks whose meshes must be rebuilt; each appears once."
+  fn dirty(o : Outcome) : List(Strata.Coord.Key) do match o do Outcome(_, d, _, _) -> d end end
+  doc "What changed, newest first."
+  fn changes(o : Outcome) : List(Change) do match o do Outcome(_, _, c, _) -> c end end
+  doc "Chunks that were not loaded: their part of the edit is queued and will be applied when they arrive."
+  fn deferred(o : Outcome) : List(Strata.Coord.Key) do match o do Outcome(_, _, _, q) -> q end end
+
+  pfn lo(a : Int, b : Int) : Int do if a < b do a else b end end
+  pfn hi(a : Int, b : Int) : Int do if a > b do a else b end end
+
+  pfn has_key(l : List(Strata.Coord.Key), k : Strata.Coord.Key) : Bool do
+    match l do
+      Nil -> false
+      Cons(h, t) -> if Kc.key_eq(h, k) do true else has_key(t, k) end
+    end
+  end
+  pfn add_key(l : List(Strata.Coord.Key), k : Strata.Coord.Key) : List(Strata.Coord.Key) do
+    if has_key(l, k) do l else Cons(k, l) end
+  end
+
+  -- Add to [acc] every LOADED chunk in the chunk box (c0..c1 on each axis).
+  -- i walks the box; n is its cell count.
+  pfn loaded_in(w : Strata.World.World, acc : List(Strata.Coord.Key), cx0 : Int, cy0 : Int, cz0 : Int, nx : Int, ny : Int, nz : Int, i : Int) : List(Strata.Coord.Key) do
+    if i >= nx * ny * nz do acc
+    else
+      let k = Kc.key(cx0 + i % nx, cy0 + (i / nx) % ny, cz0 + i / (nx * ny))
+      loaded_in(w, if Wl.is_loaded(w, k) do add_key(acc, k) else acc end, cx0, cy0, cz0, nx, ny, nz, i + 1)
+    end
+  end
+
+  -- Loaded chunks the voxel box, grown by one voxel, reaches into.
+  pfn dirty_for(w : Strata.World.World, acc : List(Strata.Coord.Key), x0 : Int, y0 : Int, z0 : Int, x1 : Int, y1 : Int, z1 : Int) : List(Strata.Coord.Key) do
+    let cx0 = Kc.chunk_of(x0 - 1)
+    let cy0 = Kc.chunk_of(y0 - 1)
+    let cz0 = Kc.chunk_of(z0 - 1)
+    loaded_in(w, acc, cx0, cy0, cz0, Kc.chunk_of(x1 + 1) - cx0 + 1, Kc.chunk_of(y1 + 1) - cy0 + 1, Kc.chunk_of(z1 + 1) - cz0 + 1, 0)
+  end
+
+  type Spread = Spread(Strata.World.World, List(Strata.Coord.Key))
+
+  -- Apply [op] to every chunk in the chunk box: loaded chunks are replaced,
+  -- the rest get the op queued and are listed as deferred.
+  pfn spread(w : Strata.World.World, defer : List(Strata.Coord.Key), op : Strata.World.Op, cx0 : Int, cy0 : Int, cz0 : Int, nx : Int, ny : Int, nz : Int, i : Int) : Spread do
+    if i >= nx * ny * nz do Spread(w, defer)
+    else
+      let k = Kc.key(cx0 + i % nx, cy0 + (i / nx) % ny, cz0 + i / (nx * ny))
+      if Wl.is_loaded(w, k) do
+        spread(Wl.replace_chunk(w, k, Wl.apply_op(Strata.Store.get(Wl.chunks(w), k), k, op)), defer, op, cx0, cy0, cz0, nx, ny, nz, i + 1)
+      else spread(Wl.enqueue(w, k, op), add_key(defer, k), op, cx0, cy0, cz0, nx, ny, nz, i + 1) end
+    end
+  end
+
+  pfn bulk(w : Strata.World.World, op : Strata.World.Op, ch : Change, x0 : Int, y0 : Int, z0 : Int, x1 : Int, y1 : Int, z1 : Int) : Outcome do
+    let cx0 = Kc.chunk_of(x0)
+    let cy0 = Kc.chunk_of(y0)
+    let cz0 = Kc.chunk_of(z0)
+    match spread(w, Nil, op, cx0, cy0, cz0, Kc.chunk_of(x1) - cx0 + 1, Kc.chunk_of(y1) - cy0 + 1, Kc.chunk_of(z1) - cz0 + 1, 0) do
+      Spread(w2, defer) -> Outcome(w2, dirty_for(w2, Nil, x0, y0, z0, x1, y1, z1), Cons(ch, Nil), defer)
+    end
+  end
+
+  doc "Set every voxel in the box with the two given corners (inclusive, in either order) to [id]."
+  fn fill_box(w : Strata.World.World, xa : Int, ya : Int, za : Int, xb : Int, yb : Int, zb : Int, id : Int) : Outcome do
+    let x0 = lo(xa, xb)
+    let x1 = hi(xa, xb)
+    let y0 = lo(ya, yb)
+    let y1 = hi(ya, yb)
+    let z0 = lo(za, zb)
+    let z1 = hi(za, zb)
+    bulk(w, Wl.op_box(x0, y0, z0, x1, y1, z1, id), BoxFill(x0, y0, z0, x1, y1, z1, id), x0, y0, z0, x1, y1, z1)
+  end
+
+  doc "Set every voxel whose centre is within [radius] voxels of (cx, cy, cz) to [id]: squared distance <= radius squared. Radius 0 is the one voxel; a negative radius is no edit."
+  fn fill_sphere(w : Strata.World.World, cx : Int, cy : Int, cz : Int, radius : Int, id : Int) : Outcome do
+    if radius < 0 do Outcome(w, Nil, Nil, Nil)
+    else bulk(w, Wl.op_sphere(cx, cy, cz, radius, id), SphereFill(cx, cy, cz, radius, id), cx - radius, cy - radius, cz - radius, cx + radius, cy + radius, cz + radius) end
+  end
+
+  -- One cell, folded into an outcome in progress.
+  pfn set_into(o : Outcome, x : Int, y : Int, z : Int, id0 : Int) : Outcome do
+    let id = if id0 < 0 || id0 > 65535 do 0 else id0 end
+    match o do
+      Outcome(w, d, cs, q) ->
+        let k = Kc.key_of_voxel(x, y, z)
+        if !Wl.is_loaded(w, k) do Outcome(Wl.enqueue(w, k, Wl.op_cell(x, y, z, id)), d, cs, add_key(q, k))
+        else
+          let old = Wl.get_block(w, x, y, z)
+          if old == id do o
+          else
+            let w2 = Wl.replace_chunk(w, k, Wl.apply_op(Strata.Store.get(Wl.chunks(w), k), k, Wl.op_cell(x, y, z, id)))
+            Outcome(w2, dirty_for(w2, d, x, y, z, x, y, z), Cons(Cell(x, y, z, old, id), cs), q)
+          end
+        end
+    end
+  end
+
+  doc "Set one block. Setting the id already there is not an edit: nothing is dirty and nothing is recorded. In a chunk that is not loaded the edit is queued and no change is recorded, since what it overwrites is not known yet."
+  fn set_block(w : Strata.World.World, x : Int, y : Int, z : Int, id : Int) : Outcome do
+    set_into(Outcome(w, Nil, Nil, Nil), x, y, z, id)
+  end
+
+  pfn many_go(o : Outcome, cells : List((Int, Int, Int, Int))) : Outcome do
+    match cells do
+      Nil -> o
+      Cons((x, y, z, id), t) -> many_go(set_into(o, x, y, z, id), t)
+    end
+  end
+
+  doc "Set a list of (x, y, z, id) cells in order, as one outcome with one Cell change per block that changed."
+  fn set_many(w : Strata.World.World, cells : List((Int, Int, Int, Int))) : Outcome do
+    many_go(Outcome(w, Nil, Nil, Nil), cells)
+  end
+end

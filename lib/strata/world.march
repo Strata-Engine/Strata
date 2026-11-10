@@ -1,0 +1,173 @@
+-- World — the loaded chunks and what must outlive them.
+--
+-- A world holds the registry, the terrain generator, the seed and the voxel
+-- scale it was made with, the chunks currently loaded, and three things
+-- that persist while a chunk is away:
+--
+--   * the cache: chunks that were unloaded while they differed from their
+--     generation. A chunk nobody edited is dropped, because it generates
+--     again identically; an edited one waits here and is restored when the
+--     world returns to it. (Nothing is written to disk yet, so the cache
+--     only grows.)
+--   * pending edits: edits made to a chunk that was not loaded. They are
+--     queued on its key, in order, and applied when it arrives.
+--   * for each loaded chunk, the hash it generated to, so a chunk edited
+--     back to its generated state is recognised and dropped again.
+--
+-- Loading policy lives in Strata.Stream; editing in Strata.Edit.
+mod Strata.World do
+
+  alias Strata.Chunk as Ck
+  alias Strata.Store as Sr
+  alias Strata.Coord as Kd
+
+  -- An edit in world voxel coordinates, as queued for a chunk that is away.
+  type Op = OpCell(Int, Int, Int, Int)                    -- x, y, z, id
+          | OpBox(Int, Int, Int, Int, Int, Int, Int)      -- low corner, high corner, id
+          | OpSphere(Int, Int, Int, Int, Int)             -- centre, radius, id
+
+  fn op_cell(x : Int, y : Int, z : Int, id : Int) : Op do OpCell(x, y, z, id) end
+  fn op_box(x0 : Int, y0 : Int, z0 : Int, x1 : Int, y1 : Int, z1 : Int, id : Int) : Op do OpBox(x0, y0, z0, x1, y1, z1, id) end
+  fn op_sphere(cx : Int, cy : Int, cz : Int, radius : Int, id : Int) : Op do OpSphere(cx, cy, cz, radius, id) end
+
+  -- registry, generator, seed, scale, loaded chunks, generation hashes,
+  -- chunks touched since they loaded, cache, pending edits (newest first)
+  type World = World(Strata.Blocks.Registry, Strata.Terrain.Gen, Int, Float, Strata.Store.Store(Strata.Chunk.Chunk), Strata.Store.Store(Int), Strata.Store.Store(Bool), Strata.Store.Store(Strata.Chunk.Chunk), Strata.Store.Store(List(Op)))
+
+  doc "An empty world: no chunk loaded. [scale] is metres per voxel."
+  fn new(r : Strata.Blocks.Registry, g : Strata.Terrain.Gen, seed : Int, scale : Float) : World do
+    World(r, g, seed, scale, Sr.empty(Ck.uniform(0)), Sr.empty(-1), Sr.empty(false), Sr.empty(Ck.uniform(0)), Sr.empty(Nil))
+  end
+
+  fn registry(w : World) : Strata.Blocks.Registry do match w do World(r, _, _, _, _, _, _, _, _) -> r end end
+  fn terrain(w : World) : Strata.Terrain.Gen do match w do World(_, g, _, _, _, _, _, _, _) -> g end end
+  fn seed(w : World) : Int do match w do World(_, _, s, _, _, _, _, _, _) -> s end end
+  doc "Metres per voxel."
+  fn scale(w : World) : Float do match w do World(_, _, _, sc, _, _, _, _, _) -> sc end end
+  doc "The loaded chunks. An absent key reads as an air chunk."
+  fn chunks(w : World) : Strata.Store.Store(Strata.Chunk.Chunk) do match w do World(_, _, _, _, cs, _, _, _, _) -> cs end end
+  fn is_loaded(w : World, k : Strata.Coord.Key) : Bool do Sr.has(chunks(w), k) end
+  fn loaded_count(w : World) : Int do Sr.size(chunks(w)) end
+  doc "How many edited chunks wait in the cache."
+  fn cache_size(w : World) : Int do match w do World(_, _, _, _, _, _, _, ca, _) -> Sr.size(ca) end end
+  doc "How many chunks have edits queued for their arrival."
+  fn pending_size(w : World) : Int do match w do World(_, _, _, _, _, _, _, _, pe) -> Sr.size(pe) end end
+
+  doc "The block at world voxel (x, y, z); air when its chunk is not loaded."
+  fn get_block(w : World, x : Int, y : Int, z : Int) : Int do
+    Ck.get_or(Sr.get(chunks(w), Kd.key_of_voxel(x, y, z)), Kd.local_of(x), Kd.local_of(y), Kd.local_of(z), 0)
+  end
+
+  -- ── Applying an edit to one chunk ────────────────────────────────────────
+  pfn lo(a : Int, b : Int) : Int do if a < b do a else b end end
+  pfn hi(a : Int, b : Int) : Int do if a > b do a else b end end
+
+  pfn sphere_x(c : Strata.Chunk.Chunk, x : Int, x1 : Int, y : Int, z : Int, ox : Int, oy : Int, oz : Int, cx : Int, cy : Int, cz : Int, rr : Int, id : Int) : Strata.Chunk.Chunk do
+    if x > x1 do c
+    else
+      let dx = ox + x - cx
+      let dy = oy + y - cy
+      let dz = oz + z - cz
+      let i = x + 32 * (z + 32 * y)
+      if dx * dx + dy * dy + dz * dz <= rr && i >= 0 && i < 32768 do sphere_x(Ck.set_idx(c, i, id), x + 1, x1, y, z, ox, oy, oz, cx, cy, cz, rr, id)
+      else sphere_x(c, x + 1, x1, y, z, ox, oy, oz, cx, cy, cz, rr, id) end
+    end
+  end
+  pfn sphere_z(c : Strata.Chunk.Chunk, x0 : Int, x1 : Int, y : Int, z : Int, z1 : Int, ox : Int, oy : Int, oz : Int, cx : Int, cy : Int, cz : Int, rr : Int, id : Int) : Strata.Chunk.Chunk do
+    if z > z1 do c else sphere_z(sphere_x(c, x0, x1, y, z, ox, oy, oz, cx, cy, cz, rr, id), x0, x1, y, z + 1, z1, ox, oy, oz, cx, cy, cz, rr, id) end
+  end
+  pfn sphere_y(c : Strata.Chunk.Chunk, x0 : Int, x1 : Int, y : Int, y1 : Int, z0 : Int, z1 : Int, ox : Int, oy : Int, oz : Int, cx : Int, cy : Int, cz : Int, rr : Int, id : Int) : Strata.Chunk.Chunk do
+    if y > y1 do c else sphere_y(sphere_z(c, x0, x1, y, z0, z1, ox, oy, oz, cx, cy, cz, rr, id), x0, x1, y + 1, y1, z0, z1, ox, oy, oz, cx, cy, cz, rr, id) end
+  end
+
+  doc "The chunk at [k] after [op], which is in world voxel coordinates and is clipped to the chunk."
+  fn apply_op(c : Strata.Chunk.Chunk, k : Strata.Coord.Key, op : Op) : Strata.Chunk.Chunk do
+    let ox = 32 * Kd.kx(k)
+    let oy = 32 * Kd.ky(k)
+    let oz = 32 * Kd.kz(k)
+    match op do
+      OpCell(x, y, z, id) -> Ck.fill_box(c, x - ox, y - oy, z - oz, x - ox, y - oy, z - oz, id)
+      OpBox(x0, y0, z0, x1, y1, z1, id) -> Ck.fill_box(c, x0 - ox, y0 - oy, z0 - oz, x1 - ox, y1 - oy, z1 - oz, id)
+      OpSphere(cx, cy, cz, r, id) ->
+        if r < 0 do c
+        else
+          let x0 = hi(cx - r - ox, 0)
+          let x1 = lo(cx + r - ox, 31)
+          let y0 = hi(cy - r - oy, 0)
+          let y1 = lo(cy + r - oy, 31)
+          let z0 = hi(cz - r - oz, 0)
+          let z1 = lo(cz + r - oz, 31)
+          if x0 > x1 || y0 > y1 || z0 > z1 do c
+          else sphere_y(c, x0, x1, y0, y1, z0, z1, ox, oy, oz, cx, cy, cz, r * r, id) end
+        end
+    end
+  end
+
+  -- queued newest first: apply the tail before the head
+  pfn apply_queued(c : Strata.Chunk.Chunk, k : Strata.Coord.Key, ops : List(Op)) : Strata.Chunk.Chunk do
+    match ops do
+      Nil -> c
+      Cons(op, older) -> apply_op(apply_queued(c, k, older), k, op)
+    end
+  end
+
+  -- ── Loading and unloading ────────────────────────────────────────────────
+  doc "Load the chunk at [k], given what the generator produced for it. A cached edited chunk takes the generated one's place, and edits queued for the key are applied."
+  fn insert(w : World, k : Strata.Coord.Key, generated : Strata.Chunk.Chunk) : World do
+    match w do
+      World(r, g, sd, sc, cs, gh, tc, ca, pe) ->
+        let cached = Sr.has(ca, k)
+        let base = if cached do Sr.get(ca, k) else generated end
+        let queued = Sr.get(pe, k)
+        let had_queue = match queued do
+          Nil -> false
+          _ -> true
+        end
+        let c = apply_queued(base, k, queued)
+        World(r, g, sd, sc, Sr.put(cs, k, c), Sr.put(gh, k, Ck.hash(generated)), if cached || had_queue do Sr.put(tc, k, true) else Sr.remove(tc, k) end, Sr.remove(ca, k), Sr.remove(pe, k))
+    end
+  end
+
+  -- Does the loaded chunk at k differ from what it generated to? Only a
+  -- chunk touched since it loaded is hashed.
+  pfn differs(cs : Strata.Store.Store(Strata.Chunk.Chunk), gh : Strata.Store.Store(Int), tc : Strata.Store.Store(Bool), k : Strata.Coord.Key) : Bool do
+    Sr.get(tc, k) && Ck.hash(Sr.get(cs, k)) != Sr.get(gh, k)
+  end
+
+  doc "Unload the chunk at [k]. One that differs from its generation moves to the cache; any other is dropped. Unloading a chunk that is not loaded changes nothing."
+  fn unload(w : World, k : Strata.Coord.Key) : World do
+    match w do
+      World(r, g, sd, sc, cs, gh, tc, ca, pe) ->
+        if !Sr.has(cs, k) do w
+        else
+          let ca2 = if differs(cs, gh, tc, k) do Sr.put(ca, k, Ck.compact(Sr.get(cs, k))) else ca end
+          World(r, g, sd, sc, Sr.remove(cs, k), Sr.remove(gh, k), Sr.remove(tc, k), ca2, pe)
+        end
+    end
+  end
+
+  doc "Has the chunk at [k] been edited: loaded and different from its generation, waiting in the cache, or with edits queued?"
+  fn is_edited(w : World, k : Strata.Coord.Key) : Bool do
+    match w do
+      World(_, _, _, _, cs, gh, tc, ca, pe) ->
+        if Sr.has(cs, k) do differs(cs, gh, tc, k) else Sr.has(ca, k) || Sr.has(pe, k) end
+    end
+  end
+
+  -- ── What Strata.Edit builds on ───────────────────────────────────────────
+  doc "Replace the loaded chunk at [k] and mark it touched. Nothing happens if [k] is not loaded."
+  fn replace_chunk(w : World, k : Strata.Coord.Key, c : Strata.Chunk.Chunk) : World do
+    match w do
+      World(r, g, sd, sc, cs, gh, tc, ca, pe) ->
+        if !Sr.has(cs, k) do w
+        else World(r, g, sd, sc, Sr.put(cs, k, c), gh, Sr.put(tc, k, true), ca, pe) end
+    end
+  end
+
+  doc "Queue [op] for the chunk at [k], to be applied when it is inserted."
+  fn enqueue(w : World, k : Strata.Coord.Key, op : Op) : World do
+    match w do
+      World(r, g, sd, sc, cs, gh, tc, ca, pe) -> World(r, g, sd, sc, cs, gh, tc, ca, Sr.put(pe, k, Cons(op, Sr.get(pe, k))))
+    end
+  end
+end
