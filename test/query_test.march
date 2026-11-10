@@ -1,0 +1,220 @@
+-- Query: voxel ray casting and swept box collision, in metres at any scale.
+mod Strata.Test.Query do
+
+  needs IO.Clock      -- charged to every test module once any uses Check.all (GAPS S3)
+  needs IO.Process
+  import Test
+  alias Strata.Query as Qy
+  alias Strata.World as Wd
+  alias Strata.Edit as Ed
+  alias Strata.Coord as Cd
+  alias Strata.Chunk as C
+  alias Strata.Blocks as B
+
+  pfn add(r : Strata.Blocks.Registry, d : Strata.Blocks.Def) : Strata.Blocks.Registry do
+    match B.register(r, d) do
+      Ok((r2, _)) -> r2
+      Err(_) -> r
+    end
+  end
+  -- 1 stone; 2 glass (see-through, collides); 3 slab: a model whose box is
+  -- the lower half of its cell; 4 plant: a cross, no collision
+  pfn reg() : Strata.Blocks.Registry do
+    match B.add_model(B.empty(), NativeArray.make_f32(0, 0.0), Cons(Strata.Blocks.Box(0.0, 0.0, 0.0, 1.0, 0.5, 1.0), Nil)) do
+      (r0, m) ->
+        let glass = B.with_opacity(B.def(), Strata.Blocks.SeeThrough)
+        let slab = B.with_style(B.with_opacity(B.def(), Strata.Blocks.Clear), Strata.Blocks.Model(m))
+        let plant = B.with_collide(B.with_style(B.with_opacity(B.def(), Strata.Blocks.Clear), Strata.Blocks.Cross), false)
+        add(add(add(add(r0, B.def()), glass), slab), plant)
+    end
+  end
+
+  pfn empty_world(scale : Float) : Strata.World.World do
+    Wd.new(reg(), Strata.Terrain.gen(fn (k, seed) -> C.uniform(0)), 1, scale)
+  end
+  -- load the 2 x 2 x 2 chunks -1..0 on each axis: voxels -32..31
+  pfn load_go(w : Strata.World.World, i : Int) : Strata.World.World do
+    if i >= 8 do w
+    else
+      let k = Cd.key(i % 2 - 1, (i / 2) % 2 - 1, i / 4 - 1)
+      load_go(Wd.insert(w, k, C.uniform(0)), i + 1)
+    end
+  end
+  pfn air(scale : Float) : Strata.World.World do load_go(empty_world(scale), 0) end
+  pfn put(w : Strata.World.World, x : Int, y : Int, z : Int, id : Int) : Strata.World.World do Ed.world(Ed.set_block(w, x, y, z, id)) end
+  pfn box(w : Strata.World.World, x0 : Int, y0 : Int, z0 : Int, x1 : Int, y1 : Int, z1 : Int, id : Int) : Strata.World.World do
+    Ed.world(Ed.fill_box(w, x0, y0, z0, x1, y1, z1, id))
+  end
+  pfn near(a : Float, b : Float) : Bool do Math.abs(a -. b) < 0.001 end
+  pfn stone_only(id : Int) : Bool do id == 1 end
+
+  -- ── The sampling oracle for the property ─────────────────────────────────
+  pfn scatter(w : Strata.World.World, cells : List((Int, Int))) : Strata.World.World do
+    match cells do
+      Nil -> w
+      Cons((a, b), t) -> scatter(put(w, a % 13 - 6, b % 11 - 5, (a / 13 + b / 11) % 13 - 6, 1), t)
+    end
+  end
+  -- first sample, every 1/64 voxel, that lies in a stone voxel: its distance, or -1.0
+  pfn sample(w : Strata.World.World, ox : Float, oy : Float, oz : Float, dx : Float, dy : Float, dz : Float, i : Int, n : Int) : Float do
+    if i > n do -1.0
+    else
+      let t = int_to_float(i) /. 64.0
+      if Wd.get_block(w, float_to_int(Math.floor(ox +. dx *. t)), float_to_int(Math.floor(oy +. dy *. t)), float_to_int(Math.floor(oz +. dz *. t))) == 1 do t
+      else sample(w, ox, oy, oz, dx, dy, dz, i + 1, n) end
+    end
+  end
+  pfn ray_agrees(w : Strata.World.World, a : Int, b : Int, c : Int) : Bool do
+    let ox = int_to_float(a % 9 - 4) +. 0.37
+    let oy = int_to_float(b % 9 - 4) +. 0.61
+    let oz = int_to_float(c % 9 - 4) +. 0.43
+    let rx = int_to_float(a / 9 % 7 - 3) +. 0.21
+    let ry = int_to_float(b / 9 % 7 - 3) +. 0.13
+    let rz = int_to_float(c / 9 % 7 - 3) -. 0.17
+    let len = Math.sqrt(rx *. rx +. ry *. ry +. rz *. rz)
+    let dx = rx /. len
+    let dy = ry /. len
+    let dz = rz /. len
+    let h = Qy.raycast(w, ox, oy, oz, rx, ry, rz, 12.0, fn id -> id == 1)
+    let s = sample(w, ox, oy, oz, dx, dy, dz, 0, 12 * 64)
+    if Qy.is_hit(h) do
+      -- the hit voxel is stone, the ray is inside it just past the hit, and the sampler found nothing clearly earlier
+      let d = Qy.hit_dist(h) +. 0.002
+      let inside = float_to_int(Math.floor(ox +. dx *. d)) == Qy.hit_x(h) && float_to_int(Math.floor(oy +. dy *. d)) == Qy.hit_y(h) && float_to_int(Math.floor(oz +. dz *. d)) == Qy.hit_z(h)
+      Wd.get_block(w, Qy.hit_x(h), Qy.hit_y(h), Qy.hit_z(h)) == 1 && inside && (s < 0.0 || s >= Qy.hit_dist(h) -. 0.02)
+    else s < 0.0 end
+  end
+
+  describe "Query.raycast" do
+    test "a ray straight down hits the floor's top face at the right distance" do
+      let w = box(air(1.0), -8, 0, -8, 8, 0, 8, 1)
+      let h = Qy.raycast(w, 0.5, 5.0, 0.5, 0.0, -1.0, 0.0, 50.0, Qy.targetable(reg()))
+      Test.assert_true(Qy.is_hit(h), "hit")
+      Test.assert_eq_int(Qy.hit_x(h), 0, "x")
+      Test.assert_eq_int(Qy.hit_y(h), 0, "the floor voxel")
+      Test.assert_eq_int(Qy.hit_z(h), 0, "z")
+      Test.assert_eq_int(Qy.hit_face(h), 0, "entered through its +y face")
+      Test.assert_true(near(Qy.hit_dist(h), 4.0), "from 5.0 to the top at 1.0")
+    end
+    test "distances are metres at any voxel scale, and the direction need not be unit length" do
+      let w = box(air(0.1), -8, 0, -8, 8, 0, 8, 1)
+      let h = Qy.raycast(w, 0.05, 0.5, 0.05, 0.0, -7.0, 0.0, 50.0, Qy.targetable(reg()))
+      Test.assert_eq_int(Qy.hit_y(h), 0, "the floor voxel")
+      Test.assert_true(near(Qy.hit_dist(h), 0.4), "from 0.5 m to the top at 0.1 m")
+    end
+    test "works across the origin into negative voxels" do
+      let w = put(air(1.0), -3, 0, 0, 1)
+      let h = Qy.raycast(w, -0.5, 0.5, 0.5, -1.0, 0.0, 0.0, 50.0, Qy.targetable(reg()))
+      Test.assert_eq_int(Qy.hit_x(h), -3, "voxel -3")
+      Test.assert_eq_int(Qy.hit_face(h), 2, "entered through its +x face")
+      Test.assert_true(near(Qy.hit_dist(h), 1.5), "from -0.5 to the face at -2.0")
+    end
+    test "a diagonal ray reports the face it crossed last" do
+      let w = put(air(1.0), 3, 0, 3, 1)
+      -- from (0.5, 0.5, 2.6) toward +x and slightly +z: enters voxel (3, 0, 3) through its -x face
+      let h = Qy.raycast(w, 0.5, 0.5, 2.6, 1.0, 0.0, 0.2, 50.0, Qy.targetable(reg()))
+      Test.assert_eq_int(Qy.hit_x(h), 3, "x")
+      Test.assert_eq_int(Qy.hit_z(h), 3, "z")
+      Test.assert_eq_int(Qy.hit_face(h), 3, "-x face")
+    end
+    test "misses when nothing is in range, or the ray leaves the loaded world" do
+      let w = put(air(1.0), 10, 0, 0, 1)
+      Test.assert_false(Qy.is_hit(Qy.raycast(w, 0.5, 0.5, 0.5, 1.0, 0.0, 0.0, 5.0, Qy.targetable(reg()))), "the block is beyond max")
+      Test.assert_true(Qy.is_hit(Qy.raycast(w, 0.5, 0.5, 0.5, 1.0, 0.0, 0.0, 9.6, Qy.targetable(reg()))), "but within 9.6")
+      Test.assert_false(Qy.is_hit(Qy.raycast(w, 0.5, 0.5, 0.5, 0.0, 1.0, 0.0, 500.0, Qy.targetable(reg()))), "up and out of the loaded chunks")
+    end
+    test "a zero direction or a non-positive range is a miss" do
+      let w = put(air(1.0), 1, 0, 0, 1)
+      Test.assert_false(Qy.is_hit(Qy.raycast(w, 0.5, 0.5, 0.5, 0.0, 0.0, 0.0, 50.0, Qy.targetable(reg()))), "no direction")
+      Test.assert_false(Qy.is_hit(Qy.raycast(w, 0.5, 0.5, 0.5, 1.0, 0.0, 0.0, 0.0, Qy.targetable(reg()))), "no range")
+      Test.assert_false(Qy.is_hit(Qy.raycast(w, 0.5, 0.5, 0.5, 1.0, 0.0, 0.0, -3.0, Qy.targetable(reg()))), "negative range")
+    end
+    test "the stop predicate chooses what ends the ray" do
+      let w = put(put(air(1.0), 2, 0, 0, 2), 5, 0, 0, 1)
+      let all = Qy.raycast(w, 0.5, 0.5, 0.5, 1.0, 0.0, 0.0, 50.0, Qy.targetable(reg()))
+      Test.assert_eq_int(Qy.hit_x(all), 2, "everything targetable: the glass")
+      let stone = Qy.raycast(w, 0.5, 0.5, 0.5, 1.0, 0.0, 0.0, 50.0, fn id -> stone_only(id))
+      Test.assert_eq_int(Qy.hit_x(stone), 5, "stone only: through the glass")
+      Test.assert_eq_int(Qy.hit_face(stone), 3, "-x face")
+      Test.assert_true(near(Qy.hit_dist(stone), 4.5), "distance")
+    end
+    test "a model block is hit only where the ray meets its boxes; a cross as its whole cell" do
+      let w = put(put(air(1.0), 3, 0, 0, 3), 3, 2, 0, 4)
+      Test.assert_false(Qy.is_hit(Qy.raycast(w, 0.5, 0.75, 0.5, 1.0, 0.0, 0.0, 20.0, Qy.targetable(reg()))), "over the half slab")
+      let low = Qy.raycast(w, 0.5, 0.25, 0.5, 1.0, 0.0, 0.0, 20.0, Qy.targetable(reg()))
+      Test.assert_eq_int(Qy.hit_x(low), 3, "into the half slab")
+      Test.assert_true(near(Qy.hit_dist(low), 2.5), "at its -x side")
+      let down = Qy.raycast(w, 3.5, 0.9, 0.5, 0.0, -1.0, 0.0, 20.0, Qy.targetable(reg()))
+      Test.assert_true(near(Qy.hit_dist(down), 0.4), "from above, onto the slab's top at 0.5")
+      Test.assert_eq_int(Qy.hit_face(down), 0, "its top")
+      let plant = Qy.raycast(w, 0.5, 2.9, 0.5, 1.0, 0.0, 0.0, 20.0, Qy.targetable(reg()))
+      Test.assert_eq_int(Qy.hit_x(plant), 3, "the cross is hit as a full cell")
+    end
+    test "a ray starting inside a block hits it at distance 0" do
+      let w = put(air(1.0), 0, 0, 0, 1)
+      let h = Qy.raycast(w, 0.5, 0.5, 0.5, 1.0, 0.0, 0.0, 20.0, Qy.targetable(reg()))
+      Test.assert_true(Qy.is_hit(h) && near(Qy.hit_dist(h), 0.0), "at once")
+    end
+    test "agrees with a fine sampler on scattered worlds" do
+      Check.all(Gen.tuple2(Gen.list(Gen.tuple2(Gen.int(0, 500), Gen.int(0, 500))), Gen.tuple3(Gen.int(0, 500), Gen.int(0, 500), Gen.int(0, 500))), fn p ->
+        match p do
+          (cells, (a, b, c)) -> ray_agrees(scatter(air(1.0), cells), a, b, c)
+        end
+      )
+    end
+  end
+
+  describe "Query.sweep" do
+    test "a falling box lands with its base on the floor" do
+      let w = box(air(1.0), -8, -1, -8, 8, -1, 8, 1)
+      let s = Qy.sweep(w, 0.5, 3.0, 0.5, 0.3, 0.9, 0.3, 0.0, -5.0, 0.0)
+      Test.assert_true(near(Qy.swept_y(s), 0.9), "centre at its half height above the floor's top at 0.0")
+      Test.assert_true(Qy.blocked_y(s), "blocked on y")
+      Test.assert_false(Qy.blocked_x(s) || Qy.blocked_z(s), "only on y")
+    end
+    test "free motion moves the whole way" do
+      let s = Qy.sweep(air(1.0), 0.5, 3.0, 0.5, 0.3, 0.9, 0.3, 1.25, -1.0, 2.5)
+      Test.assert_true(near(Qy.swept_x(s), 1.75) && near(Qy.swept_y(s), 2.0) && near(Qy.swept_z(s), 3.0), "arrived")
+      Test.assert_false(Qy.blocked_x(s) || Qy.blocked_y(s) || Qy.blocked_z(s), "unblocked")
+    end
+    test "zero motion stays put and is not blocked" do
+      let s = Qy.sweep(air(1.0), 0.5, 3.0, 0.5, 0.3, 0.9, 0.3, 0.0, 0.0, 0.0)
+      Test.assert_true(near(Qy.swept_x(s), 0.5) && near(Qy.swept_y(s), 3.0) && near(Qy.swept_z(s), 0.5), "where it was")
+      Test.assert_false(Qy.blocked_x(s) || Qy.blocked_y(s) || Qy.blocked_z(s), "unblocked")
+    end
+    test "sliding along a wall keeps the free axis" do
+      let w = box(air(1.0), 2, -2, -8, 2, 6, 8, 1)
+      let s = Qy.sweep(w, 0.5, 1.0, 0.5, 0.3, 0.9, 0.3, 3.0, 0.0, 1.0)
+      Test.assert_true(near(Qy.swept_x(s), 1.7), "stopped with its side on the wall at 2.0")
+      Test.assert_true(near(Qy.swept_z(s), 1.5), "z ran free")
+      Test.assert_true(Qy.blocked_x(s) && !Qy.blocked_z(s), "blocked on x only")
+    end
+    test "a fast box does not tunnel through a thin wall" do
+      let w = box(air(1.0), 5, -2, -8, 5, 6, 8, 1)
+      let s = Qy.sweep(w, 0.5, 1.0, 0.5, 0.3, 0.9, 0.3, 20.0, 0.0, 0.0)
+      Test.assert_true(near(Qy.swept_x(s), 4.7), "stopped at the wall")
+      let back = Qy.sweep(w, 9.5, 1.0, 0.5, 0.3, 0.9, 0.3, -20.0, 0.0, 0.0)
+      Test.assert_true(near(Qy.swept_x(back), 6.3), "and from the other side, at its far face 6.0")
+    end
+    test "a 0.6 m box fits a one-voxel gap at 1 m voxels and not at half-metre voxels" do
+      -- a corridor along +x from voxel x = 4: walls at voxel z = -1 and z = 1, the gap is voxel z = 0
+      let wide = box(box(air(1.0), 4, -4, -1, 12, 8, -1, 1), 4, -4, 1, 12, 8, 1, 1)
+      let a = Qy.sweep(wide, 1.5, 1.0, 0.5, 0.3, 0.9, 0.3, 5.0, 0.0, 0.0)
+      Test.assert_true(near(Qy.swept_x(a), 6.5) && !Qy.blocked_x(a), "passes a 1.0 m gap")
+      let narrow = box(box(air(0.5), 4, -4, -1, 12, 8, -1, 1), 4, -4, 1, 12, 8, 1, 1)
+      let b = Qy.sweep(narrow, 0.75, 1.0, 0.25, 0.3, 0.9, 0.3, 2.5, 0.0, 0.0)
+      Test.assert_true(Qy.blocked_x(b), "blocked by a 0.5 m gap")
+      Test.assert_true(near(Qy.swept_x(b), 1.7), "at the corridor's mouth, 2.0 m")
+    end
+    test "a model collides by its boxes, a cross not at all, and a block that does not collide is passed" do
+      -- a half slab at voxel (3, 0, 0): its top is at 0.5
+      let w = put(put(air(1.0), 3, 0, 0, 3), 6, 0, 0, 4)
+      let over = Qy.sweep(w, 0.5, 0.9, 0.5, 0.3, 0.3, 0.3, 4.0, 0.0, 0.0)
+      Test.assert_true(!Qy.blocked_x(over) && near(Qy.swept_x(over), 4.5), "a box whose base is at 0.6 clears the slab")
+      let into = Qy.sweep(w, 0.5, 0.5, 0.5, 0.3, 0.3, 0.3, 4.0, 0.0, 0.0)
+      Test.assert_true(Qy.blocked_x(into) && near(Qy.swept_x(into), 2.7), "one whose base is at 0.2 stops at the slab's side")
+      let plant = Qy.sweep(w, 4.5, 0.9, 0.5, 0.3, 0.3, 0.3, 4.0, 0.0, 0.0)
+      Test.assert_true(!Qy.blocked_x(plant) && near(Qy.swept_x(plant), 8.5), "the cross is walked through")
+    end
+  end
+end

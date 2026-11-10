@@ -1,0 +1,292 @@
+-- Query — asking the world about space: a voxel-stepping ray cast and a
+-- swept box collision. Positions and distances are metres; the world's
+-- voxel scale converts.
+--
+-- A Cube or Cross block is hit by a ray as its whole cell, a Model block
+-- only where the ray meets one of its boxes. A moving box is stopped by
+-- blocks the registry says collide: Cube blocks as their cell, Model blocks
+-- by their boxes, Cross blocks never.
+mod Strata.Query do
+
+  alias Strata.World as Wq
+  alias Strata.Blocks as Bq
+
+  -- ── Ray casting ──────────────────────────────────────────────────────────
+  -- voxel x, y, z; the face of that voxel the ray entered through (0 +y,
+  -- 1 -y, 2 +x, 3 -x, 4 +z, 5 -z); distance in metres
+  type Hit = Miss | Struck(Int, Int, Int, Int, Float)
+
+  fn is_hit(h : Hit) : Bool do
+    match h do
+      Miss -> false
+      Struck(_, _, _, _, _) -> true
+    end
+  end
+  doc "The voxel hit; 0 for a miss."
+  fn hit_x(h : Hit) : Int do
+    match h do
+      Struck(x, _, _, _, _) -> x
+      Miss -> 0
+    end
+  end
+  fn hit_y(h : Hit) : Int do
+    match h do
+      Struck(_, y, _, _, _) -> y
+      Miss -> 0
+    end
+  end
+  fn hit_z(h : Hit) : Int do
+    match h do
+      Struck(_, _, z, _, _) -> z
+      Miss -> 0
+    end
+  end
+  doc "The face of the voxel the ray entered through (0 +y, 1 -y, 2 +x, 3 -x, 4 +z, 5 -z): the side a block would be placed against. -1 for a miss."
+  fn hit_face(h : Hit) : Int do
+    match h do
+      Struck(_, _, _, f, _) -> f
+      Miss -> -1
+    end
+  end
+  doc "Distance to the hit in metres; -1.0 for a miss."
+  fn hit_dist(h : Hit) : Float do
+    match h do
+      Struck(_, _, _, _, d) -> d
+      Miss -> -1.0
+    end
+  end
+
+  doc "A stop predicate for `raycast`: any block that draws something (every style but NoMesh)."
+  fn targetable(r : Strata.Blocks.Registry) : Int -> Bool do
+    fn id -> Bq.style_index(r, id) != 3
+  end
+
+  pfn big() : Float do 1000000000000000000000000000000.0 end
+  pfn absf(v : Float) : Float do if v < 0.0 do 0.0 -. v else v end end
+  pfn floor_int(v : Float) : Int do float_to_int(Math.floor(v)) end
+
+  -- The face entered when stepping along [axis] (0 x, 1 y, 2 z) in direction [u].
+  pfn face_for(axis : Int, u : Float) : Int do
+    if axis == 0 do (if u > 0.0 do 3 else 2 end)
+    else if axis == 1 do (if u > 0.0 do 1 else 0 end)
+    else (if u > 0.0 do 5 else 4 end) end end
+  end
+
+  -- The face a ray is deemed to enter by when it starts inside a block:
+  -- the one facing back along its strongest axis.
+  pfn face_back(ux : Float, uy : Float, uz : Float) : Int do
+    if absf(ux) >= absf(uy) && absf(ux) >= absf(uz) do face_for(0, ux)
+    else if absf(uy) >= absf(uz) do face_for(1, uy)
+    else face_for(2, uz) end end
+  end
+
+  -- One axis of a ray/box slab test: (t near, t far) along the ray, or an
+  -- empty interval when the ray is parallel to the slab and outside it.
+  pfn slab(p : Float, u : Float, lo : Float, hi : Float) : (Float, Float) do
+    if absf(u) < 0.000000000001 do (if p >= lo && p <= hi do (0.0 -. big(), big()) else (big(), 0.0 -. big()) end)
+    else
+      let a = (lo -. p) /. u
+      let b = (hi -. p) /. u
+      if a < b do (a, b) else (b, a) end
+    end
+  end
+
+  -- Nearest hit of the ray with a list of boxes in the cell at (cx, cy, cz):
+  -- (t, face), t = big() for none. Positions in voxel units.
+  pfn boxes_hit(bs : List(Strata.Blocks.Box), cx : Float, cy : Float, cz : Float, px : Float, py : Float, pz : Float, ux : Float, uy : Float, uz : Float, best_t : Float, best_f : Int) : (Float, Int) do
+    match bs do
+      Nil -> (best_t, best_f)
+      Cons(b, rest) ->
+        match Bq.box_bounds(b) do
+          (x0, y0, z0, x1, y1, z1) ->
+            match slab(px, ux, cx +. x0, cx +. x1) do
+              (ax, bx) ->
+                match slab(py, uy, cy +. y0, cy +. y1) do
+                  (ay, b_y) ->
+                    match slab(pz, uz, cz +. z0, cz +. z1) do
+                      (az, bz) ->
+                        let near = if ax >= ay && ax >= az do ax else if ay >= az do ay else az end end
+                        let far = if bx <= b_y && bx <= bz do bx else if b_y <= bz do b_y else bz end end
+                        if near > far || far < 0.0 do boxes_hit(rest, cx, cy, cz, px, py, pz, ux, uy, uz, best_t, best_f)
+                        else
+                          let t = if near < 0.0 do 0.0 else near end
+                          let f = if near < 0.0 do face_back(ux, uy, uz)
+                            else if ax >= ay && ax >= az do face_for(0, ux)
+                            else if ay >= az do face_for(1, uy)
+                            else face_for(2, uz) end end end
+                          if t < best_t do boxes_hit(rest, cx, cy, cz, px, py, pz, ux, uy, uz, t, f)
+                          else boxes_hit(rest, cx, cy, cz, px, py, pz, ux, uy, uz, best_t, best_f) end
+                        end
+                    end
+                end
+            end
+        end
+    end
+  end
+
+  -- Walk the voxels the ray passes through. (vx, vy, vz) is the current
+  -- voxel, entered at t (voxel units) through [face]; (nx, ny, nz) are the
+  -- t at which the ray next crosses a voxel boundary on each axis.
+  pfn walk(w : Strata.World.World, r : Strata.Blocks.Registry, stop : Int -> Bool, sc : Float, tmax : Float, px : Float, py : Float, pz : Float, ux : Float, uy : Float, uz : Float, vx : Int, vy : Int, vz : Int, t : Float, face : Int, nx : Float, ny : Float, nz : Float, steps : Int) : Hit do
+    if t > tmax || steps <= 0 do Miss
+    else
+      let id = Wq.get_block(w, vx, vy, vz)
+      let t_out = if nx <= ny && nx <= nz do nx else if ny <= nz do ny else nz end end
+      let found = if id == 0 || !stop(id) do (big(), face)
+        else if Bq.style_index(r, id) == 2 do
+          match boxes_hit(Bq.model_boxes(r, Bq.model_of(r, id)), int_to_float(vx), int_to_float(vy), int_to_float(vz), px, py, pz, ux, uy, uz, big(), face) do
+            (bt, bf) -> if bt <= t_out +. 0.000000001 && bt <= tmax do (bt, bf) else (big(), face) end
+          end
+        else (t, face) end end
+      match found do
+        (ht, hf) ->
+          if ht < big() do Struck(vx, vy, vz, hf, ht *. sc)
+          else if nx <= ny && nx <= nz do walk(w, r, stop, sc, tmax, px, py, pz, ux, uy, uz, vx + (if ux > 0.0 do 1 else -1 end), vy, vz, nx, face_for(0, ux), nx +. absf(1.0 /. ux), ny, nz, steps - 1)
+          else if ny <= nz do walk(w, r, stop, sc, tmax, px, py, pz, ux, uy, uz, vx, vy + (if uy > 0.0 do 1 else -1 end), vz, ny, face_for(1, uy), nx, ny +. absf(1.0 /. uy), nz, steps - 1)
+          else walk(w, r, stop, sc, tmax, px, py, pz, ux, uy, uz, vx, vy, vz + (if uz > 0.0 do 1 else -1 end), nz, face_for(2, uz), nx, ny, nz +. absf(1.0 /. uz), steps - 1) end end end
+      end
+    end
+  end
+
+  -- t at which the ray first crosses a voxel boundary on one axis.
+  pfn first_cross(p : Float, u : Float, v : Int) : Float do
+    if absf(u) < 0.000000000001 do big()
+    else if u > 0.0 do (int_to_float(v + 1) -. p) /. u
+    else (int_to_float(v) -. p) /. u end end
+  end
+
+  doc "Cast a ray from (ox, oy, oz) along (dx, dy, dz), which need not be unit length, for at most [max] metres. [stop] says which block ids end the ray; the others are passed through. A zero direction or a non-positive [max] is a miss, as is leaving the loaded world."
+  fn raycast(w : Strata.World.World, ox : Float, oy : Float, oz : Float, dx : Float, dy : Float, dz : Float, max : Float, stop : Int -> Bool) : Hit do
+    let len = Math.sqrt(dx *. dx +. dy *. dy +. dz *. dz)
+    let sc = Wq.scale(w)
+    if len < 0.000000000001 || max <= 0.0 || sc <= 0.0 do Miss
+    else
+      let ux = dx /. len
+      let uy = dy /. len
+      let uz = dz /. len
+      let px = ox /. sc
+      let py = oy /. sc
+      let pz = oz /. sc
+      let vx = floor_int(px)
+      let vy = floor_int(py)
+      let vz = floor_int(pz)
+      let tmax = max /. sc
+      walk(w, Wq.registry(w), stop, sc, tmax, px, py, pz, ux, uy, uz, vx, vy, vz, 0.0, face_back(ux, uy, uz), first_cross(px, ux, vx), first_cross(py, uy, vy), first_cross(pz, uz, vz), 3 * float_to_int(tmax) + 8)
+    end
+  end
+
+  -- ── Swept box collision ──────────────────────────────────────────────────
+  -- new centre in metres; blocked on x, y, z
+  type Swept = Swept(Float, Float, Float, Bool, Bool, Bool)
+
+  fn swept_x(s : Swept) : Float do match s do Swept(x, _, _, _, _, _) -> x end end
+  fn swept_y(s : Swept) : Float do match s do Swept(_, y, _, _, _, _) -> y end end
+  fn swept_z(s : Swept) : Float do match s do Swept(_, _, z, _, _, _) -> z end end
+  fn blocked_x(s : Swept) : Bool do match s do Swept(_, _, _, b, _, _) -> b end end
+  fn blocked_y(s : Swept) : Bool do match s do Swept(_, _, _, _, b, _) -> b end end
+  fn blocked_z(s : Swept) : Bool do match s do Swept(_, _, _, _, _, b) -> b end end
+
+  -- The nearest obstacle face found so far along the axis of motion.
+  type Lim = Lim(Bool, Float)
+
+  pfn unit_box() : List(Strata.Blocks.Box) do Cons(Strata.Blocks.Box(0.0, 0.0, 0.0, 1.0, 1.0, 1.0), Nil) end
+
+  -- Fold one cell's boxes into the limit: a box the moving box overlaps
+  -- offers the face it met, and the nearest such face wins.
+  pfn lim_boxes(l : Lim, bs : List(Strata.Blocks.Box), sc : Float, vx : Int, vy : Int, vz : Int, x0 : Float, y0 : Float, z0 : Float, x1 : Float, y1 : Float, z1 : Float, axis : Int, forward : Bool) : Lim do
+    match bs do
+      Nil -> l
+      Cons(b, rest) ->
+        match Bq.box_bounds(b) do
+          (bx0, by0, bz0, bx1, by1, bz1) ->
+            let ox0 = (int_to_float(vx) +. bx0) *. sc
+            let oy0 = (int_to_float(vy) +. by0) *. sc
+            let oz0 = (int_to_float(vz) +. bz0) *. sc
+            let ox1 = (int_to_float(vx) +. bx1) *. sc
+            let oy1 = (int_to_float(vy) +. by1) *. sc
+            let oz1 = (int_to_float(vz) +. bz1) *. sc
+            if x0 < ox1 && x1 > ox0 && y0 < oy1 && y1 > oy0 && z0 < oz1 && z1 > oz0 do
+              let face = if axis == 0 do (if forward do ox0 else ox1 end) else if axis == 1 do (if forward do oy0 else oy1 end) else (if forward do oz0 else oz1 end) end end
+              match l do
+                Lim(have, cur) ->
+                  let better = !have || (forward && face < cur) || (!forward && face > cur)
+                  lim_boxes(if better do Lim(true, face) else l end, rest, sc, vx, vy, vz, x0, y0, z0, x1, y1, z1, axis, forward)
+              end
+            else lim_boxes(l, rest, sc, vx, vy, vz, x0, y0, z0, x1, y1, z1, axis, forward) end
+        end
+    end
+  end
+
+  -- Every voxel the box (x0..x1, y0..y1, z0..z1, metres) reaches into.
+  -- i walks the voxel range (vx0.., nx by ny by nz).
+  pfn lim_cells(l : Lim, w : Strata.World.World, r : Strata.Blocks.Registry, sc : Float, vx0 : Int, vy0 : Int, vz0 : Int, nx : Int, ny : Int, nz : Int, i : Int, x0 : Float, y0 : Float, z0 : Float, x1 : Float, y1 : Float, z1 : Float, axis : Int, forward : Bool) : Lim do
+    if i >= nx * ny * nz do l
+    else
+      let vx = vx0 + i % nx
+      let vy = vy0 + (i / nx) % ny
+      let vz = vz0 + i / (nx * ny)
+      let id = Wq.get_block(w, vx, vy, vz)
+      let st = Bq.style_index(r, id)
+      if id == 0 || !Bq.collides(r, id) || st == 1 do lim_cells(l, w, r, sc, vx0, vy0, vz0, nx, ny, nz, i + 1, x0, y0, z0, x1, y1, z1, axis, forward)
+      else
+        let bs = if st == 2 do Bq.model_boxes(r, Bq.model_of(r, id)) else unit_box() end
+        lim_cells(lim_boxes(l, bs, sc, vx, vy, vz, x0, y0, z0, x1, y1, z1, axis, forward), w, r, sc, vx0, vy0, vz0, nx, ny, nz, i + 1, x0, y0, z0, x1, y1, z1, axis, forward)
+      end
+    end
+  end
+
+  pfn obstacle(w : Strata.World.World, r : Strata.Blocks.Registry, sc : Float, x : Float, y : Float, z : Float, hx : Float, hy : Float, hz : Float, axis : Int, forward : Bool) : Lim do
+    let x0 = x -. hx
+    let y0 = y -. hy
+    let z0 = z -. hz
+    let x1 = x +. hx
+    let y1 = y +. hy
+    let z1 = z +. hz
+    let vx0 = floor_int(x0 /. sc)
+    let vy0 = floor_int(y0 /. sc)
+    let vz0 = floor_int(z0 /. sc)
+    lim_cells(Lim(false, 0.0), w, r, sc, vx0, vy0, vz0, floor_int(x1 /. sc) - vx0 + 1, floor_int(y1 /. sc) - vy0 + 1, floor_int(z1 /. sc) - vz0 + 1, 0, x0, y0, z0, x1, y1, z1, axis, forward)
+  end
+
+  type Moved = Moved(Float, Bool)
+
+  -- Move the box along one axis by [left], in steps no longer than the box
+  -- is thick on that axis, so it cannot pass through anything.
+  pfn move_axis(w : Strata.World.World, r : Strata.Blocks.Registry, sc : Float, x : Float, y : Float, z : Float, hx : Float, hy : Float, hz : Float, axis : Int, left : Float, steps : Int) : Moved do
+    let p = if axis == 0 do x else if axis == 1 do y else z end end
+    if absf(left) < 0.000000000001 || steps <= 0 do Moved(p, false)
+    else
+      let h = if axis == 0 do hx else if axis == 1 do hy else hz end end
+      let cap0 = 2.0 *. h
+      let cap = if cap0 < sc *. 0.05 do sc *. 0.05 else cap0 end
+      let step = if left > cap do cap else if left < 0.0 -. cap do 0.0 -. cap else left end end
+      let q = p +. step
+      let nx = if axis == 0 do q else x end
+      let ny = if axis == 1 do q else y end
+      let nz = if axis == 2 do q else z end
+      match obstacle(w, r, sc, nx, ny, nz, hx, hy, hz, axis, step > 0.0) do
+        Lim(hit, face) ->
+          if hit do Moved(if step > 0.0 do face -. h -. sc *. 0.0001 else face +. h +. sc *. 0.0001 end, true)
+          else move_axis(w, r, sc, nx, ny, nz, hx, hy, hz, axis, left -. step, steps - 1) end
+      end
+    end
+  end
+
+  doc "Move a box centred at (x, y, z) with half extents (hx, hy, hz) by (dx, dy, dz), all in metres, one axis at a time (y, then x, then z), stopping against anything that collides. Returns where it ends up and which axes were blocked."
+  fn sweep(w : Strata.World.World, x : Float, y : Float, z : Float, hx : Float, hy : Float, hz : Float, dx : Float, dy : Float, dz : Float) : Swept do
+    let r = Wq.registry(w)
+    let sc = Wq.scale(w)
+    if sc <= 0.0 do Swept(x, y, z, false, false, false)
+    else
+      match move_axis(w, r, sc, x, y, z, hx, hy, hz, 1, dy, 100000) do
+        Moved(y2, by2) ->
+          match move_axis(w, r, sc, x, y2, z, hx, hy, hz, 0, dx, 100000) do
+            Moved(x2, bx2) ->
+              match move_axis(w, r, sc, x2, y2, z, hx, hy, hz, 2, dz, 100000) do
+                Moved(z2, bz2) -> Swept(x2, y2, z2, bx2, by2, bz2)
+              end
+          end
+      end
+    end
+  end
+end

@@ -76,3 +76,8 @@ early. The alternative, worker actors with a collector actor polled by
 `Strata.Stream`: work started on one tick is awaited on the next, so it has
 a whole frame to finish and the wait is normally zero. A real
 `task_poll(t) : Option(a)` would let `tick` never wait at all.
+
+## S13 — float literals have no exponent form
+
+`1.0e-12` is a parse error reported as "I was expecting `do` after the
+condition here". Workaround: write the digits out.
