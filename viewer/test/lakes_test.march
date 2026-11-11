@@ -1,10 +1,13 @@
 -- The viewer's lakes: terrain stays a pure function, a lake's rim holds its
--- water, and the sea is not a fluid.
+-- water, and the sea is not a fluid. Then the island read from an atlas:
+-- lakes, rivers, the damped detail.
 mod StrataViewer.Test.Lakes do
   -- the app's capabilities are charged to its test module too (GAPS S3)
   needs IO.Console
   needs IO.Process
   needs IO.Spawn
+  needs IO.FileSystem
+  needs IO.Clock
 
   alias StrataViewer as Vw
   alias Strata.World as Wl2
@@ -36,6 +39,52 @@ mod StrataViewer.Test.Lakes do
     end
   end
 
+
+  -- ── The island ─────────────────────────────────────────────────────────
+  -- the demo-sized atlas (256 x 256, 4 m): a second to build, with lakes and rivers
+  pfn atlas() : Strata.Atlas.Atlas do Strata.Atlas.build(Strata.Atlas.def(256, 4.0, 400.0, 120.0, 5, 40.0), 7) end
+
+  pfn whole(m : Float) : Int do float_to_int(Math.floor(m)) end
+
+  -- the block at a world position, from the island chunk holding it
+  pfn island_block(a : Strata.Atlas.Atlas, x : Int, y : Int, z : Int) : Int do
+    let kx = Cl2.chunk_of(x)
+    let ky = Cl2.chunk_of(y)
+    let kz = Cl2.chunk_of(z)
+    Chl2.get_or(Vw.island_terrain(a, 1.0, kx, ky, kz, 7), x - 32 * kx, y - 32 * ky, z - 32 * kz, -1)
+  end
+
+  -- the first lake that holds water
+  pfn wet_lake(ls : List((Float, Float, Float))) : (Float, Float, Float) do
+    match ls do
+      Nil -> (0.0, 0.0, 0.0 -. 1.0)
+      Cons((x, z, lv), rest) -> if lv >= 0.0 do (x, z, lv) else wet_lake(rest) end
+    end
+  end
+
+  -- the first river point standing over [above] metres and at least [wide] metres wide
+  pfn river_point(a : Strata.Atlas.Atlas, rs : List(List((Float, Float, Float))), above : Float, wide : Float) : (Float, Float, Float) do
+    match rs do
+      Nil -> (0.0, 0.0, 0.0)
+      Cons(r, rest) ->
+        match List.find(r, fn pt -> match pt do (x, z, w) -> if w < wide do false else Strata.Atlas.height_at(a, x, z) > above end end) do
+          Some(p) -> p
+          None -> river_point(a, rest, above, wide)
+        end
+    end
+  end
+
+  -- the largest |island height - atlas height| along 64 columns of a row
+  pfn most_detail(a : Strata.Atlas.Atlas, x : Int, z : Int, i : Int, best : Float) : Float do
+    if i >= 64 do best
+    else
+      let xm = int_to_float(x + 3 * i)
+      let zm = int_to_float(z)
+      let d = Math.abs(Vw.island_height_m(a, xm, zm, 7) -. Strata.Atlas.height_at(a, xm, zm))
+      most_detail(a, x, z, i + 1, if d > best do d else best end)
+    end
+  end
+
   describe "Viewer lakes" do
     test "terrain with lakes is still a pure function" do
       match Vw.test_lake(7) do
@@ -54,6 +103,68 @@ mod StrataViewer.Test.Lakes do
           Test.assert_true(n > 0, "the lake has water at its line, and none of it stands beside air")
           Test.assert_true(Bl2.is_fluid(Vw.registry(), Wl2.get_block(w, cx, line, cz)), "its middle is lake water")
           Test.assert_eq_int(Wl2.get_block(w, cx, line + 1, cz), 0, "with air over it")
+      end
+    end
+    test "a column inside an atlas lake holds lake water to the lake level over sand" do
+      let a = atlas()
+      match wet_lake(Strata.Atlas.lakes(a)) do
+        (x, z, lv) ->
+          Test.assert_true(lv >= 0.0, "the atlas has a lake")
+          let wx = whole(x)
+          let wz = whole(z)
+          let line = whole(lv)
+          match Vw.island_column(a, wx, wz, 7, 1.0) do
+            (h, ln, river) ->
+              Test.assert_eq_int(ln, line, "the column's water line is the lake level")
+              Test.assert_eq_int(river, 0, "and no river")
+              Test.assert_true(h < line, "its bed is under the water")
+              Test.assert_eq_int(island_block(a, wx, line, wz), Vw.lake_base() + 7, "full lake water at the level")
+              Test.assert_eq_int(island_block(a, wx, h + 1, wz), Vw.lake_base() + 7, "and just over the bed")
+              Test.assert_eq_int(island_block(a, wx, line + 1, wz), 0, "air over it")
+              Test.assert_eq_int(island_block(a, wx, h, wz), 4, "a sandy bed")
+          end
+      end
+    end
+    test "a column on a river is sink water up to the atlas height" do
+      let a = atlas()
+      match river_point(a, Strata.Atlas.rivers(a), 45.0, 2.0) do
+        (x, z, w) ->
+          Test.assert_true(w >= 2.0, "the atlas has a river over 45 m")
+          let wx = whole(x)
+          let wz = whole(z)
+          let top = whole(Strata.Atlas.height_at(a, int_to_float(wx), int_to_float(wz)))
+          match Vw.island_column(a, wx, wz, 7, 1.0) do
+            (h, _, line) ->
+              Test.assert_eq_int(line, top, "the water line is the atlas height")
+              Test.assert_true(h < line, "the channel is cut below it")
+              Test.assert_eq_int(island_block(a, wx, top, wz), 5, "sink water at the surface")
+              Test.assert_eq_int(island_block(a, wx, h + 1, wz), 5, "and down to the bed")
+              Test.assert_eq_int(island_block(a, wx, top + 1, wz), 0, "air over it")
+          end
+      end
+    end
+    test "2 m from a river's bank the detail is under 1 m, and away from rivers it is not" do
+      let a = atlas()
+      -- damp there is 2 / (2 w), so the 6 m of detail is under 1 m for any river over 6 m wide
+      match river_point(a, Strata.Atlas.rivers(a), 40.0, 6.5) do
+        (x, z, w) ->
+          Test.assert_true(w >= 6.5, "the atlas has a river over 6.5 m wide")
+          let xm = x +. 0.5 *. w +. 2.0
+          Test.assert_true(Math.abs(Vw.island_height_m(a, xm, z, 7) -. Strata.Atlas.height_at(a, xm, z)) < 1.0, "under 1 m on one bank")
+          let xn = x -. 0.5 *. w -. 2.0
+          Test.assert_true(Math.abs(Vw.island_height_m(a, xn, z, 7) -. Strata.Atlas.height_at(a, xn, z)) < 1.0, "and on the other")
+      end
+      Test.assert_true(most_detail(a, -96, 0, 0, 0.0) > 1.0, "somewhere along a row the detail passes 1 m")
+    end
+    test "an island chunk generated twice is identical" do
+      let a = atlas()
+      match wet_lake(Strata.Atlas.lakes(a)) do
+        (x, z, lv) ->
+          let kx = Cl2.chunk_of(whole(x))
+          let kz = Cl2.chunk_of(whole(z))
+          let ky = Cl2.chunk_of(whole(lv))
+          Test.assert_true(same_go(Vw.island_terrain(a, 1.0, kx, ky, kz, 7), Vw.island_terrain(a, 1.0, kx, ky, kz, 7), 0), "the lake's chunk")
+          Test.assert_true(same_go(Vw.island_terrain(a, 1.0, 0, 1, 0, 7), Vw.island_terrain(a, 1.0, 0, 1, 0, 7), 0), "the origin's")
       end
     end
     test "the sea is not a fluid, and lake water is" do
