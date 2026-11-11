@@ -24,10 +24,22 @@ the shaders (`native/build_shaders.sh`).
 
 ## Running it
 
-    viewer/run.sh            # fly through a generated world (WASD, mouse, space, shift, escape)
+    viewer/run.sh            # walk a generated world
     cd demo && forge build --release && ./.march/build/release/strata_demo
 
-`viewer/` is the first rendering slice. `demo/` runs the core headless and
+In the viewer: W A S D move, the mouse looks, space jumps, F switches
+between walking and flying (space and left shift then rise and sink), left
+click carves a sphere, right click builds one, escape quits.
+
+Environment switches for scripted runs are listed at the top of
+`viewer/lib/strata_viewer.march`: a fixed scene (`STRATA_SCENE`), a frame
+count and screenshot (`STRATA_FRAMES`, `STRATA_SHOT`), offscreen timing
+(`STRATA_OFFSCREEN=1`), view radius, window size, quad capacity.
+
+    scripts/golden.sh            # render the fixed scenes and compare with test/golden/
+    scripts/golden.sh --update   # re-store them; look at each before committing
+
+`viewer/` is the renderer's test bed. `demo/` runs the core headless and
 prints what it cost; see `RESULTS.md`.
 
 ## Using it from a game

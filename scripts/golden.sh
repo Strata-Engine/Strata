@@ -36,6 +36,7 @@ glass-back:STRATA_SCENE=7
 underwater:STRATA_SCENE=8
 meadow:STRATA_SCENE=9
 post:STRATA_SCENE=10
+walk:STRATA_SCENE=11 STRATA_FRAMES=200
 overview-offscreen:STRATA_SCENE=1 STRATA_OFFSCREEN=1 GOLDEN_AS=overview
 '
 # indirect draw calls a frame must issue, whatever the scene holds

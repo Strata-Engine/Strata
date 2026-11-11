@@ -2,8 +2,9 @@
 -- a block registry, a pure terrain function, the greedy mesher, and the
 -- Vulkan quad renderer, end to end.
 --
---   W A S D   move        mouse / arrows   look
---   space     up          left shift       down        escape   quit
+--   W A S D   move        mouse / arrows   look        escape   quit
+--   space     jump        F   switch between walking and flying
+--   (flying: space rises, left shift sinks)
 --   left click   carve a sphere out of what you are looking at
 --   right click  build a sphere of stone onto it
 --
@@ -202,57 +203,74 @@ mod StrataViewer do
 
   pfn ms2(v : Float) : String do float_to_string(Math.round(v *. 100.0) /. 100.0) end
 
-  -- position, yaw, pitch, the chunk the camera was last in, mouse buttons last frame
-  type Cam = Cam(Float, Float, Float, Float, Float, Int, Int, Int, Bool, Bool)
+  -- eye position, yaw, pitch, the chunk the camera was last in, mouse buttons
+  -- last frame, flying or walking, vertical speed, on the ground, F last frame
+  type Cam = Cam(Float, Float, Float, Float, Float, Int, Int, Int, Bool, Bool, Bool, Float, Bool, Bool)
 
-  pfn frame_loop(s : Strata.Stream.Stream, sl : Strata.Render.Render, reg : Strata.Blocks.Registry, cam : Cam, frame : Int, frames : Int, t_prev : Float, t_mark : Float, vp : NativeF32Arr) : Unit do
+  -- [frames] > 0 is a scripted run: no keyboard or mouse, a fixed time step,
+  -- so the same script draws the same frames. [auto_walk] holds "forward".
+  pfn frame_loop(s : Strata.Stream.Stream, sl : Strata.Render.Render, reg : Strata.Blocks.Registry, cam : Cam, frame : Int, frames : Int, auto_walk : Bool, t_prev : Float, t_mark : Float, vp : NativeF32Arr) : Unit do
     Strata.Ffi.Vk.poll()
     if Strata.Ffi.Vk.should_close() || Strata.Ffi.Vk.key(256) || (frames > 0 && frame >= frames) do
       println("strata_viewer: done after " ++ int_to_string(frame) ++ " frames; uploads refused " ++ int_to_string(Strata.Ffi.Vk.refused()) ++ ", still waiting " ++ int_to_string(Strata.Render.waiting(sl)) ++ "; draw calls " ++ int_to_string(float_to_int(Strata.Ffi.Vk.stat(2))))
       Strata.Stream.stop(s)
     else
       match cam do
-        Cam(x, y, z, yaw, pitch, kx0, ky0, kz0, lb0, rb0) ->
+        Cam(x, y, z, yaw, pitch, kx0, ky0, kz0, lb0, rb0, fly0, vy0, ground0, f0) ->
           let now = Strata.Ffi.Vk.time()
-          let dt = clampf(now -. t_prev, 0.0, 0.1)
-          -- a scripted run ignores the keyboard and mouse
-          let live = if frames > 0 do 0.0 else 1.0 end
+          let scripted = frames > 0
+          let dt = if scripted do 0.016667 else clampf(now -. t_prev, 0.0, 0.1) end
+          let live = if scripted do 0.0 else 1.0 end
           let yaw2 = yaw +. live *. (Strata.Ffi.Vk.mouse_dx() *. 0.0025 +. axis(Strata.Ffi.Vk.key(262), Strata.Ffi.Vk.key(263)) *. dt *. 1.6)
           let pitch2 = clampf(pitch -. live *. (Strata.Ffi.Vk.mouse_dy() *. 0.0025 -. axis(Strata.Ffi.Vk.key(265), Strata.Ffi.Vk.key(264)) *. dt *. 1.2), -1.5, 1.5)
           let fx = Math.sin(yaw2) *. Math.cos(pitch2)
           let fy = Math.sin(pitch2)
           let fz = 0.0 -. Math.cos(yaw2) *. Math.cos(pitch2)
-          let speed = 40.0 *. dt *. live
-          let fwd = axis(Strata.Ffi.Vk.key(87), Strata.Ffi.Vk.key(83)) *. speed
-          let side = axis(Strata.Ffi.Vk.key(68), Strata.Ffi.Vk.key(65)) *. speed
-          let up = axis(Strata.Ffi.Vk.key(32), Strata.Ffi.Vk.key(340)) *. speed
-          let x2 = x +. fx *. fwd +. Math.cos(yaw2) *. side
-          let y2 = y +. fy *. fwd +. up
-          let z2 = z +. fz *. fwd +. Math.sin(yaw2) *. side
+          -- F switches between walking and flying, once per press
+          let fkey = !scripted && Strata.Ffi.Vk.key(70)
+          let fly = if fkey && !f0 do !fly0 else fly0 end
+          let go = if auto_walk do 1.0 else live *. axis(Strata.Ffi.Vk.key(87), Strata.Ffi.Vk.key(83)) end
+          let strafe = live *. axis(Strata.Ffi.Vk.key(68), Strata.Ffi.Vk.key(65))
+          let space = !scripted && Strata.Ffi.Vk.key(32)
+          let w0 = Strata.Stream.world(s)
+          -- flying moves along the view at 40 m/s; walking moves on the ground at 5 m/s under gravity
+          let moved = if fly do
+              let rise = live *. axis(space, Strata.Ffi.Vk.key(340))
+              StrataViewer.Walker.body_with(x +. (fx *. go +. Math.cos(yaw2) *. strafe) *. 40.0 *. dt, y +. (fy *. go +. rise) *. 40.0 *. dt, z +. (fz *. go +. Math.sin(yaw2) *. strafe) *. 40.0 *. dt, 0.0, false)
+            else
+              let mx = (Math.sin(yaw2) *. go +. Math.cos(yaw2) *. strafe) *. 5.0
+              let mz = (Math.sin(yaw2) *. strafe -. Math.cos(yaw2) *. go) *. 5.0
+              StrataViewer.Walker.step(w0, StrataViewer.Walker.body_with(x, y, z, vy0, ground0), mx, mz, space, dt)
+            end
+          let x2 = StrataViewer.Walker.eye_x(moved)
+          let y2 = StrataViewer.Walker.eye_y(moved)
+          let z2 = StrataViewer.Walker.eye_z(moved)
           -- the stream: refocus when the camera enters another chunk, then one tick
+          let t_march = Strata.Ffi.Vk.time()
           let kx = Strata.Coord.chunk_of(float_to_int(Math.floor(x2)))
           let ky = Strata.Coord.chunk_of(float_to_int(Math.floor(y2)))
           let kz = Strata.Coord.chunk_of(float_to_int(Math.floor(z2)))
           let s1 = if kx != kx0 || ky != ky0 || kz != kz0 do Strata.Stream.set_focus(s, Cons((x2, y2, z2), Nil)) else s end
-          let lb = frames == 0 && Strata.Ffi.Vk.mouse_button(0)
-          let rb = frames == 0 && Strata.Ffi.Vk.mouse_button(1)
+          let lb = !scripted && Strata.Ffi.Vk.mouse_button(0)
+          let rb = !scripted && Strata.Ffi.Vk.mouse_button(1)
           let s2 = Strata.Stream.tick(act(s1, reg, x2, y2, z2, fx, fy, fz, (lb && !lb0) || (frame == 10 && Env.get_int("STRATA_DIG", 0) == 1), rb && !rb0))
           match Strata.Render.sync(sl, s2) do
             (sl2, s3) ->
+              let march_ms = (Strata.Ffi.Vk.time() -. t_march) *. 1000.0
               let aspect = int_to_float(Strata.Ffi.Vk.fb_w()) /. int_to_float(if Strata.Ffi.Vk.fb_h() < 1 do 1 else Strata.Ffi.Vk.fb_h() end)
               let view = M4.look_at(V3.new(x2, y2, z2), V3.new(x2 +. fx, y2 +. fy, z2 +. fz), V3.new(0.0, 1.0, 0.0))
               let vp2 = M4.mul_into_f32(M4.perspective(1.15, aspect, 0.1, 1200.0), view, vp)
               Strata.Ffi.Vk.set_camera(vp2)
               Strata.Ffi.Vk.set_eye(x2, y2, z2, 1.0)
-              if frames > 0 && frame == frames - 3 do Strata.Ffi.Vk.request_shot() else () end
-              if frames > 0 && frame == Env.get_int("STRATA_REBUILD_AT", -1) do Strata.Ffi.Vk.force_rebuild() else () end
+              if scripted && frame == frames - 3 do Strata.Ffi.Vk.request_shot() else () end
+              if scripted && frame == Env.get_int("STRATA_REBUILD_AT", -1) do Strata.Ffi.Vk.force_rebuild() else () end
               -- the result is used, not dropped: a zero-argument extern bound to an unused name is optimised away (cube_forge GAPS G16)
               let next = if Strata.Ffi.Vk.frame() do frame + 1 else frame end
-              let cam2 = Cam(x2, y2, z2, yaw2, pitch2, kx, ky, kz, lb, rb)
+              let cam2 = Cam(x2, y2, z2, yaw2, pitch2, kx, ky, kz, lb, rb, fly, StrataViewer.Walker.speed_y(moved), StrataViewer.Walker.grounded(moved), fkey)
               if next != frame && frame % 240 == 239 do
-                println("  " ++ float_to_string(Math.round(240.0 /. (now -. t_mark))) ++ " fps; shim " ++ ms2(Strata.Ffi.Vk.stat(0)) ++ " ms, waiting " ++ ms2(Strata.Ffi.Vk.stat(1)) ++ " ms, gpu " ++ ms2(Strata.Ffi.Vk.stat(3)) ++ " ms; " ++ int_to_string(float_to_int(Strata.Ffi.Vk.stat(2))) ++ " draw calls, " ++ int_to_string(float_to_int(Strata.Ffi.Vk.stat(4))) ++ " see-through chunks ordered in " ++ int_to_string(float_to_int(Strata.Ffi.Vk.stat(5))) ++ " us, " ++ int_to_string(Strata.Ffi.Vk.drawn_chunks()) ++ " chunks, " ++ int_to_string(Strata.Ffi.Vk.drawn_quads()) ++ " quads; " ++ int_to_string(Strata.Stream.loaded_count(s3)) ++ " chunks loaded")
-                frame_loop(s3, sl2, reg, cam2, next, frames, now, now, vp2)
-              else frame_loop(s3, sl2, reg, cam2, next, frames, now, t_mark, vp2) end
+                println("  " ++ float_to_string(Math.round(240.0 /. (now -. t_mark))) ++ " fps; march " ++ ms2(march_ms) ++ " ms, shim " ++ ms2(Strata.Ffi.Vk.stat(0)) ++ " ms, waiting " ++ ms2(Strata.Ffi.Vk.stat(1)) ++ " ms, gpu " ++ ms2(Strata.Ffi.Vk.stat(3)) ++ " ms; " ++ int_to_string(float_to_int(Strata.Ffi.Vk.stat(2))) ++ " draw calls, " ++ int_to_string(float_to_int(Strata.Ffi.Vk.stat(4))) ++ " see-through chunks ordered in " ++ int_to_string(float_to_int(Strata.Ffi.Vk.stat(5))) ++ " us, " ++ int_to_string(Strata.Ffi.Vk.drawn_chunks()) ++ " chunks, " ++ int_to_string(Strata.Ffi.Vk.drawn_quads()) ++ " quads; " ++ int_to_string(Strata.Stream.loaded_count(s3)) ++ " chunks loaded")
+                frame_loop(s3, sl2, reg, cam2, next, frames, auto_walk, now, now, vp2)
+              else frame_loop(s3, sl2, reg, cam2, next, frames, auto_walk, now, t_mark, vp2) end
           end
       end
     end
@@ -281,6 +299,8 @@ mod StrataViewer do
   --   8 underwater    just under a lake's surface, looking up and out through it at the shore
   --   9 meadow        low over the grass, across the tall grass
   --   10 post         close to a lantern post
+  --   11 walk         standing on the ground at the origin; a scripted run walks forward
+  --   0  (the default) the same spot, for playing: walking, with the keyboard and mouse
   -- Any other number is the overview.
   -- The first column, walking a fixed grid outward from the origin, whose
   -- ground lies at least four blocks under the water: somewhere to look at
@@ -307,7 +327,8 @@ mod StrataViewer do
   end
 
   pfn pose(scene : Int, seed : Int) : (Float, Float, Float, Float, Float) do
-    if scene == 2 do
+    if scene == 0 || scene == 11 do (0.5, int_to_float(height(0, 0, seed)) +. 2.7, 0.5, 0.62, -0.1)
+    else if scene == 2 do
       match deep_water(seed, 0) do
         (wx, wz) -> (int_to_float(wx) +. 0.5, int_to_float(sea()) +. 3.5, int_to_float(wz) +. 0.5, 0.9, -0.15)
       end
@@ -323,7 +344,7 @@ mod StrataViewer do
       end
     else if scene == 9 do (-40.0, int_to_float(height(-40, 60, seed)) +. 1.9, 60.0, 0.62, -0.16)
     else if scene == 3 || scene == 5 do (-40.0, int_to_float(height(-40, 60, seed)) +. 2.6, 60.0, 0.62, -0.05)
-    else (-70.0, int_to_float(height(0, 0, seed)) +. 46.0, 96.0, 0.62, -0.42) end end end end end end end
+    else (-70.0, int_to_float(height(0, 0, seed)) +. 46.0, 96.0, 0.62, -0.42) end end end end end end end end
   end
 
   fn main(_cap : Cap(IO)) : Unit do
@@ -331,7 +352,8 @@ mod StrataViewer do
     let frames = Env.get_int("STRATA_FRAMES", 0)
     let seed = Env.get_int("STRATA_SEED", 7)
     let size = window_size()
-    let start = pose(Env.get_int("STRATA_SCENE", 1), seed)
+    let scene = Env.get_int("STRATA_SCENE", 0)
+    let start = pose(scene, seed)
     if !Strata.Ffi.Vk.open(match size do (w, _) -> w end, match size do (_, h) -> h end, frames == 0, Env.get_int("STRATA_QUADS", 0)) do println("strata_viewer: could not open a Vulkan window")
     else
       Strata.Ffi.Vk.set_vsync(Env.get_int("STRATA_VSYNC", 1) != 0)
@@ -353,7 +375,7 @@ mod StrataViewer do
       let s0 = Strata.Stream.run_until_settled(Strata.Stream.set_focus(Strata.Stream.start(world, Strata.Stream.config(r, 3, 32, 8)), Cons((ex, ey, ez), Nil)), 1000000)
       let t1 = Strata.Ffi.Vk.time()
       -- scene 4 empties the chunk holding the ground 40 m ahead: an emptied mesh must vanish
-      let s0b = if Env.get_int("STRATA_SCENE", 1) != 4 do s0
+      let s0b = if scene != 4 do s0
         else
           let px = float_to_int(Math.floor(ex +. Math.sin(yaw0) *. 40.0))
           let pz = float_to_int(Math.floor(ez -. Math.cos(yaw0) *. 40.0))
@@ -363,14 +385,14 @@ mod StrataViewer do
           Strata.Stream.run_until_settled(Strata.Stream.apply(s0, Strata.Edit.fill_box(Strata.Stream.world(s0), cx, cy, cz, cx + 31, cy + 31, cz + 31, 0)), 1000000)
         end
       -- scene 5 builds a wall of the bad-texture block ahead, topped by an unregistered id
-      let s0c = if Env.get_int("STRATA_SCENE", 1) != 5 do s0b
+      let s0c = if scene != 5 do s0b
         else
           let gy = height(-35, 53, seed)
           let w1 = Strata.Edit.world(Strata.Edit.fill_box(Strata.Stream.world(s0b), -38, gy + 1, 53, -32, gy + 2, 53, 9))
           Strata.Stream.run_until_settled(Strata.Stream.apply(Strata.Stream.apply(s0b, Strata.Edit.fill_box(Strata.Stream.world(s0b), -38, gy + 1, 53, -32, gy + 2, 53, 9)), Strata.Edit.set_block(w1, -35, gy + 3, 53, 60000)), 1000000)
         end
       -- scenes 6 and 7 hang two see-through walls in the air, in different chunks: red glass at z = 20, water at z = 40
-      let s0d = if Env.get_int("STRATA_SCENE", 1) != 6 && Env.get_int("STRATA_SCENE", 1) != 7 do s0c
+      let s0d = if scene != 6 && scene != 7 do s0c
         else
           let a1 = Strata.Stream.apply(s0c, Strata.Edit.fill_box(Strata.Stream.world(s0c), 8, 144, 20, 24, 156, 20, 10))
           Strata.Stream.run_until_settled(Strata.Stream.apply(a1, Strata.Edit.fill_box(Strata.Stream.world(a1), 8, 144, 40, 24, 156, 40, 5)), 1000000)
@@ -378,8 +400,9 @@ mod StrataViewer do
       match Strata.Render.sync(Strata.Render.new(16384), s0d) do
         (sl, s1) ->
           println("strata_viewer: " ++ int_to_string(Strata.Stream.loaded_count(s1)) ++ " chunks streamed in " ++ float_to_string(Math.round((t1 -. t0) *. 1000.0)) ++ " ms; " ++ int_to_string(Strata.Ffi.Vk.live_quads()) ++ " quads, " ++ int_to_string(Strata.Ffi.Vk.live_quads() * 8 / 1024) ++ " KB on the GPU")
-          let cam = Cam(ex, ey, ez, yaw0, pitch0, Strata.Coord.chunk_of(float_to_int(Math.floor(ex))), Strata.Coord.chunk_of(float_to_int(Math.floor(ey))), Strata.Coord.chunk_of(float_to_int(Math.floor(ez))), false, false)
-          frame_loop(s1, sl, reg, cam, 0, frames, Strata.Ffi.Vk.time(), Strata.Ffi.Vk.time(), NativeArray.make_f32(16, 0.0))
+          -- the fixed scenes fly, holding their pose; the default and the walk scene stand on the ground
+          let cam = Cam(ex, ey, ez, yaw0, pitch0, Strata.Coord.chunk_of(float_to_int(Math.floor(ex))), Strata.Coord.chunk_of(float_to_int(Math.floor(ey))), Strata.Coord.chunk_of(float_to_int(Math.floor(ez))), false, false, scene != 0 && scene != 11, 0.0, false, false)
+          frame_loop(s1, sl, reg, cam, 0, frames, scene == 11 && frames > 0, Strata.Ffi.Vk.time(), Strata.Ffi.Vk.time(), NativeArray.make_f32(16, 0.0))
       end
       Strata.Ffi.Vk.close()
     end
