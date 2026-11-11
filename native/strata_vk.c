@@ -27,10 +27,11 @@
 /* Rewritten by build_shaders.sh whenever the shaders change: forge decides
  * whether to recompile this file from its text alone, not from the headers
  * it includes (GAPS S14). */
-#define STRATA_SHADERS_STAMP "2844f727de11e2aa"
+#define STRATA_SHADERS_STAMP "d0248b1d57656c5a"
 #include "strata_shaders.h"
 #include "strata_spray.h"
 #include "strata_alloc.h"
+#include "strata_text.h"
 
 #define NARR_HDR 32
 static inline int64_t narr_len(void *a)  { return *(int64_t *)((char *)a + 16); }
@@ -44,6 +45,8 @@ static inline void   *narr_data(void *a) { return (char *)a + NARR_HDR; }
 #define SV_SPRAY_FLOATS 10     /* floats a particle */
 #define SV_UI_QUADS 16384      /* quads the 2D layer holds a frame */
 #define SV_UI_FLOATS 16        /* floats a quad (Strata.Ui) */
+#define SV_GLYPH_STAGE (1 << 20)   /* bytes of new glyph pixels a frame can carry to the atlas */
+#define SV_GLYPH_RECTS 1024
 #define SV_LIGHT_PER_FRAME 128 /* chunks whose light bytes one frame may copy into the volume */
 #define SV_LIGHT_WRITE_BYTES (32768 + 64 + 8)   /* per write: the voxels, the coarse cells, the owner texel */
 #define SV_MAX_KEYS 512
@@ -88,6 +91,7 @@ typedef struct {
     VkBuffer lstage; VkDeviceMemory lstage_mem; unsigned char *lstage_map;   /* this frame's light-volume writes, before they are copied in */
     VkBuffer stats; VkDeviceMemory stats_mem; uint32_t *stats_map;   /* written by the cull pass: commands per range [6], chunks, quads */
     VkBuffer ui; VkDeviceMemory ui_mem; float *ui_map;   /* this frame's 2D layer */
+    VkBuffer gstage; VkDeviceMemory gstage_mem; unsigned char *gstage_map;   /* this frame's new glyph pixels, before they are copied in */
     int stats_valid;           /* the cull pass has run for this Frame at least once */
     VkFence fence;             /* signalled when the frame's commands have run */
     VkSemaphore sem_image, sem_done;
@@ -156,6 +160,7 @@ static struct {
      * Frame copies them when it is recorded. */
     VkPipeline pipe_ui;
     float *ui_cpu; uint32_t ui_n; uint64_t ui_dropped;
+    Target glyphs; VkSampler glyph_sampler; uint32_t glyph_px, glyph_pages;   /* the glyph atlas: strata_text's pages, one layer each */
     Target ui_art; VkSampler ui_sampler;   /* the interface atlas: one image of a game's own interface art */
     VkBuffer loose; VkDeviceMemory loose_mem; uint32_t *loose_map;       /* model geometry, expanded per instance: 16 words a quad */
     float *models[SV_MAX_MODELS]; uint32_t model_quads[SV_MAX_MODELS];   /* 21 floats a quad, as Strata.Model lays them out */
@@ -639,6 +644,47 @@ static int ui_art_make(uint32_t w, uint32_t h, const unsigned char *rgba) {
     return 1;
 }
 
+/* The glyph atlas as the GPU holds it: every page strata_text may make, as
+ * layers of one image, empty to begin with. */
+static int glyphs_make(void) {
+    g.glyph_px = (uint32_t)st_atlas_page_px(); g.glyph_pages = (uint32_t)st_atlas_max_pages();
+    if (!g.glyph_px || !g.glyph_pages) { die("text could not start", 0); return 0; }
+    if (!make_sampled(VK_FORMAT_R8_UNORM, g.glyph_px, g.glyph_px, g.glyph_pages, 1, NULL, 1, &g.glyphs)) return 0;
+    VkSamplerCreateInfo si = { .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO, .magFilter = VK_FILTER_LINEAR, .minFilter = VK_FILTER_LINEAR,
+        .mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST, .addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, .addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+        .addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, .maxAnisotropy = 1.0f };
+    VKOK(vkCreateSampler(g.dev, &si, NULL, &g.glyph_sampler), "glyph sampler");
+    bind_image(18, g.glyph_sampler, g.glyphs.view);
+    return 1;
+}
+
+/* Copy the glyph cells strata_text has drawn since last time into the atlas,
+ * through this Frame's staging buffer. What does not fit waits a frame. */
+static void glyphs_flush(Frame *F) {
+    static VkBufferImageCopy regs[SV_GLYPH_RECTS];
+    uint32_t n = 0; size_t used = 0;
+    int w, h;
+    while (n < SV_GLYPH_RECTS && st_atlas_dirty_peek(&w, &h) && used + (size_t)w * (size_t)h <= SV_GLYPH_STAGE) {
+        int page, x, y, stride; const uint8_t *px;
+        if (!st_atlas_dirty(&page, &x, &y, &w, &h, &px, &stride)) break;
+        if (page < 0 || (uint32_t)page >= g.glyph_pages || x < 0 || y < 0 || (uint32_t)(x + w) > g.glyph_px || (uint32_t)(y + h) > g.glyph_px) continue;
+        for (int row = 0; row < h; row++) memcpy(F->gstage_map + used + (size_t)row * (size_t)w, px + (size_t)(y + row) * (size_t)stride + x, (size_t)w);
+        regs[n++] = (VkBufferImageCopy){ .bufferOffset = used, .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, (uint32_t)page, 1 },
+            .imageOffset = { x, y, 0 }, .imageExtent = { (uint32_t)w, (uint32_t)h, 1 } };
+        used += (size_t)w * (size_t)h;
+    }
+    if (n == 0) return;
+    VkImageMemoryBarrier b = { .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_SHADER_READ_BIT, .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+        .oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .image = g.glyphs.img,
+        .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, g.glyph_pages } };
+    vkCmdPipelineBarrier(F->cmd, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &b);
+    vkCmdCopyBufferToImage(F->cmd, F->gstage, g.glyphs.img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, n, regs);
+    b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT; b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL; b.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    vkCmdPipelineBarrier(F->cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, NULL, 0, NULL, 1, &b);
+}
+
 /* The interface atlas: one image, [w] x [h] RGBA bytes (sRGB colour,
  * straight alpha, rows running downward), holding all of a game's own
  * interface art. Replaces the last one. Rare and slow: it waits for the GPU. */
@@ -1105,7 +1151,7 @@ int64_t sv_open(int64_t w, int64_t h, int64_t capture_mouse, int64_t quad_capaci
     g.swap_ok = 1;
 
     /* one set layout for every pipeline: 0 uniforms, 1 chunk table, 2 indirect commands, 3 cull statistics, 4 command -> slot */
-    VkDescriptorSetLayoutBinding dslb[18] = {
+    VkDescriptorSetLayoutBinding dslb[19] = {
         { .binding = 0, .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, .descriptorCount = 1,
           .stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT },
         { .binding = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1,
@@ -1131,8 +1177,10 @@ int64_t sv_open(int64_t w, int64_t h, int64_t capture_mouse, int64_t quad_capaci
         { .binding = 15, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT },
         { .binding = 16, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT },
         /* the 2D layer's interface atlas */
-        { .binding = 17, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT } };
-    VkDescriptorSetLayoutCreateInfo dsli = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 18, .pBindings = dslb };
+        { .binding = 17, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT },
+        /* and its glyph atlas */
+        { .binding = 18, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT } };
+    VkDescriptorSetLayoutCreateInfo dsli = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 19, .pBindings = dslb };
     VKOK(vkCreateDescriptorSetLayout(g.dev, &dsli, NULL, &g.dsl), "descriptor set layout");
     /* where the call's range starts in draw_slot, and per-call flags (bit 0: cutout) */
     VkPushConstantRange pcr = { .stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, .offset = 0, .size = 8 };
@@ -1203,6 +1251,8 @@ int64_t sv_open(int64_t w, int64_t h, int64_t capture_mouse, int64_t quad_capaci
         F->stats_map = map; memset(F->stats_map, 0, 32);
         if (!make_buffer((VkDeviceSize)SV_UI_QUADS * SV_UI_FLOATS * 4, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, &F->ui, &F->ui_mem, &map)) return 0;
         F->ui_map = map;
+        if (!make_buffer(SV_GLYPH_STAGE, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, &F->gstage, &F->gstage_mem, &map)) return 0;
+        F->gstage_map = map;
         VkDescriptorSetAllocateInfo dai = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, .descriptorPool = g.dpool, .descriptorSetCount = 1, .pSetLayouts = &g.dsl };
         VKOK(vkAllocateDescriptorSets(g.dev, &dai, &F->dset), "descriptor set");
         if (!make_buffer(UBO_FLOATS * 4, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, &F->ubo, &F->ubo_mem, &map)) return 0;
@@ -1243,6 +1293,7 @@ int64_t sv_open(int64_t w, int64_t h, int64_t capture_mouse, int64_t quad_capaci
     VKOK(vkCreateCommandPool(g.dev, &cpi, NULL, &g.cpool), "command pool");
     {   static const unsigned char white[4] = { 255, 255, 255, 255 };   /* until a game supplies interface art */
         if (!ui_art_make(1, 1, white)) return 0;
+        if (!glyphs_make()) return 0;
     }
     for (int f = 0; f < SV_FRAMES; f++) {
         VkCommandBufferAllocateInfo cai = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, .commandPool = g.cpool, .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1 };
@@ -1292,8 +1343,11 @@ void sv_close(void) {
         for (int f = 0; f < SV_FRAMES; f++) {
             if (g.frames[f].ui) vkDestroyBuffer(g.dev, g.frames[f].ui, NULL);
             if (g.frames[f].ui_mem) vkFreeMemory(g.dev, g.frames[f].ui_mem, NULL);
+            if (g.frames[f].gstage) vkDestroyBuffer(g.dev, g.frames[f].gstage, NULL);
+            if (g.frames[f].gstage_mem) vkFreeMemory(g.dev, g.frames[f].gstage_mem, NULL);
         }
-        drop_target(&g.ui_art);
+        drop_target(&g.ui_art); drop_target(&g.glyphs);
+        if (g.glyph_sampler) vkDestroySampler(g.dev, g.glyph_sampler, NULL);
         if (g.ui_sampler) vkDestroySampler(g.dev, g.ui_sampler, NULL);
         if (g.pipe_spray) vkDestroyPipeline(g.dev, g.pipe_spray, NULL);
         if (g.spray) vkDestroyBuffer(g.dev, g.spray, NULL);
@@ -1834,6 +1888,7 @@ int64_t sv_frame(void) {
     }
     F->npending = 0;
     light_flush(F);               /* queued chunks into the light volume, before anything reads it */
+    glyphs_flush(F);              /* new glyphs into the atlas, before the 2D layer reads it */
     vkCmdBindDescriptorSets(F->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g.layout, 0, 1, &F->dset, 0, NULL);
     if (g.hi_slot > 0) {
         /* zero the part of each compacted list that will be submitted, so
@@ -1961,6 +2016,7 @@ int64_t sv_frame(void) {
     g.stat[1] = wait_ms;
     g.stat[2] = (double)draws;
     g.frame_no++;
+    st_frame_begin();             /* text asked for from here on belongs to the next frame */
     return 1;
 }
 

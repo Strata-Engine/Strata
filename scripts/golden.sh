@@ -78,14 +78,16 @@ lake-low-sun:STRATA_SCENE=18 STRATA_LIGHT=4 STRATA_BREACH=30 STRATA_FRAMES=1203 
 under-sea:STRATA_SCENE=8 STRATA_LIGHT=4
 under-sea-up:STRATA_SCENE=24 STRATA_LIGHT=4
 under-lake:STRATA_SCENE=25 STRATA_LIGHT=4 STRATA_FLUID=0
-ui-scale-1:STRATA_SCENE=1 STRATA_LIGHT=4 STRATA_UI=1 DRAWS=6
-ui-scale-15:STRATA_SCENE=1 STRATA_LIGHT=4 STRATA_UI=1 STRATA_UI_SCALE=150 DRAWS=6
-ui-scale-2:STRATA_SCENE=1 STRATA_LIGHT=4 STRATA_UI=1 STRATA_UI_SCALE=200 DRAWS=6
+ui-scale-1:STRATA_SCENE=1 STRATA_LIGHT=4 STRATA_UI=1 DRAWS=6 STRICT=1
+ui-scale-15:STRATA_SCENE=1 STRATA_LIGHT=4 STRATA_UI=1 STRATA_UI_SCALE=150 DRAWS=6 STRICT=1
+ui-scale-2:STRATA_SCENE=1 STRATA_LIGHT=4 STRATA_UI=1 STRATA_UI_SCALE=200 DRAWS=6 STRICT=1
 ui-flood:STRATA_SCENE=1 STRATA_UI=1 STRATA_UI_SHOW=1 DRAWS=6 SAYS=ui:_dropped_3616_quads
-ui-frames:STRATA_SCENE=1 STRATA_UI=1 STRATA_UI_SHOW=2 DRAWS=6
+ui-frames:STRATA_SCENE=1 STRATA_UI=1 STRATA_UI_SHOW=2 DRAWS=6 STRICT=1
+text-sheet:STRATA_SCENE=1 STRATA_UI=1 STRATA_UI_SHOW=3 DRAWS=6 STRICT=1
 '
 # indirect draw calls a frame must issue, whatever the scene holds; a scene
-# with a kind of geometry nowhere in it says DRAWS=n. Line 9's note stands:
+# with a kind of geometry nowhere in it says DRAWS=n. STRICT=1 holds a scene
+# to a difference of 4 in 0.05% of pixels: small text is few pixels. Line 9's note stands:
 # a new scene's first picture is left as test/golden/name.actual.ppm to be
 # looked at and stored by hand (gzip -9 -c it to test/golden/name.ppm.gz)
 EXPECT_DRAWS=5
@@ -94,8 +96,8 @@ for line in $(echo "$SCENES" | tr ' ' ','); do
   name="${line%%:*}"; envs="$(echo "${line#*:}" | tr ',' ' ')"
   stored="$name"
   draws=$EXPECT_DRAWS
-  says=""
-  for kv in $envs; do case "$kv" in GOLDEN_AS=*) stored="${kv#GOLDEN_AS=}";; DRAWS=*) draws="${kv#DRAWS=}";; SAYS=*) says="$(echo "${kv#SAYS=}" | tr '_' ' ')";; esac; done
+  says=""; strict=""
+  for kv in $envs; do case "$kv" in GOLDEN_AS=*) stored="${kv#GOLDEN_AS=}";; DRAWS=*) draws="${kv#DRAWS=}";; SAYS=*) says="$(echo "${kv#SAYS=}" | tr '_' ' ')";; STRICT=1) strict="4 0.05";; esac; done
   shot="$OUT/$name.ppm"
   if ! env MARCH_PIN_MAIN=1 STRATA_RADIUS=6 STRATA_HIDDEN=1 STRATA_OFFSCREEN=1 STRATA_PIXELS=1 STRATA_SIZE=1280x800 STRATA_FRAMES=60 STRATA_LIGHT=0 STRATA_SHOT="$shot" $envs \
        ./viewer/.march/build/release/strata_viewer > "$OUT/$name.log" 2>&1 || [ ! -s "$shot" ]; then
@@ -116,7 +118,7 @@ for line in $(echo "$SCENES" | tr ' ' ','); do
   fi
   if [ ! -f "test/golden/$stored.ppm.gz" ]; then echo "FAIL: $name has no stored image (look at test/golden/$name.actual.ppm, then store it)"; cp "$shot" "test/golden/$name.actual.ppm"; FAILED=1; continue; fi
   gunzip -c "test/golden/$stored.ppm.gz" > "$OUT/want.ppm"
-  if res=$($DIFF "$OUT/want.ppm" "$shot" 2>&1); then echo "ok   $name: $res"
+  if res=$($DIFF "$OUT/want.ppm" "$shot" $strict 2>&1); then echo "ok   $name: $res"
   else echo "FAIL $name: $res"; cp "$shot" "test/golden/$name.actual.ppm"; FAILED=1; fi
 done
 # Stillness: with nothing moving, the lit picture must have stopped changing.

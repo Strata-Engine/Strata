@@ -99,3 +99,15 @@ meshing tasks; handing it to a function 200 000 times a chunk on each of
 them is, it seems, a reference-count update on shared memory each time.
 Workaround: read what the faces need from the registry once per chunk into
 arrays the task owns, and pass those.
+
+## S16: a String reaches a C extern as the runtime's own value
+
+An `extern` parameter of type `String` arrives in C as the runtime's string
+value: a pointer to a counted heap string (`march_string`: 16 bytes of
+header, an 8-byte length, then the bytes), or, for strings of seven bytes or
+fewer, the bytes packed into the pointer word itself (top bit set, low bit
+clear). There is no documented C-side accessor outside `march_runtime.h`,
+which a consumer's C does not include. Workaround: `native/strata_text.c`
+carries its own copy of the decoding (`mstr`). It breaks if the runtime's
+string layout changes; `viewer/test/text_test.march` ("Strings reach C")
+would catch it, with short, long and built strings.

@@ -1,0 +1,145 @@
+-- Text for the 2D layer: fonts, and strings laid out as glyph quads in a
+-- Strata.Ui display.
+--
+-- A font is a handle (an Int). `default_font()` is built in; `font` loads a
+-- TrueType or OpenType file. A glyph is drawn into an atlas the first time it
+-- is used and serves every size from there, so text is sharp at any size and
+-- costs nothing extra to resize. A screenful of new glyphs is spread over a
+-- few frames: text may appear a frame or two late the first time, never as a
+-- long frame.
+--
+-- Sizes and offsets are interface pixels, like everything in Strata.Ui. A
+-- text block is placed by an anchor like any element: its own matching point
+-- sits at the anchor plus the offset.
+mod Strata.Text do
+
+  -- how lines sit in the block, wrap width (0: none), outline width and colour, shadow offset and colour
+  type TextStyle = TextStyle(Int, Float, Float, (Float, Float, Float, Float), Float, Float, (Float, Float, Float, Float))
+
+  doc "The built-in font: Noto Sans, Latin."
+  fn default_font() : Int do Strata.Ffi.Text.font_default() end
+
+  pfn fill_handles(a : NativeI32Arr, hs : List(Int), i : Int) : NativeI32Arr do
+    match hs do
+      Nil -> a
+      Cons(h, t) -> fill_handles(NativeArray.set_i32(a, i, h), t, i + 1)
+    end
+  end
+
+  doc "Set the fonts [font] falls back to, in order, for characters it lacks (at most eight). False for a bad handle."
+  fn set_fallbacks(font : Int, fallbacks : List(Int)) : Bool do
+    let n = List.length(fallbacks)
+    Strata.Ffi.Text.font_set_fallbacks(font, fill_handles(NativeArray.make_i32(if n > 0 do n else 1 end, 0), fallbacks, 0), n)
+  end
+
+  doc "Load a font file. [face] picks one face of a collection (0 for an ordinary file). [fallbacks] are fonts already loaded, tried in order for characters this one lacks. 0 if the file is missing or is not a font; drawing with 0 draws the built-in font."
+  fn font(path : String, face : Int, fallbacks : List(Int)) : Int do
+    let f = Strata.Ffi.Text.font_load(path, face)
+    if f > 0 && set_fallbacks(f, fallbacks) do f else f end
+  end
+
+  fn align_left() : Int do 0 end
+  fn align_centre() : Int do 1 end
+  fn align_right() : Int do 2 end
+
+  doc "Plain text: left-aligned lines, no wrapping, no outline, no shadow."
+  fn style() : TextStyle do TextStyle(0, 0.0, 0.0, (0.0, 0.0, 0.0, 0.0), 0.0, 0.0, (0.0, 0.0, 0.0, 0.0)) end
+  doc "An outline [px] interface pixels wide in [rgba]. It can be at most about a sixth of the text's size."
+  fn with_outline(st : TextStyle, px : Float, rgba : (Float, Float, Float, Float)) : TextStyle do match st do TextStyle(a, w, _, _, dx, dy, sc) -> TextStyle(a, w, px, rgba, dx, dy, sc) end end
+  doc "A shadow offset (dx, dy) interface pixels in [rgba]."
+  fn with_shadow(st : TextStyle, dx : Float, dy : Float, rgba : (Float, Float, Float, Float)) : TextStyle do match st do TextStyle(a, w, o, oc, _, _, _) -> TextStyle(a, w, o, oc, dx, dy, rgba) end end
+  doc "How lines sit within the block: align_left, align_centre or align_right."
+  fn with_align(st : TextStyle, align : Int) : TextStyle do match st do TextStyle(_, w, o, oc, dx, dy, sc) -> TextStyle(align, w, o, oc, dx, dy, sc) end end
+  doc "Wrap lines to [width] interface pixels. Lines break at spaces and between Chinese, Japanese and Korean characters; a word longer than the width breaks where it must."
+  fn with_wrap(st : TextStyle, width : Float) : TextStyle do match st do TextStyle(a, _, o, oc, dx, dy, sc) -> TextStyle(a, width, o, oc, dx, dy, sc) end end
+
+  pfn put4(a : NativeF32Arr, o : Int, c : (Float, Float, Float, Float), scale : Float) : NativeF32Arr do
+    match c do
+      (p, q, r, s) -> NativeArray.set_f32(NativeArray.set_f32(NativeArray.set_f32(NativeArray.set_f32(a, o, p *. scale), o + 1, q *. scale), o + 2, r *. scale), o + 3, s *. scale)
+    end
+  end
+
+  -- the parameters of one text call (native/strata_text.h, st_text), everything already in device pixels
+  pfn params(x : Float, y : Float, size : Float, st : TextStyle, k : Float, rgba : (Float, Float, Float, Float), hx : Int, vy : Int, baseline : Bool) : NativeF32Arr do
+    match st do
+      TextStyle(align, wrap, outline, oc, dx, dy, sc) ->
+        let a = put4(NativeArray.make_f32(24, 0.0), 0, (x, y, size *. k, wrap *. k), 1.0)
+        let b = put4(NativeArray.set_f32(a, 4, int_to_float(align)), 5, rgba, 1.0)
+        let c = put4(NativeArray.set_f32(b, 9, outline *. k), 10, oc, 1.0)
+        let d = put4(NativeArray.set_f32(NativeArray.set_f32(c, 14, dx *. k), 15, dy *. k), 16, sc, 1.0)
+        NativeArray.set_f32(NativeArray.set_f32(NativeArray.set_f32(d, 20, int_to_float(hx)), 21, int_to_float(vy)), 22, if baseline do 1.0 else 0.0 end)
+    end
+  end
+
+  -- write a text's quads at the end of the display
+  pfn emit(u : Strata.Ui.Ui, font : Int, s : String, p : NativeF32Arr) : Strata.Ui.Ui do
+    let room = Strata.Ui.reserve(u, 3 * Strata.Ffi.Text.byte_count(s))
+    Strata.Ui.added(room, Strata.Ffi.Text.text(Strata.Ui.quads(room), Strata.Ui.quad_count(room), font, s, p))
+  end
+
+  doc "Text in a style: see `style` and the `with_` functions. A string that is not valid UTF-8 draws nothing."
+  fn styled(u : Strata.Ui.Ui, anchor : Int, x : Float, y : Float, font : Int, size : Float, rgba : (Float, Float, Float, Float), st : TextStyle, s : String) : Strata.Ui.Ui do
+    let k = Strata.Ui.pixel_ratio(u)
+    emit(u, font, s, params((Strata.Ui.anchor_x(u, anchor) +. x) *. k, (Strata.Ui.anchor_y(u, anchor) +. y) *. k, size, st, k, rgba, anchor % 3, anchor / 3, false))
+  end
+
+  doc "Plain text, [size] interface pixels to the em, in [rgba]. Newlines start new lines."
+  fn text(u : Strata.Ui.Ui, anchor : Int, x : Float, y : Float, font : Int, size : Float, rgba : (Float, Float, Float, Float), s : String) : Strata.Ui.Ui do
+    styled(u, anchor, x, y, font, size, rgba, style(), s)
+  end
+
+  -- width, height, lines, ascent of a string at a size, in the pixels the size is in
+  pfn measured(font : Int, size : Float, s : String, wrap : Float) : NativeF32Arr do
+    let out = NativeArray.make_f32(4, 0.0)
+    if Strata.Ffi.Text.measure(font, s, params(0.0, 0.0, size, with_wrap(style(), wrap), 1.0, (1.0, 1.0, 1.0, 1.0), 0, 0, false), out) do out else out end
+  end
+
+  doc "How big a string is in a font at a size: (width, height, lines). [wrap] is the width lines wrap to, 0 for none. The width leaves out spaces at the ends of lines. An empty string is zero wide and one line high."
+  fn measure(font : Int, size : Float, s : String, wrap : Float) : (Float, Float, Int) do
+    let m = measured(font, size, s, wrap)
+    (NativeArray.get_f32(m, 0), NativeArray.get_f32(m, 1), float_to_int(NativeArray.get_f32(m, 2)))
+  end
+
+  -- the widest ascent, the tallest line, and the summed width of some runs, in device pixels
+  pfn runs_size(runs : List((Int, Float, (Float, Float, Float, Float), String)), k : Float, asc : Float, high : Float, wide : Float) : (Float, Float, Float) do
+    match runs do
+      Nil -> (asc, high, wide)
+      Cons((font, size, _, s), t) ->
+        let m = measured(font, size *. k, s, 0.0)
+        let a = NativeArray.get_f32(m, 3)
+        let h = NativeArray.get_f32(m, 1)
+        runs_size(t, k, if a > asc do a else asc end, if h > high do h else high end, wide +. advance(font, size *. k, s))
+    end
+  end
+
+  -- how far a run moves the pen: its width with the spaces at its end counted
+  pfn advance(font : Int, size : Float, s : String) : Float do
+    NativeArray.get_f32(measured(font, size, s ++ "|", 0.0), 0) -. NativeArray.get_f32(measured(font, size, "|", 0.0), 0)
+  end
+
+  pfn runs_go(u : Strata.Ui.Ui, runs : List((Int, Float, (Float, Float, Float, Float), String)), st : TextStyle, k : Float, x : Float, base : Float) : Strata.Ui.Ui do
+    match runs do
+      Nil -> u
+      Cons((font, size, rgba, s), t) ->
+        runs_go(emit(u, font, s, params(x, base, size, with_wrap(with_align(st, 0), 0.0), k, rgba, 0, 0, true)), t, st, k, x +. advance(font, size *. k, s), base)
+    end
+  end
+
+  doc "One line made of several runs, each (font, size, colour, text), set one after another on a shared baseline: more than one colour, size or font in a line. The style's outline and shadow apply to every run; its wrap and alignment do not."
+  fn runs(u : Strata.Ui.Ui, anchor : Int, x : Float, y : Float, st : TextStyle, parts : List((Int, Float, (Float, Float, Float, Float), String))) : Strata.Ui.Ui do
+    let k = Strata.Ui.pixel_ratio(u)
+    match runs_size(parts, k, 0.0, 0.0, 0.0) do
+      (asc, high, wide) ->
+        let left = Math.floor((Strata.Ui.anchor_x(u, anchor) +. x) *. k -. int_to_float(anchor % 3) *. 0.5 *. wide +. 0.5)
+        let top = (Strata.Ui.anchor_y(u, anchor) +. y) *. k -. int_to_float(anchor / 3) *. 0.5 *. high
+        runs_go(u, parts, st, k, left, Math.floor(top +. asc +. 0.5))
+    end
+  end
+
+  doc "Glyphs that had to wait since the frame began: their text is drawn a frame late. 0 once everything on screen is in the atlas."
+  fn waiting() : Int do float_to_int(Strata.Ffi.Text.stat(1)) end
+  doc "Bytes the glyph atlas holds."
+  fn atlas_bytes() : Int do float_to_int(Strata.Ffi.Text.stat(3)) end
+  doc "Microseconds a frame may spend drawing new glyphs (1000 by default). A loading screen can raise it to fill the atlas at once."
+  fn set_raster_budget(microseconds : Int) : Unit do Strata.Ffi.Text.set_raster_budget(microseconds) end
+end
