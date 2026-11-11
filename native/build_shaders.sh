@@ -25,5 +25,9 @@ build fullscreen.vert
 build gbuffer.frag tiles.glsl
 build light.frag shade.glsl tiles.glsl trace.glsl sky.glsl
 build composite.frag
-build water.frag shade.glsl tiles.glsl sky.glsl
+build water.frag shade.glsl tiles.glsl trace.glsl sky.glsl
 cp "$OUT" strata_shaders.h
+# strata_vk.c carries a stamp of the header, so a shader-only change still
+# changes the C source forge looks at
+stamp=$(shasum strata_shaders.h | cut -c1-16)
+sed -i '' "s/^#define STRATA_SHADERS_STAMP .*/#define STRATA_SHADERS_STAMP \"$stamp\"/" strata_vk.c

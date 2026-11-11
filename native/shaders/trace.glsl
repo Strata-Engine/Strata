@@ -47,8 +47,9 @@ bool cutout_blocks(uint c, vec3 p, int face) {
 }
 
 // Walk a ray from [ro] along unit [rd], both in voxel units, for at most
-// [tmax] voxels. Solid voxels stop it. Cutout voxels stop it where their
-// texture is opaque. See-through voxels stop it only if [stop_glass]. Thin
+// [tmax] voxels. Solid voxels stop it. A run of cutout voxels of one class
+// stops it where the texture is opaque at the point the ray enters the run:
+// the faces between them are not drawn, so they do not block either. See-through voxels stop it only if [stop_glass]. Thin
 // voxels never stop it; what they emit is added to h.glow. Returns false if
 // nothing stopped it, including when it left the loaded world.
 bool trace(vec3 ro, vec3 rd, float tmax, bool stop_glass, out Hit h) {
@@ -59,29 +60,37 @@ bool trace(vec3 ro, vec3 rd, float tmax, bool stop_glass, out Hit h) {
     float t = 0.0;
     int face = 0;
     ivec3 last_chunk = ivec3(-1000000);
+    ivec3 shift = ivec3(0);                       // from a chunk coordinate to its cell in the volume
+    bool hollow = false;                          // the chunk the ray is in holds nothing
     ivec3 last_thin = ivec3(-1000000);
+    uint before = 0u;                             // the class of the voxel the ray was in last
     for (int i = 0; i < 160; i++) {
         if (t >= tmax) return false;
         vec3 p = ro + d * t;
         ivec3 v = ivec3(floor(p));
         ivec3 ch = v >> 5;
         if (ch != last_chunk) {
-            ivec4 own = texelFetch(owner, wrap(ch, dims), 0);
+            ivec3 cell = wrap(ch, dims);
+            ivec4 own = texelFetch(owner, cell, 0);
             if (own.w == 0 || own.xyz != ch) return false;         // off the edge of what is loaded
-            last_chunk = ch;
+            last_chunk = ch; shift = cell - ch; hollow = own.w == 2;
         }
-        ivec3 cc = v >> 3;
         vec3 lo, hi;
-        if (texelFetch(coarse, wrap(cc, dims * 4), 0).r == 0u) {
-            lo = vec3(cc * 8); hi = lo + 8.0;                        // nothing in this 8-voxel cell: cross it whole
+        if (hollow) {
+            lo = vec3(ch * 32); hi = lo + 32.0;                      // an empty chunk: cross it whole
+            before = 0u;
+        } else if (texelFetch(coarse, (v >> 3) + shift * 4, 0).r == 0u) {
+            lo = vec3((v >> 3) * 8); hi = lo + 8.0;                  // nothing in this 8-voxel cell: cross it whole
+            before = 0u;
         } else {
-            uint c = texelFetch(vol, wrap(v, dims * 32), 0).r;
+            uint c = texelFetch(vol, v + shift * 32, 0).r;
             if (c != 0u) {
                 int kind = class_kind(c);
-                bool stops = kind == 1 || (kind == 2 && cutout_blocks(c, p, face)) || (kind == 3 && stop_glass);
+                bool stops = kind == 1 || (kind == 2 && c != before && cutout_blocks(c, p, face)) || (kind == 3 && stop_glass);
                 if (stops) { h.voxel = v; h.face = face; h.t = t; h.cls = c; return true; }
                 if (kind == 4 && v != last_thin) { h.glow += class_emission(c); last_thin = v; }
             }
+            before = c;
             lo = vec3(v); hi = lo + 1.0;
         }
         // leave the box by whichever face the ray reaches first

@@ -81,3 +81,11 @@ has two whole frames to finish and the wait is normally zero. A real
 
 `1.0e-12` is a parse error reported as "I was expecting `do` after the
 condition here". Workaround: write the digits out.
+
+## S14: forge reuses a build when only an included C header changed
+
+forge keys its build cache on the text of the `[ffi]` C sources, not on the
+headers they include. A change to `native/strata_shaders.h` alone (a shader
+edit) produced a binary with the old shaders. Workaround:
+`native/build_shaders.sh` rewrites a stamp line in `strata_vk.c` with the
+header's hash.

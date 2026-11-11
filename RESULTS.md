@@ -277,3 +277,25 @@ wait for the next frame. The soak with the volume in place: worst frame
 16.6 ms, mean 8.3 ms, nothing refused or leaked. Golden scenes `volume` and
 `volume-walk` draw the volume's classes over the overview and after a walk
 (wrap addressing): the terrain's shape, no holes, no wrapped copies.
+
+## Task 4: sun shadows (light mode 2)
+
+2560 x 1600, offscreen, the overview at stream radius 10.
+
+| | GPU time |
+|---|---|
+| mode 1, no rays | 0.66 ms |
+| mode 2, sun at 55 degrees | 1.74 ms |
+| mode 2, sun at 15 degrees | 2.60 ms |
+
+The 2 ms target is met with a high sun and missed by 0.6 ms with a low one,
+where rays skim the ground for longer. What got it there, from 10.4 ms:
+empty chunks are crossed whole (the owner table marks them), the walk no
+longer wraps coordinates at every step, and a pixel whose memory has settled
+takes a new sample one frame in four, in 8-pixel blocks (a finer pattern
+saved nothing: the GPU shades neighbouring pixels together).
+
+An edit: the slab's shadow is at full darkness on the first frame the slab is
+drawn, and gone on the first frame it is not (goldens `shadow-placed`,
+`shadow-removed`, shot four frames after the edit). Stillness: frames 118 and
+119 of the forest differ by more than 4 in 0.0017% of pixels (limit 0.05%).

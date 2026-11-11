@@ -24,6 +24,10 @@
 #include <string.h>
 #include <math.h>
 
+/* Rewritten by build_shaders.sh whenever the shaders change: forge decides
+ * whether to recompile this file from its text alone, not from the headers
+ * it includes (GAPS S14). */
+#define STRATA_SHADERS_STAMP "abde444811614867"
 #include "strata_shaders.h"
 #include "strata_alloc.h"
 
@@ -105,7 +109,12 @@ static struct {
     VkImage depth; VkDeviceMemory depth_mem; VkImageView depth_view;
     /* what the geometry pass writes and the light pass reads, and the lit image */
     Target gb_albedo, gb_nm, lit;
-    VkFramebuffer fb_g, fb_l;
+    VkFramebuffer fb_g, fb_l[SV_FRAMES];
+    /* What the light pass remembers between frames, one pair per frame in
+     * flight: a frame reads the other's and writes its own. hist: rgb sky
+     * light, a sun visibility. hmeta: r samples, g view depth, b face. */
+    Target hist[SV_FRAMES], hmeta[SV_FRAMES];
+    int hist_reset;                /* frames left in which that memory must not be read (fresh images) */
     VkSampler nearest;             /* for reading the frame's own images, texel for texel */
     int light_mode;                /* 0: the pre-ray-tracing shading, through the deferred passes */
     /* The light volume: a light class per voxel for every chunk held, the
@@ -114,9 +123,9 @@ static struct {
     int vn, vnv;                   /* its size in chunks: vn across (x and z), vnv up */
     VkBuffer ltable; VkDeviceMemory ltable_mem; int32_t *ltable_map;
     struct LightCell { int32_t chunk[3]; int valid; int uniform; } *cells;   /* per cell, as last queued: its chunk, and its class if it is one class throughout, else -1 */
-    struct LightWrite { int cell[3]; int32_t chunk[3]; int valid; int uniform; unsigned char *bytes; } *lq;   /* writes waiting to be copied in, oldest first */
+    struct LightWrite { int cell[3]; int32_t chunk[3]; int valid; int uniform; int edit; unsigned char *bytes; } *lq;   /* writes waiting to be copied in, oldest first */
     uint32_t nlq, lq_cap;
-    int light_edit;                /* frames left in which an edit's lighting is still settling */
+    int light_edit;                /* frames left in which the light pass must lean on new samples: an edit just reached the volume */
     unsigned char *stage_light; int stage_light_n;   /* the light bytes of the chunk being assembled */
     float prev_vp[16]; double time_s;
     /* an offscreen target the size of the window, for frames that must not
@@ -231,8 +240,8 @@ static void destroy_swapchain(void) {
     if (g.off_mem) vkFreeMemory(g.dev, g.off_mem, NULL);
     g.off_fb = VK_NULL_HANDLE; g.off_view = VK_NULL_HANDLE; g.off = VK_NULL_HANDLE; g.off_mem = VK_NULL_HANDLE;
     if (g.fb_g) vkDestroyFramebuffer(g.dev, g.fb_g, NULL);
-    if (g.fb_l) vkDestroyFramebuffer(g.dev, g.fb_l, NULL);
-    g.fb_g = VK_NULL_HANDLE; g.fb_l = VK_NULL_HANDLE;
+    for (int f = 0; f < SV_FRAMES; f++) { if (g.fb_l[f]) vkDestroyFramebuffer(g.dev, g.fb_l[f], NULL); g.fb_l[f] = VK_NULL_HANDLE; drop_target(&g.hist[f]); drop_target(&g.hmeta[f]); }
+    g.fb_g = VK_NULL_HANDLE;
     drop_target(&g.gb_albedo); drop_target(&g.gb_nm); drop_target(&g.lit);
     if (g.depth_view) vkDestroyImageView(g.dev, g.depth_view, NULL);
     if (g.depth) vkDestroyImage(g.dev, g.depth, NULL);
@@ -315,6 +324,11 @@ static int make_swapchain(void) {
     if (!make_image(FMT_ALBEDO, tu, VK_IMAGE_ASPECT_COLOR_BIT, &g.gb_albedo.img, &g.gb_albedo.mem, &g.gb_albedo.view)) return 0;
     if (!make_image(FMT_NM, tu, VK_IMAGE_ASPECT_COLOR_BIT, &g.gb_nm.img, &g.gb_nm.mem, &g.gb_nm.view)) return 0;
     if (!make_image(FMT_LIT, tu, VK_IMAGE_ASPECT_COLOR_BIT, &g.lit.img, &g.lit.mem, &g.lit.view)) return 0;
+    for (int f = 0; f < SV_FRAMES; f++) {
+        if (!make_image(FMT_LIT, tu, VK_IMAGE_ASPECT_COLOR_BIT, &g.hist[f].img, &g.hist[f].mem, &g.hist[f].view)) return 0;
+        if (!make_image(FMT_LIT, tu, VK_IMAGE_ASPECT_COLOR_BIT, &g.hmeta[f].img, &g.hmeta[f].mem, &g.hmeta[f].view)) return 0;
+    }
+    g.hist_reset = SV_FRAMES;
     if (!make_image(g.format, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, VK_IMAGE_ASPECT_COLOR_BIT, &g.off, &g.off_mem, &g.off_view)) return 0;
     return 1;
 }
@@ -334,6 +348,16 @@ static void bind_targets(void) {
             w[b] = (VkWriteDescriptorSet){ .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = g.frames[f].dset, .dstBinding = 7 + b, .descriptorCount = 1,
                 .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .pImageInfo = &ii[b] };
         vkUpdateDescriptorSets(g.dev, 4, w, 0, NULL);
+        /* the light pass's memory: the OTHER frame's, which the frame before this one wrote */
+        int o = (f + SV_FRAMES - 1) % SV_FRAMES;
+        VkDescriptorImageInfo hi[2] = {
+            { g.nearest, g.hist[o].view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL },
+            { g.nearest, g.hmeta[o].view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL } };
+        VkWriteDescriptorSet hw[2];
+        for (uint32_t b = 0; b < 2; b++)
+            hw[b] = (VkWriteDescriptorSet){ .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = g.frames[f].dset, .dstBinding = 15 + b, .descriptorCount = 1,
+                .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .pImageInfo = &hi[b] };
+        vkUpdateDescriptorSets(g.dev, 2, hw, 0, NULL);
     }
 }
 
@@ -355,9 +379,12 @@ static int make_framebuffers(void) {
     VkFramebufferCreateInfo gi = { .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO, .renderPass = g.pass_g, .attachmentCount = 3,
         .pAttachments = ga, .width = g.extent.width, .height = g.extent.height, .layers = 1 };
     VKOK(vkCreateFramebuffer(g.dev, &gi, NULL, &g.fb_g), "geometry framebuffer");
-    VkFramebufferCreateInfo li = { .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO, .renderPass = g.pass_l, .attachmentCount = 1,
-        .pAttachments = &g.lit.view, .width = g.extent.width, .height = g.extent.height, .layers = 1 };
-    VKOK(vkCreateFramebuffer(g.dev, &li, NULL, &g.fb_l), "light framebuffer");
+    for (int f = 0; f < SV_FRAMES; f++) {
+        VkImageView la[3] = { g.lit.view, g.hist[f].view, g.hmeta[f].view };
+        VkFramebufferCreateInfo li = { .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO, .renderPass = g.pass_l, .attachmentCount = 3,
+            .pAttachments = la, .width = g.extent.width, .height = g.extent.height, .layers = 1 };
+        VKOK(vkCreateFramebuffer(g.dev, &li, NULL, &g.fb_l[f]), "light framebuffer");
+    }
     bind_targets();
     return 1;
 }
@@ -397,17 +424,22 @@ static int make_pass_g(void) {
     return 1;
 }
 
-/* The light pass: one target, the lit image, left ready to be sampled. */
+/* The light pass: the lit image and what the pass remembers for the next
+ * frame, all left ready to be sampled. */
 static int make_pass_l(void) {
-    VkAttachmentDescription att = color_att(FMT_LIT, VK_ATTACHMENT_LOAD_OP_DONT_CARE, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-    VkAttachmentReference cref = { 0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL };
-    VkSubpassDescription sub = { .pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS, .colorAttachmentCount = 1, .pColorAttachments = &cref };
+    VkAttachmentDescription att[3];
+    VkAttachmentReference cref[3];
+    for (uint32_t i = 0; i < 3; i++) {
+        att[i] = color_att(FMT_LIT, VK_ATTACHMENT_LOAD_OP_DONT_CARE, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        cref[i] = (VkAttachmentReference){ i, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL };
+    }
+    VkSubpassDescription sub = { .pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS, .colorAttachmentCount = 3, .pColorAttachments = cref };
     VkSubpassDependency dep[2] = {
         { .srcSubpass = VK_SUBPASS_EXTERNAL, .dstSubpass = 0, .srcStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, .dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
           .srcAccessMask = VK_ACCESS_SHADER_READ_BIT, .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT },
         { .srcSubpass = 0, .dstSubpass = VK_SUBPASS_EXTERNAL, .srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, .dstStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
           .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, .dstAccessMask = VK_ACCESS_SHADER_READ_BIT } };
-    VkRenderPassCreateInfo rpi = { .sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO, .attachmentCount = 1, .pAttachments = &att,
+    VkRenderPassCreateInfo rpi = { .sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO, .attachmentCount = 3, .pAttachments = att,
         .subpassCount = 1, .pSubpasses = &sub, .dependencyCount = 2, .pDependencies = dep };
     VKOK(vkCreateRenderPass(g.dev, &rpi, NULL, &g.pass_l), "light pass");
     return 1;
@@ -476,13 +508,13 @@ static int make_pipeline(int kind, VkPipeline *out) {
     /* only the geometry pass writes depth; translucent quads test against it; full-screen passes ignore it */
     VkPipelineDepthStencilStateCreateInfo ds = { .sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO, .depthTestEnable = full ? VK_FALSE : VK_TRUE,
         .depthWriteEnable = geom ? VK_TRUE : VK_FALSE, .depthCompareOp = VK_COMPARE_OP_LESS };
-    VkPipelineColorBlendAttachmentState cba[2];
+    VkPipelineColorBlendAttachmentState cba[3];
     cba[0] = (VkPipelineColorBlendAttachmentState){ .blendEnable = blend ? VK_TRUE : VK_FALSE,
         .srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA, .dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA, .colorBlendOp = VK_BLEND_OP_ADD,
         .srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE, .dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA, .alphaBlendOp = VK_BLEND_OP_ADD,
         .colorWriteMask = 0xF };
-    cba[1] = cba[0];
-    VkPipelineColorBlendStateCreateInfo cb = { .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO, .attachmentCount = geom ? 2 : 1, .pAttachments = cba };
+    cba[1] = cba[0]; cba[2] = cba[0];
+    VkPipelineColorBlendStateCreateInfo cb = { .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO, .attachmentCount = geom ? 2 : (kind == 4 ? 3 : 1), .pAttachments = cba };
     VkDynamicState dyn[2] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
     VkPipelineDynamicStateCreateInfo dsi = { .sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, .dynamicStateCount = 2, .pDynamicStates = dyn };
     VkGraphicsPipelineCreateInfo pi = { .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, .stageCount = 2, .pStages = stages,
@@ -714,7 +746,7 @@ static void light_queue(const int32_t *chunk, int valid, int uniform, unsigned c
     /* nothing to do when the cell already holds exactly this: an air chunk re-uploaded, say */
     if (valid == c->valid && (!valid || same_owner) && !bytes && uniform >= 0 && c->uniform == uniform) return;
     /* new voxels for a chunk the volume already held: an edit, whose lighting must be re-estimated */
-    if (valid && same_owner) g.light_edit = 2;
+    int edit = valid && same_owner;
     if (g.nlq == g.lq_cap) {
         uint32_t cap = g.lq_cap ? g.lq_cap * 2 : 256;
         struct LightWrite *grown = realloc(g.lq, cap * sizeof *grown);
@@ -724,7 +756,7 @@ static void light_queue(const int32_t *chunk, int valid, int uniform, unsigned c
     struct LightWrite *w = &g.lq[g.nlq++];
     w->cell[0] = cell[0]; w->cell[1] = cell[1]; w->cell[2] = cell[2];
     w->chunk[0] = chunk[0]; w->chunk[1] = chunk[1]; w->chunk[2] = chunk[2];
-    w->valid = valid; w->uniform = bytes ? -1 : uniform; w->bytes = bytes;
+    w->valid = valid; w->uniform = bytes ? -1 : uniform; w->bytes = bytes; w->edit = edit;
     c->chunk[0] = chunk[0]; c->chunk[1] = chunk[1]; c->chunk[2] = chunk[2];
     c->valid = valid; c->uniform = w->uniform;
 }
@@ -740,6 +772,7 @@ static void light_flush(Frame *F) {
         unsigned char *dst = F->lstage_map + (size_t)i * SV_LIGHT_WRITE_BYTES;
         unsigned char *coarse = dst + 32768;
         int16_t *own = (int16_t *)(dst + 32768 + 64);
+        int any = 0;
         if (w->bytes) {
             /* the chunk's flat index is x + 32 * (z + 32 * y); the volume wants x fastest, then y, then z */
             for (int z = 0; z < 32; z++) for (int y = 0; y < 32; y++)
@@ -747,13 +780,14 @@ static void light_flush(Frame *F) {
             memset(coarse, 0, 64);
             for (int z = 0; z < 32; z++) for (int y = 0; y < 32; y++) {
                 const unsigned char *row = dst + 32 * (y + 32 * z);
-                for (int x = 0; x < 32; x++) if (row[x]) coarse[(x >> 3) + 4 * ((y >> 3) + 4 * (z >> 3))] = 1;
+                for (int x = 0; x < 32; x++) if (row[x]) { coarse[(x >> 3) + 4 * ((y >> 3) + 4 * (z >> 3))] = 1; any = 1; }
             }
         } else {
             memset(dst, w->uniform, 32768);
             memset(coarse, w->uniform ? 1 : 0, 64);
+            any = w->uniform != 0;
         }
-        own[0] = (int16_t)w->chunk[0]; own[1] = (int16_t)w->chunk[1]; own[2] = (int16_t)w->chunk[2]; own[3] = (int16_t)(w->valid ? 1 : 0);
+        own[0] = (int16_t)w->chunk[0]; own[1] = (int16_t)w->chunk[1]; own[2] = (int16_t)w->chunk[2]; own[3] = (int16_t)(w->valid ? (any ? 1 : 2) : 0);   /* 2: held, and nothing in it */
         VkDeviceSize base = (VkDeviceSize)i * SV_LIGHT_WRITE_BYTES;
         rv[i] = (VkBufferImageCopy){ .bufferOffset = base, .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
             .imageOffset = { w->cell[0] * 32, w->cell[1] * 32, w->cell[2] * 32 }, .imageExtent = { 32, 32, 32 } };
@@ -869,7 +903,7 @@ int64_t sv_open(int64_t w, int64_t h, int64_t capture_mouse, int64_t quad_capaci
     g.swap_ok = 1;
 
     /* one set layout for every pipeline: 0 uniforms, 1 chunk table, 2 indirect commands, 3 cull statistics, 4 command -> slot */
-    VkDescriptorSetLayoutBinding dslb[15] = {
+    VkDescriptorSetLayoutBinding dslb[17] = {
         { .binding = 0, .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, .descriptorCount = 1,
           .stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT },
         { .binding = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1,
@@ -890,8 +924,11 @@ int64_t sv_open(int64_t w, int64_t h, int64_t capture_mouse, int64_t quad_capaci
         { .binding = 11, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT },
         { .binding = 12, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT },
         { .binding = 13, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT },
-        { .binding = 14, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT } };
-    VkDescriptorSetLayoutCreateInfo dsli = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 15, .pBindings = dslb };
+        { .binding = 14, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT },
+        /* the light pass's memory of the frame before */
+        { .binding = 15, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT },
+        { .binding = 16, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT } };
+    VkDescriptorSetLayoutCreateInfo dsli = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 17, .pBindings = dslb };
     VKOK(vkCreateDescriptorSetLayout(g.dev, &dsli, NULL, &g.dsl), "descriptor set layout");
     /* where the call's range starts in draw_slot, and per-call flags (bit 0: cutout) */
     VkPushConstantRange pcr = { .stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, .offset = 0, .size = 8 };
@@ -940,7 +977,7 @@ int64_t sv_open(int64_t w, int64_t h, int64_t capture_mouse, int64_t quad_capaci
     if (!make_buffer((VkDeviceSize)SV_MAX_BLOCKS * 32, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &g.blocks, &g.blocks_mem, &map)) return 0;
     g.blocks_map = map;
     memset(g.blocks_map, 0, (size_t)SV_MAX_BLOCKS * 32);
-    VkDescriptorPoolSize dps[3] = { { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, SV_FRAMES }, { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 6 * SV_FRAMES }, { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 8 * SV_FRAMES } };
+    VkDescriptorPoolSize dps[3] = { { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, SV_FRAMES }, { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 6 * SV_FRAMES }, { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 10 * SV_FRAMES } };
     VkDescriptorPoolCreateInfo dpi = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = SV_FRAMES, .poolSizeCount = 3, .pPoolSizes = dps };
     VKOK(vkCreateDescriptorPool(g.dev, &dpi, NULL, &g.dpool), "descriptor pool");
     for (int f = 0; f < SV_FRAMES; f++) {
@@ -1479,7 +1516,14 @@ int64_t sv_frame(void) {
     memcpy(g.prev_vp, g.ubo_map, sizeof g.prev_vp);
     g.ubo_map[UBO_LIGHT + 0] = (float)g.light_mode; g.ubo_map[UBO_LIGHT + 1] = (float)g.time_s;
     g.ubo_map[UBO_LIGHT + 2] = (float)(g.frame_no & 0xFFFFFF);
-    { int32_t *vol = (int32_t *)(g.ubo_map + UBO_VOL); vol[0] = g.vn; vol[1] = g.vnv; vol[2] = g.vn; vol[3] = 0; }
+    { int32_t *vol = (int32_t *)(g.ubo_map + UBO_VOL); vol[0] = g.vn; vol[1] = g.vnv; vol[2] = g.vn;
+      /* how many past samples a pixel may lean on: none while the remembered
+       * images are fresh, 2 while an edit that reaches the volume this frame
+       * settles, else 64 */
+      for (uint32_t i = 0; i < g.nlq && i < SV_LIGHT_PER_FRAME; i++) if (g.lq[i].edit) g.light_edit = 2;
+      vol[3] = g.hist_reset > 0 ? 0 : (g.light_edit > 0 ? 2 : 64);
+      if (g.hist_reset > 0) g.hist_reset--;
+      if (g.light_edit > 0) g.light_edit--; }
     /* this Frame's fence has been waited on, so the GPU is done with its
      * copies: bring them up to date. From here to the next time this Frame
      * comes round, nothing the CPU does can change what it draws. */
@@ -1542,7 +1586,7 @@ int64_t sv_frame(void) {
     vkCmdEndRenderPass(F->cmd);
 
     /* 2. light: one full-screen triangle reads those buffers and writes the lit image */
-    VkRenderPassBeginInfo lbi = { .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO, .renderPass = g.pass_l, .framebuffer = g.fb_l,
+    VkRenderPassBeginInfo lbi = { .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO, .renderPass = g.pass_l, .framebuffer = g.fb_l[g.frame_no % SV_FRAMES],
         .renderArea = { { 0, 0 }, g.extent } };
     vkCmdBeginRenderPass(F->cmd, &lbi, VK_SUBPASS_CONTENTS_INLINE);
     vkCmdSetViewport(F->cmd, 0, 1, &vpt); vkCmdSetScissor(F->cmd, 0, 1, &sc);

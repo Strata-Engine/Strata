@@ -21,6 +21,11 @@ DIFF=native/tests/bin/ppm_diff
 $DIFF "$OUT/a.ppm" "$OUT/a.ppm" > /dev/null; [ $? -eq 0 ] || { echo "FAIL: ppm_diff rejects identical images"; exit 1; }
 $DIFF "$OUT/a.ppm" "$OUT/b.ppm" > /dev/null; [ $? -eq 1 ] || { echo "FAIL: ppm_diff accepts a 1% difference"; exit 1; }
 $DIFF "$OUT/a.ppm" "$OUT/c.ppm" > /dev/null 2>&1; [ $? -eq 2 ] || { echo "FAIL: ppm_diff accepts mismatched sizes"; exit 1; }
+# a stricter level and share: one pixel in a hundred off by 5 passes by default and fails at level 4, 0.05%
+{ printf 'P6\n10 10\n255\n'; printf '\005\000\000'; head -c 297 /dev/zero; } > "$OUT/d.ppm"
+$DIFF "$OUT/a.ppm" "$OUT/d.ppm" > /dev/null; [ $? -eq 0 ] || { echo "FAIL: ppm_diff rejects a difference of 5 by default"; exit 1; }
+$DIFF "$OUT/a.ppm" "$OUT/d.ppm" 4 0.05 > /dev/null; [ $? -eq 1 ] || { echo "FAIL: ppm_diff accepts a difference of 5 at level 4"; exit 1; }
+$DIFF "$OUT/a.ppm" "$OUT/a.ppm" 4 0.05 > /dev/null; [ $? -eq 0 ] || { echo "FAIL: ppm_diff rejects identical images at level 4"; exit 1; }
 
 (cd viewer && forge build --release > "$OUT/build.log" 2>&1) || { echo "FAIL: viewer build"; tail -20 "$OUT/build.log"; exit 1; }
 
@@ -42,6 +47,13 @@ volume:STRATA_SCENE=1 STRATA_LIGHT=9
 volume-walk:STRATA_SCENE=11 STRATA_FRAMES=200 STRATA_LIGHT=9
 sun-high:STRATA_SCENE=1 STRATA_LIGHT=1 STRATA_SUN=55
 sun-low:STRATA_SCENE=2 STRATA_LIGHT=1 STRATA_SUN=8
+shadow-35:STRATA_SCENE=1 STRATA_LIGHT=2 STRATA_SUN=35
+shadow-15:STRATA_SCENE=1 STRATA_LIGHT=2 STRATA_SUN=15
+shadow-forest:STRATA_SCENE=3 STRATA_LIGHT=2
+shadow-slab:STRATA_SCENE=12 STRATA_LIGHT=2
+shadow-placed:STRATA_SCENE=12 STRATA_LIGHT=2 STRATA_SLAB_AT=30 STRATA_FRAMES=37
+shadow-removed:STRATA_SCENE=12 STRATA_LIGHT=2 STRATA_SLAB_OFF=60 STRATA_FRAMES=67
+shadow-small-box:STRATA_SCENE=1 STRATA_LIGHT=2 STRATA_SUN=35 STRATA_LIGHT_BOX=2
 '
 # indirect draw calls a frame must issue, whatever the scene holds
 EXPECT_DRAWS=5
@@ -71,6 +83,16 @@ for line in $(echo "$SCENES" | tr ' ' ','); do
   if res=$($DIFF "$OUT/want.ppm" "$shot" 2>&1); then echo "ok   $name: $res"
   else echo "FAIL $name: $res"; cp "$shot" "test/golden/$name.actual.ppm"; FAILED=1; fi
 done
+# Stillness: with nothing moving, the lit picture must have stopped changing.
+# Frames 118 and 119 of the forest under shadows, from two runs of the same
+# deterministic sequence.
+if [ $UPDATE -eq 0 ]; then
+  for n in 121 122; do
+    env MARCH_PIN_MAIN=1 STRATA_RADIUS=6 STRATA_SIZE=640x400 STRATA_SCENE=3 STRATA_LIGHT=2 STRATA_FRAMES=$n STRATA_SHOT="$OUT/still$n.ppm" ./viewer/.march/build/release/strata_viewer > /dev/null 2>&1
+  done
+  if res=$($DIFF "$OUT/still121.ppm" "$OUT/still122.ppm" 4 0.05 2>&1); then echo "ok   stillness: $res"
+  else echo "FAIL stillness (frames 118 and 119): $res"; FAILED=1; fi
+fi
 # A nearly full quad buffer: a carve's new meshes are refused while the old
 # ones are still held, and must land on a later frame. The capacity is the
 # scene's own need plus a little, so the check follows the terrain.

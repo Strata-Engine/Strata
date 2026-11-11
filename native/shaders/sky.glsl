@@ -40,3 +40,29 @@ vec3 fogged(vec3 col, vec3 world) {
     float fogk = clamp((d - u.fog.x) / max(u.fog.y - u.fog.x, 0.001), 0.0, 1.0);
     return mix(col, sky_fog(to / max(d, 1.0e-4)), fogk * fogk);
 }
+
+// Two random numbers in 0..1 for a pixel, a frame and a purpose.
+vec2 rand2(ivec2 px, int frame, int salt) {
+    uint h = uint(px.x) * 1973u + uint(px.y) * 9277u + uint(frame) * 26699u + uint(salt) * 7919u;
+    h ^= h >> 16; h *= 0x7feb352du; h ^= h >> 15; h *= 0x846ca68bu; h ^= h >> 16;
+    uint k = h * 0x9e3779b9u + 0x85ebca6bu;
+    k ^= k >> 16; k *= 0x7feb352du; k ^= k >> 15;
+    return vec2(float(h & 0xffffu), float(k & 0xffffu)) / 65536.0;
+}
+
+// A direction toward a point on the sun's disc: the centre for r = (0.5, 0.5).
+vec3 sun_toward(vec2 r) {
+    vec3 s = u.sun.xyz;
+    vec3 a = normalize(cross(s, abs(s.y) < 0.9 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0)));
+    vec3 b = cross(s, a);
+    float rad = sqrt(r.x) * 0.02, ang = r.y * 6.2831853;          // wider than the real sun, for a soft rim
+    return normalize(s + (a * cos(ang) + b * sin(ang)) * rad);
+}
+
+// How much of the sun a point (voxel units) on a face with normal n sees
+// along [toward]: 0 or 1.
+float sun_visible(vec3 at, vec3 n, vec3 toward) {
+    if (dot(n, u.sun.xyz) <= 0.0) return 0.0;
+    Hit h;
+    return trace(at + n * 0.02, toward, 384.0, false, h) ? 0.0 : 1.0;
+}

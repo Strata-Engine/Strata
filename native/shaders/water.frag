@@ -19,6 +19,8 @@ void main() {
     float occ = mix(mix(a0, a1, f.x), mix(a2, a3, f.x), f.y) / 3.0;
     vec3 n = NORMALS[min(v_face, 5u)];
     if (u.light.x < 1.0 || u.light.x >= 9.0) { o_color = vec4(shade_flat(base.rgb, n, occ, v_world), base.a); return; }
-    vec3 col = base.rgb * (u.sun_color.rgb * max(dot(n, u.sun.xyz), 0.0) + sky_flat(n));
+    // one ray at the sun's centre: translucent surfaces keep no memory between frames
+    float sun_vis = u.light.x >= 2.0 ? sun_visible(v_world / u.eye.w, n, u.sun.xyz) : 1.0;
+    vec3 col = base.rgb * (u.sun_color.rgb * max(dot(n, u.sun.xyz), 0.0) * sun_vis + sky_flat(n));
     o_color = vec4(tonemap(fogged(col, v_world)), base.a);
 }

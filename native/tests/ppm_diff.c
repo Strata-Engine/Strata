@@ -1,5 +1,6 @@
-/* ppm_diff A.ppm B.ppm -- compare two binary PPM (P6) images.
- * Exit 0 when at most 0.5% of pixels differ by more than 8 in any channel,
+/* ppm_diff A.ppm B.ppm [LEVEL [PERCENT]] -- compare two binary PPM (P6) images.
+ * Exit 0 when at most PERCENT% (default 0.5) of pixels differ by more than
+ * LEVEL (default 8) in any channel,
  * 1 when more do, 2 when the files cannot be read or their sizes differ.
  * Prints the differing fraction and the largest channel difference. */
 #include <stdio.h>
@@ -19,7 +20,9 @@ static unsigned char *load(const char *path, int *w, int *h) {
 }
 
 int main(int argc, char **argv) {
-    if (argc != 3) { fprintf(stderr, "usage: ppm_diff A.ppm B.ppm\n"); return 2; }
+    if (argc < 3 || argc > 5) { fprintf(stderr, "usage: ppm_diff A.ppm B.ppm [LEVEL [PERCENT]]\n"); return 2; }
+    int level = argc > 3 ? atoi(argv[3]) : 8;
+    double allowed = (argc > 4 ? atof(argv[4]) : 0.5) / 100.0;
     int wa, ha, wb, hb;
     unsigned char *a = load(argv[1], &wa, &ha), *b = load(argv[2], &wb, &hb);
     if (!a || !b) { fprintf(stderr, "ppm_diff: cannot read %s\n", a ? argv[2] : argv[1]); return 2; }
@@ -31,12 +34,12 @@ int main(int argc, char **argv) {
         for (int c = 0; c < 3; c++) {
             int d = abs((int)a[i * 3 + c] - (int)b[i * 3 + c]);
             if (d > worst) worst = d;
-            if (d > 8) over = 1;
+            if (d > level) over = 1;
         }
         bad += (size_t)over;
     }
     double frac = (double)bad / (double)pixels;
     printf("%.4f%% of pixels differ, largest difference %d\n", frac * 100.0, worst);
     free(a); free(b);
-    return frac <= 0.005 ? 0 : 1;
+    return frac <= allowed ? 0 : 1;
 }
