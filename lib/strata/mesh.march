@@ -4,8 +4,12 @@
 --
 -- The rules:
 --   * A face of block A toward neighbour B is drawn when A is a Cube and B
---     is not solid-opaque, unless A and B are the same id (a body of water
+--     is not solid-opaque, unless A and B are the same id (a body of glass
 --     has no inner faces). The face goes to A's layer.
+--   * A fluid stands as high as its fill level, or full height when the
+--     same fluid is above it. Between two voxels of one fluid only the one
+--     standing higher draws a side face; inside a column there is no top or
+--     bottom face. Each fluid quad carries its drop below the voxel's top.
 --   * Each face corner is shaded 0..3 from the three cells around it in the
 --     layer the face looks into; only solid-opaque blocks shade, including
 --     those in neighbouring chunks.
@@ -226,11 +230,39 @@ mod Strata.Mesh do
     corner_ao(solid_at(kind, front + du), solid_at(kind, front + dv), solid_at(kind, front + du + dv))
   end
 
+  -- How high the fluid in [cell] stands, in eighths: its fill, or 8 when the
+  -- same fluid is above it.
+  pfn stands(ids : NativeIntArr, kind : NativeU8Arr, r : Strata.Blocks.Registry, cell : Int, base : Int) : Int do
+    if NativeArray.get_u8(kind, cell + 1156) >= 32 && B.fluid_base(r, NativeArray.get_int(ids, cell + 1156)) == base do 8
+    else B.fill(r, NativeArray.get_int(ids, cell)) end
+  end
+
+  -- The face of a fluid cell: none toward its own fluid above or below, and
+  -- none toward a neighbour of its own fluid that stands as high or higher.
+  pfn fluid_key(ids : NativeIntArr, kind : NativeU8Arr, r : Strata.Blocks.Registry, f : Int, cell : Int) : Int do
+    let front = cell + toward(f)
+    let id = NativeArray.get_int(ids, cell)
+    let base = B.fluid_base(r, id)
+    let same = NativeArray.get_u8(kind, front) >= 32 && B.fluid_base(r, NativeArray.get_int(ids, front)) == base
+    if solid_at(kind, front) do 0
+    else if same && f < 2 do 0
+    else
+      let h = stands(ids, kind, r, cell, base)
+      if same && stands(ids, kind, r, front, base) >= h do 0
+      else
+        let u = su(f)
+        let v = sv(f)
+        1 + id + 65536 * Q.ao4(corner_at(kind, front, 0 - u, 0 - v), corner_at(kind, front, u, 0 - v), corner_at(kind, front, 0 - u, v), corner_at(kind, front, u, v)) + 16777216 * (8 - h)
+      end
+    end end
+  end
+
   -- The merge key of the face of [cell] looking along face f, or 0 for no
-  -- face: 1 + id + 65536 * shading.
-  pfn face_key(ids : NativeIntArr, kind : NativeU8Arr, f : Int, cell : Int) : Int do
+  -- face: 1 + id + 65536 * shading + 16777216 * drop.
+  pfn face_key(ids : NativeIntArr, kind : NativeU8Arr, r : Strata.Blocks.Registry, f : Int, cell : Int) : Int do
     let k = NativeArray.get_u8(kind, cell)
     if int_and(k / 2, 3) != 0 do 0
+    else if k >= 32 do fluid_key(ids, kind, r, f, cell)
     else
       let front = cell + toward(f)
       let id = NativeArray.get_int(ids, cell)
@@ -240,16 +272,16 @@ mod Strata.Mesh do
         let v = sv(f)
         1 + id + 65536 * Q.ao4(corner_at(kind, front, 0 - u, 0 - v), corner_at(kind, front, u, 0 - v), corner_at(kind, front, 0 - u, v), corner_at(kind, front, u, v))
       end
-    end
+    end end
   end
 
   -- One slice's face keys, 32 x 32 at a + 32 * b, and how many are non-zero.
   type MaskRes = MaskRes(NativeIntArr, Int)
-  pfn mask_go(mask : NativeIntArr, ids : NativeIntArr, kind : NativeU8Arr, f : Int, base : Int, i : Int, found : Int) : MaskRes do
+  pfn mask_go(mask : NativeIntArr, ids : NativeIntArr, kind : NativeU8Arr, r : Strata.Blocks.Registry, f : Int, base : Int, i : Int, found : Int) : MaskRes do
     if i >= 1024 do MaskRes(mask, found)
     else
-      let key = face_key(ids, kind, f, base + (i % 32) * su(f) + (i / 32) * sv(f))
-      mask_go(NativeArray.set_int(mask, i, key), ids, kind, f, base, i + 1, if key == 0 do found else found + 1 end)
+      let key = face_key(ids, kind, r, f, base + (i % 32) * su(f) + (i / 32) * sv(f))
+      mask_go(NativeArray.set_int(mask, i, key), ids, kind, r, f, base, i + 1, if key == 0 do found else found + 1 end)
     end
   end
 
@@ -281,7 +313,7 @@ mod Strata.Mesh do
     let x = if f == 2 || f == 3 do n else a end
     let y = if f < 2 do n else b end
     let z = if f < 2 do b else if f < 4 do a else n end end
-    let w0 = Q.pack0(x, y, z, w, h, f)
+    let w0 = Q.with_drop(Q.pack0(x, y, z, w, h, f), int_and((key - 1) / 16777216, 7))
     -- the flags byte carries the block's light class: what the surface is to the lighting
     let w1 = Q.pack1(B.face_tex(r, id, f), ao, B.light_class(r, id))
     let l = B.layer_index(r, id)
@@ -313,7 +345,7 @@ mod Strata.Mesh do
     if n >= 32 do Greedy(bufs, mask)
     else if !slice_live(tally, f, n) do slices(bufs, mask, ids, kind, tally, r, f, n + 1)
     else
-      match mask_go(mask, ids, kind, f, porigin() + n * sn(f), 0, 0) do
+      match mask_go(mask, ids, kind, r, f, porigin() + n * sn(f), 0, 0) do
         MaskRes(m2, found) ->
           if found == 0 do slices(bufs, m2, ids, kind, tally, r, f, n + 1)
           else
