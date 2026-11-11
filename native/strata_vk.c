@@ -27,7 +27,7 @@
 /* Rewritten by build_shaders.sh whenever the shaders change: forge decides
  * whether to recompile this file from its text alone, not from the headers
  * it includes (GAPS S14). */
-#define STRATA_SHADERS_STAMP "216343689353c90b"
+#define STRATA_SHADERS_STAMP "52a4071ab1bbbf87"
 #include "strata_shaders.h"
 #include "strata_alloc.h"
 
@@ -124,9 +124,12 @@ static struct {
     int vn, vnv;                   /* its size in chunks: vn across (x and z), vnv up */
     VkBuffer ltable; VkDeviceMemory ltable_mem; int32_t *ltable_map;
     float *tex_mean; uint32_t tex_mean_n;   /* each texture layer's mean colour, linear, three floats a layer */
-    struct LightCell { int32_t chunk[3]; int valid; int uniform; } *cells;   /* per cell, as last queued: its chunk, and its class if it is one class throughout, else -1 */
+    struct LightCell { int32_t chunk[3]; int valid; int uniform; uint32_t hash; } *cells;   /* per cell, as last queued: its chunk, and its class if it is one class throughout, else -1 */
     struct LightWrite { int cell[3]; int32_t chunk[3]; int valid; int uniform; int edit; unsigned char *bytes; } *lq;   /* writes waiting to be copied in, oldest first */
     uint32_t nlq, lq_cap;
+    int32_t edit_lo[3], edit_hi[3];   /* the chunks an edit changed, while light_edit counts down */
+    int light_relax;               /* frames left in which memory is capped short: the sun moved */
+    float sun_seen[3];             /* the sun direction the light pass's memory was gathered under */
     int light_edit;                /* frames left in which the light pass must lean on new samples: an edit just reached the volume */
     unsigned char *stage_light; int stage_light_n;   /* the light bytes of the chunk being assembled */
     float prev_vp[16]; double time_s;
@@ -183,7 +186,8 @@ static struct {
 /* The uniform block, in floats (native/shaders/ubo.glsl): vp 0, sun 16,
  * sky 20, fog 24, eye 28, misc 32 (ints), inv_vp 36, prev_vp 52, light 68,
  * sun colour 72, light volume size 76 (ints). */
-#define UBO_FLOATS 80
+#define UBO_FLOATS 88
+#define UBO_EDIT 80            /* two vec4: the low and high corners (voxels) of what an edit just changed; the first w is 1 while it settles */
 #define UBO_VOL 76             /* ints: the light volume's size in chunks */
 #define UBO_INV_VP 36
 #define UBO_PREV_VP 52
@@ -716,7 +720,7 @@ static int light_box(int64_t radius_h, int64_t radius_v) {
     if (!make_volume(&g.owner, VK_FORMAT_R16G16B16A16_SINT, n, nv, n)) return 0;
     free(g.cells);
     g.cells = calloc((size_t)n * nv * n, sizeof *g.cells);
-    if (!g.cells) return 0;
+    if (!g.cells) { g.vn = 0; g.vnv = 0; return 0; }
     /* everything starts empty and owned by nobody */
     VkCommandBufferAllocateInfo cai = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, .commandPool = g.cpool, .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1 };
     VkCommandBuffer cb; VKOK(vkAllocateCommandBuffers(g.dev, &cai, &cb), "light volume command buffer");
@@ -765,6 +769,8 @@ int64_t sv_light_table_set(void *words_i32, int64_t nclasses) {
 
 static int wrapi(int v, int n) { int m = v % n; return m < 0 ? m + n : m; }
 static struct LightCell *cell_of(const int32_t *chunk, int *cell) {
+    static struct LightCell none;
+    if (!g.cells || g.vn <= 0 || g.vnv <= 0) { cell[0] = cell[1] = cell[2] = 0; memset(&none, 0, sizeof none); return &none; }
     cell[0] = wrapi(chunk[0], g.vn); cell[1] = wrapi(chunk[1], g.vnv); cell[2] = wrapi(chunk[2], g.vn);
     return &g.cells[cell[0] + g.vn * (cell[1] + g.vnv * cell[2])];
 }
@@ -778,6 +784,10 @@ static void light_queue(const int32_t *chunk, int valid, int uniform, unsigned c
     int same_owner = c->valid && c->chunk[0] == chunk[0] && c->chunk[1] == chunk[1] && c->chunk[2] == chunk[2];
     /* nothing to do when the cell already holds exactly this: an air chunk re-uploaded, say */
     if (valid == c->valid && (!valid || same_owner) && !bytes && uniform >= 0 && c->uniform == uniform) return;
+    /* the same voxels for the chunk the cell already holds (a neighbour's edit remeshed it): nothing to write */
+    uint32_t hash = 2166136261u;
+    if (bytes) for (int i = 0; i < 32768; i++) hash = (hash ^ bytes[i]) * 16777619u;
+    if (valid && same_owner && bytes && c->uniform < 0 && c->hash == hash) { free(bytes); return; }
     /* new voxels for a chunk the volume already held: an edit, whose lighting must be re-estimated */
     int edit = valid && same_owner;
     if (g.nlq == g.lq_cap) {
@@ -791,7 +801,7 @@ static void light_queue(const int32_t *chunk, int valid, int uniform, unsigned c
     w->chunk[0] = chunk[0]; w->chunk[1] = chunk[1]; w->chunk[2] = chunk[2];
     w->valid = valid; w->uniform = bytes ? -1 : uniform; w->bytes = bytes; w->edit = edit;
     c->chunk[0] = chunk[0]; c->chunk[1] = chunk[1]; c->chunk[2] = chunk[2];
-    c->valid = valid; c->uniform = w->uniform;
+    c->valid = valid; c->uniform = w->uniform; c->hash = hash;
 }
 
 /* Record, in this frame's commands, the copies that bring the volume up to
@@ -985,7 +995,7 @@ int64_t sv_open(int64_t w, int64_t h, int64_t capture_mouse, int64_t quad_capaci
     if (!make_buffer((VkDeviceSize)g.quad_cap * 8, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, &g.giga, &g.giga_mem, &map)) return 0;
     g.giga_map = map;
     g.ubo_map = calloc(UBO_FLOATS, sizeof(float));
-    g.sky_rays = 2; g.reflections = 1;
+    g.sky_rays = 2; g.reflections = 1; g.light_mode = 4;
     if (g.ubo_map) {
         /* light mode 0's flat sky (sRGB 0.53, 0.72, 0.92) and ambient share; a sun until the game sets one */
         g.ubo_map[19] = 0.30f;
@@ -1448,11 +1458,16 @@ static void invert4(const float *m, float *out) {
 
 /* How the light pass shades: 0 is the renderer's shading from before ray
  * tracing, carried through the deferred passes. */
-void sv_set_lighting(int64_t mode) { g.light_mode = (int)mode; }
+void sv_set_lighting(int64_t mode) {
+    if ((int)mode != g.light_mode) g.hist_reset = SV_FRAMES;   /* what the pass remembered was gathered another way */
+    g.light_mode = (int)mode;
+}
 /* Light quality: sky rays traced per pixel each time it samples (0..8; 0
  * falls back to a flat sky term), and whether smooth surfaces trace mirrors. */
 void sv_set_quality(int64_t sky_rays, int64_t reflections) {
-    g.sky_rays = sky_rays < 0 ? 0 : (sky_rays > 8 ? 8 : (int)sky_rays);
+    int rays = sky_rays < 0 ? 0 : (sky_rays > 8 ? 8 : (int)sky_rays);
+    if ((rays == 0) != (g.sky_rays == 0)) g.hist_reset = SV_FRAMES;   /* flat sky light and traced sky light do not mix */
+    g.sky_rays = rays;
     g.reflections = reflections != 0;
 }
 /* The time, in seconds, that moving surface detail (water's ripples) runs on. */
@@ -1566,11 +1581,26 @@ int64_t sv_frame(void) {
     g.ubo_map[UBO_LIGHT + 3] = (float)g.sky_rays; g.ubo_map[UBO_SUN_COLOR + 3] = (float)g.reflections;
     { int32_t *vol = (int32_t *)(g.ubo_map + UBO_VOL); vol[0] = g.vn; vol[1] = g.vnv; vol[2] = g.vn;
       /* how many past samples a pixel may lean on: none while the remembered
-       * images are fresh, 2 while an edit that reaches the volume this frame
-       * settles, else 255 (sun visibility leans on 64 of them at most) */
-      for (uint32_t i = 0; i < g.nlq && i < SV_LIGHT_PER_FRAME; i++) if (g.lq[i].edit) g.light_edit = 2;
-      vol[3] = g.hist_reset > 0 ? 0 : (g.light_edit > 0 ? 2 : 255);
+       * images are fresh, 2 just after the sun moved, else 255 (sun visibility
+       * leans on 64 of them at most). An edit that reaches the volume this
+       * frame caps only the pixels near it: its bounds go to the shader. */
+      for (uint32_t i = 0; i < g.nlq && i < SV_LIGHT_PER_FRAME; i++) if (g.lq[i].edit) {
+          const int32_t *ch = g.lq[i].chunk;
+          for (int k = 0; k < 3; k++) {
+              if (g.light_edit == 0 || ch[k] < g.edit_lo[k]) g.edit_lo[k] = ch[k];
+              if (g.light_edit == 0 || ch[k] > g.edit_hi[k]) g.edit_hi[k] = ch[k];
+          }
+          g.light_edit = 2;
+      }
+      /* a sun that has moved more than a fraction of a degree since the memory was gathered: lean on it less */
+      float sd = g.ubo_map[16] * g.sun_seen[0] + g.ubo_map[17] * g.sun_seen[1] + g.ubo_map[18] * g.sun_seen[2];
+      if (sd < 0.99999f) { g.light_relax = 2; memcpy(g.sun_seen, g.ubo_map + 16, sizeof g.sun_seen); }
+      vol[3] = g.hist_reset > 0 ? 0 : (g.light_relax > 0 ? 2 : 255);
+      float *ed = g.ubo_map + UBO_EDIT;
+      for (int k = 0; k < 3; k++) { ed[k] = (float)(g.edit_lo[k] * 32); ed[4 + k] = (float)(g.edit_hi[k] * 32 + 32); }
+      ed[3] = g.light_edit > 0 ? 1.0f : 0.0f; ed[7] = 0.0f;
       if (g.hist_reset > 0) g.hist_reset--;
+      if (g.light_relax > 0) g.light_relax--;
       if (g.light_edit > 0) g.light_edit--; }
     /* this Frame's fence has been waited on, so the GPU is done with its
      * copies: bring them up to date. From here to the next time this Frame

@@ -40,7 +40,7 @@ vec3 reflected(vec3 at, vec3 dir) {
     vec3 now = screen_of(u.vp, hp);
     vec3 albedo = class_color(h.cls);
     float vis = -1.0;
-    if (on_screen(was) && on_screen(now)) {
+    if (u.vol.w > 0 && on_screen(was) && on_screen(now)) {
         vec4 om = texture(meta_prev, was.xy);
         if (om.r > 0.0 && abs(om.g - was.z) < 0.03 * was.z + 0.4) {
             vis = texture(hist_prev, was.xy).a;

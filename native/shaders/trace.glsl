@@ -73,6 +73,8 @@ bool trace_steps(vec3 ro, vec3 rd, float tmax, bool stop_glass, int steps, float
     float chunk_top = 0.0;                        // how high the contents of the chunk the ray is in reach, in voxels
     ivec3 last_thin = ivec3(-1000000);
     uint before = 0u;                             // the class of the voxel the ray was in last
+    bool strode = false;                          // the last advance skipped voxels
+    float fine = fine_until;
     for (int i = 0; i < steps; i++) {
         if (t >= tmax) return false;
         vec3 p = ro + d * t;
@@ -96,20 +98,26 @@ bool trace_steps(vec3 ro, vec3 rd, float tmax, bool stop_glass, int steps, float
             if (c != 0u) {
                 int kind = class_kind(c);
                 bool stops = kind == 1 || (kind == 2 && c != before && cutout_blocks(c, p, face)) || (kind == 3 && stop_glass);
+                if (stops && strode) {
+                    // found by a stride: go back and walk the last stretch exactly, for a true point and face
+                    t -= 3.0; fine = t + 4.0; strode = false; before = 0u;
+                    continue;
+                }
                 if (stops) { h.voxel = v; h.face = face; h.t = t; h.cls = c; return true; }
                 // a thin block the ray starts beside lights it less: the block's own floor is not a hot square
                 if (kind == 4 && v != last_thin) { h.glow += class_emission(c) * (t < 1.0 ? 0.3 : 1.0); last_thin = v; }
             }
             before = c;
-            if (t > fine_until) {
+            if (t > fine) {
                 // far from where the ray began, look only every third voxel: what is
                 // missed is thin, and the saving is most of a mirror ray's cost
                 face = abs(d.y) > 0.5 ? (d.y > 0.0 ? 1 : 0) : (abs(d.x) > abs(d.z) ? (d.x > 0.0 ? 3 : 2) : (d.z > 0.0 ? 5 : 4));
-                t += 3.0;
+                t += 3.0; strode = true;
                 continue;
             }
             lo = vec3(v); hi = lo + 1.0;
         }
+        strode = false;
         // leave the box by whichever face the ray reaches first
         vec3 tb = (mix(lo, hi, step(0.0, d)) - ro) * inv;
         float tn = min(tb.x, min(tb.y, tb.z));

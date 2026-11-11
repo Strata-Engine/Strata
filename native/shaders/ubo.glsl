@@ -12,6 +12,8 @@ layout(set = 0, binding = 0) uniform U {
     vec4 light;      // x light mode, y time in seconds, z frame number, w sky rays per pixel
     vec4 sun_color;  // rgb the sun's colour; w 1 when mirror rays are on
     ivec4 vol;       // xyz the light volume's size in chunks; w how many past samples a pixel may lean on
+    vec4 edit_lo;    // xyz the low corner (voxels) of what an edit just changed; w 1 while it settles
+    vec4 edit_hi;    // xyz its high corner
 } u;
 
 // OpenGL clip space to Vulkan's: y points down, depth runs 0..1.

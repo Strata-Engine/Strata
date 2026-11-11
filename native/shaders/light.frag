@@ -59,7 +59,10 @@ void main() {
     // A pixel with a settled memory takes a new sample one frame in four, in
     // a pattern that moves round each 2 x 2 block; a pixel with little
     // memory, and every pixel while an edit settles, samples every frame.
-    bool settling = u.vol.w <= 2;
+    // An edit unsettles the pixels it can reach: those within 32 voxels of the chunks it changed.
+    // So does a sun that has just moved, everywhere.
+    bool settling = u.vol.w <= 2 || u.edit_lo.w > 0.5 && all(greaterThan(at, u.edit_lo.xyz - 32.0)) && all(lessThan(at, u.edit_hi.xyz + 32.0));
+    if (settling) kept = min(kept, 2.0);
     bool sample_now = kept < 4.0 || settling || (((px.x >> 3) & 1) + 2 * ((px.y >> 3) & 1)) == (frame & 3);
     float sun_vis = old.a;
     int rays = mode >= 4 ? int(u.light.w) : 0;
