@@ -109,3 +109,9 @@ traps with "index -1 out of bounds" when k is -1 (met in `Strata.Erosion`'s
 pass test). Never guard a read, or anything else that can trap or is
 costly, with `&&` or `||`; use `if k < 0 do false else ... end`. A
 suite-wide audit of existing `&&`/`||` guards is worth doing.
+
+## S17: `within` cannot be a parameter name
+
+`fn site_near(a : Atlas, xm : Float, zm : Float, within : Float)` is a bare
+"parse error" at the `fn` line; `within` is reserved. Workaround: another
+name (`reach` in `Strata.Atlas.site_near`).

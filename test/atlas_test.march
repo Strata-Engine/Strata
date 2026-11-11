@@ -149,6 +149,85 @@ mod Strata.Test.Atlas do
     end
   end
 
+  -- ── On any n: the demo-sized atlas ──────────────────────────────────────
+  pfn demo() : Strata.Atlas.Def do At.def(256, 4.0, 400.0, 120.0, 5, 40.0) end
+
+  pfn grid_heights(a : Strata.Atlas.Atlas, n : Int, i : Int, hs : NativeF32Arr) : NativeF32Arr do
+    if i >= n * n do hs else grid_heights(a, n, i + 1, NativeArray.set_f32(hs, i, At.height_ij(a, i % n, i / n))) end
+  end
+
+  pfn spill_of(a : Strata.Atlas.Atlas, n : Int, sea : Float) : NativeF32Arr do
+    match Fl2.fill(n, grid_heights(a, n, 0, NativeArray.make_f32(n * n, 0.0)), sea) do (sp, _) -> sp end
+  end
+
+  pfn at_n(n : Int, i : Int) : Float do int_to_float(i - n / 2) *. 4.0 end
+
+  -- no land sample off the lakes stands below its spill: a river never climbs out of a hollow
+  pfn no_hollow_go(a : Strata.Atlas.Atlas, n : Int, sea : Float, sp : NativeF32Arr, i : Int) : Bool do
+    if i >= n * n do true
+    else
+      let h = At.height_ij(a, i % n, i / n)
+      let dry = if h <= sea do false else At.lake_at(a, at_n(n, i % n), at_n(n, i / n)) < 0.0 end
+      if dry && h < NativeArray.get_f32(sp, i) do false else no_hollow_go(a, n, sea, sp, i + 1) end
+    end
+  end
+
+  -- every carved lake's centre is lake water at its recorded level, below its spill
+  pfn centres_ok(a : Strata.Atlas.Atlas, n : Int, sp : NativeF32Arr, ls : List((Float, Float, Float))) : Bool do
+    match ls do
+      Nil -> true
+      Cons((x, z, w), rest) ->
+        let i = float_to_int(x /. 4.0) + n / 2
+        let j = float_to_int(z /. 4.0) + n / 2
+        let lv = At.lake_at(a, x, z)
+        if lv >= 0.0 && lv == w && lv < NativeArray.get_f32(sp, i + n * j) do centres_ok(a, n, sp, rest) else false end
+    end
+  end
+
+  pfn last_point(p : List((Float, Float, Float))) : (Float, Float, Float) do
+    match p do
+      Nil -> (100000.0, 100000.0, 0.0)
+      Cons(v, Nil) -> v
+      Cons(_, rest) -> last_point(rest)
+    end
+  end
+
+  pfn ends_in_lake(a : Strata.Atlas.Atlas, rs : List(List((Float, Float, Float)))) : Bool do
+    match rs do
+      Nil -> false
+      Cons(p, rest) ->
+        match last_point(p) do
+          (x, z, _) -> if At.lake_at(a, x, z) >= 0.0 do true else ends_in_lake(a, rest) end
+        end
+    end
+  end
+
+  -- a lake sample among the 8 around (i, j) drains into it
+  pfn fed_by_lake(a : Strata.Atlas.Atlas, n : Int, i : Int, j : Int, t : Int) : Bool do
+    if t >= 9 do false
+    else
+      let x = i + t % 3 - 1
+      let z = j + t / 3 - 1
+      let hit = if t == 4 do false
+        else if At.lake_at(a, at_n(n, x), at_n(n, z)) < 0.0 do false
+        else At.receiver_ij(a, x, z) == i + n * j end end
+      if hit do true else fed_by_lake(a, n, i, j, t + 1) end
+    end
+  end
+
+  pfn starts_at_lake(a : Strata.Atlas.Atlas, n : Int, rs : List(List((Float, Float, Float)))) : Bool do
+    match rs do
+      Nil -> false
+      Cons(Cons((x, z, _), _), rest) ->
+        if fed_by_lake(a, n, float_to_int(x /. 4.0) + n / 2, float_to_int(z /. 4.0) + n / 2, 0) do true else starts_at_lake(a, n, rest) end
+      Cons(Nil, rest) -> starts_at_lake(a, n, rest)
+    end
+  end
+
+  pfn lit(img : String, header : Int) : Bool do
+    List.any(string_chars(string_slice(img, header, string_byte_length(img) - header)), fn c -> char_to_int(c) != 0)
+  end
+
   describe "Atlas" do
     test "the sea surrounds the island, and some land is above it" do
       let a = At.build(small(), 7)
@@ -200,6 +279,22 @@ mod Strata.Test.Atlas do
       Test.assert_true(List.length(At.rivers(b)) > 0, "some rivers among the lakes")
       Test.assert_true(wide(b, At.rivers(b)), "they start on a river")
       Test.assert_true(all_fall(b, At.rivers(b)), "and never rise, ending at a lake or the sea")
+    end
+    test "the demo-sized island holds carved lakes that rivers run into and out of" do
+      let a = At.build(demo(), 7)
+      let sp = spill_of(a, 256, 40.0)
+      Test.assert_true(List.length(At.lakes(a)) >= 3, "at least 3 lakes")
+      Test.assert_true(centres_ok(a, 256, sp, At.lakes(a)), "each centre is lake water below its spill")
+      Test.assert_true(ends_in_lake(a, At.rivers(a)), "a river ends in a lake")
+      Test.assert_true(starts_at_lake(a, 256, At.rivers(a)), "a river leaves one")
+      Test.assert_true(lit(At.layer_ppm(a, 2), string_byte_length("P6\n256 256\n255\n")), "the lake layer is not all black")
+      Test.assert_true(no_hollow_go(a, 256, 40.0, sp, 0), "no dry land below its spill")
+    end
+    test "off the lakes no land stands below its spill" do
+      let a = At.build(raw(), 7)
+      Test.assert_true(no_hollow_go(a, 64, 0.0, spill_of(a, 64, 0.0), 0), "uneroded, with lakes")
+      let b = At.build(small(), 7)
+      Test.assert_true(no_hollow_go(b, 64, 0.0, spill_of(b, 64, 0.0), 0), "eroded")
     end
     test "sites are spaced, dry, and found near where they stand" do
       let a = At.build(small(), 7)
