@@ -99,3 +99,25 @@ meshing tasks; handing it to a function 200 000 times a chunk on each of
 them is, it seems, a reference-count update on shared memory each time.
 Workaround: read what the faces need from the registry once per chunk into
 arrays the task owns, and pass those.
+
+## S17: extern functions with the same March name in two modules collide
+
+`Strata.Ffi.Audio` declared `fn x_open(...) = "sa_open"` in its extern
+block, and `Strata.Ffi.Vk` already had `fn x_open(...) = "sv_open"`. A
+program that called only the audio wrappers failed to link with
+`_sv_open` undefined: the call bound to the other module's extern of the
+same name, though each is declared in its own module and called
+unqualified. Workaround: extern names are unique across the whole program;
+the audio bindings use an `xa_` prefix. (Numbered S17 because another branch
+took S16 for `&&` and `||`.)
+
+## S18: a constructor name used in two modules confuses type inference elsewhere
+
+`Strata.Emitters` declared `type Got = Got(...)`, a private helper, and
+`Strata.Stream` already had a constructor `Got`. Both modules checked and
+tested clean, but the viewer, which compiles both, then failed on an
+unrelated line with "expected `Strata.Stream.Stream` but got `Stream`". The
+same name in two modules is reported only as a hint ("Constructor `Leaf` is
+defined by multiple types") when it is reported at all. Workaround:
+constructor names are unique across the library; `Strata.Acoustics`'s job is
+`Listening`, since `Strata.Fluid` has a `Job`.

@@ -26,7 +26,7 @@ cat "$OUT/acoustics64.log"
 # a decoded budget refuses a recording past it, and counts it
 SOUNDCHECK_SCENE=budget SOUNDCHECK_OUT="$OUT/budget.wav" $SC > "$OUT/budget.log" 2>&1 || { echo "FAIL: budget"; cat "$OUT/budget.log"; exit 1; }
 
-SCENES='blocks strike tone recording orbit-speakers orbit-headphones distance load64 wall cave field'
+SCENES='blocks strike tone recording orbit-speakers orbit-headphones distance load64 wall cave field falls-4 falls-12 falls-24'
 fail=0
 [ $UPDATE -eq 1 ] && mkdir -p "$LISTEN"
 for s in $SCENES; do
@@ -53,6 +53,13 @@ if [ $UPDATE -eq 0 ]; then
   c=$(tail_db "$OUT/cave.fp"); f=$(tail_db "$OUT/field.fp")
   if awk -v c="$c" -v f="$f" 'BEGIN { exit !(c - f >= 10) }'; then echo "ok cave rings: tail $c dB against the field's $f"
   else echo "FAIL: the cave's tail ($c dB) is not 10 dB above the field's ($f dB)"; fail=1; fi
+fi
+# falling water: louder and brighter the higher it falls
+falls() { awk 'NR > 11 { for (i = 1; i <= 20; i++) e += 10 ^ ($i / 10); hi += 10 ^ ($8 / 10) + 10 ^ ($18 / 10); lo += 10 ^ ($5 / 10) + 10 ^ ($15 / 10) } END { printf "%.2f %.2f", 10 * log(e) / log(10), 10 * log(hi / lo) / log(10) }' "$1"; }
+if [ $UPDATE -eq 0 ]; then
+  a=$(falls "$OUT/falls-4.fp"); b=$(falls "$OUT/falls-12.fp"); c=$(falls "$OUT/falls-24.fp")
+  if echo "$a $b $c" | awk '{ exit !($1 < $3 && $3 < $5 && $2 < $4 && $4 < $6) }'; then echo "ok falls: level and brightness rise with height ($a / $b / $c)"
+  else echo "FAIL: falling water is not louder and brighter the higher it falls ($a / $b / $c)"; fail=1; fi
 fi
 [ $fail -eq 0 ] && echo "audio goldens: all match"
 exit $fail

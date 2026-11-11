@@ -171,6 +171,19 @@ reflections, each from its own direction. A stone cave rings for seconds; a
 field hardly at all. `Strata.Acoustics.space` answers the same for a game
 that wants it (openness, for instance, for wind).
 
+Fluids are heard without the game doing anything but passing its fluid to
+`update`. Each step's events (`Strata.Fluid.events`, counted once by
+`Strata.Fluid.steps`) are gathered by `Strata.Emitters` into cells of an 8 m
+grid; each cell is one looping `pour` voice, placed, louder with the flow and
+brighter and louder with the height fallen, fading over a second when the
+water stops. Water a sink swallows makes an event too, so a waterfall into
+the sea splashes and is heard. `Strata.Sound.with_gust(s, true)` adds wind
+whose strength follows how open the sky is: it drops in a tunnel.
+
+In the viewer, footsteps sound every half metre walked, from the block
+underfoot (the viewer's own table of hardness and size), and a landing by
+how hard it was.
+
 ## Using it from a game
 
     [deps]

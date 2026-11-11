@@ -407,7 +407,9 @@ mod StrataViewer do
     if mode != "0" do println("strata_viewer: sound " ++ (if opened do "on (" ++ mode ++ ")" else "unavailable; running silent" end)) else () end
     let loaded = if opened do load_all(sound_files(), 0) else 0 end
     if loaded > 0 do println("strata_viewer: " ++ int_to_string(loaded) ++ " recordings from viewer/sounds/; N plays one") else () end
-    match Strata.Sound.upload(Strata.Sound.new(), Strata.Sound.strike()) do (s, _) -> s end
+    -- the strike patch first (id 1), then a gust whose strength follows how open the sky is
+    let s1 = match Strata.Sound.upload(Strata.Sound.new(), Strata.Sound.strike()) do (s, _) -> s end
+    match Strata.Sound.with_gust(s1, true) do (s2, _) -> s2 end
   end
   -- the WAV files in viewer/sounds/, in the order listed; loaded at start, so the nth has recording id 2048 + n
   pfn sound_files() : List(String) do
@@ -437,6 +439,25 @@ mod StrataViewer do
   end
   -- the strike patch is the first uploaded
   pfn strike_patch() : Int do 1 end
+  -- how the viewer's blocks sound underfoot: (hardness, size), its own table
+  pfn underfoot(id : Int) : (Float, Float) do
+    if id == 1 do (0.9, 0.4)
+    else if id == 2 do (0.3, 0.6)
+    else if id == 3 || id == 11 do (0.2, 0.5)
+    else if id == 4 do (0.12, 0.7)
+    else if id == 6 do (0.08, 0.6)
+    else if id == 7 do (0.6, 0.6)
+    else if id == 13 do (1.0, 0.3)
+    else (0.5, 0.5) end end end end end end end
+  end
+  pfn footstep(snd : Strata.Sound.Sound, id : Int, x : Float, y : Float, z : Float, energy : Float) : Strata.Sound.Sound do
+    match underfoot(id) do
+      (hard, size) ->
+        match Strata.Sound.play(snd, strike_patch(), x, y, z, 0.5, 1.0, 0.5) do
+          (s1, v) -> Strata.Sound.control(Strata.Sound.control(Strata.Sound.control(s1, v, 0, hard), v, 1, size), v, 2, energy)
+        end
+    end
+  end
   -- a strike where the view's ray meets the world, or 3 m ahead when it meets nothing
   pfn strike_at(snd : Strata.Sound.Sound, w : Strata.World.World, reg : Strata.Blocks.Registry, x : Float, y : Float, z : Float, fx : Float, fy : Float, fz : Float, hardness : Float, size : Float) : Strata.Sound.Sound do
     let h = Strata.Query.raycast(w, x, y, z, fx, fy, fz, 250.0, Strata.Query.targetable(reg))
@@ -464,8 +485,9 @@ mod StrataViewer do
   -- eye position, yaw, pitch, the chunk the camera was last in, mouse buttons
   -- last frame, flying or walking, vertical speed, on the ground, F last frame
   -- ..., then the sun's height in degrees, the light mode, and whether L was down,
-  -- then the sound keys down last frame (bit 0 N, bit 1 H) and bit 2: headphones
-  type Cam = Cam(Float, Float, Float, Float, Float, Int, Int, Int, Bool, Bool, Bool, Float, Bool, Bool, Float, Int, Bool, Int)
+  -- then the sound keys down last frame (bit 0 N, bit 1 H) and bit 2: headphones,
+  -- then the metres walked since the last footstep
+  type Cam = Cam(Float, Float, Float, Float, Float, Int, Int, Int, Bool, Bool, Bool, Float, Bool, Bool, Float, Int, Bool, Int, Float)
 
   -- Put the sun [deg] degrees above the horizon, to the south-east, warmer and dimmer the lower it is.
   fn sun_at(deg : Float) : Unit do
@@ -508,7 +530,7 @@ mod StrataViewer do
       Strata.Ffi.Audio.close()
     else
       match cam do
-        Cam(x, y, z, yaw, pitch, kx0, ky0, kz0, lb0, rb0, fly0, vy0, ground0, f0, sun0, mode0, l0, keys0) ->
+        Cam(x, y, z, yaw, pitch, kx0, ky0, kz0, lb0, rb0, fly0, vy0, ground0, f0, sun0, mode0, l0, keys0, stride0) ->
           let now = Strata.Ffi.Vk.time()
           let scripted = frames > 0
           let dt = if scripted do 0.016667 else clampf(now -. t_prev, 0.0, 0.1) end
@@ -577,13 +599,25 @@ mod StrataViewer do
           -- sound: the camera is the listener; a carve or a build strikes where it lands
           let sndl = Strata.Sound.listener(snd, x2, y2, z2, fx, fy, fz, 0.0, 1.0, 0.0)
           let snd0 = if dig_now do strike_at(sndl, w0, reg, x2, y2, z2, fx, fy, fz, 0.55, 0.85) else if build_now do strike_at(sndl, w0, reg, x2, y2, z2, fx, fy, fz, 0.95, 0.3) else sndl end end
+          -- footsteps every half metre walked on the ground, from the block underfoot; a landing, by how hard
+          let walked = !fly && StrataViewer.Walker.grounded(moved)
+          let dx_w = StrataViewer.Walker.eye_x(moved) -. x
+          let dz_w = StrataViewer.Walker.eye_z(moved) -. z
+          let stride1 = if walked do stride0 +. Math.sqrt(dx_w *. dx_w +. dz_w *. dz_w) else 0.0 end
+          let step_now = stride1 >= 0.5
+          let stride = if step_now do stride1 -. 0.5 else stride1 end
+          let feet_y = y2 -. 1.6
+          let under = Strata.World.get_block(w0, float_to_int(Math.floor(x2)), float_to_int(Math.floor(feet_y -. 0.1)), float_to_int(Math.floor(z2)))
+          let landed = !fly && !ground0 && StrataViewer.Walker.grounded(moved) && vy0 < -3.0
+          let snd_f = if step_now do footstep(snd0, under, x2, feet_y, z2, 0.45)
+            else if landed do footstep(snd0, under, x2, feet_y, z2, clampf((0.0 -. vy0) /. 15.0, 0.4, 1.0)) else snd0 end end
           -- N plays the next recording from viewer/sounds/ 5 m ahead; H switches headphones and speakers
           let nkey = !scripted && Strata.Ffi.Vk.key(78)
           let hkey = !scripted && Strata.Ffi.Vk.key(72)
           let hp_was = int_and(keys0, 4) != 0
           let hp_now = if hkey && int_and(keys0, 2) == 0 do !hp_was else hp_was end
           let keys = (if nkey do 1 else 0 end) + (if hkey do 2 else 0 end) + (if hp_now do 4 else 0 end)
-          let snd_n = if nkey && int_and(keys0, 1) == 0 do place_recording(snd0, frame, x2 +. fx *. 5.0, y2 +. fy *. 5.0, z2 +. fz *. 5.0) else snd0 end
+          let snd_n = if nkey && int_and(keys0, 1) == 0 do place_recording(snd_f, frame, x2 +. fx *. 5.0, y2 +. fy *. 5.0, z2 +. fz *. 5.0) else snd_f end
           let snd1 = if hkey && int_and(keys0, 2) == 0 do
               let hp = int_and(keys, 4) != 0
               println("strata_viewer: sound on " ++ (if hp do "headphones" else "speakers" end))
@@ -639,7 +673,7 @@ mod StrataViewer do
               let worst2 = if frame >= 10 && spent > worst do spent else worst end
               let fworst2 = if fluid_ms > fworst do fluid_ms else fworst end
               let total2 = if frame >= 10 do total +. spent else total end
-              let cam2 = Cam(x2, y2, z2, yaw2, pitch2, kx, ky, kz, lb, rb, fly, StrataViewer.Walker.speed_y(moved), StrataViewer.Walker.grounded(moved), fkey, sun, mode, lkey, keys)
+              let cam2 = Cam(x2, y2, z2, yaw2, pitch2, kx, ky, kz, lb, rb, fly, StrataViewer.Walker.speed_y(moved), StrataViewer.Walker.grounded(moved), fkey, sun, mode, lkey, keys, stride)
               if next != frame && frame % 240 == 239 do
                 println("  " ++ float_to_string(Math.round(240.0 /. (now -. t_mark))) ++ " fps; march " ++ ms2(march_ms) ++ " ms, shim " ++ ms2(Strata.Ffi.Vk.stat(0)) ++ " ms, waiting " ++ ms2(Strata.Ffi.Vk.stat(1)) ++ " ms, gpu " ++ ms2(Strata.Ffi.Vk.stat(3)) ++ " ms; " ++ int_to_string(float_to_int(Strata.Ffi.Vk.stat(2))) ++ " draw calls, " ++ int_to_string(float_to_int(Strata.Ffi.Vk.stat(4))) ++ " see-through chunks ordered in " ++ int_to_string(float_to_int(Strata.Ffi.Vk.stat(5))) ++ " us, " ++ int_to_string(Strata.Ffi.Vk.drawn_chunks()) ++ " chunks, " ++ int_to_string(Strata.Ffi.Vk.drawn_quads()) ++ " quads; " ++ int_to_string(Strata.Stream.loaded_count(s3)) ++ " chunks loaded")
                 if scripted && script != 2 && (Env.get_int("STRATA_BREACH", -1) >= 0 || Env.get_int("STRATA_DRAIN", -1) >= 0) do
@@ -855,7 +889,7 @@ mod StrataViewer do
         (sl, s1) ->
           println("strata_viewer: " ++ int_to_string(Strata.Stream.loaded_count(s1)) ++ " chunks streamed in " ++ float_to_string(Math.round((t1 -. t0) *. 1000.0)) ++ " ms; " ++ int_to_string(Strata.Ffi.Vk.live_quads()) ++ " quads, " ++ int_to_string(Strata.Ffi.Vk.live_quads() * 8 / 1024) ++ " KB on the GPU")
           -- the fixed scenes fly, holding their pose; the default and the walk scene stand on the ground
-          let cam = Cam(ex, ey, ez, yaw0, pitch0, Strata.Coord.chunk_of(float_to_int(Math.floor(ex))), Strata.Coord.chunk_of(float_to_int(Math.floor(ey))), Strata.Coord.chunk_of(float_to_int(Math.floor(ez))), false, false, soak > 0 || (scene != 0 && scene != 11), 0.0, false, false, int_to_float(Env.get_int("STRATA_SUN", 55)), Env.get_int("STRATA_LIGHT", 4), false, 0)
+          let cam = Cam(ex, ey, ez, yaw0, pitch0, Strata.Coord.chunk_of(float_to_int(Math.floor(ex))), Strata.Coord.chunk_of(float_to_int(Math.floor(ey))), Strata.Coord.chunk_of(float_to_int(Math.floor(ez))), false, false, soak > 0 || (scene != 0 && scene != 11), 0.0, false, false, int_to_float(Env.get_int("STRATA_SUN", 55)), Env.get_int("STRATA_LIGHT", 4), false, 0, 0.0)
           frame_loop(s1, Strata.Fluid.with_limits(Strata.Fluid.new(reg, Cons((lake_base(), Strata.Fluid.flowing()), Cons((5, Strata.Fluid.sink()), Nil))), Env.get_int("STRATA_FLUID_CAP", 4096), Env.get_int("STRATA_FLUID_REACH", 16), 4), None, sl, reg, cam, 0, frames, if soak > 0 do 2 else if scene == 11 && frames > 0 do 1 else if scene == 4 && frames > 0 do 3 else 0 end end end, hole, 0.0, 0.0, 0.0, Strata.Ffi.Vk.time(), Strata.Ffi.Vk.time(), NativeArray.make_f32(16, 0.0), audio_start(frames))
       end
       Strata.Ffi.Vk.close()
