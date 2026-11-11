@@ -4,6 +4,13 @@
 # left waiting, no buffer space was lost, the quad buffer did not grow
 # without bound, and no frame took over 20 ms (the target is 16.7; the
 # margin is for a busy machine). Prints the viewer's summary line.
+#
+# Sound: the flight runs with sound on miniaudio's null device (paced like a
+# real one, silent), and asserts the mixer never underran and no command was
+# refused. Two shorter runs follow: one with sound off, whose worst frame the
+# sound run must match within 0.5 ms (judged only on a quiet machine), and
+# one that holds the main thread 100 ms every 600 frames, which the mixer
+# must not notice. Nothing is played aloud. STRATA_SOAK_AUDIO=0 skips sound.
 #   scripts/soak.sh            the default quad buffer
 #   scripts/soak.sh 200000     a quad buffer of that many quads, smaller than the
 #                              scene needs: uploads are refused and wait, and the
@@ -14,7 +21,11 @@ cd "$(dirname "$0")/.." || exit 1
 QUADS="${1:-0}"
 # Offscreen unless told otherwise: with the display asleep or the window hidden,
 # MoltenVK holds a presented frame for a whole second, which is no fault of the engine.
-out=$(env MARCH_PIN_MAIN=1 STRATA_HIDDEN="${STRATA_HIDDEN:-1}" STRATA_OFFSCREEN="${STRATA_OFFSCREEN:-1}" STRATA_SOAK=3000 STRATA_BREACH=300 STRATA_QUADS="$QUADS" STRATA_SHOT=/dev/null ./viewer/.march/build/release/strata_viewer 2>&1)
+AUDIO=null; [ "${STRATA_SOAK_AUDIO:-1}" = "0" ] && AUDIO=0
+soak() { # frames, audio mode, stall interval
+  env MARCH_PIN_MAIN=1 STRATA_HIDDEN="${STRATA_HIDDEN:-1}" STRATA_OFFSCREEN="${STRATA_OFFSCREEN:-1}" STRATA_SOAK="$1" STRATA_BREACH=300 STRATA_QUADS="$QUADS" STRATA_SHOT=/dev/null STRATA_AUDIO="$2" STRATA_STALL="$3" ./viewer/.march/build/release/strata_viewer 2>&1
+}
+out=$(soak 3000 $AUDIO 0)
 line=$(echo "$out" | grep '^soak:')
 lake_start=$(echo "$out" | sed -n 's/^soak-lake: lake_start=\([0-9]*\).*/\1/p')
 [ -n "$line" ] || { echo "FAIL: the viewer printed no soak line"; exit 1; }
@@ -38,4 +49,23 @@ echo "lake at the breach: ${lake_start:-?} voxels"
 [ "$(get fluid_waiting)" = "0" ] || { echo "FAIL: fluid cells were left waiting at the end: the cap was exceeded"; fail=1; }
 # offscreen a frame is about 3 ms, so six frames can be less than the worker needs and the main thread waits for it
 awk "BEGIN { exit !($(get fluid_worst_ms) <= 6.0) }" || { echo "FAIL: a fluid step held the main thread for over 6 ms"; fail=1; }
+# sound: the mixer kept up and took every command
+if [ "$AUDIO" = "null" ]; then
+  [ "$(get audio_underruns)" = "0" ] || { echo "FAIL: the mixer underran"; fail=1; }
+  [ "$(get audio_ring_refused)" = "0" ] || { echo "FAIL: sound commands were refused"; fail=1; }
+  awk "BEGIN { exit !($(get audio_main_ms) <= 0.2) }" || echo "MISS: sound took $(get audio_main_ms) ms of the main thread in its worst frame (target 0.2)"
+  awk "BEGIN { exit !($(get acoustics_ms) <= 2.0) }" || echo "MISS: an acoustics update took $(get acoustics_ms) ms (target 2)"
+  # the same flight, shorter, with sound off and then with stalls
+  quiet=$(soak 1200 0 0 | grep '^soak:'); loud=$(soak 1200 null 0 | grep '^soak:')
+  qw=$(echo "$quiet" | sed -n 's/.* worst_ms=\([0-9.]*\).*/\1/p'); lw=$(echo "$loud" | sed -n 's/.* worst_ms=\([0-9.]*\).*/\1/p')
+  load=$(uptime | sed 's/.*load averages*: *\([0-9.]*\).*/\1/')
+  echo "worst frame, 1200 frames: sound off $qw ms, sound on $lw ms (load average $load)"
+  if awk "BEGIN { exit !($load < 8) }"; then
+    awk "BEGIN { exit !($lw - $qw <= 0.5) }" || { echo "FAIL: sound added over 0.5 ms to the worst frame"; fail=1; }
+  else echo "not judged: the machine is busy (load average $load); the 0.5 ms comparison needs it under 8"; fi
+  stalled=$(soak 1200 null 600 | grep '^soak:')
+  su=$(echo "$stalled" | sed -n 's/.* audio_underruns=\([0-9]*\).*/\1/p')
+  echo "with a 100 ms stall every 600 frames: underruns $su"
+  [ "$su" = "0" ] || { echo "FAIL: a stalled frame made the mixer underrun"; fail=1; }
+fi
 [ $fail -eq 0 ] && echo "soak: PASS" || exit 1

@@ -467,3 +467,47 @@ The review found two faults in the rules, both fixed: a cell whose landing
 place was taken by another fell out of the active set with its water still
 in the air, and an edit made while a worker step ran was forgotten when it
 touched a cell that was already active.
+
+# Audio plan
+
+Measured on the same M3 Max, release builds. Every run was made while other
+sessions kept the machine busy (load averages 24 to 39); the plan trusts a
+timing only under 8, so the figures that depend on load are marked not
+judged. Nothing here played sound aloud: renders are in game time to WAV
+files, and timed runs use miniaudio's null device, which is paced like a
+real one.
+
+| target | result | |
+|---|---|---|
+| `update` to a played sound's first sample in the device's buffer: 20 ms | 11.9 to 19.7 ms on the null device (two 256-frame buffers queued); with three it was 24 to 26 ms, so two are used | met, on the null device; a real device adds its own output latency |
+| voices mixed / tracked: 64 / 1024 | 64 / 1024, the quietest at the listener (times priority) virtual; past 1024 the quietest goes and is counted | met |
+| mixing thread, 64 rich voices, third-order bus, binaural: 10% of a core | 6.6% (C bench, before the reverb); 8.9% with the reverb, against 8.0% without it in the same busy minute | met, not judged |
+| main thread a frame, all of `Strata.Sound`: 0.2 ms | 0.05 to 0.06 ms in 60- and 120-frame soaks; 6.8 ms worst in a 3000-frame soak at load 33 | met when quiet, not judged under load |
+| acoustics update, 64 voices x 5 walks plus 64 listener rays: 2 ms on a worker | 0.4 ms in soundcheck's walled world; 1.1 to 1.6 ms on the viewer's terrain | met |
+| occlusion follows a move or an edit: 250 ms | within 15 frames of 1/60 s (test "a wall built between listener and sound muffles it within 250 ms") | met |
+| C mixer memory, without recordings: 16 MB | 1.8 MB (1024 voices of 968 bytes, 2047 patches, the bus, the reverb's lines) | met |
+| decoded recordings: 64 MB, refused past it and counted | as designed; soundcheck's budget scene refuses a 2.3 MB file at 1 MB and counts it | met |
+| underruns over a soak with a 100 ms main-thread stall every 600 frames: 0 | 0 in the stalled run; 8 in the 3000-frame run at load 33, whose frames without sound already took 54 ms | met for stalls; not judged under load |
+| output peak: never over -1 dBFS | the limiter test: 20 voices of full noise peak at -1.0 dBFS | met |
+| added to the soak's worst frame: under 0.5 ms | 54.1 ms without sound, 46.3 ms with it, at load 36 | not judged |
+
+What the soundcheck scenes show, by fingerprint (no listening needed):
+
+| scene | what is measured | |
+|---|---|---|
+| recording | the tone rendered to a file, loaded back and played, matches the tone within 1.5 dB a band | as designed |
+| wall | pink noise passing behind 2 m of stone falls from about -70 to -115 dB and comes back | |
+| cave / field | the same strikes: the cave's tail is 25 dB above the field's (-56.7 against -82.2 dB) | the gate asks 10 |
+| falls-4 / 12 / 24 | louder (-21.9, -16.3, -10.9 dB) and brighter (4 kHz over 500 Hz: -23.5, -22.1, -19.4 dB) the further the water falls | |
+| reverb | an impulse into spaces asked to ring 0.5, 2.0 and 4.0 s decays in 0.51, 2.02 and 4.01 s | C test |
+
+Not listened to yet by the owner: every stored fingerprint was stored from a
+render nobody had heard. `scripts/audio_golden.sh --update` writes the WAVs
+to listen to.
+
+Headphones use the MIT KEMAR measurements (Gardner and Martin, 1994: 368
+directions, compact set), each of 512 virtual speakers taking the nearest,
+resampled to 48 kHz and diffuse-field equalised: a diffuse field keeps its
+power within 0.65 dB. A source behind sounds duller than one in front by
+10.4 dB in the 4 to 8 kHz octave, against 1 to 4 dB from the spherical-head
+model used before.

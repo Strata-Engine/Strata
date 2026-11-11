@@ -156,3 +156,10 @@ renamed `View` to `Sight` (Strata.Fluid has a `View`).
 - `f(x).field` is a parse error. Workaround: an accessor function.
 - A `match` inside a one-line lambda, as an argument (`fn c -> match ... end`),
   is a parse error. Workaround: a named function.
+
+
+## S21: `within` cannot be a parameter name
+
+`fn site_near(a : Atlas, xm : Float, zm : Float, within : Float)` is a bare
+"parse error" at the `fn` line; `within` is reserved. Workaround: another
+name (`reach` in `Strata.Atlas.site_near`).
