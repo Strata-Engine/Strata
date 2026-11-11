@@ -3,9 +3,9 @@
  * nothing of Vulkan or GLFW.
  *
  * March values: a NativeArray arrives as its heap pointer, element count at
- * +16, data at +32; it is only read here. Answers go back one number per
- * call (an_x_matrix, an_x_mark_int, an_x_mark_weight), so C never writes into
- * a March array.
+ * +16, data at +32. Inputs are only read; an_x_matrices fills a
+ * caller-owned NativeF32Arr, as strata_noise.c's fields do. Marks go back
+ * one number per call (an_x_mark_int, an_x_mark_weight).
  *
  * Masks: March numbers a rig's masks 0, 1, ... in the order Strata.Rig made
  * them. an_x_masks uploads them all at once, right after the rig, so the
@@ -123,17 +123,9 @@ int64_t an_x_parts(int64_t fig) {
     AnFig *f = an_fig(g_w, (int)fig);
     return f ? g_w->rigs[f->rig].nparts : 0;
 }
-/* element k of figure fig's matrices (12 a part, column-major 3x4); 0 if none */
-double an_x_matrix(int64_t fig, int64_t k) {
-    if (!g_w) return 0;
-    const float *m = an_matrices(g_w, (int)fig);
-    if (!m || k < 0 || k >= an_x_parts(fig) * 12) return 0;
-    return m[k];
-}
-/* figure fig's matrices copied into a NativeF32Arr of at least 12 x parts
- * floats; answers the parts copied (0 if no such figure or too short). Not
- * bound in Strata.Ffi.Anim: it writes into a March array, which March treats
- * as a value, so Strata.Anim.matrices reads an_x_matrix instead. */
+/* figure fig's matrices (12 floats a part, column-major 3x4, world space)
+ * copied into a caller-owned NativeF32Arr of at least 12 x parts floats;
+ * answers the parts copied (0 if no such figure or the array is too short). */
 int64_t an_x_matrices(int64_t fig, void *out_f32) {
     if (!g_w || !out_f32) return 0;
     const float *m = an_matrices(g_w, (int)fig);
