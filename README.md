@@ -133,6 +133,59 @@ window onto the sky with a mirror beyond it, and the view sways. This needs
 light mode 1 or higher. There are no bubbles, no drifting specks and no
 sound.
 
+## Interface and text
+
+A 2D layer drawn over the finished frame, for a display during play: a
+crosshair, a hotbar, bars, numbers, labels. A game builds its whole display
+afresh each frame; nothing is kept between frames.
+
+```
+let u0 = Strata.Render.ui_begin(1.0)                       -- this frame's display, at the game's scale
+let u1 = Strata.Ui.rect(u0, Strata.Ui.centre(), 0.0, 0.0, 2.0, 16.0, (1.0, 1.0, 1.0, 0.9))
+let u2 = Strata.Ui.icon(u1, Strata.Ui.bottom(), 0.0, -18.0, 32.0, stone_texture)
+let u3 = Strata.Ui.frame(u2, Strata.Ui.bottom(), 0.0, -12.0, 44.0, 44.0, (0, 0, 24, 24), 4, (1.0, 1.0, 1.0, 1.0))
+let u4 = Strata.Text.text(u3, Strata.Ui.top_left(), 10.0, 8.0, Strata.Text.default_font(), 14.0, (1.0, 1.0, 1.0, 1.0), "60 fps")
+Strata.Render.draw_ui(u4)                                  -- one draw call, in the order built
+```
+
+- **Interface pixels.** At scale 1 one interface pixel is one point of the
+  window: the display is the same physical size on a retina display and an
+  ordinary one, and sharp on both. A larger scale, whole or fractional,
+  makes everything larger. Every edge is snapped to a device pixel.
+- **Anchors.** An element is placed by one of nine points of the screen and
+  an offset; its own matching point sits there. A `bottom()` element is
+  placed by the middle of its bottom edge.
+- **Images.** `icon` draws a block texture. `Strata.Render.ui_atlas` takes
+  one image of a game's own art; `image` draws a region of it and `frame`
+  nine-slices one.
+- **Text.** `Strata.Text.font` loads a TrueType or OpenType file;
+  `default_font()` is built in (Noto Sans, Latin). A glyph is drawn into an
+  atlas the first time it is used, as a distance field, and serves every
+  size from there. `styled` takes a `TextStyle`: wrap width, alignment,
+  outline, shadow. `runs` sets several fonts, sizes or colours on one
+  baseline. `measure` gives a string's size before it is drawn.
+- **New glyphs are spread over frames.** A frame spends at most 1 ms drawing
+  glyphs it has not seen (`Strata.Text.set_raster_budget`); the rest appear
+  a frame or two later. A glyph takes about 45 microseconds.
+
+Limits:
+
+- No widgets: nothing a pointer acts on, no text entry, no layout engine.
+- The whole display is rebuilt each frame. The layer holds 16 384 quads;
+  more are dropped from the end and `Strata.Render.ui_dropped` says how many.
+- Lines break at spaces and between Chinese, Japanese and Korean
+  characters. There is no hyphenation and no dictionary breaking, so Thai
+  does not wrap well.
+- An outline can be about a sixth of the text's size at most.
+- Small text is not hinted. It is readable at 8 pixels and softer than the
+  system's.
+- A consumer's `forge.toml` lists `native/strata_text.c` beside the shim
+  and links FreeType (see `viewer/forge.toml`).
+
+![The viewer's display](docs/ui-display.png)
+![Text from 8 to 200 pixels](docs/ui-text-sheet.png)
+![Wrapping, alignment, outline, shadow, mixed runs](docs/ui-text-styles.png)
+
 ## Using it from a game
 
     [deps]
