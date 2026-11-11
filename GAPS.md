@@ -100,7 +100,40 @@ them is, it seems, a reference-count update on shared memory each time.
 Workaround: read what the faces need from the registry once per chunk into
 arrays the task owns, and pass those.
 
-## S16: a record field typed by a short type name another module also defines breaks a consumer
+## S16: `&&` and `||` evaluate both sides when the right side is a call
+
+`if false && hb(k) do ... end` calls `hb`, and `false && g(k) == 3` calls
+`g`, both in the interpreter and under `--compile` (reproduced from `main`,
+no helper involved). So `k >= 0 && NativeArray.get_int(bs, k) != ...`
+traps with "index -1 out of bounds" when k is -1 (met in `Strata.Erosion`'s
+pass test). Never guard a read, or anything else that can trap or is
+costly, with `&&` or `||`; use `if k < 0 do false else ... end`. A
+suite-wide audit of existing `&&`/`||` guards is worth doing. Met again in
+`Strata.Contact.solid` (physics branch): a window read guarded by `&&` died
+with "index -11 out of bounds".
+
+## S17: extern functions with the same March name in two modules collide
+
+`Strata.Ffi.Audio` declared `fn x_open(...) = "sa_open"` in its extern
+block, and `Strata.Ffi.Vk` already had `fn x_open(...) = "sv_open"`. A
+program that called only the audio wrappers failed to link with
+`_sv_open` undefined: the call bound to the other module's extern of the
+same name, though each is declared in its own module and called
+unqualified. Workaround: extern names are unique across the whole program;
+the audio bindings use an `xa_` prefix. (Numbered S17 because another branch
+took S16 for `&&` and `||`.)
+
+## S18: a constructor name used in two modules confuses type inference elsewhere
+
+`Strata.Emitters` declared `type Got = Got(...)`, a private helper, and
+`Strata.Stream` already had a constructor `Got`. Both modules checked and
+tested clean, but the viewer, which compiles both, then failed on an
+unrelated line with "expected `Strata.Stream.Stream` but got `Stream`". The
+same name in two modules is reported only as a hint ("Constructor `Leaf` is
+defined by multiple types") when it is reported at all. Workaround:
+constructor names are unique across the library; `Strata.Acoustics`'s job is
+`Listening`, since `Strata.Fluid` has a `Job`.
+## S19: a record field typed by a short type name another module also defines breaks a consumer
 
 `Strata.Physics` declared `type Event = ...` and a record
 `type Physics = { ..., events : List(Event) }`. The library typechecked and
@@ -110,16 +143,11 @@ failed `forge check` with "expected `Strata.Stream.Stream` but got
 typed `Int` in the same place, or an `Event` type used outside a record,
 did not trigger it. Workaround: a type named in a record field gets a name
 no other module uses (`PhysEvent`).
+The same symptom as S18, from a type name rather than a constructor; the
+workaround is the same: names unique across the library. Physics also
+renamed `View` to `Sight` (Strata.Fluid has a `View`).
 
-## S17: a guarded array read after `&&` was evaluated with the guard false
-
-`i >= 0 && ... && i < sx && ... && NativeArray.get_u8(a, i + ...) == 1` in
-`Strata.Contact.solid` died with "native_u8_arr_get: index -11 out of
-bounds" when the point lay outside the window, under `forge test`. The
-same chain had not failed while every index happened to be in range.
-Workaround: put the read inside `if guard do read else false end`.
-
-## S18: three parser traps met while writing Strata.Physics
+## S20: three parser traps met while writing Strata.Physics
 
 - A record literal, or an expression ending in one, followed by a line
   that opens with `(` is read as a call of the record: `let b = { ... }`
