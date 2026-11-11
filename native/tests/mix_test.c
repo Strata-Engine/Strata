@@ -489,6 +489,99 @@ static void test_reverb(void) {
     sm_close(m);
 }
 
+static int all_finite(const float *st, int frames) { for (int i = 0; i < 2 * frames; i++) if (!isfinite(st[i])) return 0; return 1; }
+static void test_review(void) {
+    /* a NaN gain, once, must not poison the echo or the output for good */
+    SmMixer *m = sm_open();
+    mu_listener(m, 0, 0, 0, 0, 0, -1);
+    mu_environ(m, 2.0f, 0.2f, 0.5f, 0, NULL);
+    tone_patch(m, 1, SM_SRC_SINE, 300.0f, 0.3f);
+    mu_play_at(m, 1, 1, NAN, 1.0f, 0.0f, 0.0f, -3.0f);
+    render(m, SEC(0.1));
+    mu_cmd(m, SM_OP_STOP, 1, 0, 0.0f);
+    mu_play_at(m, 2, 1, 1.0f, 1.0f, 0.0f, 0.0f, -3.0f);
+    render(m, SEC(1.0));
+    CHECK(all_finite(buf, SEC(1.0)), "a NaN gain once does not leave the output non-finite");
+    float bad[5] = { NAN, NAN, NAN, NAN, NAN };
+    mu_environ(m, NAN, NAN, NAN, 1, bad);
+    render(m, SEC(0.2));
+    mu_environ(m, 1.0f, 0.2f, 0.5f, 0, NULL);
+    render(m, SEC(0.5));
+    CHECK(all_finite(buf, SEC(0.5)), "a NaN space, then a good one: finite");
+    mu_play_at(m, 3, 1, 1.0f, 1.0f, INFINITY, 0.0f, 0.0f);
+    mu_cmd(m, SM_OP_GROUP, 0, 0, NAN);
+    mu_occlude(m, 2, NAN, NAN);
+    render(m, SEC(0.3));
+    CHECK(all_finite(buf, SEC(0.3)), "an infinite position, a NaN group gain and a NaN occlusion: finite");
+    sm_close(m);
+
+    /* a placed voice starts at its level: no fade-in to blunt an attack */
+    for (int hp = 0; hp < 2; hp++) {
+        m = sm_open();
+        mu_output(m, hp);
+        mu_listener(m, 0, 0, 0, 0, 0, -1);
+        tone_patch(m, 1, SM_SRC_SQUARE, 100.0f, 0.5f);
+        mu_play_at(m, 1, 1, 1.0f, 1.0f, 0.0f, 0.0f, -1.0f);
+        render(m, SEC(0.1));
+        /* the head's filters delay sound about 24 samples: look just past that, still inside the first 2 ms */
+        float early = hp ? mu_peak(buf, 40, 96) : mu_peak(buf, 0, 40), later = mu_peak(buf, SEC(0.05), SEC(0.1));
+        CHECK(early > 0.6f * later, hp ? "binaural: a placed voice is at its level within its first millisecond" : "speakers: a placed voice is at its level within its first millisecond");
+        sm_close(m);
+    }
+
+    /* a group's gain glides within a block: no step */
+    m = sm_open();
+    tone_patch(m, 1, SM_SRC_SINE, 50.0f, 0.8f);
+    mu_play_flat(m, 1, 1, 1.0f, -1.0f);
+    render(m, SEC(0.1));
+    mu_cmd(m, SM_OP_GROUP, 0, 0, 0.3f);
+    float jump = 0.0f, last = buf[2 * (SEC(0.1) - 1)];
+    for (int b = 0; b < 40; b++) {   /* a device asks block by block: the step would fall between them */
+        render(m, SM_BLOCK);
+        for (int i = 0; i < SM_BLOCK; i++) { float d = fabsf(buf[2 * i] - last); if (d > jump) jump = d; last = buf[2 * i]; }
+    }
+    CHECK(jump < 0.02f, "turning a group down glides: no step between blocks");
+    sm_close(m);
+
+    /* a short looping recording played fast stays inside its buffer */
+    m = sm_open();
+    SmRec *r = mk_rec(10, 1, 1000.0f);
+    sm_rec_publish(m, SM_REC_FIRST, r);
+    float p[SM_PATCH_FLOATS]; mu_patch_clear(p);
+    p[SM_P_SRC(0)] = SM_SRC_RECORDING; p[SM_P_SRC(0) + 1] = 30.0f; p[SM_P_SRC(0) + 2] = 1.0f; p[SM_P_SRC(0) + 4] = (float)SM_REC_FIRST; p[SM_P_LOOP] = 1.0f;
+    mu_send_patch(m, 1, p);
+    mu_play_flat(m, 1, 1, 1.0f, 0.0f);
+    int inside = 1;
+    for (int b = 0; b < 20; b++) { render(m, SM_BLOCK); double pos = sm_voice_position(m, 1, 0); if (pos < 0.0 || pos >= 10.0) inside = 0; }
+    CHECK(inside && all_finite(buf, SM_BLOCK), "a 10-frame loop at rate 30 never reads outside its 10 frames");
+    sm_close(m);
+    free(r->data); free(r);
+
+    /* an echo left behind when the space goes dry does not come back with the next one */
+    m = sm_open();
+    mu_listener(m, 0, 0, 0, 0, 0, -1);
+    mu_environ(m, 4.0f, 0.0f, 0.6f, 0, NULL);
+    render(m, SEC(0.2));
+    click_patch(m, 1);
+    mu_play_at(m, 1, 1, 1.0f, 1.0f, 0.0f, 0.0f, -10.0f);
+    render(m, SEC(0.3));
+    mu_environ(m, 4.0f, 0.0f, 0.0f, 0, NULL);
+    render(m, SEC(1.0));
+    mu_environ(m, 4.0f, 0.0f, 0.6f, 0, NULL);
+    render(m, SEC(0.5));
+    CHECK(mu_db(mu_rms(buf, 0, SEC(0.5))) < -80.0, "a new space starts silent: the old echo is gone");
+    sm_close(m);
+
+    /* a batch pushed at once is published at once, and a full ring takes what fits */
+    static SmCmd store[16];
+    SmRing rg; sm_ring_init(&rg, store, 16);
+    SmCmd batch[20]; memset(batch, 0, sizeof batch);
+    for (int i = 0; i < 20; i++) batch[i].voice = i;
+    CHECK(sm_ring_push_n(&rg, batch, 20) == 16, "a ring of 16 takes 16 of a batch of 20");
+    SmCmd o; int ord = 1; for (int i = 0; i < 16; i++) if (!sm_ring_pop(&rg, &o) || o.voice != i) ord = 0;
+    CHECK(ord, "in order");
+}
+
 int main(void) {
     test_fp();
     test_ring();
@@ -504,6 +597,7 @@ int main(void) {
     test_space();
     test_occlusion();
     test_reverb();
+    test_review();
     if (fails == 0) printf("mix_test: ok\n");
     return fails == 0 ? 0 : 1;
 }
