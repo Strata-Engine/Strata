@@ -74,16 +74,137 @@ mod StrataViewer.Test.Lakes do
     end
   end
 
-  -- the largest |island height - atlas height| along 64 columns of a row
-  pfn most_detail(a : Strata.Atlas.Atlas, x : Int, z : Int, i : Int, best : Float) : Float do
-    if i >= 64 do best
+  pfn col_h(c : (Int, Int, Int)) : Int do match c do (h, _, _) -> h end end
+  pfn col_lake(c : (Int, Int, Int)) : Int do match c do (_, l, _) -> l end end
+  pfn col_river(c : (Int, Int, Int)) : Int do match c do (_, _, r) -> r end end
+
+  -- the island columns of the (2 half + 1)^2 box about (x0, z0), as ground, lake line and river line arrays
+  type Box = Box(Int, Int, Int, NativeIntArr, NativeIntArr, NativeIntArr)
+  pfn box_go(a : Strata.Atlas.Atlas, x0 : Int, z0 : Int, half : Int, k : Int, hs : NativeIntArr, ls : NativeIntArr, rs : NativeIntArr) : Box do
+    let side = 2 * half + 1
+    if k >= side * side do Box(x0, z0, half, hs, ls, rs)
     else
-      let xm = int_to_float(x + 3 * i)
-      let zm = int_to_float(z)
-      let d = Math.abs(Vw.island_height_m(a, xm, zm, 7) -. Strata.Atlas.height_at(a, xm, zm))
-      most_detail(a, x, z, i + 1, if d > best do d else best end)
+      let c = Vw.island_column(a, x0 - half + k % side, z0 - half + k / side, 7, 1.0)
+      box_go(a, x0, z0, half, k + 1, NativeArray.set_int(hs, k, col_h(c)), NativeArray.set_int(ls, k, col_lake(c)), NativeArray.set_int(rs, k, col_river(c)))
     end
   end
+  pfn box(a : Strata.Atlas.Atlas, x0 : Int, z0 : Int, half : Int) : Box do
+    let n = (2 * half + 1) * (2 * half + 1)
+    box_go(a, x0, z0, half, 0, NativeArray.make_int(n, 0), NativeArray.make_int(n, 0), NativeArray.make_int(n, 0))
+  end
+
+  -- a lake column within 3 m of box cell k: its lake line, or 0
+  pfn lake_near(b : Box, k : Int, t : Int) : Int do
+    if t >= 49 do 0
+    else
+      match b do
+        Box(_, _, half, _, ls, _) ->
+          let side = 2 * half + 1
+          let dx = t % 7 - 3
+          let dz = t / 7 - 3
+          let x = k % side + dx
+          let z = k / side + dz
+          let l = if x < 0 || z < 0 || x >= side || z >= side || dx * dx + dz * dz > 9 do 0 else NativeArray.get_int(ls, x + side * z) end
+          if l > 0 do l else lake_near(b, k, t + 1) end
+      end
+    end
+  end
+
+  -- land columns (no lake, no river) within 3 m of a lake column standing under its line + 1: their count, and how many were checked
+  pfn rim_go(b : Box, k : Int, bad : Int, seen : Int) : (Int, Int) do
+    match b do
+      Box(_, _, half, hs, ls, rs) ->
+        let side = 2 * half + 1
+        if k >= side * side do (bad, seen)
+        else if NativeArray.get_int(ls, k) > 0 || NativeArray.get_int(rs, k) > 0 do rim_go(b, k + 1, bad, seen)
+        else
+          let l = lake_near(b, k, 0)
+          if l == 0 do rim_go(b, k + 1, bad, seen)
+          else rim_go(b, k + 1, if NativeArray.get_int(hs, k) < l + 1 do bad + 1 else bad end, seen + 1) end
+        end end
+    end
+  end
+
+  -- bank columns: along +x from each river point, the first column out of the channel and the one past it
+  -- (both within 2 m of it); (columns checked, those whose ground stands under the atlas height)
+  pfn bank_go(a : Strata.Atlas.Atlas, pts : List((Float, Float, Float)), seen : Int, bad : Int) : (Int, Int) do
+    match pts do
+      Nil -> (seen, bad)
+      Cons((x, z, _), rest) ->
+        if seen >= 50 do (seen, bad)
+        else
+          let wz = whole(z)
+          let e = bank_edge(a, whole(x), wz, 0)
+          if e < 0 do bank_go(a, rest, seen, bad)
+          else
+            let b1 = if below_atlas(a, e, wz) do 1 else 0 end
+            let b2 = if below_atlas(a, e + 1, wz) do 1 else 0 end
+            bank_go(a, rest, seen + 2, bad + b1 + b2)
+          end
+        end
+    end
+  end
+  -- the first column at or east of wx (within 12 m) that is neither channel nor lake; -1 if none
+  pfn bank_edge(a : Strata.Atlas.Atlas, wx : Int, wz : Int, t : Int) : Int do
+    if t > 12 do -1
+    else
+      let c = Vw.island_column(a, wx + t, wz, 7, 1.0)
+      if col_lake(c) > 0 do -1
+      else if col_river(c) == 0 do wx + t
+      else bank_edge(a, wx, wz, t + 1) end end
+    end
+  end
+  pfn below_atlas(a : Strata.Atlas.Atlas, wx : Int, wz : Int) : Bool do
+    let xm = int_to_float(wx)
+    let zm = int_to_float(wz)
+    Vw.island_height_m(a, xm, zm, 7) < Strata.Atlas.height_at(a, xm, zm)
+  end
+  pfn all_points(rs : List(List((Float, Float, Float))), acc : List((Float, Float, Float))) : List((Float, Float, Float)) do
+    match rs do
+      Nil -> acc
+      Cons(r, rest) -> all_points(rest, List.append(acc, r))
+    end
+  end
+
+  -- a river point whose column 2 m east is channel, the sample 4 m east is not river, and whose
+  -- own (sample) height and the bilinear height 2 m east differ by a voxel or more: (x, z), or None
+  pfn off_sample(a : Strata.Atlas.Atlas, pts : List((Float, Float, Float))) : Option((Float, Float)) do
+    match pts do
+      Nil -> None
+      Cons((x, z, _), rest) ->
+        let own = whole(Strata.Atlas.height_at(a, x, z))
+        let mid = whole(Strata.Atlas.height_at(a, x +. 2.0, z))
+        let lone = Strata.Atlas.river_width_at(a, x +. 4.0, z) == 0.0
+        let ok = if !lone || own == mid do false else col_river(Vw.island_column(a, whole(x) + 2, whole(z), 7, 1.0)) > 0 end
+        if ok do Some((x, z)) else off_sample(a, rest) end
+    end
+  end
+
+  -- no river sample within 20 m (5 samples) of sample (i, j)
+  pfn dry_go(a : Strata.Atlas.Atlas, i : Int, j : Int, t : Int) : Bool do
+    if t >= 121 do true
+    else if Strata.Atlas.river_width_ij(a, i + t % 11 - 5, j + t / 11 - 5) > 0.0 do false
+    else dry_go(a, i, j, t + 1) end end
+  end
+  -- over samples 16 m apart in the 400 m about the origin, those 20 m from any river and off the lakes:
+  -- (how many, the largest |detail| among them)
+  pfn far_go(a : Strata.Atlas.Atlas, k : Int, n : Int, best : Float) : (Int, Float) do
+    if k >= 625 do (n, best)
+    else
+      let i = 128 + 4 * (k % 25 - 12)
+      let j = 128 + 4 * (k / 25 - 12)
+      let xm = int_to_float(i - 128) *. 4.0
+      let zm = int_to_float(j - 128) *. 4.0
+      let land = Strata.Atlas.height_at(a, xm, zm) > 41.0
+      let ok = if !land do false else if Strata.Atlas.lake_at(a, xm, zm) >= 0.0 do false else dry_go(a, i, j, 0) end end
+      if !ok do far_go(a, k + 1, n, best)
+      else
+        let d = Math.abs(Vw.island_height_m(a, xm, zm, 7) -. Strata.Atlas.height_at(a, xm, zm))
+        far_go(a, k + 1, n + 1, if d > best do d else best end)
+      end
+    end
+  end
+
 
   describe "Viewer lakes" do
     test "terrain with lakes is still a pure function" do
@@ -143,9 +264,10 @@ mod StrataViewer.Test.Lakes do
           end
       end
     end
-    test "2 m from a river's bank the detail is under 1 m, and away from rivers it is not" do
+    test "2 m from a river's bank the detail is under 1 m, and far from rivers it is not" do
       let a = atlas()
-      -- damp there is 2 / (2 w), so the 6 m of detail is under 1 m for any river over 6 m wide
+      -- damp there is 2 / (2 w), so the 6 m of detail is under 1 m only for rivers over 6 m wide
+      -- (controller ruling): a narrower river of width w gets up to 6 / w m 2 m from its bank
       match river_point(a, Strata.Atlas.rivers(a), 40.0, 6.5) do
         (x, z, w) ->
           Test.assert_true(w >= 6.5, "the atlas has a river over 6.5 m wide")
@@ -154,7 +276,40 @@ mod StrataViewer.Test.Lakes do
           let xn = x -. 0.5 *. w -. 2.0
           Test.assert_true(Math.abs(Vw.island_height_m(a, xn, z, 7) -. Strata.Atlas.height_at(a, xn, z)) < 1.0, "and on the other")
       end
-      Test.assert_true(most_detail(a, -96, 0, 0, 0.0) > 1.0, "somewhere along a row the detail passes 1 m")
+      match far_go(a, 0, 0, 0.0) do
+        (n, most) ->
+          Test.assert_true(n >= 10, "at least 10 land samples 20 m from any river and off the lakes")
+          Test.assert_true(most > 1.0, "on one of them the detail passes 1 m")
+      end
+    end
+    test "land within 3 m of a lake stands a voxel over its water line" do
+      let a = atlas()
+      match wet_lake(Strata.Atlas.lakes(a)) do
+        (x, z, _) ->
+          match rim_go(box(a, whole(x), whole(z), 60), 0, 0, 0) do
+            (bad, seen) ->
+              Test.assert_true(seen > 50, "some land columns lie within 3 m of the lake")
+              Test.assert_eq_int(bad, 0, "none stands under the water line + 1")
+          end
+      end
+    end
+    test "beside a river the detail only raises the ground" do
+      let a = atlas()
+      match bank_go(a, all_points(Strata.Atlas.rivers(a), Nil), 0, 0) do
+        (seen, bad) ->
+          Test.assert_true(seen >= 50, "50 bank columns within 2 m of a channel")
+          Test.assert_eq_int(bad, 0, "none under the atlas height")
+      end
+    end
+    test "off a river sample the channel's water line is the nearest sample's height, not the bilinear one" do
+      let a = atlas()
+      match off_sample(a, all_points(Strata.Atlas.rivers(a), Nil)) do
+        None -> Test.fail("no channel column 2 m off a river sample where the bilinear height differs by a voxel at seed 7")
+        Some((x, z)) ->
+          let line = col_river(Vw.island_column(a, whole(x) + 2, whole(z), 7, 1.0))
+          Test.assert_eq_int(line, whole(Strata.Atlas.height_at(a, x, z)), "the sample's height")
+          Test.assert_true(line != whole(Strata.Atlas.height_at(a, x +. 2.0, z)), "not the bilinear height there")
+      end
     end
     test "an island chunk generated twice is identical" do
       let a = atlas()

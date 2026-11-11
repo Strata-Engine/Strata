@@ -21,6 +21,7 @@
 -- STRATA_SPRAY=0      no spray from falling water;  STRATA_FOUNTAIN=n  n spray particles a frame ahead of the camera
 -- STRATA_ISLAND=0    the old noise terrain instead of the atlas island (default 1: the island)
 -- STRATA_ATLAS_DIR=d  where the island's atlas is cached (default .march/atlas)
+-- STRATA_CHUNK_TIMES=1  time 200 surface chunks of the land in use, print the median and worst, then run as usual
 -- STRATA_BREACH=f     scenes 18 and 19: breach the test lake's rim at frame f
 -- STRATA_DRAIN=f      open a shaft in the test lake's floor at frame f
 -- STRATA_SUN2=deg, STRATA_SUN2_AT=f   move the sun to that height at that frame
@@ -338,8 +339,8 @@ mod StrataViewer do
   -- sample is lake holds the lake fluid, full voxels from its sandy bed (the
   -- atlas bed) to the atlas level. The sea is sink water up to 40 m.
   --
-  -- Two clamps keep water from standing beside air: land next to a lake
-  -- sample stands at least one metre over its level, and beside a river
+  -- Two clamps keep water from standing beside air: land within 3 m of a lake
+  -- column stands at least one metre over its level, and beside a river
   -- (damp below 1) the detail only raises the ground.
 
   doc "The viewer's island: 512 x 512 atlas samples 4 m apart, a 2 km island 800 m in radius, the sea at 40 m."
@@ -362,8 +363,9 @@ mod StrataViewer do
   -- owns (reading the shared atlas column by column ran 45 times slower,
   -- GAPS S15): the first sample (i0, j0), the side, the step, the atlas's n,
   -- then the heights, lake levels and river widths, and the river samples
-  -- whose banks lie within two widths of the area, as (x, z, width, height).
-  type Win = Win(Int, Int, Int, Float, Int, NativeF32Arr, NativeF32Arr, NativeF32Arr, List((Float, Float, Float, Float)))
+  -- whose banks lie within two widths of the area, as (x, z, width, height);
+  -- last, whether any sample in the window is lake (if not, no rim is looked for).
+  type Win = Win(Int, Int, Int, Float, Int, NativeF32Arr, NativeF32Arr, NativeF32Arr, List((Float, Float, Float, Float)), Bool)
 
   -- how far past an area the window reaches for rivers, in metres
   pfn reach_m() : Float do 64.0 end
@@ -379,7 +381,12 @@ mod StrataViewer do
     let side = if i1 - i0 > j1 - j0 do i1 - i0 + 1 else j1 - j0 + 1 end
     let ws = Strata.Atlas.window(a, 4, i0, j0, side)
     let hs = Strata.Atlas.window(a, 0, i0, j0, side)
-    Win(i0, j0, side, st, nn, hs, Strata.Atlas.window(a, 2, i0, j0, side), ws, near_go(ws, hs, i0, j0, side, st, nn, x0, z0, x1, z1, 0, Nil))
+    let ls = Strata.Atlas.window(a, 2, i0, j0, side)
+    Win(i0, j0, side, st, nn, hs, ls, ws, near_go(ws, hs, i0, j0, side, st, nn, x0, z0, x1, z1, 0, Nil), any_lake(ls, 0, side * side))
+  end
+
+  pfn any_lake(ls : NativeF32Arr, k : Int, cnt : Int) : Bool do
+    if k >= cnt do false else if NativeArray.get_f32(ls, k) >= 0.0 do true else any_lake(ls, k + 1, cnt) end end
   end
 
   pfn near_go(ws : NativeF32Arr, hs : NativeF32Arr, i0 : Int, j0 : Int, side : Int, st : Float, nn : Int, x0 : Float, z0 : Float, x1 : Float, z1 : Float, k : Int, acc : List((Float, Float, Float, Float))) : List((Float, Float, Float, Float)) do
@@ -400,7 +407,7 @@ mod StrataViewer do
   -- a window layer at a position: bilinear, as Strata.Atlas.height_at does it
   pfn win_bilinear(wn : Win, arr : NativeF32Arr, xm : Float, zm : Float) : Float do
     match wn do
-      Win(i0, j0, side, st, nn, _, _, _, _) ->
+      Win(i0, j0, side, st, nn, _, _, _, _, _) ->
         let gx = xm /. st +. int_to_float(nn / 2) -. int_to_float(i0)
         let gz = zm /. st +. int_to_float(nn / 2) -. int_to_float(j0)
         let fx = Math.floor(gx)
@@ -418,21 +425,33 @@ mod StrataViewer do
   -- the lake level of the sample nearest a position (-1: none), as Strata.Atlas.lake_at
   pfn win_lake(wn : Win, xm : Float, zm : Float) : Float do
     match wn do
-      Win(i0, j0, side, st, nn, _, ls, _, _) ->
+      Win(i0, j0, side, st, nn, _, ls, _, _, _) ->
         let i = float_to_int(Math.floor(xm /. st +. int_to_float(nn / 2) +. 0.5)) - i0
         let j = float_to_int(Math.floor(zm /. st +. int_to_float(nn / 2) +. 0.5)) - j0
         NativeArray.get_f32(ls, i + side * j)
     end
   end
 
-  -- the highest lake level among the four samples around a position; -1 if none is lake
+  -- the highest lake level among the samples whose water can come within
+  -- 3 m of a position: those within 3 m + half a diagonal step of it (a lake
+  -- column's nearest sample is at most that far off), in the 4 x 4 samples
+  -- around it; -1 if none is lake
   pfn win_rim(wn : Win, xm : Float, zm : Float) : Float do
     match wn do
-      Win(i0, j0, side, st, nn, _, ls, _, _) ->
-        let i = float_to_int(Math.floor(xm /. st +. int_to_float(nn / 2))) - i0
-        let j = float_to_int(Math.floor(zm /. st +. int_to_float(nn / 2))) - j0
-        let k = i + side * j
-        fmax(fmax(NativeArray.get_f32(ls, k), NativeArray.get_f32(ls, k + 1)), fmax(NativeArray.get_f32(ls, k + side), NativeArray.get_f32(ls, k + side + 1)))
+      Win(i0, j0, side, st, nn, _, ls, _, _, wet) ->
+        if !wet do 0.0 -. 1.0
+        else rim_go(ls, i0, j0, side, st, nn, float_to_int(Math.floor(xm /. st)) + nn / 2, float_to_int(Math.floor(zm /. st)) + nn / 2, xm, zm, 3.0 +. st *. 0.70711, 0, 0.0 -. 1.0) end
+    end
+  end
+  pfn rim_go(ls : NativeF32Arr, i0 : Int, j0 : Int, side : Int, st : Float, nn : Int, gi : Int, gj : Int, xm : Float, zm : Float, reach : Float, t : Int, best : Float) : Float do
+    if t >= 16 do best
+    else
+      let i = gi + t % 4 - 1
+      let j = gj + t / 4 - 1
+      let dx = int_to_float(i - nn / 2) *. st -. xm
+      let dz = int_to_float(j - nn / 2) *. st -. zm
+      let v = if dx *. dx +. dz *. dz > reach *. reach do 0.0 -. 1.0 else NativeArray.get_f32(ls, (i - i0) + side * (j - j0)) end
+      rim_go(ls, i0, j0, side, st, nn, gi, gj, xm, zm, reach, t + 1, fmax(v, best))
     end
   end
 
@@ -462,7 +481,7 @@ mod StrataViewer do
   pfn damped(wn : Win, xm : Float, zm : Float, seed : Int) : Float do
     if win_lake(wn, xm, zm) >= 0.0 do 0.0
     else
-      let dm = match wn do Win(_, _, _, _, _, _, _, _, rs) -> river_damp(rs, xm, zm, 1.0) end
+      let dm = match wn do Win(_, _, _, _, _, _, _, _, rs, _) -> river_damp(rs, xm, zm, 1.0) end
       let v = detail_raw(xm, zm, seed) *. dm
       if dm < 1.0 && v < 0.0 do 0.0 else v end
     end
@@ -471,20 +490,20 @@ mod StrataViewer do
   doc "The island's ground height in metres at (xm, zm) before it is cut into voxels: the atlas height plus the damped detail (no channel, rim or lake bed applied)."
   fn island_height_m(a : Strata.Atlas.Atlas, xm : Float, zm : Float, seed : Int) : Float do
     let wn = island_window(a, xm, zm, xm, zm)
-    match wn do Win(_, _, _, _, _, hs, _, _, _) -> win_bilinear(wn, hs, xm, zm) +. damped(wn, xm, zm, seed) end
+    match wn do Win(_, _, _, _, _, hs, _, _, _, _) -> win_bilinear(wn, hs, xm, zm) +. damped(wn, xm, zm, seed) end
   end
 
   -- A column at (xm, zm) of a world of [scale] metres a voxel: (ground, lake
   -- water line, river water line) in voxels; a line is 0 where that water is not.
   pfn island_col(wn : Win, xm : Float, zm : Float, seed : Int, scale : Float) : (Int, Int, Int) do
     match wn do
-      Win(_, _, _, _, _, hs, _, ws, _) ->
+      Win(_, _, _, _, _, hs, _, ws, _, _) ->
         let h = win_bilinear(wn, hs, xm, zm)
         let lake = win_lake(wn, xm, zm)
         let w = win_bilinear(wn, ws, xm, zm)
         if lake >= 0.0 do (vox(h, scale), vox(lake, scale), 0)
         else if w >= 1.0 do
-          let top = match wn do Win(_, _, _, _, _, _, _, _, rs) -> river_surface(rs, xm, zm, 1000000.0, h) end
+          let top = match wn do Win(_, _, _, _, _, _, _, _, rs, _) -> river_surface(rs, xm, zm, 1000000.0, h) end
           let line = vox(top, scale)
           let bed = vox(top -. fmin(1.5, w /. 6.0), scale)
           (if bed < line do bed else line - 1 end, 0, line)
@@ -1114,6 +1133,35 @@ mod StrataViewer do
     end
   end
 
+  -- ── Timing the generator ─────────────────────────────────────────────────
+  -- STRATA_CHUNK_TIMES=1: generate each of 200 surface chunks (10 x 20 about
+  -- the origin, cy holding the ground at the chunk's middle) 10 times on one
+  -- task, print the median and worst time a chunk on the land in use, and exit.
+  pfn time_go(land : Land, seed : Int, k : Int, acc : List(Int)) : List(Int) do
+    if k >= 200 do acc
+    else
+      let cx = k % 10 - 5
+      let cz = k / 10 - 10
+      let cy = Strata.Coord.chunk_of(land_height(land, cx * 32 + 16, cz * 32 + 16, seed))
+      let key = Strata.Coord.key(cx, cy, cz)
+      let t0 = unix_time_ms()
+      let forms = gen_n(land, key, seed, 10, 0)
+      -- hundredths of a millisecond a chunk; the forms are used so no call is dropped (GAPS S9)
+      time_go(land, seed, k + 1, Cons((unix_time_ms() - t0) * 10 + (if forms < 0 do 1 else 0 end), acc))
+    end
+  end
+  pfn gen_n(land : Land, key : Strata.Coord.Key, seed : Int, left : Int, acc : Int) : Int do
+    if left <= 0 do acc else gen_n(land, key, seed, left - 1, acc + Ch.form(land_chunk(land, key, seed))) end
+  end
+  pfn hundredths(v : Int) : String do int_to_string(v / 100) ++ "." ++ String.pad_left(int_to_string(v % 100), 2, "0") end
+  pfn chunk_times(land : Land, seed : Int) : Unit do
+    let ts = List.sort_by(time_go(land, seed, 0, Nil), fn (p, q) -> p < q)
+    println("strata_viewer: " ++ (match land do
+        Noise -> "noise"
+        Island(_) -> "island"
+      end) ++ " chunks: median " ++ hundredths(List.nth(ts, 100)) ++ " ms, worst " ++ hundredths(List.nth(ts, 199)) ++ " ms over 200 surface chunks, 10 runs each on one task")
+  end
+
   fn main(_cap : Cap(IO)) : Unit do
     let r = Env.get_int("STRATA_RADIUS", 10)
     let soak = Env.get_int("STRATA_SOAK", 0)
@@ -1122,6 +1170,7 @@ mod StrataViewer do
     let size = window_size()
     let scene = Env.get_int("STRATA_SCENE", 0)
     let land = load_land(seed)
+    if Env.get_int("STRATA_CHUNK_TIMES", 0) == 1 do chunk_times(land, seed) else () end
     let tl = scene_lake(land, seed)
     -- the soak starts on its circuit, 60 m over the origin's ground, looking down a little
     let mid = soak_mid(tl)
