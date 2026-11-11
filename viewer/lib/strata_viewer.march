@@ -13,6 +13,11 @@
 -- STRATA_FRAMES=n   draw n frames, save a screenshot, exit (for scripts)
 -- STRATA_SHOT=path  where the screenshot goes (a PPM)
 -- STRATA_DIG=1      carve once at frame 10, as a left click would (for scripts)
+-- STRATA_SCENE=n    start from fixed camera pose n (see `pose`); with STRATA_FRAMES the run is deterministic
+-- STRATA_VSYNC=0    present immediately, for timing
+-- STRATA_SIZE=WxH   window size in points (default 1280x800)
+--
+-- With STRATA_FRAMES set the run is scripted: keyboard and mouse are ignored.
 mod StrataViewer do
 
   needs IO
@@ -232,6 +237,8 @@ mod StrataViewer do
     end
   end
 
+  pfn ms2(v : Float) : String do float_to_string(Math.round(v *. 100.0) /. 100.0) end
+
   -- position, yaw, pitch, the chunk the camera was last in, mouse buttons last frame
   type Cam = Cam(Float, Float, Float, Float, Float, Int, Int, Int, Bool, Bool)
 
@@ -243,12 +250,14 @@ mod StrataViewer do
         Cam(x, y, z, yaw, pitch, kx0, ky0, kz0, lb0, rb0) ->
           let now = Strata.Ffi.Vk.time()
           let dt = clampf(now -. t_prev, 0.0, 0.1)
-          let yaw2 = yaw +. Strata.Ffi.Vk.mouse_dx() *. 0.0025 +. axis(Strata.Ffi.Vk.key(262), Strata.Ffi.Vk.key(263)) *. dt *. 1.6
-          let pitch2 = clampf(pitch -. Strata.Ffi.Vk.mouse_dy() *. 0.0025 +. axis(Strata.Ffi.Vk.key(265), Strata.Ffi.Vk.key(264)) *. dt *. 1.2, -1.5, 1.5)
+          -- a scripted run ignores the keyboard and mouse
+          let live = if frames > 0 do 0.0 else 1.0 end
+          let yaw2 = yaw +. live *. (Strata.Ffi.Vk.mouse_dx() *. 0.0025 +. axis(Strata.Ffi.Vk.key(262), Strata.Ffi.Vk.key(263)) *. dt *. 1.6)
+          let pitch2 = clampf(pitch -. live *. (Strata.Ffi.Vk.mouse_dy() *. 0.0025 -. axis(Strata.Ffi.Vk.key(265), Strata.Ffi.Vk.key(264)) *. dt *. 1.2), -1.5, 1.5)
           let fx = Math.sin(yaw2) *. Math.cos(pitch2)
           let fy = Math.sin(pitch2)
           let fz = 0.0 -. Math.cos(yaw2) *. Math.cos(pitch2)
-          let speed = 40.0 *. dt
+          let speed = 40.0 *. dt *. live
           let fwd = axis(Strata.Ffi.Vk.key(87), Strata.Ffi.Vk.key(83)) *. speed
           let side = axis(Strata.Ffi.Vk.key(68), Strata.Ffi.Vk.key(65)) *. speed
           let up = axis(Strata.Ffi.Vk.key(32), Strata.Ffi.Vk.key(340)) *. speed
@@ -260,8 +269,8 @@ mod StrataViewer do
           let ky = Strata.Coord.chunk_of(float_to_int(Math.floor(y2)))
           let kz = Strata.Coord.chunk_of(float_to_int(Math.floor(z2)))
           let s1 = if kx != kx0 || ky != ky0 || kz != kz0 do Strata.Stream.set_focus(s, Cons((x2, y2, z2), Nil)) else s end
-          let lb = Strata.Ffi.Vk.mouse_button(0)
-          let rb = Strata.Ffi.Vk.mouse_button(1)
+          let lb = frames == 0 && Strata.Ffi.Vk.mouse_button(0)
+          let rb = frames == 0 && Strata.Ffi.Vk.mouse_button(1)
           let s2 = Strata.Stream.tick(act(s1, reg, x2, y2, z2, fx, fy, fz, (lb && !lb0) || (frame == 10 && Env.get_int("STRATA_DIG", 0) == 1), rb && !rb0))
           match sync(s2, sl) do
             (s3, sl2) ->
@@ -275,7 +284,7 @@ mod StrataViewer do
               let next = if Strata.Ffi.Vk.frame() do frame + 1 else frame end
               let cam2 = Cam(x2, y2, z2, yaw2, pitch2, kx, ky, kz, lb, rb)
               if next != frame && frame % 240 == 239 do
-                println("  " ++ float_to_string(Math.round(240.0 /. (now -. t_mark))) ++ " fps, " ++ int_to_string(Strata.Ffi.Vk.drawn_chunks()) ++ " chunks and " ++ int_to_string(Strata.Ffi.Vk.drawn_quads()) ++ " quads drawn, " ++ int_to_string(Strata.Stream.loaded_count(s3)) ++ " chunks loaded")
+                println("  " ++ float_to_string(Math.round(240.0 /. (now -. t_mark))) ++ " fps; shim " ++ ms2(Strata.Ffi.Vk.stat(0)) ++ " ms, waiting " ++ ms2(Strata.Ffi.Vk.stat(1)) ++ " ms, gpu " ++ ms2(Strata.Ffi.Vk.stat(3)) ++ " ms; " ++ int_to_string(float_to_int(Strata.Ffi.Vk.stat(2))) ++ " draw calls, " ++ int_to_string(Strata.Ffi.Vk.drawn_chunks()) ++ " chunks, " ++ int_to_string(Strata.Ffi.Vk.drawn_quads()) ++ " quads; " ++ int_to_string(Strata.Stream.loaded_count(s3)) ++ " chunks loaded")
                 frame_loop(s3, sl2, reg, cam2, next, frames, now, now, vp2)
               else frame_loop(s3, sl2, reg, cam2, next, frames, now, t_mark, vp2) end
           end
@@ -283,21 +292,64 @@ mod StrataViewer do
     end
   end
 
+  -- The window size from STRATA_SIZE=WxH, or 1280 x 800.
+  pfn window_size() : (Int, Int) do
+    match String.split(Env.get("STRATA_SIZE", "1280x800"), "x") do
+      Cons(a, Cons(b, Nil)) ->
+        match (String.to_int(a), String.to_int(b)) do
+          (Ok(w), Ok(h)) -> if w >= 64 && h >= 64 && w <= 8192 && h <= 8192 do (w, h) else (1280, 800) end
+          _ -> (1280, 800)
+        end
+      _ -> (1280, 800)
+    end
+  end
+
+  -- Fixed camera poses for scripted runs and golden images: (x, y, z, yaw, pitch).
+  --   1 overview      high over the hills, the lake ahead
+  --   2 shore         low over the water, along the shoreline
+  --   3 forest floor  among the trees, looking level
+  -- Any other number is the overview.
+  -- The first column, walking a fixed grid outward from the origin, whose
+  -- ground lies at least four blocks under the water: somewhere to look at
+  -- water from. The origin if the grid finds none.
+  pfn deep_water(seed : Int, i : Int) : (Int, Int) do
+    if i >= 4096 do (0, 0)
+    else
+      let x = (i % 64 - 32) * 8
+      let z = (i / 64 - 32) * 8
+      if height(x, z, seed) <= sea() - 4 do (x, z) else deep_water(seed, i + 1) end
+    end
+  end
+
+  pfn pose(scene : Int, seed : Int) : (Float, Float, Float, Float, Float) do
+    if scene == 2 do
+      match deep_water(seed, 0) do
+        (wx, wz) -> (int_to_float(wx) +. 0.5, int_to_float(sea()) +. 3.5, int_to_float(wz) +. 0.5, 0.9, -0.15)
+      end
+    else if scene == 3 do (-40.0, int_to_float(height(-40, 60, seed)) +. 2.6, 60.0, 0.62, -0.05)
+    else (-70.0, int_to_float(height(0, 0, seed)) +. 46.0, 96.0, 0.62, -0.42) end end
+  end
+
   fn main(_cap : Cap(IO)) : Unit do
     let r = Env.get_int("STRATA_RADIUS", 10)
     let frames = Env.get_int("STRATA_FRAMES", 0)
     let seed = Env.get_int("STRATA_SEED", 7)
-    if !Strata.Ffi.Vk.open(1280, 800, frames == 0) do println("strata_viewer: could not open a Vulkan window")
+    let size = window_size()
+    let start = pose(Env.get_int("STRATA_SCENE", 1), seed)
+    if !Strata.Ffi.Vk.open(match size do (w, _) -> w end, match size do (_, h) -> h end, frames == 0) do println("strata_viewer: could not open a Vulkan window")
     else
+      Strata.Ffi.Vk.set_vsync(Env.get_int("STRATA_VSYNC", 1) != 0)
       let reg = registry()
       palette()
       Strata.Ffi.Vk.set_sun(0.45, 0.80, 0.35, 0.30)
       Strata.Ffi.Vk.set_sky(0.53, 0.72, 0.92)
       -- chunks are meshed out to one short of the radius, so the fog closes there
       Strata.Ffi.Vk.set_fog(int_to_float(r - 1) *. 32.0 *. 0.55, int_to_float(r - 1) *. 32.0)
-      let ex = -70.0
-      let ey = int_to_float(height(0, 0, seed)) +. 46.0
-      let ez = 96.0
+      let ex = match start do (x, _, _, _, _) -> x end
+      let ey = match start do (_, y, _, _, _) -> y end
+      let ez = match start do (_, _, z, _, _) -> z end
+      let yaw0 = match start do (_, _, _, a, _) -> a end
+      let pitch0 = match start do (_, _, _, _, a) -> a end
       let world = Strata.World.new(reg, Strata.Terrain.gen(fn (k, sd) -> terrain(Strata.Coord.kx(k), Strata.Coord.ky(k), Strata.Coord.kz(k), sd)), seed, 1.0)
       let t0 = Strata.Ffi.Vk.time()
       let s0 = Strata.Stream.run_until_settled(Strata.Stream.set_focus(Strata.Stream.start(world, Strata.Stream.config(r, 3, 32, 8)), Cons((ex, ey, ez), Nil)), 1000000)
@@ -305,7 +357,7 @@ mod StrataViewer do
       match sync(s0, Slots(Strata.Store.empty(-1), Nil, 0)) do
         (s1, sl) ->
           println("strata_viewer: " ++ int_to_string(Strata.Stream.loaded_count(s1)) ++ " chunks streamed in " ++ float_to_string(Math.round((t1 -. t0) *. 1000.0)) ++ " ms; " ++ int_to_string(Strata.Ffi.Vk.live_quads()) ++ " quads, " ++ int_to_string(Strata.Ffi.Vk.live_quads() * 8 / 1024) ++ " KB on the GPU")
-          let cam = Cam(ex, ey, ez, 0.62, -0.42, Strata.Coord.chunk_of(float_to_int(Math.floor(ex))), Strata.Coord.chunk_of(float_to_int(Math.floor(ey))), Strata.Coord.chunk_of(float_to_int(Math.floor(ez))), false, false)
+          let cam = Cam(ex, ey, ez, yaw0, pitch0, Strata.Coord.chunk_of(float_to_int(Math.floor(ex))), Strata.Coord.chunk_of(float_to_int(Math.floor(ey))), Strata.Coord.chunk_of(float_to_int(Math.floor(ez))), false, false)
           frame_loop(s1, sl, reg, cam, 0, frames, Strata.Ffi.Vk.time(), Strata.Ffi.Vk.time(), NativeArray.make_f32(16, 0.0))
       end
       Strata.Ffi.Vk.close()

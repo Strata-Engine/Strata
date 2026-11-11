@@ -73,6 +73,9 @@ static struct {
     VkBuffer giga; VkDeviceMemory giga_mem; uint32_t *giga_map;
     VkBuffer ubo;  VkDeviceMemory ubo_mem;  float *ubo_map;
     int ok, resized;
+    int vsync_off;                 /* ask for the immediate present mode */
+    double stat[4];                /* last frame: CPU ms, ms waiting, draw calls, GPU ms */
+    VkQueryPool qpool; int have_ts; float ts_period; int ts_written;
     /* gigabuffer free list, in quads, sorted by first */
     Range free_list[SV_MAX_FREE]; int nfree;
     uint32_t quads_live;
@@ -171,6 +174,15 @@ static void destroy_swapchain(void) {
     g.nimages = 0;
 }
 
+/* FIFO (vsync) unless the immediate mode was asked for and the surface offers it. */
+static VkPresentModeKHR pick_present_mode(void) {
+    if (!g.vsync_off) return VK_PRESENT_MODE_FIFO_KHR;
+    uint32_t n = 16; VkPresentModeKHR modes[16];
+    if (vkGetPhysicalDeviceSurfacePresentModesKHR(g.phys, g.surface, &n, modes) != VK_SUCCESS && n == 0) return VK_PRESENT_MODE_FIFO_KHR;
+    for (uint32_t i = 0; i < n; i++) if (modes[i] == VK_PRESENT_MODE_IMMEDIATE_KHR) return VK_PRESENT_MODE_IMMEDIATE_KHR;
+    return VK_PRESENT_MODE_FIFO_KHR;
+}
+
 static int make_swapchain(void) {
     VkSurfaceCapabilitiesKHR caps;
     VKOK(vkGetPhysicalDeviceSurfaceCapabilitiesKHR(g.phys, g.surface, &caps), "surface caps");
@@ -191,9 +203,10 @@ static int make_swapchain(void) {
         .minImageCount = want, .imageFormat = pick.format, .imageColorSpace = pick.colorSpace, .imageExtent = ext,
         .imageArrayLayers = 1, .imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
         .imageSharingMode = VK_SHARING_MODE_EXCLUSIVE, .preTransform = caps.currentTransform,
-        .compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR, .presentMode = VK_PRESENT_MODE_FIFO_KHR, .clipped = VK_TRUE,
+        .compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR, .presentMode = pick_present_mode(), .clipped = VK_TRUE,
         .oldSwapchain = old };
     VKOK(vkCreateSwapchainKHR(g.dev, &sci, NULL, &g.swap), "vkCreateSwapchainKHR");
+    if (getenv("STRATA_DEBUG")) fprintf(stderr, "strata_vk: swapchain %ux%u, present mode %d, %u images wanted\n", ext.width, ext.height, (int)sci.presentMode, want);
     if (old) vkDestroySwapchainKHR(g.dev, old, NULL);
     g.format = pick.format; g.extent = ext;
     g.nimages = SV_MAX_IMAGES;
@@ -336,6 +349,8 @@ int64_t sv_open(int64_t w, int64_t h, int64_t capture_mouse) {
         if ((qf[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) && present) { g.qfam = i; found = 1; break; }
     }
     if (!found) { die("no graphics+present queue", 0); return 0; }
+    { VkPhysicalDeviceProperties pp; vkGetPhysicalDeviceProperties(g.phys, &pp);
+      g.have_ts = qf[g.qfam].timestampValidBits != 0; g.ts_period = pp.limits.timestampPeriod; }
     float prio = 1.0f;
     VkDeviceQueueCreateInfo qci = { .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, .queueFamilyIndex = g.qfam, .queueCount = 1, .pQueuePriorities = &prio };
     /* enable the portability subset extension when the device advertises it, as the spec requires */
@@ -397,6 +412,11 @@ int64_t sv_open(int64_t w, int64_t h, int64_t capture_mouse) {
     VKOK(vkCreateSemaphore(g.dev, &si, NULL, &g.sem_done), "semaphore");
     VkFenceCreateInfo fi = { .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO, .flags = VK_FENCE_CREATE_SIGNALED_BIT };
     VKOK(vkCreateFence(g.dev, &fi, NULL, &g.fence), "fence");
+    if (g.have_ts) {
+        VkQueryPoolCreateInfo qi = { .sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, .queryType = VK_QUERY_TYPE_TIMESTAMP, .queryCount = 2 };
+        if (vkCreateQueryPool(g.dev, &qi, NULL, &g.qpool) != VK_SUCCESS) g.have_ts = 0;
+    }
+    g.stat[3] = -1.0;
     g.ok = 1;
     return 1;
 }
@@ -419,6 +439,7 @@ void sv_close(void) {
         if (g.sem_image) vkDestroySemaphore(g.dev, g.sem_image, NULL);
         if (g.sem_done) vkDestroySemaphore(g.dev, g.sem_done, NULL);
         if (g.fence) vkDestroyFence(g.dev, g.fence, NULL);
+        if (g.qpool) vkDestroyQueryPool(g.dev, g.qpool, NULL);
         if (g.cpool) vkDestroyCommandPool(g.dev, g.cpool, NULL);
         vkDestroyDevice(g.dev, NULL);
     }
@@ -441,6 +462,13 @@ double sv_mouse_dy(void) { return g.mdy; }
 double sv_time(void) { return glfwGetTime(); }
 int64_t sv_fb_w(void) { return (int64_t)g.extent.width; }
 int64_t sv_fb_h(void) { return (int64_t)g.extent.height; }
+/* 0 asks for the immediate present mode (no vsync) when the surface has it. */
+void sv_set_vsync(int64_t on) { int off = on ? 0 : 1; if (g.ok && off != g.vsync_off) { g.vsync_off = off; g.resized = 1; } }
+/* Of the last frame: 0 ms of CPU work inside sv_frame, 1 ms it spent waiting
+ * (for the previous frame's fence, the next image, and present), 2 draw
+ * calls issued, 3 GPU ms or -1 if the driver
+ * gives no timestamps. */
+double sv_stat(int64_t which) { return (which >= 0 && which < 4) ? g.stat[which] : -1.0; }
 int64_t sv_drawn_chunks(void) { return g.drawn_chunks; }
 int64_t sv_drawn_quads(void) { return g.drawn_quads; }
 int64_t sv_live_quads(void) { return (int64_t)g.quads_live; }
@@ -550,15 +578,26 @@ static int rebuild_swapchain(void) {
 int64_t sv_frame(void) {
     if (!g.ok) return 0;
     if (g.resized) { g.resized = 0; if (!rebuild_swapchain()) return 0; }
+    double t_start = glfwGetTime();
     vkWaitForFences(g.dev, 1, &g.fence, VK_TRUE, UINT64_MAX);
+    double fence_ms = (glfwGetTime() - t_start) * 1000.0;
+    if (g.have_ts && g.ts_written) {          /* the previous frame is complete: read its two timestamps */
+        uint64_t ts[2] = { 0, 0 };
+        if (vkGetQueryPoolResults(g.dev, g.qpool, 0, 2, sizeof ts, ts, sizeof ts[0], VK_QUERY_RESULT_64_BIT) == VK_SUCCESS)
+            g.stat[3] = (double)(ts[1] - ts[0]) * (double)g.ts_period / 1.0e6;
+    }
     uint32_t idx = 0;
+    double t_acq = glfwGetTime();
     VkResult ar = vkAcquireNextImageKHR(g.dev, g.swap, UINT64_MAX, g.sem_image, VK_NULL_HANDLE, &idx);
     if (ar == VK_ERROR_OUT_OF_DATE_KHR) { rebuild_swapchain(); return 0; }
     if (ar != VK_SUCCESS && ar != VK_SUBOPTIMAL_KHR) { die("vkAcquireNextImageKHR", (int)ar); return 0; }
+    double wait_ms = fence_ms + (glfwGetTime() - t_acq) * 1000.0;
+    int draws = 0;
     vkResetFences(g.dev, 1, &g.fence);
     vkResetCommandBuffer(g.cmd, 0);
     VkCommandBufferBeginInfo bi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
     vkBeginCommandBuffer(g.cmd, &bi);
+    if (g.have_ts) { vkCmdResetQueryPool(g.cmd, g.qpool, 0, 2); vkCmdWriteTimestamp(g.cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, g.qpool, 0); }
     VkClearValue clear[2];
     clear[0].color.float32[0] = g.ubo_map[20]; clear[0].color.float32[1] = g.ubo_map[21];
     clear[0].color.float32[2] = g.ubo_map[22]; clear[0].color.float32[3] = 1.0f;
@@ -592,12 +631,13 @@ int64_t sv_frame(void) {
                     vkCmdPushConstants(g.cmd, g.layout, VK_SHADER_STAGE_VERTEX_BIT, 0, 16, pc);
                     pushed = 1; if (pass == 0) g.drawn_chunks++;
                 }
-                vkCmdDraw(g.cmd, 4, s->layer[l].count, 0, s->layer[l].first);
+                vkCmdDraw(g.cmd, 4, s->layer[l].count, 0, s->layer[l].first); draws++;
                 g.drawn_quads += s->layer[l].count;
             }
         }
     }
     vkCmdEndRenderPass(g.cmd);
+    if (g.have_ts) { vkCmdWriteTimestamp(g.cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, g.qpool, 1); g.ts_written = 1; }
     vkEndCommandBuffer(g.cmd);
     VkPipelineStageFlags wait = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
     VkSubmitInfo sub = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .waitSemaphoreCount = 1, .pWaitSemaphores = &g.sem_image, .pWaitDstStageMask = &wait,
@@ -607,8 +647,14 @@ int64_t sv_frame(void) {
     if (g.shot_pending) { g.shot_pending = 0; write_shot(idx); }
     VkPresentInfoKHR pi = { .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR, .waitSemaphoreCount = 1, .pWaitSemaphores = &g.sem_done,
         .swapchainCount = 1, .pSwapchains = &g.swap, .pImageIndices = &idx };
+    double t_pres = glfwGetTime();
     VkResult pr = vkQueuePresentKHR(g.queue, &pi);
+    double t_end = glfwGetTime();
     if (pr == VK_ERROR_OUT_OF_DATE_KHR || pr == VK_SUBOPTIMAL_KHR) g.resized = 1;
+    wait_ms += (t_end - t_pres) * 1000.0;
+    g.stat[0] = (t_end - t_start) * 1000.0 - wait_ms;
+    g.stat[1] = wait_ms;
+    g.stat[2] = (double)draws;
     return 1;
 }
 

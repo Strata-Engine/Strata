@@ -81,3 +81,25 @@ through the neighbourhood lookup, and per-layer tallies skip any slice
 that has no cube block or looks into a fully solid layer. What remains is
 the mask build for live slices and two whole-chunk passes (occupancy and
 instances) that could read the padded grid instead.
+
+# Renderer plan
+
+## Baseline before the renderer work (Task 1)
+
+Scene 1 (overview), radius 10 x 3, 2560 x 1600, immediate present mode
+requested, CPU frustum culling and one draw per chunk layer:
+
+| | |
+|---|---|
+| frame rate | 120 fps: still capped by the display |
+| draw calls | 242 |
+| chunks / quads drawn | 117 / 94 389 |
+| GPU time, by timestamp query | 0.5 to 1.1 ms |
+| time inside `frame` | 6 to 7 ms, almost all of it blocked in submit |
+
+MoltenVK accepts the immediate present mode and the swapchain reports it,
+but the frame still paces to the display: the block moves from the fence
+wait into `vkQueueSubmit`, where the driver takes the next drawable. Three
+MoltenVK settings were tried and none lifts it. Timestamp queries do work,
+so GPU time is real. An uncapped CPU figure needs a frame that never
+touches the swapchain; Task 2 adds an offscreen mode for that.
