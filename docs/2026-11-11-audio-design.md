@@ -407,11 +407,12 @@ Strata.Sound.open(config)               -- the device; or render(path) for an of
 Strata.Sound.load(path) / ready(id) / unload(id)
 Strata.Sound.patch(...)                 -- build a patch; upload answers its id
 Strata.Sound.gust() / pour() / strike()               -- the ready-made patches
-Strata.Sound.play(s, patch_or_recording, x, y, z, gain, pitch, priority) -> (s, voice)
-Strata.Sound.play_flat(s, patch_or_recording, gain, pan, pitch) -> (s, voice)   -- no position
+Strata.Sound.play(s, patch_or_recording, group, x, y, z, gain, pitch, priority) -> (s, voice)
+Strata.Sound.play_flat(s, patch_or_recording, group, gain, pan, pitch) -> (s, voice)   -- no position
 Strata.Sound.move / control / stop (s, voice, ...) -> s
 Strata.Sound.listener(s, x, y, z, fx, fy, fz, ux, uy, uz) -> s
-Strata.Sound.set_output(headphones?) / set_group(group, gain)
+Strata.Sound.set_output(headphones?) / set_master(level) / set_group(group, level)
+                                            -- levels 0..1 as sliders, cubed into gains (added 2026-11-11)
 Strata.Sound.update(s, world, fluid, dt) -> s   -- once a frame, last: first walks, sends
                                                 -- the frame's commands, acoustics job,
                                                 -- fluid emitters; in game-time mode, mixes dt

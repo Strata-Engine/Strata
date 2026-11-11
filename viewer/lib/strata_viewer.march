@@ -9,7 +9,7 @@
 --   right click  build a sphere of stone onto it
 --   L   step through the light modes        [ and ]   lower and raise the sun
 --   N   play a recording from viewer/sounds/ (WAV, FLAC, MP3) 5 m ahead
---   H   switch sound between headphones (3D) and speakers
+--   H   switch sound between headphones (3D) and speakers      9 and 0   main sound level down and up
 --
 -- The world streams in around the camera and has no edge: a 2 km island,
 -- read from Strata.Atlas, in a sea that goes on.
@@ -47,6 +47,7 @@
 -- STRATA_AUDIO=0|1|null|wav:path   sound off (scripted default), the device (playing default), the silent null device, or rendered to a WAV in game time
 -- STRATA_AUDIO_METER=1   a line of voices, refusals, underruns, CPU and level once a second
 -- STRATA_STALL=n    hold the main thread 100 ms every n frames, as a hitch would (soak runs)
+-- STRATA_AUDIO_LEVEL=x   the main level at start, 0..1 (9 and 0 change it while playing)
 --                   the worst and mean frame time and what the renderer still holds
 --
 -- With STRATA_FRAMES or STRATA_SOAK set the run is scripted: keyboard and mouse are ignored.
@@ -793,8 +794,25 @@ mod StrataViewer do
     if loaded > 0 do println("strata_viewer: " ++ int_to_string(loaded) ++ " recordings from viewer/sounds/; N plays one") else () end
     -- the strike patch first (id 1), then a gust whose strength follows how open the sky is
     let s1 = match Strata.Sound.upload(Strata.Sound.new(), Strata.Sound.strike()) do (s, _) -> s end
-    match Strata.Sound.with_gust(s1, true) do (s2, _) -> s2 end
+    let level = start_level()
+    if level < 1.0 do println("strata_viewer: main level " ++ ms2(level)) else () end
+    match Strata.Sound.with_gust(if level < 1.0 do Strata.Sound.set_master(s1, level) else s1 end, true, 1) do (s2, _) -> s2 end
   end
+  -- the main level at start, from STRATA_AUDIO_LEVEL, 0..1 (anything else clamped; unreadable is full)
+  pfn start_level() : Float do
+    match String.to_float(Env.get("STRATA_AUDIO_LEVEL", "1.0")) do
+      Ok(x) -> if x >= 0.0 do (if x > 1.0 do 1.0 else x end) else (if x < 0.0 do 0.0 else 1.0 end) end
+      Err(_) -> 1.0
+    end
+  end
+  doc "The viewer's key state for a main level: bits 8-11 hold it as tenths below full, rounded."
+  fn level_bits(level : Float) : Int do
+    let t = float_to_int(Math.round((if level < 0.0 do 0.0 else if level > 1.0 do 1.0 else level end end) *. 10.0))
+    (10 - t) * 256
+  end
+  doc "The main level, in tenths (0..10), held in a key state."
+  fn level_tenths(keys : Int) : Int do 10 - int_and(keys / 256, 15) end
+
   -- the WAV files in viewer/sounds/, in the order listed; loaded at start, so the nth has recording id 2048 + n
   pfn sound_files() : List(String) do
     match Dir.list("sounds") do
@@ -818,7 +836,7 @@ mod StrataViewer do
       if !Strata.Ffi.Audio.ready(id) do
         println("strata_viewer: recording " ++ int_to_string(id - 2048) ++ " is not ready")
         snd
-      else match Strata.Sound.play(Strata.Sound.recorded(snd, id, Strata.Ffi.Audio.length(id)), id, x, y, z, 0.9, 1.0, 1.0) do (s, v) -> Strata.Sound.with_range(s, v, 3.0, 150.0) end end
+      else match Strata.Sound.play(Strata.Sound.recorded(snd, id, Strata.Ffi.Audio.length(id)), id, 0, x, y, z, 0.9, 1.0, 1.0) do (s, v) -> Strata.Sound.with_range(s, v, 3.0, 150.0) end end
     end
   end
   -- the strike patch is the first uploaded
@@ -837,7 +855,7 @@ mod StrataViewer do
   pfn footstep(snd : Strata.Sound.Sound, id : Int, x : Float, y : Float, z : Float, energy : Float) : Strata.Sound.Sound do
     match underfoot(id) do
       (hard, size) ->
-        match Strata.Sound.play(snd, strike_patch(), x, y, z, 0.5, 1.0, 0.5) do
+        match Strata.Sound.play(snd, strike_patch(), 0, x, y, z, 0.5, 1.0, 0.5) do
           (s1, v) -> Strata.Sound.control(Strata.Sound.control(Strata.Sound.control(s1, v, 0, hard), v, 1, size), v, 2, energy)
         end
     end
@@ -846,7 +864,7 @@ mod StrataViewer do
   pfn strike_at(snd : Strata.Sound.Sound, w : Strata.World.World, reg : Strata.Blocks.Registry, x : Float, y : Float, z : Float, fx : Float, fy : Float, fz : Float, hardness : Float, size : Float) : Strata.Sound.Sound do
     let h = Strata.Query.raycast(w, x, y, z, fx, fy, fz, 250.0, Strata.Query.targetable(reg))
     let d = if Strata.Query.is_hit(h) do Strata.Query.hit_dist(h) else 3.0 end
-    match Strata.Sound.play(snd, strike_patch(), x +. fx *. d, y +. fy *. d, z +. fz *. d, 0.9, 1.0, 1.0) do
+    match Strata.Sound.play(snd, strike_patch(), 0, x +. fx *. d, y +. fy *. d, z +. fz *. d, 0.9, 1.0, 1.0) do
       (s1, v) -> Strata.Sound.control(Strata.Sound.control(Strata.Sound.control(Strata.Sound.with_range(s1, v, 4.0, 250.0), v, 0, hardness), v, 1, size), v, 2, 0.8)
     end
   end
@@ -889,7 +907,8 @@ mod StrataViewer do
   -- eye position, yaw, pitch, the chunk the camera was last in, mouse buttons
   -- last frame, flying or walking, vertical speed, on the ground, F last frame
   -- ..., then the sun's height in degrees, the light mode, and whether L was down,
-  -- then the sound keys down last frame (bit 0 N, bit 1 H) and bit 2: headphones,
+  -- then the sound keys down last frame (bit 0 N, bit 1 H, bit 3 9, bit 4 0), bit 2 headphones,
+  -- bits 8-11 the main level as tenths below full,
   -- then the metres walked since the last footstep
   type Cam = Cam(Float, Float, Float, Float, Float, Int, Int, Int, Bool, Bool, Bool, Float, Bool, Bool, Float, Int, Bool, Int, Float)
 
@@ -1020,13 +1039,23 @@ mod StrataViewer do
           let hkey = !scripted && Strata.Ffi.Vk.key(72)
           let hp_was = int_and(keys0, 4) != 0
           let hp_now = if hkey && int_and(keys0, 2) == 0 do !hp_was else hp_was end
-          let keys = (if nkey do 1 else 0 end) + (if hkey do 2 else 0 end) + (if hp_now do 4 else 0 end)
+          -- 9 and 0 lower and raise the main level by a tenth (held in keys' bits 8-11, as tenths below full)
+          let k9 = !scripted && Strata.Ffi.Vk.key(57)
+          let k0 = !scripted && Strata.Ffi.Vk.key(48)
+          let tenths0 = level_tenths(keys0)
+          let tenths1 = if k9 && int_and(keys0, 8) == 0 do tenths0 - 1 else if k0 && int_and(keys0, 16) == 0 do tenths0 + 1 else tenths0 end end
+          let tenths = if tenths1 < 0 do 0 else if tenths1 > 10 do 10 else tenths1 end end
+          let keys = (if nkey do 1 else 0 end) + (if hkey do 2 else 0 end) + (if hp_now do 4 else 0 end) + (if k9 do 8 else 0 end) + (if k0 do 16 else 0 end) + (10 - tenths) * 256
           let snd_n = if nkey && int_and(keys0, 1) == 0 do place_recording(snd_f, frame, x2 +. fx *. 5.0, y2 +. fy *. 5.0, z2 +. fz *. 5.0) else snd_f end
+          let snd_lv = if tenths != tenths0 do
+              println("strata_viewer: main level " ++ ms2(int_to_float(tenths) /. 10.0))
+              Strata.Sound.set_master(snd_n, int_to_float(tenths) /. 10.0)
+            else snd_n end
           let snd1 = if hkey && int_and(keys0, 2) == 0 do
               let hp = int_and(keys, 4) != 0
               println("strata_viewer: sound on " ++ (if hp do "headphones" else "speakers" end))
-              Strata.Sound.set_output(snd_n, hp)
-            else snd_n end
+              Strata.Sound.set_output(snd_lv, hp)
+            else snd_lv end
           -- the fluid: ten steps a second (a scripted run: every sixth frame)
           let t_fluid = Strata.Ffi.Vk.time()
           let due = Env.get_int("STRATA_FLUID", 1) != 0 && (if scripted do frame % 6 == 0 else Math.floor(now *. 10.0) != Math.floor(t_prev *. 10.0) end)
@@ -1402,7 +1431,7 @@ mod StrataViewer do
         (sl, s1) ->
           println("strata_viewer: " ++ int_to_string(Strata.Stream.loaded_count(s1)) ++ " chunks streamed in " ++ float_to_string(Math.round((t1 -. t0) *. 1000.0)) ++ " ms; " ++ int_to_string(Strata.Ffi.Vk.live_quads()) ++ " quads, " ++ int_to_string(Strata.Ffi.Vk.live_quads() * 8 / 1024) ++ " KB on the GPU")
           -- the fixed scenes fly, holding their pose; the default and the walk scene stand on the ground
-          let cam = Cam(ex, ey, ez, yaw0, pitch0, Strata.Coord.chunk_of(float_to_int(Math.floor(ex))), Strata.Coord.chunk_of(float_to_int(Math.floor(ey))), Strata.Coord.chunk_of(float_to_int(Math.floor(ez))), false, false, soak > 0 || (scene != 0 && scene != 11), 0.0, false, false, int_to_float(Env.get_int("STRATA_SUN", 55)), Env.get_int("STRATA_LIGHT", 4), false, 0, 0.0)
+          let cam = Cam(ex, ey, ez, yaw0, pitch0, Strata.Coord.chunk_of(float_to_int(Math.floor(ex))), Strata.Coord.chunk_of(float_to_int(Math.floor(ey))), Strata.Coord.chunk_of(float_to_int(Math.floor(ez))), false, false, soak > 0 || (scene != 0 && scene != 11), 0.0, false, false, int_to_float(Env.get_int("STRATA_SUN", 55)), Env.get_int("STRATA_LIGHT", 4), false, level_bits(start_level()), 0.0)
           frame_loop(s1, Strata.Fluid.with_limits(Strata.Fluid.new(reg, Cons((lake_base(), Strata.Fluid.flowing()), Cons((5, Strata.Fluid.sink()), Nil))), Env.get_int("STRATA_FLUID_CAP", 4096), Env.get_int("STRATA_FLUID_REACH", 16), 4), None, sl, reg, cam, 0, frames, if soak > 0 do 2 else if scene == 11 && frames > 0 do 1 else if scene == 4 && frames > 0 do 3 else 0 end end end, hole, tl, 0.0, 0.0, 0.0, Strata.Ffi.Vk.time(), Strata.Ffi.Vk.time(), NativeArray.make_f32(16, 0.0), audio_start(frames), 0.0)
       end
       Strata.Ffi.Vk.close()

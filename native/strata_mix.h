@@ -47,7 +47,8 @@ enum {
     SM_OP_ENVIRON = 8,
     SM_OP_GROUP = 9,     /* a = group, f0 = gain */
     SM_OP_OUTPUT = 10,   /* a = 0 speakers, 1 headphones */
-    SM_OP_RANGE = 11     /* f0 = reference distance, f1 = maximum distance (m) */
+    SM_OP_RANGE = 11,    /* f0 = reference distance, f1 = maximum distance (m) */
+    SM_OP_MASTER = 12    /* f0 = gain 0..1 over the whole mix, before the limiter */
 };
 
 /* ---- the patch: SM_PATCH_FLOATS floats, sent as PATCH records of 12 ---- */
@@ -179,6 +180,7 @@ typedef struct {
     float fdn[8][SM_FDN_MAX]; int fdn_at[8]; float fdn_lp[8];
     float er_coef[SM_REFL][16], er_pan[SM_REFL][2];
     int rv_cleared;
+    float master_to, master_now;   /* the main gain asked, and where its glide stands */
 } SmMixer;
 
 static inline void sm_rec_publish(SmMixer *m, int id, SmRec *r) {
@@ -203,6 +205,7 @@ static inline SmMixer *sm_open(void) {
     m->st.peak_db = -120.0f; m->st.rms_db = -120.0f;
     m->lr[0] = 1.0f; m->lu[1] = 1.0f; m->lf[2] = -1.0f;
     m->rv_decay = m->rv_decay_to = 0.1f;
+    m->master_to = m->master_now = 1.0f;
     return m;
 }
 static inline void sm_close(SmMixer *m) { free(m); }
@@ -371,6 +374,7 @@ static inline void sm_command(SmMixer *m, const SmCmd *c0) {
         }
         break;
     case SM_OP_OUTPUT: m->headphones = c->a == 1; break;
+    case SM_OP_MASTER: m->master_to = sm_clampf(c->f[0], 0.0f, 1.0f); break;
     case SM_OP_GROUP:
         if (c->a >= 0 && c->a < SM_GROUPS) m->group_gain[c->a] = c->f[0] < 0.0f ? 0.0f : c->f[0];
         break;
@@ -865,6 +869,12 @@ static inline void sm_mix(SmMixer *m, float *out, int frames) {
         int k = frames - at < SM_BLOCK ? frames - at : SM_BLOCK;
         playing = 0;
         sm_mix_block(m, out + 2 * at, k, &playing, &mixed);
+        /* the main level, gliding as the groups' do */
+        float g0 = m->master_now, g1 = g0 + (m->master_to - g0) * 0.5f * (float)k / (float)SM_BLOCK;
+        if (fabsf(m->master_to - g1) < 1e-5f) g1 = m->master_to;
+        if (g0 != 1.0f || g1 != 1.0f)
+            for (int n = 0; n < k; n++) { float g = g0 + (g1 - g0) * (float)n / (float)k; out[2 * (at + n)] *= g; out[2 * (at + n) + 1] *= g; }
+        m->master_now = g1;
     }
     /* last line of defence: anything non-finite is silenced, and the state it may have entered is reset */
     int bad = 0;

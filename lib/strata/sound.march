@@ -27,8 +27,8 @@ mod Strata.Sound do
   -- what the fluid and the wind add: the fluid's emitters, the pour patch
   -- (0 until needed), each emitter's voice, the gust voice (0 for none),
   -- and the gust's following of openness (Nil: not following; else the
-  -- openness last heard)
-  type Water = Water(Strata.Emitters.Emitters, Int, List((Int, Int)), Int, List(Float))
+  -- openness last heard), and the group the fluid's voices play in
+  type Water = Water(Strata.Emitters.Emitters, Int, List((Int, Int)), Int, List(Float), Int)
   type Sound = Sound(Int, Int, List(Cmd), Int, Int, Place, Water)
 
   doc "The op codes of a command record, as native/strata_mix.h numbers them."
@@ -43,6 +43,7 @@ mod Strata.Sound do
   fn op_group() : Int do 9 end
   fn op_output() : Int do 10 end
   fn op_range() : Int do 11 end
+  fn op_master() : Int do 12 end
 
   doc "New voices a frame may start; plays past it are refused and counted."
   fn new_per_frame() : Int do 64 end
@@ -50,7 +51,7 @@ mod Strata.Sound do
   pfn max_patch() : Int do 2047 end
 
   doc "Nothing playing, nothing sent."
-  fn new() : Sound do Sound(1, 1, Nil, 0, 0, Place((0.0, 0.0, 0.0), Nil, None, 0, 0.0, 0.0, 0, Nil), Water(Strata.Emitters.new(), 0, Nil, 0, Nil)) end
+  fn new() : Sound do Sound(1, 1, Nil, 0, 0, Place((0.0, 0.0, 0.0), Nil, None, 0, 0.0, 0.0, 0, Nil), Water(Strata.Emitters.new(), 0, Nil, 0, Nil, 0)) end
 
   doc "Placed voices started but not yet walked through the blocks, because more than 8 started in one frame; they are muffled from the next acoustics update."
   fn unwalked(s : Sound) : Int do match s do Sound(_, _, _, _, _, Place(_, _, _, _, _, _, u, _), _) -> u end end
@@ -109,14 +110,14 @@ mod Strata.Sound do
     end
   end
 
-  doc "Play source [src] at (x, y, z) metres, at [gain] and [pitch] (a rate: 1 is as made), ranked by [priority] when there are more voices than can be mixed. Answers the voice, or 0 when the play is refused."
-  fn play(s : Sound, src : Int, x : Float, y : Float, z : Float, gain : Float, pitch : Float, priority : Float) : (Sound, Int) do
-    start(s, src, 0, Cons(gain, Cons(pitch, Cons(priority, Cons(x, Cons(y, Cons(z, Cons(0.0, Cons(0.0, Nil)))))))), Some((x, y, z)))
+  doc "Play source [src] in [group] (0..3; another number is group 0) at (x, y, z) metres, at [gain] and [pitch] (a rate: 1 is as made), ranked by [priority] when there are more voices than can be mixed. Answers the voice, or 0 when the play is refused."
+  fn play(s : Sound, src : Int, group : Int, x : Float, y : Float, z : Float, gain : Float, pitch : Float, priority : Float) : (Sound, Int) do
+    start(s, src, group_of(group), Cons(gain, Cons(pitch, Cons(priority, Cons(x, Cons(y, Cons(z, Cons(0.0, Cons(0.0, Nil)))))))), Some((x, y, z)))
   end
 
-  doc "Play source [src] with no position, panned by [pan] from -1 (left) to 1 (right). For interface sounds and anything the game places itself."
-  fn play_flat(s : Sound, src : Int, gain : Float, pan : Float, pitch : Float) : (Sound, Int) do
-    start(s, src, 0, Cons(gain, Cons(pitch, Cons(1.0, Cons(0.0, Cons(0.0, Cons(0.0, Cons(1.0, Cons(pan, Nil)))))))), None)
+  doc "Play source [src] in [group] with no position, panned by [pan] from -1 (left) to 1 (right). For interface sounds and anything the game places itself."
+  fn play_flat(s : Sound, src : Int, group : Int, gain : Float, pan : Float, pitch : Float) : (Sound, Int) do
+    start(s, src, group_of(group), Cons(gain, Cons(pitch, Cons(1.0, Cons(0.0, Cons(0.0, Cons(0.0, Cons(1.0, Cons(pan, Nil)))))))), None)
   end
 
   doc "Move a playing voice to (x, y, z) metres."
@@ -156,8 +157,32 @@ mod Strata.Sound do
     if known(s, voice) do push(s, Cmd(op_range(), voice, 0, 0, Cons(reference, Cons(maximum, Nil)))) else s end
   end
 
-  doc "The gain of group [g] (0..3); every voice plays in group 0 unless told otherwise."
-  fn set_group(s : Sound, g : Int, gain : Float) : Sound do push(s, Cmd(op_group(), 0, g, 0, Cons(gain, Nil))) end
+  -- ── Levels ───────────────────────────────────────────────────────────────
+
+  doc "Groups a voice can play in: 0..3. Strata names none; a game decides which is music, which effects, and so on."
+  fn groups() : Int do 4 end
+  pfn group_of(g : Int) : Int do if g >= 0 && g < groups() do g else 0 end end
+
+  doc "The gain a 0..1 slider [level] stands for: its cube, so equal steps of the slider sound like roughly equal steps of loudness (0.5 is about -18 dB). 0 is silent, 1 is unity; anything outside is clamped, and NaN is silent."
+  fn level_gain(level : Float) : Float do
+    let l = if level >= 0.0 do (if level > 1.0 do 1.0 else level end) else 0.0 end
+    l *. l *. l
+  end
+
+  doc "The main level over everything Strata plays, 0..1 as a slider; it glides there."
+  fn set_master(s : Sound, level : Float) : Sound do push(s, Cmd(op_master(), 0, 0, 0, Cons(level_gain(level), Nil))) end
+
+  doc "The level of group [g] (0..3), 0..1 as a slider; it glides there. Another group number is ignored."
+  fn set_group(s : Sound, g : Int, level : Float) : Sound do
+    if g >= 0 && g < groups() do push(s, Cmd(op_group(), 0, g, 0, Cons(level_gain(level), Nil))) else s end
+  end
+
+  doc "The group the fluid's pour voices play in (default 0)."
+  fn with_fluid_group(s : Sound, g : Int) : Sound do
+    match water_of(s) do
+      Water(em, pour_id, map, gv, follow, _) -> with_water(s, Water(em, pour_id, map, gv, follow, group_of(g)))
+    end
+  end
 
   doc "Headphones (rendered in 3D for two ears) or speakers (panned stereo)."
   fn set_output(s : Sound, headphones : Bool) : Sound do push(s, Cmd(op_output(), 0, if headphones do 1 else 0 end, 0, Nil)) end
@@ -400,7 +425,7 @@ mod Strata.Sound do
 
   pfn heard_open(wa : Water, o : Float) : Water do
     match wa do
-      Water(em, pour_id, map, gv, follow) -> Water(em, pour_id, map, gv, if List.is_empty(follow) do Nil else Cons(o, Nil) end)
+      Water(em, pour_id, map, gv, follow, fg) -> Water(em, pour_id, map, gv, if List.is_empty(follow) do Nil else Cons(o, Nil) end, fg)
     end
   end
   pfn water_of(s : Sound) : Water do match s do Sound(_, _, _, _, _, _, wa) -> wa end end
@@ -433,14 +458,14 @@ mod Strata.Sound do
     |> with_control(1, target_level(), 0.4, 1.2, false, 0.5)
   end
 
-  doc "Start a gust, flat (all round the listener). With [follow_openness] its strength follows how open the listener's space is, from each acoustics update: full under open sky, nothing shut in a cave. Without it, set its strength with `control(s, voice, 0, x)`. Answers the voice."
-  fn with_gust(s : Sound, follow_openness : Bool) : (Sound, Int) do
+  doc "Start a gust in [group], flat (all round the listener). With [follow_openness] its strength follows how open the listener's space is, from each acoustics update: full under open sky, nothing shut in a cave. Without it, set its strength with `control(s, voice, 0, x)`. Answers the voice."
+  fn with_gust(s : Sound, follow_openness : Bool, group : Int) : (Sound, Int) do
     match upload(s, gust()) do
       (s1, pid) ->
-        match play_flat(s1, pid, 1.0, 0.0, 1.0) do
+        match play_flat(s1, pid, group, 1.0, 0.0, 1.0) do
           (s2, gv) ->
             match water_of(s2) do
-              Water(em, pour_id, map, _, _) -> (with_water(s2, Water(em, pour_id, map, gv, if follow_openness do Cons(1.0, Nil) else Nil end)), gv)
+              Water(em, pour_id, map, _, _, fg) -> (with_water(s2, Water(em, pour_id, map, gv, if follow_openness do Cons(1.0, Nil) else Nil end, fg)), gv)
             end
         end
     end
@@ -456,19 +481,19 @@ mod Strata.Sound do
   pfn is_live(ls : List((Int, Float, Float, Float, Float, Float)), eid : Int) : Bool do List.any(ls, fn q -> match q do (e, _, _, _, _, _) -> e == eid end) end
 
   -- each live emitter's pour: started if new, else moved and retuned
-  pfn sound_emitters(s : Sound, ls : List((Int, Float, Float, Float, Float, Float)), pour_id : Int, map : List((Int, Int)), acc : List((Int, Int))) : (Sound, List((Int, Int))) do
+  pfn sound_emitters(s : Sound, ls : List((Int, Float, Float, Float, Float, Float)), pour_id : Int, fg : Int, map : List((Int, Int)), acc : List((Int, Int))) : (Sound, List((Int, Int))) do
     match ls do
       Nil -> (s, acc)
       Cons((eid, x, y, z, flow, h), t) ->
         let fv = unit(flow /. 400.0)
         let hv = unit(h /. 16.0)
         let v0 = voice_for(map, eid)
-        if v0 > 0 do sound_emitters(control(control(move(s, v0, x, y, z), v0, 0, fv), v0, 1, hv), t, pour_id, map, Cons((eid, v0), acc))
+        if v0 > 0 do sound_emitters(control(control(move(s, v0, x, y, z), v0, 0, fv), v0, 1, hv), t, pour_id, fg, map, Cons((eid, v0), acc))
         else
-          match play(s, pour_id, x, y, z, 0.5 +. 0.5 *. hv, 1.0, 1.0) do
+          match play(s, pour_id, fg, x, y, z, 0.5 +. 0.5 *. hv, 1.0, 1.0) do
             (s2, v) ->
-              if v == 0 do sound_emitters(s2, t, pour_id, map, acc)
-              else sound_emitters(control(control(with_range(s2, v, 4.0, 150.0), v, 0, fv), v, 1, hv), t, pour_id, map, Cons((eid, v), acc)) end
+              if v == 0 do sound_emitters(s2, t, pour_id, fg, map, acc)
+              else sound_emitters(control(control(with_range(s2, v, 4.0, 150.0), v, 0, fv), v, 1, hv), t, pour_id, fg, map, Cons((eid, v), acc)) end
           end
         end
     end
@@ -483,18 +508,18 @@ mod Strata.Sound do
   -- what the fluid and the wind do once a frame
   pfn water(s : Sound, w : Strata.World.World, fl : Strata.Fluid.Fluid, dt : Float) : Sound do
     match water_of(s) do
-      Water(em, pour_id0, map, gv, follow) ->
+      Water(em, pour_id0, map, gv, follow, fg) ->
         let em2 = Strata.Emitters.tick(Strata.Emitters.feed(em, Strata.Fluid.events(fl), Strata.Fluid.steps(fl), Strata.World.scale(w)), dt)
         let ls = Strata.Emitters.live(em2)
         let (s1, pour_id) = if pour_id0 == 0 && !List.is_empty(ls) do upload(s, pour()) else (s, pour_id0) end
         let s2 = stop_gone(s1, map, ls)
-        match sound_emitters(s2, ls, pour_id, map, Nil) do
+        match sound_emitters(s2, ls, pour_id, fg, map, Nil) do
           (s3, map2) ->
             let s4 = match follow do
               Cons(o, _) -> if gv > 0 do control(s3, gv, 0, o) else s3 end
               Nil -> s3
             end
-            with_water(s4, Water(em2, pour_id, map2, gv, follow))
+            with_water(s4, Water(em2, pour_id, map2, gv, follow, fg))
         end
     end
   end

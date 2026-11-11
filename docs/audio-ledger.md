@@ -103,3 +103,18 @@ After: Ruling: each of 512 virtual speakers takes the nearest measured direction
 After: Ruling: the equaliser holds its gain above 20 kHz (nothing measured at 44.1 kHz) and one overall gain measured on the finished, truncated filters sets a diffuse field to unity — truncation to 128 taps lost 2 dB — pink-weighted diffuse power is 0.65 dB low, inside the 1 dB test.
 After: Ruling: the binaural onset check uses a 1 kHz sine and samples 48-144 — 128-tap measurements carry little below about 100 Hz, so a square wave's flat top decays through them and the old 100 Hz square compared unlike things — none.
 After: measured: a source behind is 10.4 dB duller than one in front in the 4-8 kHz octave (model: 1-4 dB); fingerprints orbit-headphones and load64 re-stored; full gate PASS.
+# SDD ledger — plan: docs/2026-11-11-audio-levels-plan.md
+Spec: the owner's request in conversation and docs/2026-11-11-audio-design.md §8. Branch audio. Executed natively.
+Pre-flight: T1 SM_OP_MASTER=12 -> T2 op_master() 12: consistent.
+Task 1: Ruling: gated by mix_test and the audio goldens (all unchanged), the full gate deferred to the end of Task 2 — Task 1 changes only the mixer, whose default (level 1) is unity — a non-audio regression would surface one task late.
+Task 1: complete (commits 0c3179e..1ab5cfa, tests: sh -c 'cc -O1 -Inative -o native/tests/bin/mix_test native/tests/mix_test.c && native/tests/bin/mix_test 2>/dev/null' → mix_test: ok)
+Task 2: Ruling: the viewer keeps the main level in the spare bits of Cam's key-state field (tenths below full) rather than a new Cam field — Cam already has 19 fields and four construction sites — none.
+Task 2: Ruling: a level of 0.5 in the scripted carve run measured 18.1 dB below 1.0 (peak -48.4 against -30.3) — as the cube says (18.06) — none.
+Task 2: complete (commits 1ab5cfa..34e8f4c, tests: sh -c 'tail -1 /tmp/strata-verify-lv.log' → PASS)
+Final review: fresh reviewer (opus), with fixes; no Critical.
+Final: fixed "the viewer's 9 and 0 keys ignore STRATA_AUDIO_LEVEL" — viewer test "the key state starts at the level given at start" RED (no level_bits) then GREEN; the key state starts from the start level; viewer 12/12, full gate PASS.
+Final: minor (deferred): when all 1024 tracked slots are full, a voice in a group at level 0 ranks 0 and is the first evicted, so muted music can be lost to a crowd of quiet effects.
+Final: minor (deferred): SM_OP_GROUP has no upper clamp in C (March's level_gain keeps it at unity or below).
+Final: minor (deferred): several level calls in one frame send several records (harmless; the drag test makes one a frame).
+Final: minor (deferred): the viewer's header comment for STRATA_SOAK's continuation line sits below the new switches.
+Final: minor (deferred): a start level of 1 or more, or unreadable, is full and not printed; a negative one is silent.
