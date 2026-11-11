@@ -99,3 +99,13 @@ meshing tasks; handing it to a function 200 000 times a chunk on each of
 them is, it seems, a reference-count update on shared memory each time.
 Workaround: read what the faces need from the registry once per chunk into
 arrays the task owns, and pass those.
+
+## S16: `&&` can evaluate its right side when the left is false
+
+`k >= 0 && NativeArray.get_int(bs, k) != NativeArray.get_int(bs, i)`, the
+body of a small helper whose `k` came from another call, trapped with
+"index -1 out of bounds" when k was -1 (`Strata.Erosion`'s pass test,
+compiled under `forge test`). The same shape in a standalone test function
+short-circuits correctly, so it is likely an optimisation that inlines or
+flattens the helper. Workaround: `if k < 0 do false else ... end` wherever
+the right side would trap.

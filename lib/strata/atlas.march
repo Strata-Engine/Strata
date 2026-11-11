@@ -5,18 +5,22 @@
 -- sample (i, j) sits at x = (i - n / 2) * step, z = (j - n / 2) * step. Every
 -- layer is a flat array indexed i + n * j. This module builds the island
 -- (its mask, a warped fBm laid over a falloff from the centre) and the
--- regions (cellular noise quantised to region_count); water, receiver,
--- drainage and river width are present but hold their "none" values until
--- erosion and rivers fill them.
+-- regions (cellular noise quantised to region_count), and erodes the height
+-- between the two (Strata.Erosion, uplift scaled by the mask, talus angle
+-- from a rock-strength noise); water, receiver, drainage and river width are
+-- present but hold their "none" values until rivers fill them.
 --
--- Seeds: Strata.Seed.mix(seed, 101) the island's fBm, 102 the regions.
+-- Seeds: Strata.Seed.mix(seed, 101) the island's fBm, 102 the regions, 103
+-- the rock strength.
 mod Strata.Atlas do
+
+  needs IO.Spawn      -- erosion splits rows across worker tasks
 
   alias Strata.Noise as Nz
   alias Strata.Seed as Sd3
 
-  -- n, step (m), island radius (m), region size (m), region count, sea level (m)
-  type Def = Def(Int, Float, Float, Float, Int, Float)
+  -- n, step (m), island radius (m), region size (m), region count, sea level (m), erosion
+  type Def = Def(Int, Float, Float, Float, Int, Float, Strata.Erosion.Params)
 
   -- A place of interest: kind, x (m), z (m). Filled by a later task.
   type Site = Site(Int, Float, Float)
@@ -24,17 +28,23 @@ mod Strata.Atlas do
   -- def, height, region, water, receiver, drainage, river width, sites
   type Atlas = Atlas(Def, NativeF32Arr, NativeIntArr, NativeF32Arr, NativeIntArr, NativeF32Arr, NativeF32Arr, List(Site))
 
-  doc "A grid of n x n samples, step metres apart, centred on the origin: an island of the given radius, regions about region_size metres across (region_count ids), sea at sea metres."
+  doc "A grid of n x n samples, step metres apart, centred on the origin: an island of the given radius, regions about region_size metres across (region_count ids), sea at sea metres, eroded with Strata.Erosion.default_params()."
   fn def(n : Int, step : Float, island_radius : Float, region_size : Float, region_count : Int, sea : Float) : Def do
-    Def(n, step, island_radius, region_size, region_count, sea)
+    Def(n, step, island_radius, region_size, region_count, sea, Strata.Erosion.default_params())
   end
 
-  fn d_n(d : Def) : Int do match d do Def(v, _, _, _, _, _) -> v end end
-  fn d_step(d : Def) : Float do match d do Def(_, v, _, _, _, _) -> v end end
-  fn d_radius(d : Def) : Float do match d do Def(_, _, v, _, _, _) -> v end end
-  fn d_region_size(d : Def) : Float do match d do Def(_, _, _, v, _, _) -> v end end
-  fn d_region_count(d : Def) : Int do match d do Def(_, _, _, _, v, _) -> v end end
-  fn d_sea(d : Def) : Float do match d do Def(_, _, _, _, _, v) -> v end end
+  doc "The same Def eroded with p instead; p with 0 iterations leaves the island's height as the mask made it."
+  fn with_erosion(d : Def, p : Strata.Erosion.Params) : Def do
+    match d do Def(n, st, r, rz, rc, sea, _) -> Def(n, st, r, rz, rc, sea, p) end
+  end
+
+  fn d_n(d : Def) : Int do match d do Def(v, _, _, _, _, _, _) -> v end end
+  fn d_step(d : Def) : Float do match d do Def(_, v, _, _, _, _, _) -> v end end
+  fn d_radius(d : Def) : Float do match d do Def(_, _, v, _, _, _, _) -> v end end
+  fn d_region_size(d : Def) : Float do match d do Def(_, _, _, v, _, _, _) -> v end end
+  fn d_region_count(d : Def) : Int do match d do Def(_, _, _, _, v, _, _) -> v end end
+  fn d_sea(d : Def) : Float do match d do Def(_, _, _, _, _, v, _) -> v end end
+  fn d_erosion(d : Def) : Strata.Erosion.Params do match d do Def(_, _, _, _, _, _, v) -> v end end
 
   fn def_of(a : Atlas) : Def do match a do Atlas(d, _, _, _, _, _, _, _) -> d end end
   pfn heights(a : Atlas) : NativeF32Arr do match a do Atlas(_, v, _, _, _, _, _, _) -> v end end
@@ -50,6 +60,7 @@ mod Strata.Atlas do
 
   pfn salt_mask() : Int do 101 end
   pfn salt_region() : Int do 102 end
+  pfn salt_strength() : Int do 103 end
 
   -- ── Building ─────────────────────────────────────────────────────────────
   pfn clamp(v : Float, lo : Float, hi : Float) : Float do if v < lo do lo else if v > hi do hi else v end end end
@@ -59,16 +70,17 @@ mod Strata.Atlas do
   -- centre over the island radius. m is 0.25 at the shore (so the sea starts at
   -- the radius, whatever the noise: 0.3 e + 0.7 (1 - d) < 0.25 from d = 1.07 out),
   -- and the land rises 60 m a unit above it; the sea floor falls to sea - 20.
-  pfn shape_go(hs : NativeF32Arr, d : Def, i : Int) : NativeF32Arr do
+  -- ms gets the mask, clamped to [0, 1].
+  pfn shape_go(hs : NativeF32Arr, ms : NativeF32Arr, d : Def, i : Int) : (NativeF32Arr, NativeF32Arr) do
     let n = d_n(d)
-    if i >= n * n do hs
+    if i >= n * n do (hs, ms)
     else
       let x = int_to_float(i % n - n / 2) *. d_step(d)
       let z = int_to_float(i / n - n / 2) *. d_step(d)
       let dist = Math.sqrt(x *. x +. z *. z) /. d_radius(d)
       let e = 0.5 +. 0.5 *. NativeArray.get_f32(hs, i)
       let m = e *. 0.3 +. (1.0 -. dist) *. 0.7
-      shape_go(NativeArray.set_f32(hs, i, d_sea(d) +. clamp(60.0 *. (m -. 0.25), 0.0 -. 20.0, 60.0)), d, i + 1)
+      shape_go(NativeArray.set_f32(hs, i, d_sea(d) +. clamp(60.0 *. (m -. 0.25), 0.0 -. 20.0, 60.0)), NativeArray.set_f32(ms, i, clamp(m, 0.0, 1.0)), d, i + 1)
     end
   end
 
@@ -83,7 +95,37 @@ mod Strata.Atlas do
     end
   end
 
-  doc "Build the atlas for a seed: the island mask and the regions; erosion, rivers and sites come later."
+  -- v in [-1, 1] to [0, 1]
+  pfn unit_go(arr : NativeF32Arr, i : Int, cnt : Int) : NativeF32Arr do
+    if i >= cnt do arr else unit_go(NativeArray.set_f32(arr, i, clamp(0.5 +. 0.5 *. NativeArray.get_f32(arr, i), 0.0, 1.0)), i + 1, cnt) end
+  end
+
+  pfn shift_go(arr : NativeF32Arr, by_m : Float, i : Int, cnt : Int) : NativeF32Arr do
+    if i >= cnt do arr else shift_go(NativeArray.set_f32(arr, i, NativeArray.get_f32(arr, i) +. by_m), by_m, i + 1, cnt) end
+  end
+
+  pfn workers() : Int do
+    let c = System.cpu_count()
+    if c < 1 do 1 else if c > 8 do 8 else c end end
+  end
+
+  -- erosion works in metres above the sea; rock strength is 3-octave fBm at 4 / radius
+  pfn erode(d : Def, seed : Int, hs : NativeF32Arr, ms : NativeF32Arr) : NativeF32Arr do
+    let p = d_erosion(d)
+    if Strata.Erosion.p_iterations(p) <= 0 do hs
+    else
+      let n = d_n(d)
+      let cnt = n * n
+      let x0 = int_to_float(0 - n / 2) *. d_step(d)
+      let ss = NativeArray.make_f32(cnt, 0.0)
+      let k = Nz.field2(Nz.settings(0, 3, 2.0, 0.5, 1, 0.0), Sd3.mix(seed, salt_strength()), 4.0 /. d_radius(d), x0, x0, d_step(d), n, n, ss)
+      let rel = shift_go(hs, 0.0 -. d_sea(d), 0, cnt)
+      let out = Strata.Erosion.run(p, n, d_step(d), rel, ms, unit_go(ss, 0, cnt), workers())
+      shift_go(out, d_sea(d), 0, cnt)
+    end
+  end
+
+  doc "Build the atlas for a seed: the island mask, erosion, then the regions; rivers and sites come later."
   fn build(d : Def, seed : Int) : Atlas do
     let n = d_n(d)
     let cnt = n * n
@@ -91,7 +133,7 @@ mod Strata.Atlas do
     let r = d_radius(d)
     let hs = NativeArray.make_f32(cnt, 0.0)
     let k = Nz.field2(Nz.settings(0, 4, 2.0, 0.5, 1, 0.3 *. r), Sd3.mix(seed, salt_mask()), 2.0 /. r, x0, x0, d_step(d), n, n, hs)
-    let hs2 = shape_go(hs, d, 0)
+    let hs2 = match shape_go(hs, NativeArray.make_f32(cnt, 0.0), d, 0) do (h1, ms) -> erode(d, seed, h1, ms) end
     let cells = NativeArray.make_f32(cnt, 0.0)
     let rz = d_region_size(d)
     let k2 = Nz.field2(Nz.settings(2, 1, 2.0, 0.5, 0, 0.25 *. rz), Sd3.mix(seed, salt_region()), 1.0 /. rz, x0, x0, d_step(d), n, n, cells)
@@ -178,7 +220,9 @@ mod Strata.Atlas do
     let d = def_of(a)
     let cnt = n(a) * n(a)
     let h0 = fold(fold(fold(fold(fold(fold(7, d_n(d)), q(d_step(d))), q(d_radius(d))), q(d_region_size(d))), d_region_count(d)), q(d_sea(d)))
-    let h1 = hash_f(heights(a), 0, cnt, h0)
+    let p = d_erosion(d)
+    let hp = fold(fold(fold(fold(fold(fold(fold(fold(h0, Strata.Erosion.p_iterations(p)), q(Strata.Erosion.p_dt(p))), q(Strata.Erosion.p_k(p) *. 1000000000.0)), q(Strata.Erosion.p_m(p))), q(Strata.Erosion.p_n_exp(p))), q(Strata.Erosion.p_uplift(p) *. 1000000.0)), q(Strata.Erosion.p_talus_lo(p))), q(Strata.Erosion.p_talus_hi(p)))
+    let h1 = hash_f(heights(a), 0, cnt, hp)
     let h2 = hash_i(regions(a), 0, cnt, h1)
     let h3 = hash_f(waters(a), 0, cnt, h2)
     let h4 = hash_i(receivers(a), 0, cnt, h3)

@@ -1,0 +1,493 @@
+-- Erosion — stream-power erosion with lake nodes, after Cordonnier et al.
+-- 2016 as Veloren implements it, on an n x n grid of heights `step` metres
+-- apart, index i + n * j. Heights are metres above the sea: a sample at or
+-- below 0 is sea.
+--
+-- Each iteration:
+--   1. Receivers: every sample flows to the lowest of its 8 neighbours when
+--      that one is lower. Outlets (the grid's edge and the sea) and pits
+--      have none.
+--   2. Lakes: every sample belongs to the basin of the root it drains to.
+--      All outlet basins are one; every pit's basin is a lake. Candidate
+--      passes (a pair of neighbours in two basins, at the higher of the
+--      two heights) are sorted, and union-find over basins keeps the
+--      lowest pass joining each new pair (Kruskal): a tree of basins rooted
+--      at the outlets, in O(n + m log m). Walking it from the outlets, each
+--      pit's receiver becomes the sample across its basin's pass.
+--   3. Drainage: step * step a sample, summed down the receiver tree.
+--   4. The implicit stream-power update, outlets first, so a receiver is
+--      always updated before the samples that flow into it:
+--        h' = (h + dt U + dt k A^m h_rcv / d) / (1 + dt k A^m / d)
+--      with U = uplift * mask * mask (so it fades to nothing at the shore) and d the distance to the receiver. A sample
+--      whose receiver stands at or above h + dt U (a lake's pit) only
+--      rises by dt U. Outlets keep their height. The solver is n = 1;
+--      `n_exp` is carried for the record.
+--   5. Thermal: a sample steeper than its talus angle (lerp(talus_lo,
+--      talus_hi, strength) degrees) to its lowest neighbour gives that
+--      neighbour half the excess height. Every move is worked out from the
+--      heights before the pass, then applied, so the pass does not depend
+--      on order. A move never raises a sample above its height before
+--      erosion plus the uplift so far, nor a sea sample above the sea: it
+--      is at most an eighth of that room (a sample has at most eight
+--      givers).
+--
+-- Steps 1 and 5 split rows across `workers` tasks, each filling its own
+-- array for its rows, folded by the caller; steps 2 to 4 run on one. The
+-- result is the same for any worker count.
+mod Strata.Erosion do
+
+  needs IO.Spawn      -- rows are split across worker tasks
+
+  -- iterations, dt (years), k, m, n, uplift (m a year), talus angle low and high (degrees)
+  type Params = Params(Int, Float, Float, Float, Float, Float, Float, Float)
+
+  doc "Erosion settings: iterations, the time step dt (years), the erodibility k, the area exponent m, the slope exponent n, uplift (metres a year at mask 1) and the talus angle in degrees at strength 0 and 1."
+  fn params(iterations : Int, dt : Float, k : Float, m : Float, n_exp : Float, uplift : Float, talus_lo : Float, talus_hi : Float) : Params do
+    Params(iterations, dt, k, m, n_exp, uplift, talus_lo, talus_hi)
+  end
+
+  -- Cordonnier's 0.0005 m a year assumes kilometre-scale cells: at 4 m cells it
+  -- raises the ground 125 m an iteration (an island 5 km high after 50).
+  -- 0.000005 is 1.25 m an iteration, about the island's relief over the run.
+  doc "Cordonnier's settings at the atlas's scale: 50 iterations of 250 000 years, k 5.61e-7, m 0.4, n 1, talus 15 to 60 degrees, and uplift 5e-6 m a year (his 5e-4 is for kilometre-scale cells)."
+  fn default_params() : Params do params(50, 250000.0, 0.000000561, 0.4, 1.0, 0.000005, 15.0, 60.0) end
+
+  fn p_iterations(p : Params) : Int do match p do Params(v, _, _, _, _, _, _, _) -> v end end
+  fn p_dt(p : Params) : Float do match p do Params(_, v, _, _, _, _, _, _) -> v end end
+  fn p_k(p : Params) : Float do match p do Params(_, _, v, _, _, _, _, _) -> v end end
+  fn p_m(p : Params) : Float do match p do Params(_, _, _, v, _, _, _, _) -> v end end
+  fn p_n_exp(p : Params) : Float do match p do Params(_, _, _, _, v, _, _, _) -> v end end
+  fn p_uplift(p : Params) : Float do match p do Params(_, _, _, _, _, v, _, _) -> v end end
+  fn p_talus_lo(p : Params) : Float do match p do Params(_, _, _, _, _, _, v, _) -> v end end
+  fn p_talus_hi(p : Params) : Float do match p do Params(_, _, _, _, _, _, _, v) -> v end end
+
+  -- ── The grid ─────────────────────────────────────────────────────────────
+  -- the 8 neighbours: +x, -x, +z, -z, then the diagonals
+  pfn ox(d : Int) : Int do if d == 0 || d == 4 || d == 6 do 1 else if d == 1 || d == 5 || d == 7 do 0 - 1 else 0 end end end
+  pfn oz(d : Int) : Int do if d == 2 || d == 4 || d == 5 do 1 else if d == 3 || d == 6 || d == 7 do 0 - 1 else 0 end end end
+
+  pfn on_edge(n : Int, i : Int) : Bool do
+    let x = i % n
+    let z = i / n
+    x == 0 || z == 0 || x == n - 1 || z == n - 1
+  end
+
+  pfn outlet(n : Int, h : NativeF32Arr, i : Int) : Bool do on_edge(n, i) || NativeArray.get_f32(h, i) <= 0.0 end
+
+  pfn dist(n : Int, step : Float, a : Int, b : Int) : Float do
+    let dx = int_to_float(a % n - b % n)
+    let dz = int_to_float(a / n - b / n)
+    Math.sqrt(dx *. dx +. dz *. dz) *. step
+  end
+
+  -- the lowest neighbour of interior sample i strictly below bh, or best
+  pfn lowest_go(h : NativeF32Arr, n : Int, i : Int, d : Int, best : Int, bh : Float) : Int do
+    if d >= 8 do best
+    else
+      let k = i + ox(d) + n * oz(d)
+      let v = NativeArray.get_f32(h, k)
+      if v < bh do lowest_go(h, n, i, d + 1, k, v) else lowest_go(h, n, i, d + 1, best, bh) end
+    end
+  end
+
+  pfn receiver_of(h : NativeF32Arr, n : Int, i : Int, sea_out : Bool) : Int do
+    if on_edge(n, i) do 0 - 1
+    else if sea_out && NativeArray.get_f32(h, i) <= 0.0 do 0 - 1
+    else lowest_go(h, n, i, 0, 0 - 1, NativeArray.get_f32(h, i)) end end
+  end
+
+  pfn rcv_go(h : NativeF32Arr, n : Int, base : Int, stop : Int, i : Int, sea_out : Bool, out : NativeIntArr) : NativeIntArr do
+    if i >= stop do out else rcv_go(h, n, base, stop, i + 1, sea_out, NativeArray.set_int(out, i - base, receiver_of(h, n, i, sea_out))) end
+  end
+
+  pfn rcv_rows(h : NativeF32Arr, n : Int, r0 : Int, r1 : Int, sea_out : Bool) : NativeIntArr do
+    rcv_go(h, n, r0 * n, r1 * n, r0 * n, sea_out, NativeArray.make_int((r1 - r0) * n, 0 - 1))
+  end
+
+  -- ── Rows across workers ──────────────────────────────────────────────────
+  pfn band(n : Int, w : Int, b : Int) : Int do (n * b) / w end
+
+  pfn put_int_go(dst : NativeIntArr, src : NativeIntArr, at : Int, i : Int, cnt : Int) : NativeIntArr do
+    if i >= cnt do dst else put_int_go(NativeArray.set_int(dst, at + i, NativeArray.get_int(src, i)), src, at, i + 1, cnt) end
+  end
+  pfn put_f32_go(dst : NativeF32Arr, src : NativeF32Arr, at : Int, i : Int, cnt : Int) : NativeF32Arr do
+    if i >= cnt do dst else put_f32_go(NativeArray.set_f32(dst, at + i, NativeArray.get_f32(src, i)), src, at, i + 1, cnt) end
+  end
+
+  pfn spawn_int(f : Int -> Int -> NativeIntArr, n : Int, w : Int, b : Int, acc : List(Task(NativeIntArr))) : List(Task(NativeIntArr)) do
+    if b < 0 do acc
+    else
+      let r0 = band(n, w, b)
+      let r1 = band(n, w, b + 1)
+      spawn_int(f, n, w, b - 1, Cons(task_spawn(fn _ -> f(r0, r1)), acc))
+    end
+  end
+  pfn spawn_f32(f : Int -> Int -> NativeF32Arr, n : Int, w : Int, b : Int, acc : List(Task(NativeF32Arr))) : List(Task(NativeF32Arr)) do
+    if b < 0 do acc
+    else
+      let r0 = band(n, w, b)
+      let r1 = band(n, w, b + 1)
+      spawn_f32(f, n, w, b - 1, Cons(task_spawn(fn _ -> f(r0, r1)), acc))
+    end
+  end
+
+  pfn fold_int(ts : List(Task(NativeIntArr)), n : Int, w : Int, b : Int, out : NativeIntArr) : NativeIntArr do
+    match ts do
+      Nil -> out
+      Cons(t, rest) ->
+        let at = band(n, w, b) * n
+        let cnt = (band(n, w, b + 1) - band(n, w, b)) * n
+        match task_await(t) do
+          Ok(part) -> fold_int(rest, n, w, b + 1, put_int_go(out, part, at, 0, cnt))
+          Err(_) -> fold_int(rest, n, w, b + 1, out)
+        end
+    end
+  end
+  pfn fold_f32(ts : List(Task(NativeF32Arr)), n : Int, w : Int, b : Int, out : NativeF32Arr) : NativeF32Arr do
+    match ts do
+      Nil -> out
+      Cons(t, rest) ->
+        let at = band(n, w, b) * n
+        let cnt = (band(n, w, b + 1) - band(n, w, b)) * n
+        match task_await(t) do
+          Ok(part) -> fold_f32(rest, n, w, b + 1, put_f32_go(out, part, at, 0, cnt))
+          Err(_) -> fold_f32(rest, n, w, b + 1, out)
+        end
+    end
+  end
+
+  -- f(r0, r1) fills rows r0 until r1; run over all n rows on w workers
+  pfn rows_int(n : Int, w : Int, f : Int -> Int -> NativeIntArr) : NativeIntArr do
+    if w <= 1 do f(0, n) else fold_int(spawn_int(f, n, w, w - 1, Nil), n, w, 0, NativeArray.make_int(n * n, 0)) end
+  end
+  pfn rows_f32(n : Int, w : Int, f : Int -> Int -> NativeF32Arr) : NativeF32Arr do
+    if w <= 1 do f(0, n) else fold_f32(spawn_f32(f, n, w, w - 1, Nil), n, w, 0, NativeArray.make_f32(n * n, 0.0)) end
+  end
+
+  doc "Each sample's receiver: the index of the lowest of its 8 neighbours when that is lower than the sample, else -1 (a pit, or the grid's edge)."
+  fn receivers(n : Int, step : Float, height : NativeF32Arr) : NativeIntArr do rcv_rows(height, n, 0, n, false) end
+
+  -- ── The receiver tree ────────────────────────────────────────────────────
+  -- children of each sample as offsets into one array (counts, then starts)
+  pfn count_go(rcv : NativeIntArr, i : Int, cnt : Int, c : NativeIntArr) : NativeIntArr do
+    if i >= cnt do c
+    else
+      let r = NativeArray.get_int(rcv, i)
+      count_go(rcv, i + 1, cnt, if r >= 0 do NativeArray.set_int(c, r + 1, NativeArray.get_int(c, r + 1) + 1) else c end)
+    end
+  end
+  pfn prefix_go(c : NativeIntArr, i : Int, len : Int) : NativeIntArr do
+    if i >= len do c else prefix_go(NativeArray.set_int(c, i, NativeArray.get_int(c, i) + NativeArray.get_int(c, i - 1)), i + 1, len) end
+  end
+  -- place each child at its parent's cursor (cur starts as a copy of the starts)
+  pfn place_go(rcv : NativeIntArr, i : Int, cnt : Int, cur : NativeIntArr, kids : NativeIntArr) : (NativeIntArr, NativeIntArr) do
+    if i >= cnt do (cur, kids)
+    else
+      let r = NativeArray.get_int(rcv, i)
+      if r < 0 do place_go(rcv, i + 1, cnt, cur, kids)
+      else
+        let at = NativeArray.get_int(cur, r)
+        place_go(rcv, i + 1, cnt, NativeArray.set_int(cur, r, at + 1), NativeArray.set_int(kids, at, i))
+      end
+    end
+  end
+  pfn copy_int_go(src : NativeIntArr, i : Int, cnt : Int, dst : NativeIntArr) : NativeIntArr do
+    if i >= cnt do dst else copy_int_go(src, i + 1, cnt, NativeArray.set_int(dst, i, NativeArray.get_int(src, i))) end
+  end
+
+  -- roots (receiver -1) in index order, then breadth first: every sample after its receiver
+  pfn roots_go(rcv : NativeIntArr, i : Int, cnt : Int, ord : NativeIntArr, len : Int) : (NativeIntArr, Int) do
+    if i >= cnt do (ord, len)
+    else if NativeArray.get_int(rcv, i) < 0 do roots_go(rcv, i + 1, cnt, NativeArray.set_int(ord, len, i), len + 1)
+    else roots_go(rcv, i + 1, cnt, ord, len) end end
+  end
+  pfn push_kids(starts : NativeIntArr, kids : NativeIntArr, at : Int, stop : Int, ord : NativeIntArr, len : Int) : (NativeIntArr, Int) do
+    if at >= stop do (ord, len) else push_kids(starts, kids, at + 1, stop, NativeArray.set_int(ord, len, NativeArray.get_int(kids, at)), len + 1) end
+  end
+  pfn bfs_go(starts : NativeIntArr, kids : NativeIntArr, head : Int, ord : NativeIntArr, len : Int) : (NativeIntArr, Int) do
+    if head >= len do (ord, len)
+    else
+      let v = NativeArray.get_int(ord, head)
+      match push_kids(starts, kids, NativeArray.get_int(starts, v), NativeArray.get_int(starts, v + 1), ord, len) do
+        (o2, l2) -> bfs_go(starts, kids, head + 1, o2, l2)
+      end
+    end
+  end
+
+  -- every sample once, each after its receiver (a sample on a cycle is left out: there are none)
+  pfn order(n : Int, rcv : NativeIntArr) : NativeIntArr do
+    let cnt = n * n
+    let starts = prefix_go(count_go(rcv, 0, cnt, NativeArray.make_int(cnt + 1, 0)), 1, cnt + 1)
+    match place_go(rcv, 0, cnt, copy_int_go(starts, 0, cnt + 1, NativeArray.make_int(cnt + 1, 0)), NativeArray.make_int(cnt, 0)) do
+      (_, kids) ->
+        match roots_go(rcv, 0, cnt, NativeArray.make_int(cnt, 0 - 1), 0) do
+          (o, l) -> match bfs_go(starts, kids, 0, o, l) do (o2, _) -> o2 end
+        end
+    end
+  end
+
+  -- ── Lakes ────────────────────────────────────────────────────────────────
+  -- the basin of every sample: its root, or cnt for every outlet's basin
+  pfn basin_go(n : Int, h : NativeF32Arr, rcv : NativeIntArr, ord : NativeIntArr, t : Int, cnt : Int, bs : NativeIntArr) : NativeIntArr do
+    if t >= cnt do bs
+    else
+      let i = NativeArray.get_int(ord, t)
+      let r = NativeArray.get_int(rcv, i)
+      let b = if r >= 0 do NativeArray.get_int(bs, r) else if outlet(n, h, i) do cnt else i end end
+      basin_go(n, h, rcv, ord, t + 1, cnt, NativeArray.set_int(bs, i, b))
+    end
+  end
+
+  -- the four forward neighbours of a pass: +x, +z, +x+z, -x+z
+  pfn fwd(n : Int, i : Int, s : Int) : Int do
+    let x = i % n
+    let z = i / n
+    if s == 0 do (if x + 1 < n do i + 1 else 0 - 1 end)
+    else if z + 1 >= n do 0 - 1
+    else if s == 1 do i + n
+    else if s == 2 do (if x + 1 < n do i + n + 1 else 0 - 1 end)
+    else if x > 0 do i + n - 1 else 0 - 1 end end end end end
+  end
+
+  pfn crosses(n : Int, bs : NativeIntArr, i : Int, s : Int) : Bool do
+    let k = fwd(n, i, s)
+    if k < 0 do false else NativeArray.get_int(bs, k) != NativeArray.get_int(bs, i) end   -- not `&&`: GAPS S16
+  end
+
+  pfn pass_count_go(n : Int, bs : NativeIntArr, e : Int, stop : Int, c : Int) : Int do
+    if e >= stop do c else pass_count_go(n, bs, e + 1, stop, if crosses(n, bs, e / 4, e % 4) do c + 1 else c end) end
+  end
+
+  -- a pass as one sortable key: its height in 1/256 m above -65536 m, then the pass's number
+  pfn pass_key(h : NativeF32Arr, n : Int, e : Int) : Int do
+    let a = NativeArray.get_f32(h, e / 4)
+    let b = NativeArray.get_f32(h, fwd(n, e / 4, e % 4))
+    let top = if a > b do a else b end
+    let q = float_to_int(Math.floor((top +. 65536.0) *. 256.0))
+    (if q < 0 do 0 else q end) * 8388608 + e
+  end
+
+  pfn pass_fill_go(n : Int, h : NativeF32Arr, bs : NativeIntArr, e : Int, stop : Int, at : Int, keys : NativeIntArr) : NativeIntArr do
+    if e >= stop do keys
+    else if crosses(n, bs, e / 4, e % 4) do pass_fill_go(n, h, bs, e + 1, stop, at + 1, NativeArray.set_int(keys, at, pass_key(h, n, e)))
+    else pass_fill_go(n, h, bs, e + 1, stop, at, keys) end end
+  end
+
+  pfn find(uf : NativeIntArr, a : Int) : Int do
+    let p = NativeArray.get_int(uf, a)
+    if p == a do a else find(uf, p) end
+  end
+
+  -- Kruskal over the sorted passes: the lowest pass joining two groups of
+  -- basins is a tree edge, kept as its pass number
+  pfn kruskal_go(n : Int, bs : NativeIntArr, keys : NativeIntArr, t : Int, m : Int, uf : NativeIntArr, size : NativeIntArr, tree : NativeIntArr, got : Int) : (NativeIntArr, Int) do
+    if t >= m do (tree, got)
+    else
+      let e = NativeArray.get_int(keys, t) % 8388608
+      let ra = find(uf, NativeArray.get_int(bs, e / 4))
+      let rb = find(uf, NativeArray.get_int(bs, fwd(n, e / 4, e % 4)))
+      if ra == rb do kruskal_go(n, bs, keys, t + 1, m, uf, size, tree, got)
+      else
+        let sa = NativeArray.get_int(size, ra)
+        let sb = NativeArray.get_int(size, rb)
+        let big = if sa >= sb do ra else rb end
+        let small = if sa >= sb do rb else ra end
+        kruskal_go(n, bs, keys, t + 1, m, NativeArray.set_int(uf, small, big), NativeArray.set_int(size, big, sa + sb), NativeArray.set_int(tree, got, e), got + 1)
+      end
+    end
+  end
+
+  pfn ident_go(uf : NativeIntArr, i : Int, len : Int) : NativeIntArr do
+    if i >= len do uf else ident_go(NativeArray.set_int(uf, i, i), i + 1, len) end
+  end
+
+  -- the tree edges by basin: each edge listed under both of its basins
+  pfn edge_count_go(n : Int, bs : NativeIntArr, tree : NativeIntArr, t : Int, m : Int, c : NativeIntArr) : NativeIntArr do
+    if t >= m do c
+    else
+      let e = NativeArray.get_int(tree, t)
+      let a = NativeArray.get_int(bs, e / 4)
+      let b = NativeArray.get_int(bs, fwd(n, e / 4, e % 4))
+      let c1 = NativeArray.set_int(c, a + 1, NativeArray.get_int(c, a + 1) + 1)
+      edge_count_go(n, bs, tree, t + 1, m, NativeArray.set_int(c1, b + 1, NativeArray.get_int(c1, b + 1) + 1))
+    end
+  end
+  pfn edge_place_go(n : Int, bs : NativeIntArr, tree : NativeIntArr, t : Int, m : Int, cur : NativeIntArr, adj : NativeIntArr) : NativeIntArr do
+    if t >= m do adj
+    else
+      let e = NativeArray.get_int(tree, t)
+      let a = NativeArray.get_int(bs, e / 4)
+      let b = NativeArray.get_int(bs, fwd(n, e / 4, e % 4))
+      let at = NativeArray.get_int(cur, a)
+      let cur1 = NativeArray.set_int(cur, a, at + 1)
+      let adj1 = NativeArray.set_int(adj, at, e)
+      let bt = NativeArray.get_int(cur1, b)
+      edge_place_go(n, bs, tree, t + 1, m, NativeArray.set_int(cur1, b, bt + 1), NativeArray.set_int(adj1, bt, e))
+    end
+  end
+
+  -- From basin u, each tree edge to a basin not yet reached: that basin's
+  -- pit now drains across the pass to the pass's sample on u's side.
+  pfn visit_go(n : Int, bs : NativeIntArr, adj : NativeIntArr, u : Int, at : Int, stop : Int, seen : NativeIntArr, q : NativeIntArr, len : Int, rcv : NativeIntArr) : (NativeIntArr, NativeIntArr, Int, NativeIntArr) do
+    if at >= stop do (seen, q, len, rcv)
+    else
+      let e = NativeArray.get_int(adj, at)
+      let i = e / 4
+      let k = fwd(n, i, e % 4)
+      let u_side = if NativeArray.get_int(bs, i) == u do i else k end
+      let v = if NativeArray.get_int(bs, i) == u do NativeArray.get_int(bs, k) else NativeArray.get_int(bs, i) end
+      if NativeArray.get_int(seen, v) == 1 do visit_go(n, bs, adj, u, at + 1, stop, seen, q, len, rcv)
+      else visit_go(n, bs, adj, u, at + 1, stop, NativeArray.set_int(seen, v, 1), NativeArray.set_int(q, len, v), len + 1, NativeArray.set_int(rcv, v, u_side)) end
+    end
+  end
+  pfn walk_go(n : Int, bs : NativeIntArr, starts : NativeIntArr, adj : NativeIntArr, head : Int, seen : NativeIntArr, q : NativeIntArr, len : Int, rcv : NativeIntArr) : NativeIntArr do
+    if head >= len do rcv
+    else
+      let u = NativeArray.get_int(q, head)
+      match visit_go(n, bs, adj, u, NativeArray.get_int(starts, u), NativeArray.get_int(starts, u + 1), seen, q, len, rcv) do
+        (s2, q2, l2, r2) -> walk_go(n, bs, starts, adj, head + 1, s2, q2, l2, r2)
+      end
+    end
+  end
+
+  -- receivers with every pit routed over its lake's lowest pass
+  pfn route(n : Int, h : NativeF32Arr, rcv : NativeIntArr) : NativeIntArr do
+    let cnt = n * n
+    let bs = basin_go(n, h, rcv, order(n, rcv), 0, cnt, NativeArray.make_int(cnt, 0))
+    let m = pass_count_go(n, bs, 0, 4 * cnt, 0)
+    if m == 0 do rcv
+    else
+      let keys = NativeArray.sort_int(pass_fill_go(n, h, bs, 0, 4 * cnt, 0, NativeArray.make_int(m, 0)))
+      let uf = ident_go(NativeArray.make_int(cnt + 1, 0), 0, cnt + 1)
+      match kruskal_go(n, bs, keys, 0, m, uf, NativeArray.make_int(cnt + 1, 1), NativeArray.make_int(m, 0), 0) do
+        (tree, got) ->
+          let starts = prefix_go(edge_count_go(n, bs, tree, 0, got, NativeArray.make_int(cnt + 2, 0)), 1, cnt + 2)
+          let adj = edge_place_go(n, bs, tree, 0, got, copy_int_go(starts, 0, cnt + 2, NativeArray.make_int(cnt + 2, 0)), NativeArray.make_int(2 * got + 1, 0))
+          let seen = NativeArray.set_int(NativeArray.make_int(cnt + 1, 0), cnt, 1)
+          walk_go(n, bs, starts, adj, 0, seen, NativeArray.set_int(NativeArray.make_int(cnt + 1, 0), 0, cnt), 1, rcv)
+      end
+    end
+  end
+
+  doc "The receivers erosion uses: as `receivers`, but the sea (height at or below 0) is an outlet too, and every pit drains over its basin's lowest pass to the sample across it, so following receivers from anywhere reaches the edge or the sea."
+  fn lake_receivers(n : Int, step : Float, height : NativeF32Arr) : NativeIntArr do route(n, height, rcv_rows(height, n, 0, n, true)) end
+
+  -- ── Drainage and the implicit update ─────────────────────────────────────
+  pfn area_go(rcv : NativeIntArr, ord : NativeIntArr, t : Int, a : NativeFloatArr) : NativeFloatArr do
+    if t < 0 do a
+    else
+      let i = NativeArray.get_int(ord, t)
+      let r = NativeArray.get_int(rcv, i)
+      area_go(rcv, ord, t - 1, if r >= 0 do NativeArray.set_float(a, r, NativeArray.get_float(a, r) +. NativeArray.get_float(a, i)) else a end)
+    end
+  end
+
+  pfn implicit_go(p : Params, n : Int, step : Float, mask : NativeF32Arr, rcv : NativeIntArr, ord : NativeIntArr, area : NativeFloatArr, t : Int, cnt : Int, h : NativeF32Arr) : NativeF32Arr do
+    if t >= cnt do h
+    else
+      let i = NativeArray.get_int(ord, t)
+      let r = NativeArray.get_int(rcv, i)
+      if r < 0 do implicit_go(p, n, step, mask, rcv, ord, area, t + 1, cnt, h)
+      else
+        let mi = NativeArray.get_f32(mask, i)
+        let hu = NativeArray.get_f32(h, i) +. p_dt(p) *. p_uplift(p) *. mi *. mi
+        let hr = NativeArray.get_f32(h, r)
+        let v = if hr >= hu do hu
+          else
+            let f = p_dt(p) *. p_k(p) *. Math.pow(NativeArray.get_float(area, i), p_m(p)) /. dist(n, step, i, r)
+            (hu +. f *. hr) /. (1.0 +. f)
+          end
+        implicit_go(p, n, step, mask, rcv, ord, area, t + 1, cnt, NativeArray.set_f32(h, i, v))
+      end
+    end
+  end
+
+  -- ── Thermal ──────────────────────────────────────────────────────────────
+  -- the most sample i may be raised to: its height before erosion plus the
+  -- uplift so far, and no higher than the sea while it is sea
+  pfn room(h : NativeF32Arr, h0 : NativeF32Arr, mask : NativeF32Arr, up : Float, i : Int) : Float do
+    let hi = NativeArray.get_f32(h, i)
+    let mi = NativeArray.get_f32(mask, i)
+    let c = NativeArray.get_f32(h0, i) +. up *. mi *. mi
+    let cap = if hi <= 0.0 && c > 0.0 do 0.0 else c end
+    if cap > hi do cap -. hi else 0.0 end
+  end
+
+  -- what interior sample i gives its lowest neighbour (0 for none)
+  pfn give(p : Params, n : Int, step : Float, h : NativeF32Arr, h0 : NativeF32Arr, mask : NativeF32Arr, strength : NativeF32Arr, up : Float, i : Int, k : Int) : Float do
+    if k < 0 do 0.0
+    else
+      let d = dist(n, step, i, k)
+      let s = NativeArray.get_f32(strength, i)
+      let deg = p_talus_lo(p) +. (p_talus_hi(p) -. p_talus_lo(p)) *. s
+      let limit = Math.tan(deg *. 3.14159265358979 /. 180.0) *. d
+      let drop = NativeArray.get_f32(h, i) -. NativeArray.get_f32(h, k)
+      if drop <= limit do 0.0
+      else
+        let half = (drop -. limit) *. 0.5
+        let most = room(h, h0, mask, up, k) *. 0.125
+        if half < most do half else most end
+      end
+    end
+  end
+
+  pfn target(h : NativeF32Arr, n : Int, i : Int) : Int do
+    if on_edge(n, i) do 0 - 1 else lowest_go(h, n, i, 0, 0 - 1, NativeArray.get_f32(h, i)) end
+  end
+
+  -- sample i after the pass: less what it gives, plus what its neighbours give it
+  pfn gets_go(p : Params, n : Int, step : Float, h : NativeF32Arr, h0 : NativeF32Arr, mask : NativeF32Arr, strength : NativeF32Arr, up : Float, i : Int, d : Int, acc : Float) : Float do
+    if d >= 8 do acc
+    else
+      let x = i % n + ox(d)
+      let z = i / n + oz(d)
+      if x < 0 || z < 0 || x >= n || z >= n do gets_go(p, n, step, h, h0, mask, strength, up, i, d + 1, acc)
+      else
+        let j = x + n * z
+        let tj = target(h, n, j)
+        let add = if tj == i do give(p, n, step, h, h0, mask, strength, up, j, tj) else 0.0 end
+        gets_go(p, n, step, h, h0, mask, strength, up, i, d + 1, acc +. add)
+      end
+    end
+  end
+
+  pfn thermal_go(p : Params, n : Int, step : Float, h : NativeF32Arr, h0 : NativeF32Arr, mask : NativeF32Arr, strength : NativeF32Arr, up : Float, base : Int, stop : Int, i : Int, out : NativeF32Arr) : NativeF32Arr do
+    if i >= stop do out
+    else
+      let own = NativeArray.get_f32(h, i) -. give(p, n, step, h, h0, mask, strength, up, i, target(h, n, i))
+      let v = gets_go(p, n, step, h, h0, mask, strength, up, i, 0, own)
+      thermal_go(p, n, step, h, h0, mask, strength, up, base, stop, i + 1, NativeArray.set_f32(out, i - base, v))
+    end
+  end
+
+  pfn thermal_rows(p : Params, n : Int, step : Float, h : NativeF32Arr, h0 : NativeF32Arr, mask : NativeF32Arr, strength : NativeF32Arr, up : Float, r0 : Int, r1 : Int) : NativeF32Arr do
+    thermal_go(p, n, step, h, h0, mask, strength, up, r0 * n, r1 * n, r0 * n, NativeArray.make_f32((r1 - r0) * n, 0.0))
+  end
+
+  -- ── Running ──────────────────────────────────────────────────────────────
+  pfn iterate(p : Params, n : Int, step : Float, h0 : NativeF32Arr, mask : NativeF32Arr, strength : NativeF32Arr, workers : Int, it : Int, h : NativeF32Arr) : NativeF32Arr do
+    if it >= p_iterations(p) do h
+    else
+      let cnt = n * n
+      let r0 = rows_int(n, workers, fn (a, b) -> rcv_rows(h, n, a, b, true))
+      let rcv = route(n, h, r0)
+      let ord = order(n, rcv)
+      let area = area_go(rcv, ord, cnt - 1, NativeArray.make_float(cnt, step *. step))
+      let h1 = implicit_go(p, n, step, mask, rcv, ord, area, 0, cnt, h)
+      let up = int_to_float(it + 1) *. p_dt(p) *. p_uplift(p)
+      let h2 = rows_f32(n, workers, fn (a, b) -> thermal_rows(p, n, step, h1, h0, mask, strength, up, a, b))
+      iterate(p, n, step, h0, mask, strength, workers, it + 1, h2)
+    end
+  end
+
+  doc """
+  Erode an n x n grid of heights (metres above the sea, `step` metres apart)
+  for p's iterations and return the eroded heights. mask in [0, 1] scales
+  the uplift (uplift * mask * mask); strength in [0, 1] sets the talus angle between talus_lo and
+  talus_hi. Rows are split across `workers` tasks (1 runs inline); the result
+  is the same for any count.
+  """
+  fn run(p : Params, n : Int, step : Float, height : NativeF32Arr, mask : NativeF32Arr, strength : NativeF32Arr, workers : Int) : NativeF32Arr do
+    iterate(p, n, step, height, mask, strength, workers, 0, height)
+  end
+end
