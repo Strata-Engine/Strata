@@ -1,0 +1,176 @@
+-- Body: a rigid voxel object's grid of blocks, its mass, centre and inertia,
+-- its surface, and its connected parts. Block ids: 1 stone (2000 kg/m3),
+-- 2 a plant that does not collide.
+mod Strata.Test.Body do
+
+  needs IO.Clock      -- charged to every test module once any uses Check.all (GAPS S3)
+  needs IO.Process
+  import Test
+  alias Strata.Body as Bd
+  alias Strata.Blocks as B
+  alias Strata.World as Wd
+  alias Strata.Edit as Ed
+  alias Strata.Coord as Cd
+  alias Strata.Chunk as C
+
+  pfn reg() : Strata.Blocks.Registry do
+    match B.register(B.empty(), B.def()) do
+      Ok((r1, _)) ->
+        match B.register(r1, B.with_style(B.with_opacity(B.with_collide(B.def(), false), Strata.Blocks.Clear), Strata.Blocks.Cross)) do
+          Ok((r2, _)) -> r2
+          Err(_) -> r1
+        end
+      Err(_) -> B.empty()
+    end
+  end
+
+  pfn near(a : Float, b : Float, tol : Float) : Bool do
+    let d = a -. b
+    (if d < 0.0 do 0.0 -. d else d end) <= tol
+  end
+
+  pfn filled(g : Strata.Body.Grid, sx : Int, sy : Int, sz : Int, i : Int) : Strata.Body.Grid do
+    if i >= sx * sy * sz do g
+    else filled(Bd.grid_set(g, i % sx, (i / sx) % sy, i / (sx * sy), 1), sx, sy, sz, i + 1) end
+  end
+  pfn solid(sx : Int, sy : Int, sz : Int) : Strata.Body.Grid do filled(Bd.grid(sx, sy, sz), sx, sy, sz, 0) end
+
+  -- an L of three voxels: (0,0,0), (1,0,0), (0,1,0)
+  pfn ell() : Strata.Body.Grid do Bd.grid_set(Bd.grid_set(Bd.grid_set(Bd.grid(2, 2, 1), 0, 0, 0, 1), 1, 0, 0, 1), 0, 1, 0, 1) end
+
+  -- brute force inertia of unit voxels at scale 1, each of mass m, about centre (cx, cy, cz):
+  -- tensor elements xx yy zz xy xz yz, off-diagonal ones negative products
+  type I6 = I6(Float, Float, Float, Float, Float, Float)
+  pfn brute(cells : List((Int, Int, Int)), m : Float, cx : Float, cy : Float, cz : Float, acc : I6) : I6 do
+    match cells do
+      Nil -> acc
+      Cons((x, y, z), t) ->
+        let dx = int_to_float(x) +. 0.5 -. cx
+        let dy = int_to_float(y) +. 0.5 -. cy
+        let dz = int_to_float(z) +. 0.5 -. cz
+        let own = m /. 6.0
+        match acc do
+          I6(a, b, c, d, e, f) ->
+            brute(t, m, cx, cy, cz, I6(a +. m *. (dy *. dy +. dz *. dz) +. own, b +. m *. (dx *. dx +. dz *. dz) +. own, c +. m *. (dx *. dx +. dy *. dy) +. own,
+              d -. m *. dx *. dy, e -. m *. dx *. dz, f -. m *. dy *. dz))
+        end
+    end
+  end
+
+  pfn rel(a : Float, b : Float) : Bool do near(a, b, 0.000001 *. (if b < 0.0 do 0.0 -. b else b end) +. 0.000000001) end
+
+  pfn flat() : Strata.Terrain.Gen do
+    Strata.Terrain.gen(fn (k, seed) -> if Cd.ky(k) < 0 do C.uniform(1) else C.uniform(0) end)
+  end
+
+  describe "Body grids" do
+    test "a grid reads back what is set and air outside it" do
+      let g = Bd.grid_set(Bd.grid(3, 4, 5), 2, 3, 4, 1)
+      Test.assert_eq_int(Bd.grid_get(g, 2, 3, 4), 1, "set")
+      Test.assert_eq_int(Bd.grid_get(g, 0, 0, 0), 0, "air")
+      Test.assert_eq_int(Bd.grid_get(g, 3, 0, 0), 0, "outside")
+      Test.assert_eq_int(Bd.grid_get(g, -1, 0, 0), 0, "outside below")
+      Test.assert_eq_int(Bd.size_x(g) * 100 + Bd.size_y(g) * 10 + Bd.size_z(g), 345, "sizes")
+    end
+  end
+
+  describe "Body mass" do
+    test "a 2 x 2 x 2 stone grid at 1 m" do
+      let m = Bd.mass_of(reg(), solid(2, 2, 2), 1.0)
+      Test.assert_true(near(Bd.mass_kg(m), 16000.0, 0.000001), "mass")
+      match Bd.centre(m) do
+        (x, y, z) -> Test.assert_true(near(x, 1.0, 0.000001) && near(y, 1.0, 0.000001) && near(z, 1.0, 0.000001), "centre")
+      end
+      match Bd.inertia(m) do
+        (a, b, c, d, e, f) ->
+          Test.assert_true(near(a, 10666.67, 0.01) && near(b, 10666.67, 0.01) && near(c, 10666.67, 0.01), "diagonal m a2 / 6")
+          Test.assert_true(near(d, 0.0, 0.000001) && near(e, 0.0, 0.000001) && near(f, 0.0, 0.000001), "no off-diagonal")
+      end
+    end
+
+    test "the same grid at 10 cm" do
+      let m = Bd.mass_of(reg(), solid(2, 2, 2), 0.1)
+      Test.assert_true(near(Bd.mass_kg(m), 16.0, 0.000001), "mass")
+      match Bd.centre(m) do
+        (x, y, z) -> Test.assert_true(near(x, 0.1, 0.000001) && near(y, 0.1, 0.000001) && near(z, 0.1, 0.000001), "centre")
+      end
+      match Bd.inertia(m) do
+        (a, _, c, _, _, _) -> Test.assert_true(near(a, 0.10667, 0.00001) && near(c, 0.10667, 0.00001), "diagonal")
+      end
+    end
+
+    test "an L matches brute force over its voxels" do
+      let m = Bd.mass_of(reg(), ell(), 1.0)
+      let cx = (0.5 +. 1.5 +. 0.5) /. 3.0
+      let cy = (0.5 +. 0.5 +. 1.5) /. 3.0
+      match (Bd.centre(m), Bd.inertia(m), brute(Cons((0, 0, 0), Cons((1, 0, 0), Cons((0, 1, 0), Nil))), 2000.0, cx, cy, 0.5, I6(0.0, 0.0, 0.0, 0.0, 0.0, 0.0))) do
+        ((x, y, z), (a, b, c, d, e, f), I6(a2, b2, c2, d2, e2, f2)) ->
+          Test.assert_true(rel(x, cx) && rel(y, cy) && rel(z, 0.5), "centre")
+          Test.assert_true(rel(a, a2) && rel(b, b2) && rel(c, c2), "diagonal")
+          Test.assert_true(rel(d, d2) && rel(e, e2) && rel(f, f2), "products")
+          Test.assert_false(near(d, 0.0, 1.0), "an L has a real xy product")
+      end
+    end
+
+    test "a plant voxel has no mass and no surface" do
+      let g = Bd.grid_set(solid(2, 2, 2), 0, 0, 0, 2)
+      let m = Bd.mass_of(reg(), g, 1.0)
+      Test.assert_true(near(Bd.mass_kg(m), 14000.0, 0.000001), "seven stones")
+      Test.assert_eq_int(Bd.solid_count(reg(), g), 7, "seven colliding voxels")
+      Test.assert_eq_int(NativeArray.length_int(Bd.surface(reg(), g)), 7, "all seven are on the surface")
+    end
+  end
+
+  describe "Body surface" do
+    test "a solid 3 x 3 x 3 grid has 26 surface voxels" do
+      Test.assert_eq_int(NativeArray.length_int(Bd.surface(reg(), solid(3, 3, 3))), 26, "all but the middle")
+    end
+    test "a grid with an air voxel inside counts the voxels around it" do
+      let g = Bd.grid_set(solid(5, 5, 5), 2, 2, 2, 0)
+      Test.assert_eq_int(NativeArray.length_int(Bd.surface(reg(), g)), 98 + 6, "the shell and the six beside the hole")
+    end
+  end
+
+  describe "Body split" do
+    test "two voxels with air between are two parts" do
+      let g = Bd.grid_set(Bd.grid_set(Bd.grid(3, 1, 1), 0, 0, 0, 1), 2, 0, 0, 1)
+      Test.assert_eq_int(length(Bd.split(reg(), g)), 2, "two")
+    end
+    test "two voxels touching only at an edge are two parts" do
+      let g = Bd.grid_set(Bd.grid_set(Bd.grid(2, 2, 1), 0, 0, 0, 1), 1, 1, 0, 1)
+      Test.assert_eq_int(length(Bd.split(reg(), g)), 2, "two")
+    end
+    test "an L is one part, put back where it was" do
+      match Bd.split(reg(), Bd.grid_set(ell(), 1, 1, 0, 2)) do
+        Cons((p, ox, oy, oz), Nil) ->
+          Test.assert_eq_int(Bd.solid_count(reg(), p), 3, "three voxels, the plant left behind")
+          Test.assert_eq_int(Bd.grid_get(p, 1 - ox, 0 - oy, 0 - oz), 1, "(1,0,0) is where it was")
+          Test.assert_eq_int(Bd.grid_get(p, 0 - ox, 1 - oy, 0 - oz), 1, "(0,1,0) is where it was")
+        _ -> Test.fail("expected one part")
+      end
+    end
+    test "split parts sit in their own bounding boxes" do
+      let g = Bd.grid_set(Bd.grid_set(Bd.grid(4, 1, 1), 0, 0, 0, 1), 3, 0, 0, 1)
+      match Bd.split(reg(), g) do
+        Cons((a, ax, _, _), Cons((b, bx, _, _), Nil)) ->
+          Test.assert_eq_int(Bd.size_x(a) + Bd.size_x(b), 2, "each one voxel wide")
+          Test.assert_eq_int(ax + bx, 3, "at offsets 0 and 3")
+        _ -> Test.fail("expected two parts")
+      end
+    end
+  end
+
+  describe "Body.from_world" do
+    test "a run of two cells becomes a 2 x 1 x 1 grid with the world's ids" do
+      let w0 = Wd.insert(Wd.new(reg(), flat(), 7, 1.0), Cd.key(0, 0, 0), C.uniform(0))
+      let w1 = Ed.world(Ed.set_block(Ed.world(Ed.set_block(w0, 5, 6, 7, 1)), 6, 6, 7, 2))
+      match Bd.from_world(w1, Cons((6, 6, 7), Cons((5, 6, 7), Nil))) do
+        (g, x, y, z) ->
+          Test.assert_eq_int(Bd.size_x(g) * 100 + Bd.size_y(g) * 10 + Bd.size_z(g), 211, "2 x 1 x 1")
+          Test.assert_eq_int(x * 10000 + y * 100 + z, 50607, "low corner (5, 6, 7)")
+          Test.assert_eq_int(Bd.grid_get(g, 0, 0, 0), 1, "stone first")
+          Test.assert_eq_int(Bd.grid_get(g, 1, 0, 0), 2, "then the plant")
+      end
+    end
+  end
+end
