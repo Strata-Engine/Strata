@@ -99,3 +99,13 @@ meshing tasks; handing it to a function 200 000 times a chunk on each of
 them is, it seems, a reference-count update on shared memory each time.
 Workaround: read what the faces need from the registry once per chunk into
 arrays the task owns, and pass those.
+
+## S16: `&&` and `||` evaluate both sides when the right side is a call
+
+`if false && hb(k) do ... end` calls `hb`, and `false && g(k) == 3` calls
+`g`, both in the interpreter and under `--compile` (reproduced from `main`,
+no helper involved). So `k >= 0 && NativeArray.get_int(bs, k) != ...`
+traps with "index -1 out of bounds" when k is -1 (met in `Strata.Erosion`'s
+pass test). Never guard a read, or anything else that can trap or is
+costly, with `&&` or `||`; use `if k < 0 do false else ... end`. A
+suite-wide audit of existing `&&`/`||` guards is worth doing.
