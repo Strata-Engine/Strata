@@ -27,7 +27,7 @@
 /* Rewritten by build_shaders.sh whenever the shaders change: forge decides
  * whether to recompile this file from its text alone, not from the headers
  * it includes (GAPS S14). */
-#define STRATA_SHADERS_STAMP "dbcc871703a63dda"
+#define STRATA_SHADERS_STAMP "8e8865211af95378"
 #include "strata_shaders.h"
 #include "strata_spray.h"
 #include "strata_alloc.h"
@@ -62,6 +62,9 @@ static inline void   *narr_data(void *a) { return (char *)a + NARR_HDR; }
 
 typedef SaRange Range;
 
+typedef struct { float pos[4]; float rot[4]; int32_t dims[4]; float sphere[4]; } BodyRow;    /* std430, 64 bytes: low corner (metres), rotation, size and first word, bounding sphere (voxels) */
+typedef struct { int shaped, placed; float pos[3], rot[4], seen_pos[3], seen_rot[4]; int32_t dims[3]; uint32_t first, nwords; } BodyRec;
+
 /* One entry of the chunk table, as the shaders read it (std430, 96 bytes).
  * The CPU writes entries straight into the mapped buffer. A frame in flight
  * may read an entry while it changes; either version is drawable, because a
@@ -90,6 +93,8 @@ typedef struct {
      * copied into it. */
     VkBuffer ubo; VkDeviceMemory ubo_mem; float *ubo_map;
     VkBuffer table; VkDeviceMemory table_mem; ChunkEntry *table_map;
+    VkBuffer btable, bcells, blist, bmovers; VkDeviceMemory btable_mem, bcells_mem, blist_mem, bmovers_mem;
+    BodyRow *btable_map; uint32_t *bcells_map, *blist_map; float *bmovers_map;
     uint32_t *pending; uint32_t npending; unsigned char *is_pending;   /* slots changed since this Frame's table was last brought up to date */
     VkBuffer lstage; VkDeviceMemory lstage_mem; unsigned char *lstage_map;   /* this frame's light-volume writes, before they are copied in */
     VkBuffer stats; VkDeviceMemory stats_mem; uint32_t *stats_map;   /* written by the cull pass: commands per range [6], chunks, quads */
@@ -103,6 +108,19 @@ typedef struct {
 
 static SaAlloc g_quads;        /* ranges of the quad buffer, in quads */
 static SaAlloc g_loose;        /* ranges of the loose-quad buffer, in loose quads */
+static SaAlloc g_bbytes;       /* ranges of the body class buffer, in 32-bit words (four voxels each) */
+
+/* Bodies, for the rays: each one a grid of light classes (one byte a voxel,
+ * in g.bbytes_map) at a pose. Handles are the game's to choose, below
+ * SV_MAX_BODIES. Each frame the CPU writes the placed bodies into a compact
+ * table, and a grid of the light volume's chunk cells listing which bodies
+ * each cell's chunk overlaps: a ray entering a chunk looks at its list. */
+#define SV_MAX_BODIES   16384
+#define SV_BODY_WORDS   (16u << 20)      /* 64 MB of classes */
+#define SV_BODY_LIST    262144           /* list entries a frame */
+#define SV_MOVERS       16               /* boxes a frame where moving bodies unsettle light history */
+#define SV_MAX_CELLS    65536            /* light volume cells (chunks) the body lists can cover */
+
 #define SV_LOOSE_QUADS 262144  /* 16 MB of 64-byte loose quads */
 #define SV_MAX_MODELS 4096
 
@@ -170,6 +188,8 @@ static struct {
     VkDescriptorSetLayout dsl;
     VkDescriptorPool dpool;
     ChunkEntry *entries;           /* the chunk table as the CPU keeps it, SV_MAX_SLOTS entries; each Frame has the GPU's copy */
+    BodyRec *bodies;               /* SV_MAX_BODIES */
+    VkBuffer bbytes; VkDeviceMemory bbytes_mem; uint32_t *bbytes_map;
     VkBuffer cmds;  VkDeviceMemory cmds_mem;  uint32_t *cmds_map;        /* indirect commands, SV_REGIONS * SV_CMD_STRIDE, 4 words each */
     VkBuffer dslot; VkDeviceMemory dslot_mem; uint32_t *dslot_map;       /* the slot each command draws, same shape */
     /* slots that hold translucent quads: the list the CPU orders each frame */
@@ -209,8 +229,9 @@ static struct {
 /* The uniform block, in floats (native/shaders/ubo.glsl): vp 0, sun 16,
  * sky 20, fog 24, eye 28, misc 32 (ints), inv_vp 36, prev_vp 52, light 68,
  * sun colour 72, light volume size 76 (ints). */
-#define UBO_FLOATS 96
-#define UBO_WATER 88           /* two vec4: the liquid the eye is in (rgb, and how fast it swallows light; 0: none), and its surface height */
+#define UBO_FLOATS 100
+#define UBO_BODIES 88          /* ints: x moving bodies' boxes in the movers buffer, y bodies in the body table */
+#define UBO_WATER 92           /* two vec4: the liquid the eye is in (rgb, and how fast it swallows light; 0: none), and its surface height */
 #define UBO_EDIT 80            /* two vec4: the low and high corners (voxels) of what an edit just changed; the first w is 1 while it settles */
 #define UBO_VOL 76             /* ints: the light volume's size in chunks */
 #define UBO_INV_VP 36
@@ -643,7 +664,7 @@ static int ui_art_make(uint32_t w, uint32_t h, const unsigned char *rgba) {
     }
     drop_target(&g.ui_art);
     g.ui_art = fresh;
-    bind_image(17, g.ui_sampler, g.ui_art.view);
+    bind_image(22, g.ui_sampler, g.ui_art.view);
     return 1;
 }
 
@@ -657,7 +678,7 @@ static int glyphs_make(void) {
         .mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST, .addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, .addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
         .addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, .maxAnisotropy = 1.0f };
     VKOK(vkCreateSampler(g.dev, &si, NULL, &g.glyph_sampler), "glyph sampler");
-    bind_image(18, g.glyph_sampler, g.glyphs.view);
+    bind_image(23, g.glyph_sampler, g.glyphs.view);
     return 1;
 }
 
@@ -1154,7 +1175,7 @@ int64_t sv_open(int64_t w, int64_t h, int64_t capture_mouse, int64_t quad_capaci
     g.swap_ok = 1;
 
     /* one set layout for every pipeline: 0 uniforms, 1 chunk table, 2 indirect commands, 3 cull statistics, 4 command -> slot */
-    VkDescriptorSetLayoutBinding dslb[19] = {
+    VkDescriptorSetLayoutBinding dslb[24] = {
         { .binding = 0, .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, .descriptorCount = 1,
           .stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT },
         { .binding = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1,
@@ -1179,11 +1200,17 @@ int64_t sv_open(int64_t w, int64_t h, int64_t capture_mouse, int64_t quad_capaci
         /* the light pass's memory of the frame before */
         { .binding = 15, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT },
         { .binding = 16, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT },
+        /* bodies, for the rays: table, classes, cell index, cell lists, moving boxes */
+        { .binding = 17, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT },
+        { .binding = 18, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT },
+        { .binding = 19, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT },
+        { .binding = 20, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT },
+        { .binding = 21, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT },
         /* the 2D layer's interface atlas */
-        { .binding = 17, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT },
+        { .binding = 22, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT },
         /* and its glyph atlas */
-        { .binding = 18, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT } };
-    VkDescriptorSetLayoutCreateInfo dsli = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 19, .pBindings = dslb };
+        { .binding = 23, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT } };
+    VkDescriptorSetLayoutCreateInfo dsli = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 24, .pBindings = dslb };
     VKOK(vkCreateDescriptorSetLayout(g.dev, &dsli, NULL, &g.dsl), "descriptor set layout");
     /* where the call's range starts in draw_slot, and per-call flags (bit 0: cutout) */
     VkPushConstantRange pcr = { .stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, .offset = 0, .size = 8 };
@@ -1245,7 +1272,7 @@ int64_t sv_open(int64_t w, int64_t h, int64_t capture_mouse, int64_t quad_capaci
     if (!make_buffer((VkDeviceSize)SV_MAX_BLOCKS * 32, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &g.blocks, &g.blocks_mem, &map)) return 0;
     g.blocks_map = map;
     memset(g.blocks_map, 0, (size_t)SV_MAX_BLOCKS * 32);
-    VkDescriptorPoolSize dps[3] = { { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, SV_FRAMES }, { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 6 * SV_FRAMES }, { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 12 * SV_FRAMES } };
+    VkDescriptorPoolSize dps[3] = { { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, SV_FRAMES }, { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 11 * SV_FRAMES }, { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 12 * SV_FRAMES } };
     VkDescriptorPoolCreateInfo dpi = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = SV_FRAMES, .poolSizeCount = 3, .pPoolSizes = dps };
     VKOK(vkCreateDescriptorPool(g.dev, &dpi, NULL, &g.dpool), "descriptor pool");
     for (int f = 0; f < SV_FRAMES; f++) {
@@ -1264,6 +1291,14 @@ int64_t sv_open(int64_t w, int64_t h, int64_t capture_mouse, int64_t quad_capaci
         F->table_map = map; memset(F->table_map, 0, (size_t)SV_MAX_SLOTS * sizeof(ChunkEntry));
         if (!make_buffer((VkDeviceSize)SV_LIGHT_PER_FRAME * SV_LIGHT_WRITE_BYTES, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, &F->lstage, &F->lstage_mem, &map)) return 0;
         F->lstage_map = map;
+        if (!make_buffer((VkDeviceSize)SV_MAX_BODIES * sizeof(BodyRow), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &F->btable, &F->btable_mem, &map)) return 0;
+        F->btable_map = map;
+        if (!make_buffer((VkDeviceSize)SV_MAX_CELLS * 8 + 16, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &F->bcells, &F->bcells_mem, &map)) return 0;
+        F->bcells_map = map; memset(F->bcells_map, 0, (size_t)SV_MAX_CELLS * 8 + 16);
+        if (!make_buffer((VkDeviceSize)SV_BODY_LIST * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &F->blist, &F->blist_mem, &map)) return 0;
+        F->blist_map = map;
+        if (!make_buffer((VkDeviceSize)SV_MOVERS * 32, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &F->bmovers, &F->bmovers_mem, &map)) return 0;
+        F->bmovers_map = map; memset(F->bmovers_map, 0, SV_MOVERS * 32);
         F->pending = calloc(SV_MAX_SLOTS, sizeof *F->pending);
         F->is_pending = calloc(SV_MAX_SLOTS, 1);
         if (!F->pending || !F->is_pending) return 0;
@@ -1273,6 +1308,20 @@ int64_t sv_open(int64_t w, int64_t h, int64_t capture_mouse, int64_t quad_capaci
             wds[b] = (VkWriteDescriptorSet){ .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = F->dset, .dstBinding = b, .descriptorCount = 1,
                 .descriptorType = b == 0 ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &bufs[b] };
         vkUpdateDescriptorSets(g.dev, 6, wds, 0, NULL);
+    }
+    if (!make_buffer((VkDeviceSize)SV_BODY_WORDS * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &g.bbytes, &g.bbytes_mem, &map)) return 0;
+    g.bbytes_map = map;
+    sa_init(&g_bbytes, SV_BODY_WORDS);
+    g.bodies = calloc(SV_MAX_BODIES, sizeof(BodyRec));
+    if (!g.bodies) return 0;
+    for (int f = 0; f < SV_FRAMES; f++) {
+        Frame *F = &g.frames[f];
+        VkDescriptorBufferInfo bb[5] = { { F->btable, 0, VK_WHOLE_SIZE }, { g.bbytes, 0, VK_WHOLE_SIZE }, { F->bcells, 0, VK_WHOLE_SIZE }, { F->blist, 0, VK_WHOLE_SIZE }, { F->bmovers, 0, VK_WHOLE_SIZE } };
+        VkWriteDescriptorSet bw[5];
+        for (uint32_t b = 0; b < 5; b++)
+            bw[b] = (VkWriteDescriptorSet){ .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = F->dset, .dstBinding = 17 + b, .descriptorCount = 1,
+                .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &bb[b] };
+        vkUpdateDescriptorSets(g.dev, 5, bw, 0, NULL);
     }
     bind_targets();               /* the sets did not exist when the frame's images were made */
     if (!make_buffer(256 * 32, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &g.ltable, &g.ltable_mem, &map)) return 0;
@@ -1585,6 +1634,108 @@ int64_t sv_chunk_begin(int64_t slot, double ox, double oy, double oz) {
     return 1;
 }
 
+/* ── Bodies for the rays ─────────────────────────────────────────────────── */
+/* Give body [handle] its shape: one light class byte a voxel, x fastest, then
+ * y, then z, [sx] x [sy] x [sz]. Replaces any shape it had. */
+int64_t sv_body_shape(int64_t handle, void *bytes, int64_t n, int64_t sx, int64_t sy, int64_t sz) {
+    if (!g.ok || !g.bodies || handle < 0 || handle >= SV_MAX_BODIES || sx < 1 || sy < 1 || sz < 1 || n < sx * sy * sz) return 0;
+    BodyRec *b = &g.bodies[handle];
+    uint32_t words = (uint32_t)((sx * sy * sz + 3) / 4), first = 0;
+    if (!sa_alloc(&g_bbytes, words, &first)) { g.refused++; return 0; }
+    if (b->shaped) sa_release(&g_bbytes, (SaRange){ b->first, b->nwords }, g.frame_no);
+    memset(g.bbytes_map + first, 0, (size_t)words * 4);
+    memcpy(g.bbytes_map + first, bytes, (size_t)(sx * sy * sz));
+    b->first = first; b->nwords = words; b->dims[0] = (int32_t)sx; b->dims[1] = (int32_t)sy; b->dims[2] = (int32_t)sz;
+    b->shaped = 1;
+    return 1;
+}
+/* Where body [handle] is: its grid's low corner in metres and its rotation. */
+void sv_body_place(int64_t handle, double px, double py, double pz, double qx, double qy, double qz, double qw) {
+    if (!g.ok || !g.bodies || handle < 0 || handle >= SV_MAX_BODIES) return;
+    BodyRec *b = &g.bodies[handle];
+    b->pos[0] = (float)px; b->pos[1] = (float)py; b->pos[2] = (float)pz;
+    b->rot[0] = (float)qx; b->rot[1] = (float)qy; b->rot[2] = (float)qz; b->rot[3] = (float)qw;
+    if (!b->placed) { memcpy(b->seen_pos, b->pos, sizeof b->pos); memcpy(b->seen_rot, b->rot, sizeof b->rot); }
+    b->placed = 1;
+}
+/* Body [handle] is gone: the rays no longer see it. */
+void sv_body_drop(int64_t handle) {
+    if (!g.ok || !g.bodies || handle < 0 || handle >= SV_MAX_BODIES) return;
+    BodyRec *b = &g.bodies[handle];
+    if (b->shaped) sa_release(&g_bbytes, (SaRange){ b->first, b->nwords }, g.frame_no);
+    memset(b, 0, sizeof *b);
+}
+
+/* This frame's body table, cell lists and moving boxes. The cells are the
+ * light volume's, one a chunk, addressed as the shader addresses the volume
+ * (chunk coordinate modulo its size): a ray that enters a chunk reads which
+ * bodies overlap it. A body far away may share a cell with a near chunk; the
+ * ray's own test of the body's box turns it away. */
+static void bodies_to_frame(Frame *F) {
+    int32_t *bu = (int32_t *)(g.ubo_map + UBO_BODIES);
+    bu[0] = bu[1] = bu[2] = bu[3] = 0;
+    if (!g.bodies || g.vn <= 0 || g.vnv <= 0) return;
+    float scale = g.ubo_map[31] > 0.0f ? g.ubo_map[31] : 1.0f;
+    int nx = g.vn, ny = g.vnv, nz = g.vn;
+    uint32_t ncells = (uint32_t)(nx * ny * nz);
+    if (ncells > SV_MAX_CELLS) return;
+    memset(F->bcells_map, 0, (size_t)ncells * 8);
+    /* the table, each body's box in chunks, and how many cells each lists it in */
+    static int32_t box[SV_MAX_BODIES][6];
+    static uint32_t which[SV_MAX_BODIES];
+    uint32_t n = 0, nmov = 0;
+    for (uint32_t h = 0; h < SV_MAX_BODIES; h++) {
+        BodyRec *b = &g.bodies[h];
+        if (!b->shaped || !b->placed) continue;
+        BodyRow *r = &F->btable_map[n];
+        memcpy(r->pos, b->pos, 12); r->pos[3] = 0.0f; memcpy(r->rot, b->rot, 16);
+        r->dims[0] = b->dims[0]; r->dims[1] = b->dims[1]; r->dims[2] = b->dims[2]; r->dims[3] = (int32_t)b->first;
+        float lo[3] = { 1e30f, 1e30f, 1e30f }, hi[3] = { -1e30f, -1e30f, -1e30f };
+        for (int c = 0; c < 8; c++) {
+            float v[3] = { (c & 1) ? b->dims[0] * scale : 0.0f, (c & 2) ? b->dims[1] * scale : 0.0f, (c & 4) ? b->dims[2] * scale : 0.0f }, w[3];
+            qrot3(b->rot, v, w);
+            for (int k = 0; k < 3; k++) { float x = (b->pos[k] + w[k]) / scale; if (x < lo[k]) lo[k] = x; if (x > hi[k]) hi[k] = x; }
+        }
+        for (int k = 0; k < 3; k++) { box[n][k] = (int32_t)floorf(lo[k]) >> 5; box[n][3 + k] = (int32_t)floorf(hi[k]) >> 5; }
+        {   /* a sphere round it, in voxels: most rays turn away on it, before any rotation */
+            float half[3] = { b->dims[0] * scale * 0.5f, b->dims[1] * scale * 0.5f, b->dims[2] * scale * 0.5f }, w[3];
+            qrot3(b->rot, half, w);
+            for (int k = 0; k < 3; k++) r->sphere[k] = (b->pos[k] + w[k]) / scale;
+            r->sphere[3] = 0.5f * sqrtf((float)(b->dims[0] * b->dims[0] + b->dims[1] * b->dims[1] + b->dims[2] * b->dims[2])) + 0.01f;
+        }
+        /* a body that moved since last frame unsettles light history round it, its shadow included */
+        int moved = memcmp(b->pos, b->seen_pos, 12) != 0 || memcmp(b->rot, b->seen_rot, 16) != 0;
+        if (moved && nmov < SV_MOVERS) {
+            float reach = 0.0f;
+            for (int k = 0; k < 3; k++) if (hi[k] - lo[k] > reach) reach = hi[k] - lo[k];
+            reach = reach * 2.0f + 8.0f;
+            float *m = F->bmovers_map + nmov * 8;
+            for (int k = 0; k < 3; k++) { m[k] = lo[k] - reach; m[4 + k] = hi[k] + reach; }
+            m[3] = m[7] = 0.0f;
+            nmov++;
+        }
+        memcpy(b->seen_pos, b->pos, 12); memcpy(b->seen_rot, b->rot, 16);
+        which[n] = h;
+        n++;
+    }
+    /* count, then place: cell c lists its bodies from its start */
+    for (uint32_t i = 0; i < n; i++)
+        for (int cz = box[i][2]; cz <= box[i][5]; cz++) for (int cy = box[i][1]; cy <= box[i][4]; cy++) for (int cx = box[i][0]; cx <= box[i][3]; cx++) {
+            uint32_t c = (uint32_t)(wrapi(cx, nx) + nx * (wrapi(cy, ny) + ny * wrapi(cz, nz)));
+            F->bcells_map[c * 2 + 1]++;
+        }
+    uint32_t at = 0;
+    for (uint32_t c = 0; c < ncells; c++) { F->bcells_map[c * 2] = at; at += F->bcells_map[c * 2 + 1]; F->bcells_map[c * 2 + 1] = 0; }
+    for (uint32_t i = 0; i < n; i++)
+        for (int cz = box[i][2]; cz <= box[i][5]; cz++) for (int cy = box[i][1]; cy <= box[i][4]; cy++) for (int cx = box[i][0]; cx <= box[i][3]; cx++) {
+            uint32_t c = (uint32_t)(wrapi(cx, nx) + nx * (wrapi(cy, ny) + ny * wrapi(cz, nz)));
+            uint32_t k = F->bcells_map[c * 2] + F->bcells_map[c * 2 + 1];
+            if (k < SV_BODY_LIST) { F->blist_map[k] = i; F->bcells_map[c * 2 + 1]++; }
+        }
+    (void)which;
+    bu[0] = (int32_t)nmov; bu[1] = (int32_t)n;
+}
+
 /* Begin uploading one part of a body (a 32-cubed piece of its grid) into
  * [slot]; parts and commit as for a chunk. It is drawn at the pose
  * sv_slot_pose gives and never written into the light volume. */
@@ -1867,6 +2018,7 @@ int64_t sv_frame(void) {
     double wait_ms = (glfwGetTime() - t_start) * 1000.0;
     sa_collect(&g_quads, g.frame_no);
     sa_collect(&g_loose, g.frame_no);
+    sa_collect(&g_bbytes, g.frame_no);
     /* what this Frame's cull pass let through, two frames ago */
     g.drawn_chunks = F->stats_map[6]; g.drawn_quads = F->stats_map[7];
     /* How many commands to submit for each compacted range: what this Frame's
@@ -1939,6 +2091,7 @@ int64_t sv_frame(void) {
     /* this Frame's fence has been waited on, so the GPU is done with its
      * copies: bring them up to date. From here to the next time this Frame
      * comes round, nothing the CPU does can change what it draws. */
+    bodies_to_frame(F);
     memcpy(F->ubo_map, g.ubo_map, UBO_FLOATS * 4);
     for (uint32_t i = 0; i < F->npending; i++) {
         uint32_t slot = F->pending[i];

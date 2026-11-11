@@ -1,7 +1,7 @@
 // The 2D layer's pixels. Kinds: 0 a plain colour, 1 a block texture layer,
 // 2 a region of the interface atlas, 3 a glyph of the glyph atlas.
-layout(set = 0, binding = 17) uniform sampler2D ui_art;
-layout(set = 0, binding = 18) uniform sampler2DArray glyphs;   // distance fields: 0.5 on the outline, more inside
+layout(set = 0, binding = 22) uniform sampler2D ui_art;
+layout(set = 0, binding = 23) uniform sampler2DArray glyphs;   // distance fields: 0.5 on the outline, more inside
 
 layout(location = 0) in vec2 v_uv;
 layout(location = 1) flat in vec4 v_rgba;
