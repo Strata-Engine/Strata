@@ -46,37 +46,60 @@ mod StrataDemo do
   end
 
   -- ── Terrain ──────────────────────────────────────────────────────────────
-  pfn level() : Int do 34 end
+  -- The land is described in metres: frequencies in cycles per metre,
+  -- amplitudes in metres. A world's scale (metres a voxel) only decides how
+  -- finely that one shape is cut into voxels.
+  --
+  -- Seeds: Strata.Seed.mix(seed, 1) the base, 2 the detail, 3 the ridges.
+  -- Scatter salts, for Strata.Seed.cell: 11 tall grass, 12 lamps.
+  pfn fbm_s() : Strata.Noise.Settings do Nd.settings(0, 3, 2.0, 0.5, 1, 0.0) end
+  pfn ridge_s() : Strata.Noise.Settings do Nd.settings(1, 3, 2.0, 0.5, 2, 0.0) end
+  pfn clamp01(v : Float) : Float do if v < 0.0 do 0.0 else if v > 1.0 do 1.0 else v end end end
 
-  pfn height(wx : Int, wz : Int, seed : Int) : Int do
-    let x = int_to_float(wx)
-    let z = int_to_float(wz)
-    let base = Nd.fbm(x *. 0.006, z *. 0.006, seed)
-    let ridge = Nd.ridged_fbm(x *. 0.011, z *. 0.011, seed + 20)
-    float_to_int(18.0 +. base *. 36.0 +. Nd.fbm(x *. 0.03, z *. 0.03, seed + 5) *. 8.0 +. ridge *. Nd.clamp01((base -. 0.5) *. 4.0) *. 40.0)
+  -- noise in [-1, 1] mapped to [0, 1]
+  pfn unit_noise(seed : Int, freq : Float, xm : Float, zm : Float) : Float do
+    0.5 +. 0.5 *. Nd.sample2(fbm_s(), seed, freq, xm, zm)
   end
 
-  pfn block_at(wx : Int, wy : Int, wz : Int, h : Int, seed : Int) : Int do
-    if wy > h + 1 do (if wy <= level() do 3 else 0 end)
+  doc "The ground height in metres at (xm, zm)."
+  fn height_m(xm : Float, zm : Float, seed : Int) : Float do
+    let base = unit_noise(Strata.Seed.mix(seed, 1), 0.006, xm, zm)
+    let detail = unit_noise(Strata.Seed.mix(seed, 2), 0.03, xm, zm)
+    let ridge = Nd.sample2(ridge_s(), Strata.Seed.mix(seed, 3), 0.011, xm, zm)
+    18.0 +. base *. 36.0 +. detail *. 8.0 +. ridge *. clamp01((base -. 0.5) *. 4.0) *. 40.0
+  end
+
+  -- whole voxels of [scale] metres in [m] metres (a hair over, so 34 m at 0.1 is 340)
+  pfn voxels(m : Float, scale : Float) : Int do float_to_int(Math.floor(m /. scale +. 0.000001)) end
+
+  pfn level(scale : Float) : Int do voxels(34.0, scale) end
+
+  doc "The ground voxel's height index at column (wx, wz) of a world of [scale] metres a voxel."
+  fn column(wx : Int, wz : Int, seed : Int, scale : Float) : Int do
+    voxels(height_m(int_to_float(wx) *. scale, int_to_float(wz) *. scale, seed), scale)
+  end
+
+  pfn block_at(wx : Int, wy : Int, wz : Int, h : Int, lvl : Int, seed : Int) : Int do
+    if wy > h + 1 do (if wy <= lvl do 3 else 0 end)
     else if wy == h + 1 do
-      (if wy <= level() do 3
-       else if Nd.hash2(wx, wz, seed + 900) > 0.93 do 13
-       else if Nd.hash2(wx, wz, seed + 901) > 0.998 do 12
+      (if wy <= lvl do 3
+       else if Strata.Seed.unit(Strata.Seed.cell(seed, 11, wx, 0, wz)) > 0.93 do 13
+       else if Strata.Seed.unit(Strata.Seed.cell(seed, 12, wx, 0, wz)) > 0.998 do 12
        else 0 end end end)
     else if wy >= h - 2 do 2
     else 1 end end end
   end
 
-  pfn fill_go(a : NativeI32Arr, x0 : Int, y0 : Int, z0 : Int, seed : Int, hs : NativeIntArr, i : Int) : NativeI32Arr do
+  pfn fill_go(a : NativeI32Arr, x0 : Int, y0 : Int, z0 : Int, lvl : Int, seed : Int, hs : NativeIntArr, i : Int) : NativeI32Arr do
     if i >= 32768 do a
     else
       let x = i % 32
       let z = (i / 32) % 32
-      fill_go(NativeArray.set_i32(a, i, block_at(x0 + x, y0 + i / 1024, z0 + z, NativeArray.get_int(hs, x + 32 * z), seed)), x0, y0, z0, seed, hs, i + 1)
+      fill_go(NativeArray.set_i32(a, i, block_at(x0 + x, y0 + i / 1024, z0 + z, NativeArray.get_int(hs, x + 32 * z), lvl, seed)), x0, y0, z0, lvl, seed, hs, i + 1)
     end
   end
-  pfn heights_go(hs : NativeIntArr, x0 : Int, z0 : Int, seed : Int, i : Int) : NativeIntArr do
-    if i >= 1024 do hs else heights_go(NativeArray.set_int(hs, i, height(x0 + i % 32, z0 + i / 32, seed)), x0, z0, seed, i + 1) end
+  pfn heights_go(hs : NativeIntArr, x0 : Int, z0 : Int, seed : Int, scale : Float, i : Int) : NativeIntArr do
+    if i >= 1024 do hs else heights_go(NativeArray.set_int(hs, i, column(x0 + i % 32, z0 + i / 32, seed, scale)), x0, z0, seed, scale, i + 1) end
   end
   pfn span_go(hs : NativeIntArr, i : Int, lo : Int, hi : Int) : (Int, Int) do
     if i >= 1024 do (lo, hi)
@@ -86,20 +109,22 @@ mod StrataDemo do
     end
   end
 
-  pfn chunk_for(k : Strata.Coord.Key, seed : Int) : Strata.Chunk.Chunk do
+  pfn chunk_for(k : Strata.Coord.Key, seed : Int, scale : Float) : Strata.Chunk.Chunk do
     let x0 = 32 * Kd2.kx(k)
     let y0 = 32 * Kd2.ky(k)
     let z0 = 32 * Kd2.kz(k)
-    let hs = heights_go(NativeArray.make_int(1024, 0), x0, z0, seed, 0)
+    let lvl = level(scale)
+    let hs = heights_go(NativeArray.make_int(1024, 0), x0, z0, seed, scale, 0)
     match span_go(hs, 0, 100000, -100000) do
       (lo, hi) ->
-        if y0 > (if hi + 1 > level() do hi + 1 else level() end) do Cd2.uniform(0)
+        if y0 > (if hi + 1 > lvl do hi + 1 else lvl end) do Cd2.uniform(0)
         else if y0 + 31 < lo - 2 do Cd2.uniform(1)
-        else Cd2.from_flat(fill_go(NativeArray.make_i32(32768, 0), x0, y0, z0, seed, hs, 0)) end end
+        else Cd2.from_flat(fill_go(NativeArray.make_i32(32768, 0), x0, y0, z0, lvl, seed, hs, 0)) end end
     end
   end
 
-  pfn terrain() : Strata.Terrain.Gen do Strata.Terrain.gen(fn (k, seed) -> chunk_for(k, seed)) end
+  doc "The demo's generator for a world of [scale] metres a voxel."
+  fn terrain(scale : Float) : Strata.Terrain.Gen do Strata.Terrain.gen(fn (k, seed) -> chunk_for(k, seed, scale)) end
 
   -- ── Measuring ────────────────────────────────────────────────────────────
   pfn fixed1(v : Float) : String do float_to_string(Math.round(v *. 100.0) /. 100.0) end
@@ -224,7 +249,7 @@ mod StrataDemo do
   -- ── The two runs ─────────────────────────────────────────────────────────
   pfn run_a(seed : Int) : Unit do
     let t0 = unix_time_ms()
-    let s0 = Sd.start(Wd2.new(registry(), terrain(), seed, 1.0), Sd.config(6, 3, 8, 4))
+    let s0 = Sd.start(Wd2.new(registry(), terrain(1.0), seed, 1.0), Sd.config(6, 3, 8, 4))
     let s1 = walk(s0, 0, 64, 40.5, 4.0)
     let t1 = unix_time_ms()
     println("run A (1 m voxels, radius 6 x 3): walked 256 m in 64 steps, " ++ int_to_string(t1 - t0) ++ " ms streaming")
@@ -249,8 +274,8 @@ mod StrataDemo do
 
   pfn run_b(seed : Int) : Unit do
     let t0 = unix_time_ms()
-    let s0 = Sd.start(Wd2.new(registry(), terrain(), seed, 0.1), Sd.config(3, 2, 8, 4))
-    let gy0 = height(0, 0, seed)
+    let s0 = Sd.start(Wd2.new(registry(), terrain(0.1), seed, 0.1), Sd.config(3, 2, 8, 4))
+    let gy0 = column(0, 0, seed, 0.1)
     let s1 = settle(s0, 0.05, int_to_float(gy0) *. 0.1, 0.05)
     println("run B (10 cm voxels, radius 3 x 2): settled in " ++ int_to_string(unix_time_ms() - t0) ++ " ms")
     let w1 = Sd.world(s1)

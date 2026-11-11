@@ -1,0 +1,95 @@
+-- The demo's generator is pure and scale-faithful: fixed chunks hash to
+-- stored values, and one landscape cut at two scales is the same landscape.
+mod StrataDemo.Test.Determinism do
+  -- the app's capabilities are charged to its test module too (GAPS S3)
+  needs IO
+  needs IO.Spawn
+  needs IO.Clock
+  needs IO.FileSystem
+  needs IO.Console
+
+  import Test
+  alias StrataDemo as D
+  alias Strata.Chunk as C
+  alias Strata.Coord as K
+
+  -- a hash of every voxel of a chunk
+  pfn hash_go(c : Strata.Chunk.Chunk, i : Int, h : Int) : Int do
+    if i >= 32768 do h
+    else hash_go(c, i + 1, int_and(h * 1000003 + C.get_or(c, i % 32, i / 1024, (i / 32) % 32, -1) + 2, 4294967295)) end
+  end
+
+  -- Twelve chunk keys at seed 7, all with ground in them (none is all air or
+  -- all stone), and the hash each had when this test was written, taken
+  -- once from the demo's generator at scale 1.0 and looked at (distinct).
+  pfn keys() : List((Int, Int, Int)) do
+    [(-5, 0, -4), (-5, 1, -4), (-5, 1, 1), (-5, 1, 5), (-5, 2, 5), (0, 0, -4), (0, 1, -4), (0, 0, 1), (0, 2, 1), (3, 1, -4), (3, 0, 1), (6, 1, 5)]
+  end
+  pfn stored() : List(Int) do
+    [767924208, 2068112514, 2730251708, 2509754551, 1798357819, 3901018710, 1665267755, 2112094436, 2339141432, 500277707, 2882262754, 3416421643]
+  end
+
+  pfn check_go(ks : List((Int, Int, Int)), hs : List(Int), bad : Int) : Int do
+    match ks do
+      Nil -> bad
+      Cons((a, b, c), kt) ->
+        match hs do
+          Nil -> bad + 1
+          Cons(h, ht) -> check_go(kt, ht, if chunk_hash(a, b, c) == h do bad else bad + 1 end)
+        end
+    end
+  end
+
+  pfn chunk_hash(cx : Int, cy : Int, cz : Int) : Int do
+    hash_go(Strata.Terrain.run(D.terrain(1.0), K.key(cx, cy, cz), 7), 0, 5381)
+  end
+
+  -- the surface of the column holding metre (xm, zm), in metres, found by
+  -- scanning the generated chunks from the top: the highest stone or soil
+  -- voxel's top face. [cy] is the chunk to start from.
+  pfn top_in_chunk(c : Strata.Chunk.Chunk, lx : Int, lz : Int, ly : Int) : Int do
+    if ly < 0 do -1
+    else
+      let id = C.get_or(c, lx, ly, lz, 0)
+      if id == 1 || id == 2 do ly else top_in_chunk(c, lx, lz, ly - 1) end
+    end
+  end
+
+  pfn surface_m(g : Strata.Terrain.Gen, scale : Float, xm : Int, zm : Int) : Float do
+    let wx = float_to_int(int_to_float(xm) /. scale)
+    let wz = float_to_int(int_to_float(zm) /. scale)
+    let cytop = float_to_int(160.0 /. scale) / 32
+    surface_go(g, scale, wx, wz, cytop)
+  end
+
+  pfn surface_go(g : Strata.Terrain.Gen, scale : Float, wx : Int, wz : Int, cy : Int) : Float do
+    if cy < -1 do 0.0
+    else
+      let c = Strata.Terrain.run(g, K.key(K.chunk_of(wx), cy, K.chunk_of(wz)), 7)
+      let t = top_in_chunk(c, wx - 32 * K.chunk_of(wx), wz - 32 * K.chunk_of(wz), 31)
+      if t < 0 do surface_go(g, scale, wx, wz, cy - 1) else int_to_float(cy * 32 + t + 1) *. scale end
+    end
+  end
+
+  -- the largest difference, in metres, over 50 columns; each column is a
+  -- whole number of metres, so both scales sample exactly the same point
+  pfn worst_go(coarse : Strata.Terrain.Gen, fine : Strata.Terrain.Gen, i : Int, worst : Float) : Float do
+    if i >= 50 do worst
+    else
+      let xm = i * 13 - 200
+      let zm = (i * 29) % 300 - 100
+      let d = Math.abs(surface_m(coarse, 1.0, xm, zm) -. surface_m(fine, 0.5, xm, zm))
+      worst_go(coarse, fine, i + 1, if d > worst do d else worst end)
+    end
+  end
+
+  describe "Demo determinism" do
+    test "twelve fixed chunks at seed 7 hash to their stored values" do
+      Test.assert_eq_int(check_go(keys(), stored(), 0), 0, "chunks whose hash changed")
+    end
+    test "the same ground at scale 1.0 and 0.5 within a voxel" do
+      let w = worst_go(D.terrain(1.0), D.terrain(0.5), 0, 0.0)
+      Test.assert_true(w <= 1.0, "worst difference " ++ float_to_string(w) ++ " m")
+    end
+  end
+end

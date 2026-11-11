@@ -116,62 +116,103 @@ mod StrataViewer do
   end
 
   -- ── Terrain: a pure function of chunk coordinates and seed ───────────────
-  pfn sea() : Int do 40 end
+  -- The land is described in metres: frequencies in cycles per metre,
+  -- amplitudes in metres. The world's scale (metres a voxel) only decides how
+  -- finely that shape is cut into voxels; the viewer runs at 1 m a voxel.
+  --
+  -- Seeds: Strata.Seed.mix(seed, 1) the base, 2 the hills, 3 the ridges.
+  -- Salts for Strata.Seed.cell: 21 trees, 22 / 23 / 24 a lake's centre x, centre z
+  -- and radius, 25 lantern posts, 26 tall grass. Salt 27 seeds the snow-patch noise.
+  pfn fbm_s() : Strata.Noise.Settings do Ns.settings(0, 3, 2.0, 0.5, 1, 0.0) end
+  pfn ridge_s() : Strata.Noise.Settings do Ns.settings(1, 3, 2.0, 0.5, 2, 0.0) end
+  pfn clamp01(v : Float) : Float do if v < 0.0 do 0.0 else if v > 1.0 do 1.0 else v end end end
 
-  pfn height(wx : Int, wz : Int, seed : Int) : Int do
-    let x = int_to_float(wx)
-    let z = int_to_float(wz)
-    let base = Ns.fbm(x *. 0.005, z *. 0.005, seed)
-    let hills = Ns.fbm(x *. 0.021, z *. 0.021, seed + 10)
-    let ridge = Ns.ridged_fbm(x *. 0.009, z *. 0.009, seed + 20)
-    let mount = Ns.clamp01((base -. 0.5) *. 4.0)
-    float_to_int(22.0 +. base *. 34.0 +. hills *. 12.0 +. ridge *. mount *. 52.0)
+  -- noise in [-1, 1] mapped to [0, 1]
+  pfn unit_noise(seed : Int, freq : Float, xm : Float, zm : Float) : Float do
+    0.5 +. 0.5 *. Ns.sample2(fbm_s(), seed, freq, xm, zm)
+  end
+
+  -- a fresh [0, 1) value for a column, from its own salt
+  pfn roll(wx : Int, wz : Int, seed : Int, salt : Int) : Float do
+    Strata.Seed.unit(Strata.Seed.cell(seed, salt, wx, 0, wz))
+  end
+
+  -- whole voxels of [scale] metres in [m] metres (a hair over, so 34 m at 0.1 is 340)
+  pfn vox(m : Float, scale : Float) : Int do float_to_int(Math.floor(m /. scale +. 0.000001)) end
+
+  -- The sea stands 40 m up. [sea] is whole metres; [sea_v] the same in voxels.
+  pfn sea() : Int do 40 end
+  pfn sea_v(scale : Float) : Int do vox(int_to_float(sea()), scale) end
+
+  doc "The natural ground height in metres at (xm, zm), lakes not included."
+  fn height_m(xm : Float, zm : Float, seed : Int) : Float do
+    let base = unit_noise(Strata.Seed.mix(seed, 1), 0.005, xm, zm)
+    let hills = unit_noise(Strata.Seed.mix(seed, 2), 0.021, xm, zm)
+    let ridge = Ns.sample2(ridge_s(), Strata.Seed.mix(seed, 3), 0.009, xm, zm)
+    let mount = clamp01((base -. 0.5) *. 4.0)
+    22.0 +. base *. 34.0 +. hills *. 12.0 +. ridge *. mount *. 52.0
+  end
+
+  doc "The natural ground height in whole metres at whole-metre column (wx, wz): the viewer's scripted scenes work in 1 m voxels."
+  fn height(wx : Int, wz : Int, seed : Int) : Int do
+    float_to_int(height_m(int_to_float(wx), int_to_float(wz), seed))
   end
 
   -- ── Lakes above sea level ────────────────────────────────────────────────
-  -- The map is cut into squares 192 voxels on a side (six chunks). A square
-  -- whose chosen centre stands between heights 50 and 68 holds a round lake:
-  -- a flat-bedded basin 5 to 8 deep, filled to one below the centre's height,
-  -- inside a rim three voxels wide raised to at least one above the water.
+  -- The map is cut into squares 192 m on a side (six chunks at 1 m a voxel).
+  -- A square whose chosen centre stands between 50 and 68 m holds a round
+  -- lake: a flat-bedded basin 5 to 8 m deep, filled to one metre below the
+  -- centre's height, inside a rim three metres wide raised to at least one
+  -- above the water. Lake figures are whole metres.
   pfn fdiv(a : Int, b : Int) : Int do if a >= 0 do a / b else 0 - ((b - 1 - a) / b) end end
 
-  doc "The lake of map square (gx, gz): (centre x, centre z, radius, water line). A radius of 0 means the square has none."
+  doc "The lake of map square (gx, gz): (centre x, centre z, radius, water line), whole metres. A radius of 0 means the square has none."
   fn lake_of(gx : Int, gz : Int, seed : Int) : (Int, Int, Int, Int) do
-    let cx = gx * 192 + 40 + float_to_int(Ns.hash2(gx, gz, seed + 1301) *. 112.0)
-    let cz = gz * 192 + 40 + float_to_int(Ns.hash2(gx, gz, seed + 1302) *. 112.0)
+    let cx = gx * 192 + 40 + float_to_int(roll(gx, gz, seed, 22) *. 112.0)
+    let cz = gz * 192 + 40 + float_to_int(roll(gx, gz, seed, 23) *. 112.0)
     let hc = height(cx, cz, seed)
-    if hc < 50 || hc > 68 do (cx, cz, 0, 0) else (cx, cz, 14 + float_to_int(Ns.hash2(gx, gz, seed + 1300) *. 14.99), hc - 1) end
+    if hc < 50 || hc > 68 do (cx, cz, 0, 0) else (cx, cz, 14 + float_to_int(roll(gx, gz, seed, 24) *. 14.99), hc - 1) end
   end
 
-  doc "How deep a lake of radius [rad] is: its bed is flat, 5 to 8 voxels under the water line."
+  doc "How deep a lake of radius [rad] is, in metres: its bed is flat, 5 to 8 m under the water line."
   fn lake_depth(rad : Int) : Int do 3 + rad / 5 end
 
   -- A column's ground height once its square's lake is taken into account,
-  -- and the lake's water line over it (0 where there is no lake water).
-  pfn lake_column(lk : (Int, Int, Int, Int), x : Int, z : Int, h : Int) : (Int, Int) do
+  -- and the lake's water line over it (0 where there is no lake water), both
+  -- in voxels of [scale] metres. (xm, zm) is the column's place and hm its
+  -- natural ground height, in metres.
+  pfn lake_column(lk : (Int, Int, Int, Int), xm : Float, zm : Float, hm : Float, scale : Float) : (Int, Int) do
     match lk do
       (cx, cz, rad, line) ->
-        let d2 = (x - cx) * (x - cx) + (z - cz) * (z - cz)
-        if rad == 0 || d2 > (rad + 3) * (rad + 3) do (h, 0)
-        else if d2 > rad * rad do (if h > line + 1 do h else line + 1 end, 0)
+        let dx = xm -. int_to_float(cx)
+        let dz = zm -. int_to_float(cz)
+        let d2 = dx *. dx +. dz *. dz
+        let r = int_to_float(rad)
+        let l = int_to_float(line)
+        if rad == 0 || d2 > (r +. 3.0) *. (r +. 3.0) do (vox(hm, scale), 0)
+        else if d2 > r *. r do (vox(if hm > l +. 1.0 do hm else l +. 1.0 end, scale), 0)
         else
-          (line - lake_depth(rad), line)
+          (vox(l -. int_to_float(lake_depth(rad)), scale), vox(l, scale))
         end end
     end
   end
 
-  doc "The ground height at a column, lakes included."
+  doc "The ground height in whole metres at a whole-metre column, lakes included."
   fn ground(wx : Int, wz : Int, seed : Int) : Int do
-    match lake_column(lake_of(fdiv(wx, 192), fdiv(wz, 192), seed), wx, wz, height(wx, wz, seed)) do (h, _) -> h end
+    let xm = int_to_float(wx)
+    let zm = int_to_float(wz)
+    match lake_column(lake_of(fdiv(wx, 192), fdiv(wz, 192), seed), xm, zm, height_m(xm, zm, seed), 1.0) do (h, _) -> h end
   end
 
   -- a chunk's 32 x 32 ground heights, and its lake water lines
   type Columns = Columns(NativeIntArr, NativeIntArr)
-  pfn heights_go(hs : NativeIntArr, ws : NativeIntArr, lk : (Int, Int, Int, Int), x0 : Int, z0 : Int, seed : Int, i : Int) : Columns do
+  pfn heights_go(hs : NativeIntArr, ws : NativeIntArr, lk : (Int, Int, Int, Int), x0 : Int, z0 : Int, seed : Int, scale : Float, i : Int) : Columns do
     if i >= 1024 do Columns(hs, ws)
     else
-      match lake_column(lk, x0 + i % 32, z0 + i / 32, height(x0 + i % 32, z0 + i / 32, seed)) do
-        (h, line) -> heights_go(NativeArray.set_int(hs, i, h), NativeArray.set_int(ws, i, line), lk, x0, z0, seed, i + 1)
+      let xm = int_to_float(x0 + i % 32) *. scale
+      let zm = int_to_float(z0 + i / 32) *. scale
+      match lake_column(lk, xm, zm, height_m(xm, zm, seed), scale) do
+        (h, line) -> heights_go(NativeArray.set_int(hs, i, h), NativeArray.set_int(ws, i, line), lk, x0, z0, seed, scale, i + 1)
       end
     end
   end
@@ -182,34 +223,38 @@ mod StrataViewer do
     if i >= 1024 do m else max_go(hs, i + 1, if NativeArray.get_int(hs, i) > m do NativeArray.get_int(hs, i) else m end) end
   end
 
-  pfn has_post(wx : Int, wz : Int, h : Int, seed : Int) : Bool do
-    h > sea() + 1 && h <= 72 && Ns.hash2(wx, wz, seed + 710) > 0.994
+  -- hm is a column's ground height in metres; grass grows between one metre over the sea and 72 m
+  pfn grassy(hm : Float) : Bool do hm > int_to_float(sea()) +. 1.0 && hm <= 72.0 end
+
+  pfn has_post(wx : Int, wz : Int, hm : Float, seed : Int) : Bool do
+    grassy(hm) && roll(wx, wz, seed, 25) > 0.994
   end
 
-  pfn block_at(wx : Int, wy : Int, wz : Int, h : Int, line : Int, seed : Int) : Int do
+  pfn block_at(wx : Int, wy : Int, wz : Int, h : Int, line : Int, sv : Int, scale : Float, seed : Int) : Int do
+    let hm = int_to_float(h) *. scale
     -- a lake column: full lake water over a sandy bed
     if line > 0 do (if wy > h do (if wy <= line do lake_base() + 7 else 0 end) else if wy >= h - 3 do 4 else 1 end end)
     else
     -- a lantern post on a few grass columns, tall grass on about a seventh of the rest
-    if wy == h + 1 && has_post(wx, wz, h, seed) do 12
-    else if wy == h + 1 && h > sea() + 1 && h <= 72 && Ns.hash2(wx, wz, seed + 700) > 0.86 do 11
-    else if wy > h do (if wy <= sea() do 5 else 0 end)
-    else if wy == h do (if h <= sea() + 1 do 4 else if h > 84 do (if Ns.fbm(int_to_float(wx) *. 0.06, int_to_float(wz) *. 0.06, seed + 900) > 0.62 do 13 else 6 end) else if h > 72 do 1 else 3 end end end)
-    else if wy >= h - 3 do (if h <= sea() + 1 do 4 else if h > 72 do 1 else 2 end end)
+    if wy == h + 1 && has_post(wx, wz, hm, seed) do 12
+    else if wy == h + 1 && grassy(hm) && roll(wx, wz, seed, 26) > 0.86 do 11
+    else if wy > h do (if wy <= sv do 5 else 0 end)
+    else if wy == h do (if hm <= int_to_float(sea()) +. 1.0 do 4 else if hm > 84.0 do (if unit_noise(Strata.Seed.mix(seed, 27), 0.06, int_to_float(wx) *. scale, int_to_float(wz) *. scale) > 0.62 do 13 else 6 end) else if hm > 72.0 do 1 else 3 end end end)
+    else if wy >= h - 3 do (if hm <= int_to_float(sea()) +. 1.0 do 4 else if hm > 72.0 do 1 else 2 end end)
     else 1 end end end end end
     end
   end
 
-  pfn ground_go(a : NativeI32Arr, hs : NativeIntArr, ws : NativeIntArr, x0 : Int, y0 : Int, z0 : Int, seed : Int, i : Int) : NativeI32Arr do
+  pfn ground_go(a : NativeI32Arr, hs : NativeIntArr, ws : NativeIntArr, x0 : Int, y0 : Int, z0 : Int, sv : Int, scale : Float, seed : Int, i : Int) : NativeI32Arr do
     if i >= 32768 do a
-    else ground_go(NativeArray.set_i32(a, i, block_at(x0 + i % 32, y0 + i / 1024, z0 + (i / 32) % 32, NativeArray.get_int(hs, i % 1024), NativeArray.get_int(ws, i % 1024), seed)), hs, ws, x0, y0, z0, seed, i + 1) end
+    else ground_go(NativeArray.set_i32(a, i, block_at(x0 + i % 32, y0 + i / 1024, z0 + (i / 32) % 32, NativeArray.get_int(hs, i % 1024), NativeArray.get_int(ws, i % 1024), sv, scale, seed)), hs, ws, x0, y0, z0, sv, scale, seed, i + 1) end
   end
 
   -- A tree stands on a grass column well inside the chunk's footprint, so
   -- its canopy never crosses a chunk's sides; it may cross the top, and each
   -- chunk in the column draws the part of it that falls in its own y range.
-  pfn has_tree(wx : Int, wz : Int, h : Int, seed : Int) : Bool do
-    h > sea() + 1 && h <= 72 && Ns.hash2(wx, wz, seed + 500) > 0.988
+  pfn has_tree(wx : Int, wz : Int, hm : Float, seed : Int) : Bool do
+    grassy(hm) && roll(wx, wz, seed, 21) > 0.988
   end
 
   pfn put(a : NativeI32Arr, x : Int, wy : Int, z : Int, y0 : Int, id : Int, over : Bool) : NativeI32Arr do
@@ -238,31 +283,34 @@ mod StrataViewer do
     if wy > top do a else trunk_go(put(a, x, wy, z, y0, 7, true), x, z, wy + 1, top, y0) end
   end
 
-  pfn trees_go(a : NativeI32Arr, hs : NativeIntArr, ws : NativeIntArr, x0 : Int, y0 : Int, z0 : Int, seed : Int, i : Int) : NativeI32Arr do
+  pfn trees_go(a : NativeI32Arr, hs : NativeIntArr, ws : NativeIntArr, x0 : Int, y0 : Int, z0 : Int, scale : Float, seed : Int, i : Int) : NativeI32Arr do
     if i >= 1024 do a
     else
       let x = i % 32
       let z = i / 32
       let h = NativeArray.get_int(hs, i)
-      if x >= 2 && x <= 29 && z >= 2 && z <= 29 && NativeArray.get_int(ws, i) == 0 && has_tree(x0 + x, z0 + z, h, seed) do
+      if x >= 2 && x <= 29 && z >= 2 && z <= 29 && NativeArray.get_int(ws, i) == 0 && has_tree(x0 + x, z0 + z, int_to_float(h) *. scale, seed) do
         let top = h + 5
-        trees_go(trunk_go(canopy_go(a, x, z, top, y0, 0), x, z, h + 1, top, y0), hs, ws, x0, y0, z0, seed, i + 1)
-      else trees_go(a, hs, ws, x0, y0, z0, seed, i + 1) end
+        trees_go(trunk_go(canopy_go(a, x, z, top, y0, 0), x, z, h + 1, top, y0), hs, ws, x0, y0, z0, scale, seed, i + 1)
+      else trees_go(a, hs, ws, x0, y0, z0, scale, seed, i + 1) end
     end
   end
 
-  doc "The chunk at chunk coordinates (cx, cy, cz) for [seed]. Pure: the same inputs give the same chunk."
-  fn terrain(cx : Int, cy : Int, cz : Int, seed : Int) : Strata.Chunk.Chunk do
+  doc "The chunk at chunk coordinates (cx, cy, cz) for [seed], in a world of [scale] metres a voxel. Pure: the same inputs give the same chunk."
+  fn terrain(scale : Float, cx : Int, cy : Int, cz : Int, seed : Int) : Strata.Chunk.Chunk do
     let y0 = cy * 32
-    match heights_go(NativeArray.make_int(1024, 0), NativeArray.make_int(1024, 0), lake_of(fdiv(cx * 32, 192), fdiv(cz * 32, 192), seed), cx * 32, cz * 32, seed, 0) do
+    let sv = sea_v(scale)
+    -- the lake squares are 192 m, so the square of a chunk's corner is found in metres
+    let lk = lake_of(fdiv(float_to_int(Math.floor(int_to_float(cx * 32) *. scale)), 192), fdiv(float_to_int(Math.floor(int_to_float(cz * 32) *. scale)), 192), seed)
+    match heights_go(NativeArray.make_int(1024, 0), NativeArray.make_int(1024, 0), lk, cx * 32, cz * 32, seed, scale, 0) do
       Columns(hs, ws) ->
         let lo = min_go(hs, 0, 100000)
         let hi = max_go(hs, 0, -100000)
-        let wet = max_go(ws, 0, sea())
+        let wet = max_go(ws, 0, sv)
         let roof = (if hi > wet do hi else wet end) + 8
         if y0 > roof do Ch.uniform(0)
         else if y0 + 31 < lo - 3 do Ch.uniform(1)
-        else Ch.from_flat(trees_go(ground_go(NativeArray.make_i32(32768, 0), hs, ws, cx * 32, y0, cz * 32, seed, 0), hs, ws, cx * 32, y0, cz * 32, seed, 0)) end end
+        else Ch.from_flat(trees_go(ground_go(NativeArray.make_i32(32768, 0), hs, ws, cx * 32, y0, cz * 32, sv, scale, seed, 0), hs, ws, cx * 32, y0, cz * 32, scale, seed, 0)) end end
     end
   end
 
@@ -610,7 +658,7 @@ mod StrataViewer do
       let x = i % 128 - 64
       let z = i / 128 - 64
       let h = height(x, z, seed)
-      if has_post(x, z, h, seed) && !has_tree(x, z, h, seed) do (x, z) else first_post(seed, i + 1) end
+      if has_post(x, z, int_to_float(h), seed) && !has_tree(x, z, int_to_float(h), seed) do (x, z) else first_post(seed, i + 1) end
     end
   end
 
@@ -708,7 +756,7 @@ mod StrataViewer do
       let ez = match start do (_, _, z, _, _) -> z end
       let yaw0 = match start do (_, _, _, a, _) -> a end
       let pitch0 = match start do (_, _, _, _, a) -> a end
-      let world = Strata.World.new(reg, Strata.Terrain.gen(fn (k, sd) -> terrain(Strata.Coord.kx(k), Strata.Coord.ky(k), Strata.Coord.kz(k), sd)), seed, 1.0)
+      let world = Strata.World.new(reg, Strata.Terrain.gen(fn (k, sd) -> terrain(1.0, Strata.Coord.kx(k), Strata.Coord.ky(k), Strata.Coord.kz(k), sd)), seed, 1.0)
       let t0 = Strata.Ffi.Vk.time()
       let s0 = Strata.Stream.run_until_settled(Strata.Stream.set_focus(Strata.Stream.start(world, Strata.Stream.config(r, 3, 32, 8)), Cons((ex, ey, ez), Nil)), 1000000)
       let t1 = Strata.Ffi.Vk.time()
