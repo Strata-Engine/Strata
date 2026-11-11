@@ -84,6 +84,7 @@ ui-scale-2:STRATA_SCENE=1 STRATA_LIGHT=4 STRATA_UI=1 STRATA_UI_SCALE=200 DRAWS=6
 ui-flood:STRATA_SCENE=1 STRATA_UI=1 STRATA_UI_SHOW=1 DRAWS=6 SAYS=ui:_dropped_3616_quads
 ui-frames:STRATA_SCENE=1 STRATA_UI=1 STRATA_UI_SHOW=2 DRAWS=6 STRICT=1
 text-sheet:STRATA_SCENE=1 STRATA_UI=1 STRATA_UI_SHOW=3 DRAWS=6 STRICT=1
+text-styles:STRATA_SCENE=1 STRATA_LIGHT=4 STRATA_UI=1 STRATA_UI_SHOW=4 DRAWS=6 STRICT=1
 '
 # indirect draw calls a frame must issue, whatever the scene holds; a scene
 # with a kind of geometry nowhere in it says DRAWS=n. STRICT=1 holds a scene

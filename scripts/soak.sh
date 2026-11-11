@@ -1,5 +1,5 @@
 #!/bin/sh
-# A long scripted flight with streaming, edits and moving water: 3000 frames
+# A long scripted flight with streaming, edits, moving water and the display on: 3000 frames
 # round a lake that is breached at frame 300, a sphere carved every 100. Asserts nothing was refused, nothing is
 # left waiting, no buffer space was lost, the quad buffer did not grow
 # without bound, and no frame took over 20 ms (the target is 16.7; the
@@ -14,7 +14,7 @@ cd "$(dirname "$0")/.." || exit 1
 QUADS="${1:-0}"
 # Offscreen unless told otherwise: with the display asleep or the window hidden,
 # MoltenVK holds a presented frame for a whole second, which is no fault of the engine.
-out=$(env MARCH_PIN_MAIN=1 STRATA_HIDDEN="${STRATA_HIDDEN:-1}" STRATA_OFFSCREEN="${STRATA_OFFSCREEN:-1}" STRATA_SOAK=3000 STRATA_BREACH=300 STRATA_QUADS="$QUADS" STRATA_SHOT=/dev/null ./viewer/.march/build/release/strata_viewer 2>&1)
+out=$(env MARCH_PIN_MAIN=1 STRATA_HIDDEN="${STRATA_HIDDEN:-1}" STRATA_OFFSCREEN="${STRATA_OFFSCREEN:-1}" STRATA_UI=1 STRATA_SOAK=3000 STRATA_BREACH=300 STRATA_QUADS="$QUADS" STRATA_SHOT=/dev/null ./viewer/.march/build/release/strata_viewer 2>&1)
 line=$(echo "$out" | grep '^soak:')
 lake_start=$(echo "$out" | sed -n 's/^soak-lake: lake_start=\([0-9]*\).*/\1/p')
 [ -n "$line" ] || { echo "FAIL: the viewer printed no soak line"; exit 1; }
@@ -27,6 +27,10 @@ if [ "$QUADS" = "0" ]; then
   [ "$(get waiting)" = "0" ] || { echo "FAIL: uploads still waiting"; fail=1; }
   [ "$(get refused)" = "0" ] || { echo "FAIL: uploads were refused with the default buffer"; fail=1; }
 fi
+# the display is on, with a readout that changes every frame
+[ "$(get ui_dropped)" = "0" ] || { echo "FAIL: the 2D layer dropped quads"; fail=1; }
+[ "$(get text_waiting)" = "0" ] || { echo "FAIL: glyphs were still waiting at the end"; fail=1; }
+[ "$(get atlas_bytes)" -le 16777216 ] || { echo "FAIL: the glyph atlas is over 16 MB"; fail=1; }
 [ "$(get leaked)" = "0" ] || { echo "FAIL: an allocator lost buffer space"; fail=1; }
 # the circuit keeps a steady view, so what the GPU holds must stay near what it started with
 [ "$(get live_quads)" -le 1500000 ] || { echo "FAIL: the quad buffer grew without bound"; fail=1; }

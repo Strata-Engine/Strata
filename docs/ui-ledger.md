@@ -45,3 +45,14 @@ Plan: `docs/2026-11-11-ui-text-plan.md`. Branch `interface`, cut from `swim`
   font, text, wrap and alignment. Cost if wrong: none seen.
 - Tasks 1 and 4: complete. C tests 72 checks; viewer tests 28; verify PASS.
   Frames 58 and 59 of the text sheet are identical.
+- Finding: two externs with one March name in different modules are one
+  function (GAPS S17). The text module's counts came back as the renderer's
+  draw-call count until the names were made unique.
+- Task 7's scenes and Task 8's soak and timings done ahead of Tasks 5 and 6,
+  which wait for HarfBuzz. Soak with the display on: nothing dropped, no
+  glyph waiting, atlas 4 MB; worst frame 9.5, 30.1 and 12.4 ms in three runs
+  on a machine with a load average of 13 to 15 (the limit is 20).
+- Measured: the timing display (200 rectangles, ten lines, about 520 glyph
+  quads) is built and handed over in 0.09 ms unchanged, 0.11 ms when every
+  line changes each frame. The viewer's display adds 0.03 ms of GPU time at
+  2560 x 1600 and one draw call.

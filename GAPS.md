@@ -111,3 +111,12 @@ which a consumer's C does not include. Workaround: `native/strata_text.c`
 carries its own copy of the decoding (`mstr`). It breaks if the runtime's
 string layout changes; `viewer/test/text_test.march` ("Strings reach C")
 would catch it, with short, long and built strings.
+
+## S17: two modules' externs with the same March name are one function
+
+`Strata.Ffi.Vk` and `Strata.Ffi.Text` each declared a private extern named
+`x_stat`, bound to different C symbols (`sv_stat`, `stm_stat`). Calls
+through `Strata.Ffi.Text.stat` reached `sv_stat`: the text module's glyph
+counts came back as the renderer's draw-call count. Nothing warned.
+Workaround: extern names are unique across the whole library (`xt_` in the
+text bindings).
