@@ -111,6 +111,28 @@ viewer feeds it from the fluid's events.
 ![A breached lake draining](docs/fluid-lake.png)
 ![The same breach from below](docs/fluid-waterfall.png)
 
+### In the water
+
+A game asks the fluid three things, and tells the renderer one.
+
+    Strata.Fluid.depth_in(f, w, x0, y0, z0, x1, y1, z1)   -- how much of a box is under liquid, 0 to 1
+    Strata.Fluid.flow(f, w, x, y, z)                      -- which way the liquid at a cell moves, and how hard
+    Strata.Fluid.surface(f, w, x, y, z)                   -- the height of the top of the liquid over a cell
+    Strata.Render.set_underwater(surface_y, r, g, b, density)
+    Strata.Render.clear_underwater()
+
+Strata has no player. The viewer's body (`viewer/lib/walker.march`,
+`step_in`) shows one way to use the answers: it floats with its head out,
+swims up while jump is held, moves slower in water than on land, climbs out
+at a bank, and is carried by flowing water toward a drop or a sink.
+
+While the eye is under liquid the renderer shows the world through it:
+distance fades into the liquid's colour, light dims and turns blue with
+depth, the sun ripples on what it reaches, the surface overhead is a bright
+window onto the sky with a mirror beyond it, and the view sways. This needs
+light mode 1 or higher. There are no bubbles, no drifting specks and no
+sound.
+
 ## Using it from a game
 
     [deps]

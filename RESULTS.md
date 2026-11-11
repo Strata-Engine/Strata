@@ -504,3 +504,32 @@ had a worst frame of 18.8 ms.
 Not checked: stillness of lit water at rest, because water ripples by
 design; whether many overlapping spray particles, each tracing two rays,
 cost too much in a large waterfall.
+
+# In the water
+
+Swimming and an underwater look, on branch `swim`.
+
+- `Strata.Fluid.depth_in`, `flow` and `surface` answer what a game needs to
+  move a body in water. The viewer's body floats, swims up, climbs out at a
+  bank, is slower in water and is carried by a current.
+- `Strata.Render.set_underwater` shows the world through the liquid: fog in
+  its colour, less light with depth, sun ripples, the surface from below,
+  a swaying view.
+- Three new golden scenes: `under-sea`, `under-sea-up`, `under-lake`.
+
+Measured at 2560 x 1600 on a loaded machine (load average 46), so the
+numbers are rough.
+
+| view | GPU ms |
+|---|---|
+| under the sea, looking across | 3.1 |
+| under the sea, looking up | 0.4 |
+| the shore from above, for comparison | 7.0 |
+
+Not done: bubbles, drifting specks, sound, a water line across the screen
+when the eye sits exactly at the surface. The current was tested on a body
+in a test world, not judged by playing.
+
+![Under the sea](docs/underwater-sea.png)
+![Looking up](docs/underwater-up.png)
+![On the lake bed](docs/underwater-lake.png)

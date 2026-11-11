@@ -27,7 +27,7 @@
 /* Rewritten by build_shaders.sh whenever the shaders change: forge decides
  * whether to recompile this file from its text alone, not from the headers
  * it includes (GAPS S14). */
-#define STRATA_SHADERS_STAMP "29947aeee4f4c013"
+#define STRATA_SHADERS_STAMP "f49b15817fd8e3c9"
 #include "strata_shaders.h"
 #include "strata_spray.h"
 #include "strata_alloc.h"
@@ -193,7 +193,8 @@ static struct {
 /* The uniform block, in floats (native/shaders/ubo.glsl): vp 0, sun 16,
  * sky 20, fog 24, eye 28, misc 32 (ints), inv_vp 36, prev_vp 52, light 68,
  * sun colour 72, light volume size 76 (ints). */
-#define UBO_FLOATS 88
+#define UBO_FLOATS 96
+#define UBO_WATER 88           /* two vec4: the liquid the eye is in (rgb, and how fast it swallows light; 0: none), and its surface height */
 #define UBO_EDIT 80            /* two vec4: the low and high corners (voxels) of what an edit just changed; the first w is 1 while it settles */
 #define UBO_VOL 76             /* ints: the light volume's size in chunks */
 #define UBO_INV_VP 36
@@ -1564,6 +1565,16 @@ void sv_set_fog(double start, double end, double cam_x, double cam_y) {
     (void)cam_x; (void)cam_y;
     if (!g.ok) return;
     g.ubo_map[24] = (float)start; g.ubo_map[25] = (float)end;
+}
+/* The eye is under liquid whose surface is at [surface_y] metres: the world
+ * is seen through it, in its colour (linear rgb), fading with distance at
+ * [density] per metre, and lit less the deeper it is. A density of 0 means
+ * the eye is in air. */
+void sv_set_underwater(double surface_y, double r, double gr, double b, double density) {
+    if (!g.ok) return;
+    float *wt = g.ubo_map + UBO_WATER;
+    wt[0] = (float)r; wt[1] = (float)gr; wt[2] = (float)b; wt[3] = density > 0.0 ? (float)density : 0.0f;
+    wt[4] = (float)surface_y; wt[5] = 0.0f; wt[6] = 0.0f; wt[7] = 0.0f;
 }
 void sv_set_eye(double x, double y, double z, double scale) {
     if (!g.ok) return;

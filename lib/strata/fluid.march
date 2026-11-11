@@ -794,6 +794,108 @@ mod Strata.Fluid do
     end
   end
 
+  -- ── Questions a game asks ────────────────────────────────────────────────
+  -- A body that swims needs to know how deep it stands in liquid and which
+  -- way the liquid is moving. Both are read straight from the world: the
+  -- fluid keeps no record of flow. Coordinates are in voxels.
+
+  -- How high the liquid in a cell stands above the cell's floor, in eighths:
+  -- a flowing fluid's fill (8 with the same fluid above it), 8 for a sink,
+  -- 0 for anything else.
+  pfn liquid(f : Fluid, w : Strata.World.World, x : Int, y : Int, z : Int) : Int do
+    match f do
+      Fluid(r, fl, sk, _, _, _, _, _, _, _, _) ->
+        let id = Wq.get_block(w, x, y, z)
+        if id == 0 do 0
+        else if has_int(sk, Bq.base_of(r, id)) do 8
+        else
+          let base = Bq.fluid_base(r, id)
+          if base < 0 || !has_int(fl, base) do 0
+          else if Bq.fluid_base(r, Wq.get_block(w, x, y + 1, z)) == base do 8
+          else Bq.fill(r, id) end end
+        end end
+    end
+  end
+
+  pfn overlap(a0 : Float, a1 : Float, b0 : Float, b1 : Float) : Float do
+    let lo = if a0 > b0 do a0 else b0 end
+    let hi = if a1 < b1 do a1 else b1 end
+    if hi > lo do hi -. lo else 0.0 end
+  end
+
+  pfn under_go(f : Fluid, w : Strata.World.World, x0 : Float, y0 : Float, z0 : Float, x1 : Float, y1 : Float, z1 : Float, cx0 : Int, cz0 : Int, cx1 : Int, cy1 : Int, cz1 : Int, x : Int, y : Int, z : Int, acc : Float) : Float do
+    if y > cy1 do acc
+    else if z > cz1 do under_go(f, w, x0, y0, z0, x1, y1, z1, cx0, cz0, cx1, cy1, cz1, cx0, y + 1, cz0, acc)
+    else if x > cx1 do under_go(f, w, x0, y0, z0, x1, y1, z1, cx0, cz0, cx1, cy1, cz1, cx0, y, z + 1, acc)
+    else
+      let l = liquid(f, w, x, y, z)
+      let part = if l == 0 do 0.0
+        else overlap(x0, x1, int_to_float(x), int_to_float(x + 1)) *. overlap(z0, z1, int_to_float(z), int_to_float(z + 1)) *. overlap(y0, y1, int_to_float(y), int_to_float(y) +. int_to_float(l) /. 8.0) end
+      under_go(f, w, x0, y0, z0, x1, y1, z1, cx0, cz0, cx1, cy1, cz1, x + 1, y, z, acc +. part)
+    end end end
+  end
+
+  doc "How much of the box with corners (x0, y0, z0) and (x1, y1, z1), in voxels, is under liquid: 0 for none of it, 1 for all. Flowing fluids count by how full each cell is; a sink (a sea) counts as full."
+  fn depth_in(f : Fluid, w : Strata.World.World, x0 : Float, y0 : Float, z0 : Float, x1 : Float, y1 : Float, z1 : Float) : Float do
+    let vol = (x1 -. x0) *. (y1 -. y0) *. (z1 -. z0)
+    if vol <= 0.0 do 0.0
+    else
+      let cx0 = float_to_int(Math.floor(x0))
+      let cz0 = float_to_int(Math.floor(z0))
+      under_go(f, w, x0, y0, z0, x1, y1, z1, cx0, cz0, float_to_int(Math.floor(x1 -. 0.00001)), float_to_int(Math.floor(y1 -. 0.00001)), float_to_int(Math.floor(z1 -. 0.00001)), cx0, float_to_int(Math.floor(y0)), cz0, 0.0) /. vol
+    end
+  end
+
+  pfn surface_go(f : Fluid, w : Strata.World.World, x : Int, y : Int, z : Int, n : Int) : Float do
+    let l = liquid(f, w, x, y, z)
+    if l == 0 do int_to_float(y)
+    else if l < 8 || n <= 0 do int_to_float(y) +. int_to_float(l) /. 8.0
+    else surface_go(f, w, x, y + 1, z, n - 1) end end
+  end
+
+  doc "The height, in voxels, of the liquid surface over the cell (x, y, z): the top of the column of liquid the cell is in, looking up at most 64 cells. Far below zero (-1000000) when the cell holds no liquid."
+  fn surface(f : Fluid, w : Strata.World.World, x : Int, y : Int, z : Int) : Float do
+    if liquid(f, w, x, y, z) == 0 do -1000000.0 else surface_go(f, w, x, y, z, 64) end
+  end
+
+  -- The pull toward a side neighbour, for a cell of family [base] standing
+  -- [l] eighths high: 2 toward a drop (an empty cell with room under it) or a sink,
+  -- the difference in eighths toward lower fluid or empty ground, less than
+  -- nothing toward higher fluid, nothing toward a wall.
+  pfn pull(f : Fluid, w : Strata.World.World, base : Int, l : Int, x : Int, y : Int, z : Int) : Float do
+    match f do
+      Fluid(r, _, sk, _, _, _, _, _, _, _, _) ->
+        let id = Wq.get_block(w, x, y, z)
+        if !Wq.is_loaded(w, Kq.key_of_voxel(x, y, z)) do 0.0
+        else if Bq.fluid_base(r, id) == base do int_to_float(l - liquid(f, w, x, y, z)) /. 8.0
+        else if has_int(sk, Bq.base_of(r, id)) do 2.0
+        else if id != 0 && Bq.collides(r, id) do 0.0
+        else
+          let under = Wq.get_block(w, x, y - 1, z)
+          if under == 0 || has_int(sk, Bq.base_of(r, under)) || (Bq.fluid_base(r, under) == base && Bq.fill(r, under) < 8) do 2.0
+          else int_to_float(l) /. 8.0 end
+        end end end end
+    end
+  end
+
+  doc "Which way, and how strongly, the fluid in cell (x, y, z) is moving, as a vector: toward lower fluid and, twice as hard, toward drops; each component about -2 to 2, and (0, -1, 0) for fluid that is falling. Zero for still water, for a sink, and for a cell with no flowing fluid. A game multiplies it by how hard its water should push."
+  fn flow(f : Fluid, w : Strata.World.World, x : Int, y : Int, z : Int) : (Float, Float, Float) do
+    match f do
+      Fluid(r, fl, sk, _, _, _, _, _, _, _, _) ->
+        let id = Wq.get_block(w, x, y, z)
+        let base = Bq.fluid_base(r, id)
+        if base < 0 || !has_int(fl, base) do (0.0, 0.0, 0.0)
+        else
+          let under = Wq.get_block(w, x, y - 1, z)
+          if Wq.is_loaded(w, Kq.key_of_voxel(x, y - 1, z)) && (under == 0 || has_int(sk, Bq.base_of(r, under)) || (Bq.fluid_base(r, under) == base && Bq.fill(r, under) < 8) || (under != 0 && !Bq.is_fluid(r, under) && !Bq.collides(r, under))) do (0.0, -1.0, 0.0)
+          else
+            let l = liquid(f, w, x, y, z)
+            (pull(f, w, base, l, x + 1, y, z) -. pull(f, w, base, l, x - 1, y, z), 0.0, pull(f, w, base, l, x, y, z + 1) -. pull(f, w, base, l, x, y, z - 1))
+          end
+        end
+    end
+  end
+
   pfn amount_go(w : Strata.World.World, r : Strata.Blocks.Registry, x0 : Int, z0 : Int, x1 : Int, y1 : Int, z1 : Int, x : Int, y : Int, z : Int, acc : Int) : Int do
     if y > y1 do acc
     else if z > z1 do amount_go(w, r, x0, z0, x1, y1, z1, x0, y + 1, z0, acc)
