@@ -27,7 +27,7 @@
 /* Rewritten by build_shaders.sh whenever the shaders change: forge decides
  * whether to recompile this file from its text alone, not from the headers
  * it includes (GAPS S14). */
-#define STRATA_SHADERS_STAMP "fb604ad0569f3c4e"
+#define STRATA_SHADERS_STAMP "216343689353c90b"
 #include "strata_shaders.h"
 #include "strata_alloc.h"
 
@@ -116,6 +116,7 @@ static struct {
     Target hist[SV_FRAMES], hmeta[SV_FRAMES];
     int hist_reset;                /* frames left in which that memory must not be read (fresh images) */
     VkSampler nearest;             /* for reading the frame's own images, texel for texel */
+    int sky_rays, reflections;     /* light quality: sky rays a pixel a sample, 0..8; mirror rays on or off */
     int light_mode;                /* 0: the pre-ray-tracing shading, through the deferred passes */
     /* The light volume: a light class per voxel for every chunk held, the
      * coarse copy (how high each 8-voxel cell's contents reach), and which chunk each cell holds. */
@@ -984,6 +985,7 @@ int64_t sv_open(int64_t w, int64_t h, int64_t capture_mouse, int64_t quad_capaci
     if (!make_buffer((VkDeviceSize)g.quad_cap * 8, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, &g.giga, &g.giga_mem, &map)) return 0;
     g.giga_map = map;
     g.ubo_map = calloc(UBO_FLOATS, sizeof(float));
+    g.sky_rays = 2; g.reflections = 1;
     if (g.ubo_map) {
         /* light mode 0's flat sky (sRGB 0.53, 0.72, 0.92) and ambient share; a sun until the game sets one */
         g.ubo_map[19] = 0.30f;
@@ -1447,6 +1449,12 @@ static void invert4(const float *m, float *out) {
 /* How the light pass shades: 0 is the renderer's shading from before ray
  * tracing, carried through the deferred passes. */
 void sv_set_lighting(int64_t mode) { g.light_mode = (int)mode; }
+/* Light quality: sky rays traced per pixel each time it samples (0..8; 0
+ * falls back to a flat sky term), and whether smooth surfaces trace mirrors. */
+void sv_set_quality(int64_t sky_rays, int64_t reflections) {
+    g.sky_rays = sky_rays < 0 ? 0 : (sky_rays > 8 ? 8 : (int)sky_rays);
+    g.reflections = reflections != 0;
+}
 /* The time, in seconds, that moving surface detail (water's ripples) runs on. */
 void sv_set_time(double seconds) { g.time_s = seconds; }
 
@@ -1555,12 +1563,13 @@ int64_t sv_frame(void) {
     memcpy(g.prev_vp, g.ubo_map, sizeof g.prev_vp);
     g.ubo_map[UBO_LIGHT + 0] = (float)g.light_mode; g.ubo_map[UBO_LIGHT + 1] = (float)g.time_s;
     g.ubo_map[UBO_LIGHT + 2] = (float)(g.frame_no & 0xFFFFFF);
+    g.ubo_map[UBO_LIGHT + 3] = (float)g.sky_rays; g.ubo_map[UBO_SUN_COLOR + 3] = (float)g.reflections;
     { int32_t *vol = (int32_t *)(g.ubo_map + UBO_VOL); vol[0] = g.vn; vol[1] = g.vnv; vol[2] = g.vn;
       /* how many past samples a pixel may lean on: none while the remembered
        * images are fresh, 2 while an edit that reaches the volume this frame
-       * settles, else 64 */
+       * settles, else 255 (sun visibility leans on 64 of them at most) */
       for (uint32_t i = 0; i < g.nlq && i < SV_LIGHT_PER_FRAME; i++) if (g.lq[i].edit) g.light_edit = 2;
-      vol[3] = g.hist_reset > 0 ? 0 : (g.light_edit > 0 ? 2 : 64);
+      vol[3] = g.hist_reset > 0 ? 0 : (g.light_edit > 0 ? 2 : 255);
       if (g.hist_reset > 0) g.hist_reset--;
       if (g.light_edit > 0) g.light_edit--; }
     /* this Frame's fence has been waited on, so the GPU is done with its

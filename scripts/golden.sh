@@ -58,6 +58,10 @@ reflect-lake:STRATA_SCENE=2 STRATA_LIGHT=3 STRATA_SUN=12
 reflect-glint:STRATA_SCENE=13 STRATA_LIGHT=3 STRATA_SUN=12
 reflect-down:STRATA_SCENE=14 STRATA_LIGHT=3 STRATA_SUN=35
 reflect-high:STRATA_SCENE=15 STRATA_LIGHT=3 STRATA_SUN=30 DRAWS=4
+full-forest:STRATA_SCENE=3 STRATA_LIGHT=4
+full-cave:STRATA_SCENE=16 STRATA_LIGHT=4
+full-lantern:STRATA_SCENE=17 STRATA_LIGHT=4 STRATA_SUN=-5
+full-overview:STRATA_SCENE=1 STRATA_LIGHT=4 STRATA_SUN=35
 '
 # indirect draw calls a frame must issue, whatever the scene holds; a scene
 # with a kind of geometry nowhere in it says DRAWS=n
@@ -69,7 +73,7 @@ for line in $(echo "$SCENES" | tr ' ' ','); do
   draws=$EXPECT_DRAWS
   for kv in $envs; do case "$kv" in GOLDEN_AS=*) stored="${kv#GOLDEN_AS=}";; DRAWS=*) draws="${kv#DRAWS=}";; esac; done
   shot="$OUT/$name.ppm"
-  if ! env MARCH_PIN_MAIN=1 STRATA_RADIUS=6 STRATA_SIZE=640x400 STRATA_FRAMES=60 STRATA_SHOT="$shot" $envs \
+  if ! env MARCH_PIN_MAIN=1 STRATA_RADIUS=6 STRATA_SIZE=640x400 STRATA_FRAMES=60 STRATA_LIGHT=0 STRATA_SHOT="$shot" $envs \
        ./viewer/.march/build/release/strata_viewer > "$OUT/$name.log" 2>&1 || [ ! -s "$shot" ]; then
     echo "FAIL: $name did not render"; tail -5 "$OUT/$name.log"; FAILED=1; continue
   fi
@@ -93,17 +97,19 @@ done
 # Frames 118 and 119 of the forest under shadows, from two runs of the same
 # deterministic sequence.
 if [ $UPDATE -eq 0 ]; then
-  for n in 121 122; do
-    env MARCH_PIN_MAIN=1 STRATA_RADIUS=6 STRATA_SIZE=640x400 STRATA_SCENE=3 STRATA_LIGHT=2 STRATA_FRAMES=$n STRATA_SHOT="$OUT/still$n.ppm" ./viewer/.march/build/release/strata_viewer > /dev/null 2>&1
+  for mode in 2 4; do
+    for n in 121 122; do
+      env MARCH_PIN_MAIN=1 STRATA_RADIUS=6 STRATA_SIZE=640x400 STRATA_SCENE=3 STRATA_LIGHT=$mode STRATA_FRAMES=$n STRATA_SHOT="$OUT/still$n.ppm" ./viewer/.march/build/release/strata_viewer > /dev/null 2>&1
+    done
+    if res=$($DIFF "$OUT/still121.ppm" "$OUT/still122.ppm" 4 0.05 2>&1); then echo "ok   stillness, light mode $mode: $res"
+    else echo "FAIL stillness, light mode $mode (frames 118 and 119): $res"; FAILED=1; fi
   done
-  if res=$($DIFF "$OUT/still121.ppm" "$OUT/still122.ppm" 4 0.05 2>&1); then echo "ok   stillness: $res"
-  else echo "FAIL stillness (frames 118 and 119): $res"; FAILED=1; fi
 fi
 # A nearly full quad buffer: a carve's new meshes are refused while the old
 # ones are still held, and must land on a later frame. The capacity is the
 # scene's own need plus a little, so the check follows the terrain.
 if [ $UPDATE -eq 0 ]; then
-  RUN="env MARCH_PIN_MAIN=1 STRATA_RADIUS=6 STRATA_SIZE=640x400 STRATA_SCENE=1 STRATA_DIG=1 STRATA_FRAMES=60 STRATA_SHOT=/dev/null ./viewer/.march/build/release/strata_viewer"
+  RUN="env MARCH_PIN_MAIN=1 STRATA_LIGHT=0 STRATA_RADIUS=6 STRATA_SIZE=640x400 STRATA_SCENE=1 STRATA_DIG=1 STRATA_FRAMES=60 STRATA_SHOT=/dev/null ./viewer/.march/build/release/strata_viewer"
   need=$($RUN 2>&1 | sed -n 's/.*; \([0-9]*\) quads,.*/\1/p' | head -1)
   line=$(STRATA_QUADS=$((need + 2100)) $RUN 2>&1 | grep 'done after')
   refused=$(echo "$line" | sed -n 's/.*uploads refused \([0-9]*\),.*/\1/p')

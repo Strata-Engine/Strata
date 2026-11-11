@@ -97,7 +97,8 @@ bool trace_steps(vec3 ro, vec3 rd, float tmax, bool stop_glass, int steps, float
                 int kind = class_kind(c);
                 bool stops = kind == 1 || (kind == 2 && c != before && cutout_blocks(c, p, face)) || (kind == 3 && stop_glass);
                 if (stops) { h.voxel = v; h.face = face; h.t = t; h.cls = c; return true; }
-                if (kind == 4 && v != last_thin) { h.glow += class_emission(c); last_thin = v; }
+                // a thin block the ray starts beside lights it less: the block's own floor is not a hot square
+                if (kind == 4 && v != last_thin) { h.glow += class_emission(c) * (t < 1.0 ? 0.3 : 1.0); last_thin = v; }
             }
             before = c;
             if (t > fine_until) {
@@ -120,3 +121,13 @@ bool trace_steps(vec3 ro, vec3 rd, float tmax, bool stop_glass, int steps, float
 
 // A ray with the usual step limit: enough for shadows, which leave the loaded world upward.
 bool trace(vec3 ro, vec3 rd, float tmax, bool stop_glass, out Hit h) { return trace_steps(ro, rd, tmax, stop_glass, 160, 1.0e9, h); }
+
+// The light class of the voxel holding [p] (voxel units); 0 outside the loaded world.
+uint class_at(vec3 p) {
+    ivec3 v = ivec3(floor(p));
+    ivec3 ch = v >> 5;
+    ivec3 cell = wrap(ch, u.vol.xyz);
+    ivec4 own = texelFetch(owner, cell, 0);
+    if (own.w == 0 || own.xyz != ch) return 0u;
+    return texelFetch(vol, v + (cell - ch) * 32, 0).r;
+}

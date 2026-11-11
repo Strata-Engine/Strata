@@ -62,24 +62,31 @@ void main() {
     bool settling = u.vol.w <= 2;
     bool sample_now = kept < 4.0 || settling || (((px.x >> 3) & 1) + 2 * ((px.y >> 3) & 1)) == (frame & 3);
     float sun_vis = old.a;
+    int rays = mode >= 4 ? int(u.light.w) : 0;
+    vec3 sky = rays > 0 ? old.rgb : sky_flat(n);
     float count = kept;
     if (sample_now) {
         float sun_now = sun_visible(at, n, sun_toward(rand2(px, frame, 0)));
         // while an edit settles, a pixel whose new sample contradicts its memory starts again
         if (settling && abs(old.a - sun_now) > 0.6) kept = 0.0;
-        sun_vis = mix(old.a, sun_now, 1.0 / (kept + 1.0));
+        // shadows lean on 64 past samples at most, so they follow a moving sun; sky light on all of them, since a small bright thing is found by few rays
+        sun_vis = mix(old.a, sun_now, 1.0 / (min(kept, 64.0) + 1.0));
+        if (rays > 0) sky = mix(old.rgb, sky_light(at, n, px, frame, rays), 1.0 / (kept + 1.0));
         count = kept + 1.0;
     }
-    o_hist = vec4(0.0, 0.0, 0.0, sun_vis);
+    o_hist = vec4(sky, sun_vis);
     o_meta = vec4(count, view_depth, float(face), 0.0);
 
-    vec3 col = albedo * (u.sun_color.rgb * ndl * sun_vis + sky_flat(n));
+    // the pixel's light class: flat quads carry it; models and plants do not, and are looked up
+    uint cls = uint(nm.b * 255.0 + 0.5);
+    if (cls == 0u) cls = class_at(at - n * 0.01);
+    vec3 col = albedo * (u.sun_color.rgb * ndl * sun_vis + sky);
+    if (mode >= 4) col += albedo * class_emission(cls) * GLOW;
     if (mode >= 3) {
         // the sun's highlight on anything not fully rough; a mirror ray for what is smooth
-        uint cls = uint(nm.b * 255.0 + 0.5);
-        float rough = float(class_roughness(cls)) / 255.0;
+        float rough = cls == 0u ? 1.0 : float(class_roughness(cls)) / 255.0;
         vec3 toward_eye = normalize(u.eye.xyz - world);
-        if (rough < 0.25) {
+        if (rough < 0.25 && u.sun_color.w > 0.5) {
             float share = mirror_share(n, toward_eye, 0.12) * (1.0 - rough);
             col = mix(col, reflected(at + n * 0.02, mirror_dir(toward_eye, n, n)), share);
         }

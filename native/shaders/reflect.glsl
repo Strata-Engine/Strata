@@ -32,7 +32,7 @@ vec3 mirror_dir(vec3 toward_eye, vec3 m, vec3 n) {
 vec3 reflected(vec3 at, vec3 dir) {
     Hit h;
     // exact for the first 40 voxels, every third voxel beyond: far reflections lose thin things
-    if (!trace_steps(at, dir, 400.0, true, 200, 40.0, h)) return sky_color(dir) + h.glow;
+    if (!trace_steps(at, dir, 400.0, true, 200, 40.0, h)) return sky_color(dir) + h.glow * GLOW;
     vec3 hv = at + dir * h.t;
     vec3 hp = hv * u.eye.w;
     vec3 hn = NORMALS[h.face];
@@ -48,6 +48,6 @@ vec3 reflected(vec3 at, vec3 dir) {
         }
     }
     if (vis < 0.0) vis = sun_visible(hv, hn, u.sun.xyz);
-    vec3 col = albedo * (u.sun_color.rgb * max(dot(hn, u.sun.xyz), 0.0) * vis + sky_flat(hn)) + class_emission(h.cls) + h.glow;
+    vec3 col = albedo * (u.sun_color.rgb * max(dot(hn, u.sun.xyz), 0.0) * vis + sky_flat(hn)) + (class_emission(h.cls) + h.glow) * GLOW;
     return fogged(col, hp);
 }

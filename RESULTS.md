@@ -315,3 +315,28 @@ ray every frame, with no memory between frames. Two changes to the ray walk
 made along the way also brought mode 2 down to 1.43 ms (sun 55) and 1.96 ms
 (sun 15), inside its 2 ms target: a coarse cell and a chunk now record how
 high their contents reach, and a rising ray above that crosses them whole.
+
+## Task 6: sky light, emission and one bounce (light mode 4, the default)
+
+2560 x 1600, offscreen, stream radius 10, two sky rays a pixel a sample.
+
+| scene | GPU time | frame rate |
+|---|---|---|
+| overview, sun 35 | 4.3 ms | about 230 fps |
+| forest floor | 4.0 ms | |
+| high ground, snow and ice | 3.4 ms | |
+| lantern at dusk | 4.2 ms | |
+| lake filling half the screen, sun 12 | 9.7 ms | about 100 fps |
+
+The 6 ms target is met everywhere except with a lake filling the view, where
+the 120 fps target is missed too. The cost there is the water itself: each
+water pixel traces a sun ray and a mirror ray every frame, in the final pass,
+which a half-resolution light pass would not touch. So the light pass stays
+at full resolution, and `Strata.Render.set_quality(sky_rays, reflections)`
+is the lever: without mirror rays the lake costs about 7 ms.
+
+Stillness (frames 118 and 119, share of pixels differing by more than 4,
+limit 0.05%): shadows only 0.0017%; everything on, daylight forest 0.0325%;
+lantern light at dusk 0.68% after two seconds and 0.07% after ten. Light from
+a small lamp is found by few rays, so it takes longer to settle than the
+one-second target.
