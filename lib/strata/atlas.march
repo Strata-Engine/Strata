@@ -22,9 +22,13 @@
 --
 -- Seeds: Strata.Seed.mix(seed, 101) the island's fBm, 102 the regions, 103
 -- the rock strength; Strata.Seed.cell(seed, 104, i, 0, j) ranks the sites.
+--
+-- An atlas goes to bytes and back (to_bytes, from_bytes) and is kept on
+-- disk by load_or_build, in a file cache_name names after the seed and Def.
 mod Strata.Atlas do
 
   needs IO.Spawn      -- erosion splits rows across worker tasks
+  needs IO.FileSystem -- load_or_build keeps a cache on disk
 
   alias Strata.Noise as Nz
   alias Strata.Seed as Sd3
@@ -481,18 +485,24 @@ mod Strata.Atlas do
   doc "The region of sample (i, j): 0..region_count-1 on land, -1 in the sea."
   fn region_ij(a : Atlas, i : Int, j : Int) : Int do NativeArray.get_int(regions(a), i + n(a) * j) end
 
+  doc "The river width of sample (i, j) in metres, 0 off the rivers."
+  fn river_width_ij(a : Atlas, i : Int, j : Int) : Float do NativeArray.get_f32(widths(a), i + n(a) * j) end
+
+  doc "The lake level of sample (i, j) in metres, -1 where there is no lake."
+  fn lake_ij(a : Atlas, i : Int, j : Int) : Float do NativeArray.get_f32(waters(a), i + n(a) * j) end
+
   doc "The sample that sample (i, j) drains into, as an index i + n * j over the filled surface; -1 for an outlet (the sea, or the grid's edge)."
   fn receiver_ij(a : Atlas, i : Int, j : Int) : Int do NativeArray.get_int(receivers(a), i + n(a) * j) end
 
   -- grid coordinate of a position: sample i is at gx = i
   pfn grid(a : Atlas, m : Float) : Float do m /. step(a) +. int_to_float(n(a) / 2) end
 
-  doc "The height at a position in metres, bilinear between samples; the sea level minus 20 m beyond the grid."
-  fn height_at(a : Atlas, xm : Float, zm : Float) : Float do
+  -- layer [arr] at a position, bilinear between samples; [beyond] off the grid
+  pfn bilinear(a : Atlas, arr : NativeF32Arr, xm : Float, zm : Float, beyond : Float) : Float do
     let gx = grid(a, xm)
     let gz = grid(a, zm)
     let top = int_to_float(n(a) - 1)
-    if gx < 0.0 || gz < 0.0 || gx > top || gz > top do sea(a) -. 20.0
+    if gx < 0.0 || gz < 0.0 || gx > top || gz > top do beyond
     else
       let fx = Math.floor(gx)
       let fz = Math.floor(gz)
@@ -502,10 +512,31 @@ mod Strata.Atlas do
       let j1 = if j + 1 > n(a) - 1 do j else j + 1 end
       let tx = gx -. fx
       let tz = gz -. fz
-      let a0 = height_ij(a, i, j) *. (1.0 -. tx) +. height_ij(a, i1, j) *. tx
-      let a1 = height_ij(a, i, j1) *. (1.0 -. tx) +. height_ij(a, i1, j1) *. tx
+      let a0 = NativeArray.get_f32(arr, i + n(a) * j) *. (1.0 -. tx) +. NativeArray.get_f32(arr, i1 + n(a) * j) *. tx
+      let a1 = NativeArray.get_f32(arr, i + n(a) * j1) *. (1.0 -. tx) +. NativeArray.get_f32(arr, i1 + n(a) * j1) *. tx
       a0 *. (1.0 -. tz) +. a1 *. tz
     end
+  end
+
+  doc "The height at a position in metres, bilinear between samples; the sea level minus 20 m beyond the grid."
+  fn height_at(a : Atlas, xm : Float, zm : Float) : Float do bilinear(a, heights(a), xm, zm, sea(a) -. 20.0) end
+
+  pfn window_go(nn : Int, arr : NativeF32Arr, none : Float, i0 : Int, j0 : Int, side : Int, k : Int, out : NativeF32Arr) : NativeF32Arr do
+    if k >= side * side do out
+    else
+      let i = i0 + k % side
+      let j = j0 + k / side
+      let v = if i < 0 || j < 0 || i >= nn || j >= nn do none else NativeArray.get_f32(arr, i + nn * j) end
+      window_go(nn, arr, none, i0, j0, side, k + 1, NativeArray.set_f32(out, k, v))
+    end
+  end
+
+  doc "A copy of one layer over the side x side samples from (i0, j0), row by row (index (i - i0) + side * (j - j0)): layer 0 the height, 2 the lake level, 4 the river width; a sample beyond the grid reads sea - 20, -1 and 0. For a generator that samples one area many times: the copy is its own, so worker tasks do not share it (GAPS S15)."
+  fn window(a : Atlas, layer : Int, i0 : Int, j0 : Int, side : Int) : NativeF32Arr do
+    let out = NativeArray.make_f32(side * side, 0.0)
+    if layer == 0 do window_go(n(a), heights(a), sea(a) -. 20.0, i0, j0, side, 0, out)
+    else if layer == 2 do window_go(n(a), waters(a), 0.0 -. 1.0, i0, j0, side, 0, out)
+    else window_go(n(a), widths(a), 0.0, i0, j0, side, 0, out) end end
   end
 
   -- the index of the sample nearest a position, or -1 beyond the grid
@@ -527,11 +558,8 @@ mod Strata.Atlas do
     if k < 0 do 0.0 -. 1.0 else NativeArray.get_f32(waters(a), k) end
   end
 
-  doc "The river width in metres at a position (nearest sample), 0 where there is none."
-  fn river_width_at(a : Atlas, xm : Float, zm : Float) : Float do
-    let k = nearest(a, xm, zm)
-    if k < 0 do 0.0 else NativeArray.get_f32(widths(a), k) end
-  end
+  doc "The river width in metres at a position, bilinear between samples (a sample off the rivers is 0), so it fades to 0 one step from a river; 0 beyond the grid."
+  fn river_width_at(a : Atlas, xm : Float, zm : Float) : Float do bilinear(a, widths(a), xm, zm, 0.0) end
 
   doc "The drainage area in square metres at a position (nearest sample), 0 where unknown."
   fn drainage_at(a : Atlas, xm : Float, zm : Float) : Float do
@@ -594,6 +622,249 @@ mod Strata.Atlas do
     match ss do
       Nil -> h
       Cons(s, rest) -> hash_sites(rest, fold(fold(fold(fold(fold(fold(h, q(s_x(s))), q(s_z(s))), q(s_floor(s))), q(s_radius(s))), s_region(s)), s_index(s)))
+    end
+  end
+
+  -- ── Bytes ────────────────────────────────────────────────────────────────
+  -- An atlas as bytes, for a cache on disk, little-endian: a version byte;
+  -- the Def in its field order (floats as binary64, counts as 32 bits); the
+  -- six layers as held (binary32 floats, 32-bit ints); then the sites, the
+  -- river polylines and the carved lakes, each list led by its length.
+  -- March has no bit casts, so a float is taken apart into sign, exponent
+  -- and mantissa by hand; every value comes back exactly.
+  --
+  -- version() names the layout AND what build makes: raise it whenever
+  -- build's output for a Def could change, so a cache made by older code is
+  -- never read. It is in the bytes, so in cache_name too.
+  pfn version() : Int do 1 end
+
+  ptype Wr = Wr(NativeU8Arr, Int)
+
+  pfn w8(w : Wr, v : Int) : Wr do match w do Wr(b, p) -> Wr(NativeArray.set_u8(b, p, int_and(v, 255)), p + 1) end end
+  pfn w32(w : Wr, v : Int) : Wr do w8(w8(w8(w8(w, v), int_shr(v, 8)), int_shr(v, 16)), int_shr(v, 24)) end
+
+  pfn r32(b : NativeU8Arr, p : Int) : Int do
+    NativeArray.get_u8(b, p) + int_shl(NativeArray.get_u8(b, p + 1), 8) + int_shl(NativeArray.get_u8(b, p + 2), 16) + int_shl(NativeArray.get_u8(b, p + 3), 24)
+  end
+  -- the same 32 bits as a signed number
+  pfn r32s(b : NativeU8Arr, p : Int) : Int do
+    let u = r32(b, p)
+    if u >= 2147483648 do u - 4294967296 else u end
+  end
+
+  pfn pow2(e : Int) : Float do Math.pow(2.0, int_to_float(e)) end
+
+  -- e with 2^e <= a < 2^(e + 1), for a > 0
+  pfn exponent(a : Float) : Int do
+    let e = float_to_int(Math.floor(Math.log(a) /. Math.log(2.0)))
+    if a /. pow2(e) >= 2.0 do e + 1 else if a /. pow2(e) < 1.0 do e - 1 else e end end
+  end
+
+  -- the binary32 bits of v, which is exact in binary32 (it was read from a f32 array)
+  pfn f32_bits(v : Float) : Int do
+    if v == 0.0 do 0
+    else
+      let sign = if v < 0.0 do 2147483648 else 0 end
+      let a = Math.abs(v)
+      let e = exponent(a)
+      if e < 0 - 126 do sign + float_to_int(Math.round(a /. pow2(0 - 149)))
+      else sign + int_shl(e + 127, 23) + float_to_int(Math.round((a /. pow2(e) -. 1.0) *. 8388608.0)) end
+    end
+  end
+
+  pfn f32_of(u : Int) : Float do
+    let ex = int_and(int_shr(u, 23), 255)
+    let m = int_and(u, 8388607)
+    let a = if ex == 0 do int_to_float(m) *. pow2(0 - 149) else (1.0 +. int_to_float(m) /. 8388608.0) *. pow2(ex - 127) end
+    if u >= 2147483648 do 0.0 -. a else a end
+  end
+
+  -- a binary64 as two 32-bit words: the mantissa's low 32 bits, then sign,
+  -- 11 exponent bits and the mantissa's top 20 (a subnormal is written as 0)
+  pfn wf(w : Wr, v : Float) : Wr do
+    let a = Math.abs(v)
+    if a < pow2(0 - 1022) do w32(w32(w, 0), 0)
+    else
+      let sign = if v < 0.0 do 2147483648 else 0 end
+      let e = exponent(a)
+      let m = float_to_int((a /. pow2(e) -. 1.0) *. 4503599627370496.0)
+      w32(w32(w, int_and(m, 4294967295)), sign + int_shl(e + 1023, 20) + int_shr(m, 32))
+    end
+  end
+
+  pfn rf(b : NativeU8Arr, p : Int) : Float do
+    let hi = r32(b, p + 4)
+    let ex = int_and(int_shr(hi, 20), 2047)
+    if ex == 0 do 0.0
+    else
+      let m = int_shl(int_and(hi, 1048575), 32) + r32(b, p)
+      let a = (1.0 +. int_to_float(m) /. 4503599627370496.0) *. pow2(ex - 1023)
+      if hi >= 2147483648 do 0.0 -. a else a end
+    end
+  end
+
+  -- the version byte and the Def: 157 bytes
+  pfn def_size() : Int do 157 end
+
+  pfn put_def(w0 : Wr, d : Def) : Wr do
+    let p = d_erosion(d)
+    let w1 = w32(wf(w32(wf(wf(wf(w32(w8(w0, version()), d_n(d)), d_step(d)), d_radius(d)), d_region_size(d)), d_region_count(d)), d_sea(d)), Strata.Erosion.p_iterations(p))
+    let w2 = wf(wf(wf(wf(wf(wf(wf(w1, Strata.Erosion.p_dt(p)), Strata.Erosion.p_k(p)), Strata.Erosion.p_m(p)), Strata.Erosion.p_n_exp(p)), Strata.Erosion.p_uplift(p)), Strata.Erosion.p_talus_lo(p)), Strata.Erosion.p_talus_hi(p))
+    let w3 = wf(wf(w32(wf(wf(w2, d_river_min_area(d)), d_lake_margin(d)), d_site_count(d)), d_site_spacing(d)), d_site_flat(d))
+    wf(wf(w32(w3, d_lake_count(d)), d_lake_radius(d)), d_lake_depth(d))
+  end
+
+  pfn get_def(b : NativeU8Arr) : Def do
+    let e = Strata.Erosion.params(r32s(b, 41), rf(b, 45), rf(b, 53), rf(b, 61), rf(b, 69), rf(b, 77), rf(b, 85), rf(b, 93))
+    Def(r32s(b, 1), rf(b, 5), rf(b, 13), rf(b, 21), r32s(b, 29), rf(b, 33), e, rf(b, 101), rf(b, 109), r32s(b, 117), rf(b, 121), rf(b, 129), r32s(b, 137), rf(b, 141), rf(b, 149))
+  end
+
+  pfn put_fs(w : Wr, arr : NativeF32Arr, i : Int, cnt : Int) : Wr do
+    if i >= cnt do w else put_fs(w32(w, f32_bits(NativeArray.get_f32(arr, i))), arr, i + 1, cnt) end
+  end
+  pfn put_is(w : Wr, arr : NativeIntArr, i : Int, cnt : Int) : Wr do
+    if i >= cnt do w else put_is(w32(w, NativeArray.get_int(arr, i)), arr, i + 1, cnt) end
+  end
+  pfn get_fs(b : NativeU8Arr, p : Int, arr : NativeF32Arr, i : Int, cnt : Int) : NativeF32Arr do
+    if i >= cnt do arr else get_fs(b, p, NativeArray.set_f32(arr, i, f32_of(r32(b, p + 4 * i))), i + 1, cnt) end
+  end
+  pfn get_is(b : NativeU8Arr, p : Int, arr : NativeIntArr, i : Int, cnt : Int) : NativeIntArr do
+    if i >= cnt do arr else get_is(b, p, NativeArray.set_int(arr, i, r32s(b, p + 4 * i)), i + 1, cnt) end
+  end
+
+  pfn put_sites(w : Wr, ss : List(Site)) : Wr do
+    match ss do
+      Nil -> w
+      Cons(s, rest) -> put_sites(w32(w32(wf(wf(wf(wf(w, s_x(s)), s_z(s)), s_floor(s)), s_radius(s)), s_region(s)), s_index(s)), rest)
+    end
+  end
+  pfn put_points(w : Wr, ps : List((Float, Float, Float))) : Wr do
+    match ps do
+      Nil -> w
+      Cons((x, z, v), rest) -> put_points(wf(wf(wf(w, x), z), v), rest)
+    end
+  end
+  pfn put_rivers(w : Wr, rs : List(List((Float, Float, Float)))) : Wr do
+    match rs do
+      Nil -> w
+      Cons(r, rest) -> put_rivers(put_points(w32(w, List.length(r)), r), rest)
+    end
+  end
+  pfn points_size(rs : List(List((Float, Float, Float))), acc : Int) : Int do
+    match rs do
+      Nil -> acc
+      Cons(r, rest) -> points_size(rest, acc + 4 + 24 * List.length(r))
+    end
+  end
+
+  doc "The atlas as bytes, for from_bytes: a version byte, the Def, the layers, the sites, the rivers and the lakes."
+  fn to_bytes(a : Atlas) : NativeU8Arr do
+    let cnt = n(a) * n(a)
+    let size = def_size() + 24 * cnt + 4 + 40 * List.length(sites(a)) + points_size(rivers(a), 4) + 4 + 24 * List.length(lakes(a))
+    let w1 = put_def(Wr(NativeArray.make_u8(size, 0), 0), def_of(a))
+    let w2 = put_fs(put_is(put_fs(put_fs(put_is(put_fs(w1, heights(a), 0, cnt), regions(a), 0, cnt), waters(a), 0, cnt), drainages(a), 0, cnt), receivers(a), 0, cnt), widths(a), 0, cnt)
+    let w3 = put_points(w32(put_rivers(w32(put_sites(w32(w2, List.length(sites(a))), sites(a)), List.length(rivers(a))), rivers(a)), List.length(lakes(a))), lakes(a))
+    match w3 do Wr(b, _) -> b end
+  end
+
+  -- a list's length at p, if there is room for it and for [each] bytes an item after it
+  pfn count_at(b : NativeU8Arr, p : Int, each : Int) : Option(Int) do
+    let len = NativeArray.length_u8(b)
+    if p + 4 > len do None
+    else
+      let c = r32s(b, p)
+      if c < 0 do None else if p + 4 + c * each > len do None else Some(c) end end
+    end
+  end
+
+  pfn get_sites(b : NativeU8Arr, p : Int, i : Int, c : Int, acc : List(Site)) : List(Site) do
+    if i >= c do List.reverse(acc)
+    else
+      let q = p + 40 * i
+      get_sites(b, p, i + 1, c, Cons(Site(rf(b, q), rf(b, q + 8), rf(b, q + 16), rf(b, q + 24), r32s(b, q + 32), r32s(b, q + 36)), acc))
+    end
+  end
+  pfn get_points(b : NativeU8Arr, p : Int, i : Int, c : Int, acc : List((Float, Float, Float))) : List((Float, Float, Float)) do
+    if i >= c do List.reverse(acc)
+    else get_points(b, p, i + 1, c, Cons((rf(b, p + 24 * i), rf(b, p + 24 * i + 8), rf(b, p + 24 * i + 16)), acc)) end
+  end
+  -- [left] polylines from p: the polylines and the position after them, or None if the bytes end first
+  pfn get_rivers(b : NativeU8Arr, p : Int, left : Int, acc : List(List((Float, Float, Float)))) : Option((List(List((Float, Float, Float))), Int)) do
+    if left <= 0 do Some((List.reverse(acc), p))
+    else
+      match count_at(b, p, 24) do
+        None -> None
+        Some(c) -> get_rivers(b, p + 4 + 24 * c, left - 1, Cons(get_points(b, p + 4, 0, c, Nil), acc))
+      end
+    end
+  end
+
+  doc "The atlas to_bytes wrote, or None if the bytes are cut short, run long, or come from another version."
+  fn from_bytes(b : NativeU8Arr) : Option(Atlas) do
+    let len = NativeArray.length_u8(b)
+    if len < def_size() do None
+    else if NativeArray.get_u8(b, 0) != version() do None
+    else
+      let d = get_def(b)
+      let nn = d_n(d)
+      let cnt = nn * nn
+      let p0 = def_size()
+      if nn < 1 || nn > 8192 || p0 + 24 * cnt > len do None
+      else
+        let hs = get_fs(b, p0, NativeArray.make_f32(cnt, 0.0), 0, cnt)
+        let rs = get_is(b, p0 + 4 * cnt, NativeArray.make_int(cnt, 0), 0, cnt)
+        let ws = get_fs(b, p0 + 8 * cnt, NativeArray.make_f32(cnt, 0.0), 0, cnt)
+        let ar = get_fs(b, p0 + 12 * cnt, NativeArray.make_f32(cnt, 0.0), 0, cnt)
+        let rcv = get_is(b, p0 + 16 * cnt, NativeArray.make_int(cnt, 0), 0, cnt)
+        let wd = get_fs(b, p0 + 20 * cnt, NativeArray.make_f32(cnt, 0.0), 0, cnt)
+        let p1 = p0 + 24 * cnt
+        match count_at(b, p1, 40) do
+          None -> None
+          Some(sc) ->
+            let p2 = p1 + 4 + 40 * sc
+            match count_at(b, p2, 4) do
+              None -> None
+              Some(rc) ->
+                match get_rivers(b, p2 + 4, rc, Nil) do
+                  None -> None
+                  Some((lines, p3)) ->
+                    match count_at(b, p3, 24) do
+                      None -> None
+                      Some(lc) ->
+                        if p3 + 4 + 24 * lc != len do None
+                        else Some(Atlas(d, hs, rs, ws, rcv, ar, wd, get_sites(b, p1 + 4, 0, sc, Nil), lines, get_points(b, p3 + 4, 0, lc, Nil))) end
+                    end
+                end
+            end
+        end
+      end
+    end end
+  end
+
+  pfn fold_bytes(b : NativeU8Arr, i : Int, cnt : Int, h : Int) : Int do
+    if i >= cnt do h else fold_bytes(b, i + 1, cnt, fold(h, NativeArray.get_u8(b, i))) end
+  end
+
+  doc "The file a cache keeps this seed's atlas in: atlas-<seed>-<a hash of the Def's exact bytes and the format version>.bin."
+  fn cache_name(d : Def, seed : Int) : String do
+    let b = match put_def(Wr(NativeArray.make_u8(def_size(), 0), 0), d) do Wr(v, _) -> v end
+    "atlas-" ++ int_to_string(seed) ++ "-" ++ int_to_string(fold_bytes(b, 0, def_size(), 7)) ++ ".bin"
+  end
+
+  doc "The atlas for (d, seed) from dir/cache_name(d, seed) if that file holds it, else built and written there (dir is made if missing; a failed write only loses the cache)."
+  fn load_or_build(dir : String, d : Def, seed : Int) : Atlas do
+    let path = dir ++ "/" ++ cache_name(d, seed)
+    let cached = match File.read(path) do
+      Ok(text) -> from_bytes(Bytes.to_u8_arr(Bytes.from_string(text)))
+      Err(_) -> None
+    end
+    match cached do
+      Some(a) -> a
+      None ->
+        let a = build(d, seed)
+        let _made = Dir.mkdir_p(dir)
+        let _wrote = File.write(path, Bytes.to_string(Bytes.from_u8_arr(to_bytes(a))))
+        a
     end
   end
 

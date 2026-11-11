@@ -78,3 +78,14 @@ Final: not judged by the reviewer: anything in pixels, all timings, GPU behaviou
 - Not done: a cave flooded through its roof keeps air under the roof (water
   is not pressed upward). No golden picture of a dig in the sea; nine tests
   cover it.
+- Ruling (at the merge with main): the generation project builds its rivers
+  from the sea's block, as a sink, so that a breached lake drains. As a sea,
+  a river kept the lake topped up and took it over. `with_sea_top(f, y)`
+  makes sea blocks above y sinks; the viewer sets it to sea level. Cost: a
+  hole dug beside a river inland stays dry behind a wall of water. The
+  proper fix is rivers of their own kind of water, in the generation
+  project.
+- At the merge: water meeting the sea sideways at its level now joins it
+  without a splash event; only water falling onto it is swallowed with one.
+  Three waterfall sound fingerprints (falls-4, falls-12, falls-24) were
+  regenerated and not listened to: the change was 1.5 dB.
