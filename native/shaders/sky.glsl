@@ -1,0 +1,42 @@
+// The sky, and the light it and the sun put on a surface. Colours are
+// linear. The sun is u.sun.xyz (the direction to it) and u.sun_color.
+
+// The sky's colour in unit direction d, without the sun's disc.
+vec3 sky_base(vec3 d) {
+    vec3 s = u.sun.xyz;
+    float day = smoothstep(-0.15, 0.25, s.y);
+    float low = 1.0 - smoothstep(0.0, 0.45, s.y);              // 1 with the sun on the horizon
+    vec3 zenith = mix(vec3(0.004, 0.006, 0.02), vec3(0.10, 0.24, 0.62), day);
+    vec3 horizon = mix(vec3(0.01, 0.015, 0.03), vec3(0.46, 0.62, 0.84), day);
+    horizon = mix(horizon, vec3(0.62, 0.40, 0.26) * day, low * 0.55);
+    zenith = mix(zenith, zenith * vec3(0.55, 0.60, 0.85), low);
+    float up = max(d.y, 0.0);
+    vec3 col = mix(zenith, horizon, pow(1.0 - up, 4.0));
+    float toward = max(dot(d, s), 0.0);
+    col += vec3(1.0, 0.42, 0.12) * low * day * pow(toward, 5.0) * 0.7;       // the glow round a low sun
+    col += u.sun_color.rgb * 0.04 * pow(toward, 96.0);                       // and the haze close to it
+    return col;
+}
+
+// The sky with the sun's disc.
+vec3 sky_color(vec3 d) {
+    return sky_base(d) + u.sun_color.rgb * 12.0 * smoothstep(0.99975, 0.99990, dot(d, u.sun.xyz));
+}
+
+// What distance fades to: the sky at the horizon, the way the eye is looking.
+vec3 sky_fog(vec3 d) { return sky_base(normalize(vec3(d.x, 0.04, d.z))); }
+
+// Sky light on a face with normal n when nothing is known about what it can
+// see: more from above, a little bounced from below.
+vec3 sky_flat(vec3 n) {
+    vec3 above = 0.5 * (sky_base(vec3(0.0, 1.0, 0.0)) + sky_base(normalize(vec3(n.x, 0.25, n.z) + vec3(1.0e-4, 0.0, 0.0))));
+    return above * (0.25 + 0.35 * (0.5 + 0.5 * n.y));
+}
+
+// Fade a lit colour into the sky with distance.
+vec3 fogged(vec3 col, vec3 world) {
+    vec3 to = world - u.eye.xyz;
+    float d = length(to);
+    float fogk = clamp((d - u.fog.x) / max(u.fog.y - u.fog.x, 0.001), 0.0, 1.0);
+    return mix(col, sky_fog(to / max(d, 1.0e-4)), fogk * fogk);
+}

@@ -25,3 +25,10 @@ vec3 world_at(vec2 uv, float depth) {
 }
 
 const vec3 NORMALS[6] = vec3[6](vec3(0, 1, 0), vec3(0, -1, 0), vec3(1, 0, 0), vec3(-1, 0, 0), vec3(0, 0, 1), vec3(0, 0, -1));
+
+// Linear colour to the 0..1 the screen takes (light modes above 0): as it
+// is up to 0.6, then rolled off so that bright things keep their colour.
+vec3 tonemap(vec3 c) {
+    vec3 over = max(c - 0.6, 0.0);
+    return min(c, 0.6) + 0.4 * (1.0 - exp(-over / 0.4));
+}

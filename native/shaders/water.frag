@@ -18,5 +18,7 @@ void main() {
     float a0 = float(ao & 3u), a1 = float((ao >> 2) & 3u), a2 = float((ao >> 4) & 3u), a3 = float((ao >> 6) & 3u);
     float occ = mix(mix(a0, a1, f.x), mix(a2, a3, f.x), f.y) / 3.0;
     vec3 n = NORMALS[min(v_face, 5u)];
-    o_color = vec4(shade_flat(base.rgb, n, occ, v_world), base.a);
+    if (u.light.x < 1.0 || u.light.x >= 9.0) { o_color = vec4(shade_flat(base.rgb, n, occ, v_world), base.a); return; }
+    vec3 col = base.rgb * (u.sun_color.rgb * max(dot(n, u.sun.xyz), 0.0) + sky_flat(n));
+    o_color = vec4(tonemap(fogged(col, v_world)), base.a);
 }

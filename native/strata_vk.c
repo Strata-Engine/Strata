@@ -910,6 +910,13 @@ int64_t sv_open(int64_t w, int64_t h, int64_t capture_mouse, int64_t quad_capaci
     if (!make_buffer((VkDeviceSize)g.quad_cap * 8, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, &g.giga, &g.giga_mem, &map)) return 0;
     g.giga_map = map;
     g.ubo_map = calloc(UBO_FLOATS, sizeof(float));
+    if (g.ubo_map) {
+        /* light mode 0's flat sky (sRGB 0.53, 0.72, 0.92) and ambient share; a sun until the game sets one */
+        g.ubo_map[19] = 0.30f;
+        g.ubo_map[20] = (float)pow(0.53, 2.2); g.ubo_map[21] = (float)pow(0.72, 2.2); g.ubo_map[22] = (float)pow(0.92, 2.2); g.ubo_map[23] = 1.0f;
+        g.ubo_map[16] = 0.458f; g.ubo_map[17] = 0.814f; g.ubo_map[18] = 0.356f;
+        g.ubo_map[UBO_SUN_COLOR] = 1.05f; g.ubo_map[UBO_SUN_COLOR + 1] = 1.0f; g.ubo_map[UBO_SUN_COLOR + 2] = 0.9f;
+    }
     if (!g.ubo_map) return 0;
     sa_init(&g_quads, g.quad_cap);
     if (!make_buffer((VkDeviceSize)SV_LOOSE_QUADS * 64, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, &g.loose, &g.loose_mem, &map)) return 0;
@@ -1374,15 +1381,12 @@ void sv_set_camera(void *vp16) {
     if (!g.ok || !vp16 || narr_len(vp16) < 16) return;
     memcpy(g.ubo_map, narr_data(vp16), 16 * 4);
 }
-void sv_set_sun(double x, double y, double z, double ambient) {
+/* The direction to the sun and its colour (linear, as bright as wanted). */
+void sv_set_sun(double x, double y, double z, double r, double gr, double b) {
     if (!g.ok) return;
     float l = (float)sqrt(x * x + y * y + z * z); if (l < 1e-6f) l = 1.0f;
-    g.ubo_map[16] = (float)x / l; g.ubo_map[17] = (float)y / l; g.ubo_map[18] = (float)z / l; g.ubo_map[19] = (float)ambient;
-}
-void sv_set_sky(double r, double gr, double b) {
-    if (!g.ok) return;
-    /* given as sRGB, stored linear: the swapchain encodes on write */
-    g.ubo_map[20] = (float)pow(r < 0 ? 0 : r, 2.2); g.ubo_map[21] = (float)pow(gr < 0 ? 0 : gr, 2.2); g.ubo_map[22] = (float)pow(b < 0 ? 0 : b, 2.2); g.ubo_map[23] = 1.0f;
+    g.ubo_map[16] = (float)x / l; g.ubo_map[17] = (float)y / l; g.ubo_map[18] = (float)z / l;
+    g.ubo_map[UBO_SUN_COLOR] = (float)r; g.ubo_map[UBO_SUN_COLOR + 1] = (float)gr; g.ubo_map[UBO_SUN_COLOR + 2] = (float)b;
 }
 void sv_set_fog(double start, double end, double cam_x, double cam_y) {
     (void)cam_x; (void)cam_y;

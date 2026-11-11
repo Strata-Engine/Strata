@@ -23,7 +23,7 @@ build cross.vert
 build loose.vert
 build fullscreen.vert
 build gbuffer.frag tiles.glsl
-build light.frag shade.glsl tiles.glsl trace.glsl
+build light.frag shade.glsl tiles.glsl trace.glsl sky.glsl
 build composite.frag
-build water.frag shade.glsl tiles.glsl
+build water.frag shade.glsl tiles.glsl sky.glsl
 cp "$OUT" strata_shaders.h

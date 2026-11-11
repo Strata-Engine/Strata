@@ -17,12 +17,16 @@ vec3 class_tint(uint c) {
 
 void main() {
     float depth = texture(gb_depth, v_uv).r;
-    if (depth >= 1.0) { o_lit = vec4(u.sky.rgb, 1.0); return; }      // nothing drawn here: sky
+    int mode = int(u.light.x);
+    if (depth >= 1.0) {                                               // nothing drawn here: sky
+        o_lit = vec4(mode >= 1 && mode < 9 ? sky_color(normalize(world_at(v_uv, 1.0) - u.eye.xyz)) : u.sky.rgb, 1.0);
+        return;
+    }
     vec3 albedo = texture(gb_albedo, v_uv).rgb;
     vec4 nm = texture(gb_nm, v_uv);
     vec3 n = NORMALS[min(int(nm.r * 255.0 + 0.5), 5)];
     vec3 world = world_at(v_uv, depth);
-    if (int(u.light.x) == 9) {
+    if (mode == 9) {
         // look at the light volume: step back off the surface, trace into it,
         // and show the class of the voxel found there (black where there is none)
         Hit h;
@@ -31,5 +35,7 @@ void main() {
         o_lit = vec4(hit ? class_tint(h.cls) * (0.6 + 0.4 * max(dot(n, u.sun.xyz), 0.0)) : vec3(0.0), 1.0);
         return;
     }
-    o_lit = vec4(shade_flat(albedo, n, nm.a, world), 1.0);
+    if (mode == 0) { o_lit = vec4(shade_flat(albedo, n, nm.a, world), 1.0); return; }
+    vec3 col = albedo * (u.sun_color.rgb * max(dot(n, u.sun.xyz), 0.0) + sky_flat(n));
+    o_lit = vec4(fogged(col, world), 1.0);
 }
