@@ -16,6 +16,8 @@
 -- STRATA_LIGHT=n     light mode: 0 the old flat shading, 1 sky and sun, 2 + shadows, 3 + reflections, 4 + sky light (default), 9 the light volume
 -- STRATA_FLUID=0     stop the water from moving
 -- STRATA_FLUID_CAP=n, STRATA_FLUID_REACH=n   the fluid's cell cap a step and its way-down search (defaults 4096, 16)
+-- STRATA_SPLASH=f     scene 21: drop a block of water from 12 cells up, and one cell from 4, at frame f
+-- STRATA_SPRAY=0      no spray from falling water;  STRATA_FOUNTAIN=n  n spray particles a frame ahead of the camera
 -- STRATA_BREACH=f     scenes 18 and 19: breach the test lake's rim at frame f
 -- STRATA_DRAIN=f      open a shaft in the test lake's floor at frame f
 -- STRATA_SUN2=deg, STRATA_SUN2_AT=f   move the sun to that height at that frame
@@ -352,6 +354,27 @@ mod StrataViewer do
     end
   end
 
+  -- Spray for what the water did this step: a burst where it lands, bigger
+  -- for more water and faster for a longer fall; a little mist where it is
+  -- still falling.
+  pfn spray_events(es : List(Strata.Fluid.Event), n : Int) : Int do
+    match es do
+      Nil -> n
+      Cons(e, t) ->
+        let x = int_to_float(Strata.Fluid.ev_x(e)) +. 0.5
+        let y = int_to_float(Strata.Fluid.ev_y(e))
+        let z = int_to_float(Strata.Fluid.ev_z(e)) +. 0.5
+        let eighths = Strata.Fluid.ev_eighths(e)
+        if Strata.Fluid.ev_landed(e) do
+          let speed = 1.5 +. 0.9 *. Math.sqrt(int_to_float(Strata.Fluid.ev_fell(e)))
+          let count = if 2 * eighths > 64 do 64 else 2 * eighths end
+          spray_events(t, if Strata.Render.spray(x, y +. 0.3, z, 0.0, speed *. 0.55, 0.0, count, speed *. 0.45, 0.8, 13) do n + count else n end)
+        else if eighths >= 4 do
+          spray_events(t, if Strata.Render.spray(x, y +. 0.5, z, 0.0, -1.0, 0.0, eighths / 4, 0.6, 0.5, 13) do n + eighths / 4 else n end)
+        else spray_events(t, n) end end
+    end
+  end
+
   -- Left click carves, right click builds, each once per press.
   pfn act(m : Sim, reg : Strata.Blocks.Registry, x : Float, y : Float, z : Float, fx : Float, fy : Float, fz : Float, dig : Bool, build : Bool) : Sim do
     if !dig && !build do m
@@ -450,7 +473,12 @@ mod StrataViewer do
             else m0 end
           let m2 = if scripted && frame == Env.get_int("STRATA_SLAB_AT", -1) do edit(m1, slab_edit(Strata.Stream.world(sim_stream(m1)), seed, 1))
             else if scripted && frame == Env.get_int("STRATA_SLAB_OFF", -1) do edit(m1, slab_edit(Strata.Stream.world(sim_stream(m1)), seed, 0)) else m1 end end
-          let m3 = if scripted && frame == Env.get_int("STRATA_BREACH", -1) do breach(m2, seed) else if scripted && frame == Env.get_int("STRATA_DRAIN", -1) do drain_floor(m2, seed) else m2 end end
+          let m2s = if scripted && frame == Env.get_int("STRATA_SPLASH", -1) do
+              let o1 = Strata.Edit.fill_box(Strata.Stream.world(sim_stream(m2)), -38, height(-35, 53, seed) + 16, 52, -37, height(-35, 53, seed) + 17, 53, lake_base() + 7)
+              let m2a = edit(m2, o1)
+              edit(m2a, Strata.Edit.set_block(Strata.Stream.world(sim_stream(m2a)), -32, height(-35, 53, seed) + 8, 53, lake_base() + 7))
+            else m2 end
+          let m3 = if scripted && frame == Env.get_int("STRATA_BREACH", -1) do breach(m2s, seed) else if scripted && frame == Env.get_int("STRATA_DRAIN", -1) do drain_floor(m2s, seed) else m2s end end
           let lb = !scripted && Strata.Ffi.Vk.mouse_button(0)
           let rb = !scripted && Strata.Ffi.Vk.mouse_button(1)
           let m4 = act(m3, reg, x2, y2, z2, fx, fy, fz, (lb && !lb0) || (frame == 10 && Env.get_int("STRATA_DIG", 0) == 1) || (script == 2 && frame % 100 == 50), rb && !rb0)
@@ -472,6 +500,10 @@ mod StrataViewer do
                 (f3, j2) -> (f3, Some(j2))
               end
             else (sim_fluid(m5), job) end
+          -- spray for what the step that just ended did, and a fountain if a timing run asks for one
+          let _sprayed = if due && Env.get_int("STRATA_SPRAY", 1) != 0 do spray_events(Strata.Fluid.events(sim_fluid(m5)), 0) else 0 end
+          let fountain = Env.get_int("STRATA_FOUNTAIN", 0)
+          if fountain > 0 && Strata.Render.spray(x2 +. fx *. 30.0, y2 +. fy *. 30.0 -. 4.0, z2 +. fz *. 30.0, 0.0, 9.0, 0.0, fountain, 4.0, 3.0, 13) do () else () end
           let fl2 = match begun do (f3, _) -> f3 end
           let job2 = match begun do (_, j3) -> j3 end
           let fluid_ms = (Strata.Ffi.Vk.time() -. t_fluid) *. 1000.0
@@ -618,6 +650,7 @@ mod StrataViewer do
           if scene == 18 do (int_to_float(at_x(cx, d, 0 - (rad * 6) / 10)), int_to_float(line) +. 16.0, int_to_float(at_z(cz, d, 0 - (rad * 6) / 10)), int_to_float(d) *. 0.39269908, -0.5)
           else (int_to_float(at_x(cx, d, rad + 44)), int_to_float(height(at_x(cx, d, rad + 44), at_z(cz, d, rad + 44), seed)) +. 14.0, int_to_float(at_z(cz, d, rad + 44)), int_to_float(d) *. 0.39269908 +. 3.14159265, -0.25) end
       end
+    else if scene == 21 do (-35.5, int_to_float(height(-35, 53, seed)) +. 9.0, 66.0, 0.0, -0.3)
     else if scene == 20 do (-35.5, int_to_float(height(-35, 53, seed)) +. 12.0, 60.5, 0.0, -0.95)
     else if scene == 16 do (-34.5, int_to_float(height(-35, 53, seed)) -. 1.3, 58.2, 0.0, -0.03)
     else if scene == 10 || scene == 17 do
@@ -626,7 +659,7 @@ mod StrataViewer do
       end
     else if scene == 9 do (-40.0, int_to_float(height(-40, 60, seed)) +. 1.9, 60.0, 0.62, -0.16)
     else if scene == 3 || scene == 5 do (-40.0, int_to_float(height(-40, 60, seed)) +. 2.6, 60.0, 0.62, -0.05)
-    else (-70.0, int_to_float(height(0, 0, seed)) +. 46.0, 96.0, 0.62, -0.42) end end end end end end end end end end end end end end
+    else (-70.0, int_to_float(height(0, 0, seed)) +. 46.0, 96.0, 0.62, -0.42) end end end end end end end end end end end end end end end
   end
 
   fn main(_cap : Cap(IO)) : Unit do
@@ -694,13 +727,16 @@ mod StrataViewer do
           end
         end
       -- scene 20 lays a stone tray on stilts holding a row of lake water, one eighth to full, beside a full block of it
-      let s0h = if scene != 20 do s0g
+      let s0h = if scene == 21 do
+          let gy1 = height(-35, 53, seed) + 3
+          Strata.Stream.run_until_settled(Strata.Stream.apply(s0g, Strata.Edit.fill_box(Strata.Stream.world(s0g), -41, gy1, 50, -29, gy1, 56, 1)), 1000000)
+        else if scene != 20 do s0g
         else
           let gy = height(-35, 53, seed) + 3
           let tray = Strata.Stream.apply(s0g, Strata.Edit.fill_box(Strata.Stream.world(s0g), -41, gy, 51, -30, gy + 1, 55, 1))
           let hollow = Strata.Stream.apply(tray, Strata.Edit.fill_box(Strata.Stream.world(tray), -40, gy + 1, 52, -31, gy + 1, 54, 0))
           Strata.Stream.run_until_settled(Strata.Stream.apply(hollow, Strata.Edit.set_many(Strata.Stream.world(hollow), stairs(gy + 1, 0, Nil))), 1000000)
-        end
+        end end
       -- scene 12 starts with its slab in place unless a run asks for it to appear later
       let s0e = if scene == 12 && Env.get_int("STRATA_SLAB_AT", -1) < 0 do Strata.Stream.run_until_settled(slab(s0h, seed, 1), 1000000) else s0h end
       match Strata.Render.sync(Strata.Render.new(16384), s0e) do

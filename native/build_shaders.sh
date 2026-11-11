@@ -26,6 +26,8 @@ build gbuffer.frag tiles.glsl
 build light.frag shade.glsl tiles.glsl gbuf.glsl trace.glsl sky.glsl reflect.glsl
 build composite.frag
 build water.frag shade.glsl tiles.glsl gbuf.glsl trace.glsl sky.glsl reflect.glsl
+build spray.vert
+build spray.frag tiles.glsl trace.glsl sky.glsl
 cp "$OUT" strata_shaders.h
 # strata_vk.c carries a stamp of the header, so a shader-only change still
 # changes the C source forge looks at

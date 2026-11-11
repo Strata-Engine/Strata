@@ -27,8 +27,9 @@
 /* Rewritten by build_shaders.sh whenever the shaders change: forge decides
  * whether to recompile this file from its text alone, not from the headers
  * it includes (GAPS S14). */
-#define STRATA_SHADERS_STAMP "c8d109e19a29030c"
+#define STRATA_SHADERS_STAMP "2fc78c2ea647bee4"
 #include "strata_shaders.h"
+#include "strata_spray.h"
 #include "strata_alloc.h"
 
 #define NARR_HDR 32
@@ -39,6 +40,8 @@ static inline void   *narr_data(void *a) { return (char *)a + NARR_HDR; }
 #define SV_MAX_SLOTS 16384
 #define SV_DEFAULT_QUADS (8u * 1024u * 1024u)   /* 64 MB of 8-byte quads */
 #define SV_FRAMES 2            /* frames in flight */
+#define SV_SPRAY_CAP 65536     /* particles the spray ring holds */
+#define SV_SPRAY_FLOATS 10     /* floats a particle */
 #define SV_LIGHT_PER_FRAME 128 /* chunks whose light bytes one frame may copy into the volume */
 #define SV_LIGHT_WRITE_BYTES (32768 + 64 + 8)   /* per write: the voxels, the coarse cells, the owner texel */
 #define SV_MAX_KEYS 512
@@ -141,7 +144,11 @@ static struct {
      * image, to the offscreen target); the two final passes are compatible */
     VkRenderPass pass_g, pass_l, pass, pass_off;
     VkPipelineLayout layout;
-    VkPipeline pipe_opaque, pipe_blend, pipe_cross, pipe_loose, pipe_cull, pipe_light, pipe_composite;
+    VkPipeline pipe_opaque, pipe_blend, pipe_cross, pipe_loose, pipe_cull, pipe_light, pipe_composite, pipe_spray;
+    /* Spray: a ring of particles in a mapped buffer, ten floats each (start
+     * xyz, birth, velocity xyz, life, texture layer, size). */
+    VkBuffer spray; VkDeviceMemory spray_mem; float *spray_map;
+    SprayRing ring; float *spray_births;
     VkBuffer loose; VkDeviceMemory loose_mem; uint32_t *loose_map;       /* model geometry, expanded per instance: 16 words a quad */
     float *models[SV_MAX_MODELS]; uint32_t model_quads[SV_MAX_MODELS];   /* 21 floats a quad, as Strata.Model lays them out */
     VkDescriptorSetLayout dsl;
@@ -475,15 +482,19 @@ static int make_render_pass(VkImageLayout final, VkRenderPass *out) {
 }
 
 /* kind 0: opaque and cutout quads; 1: translucent quads; 2: cross instances;
- * 3: loose quads; 4: the light pass; 5: the lit image to the screen.
+ * 3: loose quads; 4: the light pass; 5: the lit image to the screen;
+ * 6: spray (final pass, blended, after the translucent quads).
  * Kinds 0, 2 and 3 belong to the geometry pass, 4 to the light pass, 1 and 5
  * to the final pass. */
 static int make_pipeline(int kind, VkPipeline *out) {
-    int blend = kind == 1, cross = kind == 2, loose = kind == 3, full = kind >= 4, geom = kind == 0 || cross || loose;
-    VkShaderModule vs = cross ? shader(strata_cross_vert, sizeof(strata_cross_vert))
+    int spray = kind == 6;
+    int blend = kind == 1 || spray, cross = kind == 2, loose = kind == 3, full = kind == 4 || kind == 5, geom = kind == 0 || cross || loose;
+    VkShaderModule vs = spray ? shader(strata_spray_vert, sizeof(strata_spray_vert))
+                      : cross ? shader(strata_cross_vert, sizeof(strata_cross_vert))
                       : loose ? shader(strata_loose_vert, sizeof(strata_loose_vert))
                       : full  ? shader(strata_fullscreen_vert, sizeof(strata_fullscreen_vert)) : shader(strata_quad_vert, sizeof(strata_quad_vert));
-    VkShaderModule fs = kind == 4 ? shader(strata_light_frag, sizeof(strata_light_frag))
+    VkShaderModule fs = spray ? shader(strata_spray_frag, sizeof(strata_spray_frag))
+                      : kind == 4 ? shader(strata_light_frag, sizeof(strata_light_frag))
                       : kind == 5 ? shader(strata_composite_frag, sizeof(strata_composite_frag))
                       : blend     ? shader(strata_water_frag, sizeof(strata_water_frag)) : shader(strata_gbuffer_frag, sizeof(strata_gbuffer_frag));
     VkPipelineShaderStageCreateInfo stages[2] = {
@@ -501,9 +512,15 @@ static int make_pipeline(int kind, VkPipeline *out) {
         { .location = 1, .binding = 0, .format = VK_FORMAT_R32G32B32A32_UINT, .offset = 16 },
         { .location = 2, .binding = 0, .format = VK_FORMAT_R32G32B32A32_UINT, .offset = 32 },
         { .location = 3, .binding = 0, .format = VK_FORMAT_R32G32B32A32_UINT, .offset = 48 } };
+    /* a spray particle is ten floats */
+    VkVertexInputBindingDescription sbind = { .binding = 0, .stride = SV_SPRAY_FLOATS * 4, .inputRate = VK_VERTEX_INPUT_RATE_INSTANCE };
+    VkVertexInputAttributeDescription sattrs[3] = {
+        { .location = 0, .binding = 0, .format = VK_FORMAT_R32G32B32A32_SFLOAT, .offset = 0 },
+        { .location = 1, .binding = 0, .format = VK_FORMAT_R32G32B32A32_SFLOAT, .offset = 16 },
+        { .location = 2, .binding = 0, .format = VK_FORMAT_R32G32_SFLOAT, .offset = 32 } };
     VkPipelineVertexInputStateCreateInfo vin = { .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
-        .vertexBindingDescriptionCount = full ? 0 : 1, .pVertexBindingDescriptions = loose ? &lbind : &bind,
-        .vertexAttributeDescriptionCount = full ? 0 : (loose ? 4 : 2), .pVertexAttributeDescriptions = loose ? lattrs : attrs };
+        .vertexBindingDescriptionCount = full ? 0 : 1, .pVertexBindingDescriptions = spray ? &sbind : (loose ? &lbind : &bind),
+        .vertexAttributeDescriptionCount = full ? 0 : (spray ? 3 : (loose ? 4 : 2)), .pVertexAttributeDescriptions = spray ? sattrs : (loose ? lattrs : attrs) };
     VkPipelineInputAssemblyStateCreateInfo ia = { .sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
         .topology = (cross || full) ? VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST : VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP };
     VkPipelineViewportStateCreateInfo vp = { .sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO, .viewportCount = 1, .scissorCount = 1 };
@@ -989,6 +1006,14 @@ int64_t sv_open(int64_t w, int64_t h, int64_t capture_mouse, int64_t quad_capaci
     if (!make_pipeline(3, &g.pipe_loose)) return 0;
     if (!make_pipeline(4, &g.pipe_light)) return 0;
     if (!make_pipeline(5, &g.pipe_composite)) return 0;
+    if (!make_pipeline(6, &g.pipe_spray)) return 0;
+    {   void *smap = NULL;
+        if (!make_buffer((VkDeviceSize)SV_SPRAY_CAP * SV_SPRAY_FLOATS * 4, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, &g.spray, &g.spray_mem, &smap)) return 0;
+        g.spray_map = smap; memset(g.spray_map, 0, (size_t)SV_SPRAY_CAP * SV_SPRAY_FLOATS * 4);
+        g.spray_births = calloc(SV_SPRAY_CAP, sizeof(float));
+        if (!g.spray_births) return 0;
+        sp_init(&g.ring, g.spray_births, SV_SPRAY_CAP);
+    }
 
     void *map = NULL;
     g.quad_cap = (quad_capacity > 0 && quad_capacity < 0x20000000) ? (uint32_t)quad_capacity : SV_DEFAULT_QUADS;
@@ -1115,6 +1140,9 @@ void sv_close(void) {
         }
         if (g.pipe_light) vkDestroyPipeline(g.dev, g.pipe_light, NULL);
         if (g.pipe_composite) vkDestroyPipeline(g.dev, g.pipe_composite, NULL);
+        if (g.pipe_spray) vkDestroyPipeline(g.dev, g.pipe_spray, NULL);
+        if (g.spray) vkDestroyBuffer(g.dev, g.spray, NULL);
+        if (g.spray_mem) vkFreeMemory(g.dev, g.spray_mem, NULL);
         if (g.pass_g) vkDestroyRenderPass(g.dev, g.pass_g, NULL);
         if (g.pass_l) vkDestroyRenderPass(g.dev, g.pass_l, NULL);
         if (g.nearest) vkDestroySampler(g.dev, g.nearest, NULL);
@@ -1161,6 +1189,7 @@ void sv_close(void) {
     if (g.win) glfwDestroyWindow(g.win);
     glfwTerminate();
     free(g.trans); free(g.trans_at); free(g.trans_keys);
+    free(g.spray_births); g.spray_births = NULL;
     free(g.ubo_map); free(g.entries); free(g.cells); free(g.stage_light);
     for (uint32_t i = 0; i < g.nlq; i++) free(g.lq[i].bytes);
     free(g.lq);
@@ -1190,6 +1219,7 @@ void sv_set_vsync(int64_t on) { int off = on ? 0 : 1; if (g.ok && off != g.vsync
 double sv_stat(int64_t which) {
     if (which == 6) return (double)g.rebuilds;
     if (which == 7) return (double)g_quads.leaked + (double)g_loose.leaked;
+    if (which == 8) return g.spray_births ? (double)sp_count(&g.ring) : 0.0;
     return (which >= 0 && which < 6) ? g.stat[which] : -1.0;
 }
 int64_t sv_drawn_chunks(void) { return g.drawn_chunks; }
@@ -1470,6 +1500,30 @@ void sv_set_quality(int64_t sky_rays, int64_t reflections) {
     g.sky_rays = rays;
     g.reflections = reflections != 0;
 }
+/* Add [count] spray particles (at most 512 a call) at (x, y, z), flying at
+ * about (vx, vy, vz) m/s, each velocity component off by up to [spread],
+ * living [life] seconds, drawn with texture layer [tex]. They are born at
+ * the time last given to sv_set_time. Answers how many were added. */
+static float spray_hash(uint32_t i, uint32_t salt) {
+    uint32_t h = i * 2654435761u + salt * 40503u;
+    h ^= h >> 15; h *= 0x2c1b3c6du; h ^= h >> 12; h *= 0x297a2d39u; h ^= h >> 15;
+    return (float)(h & 0xffffu) / 32768.0f - 1.0f;      /* -1..1 */
+}
+int64_t sv_spray(double x, double y, double z, double vx, double vy, double vz, int64_t count, double spread, double life, int64_t tex) {
+    if (!g.ok || !g.spray_map || life <= 0.0) return 0;
+    int64_t n = sp_clamp(count);
+    for (int64_t i = 0; i < n; i++) {
+        uint32_t id = (uint32_t)g.ring.head;
+        uint32_t slot = sp_push(&g.ring, (float)g.time_s, (float)life);
+        float *p = g.spray_map + (size_t)slot * SV_SPRAY_FLOATS;
+        p[0] = (float)x + 0.35f * spray_hash(id, 1); p[1] = (float)y + 0.15f * spray_hash(id, 2); p[2] = (float)z + 0.35f * spray_hash(id, 3);
+        p[3] = (float)g.time_s;
+        p[4] = (float)(vx + spread * spray_hash(id, 4)); p[5] = (float)(vy + spread * 0.5 * (spray_hash(id, 5) + 1.0f)); p[6] = (float)(vz + spread * spray_hash(id, 6));
+        p[7] = (float)(life * (0.7 + 0.15 * (spray_hash(id, 7) + 1.0f)));
+        p[8] = (float)tex; p[9] = 0.16f + 0.07f * spray_hash(id, 8);
+    }
+    return n;
+}
 /* The time, in seconds, that moving surface detail (water's ripples) runs on. */
 void sv_set_time(double seconds) { g.time_s = seconds; }
 
@@ -1688,6 +1742,16 @@ int64_t sv_frame(void) {
         vkCmdBindPipeline(F->cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g.pipe_blend);
         vkCmdPushConstants(F->cmd, g.layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, 8, pc);
         vkCmdDrawIndirect(F->cmd, g.cmds, (VkDeviceSize)base * 16, ntrans, 16); draws++;
+    }
+    /* spray last, over the water: the ring's live span, in one draw or, where it wraps, two */
+    sp_expire(&g.ring, (float)g.time_s);
+    if (sp_count(&g.ring) > 0) {
+        uint32_t first = sp_first(&g.ring), n = sp_count(&g.ring);
+        uint32_t run = first + n > SV_SPRAY_CAP ? SV_SPRAY_CAP - first : n;
+        vkCmdBindVertexBuffers(F->cmd, 0, 1, &g.spray, &zero);
+        vkCmdBindPipeline(F->cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g.pipe_spray);
+        vkCmdDraw(F->cmd, 4, run, 0, first); draws++;
+        if (run < n) { vkCmdDraw(F->cmd, 4, n - run, 0, 0); draws++; }
     }
     vkCmdEndRenderPass(F->cmd);
     if (g.have_ts) vkCmdWriteTimestamp(F->cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, g.qpool, q0 + 1);

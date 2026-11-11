@@ -406,3 +406,17 @@ never moves on flat ground.
 The lake used is 10 000 voxels, not the planned 20 000: of the lakes near the
 origin for seed 7 it is the largest whose bed is above the ground outside,
 so that a breach can drain it at all.
+
+## Task 6: spray
+
+A ring of 65 536 particles, ten floats each, flown by the clock in the
+vertex shader; one draw (two where the ring wraps), only when any are live.
+
+| | GPU time | frame rate |
+|---|---|---|
+| overview, everything lit, no particles | 5.87 ms | 165 fps |
+| the same with the ring full (65 536 live) | 6.17 ms | 156 fps |
+
+Measured with the machine under a load average of 29, so both rows are slow;
+the difference, 0.3 ms for a full ring, is what the particles cost. The
+target (50 000 live at 120 fps or better) is met.
