@@ -28,7 +28,7 @@
 #define SA_RING 4096
 #define SA_STATS 12
 #define SA_PERIOD 256
-#define SA_PERIODS 3
+#define SA_PERIODS 2   /* two 256-frame buffers: 10.7 ms queued, so a play reaches the speaker within the 20 ms target */
 
 static SmMixer *g_mix;
 static SmRing g_ring;
@@ -344,3 +344,7 @@ void sa_unload(int64_t id) {
     sa_request(2, (int)id, NULL);
 }
 void sa_set_budget(int64_t bytes) { atomic_store(&g_budget, bytes < 0 ? 0 : bytes); }
+
+/* For soak runs only: hold the calling (main) thread for [ms], as a frame
+ * hitch would, to show that the mixing thread does not notice. */
+void sa_debug_stall(int64_t ms) { if (ms > 0 && ms < 2000) { struct timespec t = { ms / 1000, (long)(ms % 1000) * 1000000L }; nanosleep(&t, NULL); } }

@@ -184,6 +184,28 @@ In the viewer, footsteps sound every half metre walked, from the block
 underfoot (the viewer's own table of hardness and size), and a landing by
 how hard it was.
 
+### Listening
+
+Every scene soundcheck renders, written to WAV files to play (nothing is
+played aloud):
+
+    scripts/audio_golden.sh --update     # then open $TMPDIR/strata-audio-listen/*.wav
+
+blocks and strike (the building blocks), tone and recording, orbit-speakers
+and orbit-headphones (a sound circling you), distance (walking away to
+120 m), wall (passing behind 2 m of stone), cave and field (the same strikes
+in each), falls-4, falls-12 and falls-24 (water falling further).
+
+In the viewer, with sound (the default when playing; `H` for headphones):
+
+    viewer/run.sh                                  # walk: footsteps on grass, sand, stone; wind
+    STRATA_SCENE=18 STRATA_BREACH=30 viewer/run.sh # a lake breached: the waterfall, then the sea
+    STRATA_SCENE=19 STRATA_BREACH=30 viewer/run.sh # the same from the valley below
+
+Carve into a hillside (left click), walk into the tunnel and click again:
+the strike rings, and the wind drops. Build a wall between yourself and the
+waterfall (right click) and it dulls.
+
 ## Using it from a game
 
     [deps]
