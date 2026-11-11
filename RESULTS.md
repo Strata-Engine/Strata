@@ -505,6 +505,13 @@ Not listened to yet by the owner: every stored fingerprint was stored from a
 render nobody had heard. `scripts/audio_golden.sh --update` writes the WAVs
 to listen to.
 
+Headphones use the MIT KEMAR measurements (Gardner and Martin, 1994: 368
+directions, compact set), each of 512 virtual speakers taking the nearest,
+resampled to 48 kHz and diffuse-field equalised: a diffuse field keeps its
+power within 0.65 dB. A source behind sounds duller than one in front by
+10.4 dB in the 4 to 8 kHz octave, against 1 to 4 dB from the spherical-head
+model used before.
+
 Headphones use filters from a computed spherical head (Woodworth's delay,
 Brown and Duda's shadow, a pinna notch that rises with elevation, a lift in
 front and a dulling behind), diffuse-field equalised. Measured ears (MIT's

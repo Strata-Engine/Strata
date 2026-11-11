@@ -520,11 +520,11 @@ static void test_review(void) {
         m = sm_open();
         mu_output(m, hp);
         mu_listener(m, 0, 0, 0, 0, 0, -1);
-        tone_patch(m, 1, SM_SRC_SQUARE, 100.0f, 0.5f);
+        tone_patch(m, 1, SM_SRC_SINE, 1000.0f, 0.5f);   /* inside the band a measured head shapes */
         mu_play_at(m, 1, 1, 1.0f, 1.0f, 0.0f, 0.0f, -1.0f);
         render(m, SEC(0.1));
-        /* the head's filters delay sound about 24 samples: look just past that, still inside the first 2 ms */
-        float early = hp ? mu_peak(buf, 40, 96) : mu_peak(buf, 0, 40), later = mu_peak(buf, SEC(0.05), SEC(0.1));
+        /* the head's filters delay sound by a few dozen samples: look just past that, still inside the first 3 ms */
+        float early = hp ? mu_peak(buf, 48, 144) : mu_peak(buf, 0, 48), later = mu_peak(buf, SEC(0.05), SEC(0.1));
         CHECK(early > 0.6f * later, hp ? "binaural: a placed voice is at its level within its first millisecond" : "speakers: a placed voice is at its level within its first millisecond");
         sm_close(m);
     }
@@ -582,6 +582,10 @@ static void test_review(void) {
     CHECK(ord, "in order");
 }
 
+static void test_measured_ears(void) {
+    CHECK(strcmp(SH_MODEL, "MIT KEMAR") == 0, "the binaural filters come from the MIT KEMAR measurements");
+}
+
 int main(void) {
     test_fp();
     test_ring();
@@ -598,6 +602,7 @@ int main(void) {
     test_occlusion();
     test_reverb();
     test_review();
+    test_measured_ears();
     if (fails == 0) printf("mix_test: ok\n");
     return fails == 0 ? 0 : 1;
 }
