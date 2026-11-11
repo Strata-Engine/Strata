@@ -40,6 +40,8 @@ mod Strata.Physics do
   pfn c_gravity(c : Config) : Float do match c do PhConfig(g, _, _, _, _, _, _, _) -> g end end
   pfn c_dt(c : Config) : Float do match c do PhConfig(_, r, _, _, _, _, _, _) -> 1.0 /. int_to_float(if r < 1 do 1 else r end) end end
   pfn c_iters(c : Config) : Int do match c do PhConfig(_, _, i, _, _, _, _, _) -> i end end
+  pfn c_awake(c : Config) : Int do match c do PhConfig(_, _, _, a, _, _, _, _) -> a end end
+  pfn c_total(c : Config) : Int do match c do PhConfig(_, _, _, _, t, _, _, _) -> t end end
   pfn c_scale(c : Config) : Float do match c do PhConfig(_, _, _, _, _, _, _, sc) -> sc end end
 
   doc "A body physics moves."
@@ -53,7 +55,7 @@ mod Strata.Physics do
   -- still; asleep; asleep because it touches a chunk that is not loaded
   type Rigid = { id : Int, kind : Int, grid : Strata.Body.Grid, surf : NativeIntArr, m : Float, lx : Float, ly : Float, lz : Float,
                 ii : NativeFloatArr, px : Float, py : Float, pz : Float, q : Strata.Math.Quat.Quat,
-                vx : Float, vy : Float, vz : Float, wx : Float, wy : Float, wz : Float, still : Int, asleep : Bool, edge : Bool }
+                vx : Float, vy : Float, vz : Float, wx : Float, wy : Float, wz : Float, still : Int, asleep : Bool, edge : Bool, waited : Int }
 
   -- kind (0 impact, 1 break, 2 loose, 3 splash, 4 deferred, 5 spray), body, other (-1 the world), where, size
   type PhysEvent = PhEvent(Int, Int, Int, Float, Float, Float, Float)
@@ -71,12 +73,15 @@ mod Strata.Physics do
   -- an impulse to give body [id] at the next step: where, and how much (N s)
   type PhPush = PhPush(Int, Float, Float, Float, Float, Float, Float)
 
-  type Physics = { reg : Strata.Blocks.Registry, cfg : Config, bodies : List(Rigid), next : Int, steps : Int,
+  -- the game's camera: whether one is set, the eye, the direction looked in (unit), the cosine of half the view's angle
+  type Sight = NoView | Seen(Float, Float, Float, Float, Float, Float, Float)
+
+  type Physics = { reg : Strata.Blocks.Registry, cfg : Config, bodies : List(Rigid), next : Int, steps : Int, view : Sight, waiting : Int, over : Int,
                    pushes : List(PhPush), wakes : List(Strata.Edit.Change), events : List(PhysEvent) }
 
   doc "No bodies yet."
   fn new(r : Strata.Blocks.Registry, c : Config) : Physics do
-    { reg: r, cfg: c, bodies: Nil, next: 1, steps: 0, pushes: Nil, wakes: Nil, events: Nil }
+    { reg: r, cfg: c, bodies: Nil, next: 1, steps: 0, view: NoView, waiting: 0, over: 0, pushes: Nil, wakes: Nil, events: Nil }
   end
 
   -- ── Small maths ──────────────────────────────────────────────────────────
@@ -129,7 +134,7 @@ mod Strata.Physics do
           (ox, oy, oz) ->
             let body = { id: p.next, kind: kind, grid: g, surf: Bg.corners(p.reg, g), m: Bg.mass_kg(mass), lx: lx, ly: ly, lz: lz,
                          ii: inverse_sym(a, b, c, d, e, f), px: x +. ox, py: y +. oy, pz: z +. oz, q: qn,
-                         vx: 0.0, vy: 0.0, vz: 0.0, wx: 0.0, wy: 0.0, wz: 0.0, still: 0, asleep: false, edge: false }
+                         vx: 0.0, vy: 0.0, vz: 0.0, wx: 0.0, wy: 0.0, wz: 0.0, still: 0, asleep: false, edge: false, waited: 0 }
             let p2 = { p with bodies: List.append(p.bodies, Cons(body, Nil)), next: p.next + 1 }
             with_id(p2, p.next)
         end
@@ -139,8 +144,27 @@ mod Strata.Physics do
   -- (a record literal followed by a line opening with a bracket parses as a call)
   pfn with_id(p : Physics, id : Int) : (Physics, Int) do (p, id) end
 
-  doc "Take body [id] away."
-  fn remove(p : Physics, id : Int) : Physics do { p with bodies: List.filter(p.bodies, fn b -> b.id != id) } end
+  doc "Take body [id] away. Bodies resting on it or against it wake."
+  fn remove(p : Physics, id : Int) : Physics do
+    match find(p, id) do
+      None -> p
+      Some(gone) ->
+        let scale = c_scale(p.cfg)
+        let gb = bounds(gone, scale)
+        let rest = List.filter(p.bodies, fn b -> b.id != id)
+        { p with bodies: List.map(rest, fn b -> if b.asleep && overlap(bounds(b, scale), gb, 1) do awaken(b) else b end) }
+    end
+  end
+
+  doc "The game's camera, for the total cap: a sleeping body inside this cone (eye, unit direction, cosine of half its angle) is in view and is never snapped into the grid. With no view set, nothing is in view."
+  fn with_view(p : Physics, ex : Float, ey : Float, ez : Float, dx : Float, dy : Float, dz : Float, cos_half : Float) : Physics do
+    let l = Math.sqrt(dx *. dx +. dy *. dy +. dz *. dz)
+    if l <= 0.0 do { p with view: NoView } else { p with view: Seen(ex, ey, ez, dx /. l, dy /. l, dz /. l, cos_half) } end
+  end
+  doc "Awake bodies the last step left for later (the awake cap)."
+  fn waiting_count(p : Physics) : Int do p.waiting end
+  doc "Bodies above the total cap that could not be snapped into the grid (every candidate was awake or in view)."
+  fn over_cap(p : Physics) : Int do p.over end
 
   pfn find(p : Physics, id : Int) : Option(Rigid) do List.find(p.bodies, fn b -> b.id == id) end
 
@@ -216,6 +240,13 @@ mod Strata.Physics do
         let rz = 0.5 *. (absf(g) *. ex +. absf(h) *. ey +. absf(i) *. ez)
         let fl = fn v -> float_to_int(Math.floor(v /. scale))
         (fl(mx -. rx), fl(my -. ry), fl(mz -. rz), fl(mx +. rx), fl(my +. ry), fl(mz +. rz))
+    end
+  end
+
+  pfn overlap(a : (Int, Int, Int, Int, Int, Int), b : (Int, Int, Int, Int, Int, Int), grow : Int) : Bool do
+    match (a, b) do
+      ((ax0, ay0, az0, ax1, ay1, az1), (bx0, by0, bz0, bx1, by1, bz1)) ->
+        ax1 + grow >= bx0 && ax0 - grow <= bx1 && ay1 + grow >= by0 && ay0 - grow <= by1 && az1 + grow >= bz0 && az0 - grow <= bz1
     end
   end
 
@@ -309,12 +340,18 @@ mod Strata.Physics do
   -- ── The dynamics ─────────────────────────────────────────────────────────
   pfn moving(b : Rigid) : Bool do !b.asleep && b.kind == dynamic() && b.m > 0.0 end
 
-  -- write body b into state slot k
-  pfn load_state(st : NativeFloatArr, k : Int, b : Rigid) : NativeFloatArr do
+  -- write body b into state slot k; a static slot (a sleeping, waiting or
+  -- driven body something may touch) has no inverse mass, so it does not move
+  pfn load_state(st : NativeFloatArr, k : Int, b : Rigid, static : Bool) : NativeFloatArr do
     let o = k * 32
     let s1 = pset(pset(pset(pset(pset(pset(pset(st, o, b.px), o + 1, b.py), o + 2, b.pz), o + 3, Qt.x(b.q)), o + 4, Qt.y(b.q)), o + 5, Qt.z(b.q)), o + 6, Qt.w(b.q))
-    let s2 = pset(pset(pset(pset(pset(pset(pset(s1, o + 7, b.vx), o + 8, b.vy), o + 9, b.vz), o + 10, b.wx), o + 11, b.wy), o + 12, b.wz), o + 13, 1.0 /. b.m)
-    put_mats(s2, o, b.q, world_inv(b))
+    if static do
+      let s2 = pset(pset(pset(pset(pset(pset(pset(s1, o + 7, 0.0), o + 8, 0.0), o + 9, 0.0), o + 10, 0.0), o + 11, 0.0), o + 12, 0.0), o + 13, 0.0)
+      put_mats(s2, o, b.q, (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0))
+    else
+      let s2 = pset(pset(pset(pset(pset(pset(pset(s1, o + 7, b.vx), o + 8, b.vy), o + 9, b.vz), o + 10, b.wx), o + 11, b.wy), o + 12, b.wz), o + 13, 1.0 /. b.m)
+      put_mats(s2, o, b.q, world_inv(b))
+    end
   end
   pfn put_mats(st : NativeFloatArr, o : Int, q : Strata.Math.Quat.Quat, iw : (Float, Float, Float, Float, Float, Float, Float, Float, Float)) : NativeFloatArr do
     match (iw, rot(q)) do
@@ -330,12 +367,12 @@ mod Strata.Physics do
              vx: pget(st, o + 7), vy: pget(st, o + 8), vz: pget(st, o + 9), wx: pget(st, o + 10), wy: pget(st, o + 11), wz: pget(st, o + 12) }
   end
 
-  -- gravity on every slot
+  -- gravity on the first n slots (the moving bodies)
   pfn fall(st : NativeFloatArr, k : Int, n : Int, dv : Float) : NativeFloatArr do
     if k >= n do st else fall(pset(st, k * 32 + 8, pget(st, k * 32 + 8) -. dv), k + 1, n, dv) end
   end
 
-  -- advance positions by velocity plus push-out, rotations by spin plus push-out spin
+  -- advance the moving bodies by velocity plus push-out, rotations by spin plus push-out spin
   pfn integrate(st : NativeFloatArr, ps : NativeFloatArr, bs : List(Rigid), k : Int, dt : Float) : NativeFloatArr do
     match bs do
       Nil -> st
@@ -354,12 +391,15 @@ mod Strata.Physics do
                                                     qz +. h *. (wz *. qw +. wx *. qy -. wy *. qx), qw +. h *. (0.0 -. wx *. qx -. wy *. qy -. wz *. qz)))
         let s2 = pset(pset(pset(pset(s1, o + 3, Qt.x(q2)), o + 4, Qt.y(q2)), o + 5, Qt.z(q2)), o + 6, Qt.w(q2))
         -- the world inverse inertia and rotation matrix follow the new rotation
-        let b2 = { b with q: q2 }
-        integrate(put_mats(s2, o, q2, world_inv(b2)), ps, t, k + 1, dt)
+        integrate(put_mats(s2, o, q2, world_inv({ b with q: q2 })), ps, t, k + 1, dt)
     end
   end
 
-  -- every body's contacts with the world, in body order
+  -- one taking part in the step: its slot, the body, its grid as a window, its box (voxels, grown by how far it may move)
+  type Part = Part(Int, Rigid, Strata.Contact.Win3, (Int, Int, Int, Int, Int, Int))
+  pfn part_corners(pt : Part) : Int do match pt do Part(_, b, _, _) -> NativeArray.length_int(b.surf) end end
+
+  -- every moving body's contacts with the world, in body order
   pfn gen_all(cs : NativeFloatArr, nc : Int, st : NativeFloatArr, bs : List(Rigid), wins : List(Strata.Contact.Win3), k : Int, scale : Float, dt : Float) : (NativeFloatArr, Int) do
     match (bs, wins) do
       (Cons(b, t), Cons(win, wt)) ->
@@ -369,40 +409,79 @@ mod Strata.Physics do
       _ -> (cs, nc)
     end
   end
-
-  -- impacts: per body, the normal impulse of contacts that were closing faster than 0.5 m/s
-  pfn impacts(cs : NativeFloatArr, nc : Int, bs : List(Rigid), st : NativeFloatArr) : List(PhysEvent) do
-    impacts_go(cs, nc, bs, st, 0, Nil)
-  end
-  pfn impacts_go(cs : NativeFloatArr, nc : Int, bs : List(Rigid), st : NativeFloatArr, k : Int, acc : List(PhysEvent)) : List(PhysEvent) do
-    match bs do
-      Nil -> reverse(acc)
-      Cons(b, t) ->
-        match sum_impact(cs, nc, k, 0, 0.0, 0.0, 0.0, 0.0, 0) do
-          (j, x, y, z, n) ->
-            if n == 0 || j <= 0.0 do impacts_go(cs, nc, t, st, k + 1, acc)
-            else
-              let o = k * 32
-              let c = int_to_float(n)
-              impacts_go(cs, nc, t, st, k + 1, Cons(PhEvent(0, b.id, -1, pget(st, o) +. x /. c, pget(st, o + 1) +. y /. c, pget(st, o + 2) +. z /. c, j), acc))
+  -- contacts between the two bodies of each pair, each one's corners against the other's grid
+  pfn gen_pairs(cs : NativeFloatArr, nc : Int, st : NativeFloatArr, prs : List((Part, Part)), scale : Float, dt : Float) : (NativeFloatArr, Int) do
+    match prs do
+      Nil -> (cs, nc)
+      Cons((Part(i, a, wa, _), Part(j, b, wb, _)), t) ->
+        match Ct.gen_body(cs, nc, st, i, j, wb, scale, dt, Bg.size_x(a.grid), Bg.size_y(a.grid), a.surf, a.lx, a.ly, a.lz, b.lx, b.ly, b.lz) do
+          (cs2, nc2) ->
+            match Ct.gen_body(cs2, nc2, st, j, i, wa, scale, dt, Bg.size_x(b.grid), Bg.size_y(b.grid), b.surf, b.lx, b.ly, b.lz, a.lx, a.ly, a.lz) do
+              (cs3, nc3) -> gen_pairs(cs3, nc3, st, t, scale, dt)
             end
         end
     end
   end
-  pfn sum_impact(cs : NativeFloatArr, nc : Int, k : Int, c : Int, j : Float, x : Float, y : Float, z : Float, n : Int) : (Float, Float, Float, Float, Int) do
-    if c >= nc do (j, x, y, z, n)
+
+  -- impacts: per moving body, the normal impulse of contacts that were
+  -- closing faster than 0.5 m/s; the thing (the world, or another body)
+  -- struck hardest names the event. One pass over the contacts into a table
+  -- of 7 floats a slot: impulse, x, y, z sums, count, strongest, its other slot.
+  pfn tally(cs : NativeFloatArr, nc : Int, n : Int, t : NativeFloatArr, c : Int) : NativeFloatArr do
+    if c >= nc do t
     else
       let o = c * 28
-      if float_to_int(pget(cs, o)) == k && pget(cs, o + 27) < -0.5 && pget(cs, o + 23) > 0.0 do
-        sum_impact(cs, nc, k, c + 1, j +. pget(cs, o + 23), x +. pget(cs, o + 2), y +. pget(cs, o + 3), z +. pget(cs, o + 4), n + 1)
-      else sum_impact(cs, nc, k, c + 1, j, x, y, z, n) end
+      let l = pget(cs, o + 23)
+      -- only moving bodies (slots below n) have rows; a wall's corners touching a moving body count against that body when it is the a side
+      if pget(cs, o + 27) < -0.5 && l > 0.0 && float_to_int(pget(cs, o)) < n do
+        let k = float_to_int(pget(cs, o)) * 7
+        let t1 = pset(pset(pset(pset(pset(t, k, pget(t, k) +. l), k + 1, pget(t, k + 1) +. pget(cs, o + 2)), k + 2, pget(t, k + 2) +. pget(cs, o + 3)), k + 3, pget(t, k + 3) +. pget(cs, o + 4)), k + 4, pget(t, k + 4) +. 1.0)
+        let t2 = if l > pget(t1, k + 5) do pset(pset(t1, k + 5, l), k + 6, pget(cs, o + 1)) else t1 end
+        tally(cs, nc, n, t2, c + 1)
+      else tally(cs, nc, n, t, c + 1) end
+    end
+  end
+  pfn impacts(cs : NativeFloatArr, nc : Int, n : Int, ids : NativeIntArr, st : NativeFloatArr) : List(PhysEvent) do
+    impacts_go(tally(cs, nc, n, NativeArray.make_float(n * 7 + 1, 0.0), 0), n, ids, st, n - 1, Nil)
+  end
+  pfn impacts_go(t : NativeFloatArr, n : Int, ids : NativeIntArr, st : NativeFloatArr, k : Int, acc : List(PhysEvent)) : List(PhysEvent) do
+    if k < 0 do acc
+    else
+      let o = k * 7
+      let cnt = pget(t, o + 4)
+      if cnt <= 0.0 do impacts_go(t, n, ids, st, k - 1, acc)
+      else
+        let other = float_to_int(pget(t, o + 6))
+        let oid = if other < 0 do -1 else NativeArray.get_int(ids, other) end
+        let so = k * 32
+        impacts_go(t, n, ids, st, k - 1, Cons(PhEvent(0, NativeArray.get_int(ids, k), oid, pget(st, so) +. pget(t, o + 1) /. cnt, pget(st, so + 1) +. pget(t, o + 2) /. cnt, pget(st, so + 2) +. pget(t, o + 3) /. cnt, pget(t, o)), acc))
+      end
     end
   end
 
-  pfn surf_total(bs : List(Rigid), n : Int) : Int do
+  -- the normal impulse every slot took this sub-step, from either side of a contact
+  pfn took(cs : NativeFloatArr, nc : Int, acc : NativeFloatArr, c : Int) : NativeFloatArr do
+    if c >= nc do acc
+    else
+      let o = c * 28
+      let l = pget(cs, o + 23)
+      let a = float_to_int(pget(cs, o))
+      let b = float_to_int(pget(cs, o + 1))
+      let a1 = pset(acc, a, pget(acc, a) +. l)
+      took(cs, nc, if b >= 0 do pset(a1, b, pget(a1, b) +. l) else a1 end, c + 1)
+    end
+  end
+
+  pfn corner_total(bs : List(Rigid), n : Int) : Int do
     match bs do
       Nil -> n
-      Cons(b, t) -> surf_total(t, n + NativeArray.length_int(b.surf))
+      Cons(b, t) -> corner_total(t, n + NativeArray.length_int(b.surf))
+    end
+  end
+  pfn pair_total(prs : List((Part, Part)), n : Int) : Int do
+    match prs do
+      Nil -> n
+      Cons((a, b), t) -> pair_total(t, n + part_corners(a) + part_corners(b))
     end
   end
 
@@ -418,28 +497,39 @@ mod Strata.Physics do
     end
   end
 
-  -- a body's world window for this step: its box grown by how far it can move, plus two voxels
-  pfn window_of(w : Strata.World.World, t : NativeU8Arr, b : Rigid, scale : Float, dt : Float) : Strata.Contact.Win3 do
+  -- how many voxels a body may move this step, plus two
+  pfn reach_of(b : Rigid, scale : Float, dt : Float) : Int do
     let ex = int_to_float(Bg.size_x(b.grid) + Bg.size_y(b.grid) + Bg.size_z(b.grid)) *. scale
     let reach = (Math.sqrt(b.vx *. b.vx +. b.vy *. b.vy +. b.vz *. b.vz) +. 10.0 *. dt +. Math.sqrt(b.wx *. b.wx +. b.wy *. b.wy +. b.wz *. b.wz) *. ex) *. dt
-    let g = float_to_int(Math.ceil(reach /. scale)) + 2
-    match bounds(b, scale) do
-      (x0, y0, z0, x1, y1, z1) -> Ct.window(w, t, x0 - g, y0 - g, z0 - g, x1 + g, y1 + g, z1 + g)
+    float_to_int(Math.ceil(reach /. scale)) + 2
+  end
+  pfn grown(bx : (Int, Int, Int, Int, Int, Int), g : Int) : (Int, Int, Int, Int, Int, Int) do
+    match bx do
+      (x0, y0, z0, x1, y1, z1) -> (x0 - g, y0 - g, z0 - g, x1 + g, y1 + g, z1 + g)
+    end
+  end
+  pfn window_at(w : Strata.World.World, t : NativeU8Arr, bx : (Int, Int, Int, Int, Int, Int)) : Strata.Contact.Win3 do
+    match bx do
+      (x0, y0, z0, x1, y1, z1) -> Ct.window(w, t, x0, y0, z0, x1, y1, z1)
     end
   end
 
-  pfn sub_go(st : NativeFloatArr, bs : List(Rigid), wins : List(Strata.Contact.Win3), n : Int, cap : Int, scale : Float, dt : Float, g : Float, iters : Int, i : Int, evs : List(PhysEvent)) : (NativeFloatArr, List(PhysEvent)) do
-    if i <= 0 do (st, evs)
+  pfn sub_go(st : NativeFloatArr, mv : List(Rigid), wins : List(Strata.Contact.Win3), prs : List((Part, Part)), n : Int, total : Int, ids : NativeIntArr, cap : Int,
+             scale : Float, dt : Float, g : Float, iters : Int, i : Int, evs : List(PhysEvent), push : NativeFloatArr) : (NativeFloatArr, List(PhysEvent), NativeFloatArr) do
+    if i <= 0 do (st, evs, push)
     else
       let s1 = fall(st, 0, n, g *. dt)
-      match gen_all(NativeArray.make_float(cap * 28 + 1, 0.0), 0, s1, bs, wins, 0, scale, dt) do
-        (cs0, nc) ->
-          let cs1 = Ct.prepare(cs0, nc, s1, dt, scale)
-          match Ct.solve(cs1, nc, s1, iters, 0.6) do
-            (cs2, s2) ->
-              let ps = Ct.push_out(cs2, nc, s2, n, iters)
-              let s3 = integrate(s2, ps, bs, 0, dt)
-              sub_go(s3, bs, wins, n, cap, scale, dt, g, iters, i - 1, List.append(evs, impacts(cs2, nc, bs, s2)))
+      match gen_all(NativeArray.make_float(cap * 28 + 1, 0.0), 0, s1, mv, wins, 0, scale, dt) do
+        (cs0, nw) ->
+          match gen_pairs(cs0, nw, s1, prs, scale, dt) do
+            (cs1, nc) ->
+              let cs2 = Ct.prepare(cs1, nc, s1, dt, scale)
+              match Ct.solve(cs2, nc, s1, iters, 0.6) do
+                (cs3, s2) ->
+                  let ps = Ct.push_out(cs3, nc, s2, total, iters)
+                  let s3 = integrate(s2, ps, mv, 0, dt)
+                  sub_go(s3, mv, wins, prs, n, total, ids, cap, scale, dt, g, iters, i - 1, List.append(evs, impacts(cs3, nc, n, ids, s2)), took(cs3, nc, push, 0))
+              end
           end
       end
     end
@@ -451,10 +541,16 @@ mod Strata.Physics do
       Cons(b, t) -> read_all(st, t, k + 1, Cons(read_state(st, k, b), acc))
     end
   end
-  pfn load_all(st : NativeFloatArr, bs : List(Rigid), k : Int) : NativeFloatArr do
+  pfn load_all(st : NativeFloatArr, bs : List(Rigid), k : Int, static : Bool) : NativeFloatArr do
     match bs do
       Nil -> st
-      Cons(b, t) -> load_all(load_state(st, k, b), t, k + 1)
+      Cons(b, t) -> load_all(load_state(st, k, b, static), t, k + 1, static)
+    end
+  end
+  pfn id_array(bs : List(Rigid), a : NativeIntArr, k : Int) : NativeIntArr do
+    match bs do
+      Nil -> a
+      Cons(b, t) -> id_array(t, NativeArray.set_int(a, k, b.id), k + 1)
     end
   end
 
@@ -468,7 +564,7 @@ mod Strata.Physics do
     else { b with still: 0 } end
   end
 
-  -- put the moved bodies back among the rest, keeping id order
+  -- put the changed bodies back among the rest, keeping id order (both lists are in id order)
   pfn merge(all : List(Rigid), moved : List(Rigid), acc : List(Rigid)) : List(Rigid) do
     match all do
       Nil -> reverse(acc)
@@ -480,26 +576,260 @@ mod Strata.Physics do
     end
   end
 
-  doc "One step of 1/60 s (the config's rate) against world [w], as it stands. [focus] orders the work when it is capped. Returns the bodies after the step and the edit physics made to the world."
-  fn step_world(p : Physics, w : Strata.World.World, _focus : List((Float, Float, Float))) : (Physics, Strata.Edit.Outcome) do
+  -- ── The awake cap ────────────────────────────────────────────────────────
+  pfn dist2(fs : List((Float, Float, Float)), b : Rigid, best : Float) : Float do
+    match fs do
+      Nil -> if best < 0.0 do 0.0 else best end
+      Cons((x, y, z), t) ->
+        let d = (b.px -. x) *. (b.px -. x) +. (b.py -. y) *. (b.py -. y) +. (b.pz -. z) *. (b.pz -. z)
+        dist2(t, b, if best < 0.0 || d < best do d else best end)
+    end
+  end
+  -- nearest the focus first, a body that has waited counting as nearer; then
+  -- the longest waiting; then the lowest id
+  pfn sooner(fs : List((Float, Float, Float)), a : Rigid, b : Rigid) : Bool do
+    let wa = int_to_float(1 + a.waited * a.waited)
+    let wb = int_to_float(1 + b.waited * b.waited)
+    let ua = dist2(fs, a, -1.0) /. wa
+    let ub = dist2(fs, b, -1.0) /. wb
+    if ua != ub do ua < ub
+    else if a.waited != b.waited do a.waited > b.waited
+    else a.id < b.id end end
+  end
+  pfn by_id(bs : List(Rigid)) : List(Rigid) do List.sort_by(bs, fn (a, b) -> a.id <= b.id) end
+
+  -- ── The total cap ────────────────────────────────────────────────────────
+  pfn in_view(v : Sight, b : Rigid) : Bool do
+    match v do
+      NoView -> false
+      Seen(ex, ey, ez, dx, dy, dz, c) ->
+        let x = b.px -. ex
+        let y = b.py -. ey
+        let z = b.pz -. ez
+        let l = Math.sqrt(x *. x +. y *. y +. z *. z)
+        l <= 0.0 || (x *. dx +. y *. dy +. z *. dz) /. l >= c
+    end
+  end
+
+  -- the nearest of the 24 axis-aligned rotations to q: each of the body's axes
+  -- turned to the world axis it is closest to
+  pfn axis_of(x : Float, y : Float, z : Float, not_a : Int) : (Int, Float) do
+    let ax = if not_a == 0 do -1.0 else absf(x) end
+    let ay = if not_a == 1 do -1.0 else absf(y) end
+    let az = if not_a == 2 do -1.0 else absf(z) end
+    if ax >= ay && ax >= az do (0, if x < 0.0 do -1.0 else 1.0 end)
+    else if ay >= az do (1, if y < 0.0 do -1.0 else 1.0 end)
+    else (2, if z < 0.0 do -1.0 else 1.0 end) end end
+  end
+  pfn unit(axis : Int, sign : Float) : (Float, Float, Float) do
+    if axis == 0 do (sign, 0.0, 0.0) else if axis == 1 do (0.0, sign, 0.0) else (0.0, 0.0, sign) end end
+  end
+  -- the snapped rotation as a matrix, columns c0 c1 c2 (the body's x, y, z axes in the world)
+  pfn snapped(q : Strata.Math.Quat.Quat) : ((Float, Float, Float), (Float, Float, Float), (Float, Float, Float)) do
+    match rot(q) do
+      (r0, _, _, r3, _, _, r6, _, _) ->
+        match axis_of(r0, r3, r6, -1) do
+          (a0, s0) ->
+            match rot(q) do
+              (_, r1, _, _, r4, _, _, r7, _) ->
+                match axis_of(r1, r4, r7, a0) do
+                  (a1, s1) ->
+                    let (c0x, c0y, c0z) = unit(a0, s0)
+                    let (c1x, c1y, c1z) = unit(a1, s1)
+                    ((c0x, c0y, c0z), (c1x, c1y, c1z), (c0y *. c1z -. c0z *. c1y, c0z *. c1x -. c0x *. c1z, c0x *. c1y -. c0y *. c1x))
+                end
+            end
+        end
+    end
+  end
+
+  -- the cells a body becomes, turned to its nearest axis-aligned rotation:
+  -- each colliding voxel's centre, carried about the centre of mass, floored
+  -- to the world voxel it is in; only cells that are air or do not collide
+  -- are written
+  pfn snap_cells(r : Strata.Blocks.Registry, w : Strata.World.World, b : Rigid, scale : Float) : List((Int, Int, Int, Int)) do
+    let g = b.grid
+    let sx = Bg.size_x(g)
+    let sy = Bg.size_y(g)
+    let sz = Bg.size_z(g)
+    match snapped(b.q) do
+      ((ax, ay, az), (bx, yb, bz), (cx, cy, cz)) ->
+        snap_go(r, w, g, scale, b, ax, ay, az, bx, yb, bz, cx, cy, cz, sx, sy, 0, sx * sy * sz, Nil)
+    end
+  end
+  pfn snap_go(r : Strata.Blocks.Registry, w : Strata.World.World, g : Strata.Body.Grid, scale : Float, b : Rigid, ax : Float, ay : Float, az : Float, bx : Float, yb : Float, bz : Float, cx : Float, cy : Float, cz : Float, sx : Int, sy : Int, i : Int, n : Int, acc : List((Int, Int, Int, Int))) : List((Int, Int, Int, Int)) do
+    if i >= n do reverse(acc)
+    else
+      let id = NativeArray.get_i32(Bg.ids(g), i)
+      if !Strata.Blocks.collides(r, id) do snap_go(r, w, g, scale, b, ax, ay, az, bx, yb, bz, cx, cy, cz, sx, sy, i + 1, n, acc)
+      else
+        let lx = (int_to_float(i % sx) +. 0.5) *. scale -. b.lx
+        let ly = (int_to_float((i / sx) % sy) +. 0.5) *. scale -. b.ly
+        let lz = (int_to_float(i / (sx * sy)) +. 0.5) *. scale -. b.lz
+        let fl = fn v -> float_to_int(Math.floor(v /. scale))
+        let x = fl(b.px +. ax *. lx +. bx *. ly +. cx *. lz)
+        let y = fl(b.py +. ay *. lx +. yb *. ly +. cy *. lz)
+        let z = fl(b.pz +. az *. lx +. bz *. ly +. cz *. lz)
+        let free = !Strata.Blocks.collides(r, Strata.World.get_block(w, x, y, z))
+        snap_go(r, w, g, scale, b, ax, ay, az, bx, yb, bz, cx, cy, cz, sx, sy, i + 1, n, if free do Cons((x, y, z, id), acc) else acc end)
+      end
+    end
+  end
+
+  doc "Write body [id] into the world as blocks, turned to the nearest of the 24 axis-aligned rotations and rounded to whole voxels, and remove it. A voxel whose cell is taken by a block that collides is dropped. Bodies resting on it wake."
+  fn to_blocks(p : Physics, w : Strata.World.World, id : Int) : (Physics, Strata.Edit.Outcome) do
+    match find(p, id) do
+      None -> (p, Strata.Edit.set_many(w, Nil))
+      Some(b) ->
+        let o = Strata.Edit.set_many(w, snap_cells(p.reg, w, b, c_scale(p.cfg)))
+        (remove(p, id), o)
+    end
+  end
+
+  -- past the total cap: the sleeping bodies out of view farthest from the focus become blocks
+  pfn capped(p : Physics, w : Strata.World.World, focus : List((Float, Float, Float))) : (Physics, List((Int, Int, Int, Int))) do
+    let excess = List.length(p.bodies) - c_total(p.cfg)
+    if excess <= 0 do ({ p with over: 0 }, Nil)
+    else
+      let cand = List.sort_by(List.filter(p.bodies, fn b -> b.asleep && b.kind == dynamic() && !in_view(p.view, b)), fn (a, b) -> farther(focus, a, b))
+      let gone = List.take(cand, excess)
+      let scale = c_scale(p.cfg)
+      let cells = List.fold_left(gone, Nil, fn (acc, b) -> List.append(acc, snap_cells(p.reg, w, b, scale)))
+      let p2 = List.fold_left(gone, p, fn (q, b) -> remove(q, b.id))
+      ({ p2 with over: excess - List.length(gone) }, cells)
+    end
+  end
+  pfn farther(fs : List((Float, Float, Float)), a : Rigid, b : Rigid) : Bool do
+    let da = dist2(fs, a, -1.0)
+    let db = dist2(fs, b, -1.0)
+    if da != db do da > db else a.id < b.id end
+  end
+
+  pfn finish_step(p : Physics, w : Strata.World.World, focus : List((Float, Float, Float))) : (Physics, Strata.Edit.Outcome) do
+    match capped(p, w, focus) do
+      (p2, cells) -> (p2, Strata.Edit.set_many(w, cells))
+    end
+  end
+
+  doc "One step of 1/60 s (the config's rate) against world [w], as it stands. [focus] orders the work when it is capped: bodies nearest it move first, and past the total cap the bodies farthest from it become blocks. Returns the bodies after the step and the edit physics made to the world."
+  fn step_world(p : Physics, w : Strata.World.World, focus : List((Float, Float, Float))) : (Physics, Strata.Edit.Outcome) do
     let scale = c_scale(p.cfg)
     let dt0 = c_dt(p.cfg)
     let g = c_gravity(p.cfg)
     let bs0 = List.map(p.bodies, fn b -> at_edge(w, pushed(woken(b, p.wakes, scale), p.pushes), scale))
-    let mv = List.filter(bs0, fn b -> moving(b))
+    -- the awake cap: the soonest go, the rest wait
+    let cand = List.sort_by(List.filter(bs0, fn b -> moving(b)), fn (a, b) -> sooner(focus, a, b))
+    let mv = by_id(List.take(cand, c_awake(p.cfg)))
+    let waiting = List.drop(cand, c_awake(p.cfg))
+    let bs1 = merge(bs0, List.map(by_id(waiting), fn b -> { b with waited: b.waited + 1 }), Nil)
     let n = List.length(mv)
-    if n == 0 do ({ p with bodies: bs0, steps: p.steps + 1, pushes: Nil, wakes: Nil, events: Nil }, Strata.Edit.set_many(w, Nil))
+    let p1 = { p with steps: p.steps + 1, pushes: Nil, wakes: Nil, events: Nil, waiting: List.length(waiting) }
+    if n == 0 do finish_step({ p1 with bodies: bs1 }, w, focus)
     else
       let nsub = substeps(mv, dt0, g, scale, 1)
       let dt = dt0 /. int_to_float(nsub)
       let t = Ct.collide_table(p.reg)
-      let wins = List.map(mv, fn b -> window_of(w, t, b, scale, dt0))
-      let st0 = load_all(NativeArray.make_float(n * 32 + 1, 0.0), mv, 0)
-      match sub_go(st0, mv, wins, n, surf_total(mv, 0), scale, dt, g, c_iters(p.cfg), nsub, Nil) do
-        (st, evs) ->
-          let moved = List.map(read_all(st, mv, 0, Nil), fn b -> settle(b))
-          ({ p with bodies: merge(bs0, moved, Nil), steps: p.steps + 1, pushes: Nil, wakes: Nil, events: evs }, Strata.Edit.set_many(w, Nil))
+      let boxes = List.map(mv, fn b -> grown(bounds(b, scale), reach_of(b, scale, dt0)))
+      -- the others: bodies that do not move this step; one a moving body may
+      -- touch takes part as a wall
+      let others = List.filter(minus(bs1, mv, Nil), fn b -> b.m > 0.0)
+      let m = List.length(others)
+      let bx = boxes_array(List.append(boxes, List.map(others, fn b -> bounds(b, scale))), NativeArray.make_int((n + m) * 6 + 1, 0), 0)
+      let order = List.sort_by(List.range(0, n + m), fn (a, b) -> NativeArray.get_int(bx, a * 6) < NativeArray.get_int(bx, b * 6) || (NativeArray.get_int(bx, a * 6) == NativeArray.get_int(bx, b * 6) && a <= b))
+      let cands = sweep(bx, order, Nil, n, Nil)
+      let used = List.fold_left(cands, NativeArray.make_int(n + m + 1, 0), fn (u, pr) -> match pr do (a, b) -> NativeArray.set_int(NativeArray.set_int(u, a, 1), b, 1) end)
+      let statics = pick(others, used, n, Nil)
+      let slot = slots(used, n, m, NativeArray.make_int(n + m + 1, -1), 0, n)
+      let parts = Strata.Tree.from_list(List.map(List.zip(List.range(0, n + List.length(statics)), List.append(mv, statics)), fn pr -> make_part(pr, t, scale, dt0)), make_part((0, first(mv)), t, scale, dt0))
+      let prs = List.map(cands, fn pr -> match pr do (a, b) -> (Strata.Tree.get(parts, NativeArray.get_int(slot, a)), Strata.Tree.get(parts, NativeArray.get_int(slot, b))) end)
+      let total = n + List.length(statics)
+      let ids = id_array(List.append(mv, statics), NativeArray.make_int(total + 1, 0), 0)
+      let st0 = load_all(load_all(NativeArray.make_float(total * 32 + 1, 0.0), mv, 0, false), statics, n, true)
+      let wins = List.map(boxes, fn bx -> window_at(w, t, bx))
+      let cap = corner_total(mv, 0) + pair_total(prs, 0)
+      match sub_go(st0, mv, wins, prs, n, total, ids, cap, scale, dt, g, c_iters(p.cfg), nsub, Nil, NativeArray.make_float(total + 1, 0.0)) do
+        (st, evs, push) ->
+          let moved = List.map(read_all(st, mv, 0, Nil), fn b -> settle({ b with waited: 0 }))
+          -- a wall that took more than half a metre a second's worth of its own momentum wakes
+          let woke = woken_statics(statics, push, n, Nil)
+          let changed = by_id(List.append(moved, woke))
+          finish_step({ p1 with bodies: merge(bs1, changed, Nil), events: evs }, w, focus)
       end
+    end
+  end
+
+  pfn make_part(pr : (Int, Rigid), t : NativeU8Arr, scale : Float, dt : Float) : Part do
+    match pr do
+      (k, b) -> Part(k, b, Ct.grid_window(b.grid, t), grown(bounds(b, scale), reach_of(b, scale, dt)))
+    end
+  end
+  -- the bodies of [all] not in [mv]; both in id order
+  pfn minus(all : List(Rigid), mv : List(Rigid), acc : List(Rigid)) : List(Rigid) do
+    match all do
+      Nil -> reverse(acc)
+      Cons(b, t) ->
+        match mv do
+          Cons(m, mt) -> if m.id == b.id do minus(t, mt, acc) else minus(t, mv, Cons(b, acc)) end
+          Nil -> minus(t, Nil, Cons(b, acc))
+        end
+    end
+  end
+  pfn first(bs : List(Rigid)) : Rigid do
+    match bs do
+      Cons(b, _) -> b
+      Nil -> { id: 0, kind: 0, grid: Bg.grid(1, 1, 1), surf: NativeArray.make_int(0, 0), m: 0.0, lx: 0.0, ly: 0.0, lz: 0.0, ii: NativeArray.make_float(9, 0.0),
+               px: 0.0, py: 0.0, pz: 0.0, q: Qt.identity(), vx: 0.0, vy: 0.0, vz: 0.0, wx: 0.0, wy: 0.0, wz: 0.0, still: 0, asleep: true, edge: false, waited: 0 }
+    end
+  end
+  -- boxes laid out six ints an item: x0 y0 z0 x1 y1 z1
+  pfn boxes_array(bs : List((Int, Int, Int, Int, Int, Int)), a : NativeIntArr, k : Int) : NativeIntArr do
+    match bs do
+      Nil -> a
+      Cons((x0, y0, z0, x1, y1, z1), t) ->
+        let o = k * 6
+        boxes_array(t, NativeArray.set_int(NativeArray.set_int(NativeArray.set_int(NativeArray.set_int(NativeArray.set_int(NativeArray.set_int(a, o, x0), o + 1, y0), o + 2, z0), o + 3, x1), o + 4, y1), o + 5, z1), k + 1)
+    end
+  end
+  pfn meets(bx : NativeIntArr, a : Int, b : Int) : Bool do
+    let oa = a * 6
+    let ob = b * 6
+    NativeArray.get_int(bx, oa + 3) >= NativeArray.get_int(bx, ob) && NativeArray.get_int(bx, oa) <= NativeArray.get_int(bx, ob + 3) &&
+    NativeArray.get_int(bx, oa + 4) >= NativeArray.get_int(bx, ob + 1) && NativeArray.get_int(bx, oa + 1) <= NativeArray.get_int(bx, ob + 4) &&
+    NativeArray.get_int(bx, oa + 5) >= NativeArray.get_int(bx, ob + 2) && NativeArray.get_int(bx, oa + 2) <= NativeArray.get_int(bx, ob + 5)
+  end
+  -- sort and sweep along x: items in order of their low x; each meets the
+  -- still-open items before it. A pair counts when at least one is moving
+  -- (item below n). Pairs come as (lower item, higher item).
+  pfn sweep(bx : NativeIntArr, order : List(Int), active : List(Int), n : Int, acc : List((Int, Int))) : List((Int, Int)) do
+    match order do
+      Nil -> reverse(acc)
+      Cons(i, t) ->
+        let x0 = NativeArray.get_int(bx, i * 6)
+        let open = List.filter(active, fn a -> NativeArray.get_int(bx, a * 6 + 3) >= x0)
+        let found = List.fold_left(reverse(open), acc, fn (ac, a) -> if (a < n || i < n) && meets(bx, a, i) do Cons((if a < i do a else i end, if a < i do i else a end), ac) else ac end)
+        sweep(bx, t, Cons(i, open), n, found)
+    end
+  end
+  -- the others some pair uses, in order
+  pfn pick(others : List(Rigid), used : NativeIntArr, k : Int, acc : List(Rigid)) : List(Rigid) do
+    match others do
+      Nil -> reverse(acc)
+      Cons(b, t) -> pick(t, used, k + 1, if NativeArray.get_int(used, k) == 1 do Cons(b, acc) else acc end)
+    end
+  end
+  -- each item's slot: moving items keep theirs; a used other takes the next
+  pfn slots(used : NativeIntArr, n : Int, m : Int, slot : NativeIntArr, i : Int, next : Int) : NativeIntArr do
+    if i >= n + m do slot
+    else if i < n do slots(used, n, m, NativeArray.set_int(slot, i, i), i + 1, next)
+    else if NativeArray.get_int(used, i) == 1 do slots(used, n, m, NativeArray.set_int(slot, i, next), i + 1, next + 1)
+    else slots(used, n, m, slot, i + 1, next) end end end
+  end
+  pfn woken_statics(bs : List(Rigid), push : NativeFloatArr, k : Int, acc : List(Rigid)) : List(Rigid) do
+    match bs do
+      Nil -> reverse(acc)
+      Cons(b, t) ->
+        if b.kind == dynamic() && pget(push, k) > 0.5 *. b.m do woken_statics(t, push, k + 1, Cons(awaken(b), acc))
+        else woken_statics(t, push, k + 1, acc) end
     end
   end
 end

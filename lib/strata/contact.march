@@ -115,7 +115,7 @@ mod Strata.Contact do
         let i = x - ox
         let j = y - oy
         let k = z - oz
-        i >= 0 && j >= 0 && k >= 0 && i < sx && j < sy && k < sz && NativeArray.get_u8(a, i + sx * (j + sy * k)) == 1
+        if i >= 0 && j >= 0 && k >= 0 && i < sx && j < sy && k < sz do NativeArray.get_u8(a, i + sx * (j + sy * k)) == 1 else false end
     end
   end
 
@@ -160,71 +160,114 @@ mod Strata.Contact do
     cand(b4, !solid(win, x, y, z - 1), uz -. int_to_float(z), 0.0, 0.0, -1.0)
   end
 
-  pfn put_contact(cs : NativeFloatArr, c : Int, a : Int, rax : Float, ray : Float, raz : Float, nx : Float, ny : Float, nz : Float, gap : Float) : NativeFloatArr do
+  pfn put_contact(cs : NativeFloatArr, c : Int, a : Int, b : Int, rax : Float, ray : Float, raz : Float, rbx : Float, rby : Float, rbz : Float, nx : Float, ny : Float, nz : Float, gap : Float) : NativeFloatArr do
     let o = c * 28
-    let c1 = cset(cset(cset(cset(cset(cs, o, int_to_float(a)), o + 1, -1.0), o + 2, rax), o + 3, ray), o + 4, raz)
-    let c2 = cset(cset(cset(cset(cset(cset(c1, o + 5, 0.0), o + 6, 0.0), o + 7, 0.0), o + 8, nx), o + 9, ny), o + 10, nz)
+    let c1 = cset(cset(cset(cset(cset(cs, o, int_to_float(a)), o + 1, int_to_float(b)), o + 2, rax), o + 3, ray), o + 4, raz)
+    let c2 = cset(cset(cset(cset(cset(cset(c1, o + 5, rbx), o + 6, rby), o + 7, rbz), o + 8, nx), o + 9, ny), o + 10, nz)
     cset(cset(cset(cset(cset(c2, o + 11, gap), o + 23, 0.0), o + 24, 0.0), o + 25, 0.0), o + 26, 0.0)
   end
 
-  -- one surface voxel of body a against the world
-  pfn point_world(cs : NativeFloatArr, nc : Int, st : NativeFloatArr, a : Int, win : Win3, scale : Float, dt : Float, lx : Float, ly : Float, lz : Float) : (NativeFloatArr, Int) do
-    let o = a * 32
-    -- the voxel centre in world metres, relative to the body's centre
-    let rx = cget(st, o + 23) *. lx +. cget(st, o + 24) *. ly +. cget(st, o + 25) *. lz
-    let ry = cget(st, o + 26) *. lx +. cget(st, o + 27) *. ly +. cget(st, o + 28) *. lz
-    let rz = cget(st, o + 29) *. lx +. cget(st, o + 30) *. ly +. cget(st, o + 31) *. lz
-    let wx = cget(st, o + 10)
-    let wy = cget(st, o + 11)
-    let wz = cget(st, o + 12)
-    let vx = cget(st, o + 7) +. wy *. rz -. wz *. ry
-    let vy = cget(st, o + 8) +. wz *. rx -. wx *. rz
-    let vz = cget(st, o + 9) +. wx *. ry -. wy *. rx
-    let speed = Math.sqrt(vx *. vx +. vy *. vy +. vz *. vz)
-    let margin = minf(0.5, speed *. dt /. scale +. 0.02)
-    let reach = margin
-    let ux = (cget(st, o) +. rx) /. scale
-    let uy = (cget(st, o + 1) +. ry) /. scale
-    let uz = (cget(st, o + 2) +. rz) /. scale
-    match near_cells(win, ux, uy, uz, floori(ux -. reach), floori(ux +. reach), floori(uy -. reach), floori(uy +. reach), floori(uz -. reach), floori(uz +. reach),
-                     floori(ux -. reach), floori(uy -. reach), floori(uz -. reach), NearHit(-1.0, 0.0, 0.0, 0.0, 0, 0, 0)) do
-      NearHit(d, qx, qy, qz, cx, cy, cz) ->
-        if d < 0.0 do (cs, nc)
-        else if d > 0.000001 do
-          let gap = d
-          if gap >= margin do (cs, nc)
-          else
-            let nx = (ux -. qx) /. d
-            let ny = (uy -. qy) /. d
-            let nz = (uz -. qz) /. d
-            (put_contact(cs, nc, a, qx *. scale -. cget(st, o), qy *. scale -. cget(st, o + 1), qz *. scale -. cget(st, o + 2), nx, ny, nz, gap *. scale), nc + 1)
-          end
-        else
-          match face_out(win, ux, uy, uz, cx, cy, cz) do
-            (fd, nx, ny, nz) ->
-              if fd < 0.0 do (cs, nc)
-              else (put_contact(cs, nc, a, (ux +. nx *. fd) *. scale -. cget(st, o), (uy +. ny *. fd) *. scale -. cget(st, o + 1), (uz +. nz *. fd) *. scale -. cget(st, o + 2), nx, ny, nz, (0.0 -. fd) *. scale), nc + 1) end
-          end
-        end end
+  -- the frame of what a point is tested against: body b's centre and rotation
+  -- (row-major), or the world's (origin, no turn) when b < 0
+  type Frame = Frame(Float, Float, Float, Float, Float, Float, Float, Float, Float, Float, Float, Float)
+  pfn frame_of(st : NativeFloatArr, b : Int) : Frame do
+    if b < 0 do Frame(0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0)
+    else
+      let o = b * 32
+      Frame(cget(st, o), cget(st, o + 1), cget(st, o + 2), cget(st, o + 23), cget(st, o + 24), cget(st, o + 25), cget(st, o + 26), cget(st, o + 27), cget(st, o + 28), cget(st, o + 29), cget(st, o + 30), cget(st, o + 31))
     end
   end
 
-  pfn points_world(cs : NativeFloatArr, nc : Int, st : NativeFloatArr, a : Int, win : Win3, scale : Float, dt : Float, sx : Int, sy : Int, surf : NativeIntArr, cx : Float, cy : Float, cz : Float, i : Int, n : Int) : (NativeFloatArr, Int) do
+  -- one corner of body a (at (lx, ly, lz) metres from its centre, in its own
+  -- frame) against [win]: the world's cells (b < 0), or body b's grid, whose
+  -- centre is (lbx, lby, lbz) metres from that grid's low corner
+  pfn point_vs(cs : NativeFloatArr, nc : Int, st : NativeFloatArr, a : Int, b : Int, win : Win3, scale : Float, dt : Float, lx : Float, ly : Float, lz : Float, lbx : Float, lby : Float, lbz : Float) : (NativeFloatArr, Int) do
+    let o = a * 32
+    -- the corner in the world, relative to a's centre
+    let rx = cget(st, o + 23) *. lx +. cget(st, o + 24) *. ly +. cget(st, o + 25) *. lz
+    let ry = cget(st, o + 26) *. lx +. cget(st, o + 27) *. ly +. cget(st, o + 28) *. lz
+    let rz = cget(st, o + 29) *. lx +. cget(st, o + 30) *. ly +. cget(st, o + 31) *. lz
+    let wpx = cget(st, o) +. rx
+    let wpy = cget(st, o + 1) +. ry
+    let wpz = cget(st, o + 2) +. rz
+    match frame_of(st, b) do
+      Frame(bx, yb, bz, r0, r1, r2, r3, r4, r5, r6, r7, r8) ->
+        let (vax, vay, vaz) = point_vel(st, a, rx, ry, rz)
+        let (vbx, vby, vbz) = point_vel(st, b, wpx -. bx, wpy -. yb, wpz -. bz)
+        let dvx = vax -. vbx
+        let dvy = vay -. vby
+        let dvz = vaz -. vbz
+        let speed = Math.sqrt(dvx *. dvx +. dvy *. dvy +. dvz *. dvz)
+        let margin = minf(0.5, speed *. dt /. scale +. 0.02)
+        -- into the target's frame, in voxels
+        let dx = wpx -. bx
+        let dy = wpy -. yb
+        let dz = wpz -. bz
+        let ux = (r0 *. dx +. r3 *. dy +. r6 *. dz +. lbx) /. scale
+        let uy = (r1 *. dx +. r4 *. dy +. r7 *. dz +. lby) /. scale
+        let uz = (r2 *. dx +. r5 *. dy +. r8 *. dz +. lbz) /. scale
+        -- a touched point (in the target's voxels) and normal (in its frame) back to the world
+        let emit = fn (qx, qy, qz, nx, ny, nz, gap) ->
+          let tx = qx *. scale -. lbx
+          let ty = qy *. scale -. lby
+          let tz = qz *. scale -. lbz
+          let qwx = bx +. r0 *. tx +. r1 *. ty +. r2 *. tz
+          let qwy = yb +. r3 *. tx +. r4 *. ty +. r5 *. tz
+          let qwz = bz +. r6 *. tx +. r7 *. ty +. r8 *. tz
+          let nwx = r0 *. nx +. r1 *. ny +. r2 *. nz
+          let nwy = r3 *. nx +. r4 *. ny +. r5 *. nz
+          let nwz = r6 *. nx +. r7 *. ny +. r8 *. nz
+          (put_contact(cs, nc, a, b, qwx -. cget(st, o), qwy -. cget(st, o + 1), qwz -. cget(st, o + 2), qwx -. bx, qwy -. yb, qwz -. bz, nwx, nwy, nwz, gap *. scale), nc + 1)
+        match near_cells(win, ux, uy, uz, floori(ux -. margin), floori(ux +. margin), floori(uy -. margin), floori(uy +. margin), floori(uz -. margin), floori(uz +. margin),
+                         floori(ux -. margin), floori(uy -. margin), floori(uz -. margin), NearHit(-1.0, 0.0, 0.0, 0.0, 0, 0, 0)) do
+          NearHit(d, qx, qy, qz, cx, cy, cz) ->
+            if d < 0.0 do (cs, nc)
+            else if d > 0.000001 do
+              if d >= margin do (cs, nc)
+              else emit(qx, qy, qz, (ux -. qx) /. d, (uy -. qy) /. d, (uz -. qz) /. d, d) end
+            else
+              match face_out(win, ux, uy, uz, cx, cy, cz) do
+                (fd, nx, ny, nz) ->
+                  if fd < 0.0 do (cs, nc)
+                  else emit(ux +. nx *. fd, uy +. ny *. fd, uz +. nz *. fd, nx, ny, nz, 0.0 -. fd) end
+              end
+            end end
+        end
+    end
+  end
+
+  pfn points_vs(cs : NativeFloatArr, nc : Int, st : NativeFloatArr, a : Int, b : Int, win : Win3, scale : Float, dt : Float, sx : Int, sy : Int, surf : NativeIntArr, cx : Float, cy : Float, cz : Float, lbx : Float, lby : Float, lbz : Float, i : Int, n : Int) : (NativeFloatArr, Int) do
     if i >= n do (cs, nc)
     else
       let v = NativeArray.get_int(surf, i)
       let lx = int_to_float(v % (sx + 1)) *. scale -. cx
       let ly = int_to_float((v / (sx + 1)) % (sy + 1)) *. scale -. cy
       let lz = int_to_float(v / ((sx + 1) * (sy + 1))) *. scale -. cz
-      match point_world(cs, nc, st, a, win, scale, dt, lx, ly, lz) do
-        (cs2, nc2) -> points_world(cs2, nc2, st, a, win, scale, dt, sx, sy, surf, cx, cy, cz, i + 1, n)
+      match point_vs(cs, nc, st, a, b, win, scale, dt, lx, ly, lz, lbx, lby, lbz) do
+        (cs2, nc2) -> points_vs(cs2, nc2, st, a, b, win, scale, dt, sx, sy, surf, cx, cy, cz, lbx, lby, lbz, i + 1, n)
       end
     end
   end
 
   doc "Contacts of body [a] (its grid is [sx] x [sy] voxels in x and y, its surface corner indices [surf] (`Strata.Body.corners`), its centre at (cx, cy, cz) metres from the grid's low corner) against the world window, appended to [cs] from [nc]. [cs] must have room for one contact per corner."
   fn gen_world(cs : NativeFloatArr, nc : Int, st : NativeFloatArr, a : Int, win : Win3, scale : Float, dt : Float, sx : Int, sy : Int, surf : NativeIntArr, cx : Float, cy : Float, cz : Float) : (NativeFloatArr, Int) do
-    points_world(cs, nc, st, a, win, scale, dt, sx, sy, surf, cx, cy, cz, 0, NativeArray.length_int(surf))
+    points_vs(cs, nc, st, a, -1, win, scale, dt, sx, sy, surf, cx, cy, cz, 0.0, 0.0, 0.0, 0, NativeArray.length_int(surf))
+  end
+
+  doc "Contacts of body [a]'s corners (as for `gen_world`) against body [b]'s grid, given as a window from `grid_window` and b's centre (lbx, lby, lbz) metres from its grid's low corner. Normals point out of b toward a."
+  fn gen_body(cs : NativeFloatArr, nc : Int, st : NativeFloatArr, a : Int, b : Int, winb : Win3, scale : Float, dt : Float, sx : Int, sy : Int, surf : NativeIntArr, cx : Float, cy : Float, cz : Float, lbx : Float, lby : Float, lbz : Float) : (NativeFloatArr, Int) do
+    points_vs(cs, nc, st, a, b, winb, scale, dt, sx, sy, surf, cx, cy, cz, lbx, lby, lbz, 0, NativeArray.length_int(surf))
+  end
+
+  pfn grid_go(ids : NativeI32Arr, t : NativeU8Arr, out : NativeU8Arr, i : Int, n : Int) : NativeU8Arr do
+    if i >= n do out else grid_go(ids, t, NativeArray.set_u8(out, i, collides_id(t, NativeArray.get_i32(ids, i))), i + 1, n) end
+  end
+  doc "A body's grid as a window in its own voxels (low corner 0, 0, 0): which voxels stop another body."
+  fn grid_window(g : Strata.Body.Grid, t : NativeU8Arr) : Win3 do
+    let sx = Strata.Body.size_x(g)
+    let sy = Strata.Body.size_y(g)
+    let sz = Strata.Body.size_z(g)
+    Win3(0, 0, 0, sx, sy, sz, grid_go(Strata.Body.ids(g), t, NativeArray.make_u8(sx * sy * sz, 0), 0, sx * sy * sz))
   end
 
   -- ── Solving ──────────────────────────────────────────────────────────────
@@ -308,7 +351,7 @@ mod Strata.Contact do
       let vn = (vax -. vbx) *. nx +. (vay -. vby) *. ny +. (vaz -. vbz) *. nz
       let tgt0 = if gap > 0.0 do 0.0 -. gap /. dt else 0.0 end
       let tgt = if gap <= slop && vn < -1.0 do maxf(tgt0, 0.0 -. restitution() *. vn) else tgt0 end
-      let bias = if gap < 0.0 -. slop do minf(0.2 *. (0.0 -. gap -. slop) /. dt, push_max /. dt) else 0.0 end
+      let bias = if gap < 0.0 -. slop do minf(0.8 *. (0.0 -. gap -. slop) /. dt, push_max /. dt) else 0.0 end
       let c1 = cset(cset(cset(cset(cset(cs, o + 12, tgt), o + 13, bias), o + 14, if kn > 0.0 do 1.0 /. kn else 0.0 end), o + 15, t1x), o + 16, t1y)
       let c2 = cset(cset(cset(cset(cset(c1, o + 17, t1z), o + 18, t2x), o + 19, t2y), o + 20, t2z), o + 21, if k1 > 0.0 do 1.0 /. k1 else 0.0 end)
       prep_go(cset(cset(c2, o + 22, if k2 > 0.0 do 1.0 /. k2 else 0.0 end), o + 27, vn), st, c + 1, nc, dt, slop, push_max)

@@ -110,3 +110,21 @@ failed `forge check` with "expected `Strata.Stream.Stream` but got
 typed `Int` in the same place, or an `Event` type used outside a record,
 did not trigger it. Workaround: a type named in a record field gets a name
 no other module uses (`PhysEvent`).
+
+## S17: a guarded array read after `&&` was evaluated with the guard false
+
+`i >= 0 && ... && i < sx && ... && NativeArray.get_u8(a, i + ...) == 1` in
+`Strata.Contact.solid` died with "native_u8_arr_get: index -11 out of
+bounds" when the point lay outside the window, under `forge test`. The
+same chain had not failed while every index happened to be in range.
+Workaround: put the read inside `if guard do read else false end`.
+
+## S18: three parser traps met while writing Strata.Physics
+
+- A record literal, or an expression ending in one, followed by a line
+  that opens with `(` is read as a call of the record: `let b = { ... }`
+  then `(p2, id)` on the next line failed with "this is not a function".
+  Workaround: end the block with a named call (`with_id(p2, id)`).
+- `f(x).field` is a parse error. Workaround: an accessor function.
+- A `match` inside a one-line lambda, as an argument (`fn c -> match ... end`),
+  is a parse error. Workaround: a named function.

@@ -266,6 +266,201 @@ mod Strata.Test.Physics do
     end
   end
 
+
+  -- ── Bodies against bodies ────────────────────────────────────────────────
+  pfn crate_at(p : Strata.Physics.Physics, x : Float, y : Float, z : Float) : (Strata.Physics.Physics, Int) do add(p, block(2, 2, 2), x, y, z, Qt.identity()) end
+  pfn ids_of(p : Strata.Physics.Physics, n : Int, x : Float, y : Float, z : Float, dy : Float, acc : List(Int)) : (Strata.Physics.Physics, List(Int)) do
+    if n <= 0 do (p, reverse(acc))
+    else
+      match crate_at(p, x, y, z) do
+        (p2, id) -> ids_of(p2, n - 1, x, y +. dy, z, dy, Cons(id, acc))
+      end
+    end
+  end
+  pfn pos_list(p : Strata.Physics.Physics, ids : List(Int)) : List((Float, Float, Float)) do List.map(ids, fn i -> Ph.position(p, i)) end
+  pfn moved_less(a : List((Float, Float, Float)), b : List((Float, Float, Float)), tol : Float) : Bool do
+    match (a, b) do
+      (Cons((ax, ay, az), at), Cons((bx, yb, bz), bt)) -> near(ax, bx, tol) && near(ay, yb, tol) && near(az, bz, tol) && moved_less(at, bt, tol)
+      _ -> true
+    end
+  end
+  pfn all_asleep(p : Strata.Physics.Physics, ids : List(Int)) : Bool do List.all(ids, fn i -> Ph.is_asleep(p, i)) end
+  -- steps until no impact for [quiet] steps or [n] run out: (sim, step of the last impact)
+  pfn last_impact(s : Sim, n : Int, step : Int, last : Int) : (Sim, Int) do
+    if n <= 0 do (s, last)
+    else
+      let s2 = run(s, 1)
+      let hit = List.any(Ph.events(sp(s2)), fn e -> Ph.ev_kind(e) == 0)
+      last_impact(s2, n - 1, step + 1, if hit do step + 1 else last end)
+    end
+  end
+  pfn run_f(s : Sim, n : Int, focus : List((Float, Float, Float))) : Sim do
+    if n <= 0 do s
+    else
+      match s do
+        Sim(p, w) ->
+          match Ph.step_world(p, w, focus) do
+            (p2, o) -> run_f(Sim(p2, Ed.world(o)), n - 1, focus)
+          end
+      end
+    end
+  end
+  -- the most bodies that moved in one step over n steps
+  pfn most_moved(s : Sim, ids : List(Int), n : Int, most : Int) : (Sim, Int) do
+    if n <= 0 do (s, most)
+    else
+      let before = pos_list(sp(s), ids)
+      let s2 = run(s, 1)
+      let after = pos_list(sp(s2), ids)
+      let k = List.length(List.filter(List.zip(before, after), fn pr -> differs(pr)))
+      most_moved(s2, ids, n - 1, if k > most do k else most end)
+    end
+  end
+  pfn lay_row(p : Strata.Physics.Physics, n : Int, i : Int, acc : List(Int)) : (Strata.Physics.Physics, List(Int)) do
+    if i >= n do (p, reverse(acc))
+    else
+      match crate_at(p, int_to_float((i % 20) * 3 - 30), 20.0 +. int_to_float(i / 20) * 3.0, int_to_float(((i / 20) % 5) * 3 - 10)) do
+        (p2, id) -> lay_row(p2, n, i + 1, Cons(id, acc))
+      end
+    end
+  end
+
+  pfn same_column(c : Strata.Edit.Change, cs : List(Strata.Edit.Change)) : Bool do
+    match (Ed.low(c), cs) do
+      ((x, _, z), Cons(h, _)) -> match Ed.low(h) do (hx, _, hz) -> x == hx && z == hz end
+      _ -> false
+    end
+  end
+  pfn faster(s : Sim, id : Int, v : Float) : Bool do match Ph.velocity(sp(s), id) do (x, y, z) -> x *. x +. y *. y +. z *. z > v *. v end end
+  pfn differs(pr : ((Float, Float, Float), (Float, Float, Float))) : Bool do match pr do ((ax, ay, az), (bx, yb, bz)) -> ax != bx || ay != yb || az != bz end end
+  pfn heap_one(p : Strata.Physics.Physics, i : Int) : Strata.Physics.Physics do
+    match add(p, block(2, 2, 2), int_to_float(i % 3) *. 0.7, 2.0 +. int_to_float(i) *. 2.2, int_to_float(i % 2) *. 0.6, Qt.from_axis_angle(0.0, 1.0, 0.0, int_to_float(i) *. 0.4)) do
+      (p2, _) -> p2
+    end
+  end
+
+  describe "Physics bodies against bodies" do
+    test "a stack of three crates stands" do
+      match ids_of(phys(), 3, 0.0, 0.0, 0.0, 2.0, Nil) do
+        (p, ids) ->
+          let s = run(Sim(p, world()), 300)
+          let settled = pos_list(sp(s), ids)
+          let s2 = run(s, 300)
+          Test.assert_true(moved_less(settled, pos_list(sp(s2), ids), 0.05), "each moved under 0.05 voxel after settling")
+          Test.assert_true(all_asleep(sp(s2), ids), "all asleep")
+          match Ph.position(sp(s2), 3) do (_, y, _) -> Test.assert_true(y > 4.5, "the top crate is still on top") end
+      end
+    end
+
+    test "a heap of ten crates settles and sleeps" do
+      let p = List.fold_left(List.range(0, 10), phys(), fn (p0, i) -> heap_one(p0, i))
+      let ids = List.range(1, 11)
+      match last_impact(Sim(p, world()), 900, 0, 0) do
+        (_, last) ->
+          let s = run(Sim(p, world()), last + 180)
+          Test.assert_true(all_asleep(sp(s), ids), "all asleep within 180 steps of the last impact")
+          let still = pos_list(sp(s), ids)
+          Test.assert_true(moved_less(still, pos_list(sp(run(s, 120)), ids), 0.0), "and nothing moves after")
+      end
+    end
+
+    test "two overlapping crates separate gently" do
+      let p0 = Ph.new(reg(), Ph.with_gravity(Ph.config(), 0.0))
+      match crate_at(p0, 0.0, 10.0, 0.0) do
+        (p1, a) ->
+          match crate_at(p1, 1.5, 10.0, 0.0) do
+            (p2, b) ->
+              let s = run(Sim(p2, world()), 10)
+              Test.assert_true(px(s, b) -. px(s, a) >= 1.97, "apart within 10 steps (to within the contact slop of 0.02 voxel)")
+              Test.assert_false(faster(s, a, 2.0) || faster(s, b, 2.0), "neither faster than 2 m/s")
+          end
+      end
+    end
+
+    test "a body on a body that leaves wakes" do
+      match ids_of(phys(), 2, 0.0, 0.0, 0.0, 2.0, Nil) do
+        (p, ids) ->
+          let s = run(Sim(p, world()), 240)
+          Test.assert_true(all_asleep(sp(s), ids), "both asleep")
+          let y0 = py(s, 2)
+          let s2 = run(Sim(Ph.remove(sp(s), 1), sw(s)), 60)
+          Test.assert_true(py(s2, 2) <= y0 -. 0.5, "the upper one falls when the lower is removed")
+          match Ph.to_blocks(sp(s), sw(s), 1) do
+            (p3, o) ->
+              let s3 = run(Sim(p3, Ed.world(o)), 60)
+              Test.assert_false(Ph.exists(sp(s3), 1), "the lower is blocks now")
+              Test.assert_true(py(s3, 2) >= y0 -. 0.5, "and the upper rests on them")
+          end
+      end
+    end
+
+    test "the awake cap: no more than the cap move in a step, the rest wait, none is lost" do
+      -- the default cap of 256 over 300 crates behaves alike; 16 over 20 keeps the suite quick
+      match lay_row(Ph.new(reg(), Ph.with_caps(Ph.config(), 16, 4096)), 20, 0, Nil) do
+        (p, ids) ->
+          let s1 = run(Sim(p, world()), 1)
+          Test.assert_eq_int(Ph.waiting_count(sp(s1)), 4, "4 wait after the first step")
+          match most_moved(s1, ids, 20, 0) do
+            (s2, most) ->
+              Test.assert_true(most <= 16, "no step moves more than 16")
+              let s3 = run(s2, 580)
+              Test.assert_true(List.all(ids, fn i -> py(s3, i) < 1.1), "every crate has landed by step 600")
+          end
+      end
+    end
+
+    test "the total cap snaps the farthest sleeping bodies outside the view" do
+      -- twelve crates in a row along x, 4 m apart; the view looks down +x from x = 30 at the six nearest
+      let p0 = Ph.new(reg(), Ph.with_caps(Ph.config(), 256, 10))
+      match ids_of_row(p0, 12, 0, Nil) do
+        (p, ids) ->
+          let s = run_f(Sim(p, world()), 120, Cons((40.0, 1.0, 0.0), Nil))
+          Test.assert_eq_int(Ph.count(sp(s)), 10, "two snapped")
+          Test.assert_false(Ph.exists(sp(s), 1) || Ph.exists(sp(s), 2), "the two farthest from the focus")
+          Test.assert_eq_int(Strata.World.get_block(sw(s), 1, 0, 1), 1, "are blocks in the world")
+          let seen = Ph.with_view(Ph.new(reg(), Ph.with_caps(Ph.config(), 256, 10)), -10.0, 1.0, 0.0, 1.0, 0.0, 0.0, 0.5)
+          match ids_of_row(seen, 12, 0, Nil) do
+            (p2, _) ->
+              let s2 = run_f(Sim(p2, world()), 120, Cons((40.0, 1.0, 0.0), Nil))
+              Test.assert_eq_int(Ph.count(sp(s2)), 12, "with all in view none is snapped")
+              Test.assert_eq_int(Ph.over_cap(sp(s2)), 2, "two over the cap")
+          end
+      end
+    end
+
+    test "to_blocks turns a body to the nearest axis-aligned orientation" do
+      match add(phys(), block(3, 1, 1), 0.0, 0.0, 0.0, Qt.from_axis_angle(0.0, 1.0, 0.0, deg(40.0))) do
+        (p, id) ->
+          let s = run(Sim(p, world()), 120)
+          match Ph.to_blocks(sp(s), sw(s), id) do
+            (_, o) ->
+              let w = Ed.world(o)
+              let along_x = fn (x0, z0) -> Strata.World.get_block(w, x0, 0, z0) == 1 && Strata.World.get_block(w, x0 + 1, 0, z0) == 1 && Strata.World.get_block(w, x0 + 2, 0, z0) == 1
+              Test.assert_eq_int(List.length(Ed.changes(o)), 3, "three blocks written")
+              Test.assert_true(List.any(List.range(-3, 3), fn x0 -> List.any(List.range(-3, 3), fn z0 -> along_x(x0, z0))), "a bar along x")
+          end
+      end
+      match add(phys(), block(1, 3, 1), 0.0, 5.0, 0.0, Qt.from_axis_angle(1.0, 0.0, 0.0, deg(44.0))) do
+        (p, id) ->
+          match Ph.to_blocks(p, world(), id) do
+            (_, o) ->
+              let cs = Ed.changes(o)
+              Test.assert_eq_int(List.length(cs), 3, "three blocks written")
+              Test.assert_true(List.all(cs, fn c -> same_column(c, cs)), "standing along y in one column")
+          end
+      end
+    end
+  end
+
+  pfn ids_of_row(p : Strata.Physics.Physics, n : Int, i : Int, acc : List(Int)) : (Strata.Physics.Physics, List(Int)) do
+    if i >= n do (p, reverse(acc))
+    else
+      match crate_at(p, int_to_float(i * 4) -. 3.0, 0.0, 0.0) do
+        (p2, id) -> ids_of_row(p2, n, i + 1, Cons(id, acc))
+      end
+    end
+  end
+
   -- a world shaped by a 16 x 16 heightmap (heights 0..6) and up to six crates dropped on it
   pfn shaped(w : Strata.World.World, hs : List(Int), i : Int) : Strata.World.World do
     match hs do
@@ -279,7 +474,7 @@ mod Strata.Test.Physics do
       Cons(((x, z), (h, sz)), t) ->
         if n >= 6 do p
         else
-          match Ph.add(p, block(sz, sz, sz), int_to_float(x), 8.0 +. int_to_float(h) *. 4.0, int_to_float(z), Qt.from_axis_angle(0.0, 1.0, 0.0, int_to_float(h) *. 0.3), Ph.dynamic()) do
+          match Ph.add(p, block(sz, sz, sz), int_to_float(x / 3), 8.0 +. int_to_float(n) *. 3.0, int_to_float(z / 3), Qt.from_axis_angle(0.0, 1.0, 0.0, int_to_float(h) *. 0.3), Ph.dynamic()) do
             (p2, _) -> dropped(p2, t, n + 1)
           end
         end
