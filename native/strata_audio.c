@@ -12,7 +12,7 @@
  * March values: a NativeArray arrives as its heap pointer, element count at
  * +16, data at +32; a String through march_str_borrow. */
 /* Rewritten by stamp_audio.sh whenever strata_mix.h or strata_hrir.h changes (GAPS S14). */
-#define STRATA_AUDIO_STAMP "d5fee09a63781e4b"
+#define STRATA_AUDIO_STAMP "d650c4f22b5777e4"
 #define MA_NO_ENCODING
 #define MA_NO_GENERATION
 #define MA_NO_RESOURCE_MANAGER
@@ -28,9 +28,12 @@
 #define SA_RING 4096
 #define SA_STATS 12
 #define SA_PERIOD 256
-#define SA_PERIODS 3
+#define SA_PERIODS 2   /* two 256-frame buffers: 10.7 ms queued, so a play reaches the speaker within the 20 ms target */
 
 static SmMixer *g_mix;
+#define SA_PEND 16384
+static SmCmd g_pend[SA_PEND];          /* records waiting for room in the ring, in order */
+static int g_npend;
 static SmRing g_ring;
 static SmCmd g_ring_buf[SA_RING];
 static int g_mode;                 /* 0 closed, 1 device, 2 null device, 3 game time */
@@ -184,6 +187,7 @@ static void sa_callback(ma_device *d, void *out, const void *in, ma_uint32 frame
 }
 
 static void sa_reset(void) {
+    g_npend = 0;
     for (int i = 0; i < SA_STATS; i++) atomic_store(&g_stat[i], 0.0);
     atomic_store(&g_refused_here, 0); atomic_store(&g_play_pending, 0);
     sm_ring_init(&g_ring, g_ring_buf, SA_RING);
@@ -263,16 +267,37 @@ void sa_close(void) {
     g_mode = 0;
 }
 
+/* Records the ring could not take yet wait here, in order, on the main
+ * thread's side, and go first next time; only when this too is full is a
+ * record refused (and counted). So a stop at the end of a huge frame is
+ * delayed, never lost. */
+static void sa_flush_pending(void) {
+    if (g_npend == 0) return;
+    int k = sm_ring_push_n(&g_ring, g_pend, g_npend);
+    if (k > 0) { memmove(g_pend, g_pend + k, sizeof(SmCmd) * (size_t)(g_npend - k)); g_npend -= k; }
+}
+
 int64_t sa_send(void *ints, void *floats, int64_t n) {
     if (!g_mode || n <= 0) { if (n > 0) atomic_fetch_add(&g_refused_here, n); return 0; }
     const int32_t *ia = (const int32_t *)((char *)ints + 32);
     const float *fa = (const float *)((char *)floats + 32);
+    static SmCmd conv[256];
     int64_t took = 0; int played = 0;
-    for (int64_t i = 0; i < n; i++) {
-        SmCmd c;
-        c.op = ia[4 * i]; c.voice = ia[4 * i + 1]; c.a = ia[4 * i + 2]; c.b = ia[4 * i + 3];
-        memcpy(c.f, fa + 12 * i, sizeof c.f);
-        if (sm_ring_push(&g_ring, &c)) { took++; if (c.op == SM_OP_PLAY) played = 1; }
+    sa_flush_pending();
+    for (int64_t at = 0; at < n; at += 256) {
+        int k = n - at < 256 ? (int)(n - at) : 256;
+        for (int i = 0; i < k; i++) {
+            SmCmd *c = &conv[i]; int64_t j = at + i;
+            c->op = ia[4 * j]; c->voice = ia[4 * j + 1]; c->a = ia[4 * j + 2]; c->b = ia[4 * j + 3];
+            memcpy(c->f, fa + 12 * j, sizeof c->f);
+            if (c->op == SM_OP_PLAY) played = 1;
+        }
+        /* straight into the ring, a batch at a time, while nothing waits ahead of it */
+        int pushed = g_npend == 0 ? sm_ring_push_n(&g_ring, conv, k) : 0;
+        int rest = k - pushed;
+        int keep = rest < SA_PEND - g_npend ? rest : SA_PEND - g_npend;
+        if (keep > 0) { memcpy(g_pend + g_npend, conv + pushed, sizeof(SmCmd) * (size_t)keep); g_npend += keep; }
+        took += pushed + keep;
     }
     if (played) { atomic_store(&g_play_sent, sa_now()); atomic_store(&g_play_pending, 1); }
     if (took < n) atomic_fetch_add(&g_refused_here, n - took);
@@ -284,6 +309,7 @@ void sa_advance(double seconds) {
     g_carry += seconds * SM_RATE;
     int frames = (int)g_carry;
     g_carry -= frames;
+    sa_flush_pending();
     sa_drain();
     while (frames > 0) {
         int k = frames < 4096 ? frames : 4096;
@@ -343,4 +369,14 @@ void sa_unload(int64_t id) {
     if (id < SM_REC_FIRST || id >= SM_REC_FIRST + SM_RECS || !g_loader_on) return;
     sa_request(2, (int)id, NULL);
 }
+/* A ready recording's length in seconds; 0 when it is not ready. */
+double sa_length(int64_t id) {
+    if (!g_mix) return 0.0;
+    SmRec *r = sm_rec_get(g_mix, (int)id);
+    return r ? (double)r->frames / SM_RATE : 0.0;
+}
 void sa_set_budget(int64_t bytes) { atomic_store(&g_budget, bytes < 0 ? 0 : bytes); }
+
+/* For soak runs only: hold the calling (main) thread for [ms], as a frame
+ * hitch would, to show that the mixing thread does not notice. */
+void sa_debug_stall(int64_t ms) { if (ms > 0 && ms < 2000) { struct timespec t = { ms / 1000, (long)(ms % 1000) * 1000000L }; nanosleep(&t, NULL); } }

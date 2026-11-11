@@ -42,6 +42,7 @@
 -- STRATA_SOAK=n     fly a fixed circuit for n frames, carving a sphere every 100, then report
 -- STRATA_AUDIO=0|1|null|wav:path   sound off (scripted default), the device (playing default), the silent null device, or rendered to a WAV in game time
 -- STRATA_AUDIO_METER=1   a line of voices, refusals, underruns, CPU and level once a second
+-- STRATA_STALL=n    hold the main thread 100 ms every n frames, as a hitch would (soak runs)
 --                   the worst and mean frame time and what the renderer still holds
 --
 -- With STRATA_FRAMES or STRATA_SOAK set the run is scripted: keyboard and mouse are ignored.
@@ -486,7 +487,7 @@ mod StrataViewer do
       if !Strata.Ffi.Audio.ready(id) do
         println("strata_viewer: recording " ++ int_to_string(id - 2048) ++ " is not ready")
         snd
-      else match Strata.Sound.play(snd, id, x, y, z, 0.9, 1.0, 1.0) do (s, v) -> Strata.Sound.with_range(s, v, 3.0, 150.0) end end
+      else match Strata.Sound.play(Strata.Sound.recorded(snd, id, Strata.Ffi.Audio.length(id)), id, x, y, z, 0.9, 1.0, 1.0) do (s, v) -> Strata.Sound.with_range(s, v, 3.0, 150.0) end end
     end
   end
   -- the strike patch is the first uploaded
@@ -532,6 +533,26 @@ mod StrataViewer do
     end
   end
 
+  -- the soak line's sound figures: the mixer's state, the worst frame's sound
+  -- work on the main thread, and an acoustics update for 64 voices round
+  -- the camera timed here on the real terrain
+  pfn ring64(x : Float, y : Float, z : Float, i : Int, acc : List((Int, Float, Float, Float))) : List((Int, Float, Float, Float)) do
+    if i >= 64 do acc
+    else
+      let a = int_to_float(i) *. 0.0981747704
+      ring64(x, y, z, i + 1, Cons((i + 1, x +. 30.0 *. Math.cos(a), y -. 5.0 +. int_to_float(i % 8), z +. 30.0 *. Math.sin(a)), acc))
+    end
+  end
+  pfn audio_summary(s : Strata.Stream.Stream, reg : Strata.Blocks.Registry, cam : Cam, aworst : Float) : String do
+    match cam do
+      Cam(x, y, z, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _) ->
+        let t0 = Strata.Ffi.Vk.time()
+        let n = List.length(Strata.Acoustics.finish(Strata.Acoustics.begin(Strata.Stream.world(s), reg, (x, y, z), ring64(x, y, z, 0, Nil))))
+        let acoustics_ms = (Strata.Ffi.Vk.time() -. t0) *. 1000.0
+        " audio_underruns=" ++ int_to_string(float_to_int(Strata.Ffi.Audio.stat(4))) ++ " audio_ring_refused=" ++ int_to_string(float_to_int(Strata.Ffi.Audio.stat(3))) ++ " audio_refused=" ++ int_to_string(float_to_int(Strata.Ffi.Audio.stat(2))) ++ " audio_cpu=" ++ ms2(Strata.Ffi.Audio.stat(5) *. 100.0) ++ " audio_main_ms=" ++ ms2(aworst) ++ " audio_latency_ms=" ++ ms2(Strata.Ffi.Audio.stat(10)) ++ " audio_mem_kb=" ++ int_to_string(float_to_int(Strata.Ffi.Audio.stat(11)) / 1024) ++ " acoustics_ms=" ++ ms2(acoustics_ms) ++ " acoustics_voices=" ++ int_to_string(n)
+    end
+  end
+
   pfn ms2(v : Float) : String do float_to_string(Math.round(v *. 100.0) /. 100.0) end
 
   -- eye position, yaw, pitch, the chunk the camera was last in, mouse buttons
@@ -571,12 +592,12 @@ mod StrataViewer do
     end
   end
 
-  pfn frame_loop(s : Strata.Stream.Stream, fl : Strata.Fluid.Fluid, job : Option(Strata.Fluid.Job), sl : Strata.Render.Render, reg : Strata.Blocks.Registry, cam : Cam, frame : Int, frames : Int, script : Int, hole : (Int, Int, Int), worst : Float, total : Float, fworst : Float, t_prev : Float, t_mark : Float, vp : NativeF32Arr, snd : Strata.Sound.Sound) : Unit do
+  pfn frame_loop(s : Strata.Stream.Stream, fl : Strata.Fluid.Fluid, job : Option(Strata.Fluid.Job), sl : Strata.Render.Render, reg : Strata.Blocks.Registry, cam : Cam, frame : Int, frames : Int, script : Int, hole : (Int, Int, Int), worst : Float, total : Float, fworst : Float, t_prev : Float, t_mark : Float, vp : NativeF32Arr, snd : Strata.Sound.Sound, aworst : Float) : Unit do
     Strata.Ffi.Vk.poll()
     if Strata.Ffi.Vk.should_close() || Strata.Ffi.Vk.key(256) || (frames > 0 && frame >= frames) do
       println("strata_viewer: done after " ++ int_to_string(frame) ++ " frames; uploads refused " ++ int_to_string(Strata.Ffi.Vk.refused()) ++ ", still waiting " ++ int_to_string(Strata.Render.waiting(sl)) ++ "; rebuilds " ++ int_to_string(float_to_int(Strata.Ffi.Vk.stat(6))) ++ "; draw calls " ++ int_to_string(float_to_int(Strata.Ffi.Vk.stat(2))))
       if script == 2 do
-        println("soak: frames=" ++ int_to_string(frame) ++ " worst_ms=" ++ ms2(worst *. 1000.0) ++ " mean_ms=" ++ ms2(total *. 1000.0 /. int_to_float(if frame > 10 do frame - 10 else 1 end)) ++ " refused=" ++ int_to_string(Strata.Ffi.Vk.refused()) ++ " waiting=" ++ int_to_string(Strata.Render.waiting(sl)) ++ " slots=" ++ int_to_string(Strata.Render.used(sl)) ++ " live_quads=" ++ int_to_string(Strata.Ffi.Vk.live_quads()) ++ " leaked=" ++ int_to_string(float_to_int(Strata.Ffi.Vk.stat(7))) ++ " loaded=" ++ int_to_string(Strata.Stream.loaded_count(s)) ++ " fluid_worst_ms=" ++ ms2(fworst) ++ " fluid_active=" ++ int_to_string(Strata.Fluid.active_count(fl)) ++ " fluid_waiting=" ++ int_to_string(Strata.Fluid.waiting_count(fl)) ++ (if soak_lake() do " lake_end=" ++ int_to_string(lake_voxels(Strata.Stream.world(s), reg)) else "" end))
+        println("soak: frames=" ++ int_to_string(frame) ++ " worst_ms=" ++ ms2(worst *. 1000.0) ++ " mean_ms=" ++ ms2(total *. 1000.0 /. int_to_float(if frame > 10 do frame - 10 else 1 end)) ++ " refused=" ++ int_to_string(Strata.Ffi.Vk.refused()) ++ " waiting=" ++ int_to_string(Strata.Render.waiting(sl)) ++ " slots=" ++ int_to_string(Strata.Render.used(sl)) ++ " live_quads=" ++ int_to_string(Strata.Ffi.Vk.live_quads()) ++ " leaked=" ++ int_to_string(float_to_int(Strata.Ffi.Vk.stat(7))) ++ " loaded=" ++ int_to_string(Strata.Stream.loaded_count(s)) ++ " fluid_worst_ms=" ++ ms2(fworst) ++ " fluid_active=" ++ int_to_string(Strata.Fluid.active_count(fl)) ++ " fluid_waiting=" ++ int_to_string(Strata.Fluid.waiting_count(fl)) ++ (if soak_lake() do " lake_end=" ++ int_to_string(lake_voxels(Strata.Stream.world(s), reg)) else "" end) ++ audio_summary(s, reg, cam, aworst))
       else () end
       Strata.Stream.stop(s)
       Strata.Ffi.Audio.close()
@@ -717,7 +738,14 @@ mod StrataViewer do
               if scripted && script != 2 && frame == frames - 3 do Strata.Ffi.Vk.request_shot() else () end
               if scripted && frame == Env.get_int("STRATA_REBUILD_AT", -1) do Strata.Ffi.Vk.force_rebuild() else () end
               -- the result is used, not dropped: a zero-argument extern bound to an unused name is optimised away (cube_forge GAPS G16)
+              let t_audio = Strata.Ffi.Vk.time()
               let snd2 = audio_frame(snd1, Strata.Stream.world(s3), fl2, dt, frame, scripted, now, t_prev)
+              let audio_ms = (Strata.Ffi.Vk.time() -. t_audio) *. 1000.0
+              let aworst2 = if frame >= 10 && audio_ms > aworst do audio_ms else aworst end
+              -- STRATA_STALL=n: hold the main thread 100 ms every n frames, as a hitch would (soak runs)
+              let stall = Env.get_int("STRATA_STALL", 0)
+              -- nested, not &&: both sides of && are evaluated (GAPS S16 on main), and frame % 0 panics
+              if stall > 0 do (if frame % stall == stall - 1 do Strata.Ffi.Audio.debug_stall(100) else () end) else () end
               let next = if Strata.Ffi.Vk.frame() do frame + 1 else frame end
               let spent = now -. t_prev
               -- in a soak, name any frame slower than 25 ms and where its time went
@@ -734,8 +762,8 @@ mod StrataViewer do
                   end
                 else () end
                 if Strata.Fluid.active_count(fl2) + Strata.Fluid.dormant_count(fl2) > 0 do println("  fluid: active " ++ int_to_string(Strata.Fluid.active_count(fl2)) ++ ", waiting " ++ int_to_string(Strata.Fluid.waiting_count(fl2)) ++ ", dormant " ++ int_to_string(Strata.Fluid.dormant_count(fl2)) ++ "; last step " ++ ms2(fluid_ms) ++ " ms") else () end
-                frame_loop(s3, fl2, job2, sl2, reg, cam2, next, frames, script, hole, worst2, total2, fworst2, now, now, vp2, snd2)
-              else frame_loop(s3, fl2, job2, sl2, reg, cam2, next, frames, script, hole, worst2, total2, fworst2, now, t_mark, vp2, snd2) end
+                frame_loop(s3, fl2, job2, sl2, reg, cam2, next, frames, script, hole, worst2, total2, fworst2, now, now, vp2, snd2, aworst2)
+              else frame_loop(s3, fl2, job2, sl2, reg, cam2, next, frames, script, hole, worst2, total2, fworst2, now, t_mark, vp2, snd2, aworst2) end
           end
       end
     end
@@ -943,7 +971,7 @@ mod StrataViewer do
           println("strata_viewer: " ++ int_to_string(Strata.Stream.loaded_count(s1)) ++ " chunks streamed in " ++ float_to_string(Math.round((t1 -. t0) *. 1000.0)) ++ " ms; " ++ int_to_string(Strata.Ffi.Vk.live_quads()) ++ " quads, " ++ int_to_string(Strata.Ffi.Vk.live_quads() * 8 / 1024) ++ " KB on the GPU")
           -- the fixed scenes fly, holding their pose; the default and the walk scene stand on the ground
           let cam = Cam(ex, ey, ez, yaw0, pitch0, Strata.Coord.chunk_of(float_to_int(Math.floor(ex))), Strata.Coord.chunk_of(float_to_int(Math.floor(ey))), Strata.Coord.chunk_of(float_to_int(Math.floor(ez))), false, false, soak > 0 || (scene != 0 && scene != 11), 0.0, false, false, int_to_float(Env.get_int("STRATA_SUN", 55)), Env.get_int("STRATA_LIGHT", 4), false, 0, 0.0)
-          frame_loop(s1, Strata.Fluid.with_limits(Strata.Fluid.new(reg, Cons((lake_base(), Strata.Fluid.flowing()), Cons((5, Strata.Fluid.sink()), Nil))), Env.get_int("STRATA_FLUID_CAP", 4096), Env.get_int("STRATA_FLUID_REACH", 16), 4), None, sl, reg, cam, 0, frames, if soak > 0 do 2 else if scene == 11 && frames > 0 do 1 else if scene == 4 && frames > 0 do 3 else 0 end end end, hole, 0.0, 0.0, 0.0, Strata.Ffi.Vk.time(), Strata.Ffi.Vk.time(), NativeArray.make_f32(16, 0.0), audio_start(frames))
+          frame_loop(s1, Strata.Fluid.with_limits(Strata.Fluid.new(reg, Cons((lake_base(), Strata.Fluid.flowing()), Cons((5, Strata.Fluid.sink()), Nil))), Env.get_int("STRATA_FLUID_CAP", 4096), Env.get_int("STRATA_FLUID_REACH", 16), 4), None, sl, reg, cam, 0, frames, if soak > 0 do 2 else if scene == 11 && frames > 0 do 1 else if scene == 4 && frames > 0 do 3 else 0 end end end, hole, 0.0, 0.0, 0.0, Strata.Ffi.Vk.time(), Strata.Ffi.Vk.time(), NativeArray.make_f32(16, 0.0), audio_start(frames), 0.0)
       end
       Strata.Ffi.Vk.close()
     end

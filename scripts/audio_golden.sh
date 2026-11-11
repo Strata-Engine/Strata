@@ -19,6 +19,9 @@ SC=soundcheck/.march/build/release/soundcheck
 # no device: open fails, the game goes on, every record is counted
 STRATA_AUDIO_FAIL=1 SOUNDCHECK_SCENE=nodevice $SC > "$OUT/nodevice.log" 2>&1 || { echo "FAIL: nodevice"; cat "$OUT/nodevice.log"; exit 1; }
 
+# a frame of more records than the ring holds: none is lost, so a stop at its end still stops
+SOUNDCHECK_SCENE=overflow SOUNDCHECK_OUT="$OUT/overflow.wav" $SC > "$OUT/overflow.log" 2>&1 || { echo "FAIL: overflow"; cat "$OUT/overflow.log"; exit 1; }
+
 # what an acoustics update costs (reported, not judged here)
 SOUNDCHECK_SCENE=acoustics64 $SC > "$OUT/acoustics64.log" 2>&1 || { echo "FAIL: acoustics64"; cat "$OUT/acoustics64.log"; exit 1; }
 cat "$OUT/acoustics64.log"
