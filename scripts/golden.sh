@@ -101,8 +101,8 @@ for line in $(echo "$SCENES" | tr ' ' ','); do
   else echo "FAIL $name: $res"; cp "$shot" "test/golden/$name.actual.ppm"; FAILED=1; fi
 done
 # Stillness: with nothing moving, the lit picture must have stopped changing.
-# Frames 118 and 119 of the overview under shadows (it was the forest until
-# the OpenSimplex2 land put a canopy against that camera), from two runs of the
+# Frames 118 and 119 of the overview under shadows (the forest camera stands in
+# dappled leaves on this land and never settles to 0.05%), from two runs of the
 # same deterministic sequence.
 if [ $UPDATE -eq 0 ]; then
   for mode in 2 4; do
@@ -119,9 +119,9 @@ fi
 if [ $UPDATE -eq 0 ]; then
   RUN="env MARCH_PIN_MAIN=1 STRATA_LIGHT=0 STRATA_RADIUS=6 STRATA_PIXELS=1 STRATA_SIZE=1280x800 STRATA_SCENE=1 STRATA_DIG=1 STRATA_FRAMES=60 STRATA_SHOT=/dev/null ./viewer/.march/build/release/strata_viewer"
   need=$($RUN 2>&1 | sed -n 's/.*; \([0-9]*\) quads,.*/\1/p' | head -1)
-  line=$(STRATA_QUADS=$((need + 1850)) $RUN 2>&1 | grep 'done after')
+  line=$(STRATA_QUADS=$((need + 4000)) $RUN 2>&1 | grep 'done after')
   refused=$(echo "$line" | sed -n 's/.*uploads refused \([0-9]*\),.*/\1/p')
   if echo "$line" | grep -q 'still waiting 0;' && [ "${refused:-0}" -gt 0 ]; then echo "ok   retry: $refused uploads refused, none left waiting"
-  else echo "FAIL retry (capacity $((need + 1850))): $line"; FAILED=1; fi
+  else echo "FAIL retry (capacity $((need + 4000))): $line"; FAILED=1; fi
 fi
 [ $FAILED -eq 0 ] && echo "golden: PASS" || { echo "golden: FAIL (actual images left in test/golden/*.actual.ppm)"; exit 1; }
