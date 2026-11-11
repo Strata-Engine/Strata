@@ -9,6 +9,8 @@
 #define ST_PARAMS 24           /* floats in a text call's parameters (see st_text) */
 #define ST_EM 48               /* pixels to the em at which glyphs are stored */
 #define ST_SPREAD 8            /* how far the stored distance field reaches, in those pixels */
+#define ST_UPLOAD_BYTES (1 << 20)   /* new glyph pixels one frame may make: what the renderer carries to the GPU in a frame */
+#define ST_UPLOAD_RECTS 1024
 #define ST_BIG 3               /* text larger than ST_BIG_FROM pixels is stored ST_BIG times finer: big letters keep their corners */
 #define ST_BIG_FROM 80.0f
 
@@ -49,7 +51,8 @@ void st_set_raster_budget(int64_t microseconds);       /* a frame; default 1000 
 /* 0 glyphs in the atlas, 1 glyphs that waited since the last frame began,
  * 2 evictions so far, 3 atlas bytes held, 4 glyphs rasterised so far,
  * 5 microseconds spent rasterising this frame, 6 layouts worked out so far
- * (a cached one is not counted), 7 runs HarfBuzz has shaped so far. */
+ * (a cached one is not counted), 7 runs HarfBuzz has shaped so far, 8 glyphs
+ * that waited in the frame that just ended. */
 double st_stat(int64_t which);
 
 /* Lay out [n] bytes of UTF-8 and write its glyphs as quads, in device pixels.

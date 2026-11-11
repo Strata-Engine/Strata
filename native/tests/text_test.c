@@ -268,6 +268,42 @@ static void test_shaping(void) {
     CHECK(m[2] >= 2 && m[2] <= 4, "a narrow wrap breaks the word at clusters, not at every character");
 }
 
+static void test_review(void) {
+    int64_t f = st_font_default();
+    float g[8];
+    /* no more new pixels in a frame than the renderer carries to the GPU in one */
+    st_atlas_config(2048, 4); st_set_raster_budget(1000000000);
+    st_frame_begin();
+    int ready = 0, waited = 0;
+    for (int c = 0x21; c < 0x7f; c++) { if (st_glyph(f, st_font_glyph(f, c), 1, g) == 1) ready++; else waited++; }
+    long bytes = 0; int rects = 0, page, x, y, w, h, stride; const uint8_t *px;
+    while (st_atlas_dirty(&page, &x, &y, &w, &h, &px, &stride)) { bytes += (long)w * h; rects++; }
+    CHECK(bytes <= ST_UPLOAD_BYTES && rects <= ST_UPLOAD_RECTS, "a frame's new glyphs fit what one frame uploads");
+    CHECK(ready > 10 && waited > 0, "the rest wait, however large the time budget");
+    st_frame_begin();
+    CHECK(st_glyph(f, st_font_glyph(f, 0x7e), 1, g) == 1, "and come on a later frame");
+    /* the glyph table makes room for new glyphs however many it has seen */
+    st_atlas_config(256, 1);
+    for (int id = 1000; id < 51000; id++) { if (id % 16 == 0) st_frame_begin(); st_glyph(f, id, 0, g); }
+    st_frame_begin();
+    CHECK(st_glyph(f, st_font_glyph(f, 'A'), 0, g) == 1, "after fifty thousand glyphs have come and gone, a new one is still drawn");
+    st_atlas_config(2048, 4); st_set_raster_budget(1000000);
+    /* setting the same fallback list again forgets no layouts */
+    int64_t sc = load("test/fonts/NotoSansSC-Sub.otf"), lat = load("test/fonts/NotoSans-Latin.ttf");
+    float p[ST_PARAMS], m[4]; params(p, 20, 0);
+    st_font_set_fallbacks(lat, &sc, 1);
+    measure(f, "kept across a font call", p, m);
+    double lay = st_stat(6);
+    st_font_set_fallbacks(lat, &sc, 1);
+    measure(f, "kept across a font call", p, m);
+    CHECK(st_stat(6) == lay, "an unchanged fallback list keeps the layouts");
+    /* what waited in the frame that just ended is still known after the next begins */
+    st_set_raster_budget(0); st_atlas_config(2048, 4);
+    st_frame_begin(); st_glyph(f, st_font_glyph(f, 'Z'), 0, g); st_frame_begin();
+    CHECK(st_stat(1) == 0 && st_stat(8) == 1, "the last frame's waiting count outlives the frame");
+    st_set_raster_budget(1000000);
+}
+
 int main(void) {
     test_utf8();
     test_fonts();
@@ -276,6 +312,7 @@ int main(void) {
     test_layout();
     test_fallback();
     test_shaping();
+    test_review();
     printf("text_test: %d checks, %d failed\n", checks, fails);
     return fails ? 1 : 0;
 }

@@ -45,8 +45,8 @@ static inline void   *narr_data(void *a) { return (char *)a + NARR_HDR; }
 #define SV_SPRAY_FLOATS 10     /* floats a particle */
 #define SV_UI_QUADS 16384      /* quads the 2D layer holds a frame */
 #define SV_UI_FLOATS 16        /* floats a quad (Strata.Ui) */
-#define SV_GLYPH_STAGE (1 << 20)   /* bytes of new glyph pixels a frame can carry to the atlas */
-#define SV_GLYPH_RECTS 1024
+#define SV_GLYPH_STAGE ST_UPLOAD_BYTES   /* bytes of new glyph pixels a frame carries to the atlas: all strata_text makes in a frame */
+#define SV_GLYPH_RECTS ST_UPLOAD_RECTS
 #define SV_LIGHT_PER_FRAME 128 /* chunks whose light bytes one frame may copy into the volume */
 #define SV_LIGHT_WRITE_BYTES (32768 + 64 + 8)   /* per write: the voxels, the coarse cells, the owner texel */
 #define SV_MAX_KEYS 512

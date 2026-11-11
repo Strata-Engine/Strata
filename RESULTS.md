@@ -533,3 +533,48 @@ in a test world, not judged by playing.
 ![Under the sea](docs/underwater-sea.png)
 ![Looking up](docs/underwater-up.png)
 ![On the lake bed](docs/underwater-lake.png)
+
+# Interface and text
+
+Branch `interface`. Plan `docs/2026-11-11-ui-text-plan.md`, rulings in
+`docs/ui-ledger.md`. Measured on an M3 Max while another session was also
+building and testing, so times are rough.
+
+| | target | measured | |
+|---|---|---|---|
+| GPU time for the viewer's display, 2560 x 1600 | 0.2 ms | 0.03 ms | met |
+| CPU time, 200 rectangles and ten lines (about 520 glyph quads), unchanged text | 0.2 ms | 0.09 ms | met |
+| the same with every line changing each frame | none set | 0.11 ms | measured before HarfBuzz; not repeated after |
+| draw calls added | 1 | 1 | met |
+| rasterising in a frame | 1 ms | 1.0 to 1.08 ms | met within a glyph's overshoot |
+| a glyph's first use | | about 45 microseconds | |
+| text edge | sharp from 8 to 200 px, still | sharp on the sheet; frames 58 and 59 identical | met; 8 and 10 px are unhinted and soft |
+| glyph atlas memory | 16 MB | 4 MB after the soak; 16 MB is the ceiling | met |
+
+- The six-script sheet (121 glyphs) is complete after 6 frames.
+- Soak, 3000 frames with the display on: nothing dropped, no glyph waiting,
+  worst frame 9.5, 30.1 and 12.4 ms in three runs (limit 20) on a loaded
+  machine.
+- FreeType's own distance-field renderer took 2 to 4 ms a glyph; the field
+  is worked out in `strata_text.c` from FreeType's coverage instead.
+- Text over 80 pixels uses a second, finer picture of each glyph: nine
+  times the atlas room, for corners that stay sharp.
+
+After the review (one independent reviewer, whole branch), fixed with a test
+each:
+
+- A frame makes no more new glyph pixels than the renderer uploads in a
+  frame, so a glyph is never drawn before its pixels are on the GPU.
+- The glyph table forgets evicted glyphs when it fills, so new glyphs are
+  still drawn after tens of thousands have come and gone.
+- Text written into a display no longer shows through in another display
+  built from the same starting one.
+- Loading a font again, or setting the same fallback list, no longer
+  forgets every remembered layout.
+- The soak's "no glyph waiting" check reads the frame that just ended; it
+  could not fail before.
+- A glyph that finds no room is tried about once a second, not every frame.
+
+Not done: the comparison against macOS's own text rendering; a test of the
+upload path on the GPU; wrapping right-to-left text is checked by a probe,
+not by the suite.

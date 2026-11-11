@@ -164,6 +164,11 @@ Strata.Render.draw_ui(u4)                                  -- one draw call, in 
   size from there. `styled` takes a `TextStyle`: wrap width, alignment,
   outline, shadow. `runs` sets several fonts, sizes or colours on one
   baseline. `measure` gives a string's size before it is drawn.
+- **Scripts.** Text is put in reading order (the Unicode bidirectional
+  algorithm, by SheenBidi) and shaped by HarfBuzz: kerning, ligatures,
+  joined Arabic, Indic conjuncts. A number in a right-to-left line reads
+  left to right. A font takes a list of fallback fonts for the characters
+  it lacks; a character no font has is drawn as the missing-glyph box.
 - **New glyphs are spread over frames.** A frame spends at most 1 ms drawing
   glyphs it has not seen (`Strata.Text.set_raster_budget`); the rest appear
   a frame or two later. A glyph takes about 45 microseconds.
@@ -179,12 +184,20 @@ Limits:
 - An outline can be about a sixth of the text's size at most.
 - Small text is not hinted. It is readable at 8 pixels and softer than the
   system's.
+- There is no language tag. Where Chinese and Japanese share a character,
+  it is drawn from whichever font comes first in the fallback list; give
+  each language's text its own font to get its own forms.
+- The script lines were checked by eye for joining, direction and number
+  order, not by a native reader and not against another renderer.
 - A consumer's `forge.toml` lists `native/strata_text.c` beside the shim
-  and links FreeType (see `viewer/forge.toml`).
+  and links FreeType and HarfBuzz, both from Homebrew (see
+  `viewer/forge.toml`). SheenBidi is in `native/sheenbidi` and is compiled
+  into that file.
 
 ![The viewer's display](docs/ui-display.png)
 ![Text from 8 to 200 pixels](docs/ui-text-sheet.png)
 ![Wrapping, alignment, outline, shadow, mixed runs](docs/ui-text-styles.png)
+![Six scripts, mixed direction, kerning and ligatures](docs/ui-text-scripts.png)
 
 ## Using it from a game
 

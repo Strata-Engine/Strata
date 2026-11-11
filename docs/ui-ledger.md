@@ -74,3 +74,15 @@ Plan: `docs/2026-11-11-ui-text-plan.md`. Branch `interface`, cut from `swim`
 - Measured: the six-script sheet's 121 glyphs arrive over 6 frames, each
   frame spending 1.0 to 1.08 ms drawing glyphs against the 1 ms budget.
 - Tasks 5 and 6: complete. C tests 91 checks.
+- Final review: one fresh reviewer on the whole branch (312cee7..a3dccf1).
+- Final: fixed glyph drawn before its pixels are uploaded — "a frame's new glyphs fit what one frame uploads" RED→GREEN.
+- Final: fixed glyph table never recovering — "after fifty thousand glyphs have come and gone" RED→GREEN.
+- Final: fixed C writing into a shared display array — "two texts built on the same display do not write over each other" RED→GREEN.
+- Final: fixed font() forgetting all layouts — "an unchanged fallback list keeps the layouts" RED→GREEN. `font` with an empty list now leaves a font's fallbacks alone.
+- Final: fixed (re-graded from Minor: an assertion that cannot fail is no assertion) the soak's waiting check — "the last frame's waiting count outlives the frame" RED→GREEN.
+- Final: fixed without a test (Minor, done because it sat in the same lines) a glyph with no room being redrawn every frame; dead free-cell code removed.
+- Final: minor (deferred): text state survives a window close and reopen in one process; glyphs used before would draw blank.
+- Final: minor (deferred): an embedded NUL in a font path cuts the path short.
+- Final: minor (deferred): a text call reserves three quads per byte of its string; a megabyte string reserves 192 MB.
+- Final: minor (deferred): loose tolerances in two C layout tests (measured width, right alignment); two March tests weaker than their names (bad font handle, invalid UTF-8).
+- Final: minor (deferred): no suite test wraps right-to-left text; the reviewer's probe found it sound.

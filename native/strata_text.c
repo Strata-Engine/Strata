@@ -5,7 +5,7 @@
  * the em, and that one picture serves every size. FreeType draws the glyph's
  * coverage; the field is worked out here from that (FreeType's own
  * distance-field renderer takes 1 to 4 ms a glyph, this about a twentieth). The atlas is pages of
- * 8-bit pixels; a glyph's cell comes from a free cell, then a shelf, then
+ * 8-bit pixels; a glyph's cell comes from a shelf, then
  * from the glyph unused for longest (never one used this frame), then from a
  * new page. Rasterising is budgeted per frame, so a screenful of new text is
  * spread over a few frames instead of being one long one.
@@ -76,7 +76,7 @@ typedef struct {
 
 typedef struct {
     uint32_t font, gid;           /* gid's top bit: the fine picture, for large text */
-    uint8_t state;             /* 0 never seen, 1 in the atlas (or inkless), 2 evicted */
+    uint8_t state;             /* 0 never seen, 1 in the atlas (or inkless), 2 evicted, 3 could not be placed (tried in frame [used]) */
     int16_t page, x, y, w, h, cw, ch, left, top;
     uint64_t used;             /* the frame it was last asked for */
 } Glyph;
@@ -96,12 +96,12 @@ static struct {
     int page_px, max_pages, npages;
     uint8_t *pages[MAX_PAGES]; int page_y[MAX_PAGES];
     Shelf *shelves; int nshelves, shelf_cap;
-    Cell *free_cells; int nfree, free_cap;
     Glyph *glyphs; int nglyphs_seen, nlive;
     struct { int16_t page, x, y, w, h; } dirty[DIRTY_CAP]; uint32_t dirty_head, dirty_n;
     uint64_t frame;
     int64_t budget_us; double spent_us;
-    uint64_t waited, evictions, rasterised, layouts, shapes;
+    uint64_t waited, waited_last, evictions, rasterised, layouts, shapes;
+    int64_t frame_bytes; int frame_rects;      /* new glyph pixels made this frame: bounded by what one frame uploads */
     hb_buffer_t *hb;
     Layout cache[LC_CAP]; uint64_t tick;
 } T;
@@ -110,7 +110,7 @@ static double now_us(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, 
 
 static void atlas_reset(void) {
     for (int p = 0; p < MAX_PAGES; p++) { free(T.pages[p]); T.pages[p] = NULL; T.page_y[p] = 0; }
-    T.npages = 0; T.nshelves = 0; T.nfree = 0; T.dirty_head = 0; T.dirty_n = 0; T.nlive = 0; T.nglyphs_seen = 0;
+    T.npages = 0; T.nshelves = 0; T.dirty_head = 0; T.dirty_n = 0; T.nlive = 0; T.nglyphs_seen = 0; T.frame_bytes = 0; T.frame_rects = 0;
     if (T.glyphs) memset(T.glyphs, 0, sizeof(Glyph) * GL_CAP);
 }
 
@@ -198,9 +198,11 @@ static int font_ok(int64_t font) { return (init() && font >= 1 && font < T.nfont
 int64_t st_font_set_fallbacks(int64_t font, const int64_t *handles, int64_t n) {
     if (!init() || font < 1 || font >= T.nfonts || n < 0 || (n > 0 && !handles)) return 0;
     Font *f = &T.fonts[font];
-    f->nfb = 0;
-    for (int64_t i = 0; i < n && f->nfb < MAX_FALLBACKS; i++)
-        if (handles[i] >= 1 && handles[i] < T.nfonts && handles[i] != font) f->fb[f->nfb++] = (int)handles[i];
+    int fresh[MAX_FALLBACKS], nfresh = 0;
+    for (int64_t i = 0; i < n && nfresh < MAX_FALLBACKS; i++)
+        if (handles[i] >= 1 && handles[i] < T.nfonts && handles[i] != font) fresh[nfresh++] = (int)handles[i];
+    if (nfresh == f->nfb && memcmp(fresh, f->fb, sizeof(int) * (size_t)nfresh) == 0) return 1;      /* nothing changed */
+    f->nfb = nfresh; memcpy(f->fb, fresh, sizeof(int) * (size_t)nfresh);
     for (int i = 0; i < LC_CAP; i++) T.cache[i].hash = 0;      /* layouts made under the old list are stale */
     return 1;
 }
@@ -220,7 +222,7 @@ void st_atlas_config(int64_t page_px, int64_t max_pages) {
 int64_t st_atlas_page_px(void) { return init() ? T.page_px : 0; }
 int64_t st_atlas_max_pages(void) { return init() ? T.max_pages : 0; }
 
-void st_frame_begin(void) { if (!init()) return; T.frame++; T.spent_us = 0.0; T.waited = 0; }
+void st_frame_begin(void) { if (!init()) return; T.frame++; T.spent_us = 0.0; T.waited_last = T.waited; T.waited = 0; T.frame_bytes = 0; T.frame_rects = 0; }
 void st_set_raster_budget(int64_t us) { if (init()) T.budget_us = us < 0 ? 0 : us; }
 
 double st_stat(int64_t which) {
@@ -234,19 +236,40 @@ double st_stat(int64_t which) {
         case 5: return T.spent_us;
         case 6: return (double)T.layouts;
         case 7: return (double)T.shapes;
+        case 8: return (double)T.waited_last;
         default: return -1.0;
     }
 }
 
 static uint32_t gl_hash(uint32_t font, uint32_t gid) { uint32_t h = font * 0x9e3779b1u ^ gid * 0x85ebca6bu; h ^= h >> 15; h *= 0x2c1b3c6du; h ^= h >> 12; return h; }
 
-/* The glyph's slot in the table, made if it is not there. NULL if the table is full. */
+/* The table has seen too many glyphs: keep the ones that hold a cell or were
+ * asked for this frame, forget the rest (evicted glyphs, and inkless ones,
+ * which cost nothing to work out again). 1 if that made room. */
+static int gl_compact(void) {
+    Glyph *fresh = calloc(GL_CAP, sizeof(Glyph));
+    if (!fresh) return 0;
+    int kept = 0;
+    for (int i = 0; i < GL_CAP; i++) {
+        Glyph *g = &T.glyphs[i];
+        if (g->state != 1 || (g->cw == 0 && g->used < T.frame)) continue;
+        uint32_t at = gl_hash(g->font, g->gid) & (GL_CAP - 1);
+        while (fresh[at].state != 0) at = (at + 1) & (GL_CAP - 1);
+        fresh[at] = *g; kept++;
+    }
+    free(T.glyphs);
+    T.glyphs = fresh; T.nglyphs_seen = kept; T.nlive = kept;
+    return kept < GL_CAP * 3 / 4;
+}
+
+/* The glyph's slot in the table, made if it is not there. NULL if the table
+ * is full of glyphs in use. */
 static Glyph *gl_find(uint32_t font, uint32_t gid) {
     uint32_t i = gl_hash(font, gid) & (GL_CAP - 1);
     for (int probe = 0; probe < GL_CAP; probe++, i = (i + 1) & (GL_CAP - 1)) {
         Glyph *g = &T.glyphs[i];
         if (g->state == 0) {
-            if (T.nglyphs_seen >= GL_CAP * 3 / 4) return NULL;
+            if (T.nglyphs_seen >= GL_CAP * 3 / 4) return gl_compact() ? gl_find(font, gid) : NULL;
             g->font = font; g->gid = gid; T.nglyphs_seen++;
             return g;
         }
@@ -284,19 +307,6 @@ static int shelf_take(int cw, int ch, Cell *out) {
     return 0;
 }
 
-static int free_take(int cw, int ch, Cell *out) {
-    int best = -1;
-    for (int i = 0; i < T.nfree; i++) {
-        Cell *c = &T.free_cells[i];
-        if (c->cw < cw || c->ch < ch) continue;
-        if (best < 0 || (int)c->cw * c->ch < (int)T.free_cells[best].cw * T.free_cells[best].ch) best = i;
-    }
-    if (best < 0) return 0;
-    *out = T.free_cells[best];
-    T.free_cells[best] = T.free_cells[--T.nfree];
-    return 1;
-}
-
 /* Drop the glyph unused for longest whose cell is big enough, and take its
  * cell. Never one asked for this frame. */
 static int evict_take(int cw, int ch, Cell *out) {
@@ -332,9 +342,6 @@ static int page_wipe(void) {
     int keep = 0;
     for (int i = 0; i < T.nshelves; i++) if (T.shelves[i].page != pick) T.shelves[keep++] = T.shelves[i];
     T.nshelves = keep;
-    keep = 0;
-    for (int i = 0; i < T.nfree; i++) if (T.free_cells[i].page != pick) T.free_cells[keep++] = T.free_cells[i];
-    T.nfree = keep;
     T.page_y[pick] = 0;
     return 1;
 }
@@ -342,7 +349,7 @@ static int page_wipe(void) {
 static int cell_take(int cw, int ch, Cell *out) {
     if (cw > T.page_px || ch > T.page_px) return 0;
     if (T.npages == 0 && !page_make()) return 0;
-    if (free_take(cw, ch, out) || shelf_take(cw, ch, out) || evict_take(cw, ch, out)) return 1;
+    if (shelf_take(cw, ch, out) || evict_take(cw, ch, out)) return 1;
     if (page_make() && shelf_take(cw, ch, out)) return 1;
     return page_wipe() && shelf_take(cw, ch, out);
 }
@@ -439,7 +446,11 @@ int64_t st_glyph(int64_t font, int64_t glyph, int64_t big, float out[8]) {
     memset(out, 0, 8 * sizeof(float));
     if (!g) { T.waited++; return 0; }
     if (g->state == 1) { g->used = T.frame; gl_out(g, out); return 1; }
-    if (T.spent_us >= (double)T.budget_us) { T.waited++; return 0; }
+    /* one that found no room is not drawn again and again: it is tried once a second or so */
+    if (g->state == 3 && T.frame < g->used + 60) { T.waited++; return 0; }
+    /* a frame makes no more new pixels than the renderer uploads in a frame,
+     * so a glyph said to be drawable always has its pixels on the GPU when it is drawn */
+    if (T.spent_us >= (double)T.budget_us || T.frame_rects >= ST_UPLOAD_RECTS || T.frame_bytes >= ST_UPLOAD_BYTES) { T.waited++; return 0; }
     double t0 = now_us();
     FT_Face face = T.fonts[fi].face;
     int inked = 0;
@@ -459,7 +470,9 @@ int64_t st_glyph(int64_t font, int64_t glyph, int64_t big, float out[8]) {
         int w = (int)face->glyph->bitmap.width + 2 * spread, h = (int)face->glyph->bitmap.rows + 2 * spread;
         int cw = (w + 1 + CELL - 1) / CELL * CELL, ch = (h + 1 + CELL - 1) / CELL * CELL;     /* a clear pixel between neighbours */
         Cell c;
-        if (!cell_take(cw, ch, &c)) ok = 0;
+        if ((int64_t)cw * ch > ST_UPLOAD_BYTES) { ok = 0; }                    /* larger than a frame can upload: never placed */
+        else if (T.frame_bytes + (int64_t)cw * ch > ST_UPLOAD_BYTES) { free(field); T.spent_us += now_us() - t0; if (big) FT_Set_Pixel_Sizes(face, 0, ST_EM); T.waited++; return 0; }   /* next frame */
+        else if (!cell_take(cw, ch, &c)) ok = 0;
         else {
             uint8_t *page = T.pages[c.page];
             for (int row = 0; row < c.ch; row++) memset(page + (size_t)(c.y + row) * T.page_px + c.x, 0, (size_t)c.cw);
@@ -467,12 +480,13 @@ int64_t st_glyph(int64_t font, int64_t glyph, int64_t big, float out[8]) {
             g->page = c.page; g->x = c.x; g->y = c.y; g->w = (int16_t)w; g->h = (int16_t)h; g->cw = c.cw; g->ch = c.ch;
             g->left = (int16_t)(face->glyph->bitmap_left - spread); g->top = (int16_t)(face->glyph->bitmap_top + spread);
             dirty_push(&c);
+            T.frame_bytes += (int64_t)c.cw * c.ch; T.frame_rects++;
         }
     }
     free(field);
     if (big) FT_Set_Pixel_Sizes(face, 0, ST_EM);
     T.spent_us += now_us() - t0;
-    if (!ok) { T.waited++; return 0; }
+    if (!ok) { g->state = 3; g->used = T.frame; T.waited++; return 0; }
     g->state = 1; g->used = T.frame; T.nlive++; T.rasterised++;
     gl_out(g, out);
     return 1;
