@@ -99,3 +99,14 @@ meshing tasks; handing it to a function 200 000 times a chunk on each of
 them is, it seems, a reference-count update on shared memory each time.
 Workaround: read what the faces need from the registry once per chunk into
 arrays the task owns, and pass those.
+
+## S16: a record field typed by a short type name another module also defines breaks a consumer
+
+`Strata.Physics` declared `type Event = ...` and a record
+`type Physics = { ..., events : List(Event) }`. The library typechecked and
+its tests passed, but the viewer, which also uses `Strata.Fluid.Event`,
+failed `forge check` with "expected `Strata.Stream.Stream` but got
+`Stream`" at fluid calls that have nothing to do with physics. A field
+typed `Int` in the same place, or an `Event` type used outside a record,
+did not trigger it. Workaround: a type named in a record field gets a name
+no other module uses (`PhysEvent`).
