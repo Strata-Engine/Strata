@@ -81,6 +81,17 @@ mod Strata.Render do
     b && p0 && p1 && p2 && p3 && pl && done
   end
 
+  -- Upload one part of a body: drawn at a pose set every frame, never in the light volume.
+  pfn upload_part(slot : Int, m : Strata.Mesh.Meshed) : Bool do
+    let b = Strata.Ffi.Vk.body_begin(slot)
+    let p0 = Strata.Ffi.Vk.chunk_part(0, Strata.Mesh.quads_at(m, 0), Strata.Mesh.quad_count_at(m, 0))
+    let p1 = Strata.Ffi.Vk.chunk_part(1, Strata.Mesh.quads_at(m, 1), Strata.Mesh.quad_count_at(m, 1))
+    let p2 = Strata.Ffi.Vk.chunk_part(2, Strata.Mesh.quads_at(m, 2), Strata.Mesh.quad_count_at(m, 2))
+    let p3 = Strata.Ffi.Vk.chunk_part(3, Strata.Mesh.instances(m), Strata.Mesh.instance_count(m))
+    let done = Strata.Ffi.Vk.chunk_commit()
+    b && p0 && p1 && p2 && p3 && done
+  end
+
   pfn perform(sl : Strata.Slots.Slots, acts : List(Strata.Slots.Action), none : Strata.Mesh.Meshed) : Strata.Slots.Slots do
     match acts do
       Nil -> sl
@@ -88,8 +99,53 @@ mod Strata.Render do
         if !Sr2.is_upload(a) do
           Strata.Ffi.Vk.chunk_free(Sr2.slot(a))
           perform(sl, t, none)
-        else perform(if upload(Sr2.slot(a), Sr2.key(a), Sr2.mesh_or(a, none)) do sl else Sr2.refused(sl, a) end, t, none) end
+        else
+          let ok = if Strata.Physics.is_part_key(Sr2.key(a)) do upload_part(Sr2.slot(a), Sr2.mesh_or(a, none)) else upload(Sr2.slot(a), Sr2.key(a), Sr2.mesh_or(a, none)) end
+          perform(if ok do sl else Sr2.refused(sl, a) end, t, none)
+        end
     end
+  end
+
+  -- every body part the renderer holds: drawn where its body is at clock t
+  pfn pose_parts(sl : Strata.Slots.Slots, p : Strata.Physics.Physics, t : Float, ks : List(Strata.Coord.Key)) : Unit do
+    match ks do
+      Nil -> ()
+      Cons(k, rest) ->
+        if !Strata.Physics.is_part_key(k) do pose_parts(sl, p, t, rest)
+        else
+          let id = Strata.Coord.kx(k)
+          let (ox, oy, oz) = Strata.Physics.part_offset(p, id, Strata.Coord.ky(k))
+          let sc = Strata.Physics.scale(p)
+          match Strata.Physics.pose(p, id, t) do
+            (x, y, z, q) ->
+              let v = Strata.Math.Quat.rotate(q, Strata.Math.Vec3.new(int_to_float(ox) *. sc, int_to_float(oy) *. sc, int_to_float(oz) *. sc))
+              Strata.Ffi.Vk.slot_pose(Sr2.slot_of(sl, k), x +. Strata.Math.Vec3.x(v), y +. Strata.Math.Vec3.y(v), z +. Strata.Math.Vec3.z(v), Strata.Math.Quat.x(q), Strata.Math.Quat.y(q), Strata.Math.Quat.z(q), Strata.Math.Quat.w(q))
+              pose_parts(sl, p, t, rest)
+          end
+        end
+    end
+  end
+
+  doc "Keep the renderer in step with the bodies: upload parts meshed since the last call, free the parts of bodies that are gone, and draw every body where it is at clock [t] (seconds; see `Strata.Physics.pose`)."
+  fn bodies(r : Render, p : Strata.Physics.Physics, t : Float) : (Render, Strata.Physics.Physics) do
+    match Strata.Physics.take_meshes(p) do
+      (p2, made) ->
+        match r do
+          Render(sl, none) ->
+            let held = Sr2.keys(sl)
+            let gone = List.filter(held, fn k -> Strata.Physics.is_part_key(k) && !Strata.Physics.exists(p2, Strata.Coord.kx(k)))
+            let keyed = List.map(made, fn m -> keyed_part(m))
+            match Sr2.plan(sl, keyed, gone) do
+              (sl2, acts) ->
+                let sl3 = perform(sl2, acts, none)
+                pose_parts(sl3, p2, t, Sr2.keys(sl3))
+                (Render(sl3, none), p2)
+            end
+        end
+    end
+  end
+  pfn keyed_part(m : (Int, Int, Strata.Mesh.Meshed)) : (Strata.Coord.Key, Strata.Mesh.Meshed) do
+    match m do (id, k, mesh) -> (Strata.Physics.part_key(id, k), mesh) end
   end
 
   doc "Bring the renderer up to date with the stream: upload its finished meshes, free its unloaded chunks, retry anything refused earlier."
