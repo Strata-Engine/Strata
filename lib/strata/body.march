@@ -1,0 +1,273 @@
+-- Body — what a rigid voxel object is made of: a dense box of block ids from
+-- the game's registry, its mass, centre of mass and inertia, the voxels on
+-- its surface (the points that touch other things), and its connected
+-- parts. A body's voxels are the world's size; `scale` is metres per voxel.
+--
+-- Positions inside a grid are voxels from its low corner; a voxel's index
+-- is x + sx * (y + sy * z). Only blocks that collide have mass, surface or
+-- connection: a plant inside a grid is carried but weighs nothing.
+mod Strata.Body do
+
+  alias Strata.Blocks as B
+
+  doc "The most voxels a grid has on a side."
+  fn max_side() : Int do 128 end
+
+  -- sizes x, y, z and the ids, x fastest
+  type Grid = Grid(Int, Int, Int, NativeI32Arr)
+
+  pfn side(v : Int) : Int do if v < 1 do 1 else if v > max_side() do max_side() else v end end end
+
+  doc "A grid of [sx] x [sy] x [sz] voxels of air; each side is clamped to 1 .. 128."
+  fn grid(sx : Int, sy : Int, sz : Int) : Grid do
+    let x = side(sx)
+    let y = side(sy)
+    let z = side(sz)
+    Grid(x, y, z, NativeArray.make_i32(x * y * z, 0))
+  end
+
+  fn size_x(g : Grid) : Int do match g do Grid(x, _, _, _) -> x end end
+  fn size_y(g : Grid) : Int do match g do Grid(_, y, _, _) -> y end end
+  fn size_z(g : Grid) : Int do match g do Grid(_, _, z, _) -> z end end
+  doc "The ids, x fastest: index x + sx * (y + sy * z)."
+  fn ids(g : Grid) : NativeI32Arr do match g do Grid(_, _, _, a) -> a end end
+
+  pfn inside(g : Grid, x : Int, y : Int, z : Int) : Bool do
+    match g do
+      Grid(sx, sy, sz, _) -> x >= 0 && y >= 0 && z >= 0 && x < sx && y < sy && z < sz
+    end
+  end
+
+  doc "The block at (x, y, z); air outside the grid."
+  fn grid_get(g : Grid, x : Int, y : Int, z : Int) : Int do
+    match g do
+      Grid(sx, sy, _, a) -> if inside(g, x, y, z) do NativeArray.get_i32(a, x + sx * (y + sy * z)) else 0 end
+    end
+  end
+
+  doc "Set the block at (x, y, z); outside the grid nothing changes."
+  fn grid_set(g : Grid, x : Int, y : Int, z : Int, id : Int) : Grid do
+    if inside(g, x, y, z) do
+      match g do
+        Grid(sx, sy, sz, a) -> Grid(sx, sy, sz, NativeArray.set_i32(a, x + sx * (y + sy * z), id))
+      end
+    else g end
+  end
+
+  pfn count_go(r : Strata.Blocks.Registry, a : NativeI32Arr, i : Int, n : Int, acc : Int) : Int do
+    if i >= n do acc else count_go(r, a, i + 1, n, if B.collides(r, NativeArray.get_i32(a, i)) do acc + 1 else acc end) end
+  end
+  doc "How many of the grid's voxels collide."
+  fn solid_count(r : Strata.Blocks.Registry, g : Grid) : Int do
+    match g do Grid(sx, sy, sz, a) -> count_go(r, a, 0, sx * sy * sz, 0) end
+  end
+
+  -- ── Mass ─────────────────────────────────────────────────────────────────
+  -- kg; centre x, y, z in metres from the low corner; inertia about the
+  -- centre as tensor elements xx yy zz xy xz yz (an off-diagonal element is
+  -- minus the sum of mass times the two offsets), kg m²
+  type Mass = Mass(Float, Float, Float, Float, Float, Float, Float, Float, Float, Float)
+
+  fn mass_kg(m : Mass) : Float do match m do Mass(k, _, _, _, _, _, _, _, _, _) -> k end end
+  doc "The centre of mass, in metres from the grid's low corner."
+  fn centre(m : Mass) : (Float, Float, Float) do match m do Mass(_, x, y, z, _, _, _, _, _, _) -> (x, y, z) end end
+  doc "The inertia tensor about the centre: xx, yy, zz, xy, xz, yz in kg m². Off-diagonal elements are minus the products of inertia."
+  fn inertia(m : Mass) : (Float, Float, Float, Float, Float, Float) do match m do Mass(_, _, _, _, a, b, c, d, e, f) -> (a, b, c, d, e, f) end end
+
+  -- sums over voxels of m, m x, m y, m z, m x², m y², m z², m x y, m x z, m y z (x, y, z voxel centres in metres)
+  type Sums = Sums(Float, Float, Float, Float, Float, Float, Float, Float, Float, Float)
+
+  pfn sums_go(r : Strata.Blocks.Registry, g : Grid, s : Float, i : Int, n : Int, acc : Sums) : Sums do
+    if i >= n do acc
+    else
+      match g do
+        Grid(sx, sy, _, a) ->
+          let d = B.density(r, NativeArray.get_i32(a, i))
+          if d <= 0 do sums_go(r, g, s, i + 1, n, acc)
+          else
+            let m = int_to_float(d) *. s *. s *. s
+            let x = (int_to_float(i % sx) +. 0.5) *. s
+            let y = (int_to_float((i / sx) % sy) +. 0.5) *. s
+            let z = (int_to_float(i / (sx * sy)) +. 0.5) *. s
+            match acc do
+              Sums(k, kx, ky, kz, xx, yy, zz, xy, xz, yz) ->
+                sums_go(r, g, s, i + 1, n, Sums(k +. m, kx +. m *. x, ky +. m *. y, kz +. m *. z,
+                  xx +. m *. x *. x, yy +. m *. y *. y, zz +. m *. z *. z, xy +. m *. x *. y, xz +. m *. x *. z, yz +. m *. y *. z))
+            end
+          end
+      end
+    end
+  end
+
+  doc "Mass, centre and inertia of the grid's colliding voxels at [scale] metres a voxel. Each voxel is a uniform cube. A grid with no mass has its centre in the middle of the box and no inertia."
+  fn mass_of(r : Strata.Blocks.Registry, g : Grid, scale : Float) : Mass do
+    match g do
+      Grid(sx, sy, sz, _) ->
+        match sums_go(r, g, scale, 0, sx * sy * sz, Sums(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)) do
+          Sums(k, kx, ky, kz, xx, yy, zz, xy, xz, yz) ->
+            if k <= 0.0 do Mass(0.0, int_to_float(sx) *. scale *. 0.5, int_to_float(sy) *. scale *. 0.5, int_to_float(sz) *. scale *. 0.5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+            else
+              let cx = kx /. k
+              let cy = ky /. k
+              let cz = kz /. k
+              -- second moments about the centre, plus each cube's own m s² / 6 on the diagonal
+              let own = k *. scale *. scale /. 6.0
+              let x2 = xx -. k *. cx *. cx
+              let y2 = yy -. k *. cy *. cy
+              let z2 = zz -. k *. cz *. cz
+              Mass(k, cx, cy, cz, y2 +. z2 +. own, x2 +. z2 +. own, x2 +. y2 +. own,
+                0.0 -. (xy -. k *. cx *. cy), 0.0 -. (xz -. k *. cx *. cz), 0.0 -. (yz -. k *. cy *. cz))
+            end
+        end
+    end
+  end
+
+  -- ── Surface ──────────────────────────────────────────────────────────────
+  pfn solid_at(r : Strata.Blocks.Registry, g : Grid, x : Int, y : Int, z : Int) : Bool do B.collides(r, grid_get(g, x, y, z)) end
+
+  pfn on_surface(r : Strata.Blocks.Registry, g : Grid, i : Int) : Bool do
+    match g do
+      Grid(sx, sy, _, a) ->
+        if !B.collides(r, NativeArray.get_i32(a, i)) do false
+        else
+          let x = i % sx
+          let y = (i / sx) % sy
+          let z = i / (sx * sy)
+          !(solid_at(r, g, x + 1, y, z) && solid_at(r, g, x - 1, y, z) && solid_at(r, g, x, y + 1, z) && solid_at(r, g, x, y - 1, z) && solid_at(r, g, x, y, z + 1) && solid_at(r, g, x, y, z - 1))
+        end
+    end
+  end
+
+  pfn surface_count(r : Strata.Blocks.Registry, g : Grid, i : Int, n : Int, acc : Int) : Int do
+    if i >= n do acc else surface_count(r, g, i + 1, n, if on_surface(r, g, i) do acc + 1 else acc end) end
+  end
+  pfn surface_fill(r : Strata.Blocks.Registry, g : Grid, i : Int, n : Int, out : NativeIntArr, k : Int) : NativeIntArr do
+    if i >= n do out
+    else if on_surface(r, g, i) do surface_fill(r, g, i + 1, n, NativeArray.set_int(out, k, i), k + 1)
+    else surface_fill(r, g, i + 1, n, out, k) end end
+  end
+
+  doc "The indices of colliding voxels with a face open to a voxel that does not collide, or on the face of the box, in index order."
+  fn surface(r : Strata.Blocks.Registry, g : Grid) : NativeIntArr do
+    match g do
+      Grid(sx, sy, sz, _) ->
+        let n = sx * sy * sz
+        let k = surface_count(r, g, 0, n, 0)
+        surface_fill(r, g, 0, n, NativeArray.make_int(k, 0), 0)
+    end
+  end
+
+  -- ── Connected parts ──────────────────────────────────────────────────────
+  -- labels (-1 unlabelled), the flood stack and its height
+  type Flood = Flood(NativeIntArr, NativeIntArr, Int, Int, Int, Int, Int, Int, Int)   -- labels, stack, height, bounds x0 y0 z0 x1 y1 z1 (as ints)
+
+  pfn mn(a : Int, b : Int) : Int do if a < b do a else b end end
+  pfn mx(a : Int, b : Int) : Int do if a > b do a else b end end
+
+  pfn try_push(r : Strata.Blocks.Registry, g : Grid, f : Flood, c : Int, x : Int, y : Int, z : Int) : Flood do
+    if !inside(g, x, y, z) do f
+    else
+      match g do
+        Grid(sx, sy, _, a) ->
+          let j = x + sx * (y + sy * z)
+          match f do
+            Flood(lab, st, h, x0, y0, z0, x1, y1, z1) ->
+              if NativeArray.get_int(lab, j) != -1 || !B.collides(r, NativeArray.get_i32(a, j)) do f
+              else Flood(NativeArray.set_int(lab, j, c), NativeArray.set_int(st, h, j), h + 1, mn(x0, x), mn(y0, y), mn(z0, z), mx(x1, x), mx(y1, y), mx(z1, z)) end
+          end
+      end
+    end
+  end
+
+  pfn flood(r : Strata.Blocks.Registry, g : Grid, f : Flood, c : Int) : Flood do
+    match f do
+      Flood(lab, st, h, x0, y0, z0, x1, y1, z1) ->
+        if h <= 0 do f
+        else
+          match g do
+            Grid(sx, sy, _, _) ->
+              let i = NativeArray.get_int(st, h - 1)
+              let x = i % sx
+              let y = (i / sx) % sy
+              let z = i / (sx * sy)
+              let f0 = Flood(lab, st, h - 1, x0, y0, z0, x1, y1, z1)
+              let f1 = try_push(r, g, try_push(r, g, try_push(r, g, f0, c, x + 1, y, z), c, x - 1, y, z), c, x, y + 1, z)
+              flood(r, g, try_push(r, g, try_push(r, g, try_push(r, g, f1, c, x, y - 1, z), c, x, y, z + 1), c, x, y, z - 1), c)
+          end
+        end
+    end
+  end
+
+  pfn copy_part(g : Grid, lab : NativeIntArr, c : Int, out : Grid, x0 : Int, y0 : Int, z0 : Int, i : Int) : Grid do
+    match out do
+      Grid(ox, oy, oz, _) ->
+        if i >= ox * oy * oz do out
+        else
+          let x = x0 + i % ox
+          let y = y0 + (i / ox) % oy
+          let z = z0 + i / (ox * oy)
+          match g do
+            Grid(sx, sy, _, a) ->
+              let j = x + sx * (y + sy * z)
+              let o2 = if NativeArray.get_int(lab, j) == c do grid_set(out, x - x0, y - y0, z - z0, NativeArray.get_i32(a, j)) else out end
+              copy_part(g, lab, c, o2, x0, y0, z0, i + 1)
+          end
+        end
+    end
+  end
+
+  -- scan for unlabelled colliding voxels; each starts a part
+  pfn parts_go(r : Strata.Blocks.Registry, g : Grid, lab : NativeIntArr, st : NativeIntArr, i : Int, n : Int, c : Int, acc : List((Grid, Int, Int, Int))) : List((Grid, Int, Int, Int)) do
+    if i >= n do reverse(acc)
+    else
+      match g do
+        Grid(sx, sy, _, a) ->
+          if NativeArray.get_int(lab, i) != -1 || !B.collides(r, NativeArray.get_i32(a, i)) do parts_go(r, g, lab, st, i + 1, n, c, acc)
+          else
+            let x = i % sx
+            let y = (i / sx) % sy
+            let z = i / (sx * sy)
+            match flood(r, g, Flood(NativeArray.set_int(lab, i, c), NativeArray.set_int(st, 0, i), 1, x, y, z, x, y, z), c) do
+              Flood(lab2, st2, _, x0, y0, z0, x1, y1, z1) ->
+                let part = copy_part(g, lab2, c, grid(x1 - x0 + 1, y1 - y0 + 1, z1 - z0 + 1), x0, y0, z0, 0)
+                parts_go(r, g, lab2, st2, i + 1, n, c + 1, Cons((part, x0, y0, z0), acc))
+            end
+          end
+      end
+    end
+  end
+
+  doc "The grid's face-connected parts of colliding voxels, each in its own bounding box, with the box's low corner in this grid. Parts come in the order of their first voxel's index. Blocks that do not collide are left out."
+  fn split(r : Strata.Blocks.Registry, g : Grid) : List((Grid, Int, Int, Int)) do
+    match g do
+      Grid(sx, sy, sz, _) ->
+        let n = sx * sy * sz
+        parts_go(r, g, NativeArray.make_int(n, -1), NativeArray.make_int(n, 0), 0, n, 0, Nil)
+    end
+  end
+
+  -- ── From the world ───────────────────────────────────────────────────────
+  pfn bounds(cells : List((Int, Int, Int)), x0 : Int, y0 : Int, z0 : Int, x1 : Int, y1 : Int, z1 : Int) : (Int, Int, Int, Int, Int, Int) do
+    match cells do
+      Nil -> (x0, y0, z0, x1, y1, z1)
+      Cons((x, y, z), t) -> bounds(t, mn(x0, x), mn(y0, y), mn(z0, z), mx(x1, x), mx(y1, y), mx(z1, z))
+    end
+  end
+  pfn put_cells(w : Strata.World.World, g : Grid, cells : List((Int, Int, Int)), x0 : Int, y0 : Int, z0 : Int) : Grid do
+    match cells do
+      Nil -> g
+      Cons((x, y, z), t) -> put_cells(w, grid_set(g, x - x0, y - y0, z - z0, Strata.World.get_block(w, x, y, z)), t, x0, y0, z0)
+    end
+  end
+
+  doc "The world's blocks at [cells], in a grid that is their bounding box, and the box's low corner in world voxels. Cells beyond 128 voxels of the first along an axis are left out."
+  fn from_world(w : Strata.World.World, cells : List((Int, Int, Int))) : (Grid, Int, Int, Int) do
+    match cells do
+      Nil -> (grid(1, 1, 1), 0, 0, 0)
+      Cons((x, y, z), _) ->
+        match bounds(cells, x, y, z, x, y, z) do
+          (x0, y0, z0, x1, y1, z1) -> (put_cells(w, grid(x1 - x0 + 1, y1 - y0 + 1, z1 - z0 + 1), cells, x0, y0, z0), x0, y0, z0)
+        end
+    end
+  end
+end
