@@ -80,6 +80,8 @@ crate-drop-air:STRATA_SCENE=25 STRATA_CRATE=10 STRATA_FRAMES=43
 crate-drop-rest:STRATA_SCENE=25 STRATA_CRATE=10 STRATA_FRAMES=123
 tilted-slab:STRATA_SCENE=26 STRATA_LIGHT=1 STRATA_SUN=12 STRATA_FRAMES=123
 fine-overview:STRATA_SCENE=27 STRATA_SCALE=0.1 STRATA_FRAMES=63
+tilted-slab-lit:STRATA_SCENE=26 STRATA_LIGHT=4 STRATA_SUN=12 STRATA_FRAMES=123
+body-by-lake:STRATA_SCENE=28 STRATA_LIGHT=3 STRATA_SUN=12 STRATA_FRAMES=90
 '
 # indirect draw calls a frame must issue, whatever the scene holds; a scene
 # with a kind of geometry nowhere in it says DRAWS=n

@@ -5,6 +5,8 @@ layout(location = 0) in vec2 v_uv;
 layout(location = 0) out vec4 o_lit;
 layout(location = 1) out vec4 o_hist;
 layout(location = 2) out vec4 o_meta;
+// boxes (voxels, low and high corners) round bodies that moved this frame
+layout(std430, set = 0, binding = 21) readonly buffer Movers { vec4 boxes[]; } movers;
 
 // A colour for a light class, for looking at the volume.
 vec3 class_tint(uint c) {
@@ -63,6 +65,9 @@ void main() {
     // An edit unsettles the pixels it can reach: those within 32 voxels of the chunks it changed.
     // So does a sun that has just moved, everywhere.
     bool settling = u.vol.w <= 2 || u.edit_lo.w > 0.5 && all(greaterThan(at, u.edit_lo.xyz - 32.0)) && all(lessThan(at, u.edit_hi.xyz + 32.0));
+    // so does a body moving near it: its own surface, and its shadow
+    for (int m = 0; m < u.bodies.x && m < 16; m++)
+        if (all(greaterThan(at, movers.boxes[2 * m].xyz)) && all(lessThan(at, movers.boxes[2 * m + 1].xyz))) settling = true;
     if (settling) kept = min(kept, 2.0);
     bool sample_now = kept < 4.0 || settling || (((px.x >> 3) & 1) + 2 * ((px.y >> 3) & 1)) == (frame & 3);
     float sun_vis = old.a;

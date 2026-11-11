@@ -14,6 +14,7 @@ layout(set = 0, binding = 0) uniform U {
     ivec4 vol;       // xyz the light volume's size in chunks; w how many past samples a pixel may lean on
     vec4 edit_lo;    // xyz the low corner (voxels) of what an edit just changed; w 1 while it settles
     vec4 edit_hi;    // xyz its high corner
+    ivec4 bodies;    // x moving bodies' boxes in the movers buffer, y bodies in the body table
 } u;
 
 // OpenGL clip space to Vulkan's: y points down, depth runs 0..1.
