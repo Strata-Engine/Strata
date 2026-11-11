@@ -122,7 +122,7 @@ thread and never waits for the frame, nor the frame for it. Design:
 ```march
 let opened = Strata.Ffi.Audio.open(false)              -- speakers; false when there is no device
 let (s1, strike) = Strata.Sound.upload(Strata.Sound.new(), Strata.Sound.strike())
-let (s2, v) = Strata.Sound.play_flat(s1, strike, 0.9, 0.0, 1.0)
+let (s2, v) = Strata.Sound.play_flat(s1, strike, 0, 0.9, 0.0, 1.0)   -- group 0
 let s3 = Strata.Sound.control(s2, v, 0, 0.8)           -- hardness
 
 -- once a frame, last
@@ -185,6 +185,25 @@ whose strength follows how open the sky is: it drops in a tunnel.
 In the viewer, footsteps sound every half metre walked, from the block
 underfoot (the viewer's own table of hardness and size), and a landing by
 how hard it was.
+
+### Levels
+
+A game's sound menu sets levels; Strata draws no menu and saves nothing.
+
+```march
+let s1 = Strata.Sound.set_master(s, 0.8)          -- main volume, 0..1 as a slider
+let s2 = Strata.Sound.set_group(s1, 1, 0.5)       -- group 1 (the game's music, say)
+let (s3, v) = Strata.Sound.play_flat(s2, theme, 1, 1.0, 0.0, 1.0)   -- plays in group 1
+```
+
+There are four groups, 0 to 3; the game decides what each is for, and every
+`play` and `play_flat` names one. Strata's own sounds go where the game says:
+`Strata.Sound.with_fluid_group(s, g)` for falling water, and the group
+argument of `with_gust`. A level is a slider value from 0 to 1, cubed into a
+gain, so equal steps of a slider sound like roughly equal steps of loudness
+(0.5 is about -18 dB, 0 is silent). Every change glides, so dragging a
+slider never clicks. In the viewer, 9 and 0 lower and raise the main level;
+`STRATA_AUDIO_LEVEL` sets it at start.
 
 ### Listening
 
