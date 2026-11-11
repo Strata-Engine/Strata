@@ -108,6 +108,15 @@ millisecond. `Strata.Fluid.step` does one at once instead, for tools and
 tests. `Strata.Render.spray` draws particles that fly on the clock; the
 viewer feeds it from the fluid's events.
 
+A family is one of three kinds. `flowing` water moves and is finite. A
+`sink` swallows what reaches it and never changes. A `sea` is a body that is
+never used up: it swallows water that runs out over it, and it floods any
+hole dug in it or beside it, up to its own level and no higher. Over a drop
+it pours flowing water, so a cave under the seabed floods from above. An
+edit that touches a sea must be passed to `Strata.Fluid.wake`, as for any
+water. A cave flooded through its roof keeps some air under the roof.
+
+![A hole dug in the sea closes](docs/fluid-sea-closes.png)
 ![A breached lake draining](docs/fluid-lake.png)
 ![The same breach from below](docs/fluid-waterfall.png)
 

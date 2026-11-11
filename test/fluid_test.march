@@ -271,6 +271,129 @@ mod FluidTest do
   -- only chunk column (0, *, 0): stone below, air above
   pfn lone() : Strata.World.World do load(load(Wf.new(reg(), flat(), 7, 1.0), 0, -1, 0), 0, 0, 0) end
 
+  -- a sea: block 10 as a body that is never used up
+  pfn seafluid() : Strata.Fluid.Fluid do F.new(reg(), Cons((2, F.flowing()), Cons((10, F.sea()), Nil))) end
+  -- a sea three deep set into the ground, its surface level with the ground
+  pfn sea_world() : Strata.World.World do box(fresh(), -3, -3, 5, 3, -1, 9, 10) end
+  -- dig a box out and wake what the dig touches, as a game does
+  pfn dug(f : Strata.Fluid.Fluid, w : Strata.World.World, x0 : Int, y0 : Int, z0 : Int, x1 : Int, y1 : Int, z1 : Int) : Run do
+    let o = Ef.fill_box(w, x0, y0, z0, x1, y1, z1, 0)
+    Run(F.wake(f, Ef.world(o), o), Ef.world(o))
+  end
+
+  -- how many cells of a box hold block [id]
+  pfn count_id(w : Strata.World.World, x0 : Int, y0 : Int, z0 : Int, x1 : Int, y1 : Int, z1 : Int, id : Int, x : Int, y : Int, z : Int, acc : Int) : Int do
+    if y > y1 do acc
+    else if z > z1 do count_id(w, x0, y0, z0, x1, y1, z1, id, x0, y + 1, z0, acc)
+    else if x > x1 do count_id(w, x0, y0, z0, x1, y1, z1, id, x0, y, z + 1, acc)
+    else count_id(w, x0, y0, z0, x1, y1, z1, id, x + 1, y, z, if Wf.get_block(w, x, y, z) == id do acc + 1 else acc end) end end end
+  end
+  pfn seas(w : Strata.World.World, x0 : Int, y0 : Int, z0 : Int, x1 : Int, y1 : Int, z1 : Int) : Int do count_id(w, x0, y0, z0, x1, y1, z1, 10, x0, y0, z0, 0) end
+
+  describe "Fluid from a sea" do
+    test "a pit dug beside a sea becomes sea, to the sea's level and no higher" do
+      match dug(seafluid(), sea_world(), 4, -3, 6, 6, -1, 8) do
+        Run(f, w) ->
+          Test.assert_true(F.active_count(f) > 0, "the dig wakes the sea beside it")
+          match until_rest(f, w, 400, 0) do
+            (rr, taken) ->
+              Test.assert_true(taken >= 0, "it comes to rest")
+              Test.assert_eq_int(seas(world_of(rr), 4, -3, 6, 6, -1, 8), 27, "the pit is sea")
+              Test.assert_eq_int(seas(world_of(rr), -8, 0, 0, 12, 4, 14), 0, "nothing above the sea's level")
+              Test.assert_eq_int(total(world_of(rr)), 0, "and no loose water is left about")
+              Test.assert_eq_int(seas(world_of(rr), -3, -3, 5, 3, -1, 9), 105, "the sea is as it was")
+          end
+      end
+    end
+    test "a hole dug in the sea itself closes" do
+      match dug(seafluid(), sea_world(), -1, -2, 6, 1, -1, 8) do
+        Run(f, w) ->
+          Test.assert_eq_int(seas(w, -3, -3, 5, 3, -1, 9), 105 - 18, "the dig took eighteen cells of sea")
+          match until_rest(f, w, 100, 0) do
+            (rr, taken) ->
+              Test.assert_true(taken >= 0 && taken <= 12, "it comes to rest in a few steps")
+              Test.assert_eq_int(seas(world_of(rr), -3, -3, 5, 3, -1, 9), 105, "the sea is whole again")
+              Test.assert_eq_int(seas(world_of(rr), -8, 0, 0, 12, 4, 14), 0, "and no higher than it was")
+              Test.assert_eq_int(total(world_of(rr)), 0, "with no loose water")
+          end
+      end
+    end
+    test "a shaft dug under a sea floods from above" do
+      match dug(seafluid(), sea_world(), 0, -6, 7, 0, -4, 7) do
+        Run(f, w) ->
+          match until_rest(f, w, 200, 0) do
+            (rr, taken) ->
+              Test.assert_true(taken >= 0, "it comes to rest")
+              Test.assert_true(near(F.depth_in(seafluid(), world_of(rr), 0.0, -6.0, 7.0, 1.0, -3.0, 8.0), 1.0), "the shaft is full of liquid")
+          end
+      end
+    end
+    test "a cave under the sea fills" do
+      -- a chamber five by five, two high, three below the sea's bed, and a one-cell shaft up into the sea
+      match dug(seafluid(), box(sea_world(), -2, -8, 5, 2, -7, 9, 0), 0, -6, 7, 0, -4, 7) do
+        Run(f, w) ->
+          match until_rest(f, w, 1500, 0) do
+            (rr, taken) ->
+              Test.assert_true(taken >= 0, "it comes to rest")
+              Test.assert_true(F.depth_in(seafluid(), world_of(rr), -2.0, -8.0, 5.0, 3.0, -7.0, 10.0) > 0.999, "the chamber's lower layer is full")
+              Test.assert_true(F.depth_in(seafluid(), world_of(rr), -2.0, -7.0, 5.0, 3.0, -6.0, 10.0) > 0.7, "and its upper layer mostly: water let in through the roof is not pressed up against it, so some air stays under the roof")
+          end
+      end
+    end
+    test "a ball dug out through the sea's bed fills, leaving no air below the sea's level" do
+      -- a wide sea five deep; the ball, six in radius, takes water, bed and the rock under it
+      let w0 = box(fresh(), -14, -5, -14, 14, -1, 14, 10)
+      let o = Ef.fill_sphere(w0, 0, -5, 0, 6, 0)
+      match until_rest(F.wake(seafluid(), Ef.world(o), o), Ef.world(o), 600, 0) do
+        (rr, taken) ->
+          Test.assert_true(taken >= 0, "it comes to rest")
+          Test.assert_eq_int(count_id(world_of(rr), -8, -12, -8, 8, -1, 8, 0, -8, -12, -8, 0), 0, "no air is left below the sea's level")
+          Test.assert_eq_int(F.amount(world_of(rr), reg(), -8, -12, -8, 8, -1, 8), 0, "and all of it is sea: no second kind of water stands in the hole")
+          Test.assert_eq_int(seas(world_of(rr), -8, 0, -8, 8, 3, 8), 0, "and the sea is no higher than before")
+      end
+    end
+    test "a sea still takes water that falls onto it" do
+      let w = put(sea_world(), 0, 4, 7, water(8))
+      match until_rest(wake_all(seafluid()), w, 100, 0) do
+        (rr, taken) ->
+          Test.assert_true(taken >= 0, "it comes to rest")
+          Test.assert_eq_int(total(world_of(rr)), 0, "the water is gone into the sea")
+          Test.assert_eq_int(seas(world_of(rr), -8, 0, 0, 12, 6, 14), 0, "and the sea did not rise")
+      end
+    end
+    test "water that runs off the land over a sea is swallowed, and the sea does not come up onto the land" do
+      -- a block of water three high standing on the ground at the sea's edge
+      let w = box(sea_world(), 4, 0, 6, 6, 2, 8, water(8))
+      match until_rest(wake_all(seafluid()), w, 600, 0) do
+        (rr, taken) ->
+          Test.assert_true(taken >= 0, "it comes to rest")
+          Test.assert_eq_int(seas(world_of(rr), -24, 0, -24, 24, 8, 24), 0, "no sea above the sea's level")
+          Test.assert_eq_int(F.amount(world_of(rr), reg(), -3, 0, 5, 3, 4, 9), 0, "nothing is left lying on the sea")
+          Test.assert_true(total(world_of(rr)) < 27 * 8, "and water was swallowed")
+      end
+    end
+    test "a sea left alone does nothing" do
+      match until_rest(wake_all(seafluid()), sea_world(), 10, 0) do
+        (rr, taken) ->
+          Test.assert_true(taken >= 0 && taken <= 1, "nothing to do")
+          Test.assert_eq_int(total(world_of(rr)), 0, "no water appears on a whole shore")
+          Test.assert_eq_int(seas(world_of(rr), -24, -8, -24, 24, 24, 24), 105, "and the sea has not spread")
+      end
+    end
+    test "a sea does not climb a bank or cross dry ground" do
+      -- a trench one cell deep leading away from the sea's top layer, then a step up
+      match dug(seafluid(), sea_world(), 4, -1, 7, 8, -1, 7) do
+        Run(f, w) ->
+          match until_rest(f, w, 200, 0) do
+            (rr, taken) ->
+              Test.assert_true(taken >= 0, "it comes to rest")
+              Test.assert_eq_int(seas(world_of(rr), 4, -1, 7, 8, -1, 7), 5, "the trench at the sea's level fills")
+              Test.assert_eq_int(seas(world_of(rr), 4, 0, 5, 12, 3, 9), 0, "nothing stands on the ground beside it")
+          end
+      end
+    end
+  end
+
   describe "Fluid waking and bounds" do
     test "an edit under still water wakes it" do
       let w = put(box(fresh(), 0, 3, 0, 2, 3, 2, 1), 1, 4, 1, water(8))

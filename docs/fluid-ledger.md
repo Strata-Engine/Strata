@@ -60,3 +60,21 @@ Final: minor (deferred): spray never expires if the game never sets the time; on
 Final: minor (deferred): the soak checks the lake at the end only, not that the amount never grows or that no step exceeded the cap.
 Final: minor (deferred): the design's floor-opening scene has no golden image.
 Final: not judged by the reviewer: anything in pixels, all timings, GPU behaviour of the spray buffer.
+
+## The sea (after the owner played it: "not all water flows when dug out")
+
+- Cause: the viewer's sea was a sink, which swallows and never changes. A
+  dig removed the sea it hit and left a dry hole with walls of water.
+- Ruling: a third kind, `sea`. Empty cells beside or under it that have
+  something to stand on become sea; over a drop it pours the flowing family;
+  full water standing against it joins it from the top down; water lying on
+  its open surface is still swallowed. It never spreads upward. Cost if
+  wrong: any space below sea level that an edit connects to the sea floods
+  without limit, which is what a sea does.
+- Ruling: the sea closes a hole with its own block, not with flowing water,
+  so the result is one kind of water and comes to rest. A first version
+  that filled holes with flowing water left two kinds side by side and
+  never rested.
+- Not done: a cave flooded through its roof keeps air under the roof (water
+  is not pressed upward). No golden picture of a dig in the sea; nine tests
+  cover it.
