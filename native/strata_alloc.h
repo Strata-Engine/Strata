@@ -92,6 +92,26 @@ static inline void sa_collect(SaAlloc *a, uint64_t frame) {
     a->nheld = keep;
 }
 
+/* Give back a range that was allocated and never used: no frame can be
+ * reading it, so it returns to the free list at once. */
+static inline void sa_cancel(SaAlloc *a, SaRange r) {
+    if (r.count == 0) return;
+    a->live -= r.count;
+    sa_free_now(a, r);
+}
+
+/* Allocate [n] ranges or none. On failure the allocator is exactly as it
+ * was. A zero count yields a range at 0 and takes nothing. */
+static inline int sa_alloc_many(SaAlloc *a, const uint32_t *counts, int n, uint32_t *firsts) {
+    for (int i = 0; i < n; i++) {
+        if (!sa_alloc(a, counts[i], &firsts[i])) {
+            for (int j = 0; j < i; j++) sa_cancel(a, (SaRange){ firsts[j], counts[j] });
+            return 0;
+        }
+    }
+    return 1;
+}
+
 static inline uint32_t sa_live(const SaAlloc *a) { return a->live; }
 static inline uint32_t sa_free_total(const SaAlloc *a) { uint32_t t = 0; for (int i = 0; i < a->nfree; i++) t += a->free_list[i].count; return t; }
 static inline uint32_t sa_held_total(const SaAlloc *a) { uint32_t t = 0; for (int i = 0; i < a->nheld; i++) t += a->held[i].count; return t; }

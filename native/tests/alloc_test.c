@@ -15,7 +15,8 @@ static void test_fill(void) {
     CHECK(sa_alloc(&a, 40, &f) && f == 60, "second follows it");
     CHECK(!sa_alloc(&a, 1, &f), "a full allocator refuses");
     CHECK(sa_live(&a) == 100, "live counts both");
-    CHECK(!sa_alloc(&a, 0, &f) || 1, "a zero-length alloc does not crash");
+    f = 77;
+    CHECK(sa_alloc(&a, 0, &f) && f == 0 && sa_live(&a) == 100, "a zero-length alloc succeeds at 0 and takes nothing, even when full");
 }
 
 static void test_deferred(void) {
@@ -81,7 +82,26 @@ static void test_random(void) {
     CHECK(!broke, "live + free + held is the total at every step");
 }
 
+/* All-or-nothing allocation of several ranges, and giving one back unused. */
+static void test_many(void) {
+    static SaAlloc a; sa_init(&a, 100);
+    uint32_t counts[4] = { 30, 0, 20, 10 }, firsts[4] = { 9, 9, 9, 9 };
+    CHECK(sa_alloc_many(&a, counts, 4, firsts), "four ranges that fit are all allocated");
+    CHECK(firsts[0] == 0 && firsts[1] == 0 && firsts[2] == 30 && firsts[3] == 50, "in order, a zero-length one at 0");
+    CHECK(sa_live(&a) == 60, "sixty live");
+    uint32_t big[3] = { 20, 15, 10 }, bf[3] = { 7, 7, 7 };
+    CHECK(!sa_alloc_many(&a, big, 3, bf), "three ranges that do not all fit are refused");
+    CHECK(sa_live(&a) == 60 && sa_free_total(&a) == 40 && sa_held_total(&a) == 0, "and the allocator is exactly as it was: nothing live, nothing held");
+    uint32_t f = 0;
+    CHECK(sa_alloc(&a, 40, &f) && f == 60, "the room the refused request touched is whole again");
+    /* a range allocated and never used can go straight back */
+    sa_cancel(&a, (SaRange){ 60, 40 });
+    CHECK(sa_live(&a) == 60 && sa_free_total(&a) == 40, "cancel returns a range at once, with no hold");
+    CHECK(sa_alloc(&a, 40, &f) && f == 60, "and it is reusable in the same frame");
+}
+
 int main(void) {
+    test_many();
     test_fill(); test_deferred(); test_merge(); test_zero(); test_random();
     if (failures) { printf("%d failure(s)\n", failures); return 1; }
     printf("alloc_test: ok\n");

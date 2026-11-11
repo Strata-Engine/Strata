@@ -3,9 +3,9 @@
 -- A game's frame is: tick the stream, `sync` the renderer with it, set the
 -- camera, draw. `sync` takes the stream's finished meshes and unloaded
 -- chunks, lets Strata.Slots decide which slot each belongs in, and performs
--- the uploads and frees. An upload the renderer refuses (its quad buffer is
--- full) is kept and tried again on the next sync; until it lands, the
--- chunk's previous mesh stays on screen.
+-- the uploads and frees. A chunk is uploaded whole or not at all: one the
+-- renderer has no room for is kept and tried again on the next sync, and
+-- until it lands the chunk's previous mesh stays on screen, all of it.
 mod Strata.Render do
 
   alias Strata.Slots as Sr2
@@ -43,10 +43,17 @@ mod Strata.Render do
   doc "Give the renderer every model's drawing geometry. Call before the first chunks are uploaded."
   fn upload_models(r : Strata.Blocks.Registry) : Bool do models_go(r, 0, true) end
 
-  -- Upload one layer; every layer is sent, empty ones too, so a layer that
-  -- lost its last quad is cleared.
-  pfn layer_ok(slot : Int, k : Strata.Coord.Key, m : Strata.Mesh.Meshed, l : Int) : Bool do
-    Strata.Ffi.Vk.chunk_upload(slot, l, Strata.Mesh.quads_at(m, l), Strata.Mesh.quad_count_at(m, l), 32 * Strata.Coord.kx(k), 32 * Strata.Coord.ky(k), 32 * Strata.Coord.kz(k))
+  -- Upload a chunk whole. Every part is given, empty ones too, so a part
+  -- that lost its last quad is cleared; the renderer takes all of it or none.
+  pfn upload(slot : Int, k : Strata.Coord.Key, m : Strata.Mesh.Meshed) : Bool do
+    let b = Strata.Ffi.Vk.chunk_begin(slot, 32 * Strata.Coord.kx(k), 32 * Strata.Coord.ky(k), 32 * Strata.Coord.kz(k))
+    let p0 = Strata.Ffi.Vk.chunk_part(0, Strata.Mesh.quads_at(m, 0), Strata.Mesh.quad_count_at(m, 0))
+    let p1 = Strata.Ffi.Vk.chunk_part(1, Strata.Mesh.quads_at(m, 1), Strata.Mesh.quad_count_at(m, 1))
+    let p2 = Strata.Ffi.Vk.chunk_part(2, Strata.Mesh.quads_at(m, 2), Strata.Mesh.quad_count_at(m, 2))
+    let p3 = Strata.Ffi.Vk.chunk_part(3, Strata.Mesh.instances(m), Strata.Mesh.instance_count(m))
+    -- commit is called whatever came before, so a failed part cannot leave a half-built chunk staged
+    let done = Strata.Ffi.Vk.chunk_commit()
+    b && p0 && p1 && p2 && p3 && done
   end
 
   pfn perform(sl : Strata.Slots.Slots, acts : List(Strata.Slots.Action), none : Strata.Mesh.Meshed) : Strata.Slots.Slots do
@@ -56,15 +63,7 @@ mod Strata.Render do
         if !Sr2.is_upload(a) do
           Strata.Ffi.Vk.chunk_free(Sr2.slot(a))
           perform(sl, t, none)
-        else
-          let m = Sr2.mesh_or(a, none)
-          let k = Sr2.key(a)
-          let ok0 = layer_ok(Sr2.slot(a), k, m, 0)
-          let ok1 = layer_ok(Sr2.slot(a), k, m, 1)
-          let ok2 = layer_ok(Sr2.slot(a), k, m, 2)
-          let ok3 = Strata.Ffi.Vk.chunk_instances(Sr2.slot(a), Strata.Mesh.instances(m), Strata.Mesh.instance_count(m))
-          perform(if ok0 && ok1 && ok2 && ok3 do sl else Sr2.refused(sl, a) end, t, none)
-        end
+        else perform(if upload(Sr2.slot(a), Sr2.key(a), Sr2.mesh_or(a, none)) do sl else Sr2.refused(sl, a) end, t, none) end
     end
   end
 

@@ -236,3 +236,12 @@ later.
 | CPU in the shim under 0.5 ms | met at 3087 chunks: 0.17 ms. The 8400-chunk scene is the far-field plan's |
 | 240 fps standing still at the 5 km view | not yet measurable: no 5 km view. About 2 000 fps offscreen at radius 10 |
 | GPU memory for quads under 64 MB at the 5 km view | not yet measurable. 4 MB at radius 10 |
+
+### After the review
+
+The review's fixes (a copy of the uniform block and chunk table per frame
+in flight, whole-chunk uploads, the model lighting fix) left the numbers
+where they were: scene 1 offscreen about 1 970 fps with 0.17 ms in the
+shim, and the soak at
+
+    soak: frames=3000 worst_ms=14.47 mean_ms=8.33 refused=0 waiting=0 slots=2200 live_quads=496835 leaked=0 loaded=3381

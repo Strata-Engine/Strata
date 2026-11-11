@@ -63,7 +63,14 @@ typedef struct {
 /* What one frame in flight owns. */
 typedef struct {
     VkCommandBuffer cmd;
-    VkDescriptorSet dset;      /* differs between frames only in the stats buffer */
+    VkDescriptorSet dset;
+    /* Each frame in flight has its own copy of everything the CPU changes
+     * between frames, so a frame the GPU is still drawing never sees it move:
+     * the uniform block, and the chunk table with the slots waiting to be
+     * copied into it. */
+    VkBuffer ubo; VkDeviceMemory ubo_mem; float *ubo_map;
+    VkBuffer table; VkDeviceMemory table_mem; ChunkEntry *table_map;
+    uint32_t *pending; uint32_t npending; unsigned char *is_pending;   /* slots changed since this Frame's table was last brought up to date */
     VkBuffer stats; VkDeviceMemory stats_mem; uint32_t *stats_map;   /* written by the cull pass: commands per range [6], chunks, quads */
     int stats_valid;           /* the cull pass has run for this Frame at least once */
     VkFence fence;             /* signalled when the frame's commands have run */
@@ -101,7 +108,7 @@ static struct {
     float *models[SV_MAX_MODELS]; uint32_t model_quads[SV_MAX_MODELS];   /* 21 floats a quad, as Strata.Model lays them out */
     VkDescriptorSetLayout dsl;
     VkDescriptorPool dpool;
-    VkBuffer table; VkDeviceMemory table_mem; ChunkEntry *entries;      /* the chunk table, SV_MAX_SLOTS entries */
+    ChunkEntry *entries;           /* the chunk table as the CPU keeps it, SV_MAX_SLOTS entries; each Frame has the GPU's copy */
     VkBuffer cmds;  VkDeviceMemory cmds_mem;  uint32_t *cmds_map;        /* indirect commands, SV_REGIONS * SV_CMD_STRIDE, 4 words each */
     VkBuffer dslot; VkDeviceMemory dslot_mem; uint32_t *dslot_map;       /* the slot each command draws, same shape */
     /* slots that hold translucent quads: the list the CPU orders each frame */
@@ -119,10 +126,13 @@ static struct {
     Frame frames[SV_FRAMES];
     uint64_t frame_no;         /* frames begun; frame_no % SV_FRAMES picks the Frame */
     VkBuffer giga; VkDeviceMemory giga_mem; uint32_t *giga_map; uint32_t quad_cap;
-    VkBuffer ubo;  VkDeviceMemory ubo_mem;  float *ubo_map;
+    float *ubo_map;                /* the uniform block as the CPU keeps it; each Frame has the GPU's copy */
+    uint32_t rebuilds;             /* swapchain rebuilds so far */
     int ok, swap_ok, resized;
     int vsync_off;                 /* ask for the immediate present mode */
     double stat[6];                /* last frame: CPU ms, ms waiting, draw calls, GPU ms, translucent chunks drawn, microseconds ordering them */
+    /* a chunk being assembled by sv_chunk_begin .. sv_chunk_commit */
+    struct { int64_t slot; int32_t origin[3]; uint32_t *part[4]; uint32_t n[4], cap[4]; int open; } stage;
     VkQueryPool qpool; int have_ts; float ts_period;
     int64_t refused;               /* uploads turned away because the buffer was full */
     /* stats of the last frame */
@@ -532,9 +542,10 @@ int64_t sv_open(int64_t w, int64_t h, int64_t capture_mouse, int64_t quad_capaci
     VkPhysicalDeviceVulkan11Features have11 = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES };
     VkPhysicalDeviceFeatures2 have2 = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &have11 };
     vkGetPhysicalDeviceFeatures2(g.phys, &have2);
-    if (!have.multiDrawIndirect || !have11.shaderDrawParameters) { die("device lacks multiDrawIndirect or shaderDrawParameters", 0); return 0; }
+    /* every indirect command carries a first instance: where its chunk's quads start */
+    if (!have.multiDrawIndirect || !have.drawIndirectFirstInstance || !have11.shaderDrawParameters) { die("device lacks multiDrawIndirect, drawIndirectFirstInstance or shaderDrawParameters", 0); return 0; }
     g.aniso = have.samplerAnisotropy ? 1 : 0;
-    VkPhysicalDeviceFeatures feats = { .multiDrawIndirect = VK_TRUE, .samplerAnisotropy = have.samplerAnisotropy };
+    VkPhysicalDeviceFeatures feats = { .multiDrawIndirect = VK_TRUE, .drawIndirectFirstInstance = VK_TRUE, .samplerAnisotropy = have.samplerAnisotropy };
     VkPhysicalDeviceVulkan11Features feats11 = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES, .shaderDrawParameters = VK_TRUE };
     VkDeviceCreateInfo dci = { .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, .pNext = &feats11, .queueCreateInfoCount = 1, .pQueueCreateInfos = &qci,
         .enabledExtensionCount = nd, .ppEnabledExtensionNames = dext, .pEnabledFeatures = &feats };
@@ -576,16 +587,14 @@ int64_t sv_open(int64_t w, int64_t h, int64_t capture_mouse, int64_t quad_capaci
     g.quad_cap = (quad_capacity > 0 && quad_capacity < 0x20000000) ? (uint32_t)quad_capacity : SV_DEFAULT_QUADS;
     if (!make_buffer((VkDeviceSize)g.quad_cap * 8, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, &g.giga, &g.giga_mem, &map)) return 0;
     g.giga_map = map;
-    if (!make_buffer(UBO_FLOATS * 4, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, &g.ubo, &g.ubo_mem, &map)) return 0;
-    g.ubo_map = map;
-    memset(g.ubo_map, 0, UBO_FLOATS * 4);
+    g.ubo_map = calloc(UBO_FLOATS, sizeof(float));
+    if (!g.ubo_map) return 0;
     sa_init(&g_quads, g.quad_cap);
     if (!make_buffer((VkDeviceSize)SV_LOOSE_QUADS * 64, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, &g.loose, &g.loose_mem, &map)) return 0;
     g.loose_map = map;
     sa_init(&g_loose, SV_LOOSE_QUADS);
-    if (!make_buffer((VkDeviceSize)SV_MAX_SLOTS * sizeof(ChunkEntry), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &g.table, &g.table_mem, &map)) return 0;
-    g.entries = map;
-    memset(g.entries, 0, (size_t)SV_MAX_SLOTS * sizeof(ChunkEntry));
+    g.entries = calloc(SV_MAX_SLOTS, sizeof(ChunkEntry));
+    if (!g.entries) return 0;
     VkDeviceSize cmd_bytes = (VkDeviceSize)SV_REGIONS * SV_CMD_STRIDE * 16;
     if (!make_buffer(cmd_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, &g.cmds, &g.cmds_mem, &map)) return 0;
     memset(map, 0, (size_t)cmd_bytes);            /* the padding commands stay zero-count for good */
@@ -611,7 +620,14 @@ int64_t sv_open(int64_t w, int64_t h, int64_t capture_mouse, int64_t quad_capaci
         F->stats_map = map; memset(F->stats_map, 0, 32);
         VkDescriptorSetAllocateInfo dai = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, .descriptorPool = g.dpool, .descriptorSetCount = 1, .pSetLayouts = &g.dsl };
         VKOK(vkAllocateDescriptorSets(g.dev, &dai, &F->dset), "descriptor set");
-        VkDescriptorBufferInfo bufs[6] = { { g.ubo, 0, UBO_FLOATS * 4 }, { g.table, 0, VK_WHOLE_SIZE }, { g.cmds, 0, VK_WHOLE_SIZE }, { F->stats, 0, 32 }, { g.dslot, 0, VK_WHOLE_SIZE }, { g.blocks, 0, VK_WHOLE_SIZE } };
+        if (!make_buffer(UBO_FLOATS * 4, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, &F->ubo, &F->ubo_mem, &map)) return 0;
+        F->ubo_map = map; memset(F->ubo_map, 0, UBO_FLOATS * 4);
+        if (!make_buffer((VkDeviceSize)SV_MAX_SLOTS * sizeof(ChunkEntry), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &F->table, &F->table_mem, &map)) return 0;
+        F->table_map = map; memset(F->table_map, 0, (size_t)SV_MAX_SLOTS * sizeof(ChunkEntry));
+        F->pending = calloc(SV_MAX_SLOTS, sizeof *F->pending);
+        F->is_pending = calloc(SV_MAX_SLOTS, 1);
+        if (!F->pending || !F->is_pending) return 0;
+        VkDescriptorBufferInfo bufs[6] = { { F->ubo, 0, UBO_FLOATS * 4 }, { F->table, 0, VK_WHOLE_SIZE }, { g.cmds, 0, VK_WHOLE_SIZE }, { F->stats, 0, 32 }, { g.dslot, 0, VK_WHOLE_SIZE }, { g.blocks, 0, VK_WHOLE_SIZE } };
         VkWriteDescriptorSet wds[6];
         for (uint32_t b = 0; b < 6; b++)
             wds[b] = (VkWriteDescriptorSet){ .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = F->dset, .dstBinding = b, .descriptorCount = 1,
@@ -666,8 +682,6 @@ void sv_close(void) {
         if (g.loose) vkDestroyBuffer(g.dev, g.loose, NULL);
         if (g.loose_mem) vkFreeMemory(g.dev, g.loose_mem, NULL);
         for (int m = 0; m < SV_MAX_MODELS; m++) free(g.models[m]);
-        if (g.table) vkDestroyBuffer(g.dev, g.table, NULL);
-        if (g.table_mem) vkFreeMemory(g.dev, g.table_mem, NULL);
         if (g.cmds) vkDestroyBuffer(g.dev, g.cmds, NULL);
         if (g.cmds_mem) vkFreeMemory(g.dev, g.cmds_mem, NULL);
         if (g.dslot) vkDestroyBuffer(g.dev, g.dslot, NULL);
@@ -686,8 +700,13 @@ void sv_close(void) {
         if (g.pass) vkDestroyRenderPass(g.dev, g.pass, NULL);
         if (g.giga) vkDestroyBuffer(g.dev, g.giga, NULL);
         if (g.giga_mem) vkFreeMemory(g.dev, g.giga_mem, NULL);
-        if (g.ubo) vkDestroyBuffer(g.dev, g.ubo, NULL);
-        if (g.ubo_mem) vkFreeMemory(g.dev, g.ubo_mem, NULL);
+        for (int f = 0; f < SV_FRAMES; f++) {
+            if (g.frames[f].ubo) vkDestroyBuffer(g.dev, g.frames[f].ubo, NULL);
+            if (g.frames[f].ubo_mem) vkFreeMemory(g.dev, g.frames[f].ubo_mem, NULL);
+            if (g.frames[f].table) vkDestroyBuffer(g.dev, g.frames[f].table, NULL);
+            if (g.frames[f].table_mem) vkFreeMemory(g.dev, g.frames[f].table_mem, NULL);
+            free(g.frames[f].pending); free(g.frames[f].is_pending);
+        }
         for (int f = 0; f < SV_FRAMES; f++) {
             if (g.frames[f].sem_image) vkDestroySemaphore(g.dev, g.frames[f].sem_image, NULL);
             if (g.frames[f].sem_done) vkDestroySemaphore(g.dev, g.frames[f].sem_done, NULL);
@@ -703,6 +722,8 @@ void sv_close(void) {
     if (g.win) glfwDestroyWindow(g.win);
     glfwTerminate();
     free(g.trans); free(g.trans_at); free(g.trans_keys);
+    free(g.ubo_map); free(g.entries);
+    for (int i = 0; i < 4; i++) free(g.stage.part[i]);
     memset(&g, 0, sizeof g);
 }
 
@@ -723,8 +744,13 @@ void sv_set_vsync(int64_t on) { int off = on ? 0 : 1; if (g.ok && off != g.vsync
  * (for the previous frame's fence, the next image, and present), 2 draw
  * calls issued, 3 GPU ms or -1 if the driver
  * gives no timestamps, 4 translucent chunks drawn, 5 microseconds spent
- * ordering them. */
-double sv_stat(int64_t which) { return (which >= 0 && which < 6) ? g.stat[which] : -1.0; }
+ * ordering them. And since the start: 6 swapchain rebuilds, 7 buffer
+ * elements lost because an allocator's list was full. */
+double sv_stat(int64_t which) {
+    if (which == 6) return (double)g.rebuilds;
+    if (which == 7) return (double)g_quads.leaked + (double)g_loose.leaked;
+    return (which >= 0 && which < 6) ? g.stat[which] : -1.0;
+}
 int64_t sv_drawn_chunks(void) { return g.drawn_chunks; }
 int64_t sv_drawn_quads(void) { return g.drawn_quads; }
 int64_t sv_live_quads(void) { return (int64_t)sa_live(&g_quads); }
@@ -805,52 +831,48 @@ static uint32_t order_translucent(uint32_t region) {
 }
 
 /* ── Chunk uploads ────────────────────────────────────────────────────────── */
-/* Replace one layer of a slot with [nquads] quads from a NativeI32Arr (two
- * words per quad). The new range is allocated before the old one is freed, so
- * a chunk is never updated in place. Returns 1, or 0 if the slot is out of
- * range, the array is short, or the gigabuffer is full (the old mesh stays). */
-int64_t sv_chunk_upload(int64_t slot, int64_t layer, void *quads, int64_t nquads, double ox, double oy, double oz) {
-    if (!g.ok || slot < 0 || slot >= SV_MAX_SLOTS || layer < 0 || layer >= SV_LAYERS || nquads < 0) return 0;
-    if (nquads > 0 && (!quads || narr_len(quads) < nquads * 2)) return 0;
-    ChunkEntry *e = &g.entries[slot];
-    Range fresh = { 0, (uint32_t)nquads };
-    if (nquads > 0) {
-        if (!sa_alloc(&g_quads, (uint32_t)nquads, &fresh.first)) { g.refused++; return 0; }
-        /* the range has been idle for two frames or was never used: no frame in flight reads it */
-        memcpy(g.giga_map + (size_t)fresh.first * 2, narr_data(quads), (size_t)nquads * 8);
+/* A slot's entry changed: every frame in flight must copy it before it draws. */
+static void touch(uint32_t slot) {
+    for (int f = 0; f < SV_FRAMES; f++) {
+        Frame *F = &g.frames[f];
+        if (!F->is_pending[slot]) { F->is_pending[slot] = 1; F->pending[F->npending++] = slot; }
     }
-    /* a frame in flight may still read the old range: hold it two frames instead of waiting */
-    sa_release(&g_quads, (Range){ e->first[layer], e->count[layer] }, g.frame_no);
-    e->origin[0] = (int32_t)ox; e->origin[1] = (int32_t)oy; e->origin[2] = (int32_t)oz;
-    e->first[layer] = fresh.first;
-    e->count[layer] = fresh.count;
-    e->level_flags = SV_IN_USE;
-    if (layer == 2) trans_track((uint32_t)slot, fresh.count > 0);
-    if ((uint32_t)slot + 1 > g.hi_slot) g.hi_slot = (uint32_t)slot + 1;
+}
+
+/* A chunk is uploaded whole or not at all:
+ *
+ *     sv_chunk_begin(slot, ox, oy, oz)
+ *     sv_chunk_part(0, opaque quads, n)        each part is optional;
+ *     sv_chunk_part(1, cutout quads, n)        a part not given is empty
+ *     sv_chunk_part(2, translucent quads, n)
+ *     sv_chunk_part(3, instances, n)
+ *     sv_chunk_commit()
+ *
+ * Quads and instances are Strata.Quad's two-word records. Each part is copied
+ * as it is given, so the caller's arrays need not outlive the call. Commit
+ * finds room for everything first; if any of it does not fit, nothing
+ * changes and the slot keeps drawing what it had. It never waits for the
+ * GPU: ranges the chunk held before are reused two frames later. */
+int64_t sv_chunk_begin(int64_t slot, double ox, double oy, double oz) {
+    g.stage.open = 0;
+    if (!g.ok || slot < 0 || slot >= SV_MAX_SLOTS) return 0;
+    g.stage.slot = slot;
+    g.stage.origin[0] = (int32_t)ox; g.stage.origin[1] = (int32_t)oy; g.stage.origin[2] = (int32_t)oz;
+    for (int i = 0; i < 4; i++) g.stage.n[i] = 0;
+    g.stage.open = 1;
     return 1;
 }
 
-void sv_chunk_free(int64_t slot) {
-    if (!g.ok || slot < 0 || slot >= SV_MAX_SLOTS) return;
-    ChunkEntry *e = &g.entries[slot];
-    if (!(e->level_flags & SV_IN_USE)) return;
-    e->level_flags = 0;                      /* the cull pass skips it from the next frame on */
-    trans_track((uint32_t)slot, 0);
-    for (int l = 0; l < 4; l++) { sa_release(&g_quads, (Range){ e->first[l], e->count[l] }, g.frame_no); e->first[l] = 0; e->count[l] = 0; }
-    sa_release(&g_loose, (Range){ e->first[4], e->count[4] }, g.frame_no); e->first[4] = 0; e->count[4] = 0;
-}
-
-/* Give model [index] its drawing geometry: [nquads] quads of 21 floats
- * (Strata.Model). Chunks uploaded afterwards draw it; ones already uploaded
- * keep what they had until their instances are sent again. */
-int64_t sv_model_set(int64_t index, void *floats, int64_t nquads) {
-    if (index < 0 || index >= SV_MAX_MODELS || nquads < 0 || nquads > 4096) return 0;
-    if (nquads > 0 && (!floats || narr_len(floats) < nquads * 21)) return 0;
-    float *copy = nquads > 0 ? malloc((size_t)nquads * 21 * sizeof(float)) : NULL;
-    if (nquads > 0 && !copy) return 0;
-    if (nquads > 0) memcpy(copy, narr_data(floats), (size_t)nquads * 21 * sizeof(float));
-    free(g.models[index]);
-    g.models[index] = copy; g.model_quads[index] = (uint32_t)nquads;
+int64_t sv_chunk_part(int64_t part, void *words, int64_t n) {
+    if (!g.stage.open || part < 0 || part > 3 || n < 0 || n > 0x4000000) return 0;
+    if (n > 0 && (!words || narr_len(words) < n * 2)) { g.stage.open = 0; return 0; }
+    if ((uint32_t)n > g.stage.cap[part]) {
+        uint32_t *grown = realloc(g.stage.part[part], (size_t)n * 8);
+        if (!grown) { g.stage.open = 0; return 0; }
+        g.stage.part[part] = grown; g.stage.cap[part] = (uint32_t)n;
+    }
+    if (n > 0) memcpy(g.stage.part[part], narr_data(words), (size_t)n * 8);
+    g.stage.n[part] = (uint32_t)n;
     return 1;
 }
 
@@ -859,34 +881,33 @@ static uint32_t fixed16(float v, float offset) {
     return f <= 0.0f ? 0u : (f >= 65535.0f ? 65535u : (uint32_t)(f + 0.5f));
 }
 
-/* Replace a slot's instances: [n] two-word records (Strata.Quad). Cross
- * instances (model -1) are stored as they are, in the quad buffer, and drawn
- * by the cross pipeline. Model instances are expanded here into loose quads,
- * one per quad of the model, placed at the instance's cell; an instance
- * naming a model that was never set draws nothing. n == 0 clears. Returns 0
- * when refused, like sv_chunk_upload, and then nothing has changed. */
-int64_t sv_chunk_instances(int64_t slot, void *words, int64_t n) {
-    if (!g.ok || slot < 0 || slot >= SV_MAX_SLOTS || n < 0) return 0;
-    if (n > 0 && (!words || narr_len(words) < n * 2)) return 0;
-    ChunkEntry *e = &g.entries[slot];
-    const uint32_t *src = n > 0 ? (const uint32_t *)narr_data(words) : NULL;
+int64_t sv_chunk_commit(void) {
+    if (!g.stage.open) return 0;
+    g.stage.open = 0;
+    int64_t slot = g.stage.slot;
+    const uint32_t *inst = g.stage.part[3];
+    /* instances split two ways: crosses stay 8-byte records in the quad
+     * buffer; model instances become loose quads, one per quad of the model */
     uint32_t ncross = 0, nloose = 0;
-    for (int64_t i = 0; i < n; i++) {
-        uint32_t m1 = src[i * 2] >> 15;                       /* model + 1 */
+    for (uint32_t i = 0; i < g.stage.n[3]; i++) {
+        uint32_t m1 = inst[i * 2] >> 15;                       /* model + 1 */
         if (m1 == 0) ncross++;
         else if (m1 - 1 < SV_MAX_MODELS) nloose += g.model_quads[m1 - 1];
     }
-    Range cr = { 0, ncross }, lr = { 0, nloose };
-    if (ncross > 0 && !sa_alloc(&g_quads, ncross, &cr.first)) { g.refused++; return 0; }
-    if (nloose > 0 && !sa_alloc(&g_loose, nloose, &lr.first)) {
-        if (ncross > 0) sa_release(&g_quads, cr, g.frame_no);
+    uint32_t counts[4] = { g.stage.n[0], g.stage.n[1], g.stage.n[2], ncross }, firsts[4] = { 0, 0, 0, 0 }, lfirst = 0;
+    if (!sa_alloc_many(&g_quads, counts, 4, firsts)) { g.refused++; return 0; }
+    if (!sa_alloc(&g_loose, nloose, &lfirst)) {
+        for (int i = 0; i < 4; i++) sa_cancel(&g_quads, (Range){ firsts[i], counts[i] });
         g.refused++; return 0;
     }
-    uint32_t *cdst = g.giga_map + (size_t)cr.first * 2;
-    uint32_t *ldst = g.loose_map + (size_t)lr.first * 16;
-    for (int64_t i = 0; i < n; i++) {
-        uint32_t w0 = src[i * 2], m1 = w0 >> 15;
-        if (m1 == 0) { *cdst++ = w0; *cdst++ = src[i * 2 + 1]; continue; }
+    /* the new ranges have been idle for two frames or were never used: no frame in flight reads them */
+    for (int l = 0; l < 3; l++)
+        if (counts[l]) memcpy(g.giga_map + (size_t)firsts[l] * 2, g.stage.part[l], (size_t)counts[l] * 8);
+    uint32_t *cdst = g.giga_map + (size_t)firsts[3] * 2;
+    uint32_t *ldst = g.loose_map + (size_t)lfirst * 16;
+    for (uint32_t i = 0; i < g.stage.n[3]; i++) {
+        uint32_t w0 = inst[i * 2], m1 = w0 >> 15;
+        if (m1 == 0) { *cdst++ = w0; *cdst++ = inst[i * 2 + 1]; continue; }
         if (m1 - 1 >= SV_MAX_MODELS) continue;
         const float *q = g.models[m1 - 1];
         float cx = (float)(w0 & 31), cy = (float)((w0 >> 5) & 31), cz = (float)((w0 >> 10) & 31);
@@ -901,13 +922,44 @@ int64_t sv_chunk_instances(int64_t slot, void *words, int64_t n) {
             }
         }
     }
-    sa_release(&g_quads, (Range){ e->first[3], e->count[3] }, g.frame_no);
+    /* frames in flight may still read the old ranges: hold them two frames */
+    ChunkEntry *e = &g.entries[slot];
+    for (int r = 0; r < 4; r++) sa_release(&g_quads, (Range){ e->first[r], e->count[r] }, g.frame_no);
     sa_release(&g_loose, (Range){ e->first[4], e->count[4] }, g.frame_no);
-    e->first[3] = cr.first; e->count[3] = cr.count;
-    e->first[4] = lr.first; e->count[4] = lr.count;
+    e->origin[0] = g.stage.origin[0]; e->origin[1] = g.stage.origin[1]; e->origin[2] = g.stage.origin[2];
+    for (int r = 0; r < 4; r++) { e->first[r] = firsts[r]; e->count[r] = counts[r]; }
+    e->first[4] = lfirst; e->count[4] = nloose;
+    e->level_flags = SV_IN_USE;
+    if ((uint32_t)slot + 1 > g.hi_slot) g.hi_slot = (uint32_t)slot + 1;
+    trans_track((uint32_t)slot, counts[2] > 0);
+    touch((uint32_t)slot);
     return 1;
 }
 
+void sv_chunk_free(int64_t slot) {
+    if (!g.ok || slot < 0 || slot >= SV_MAX_SLOTS) return;
+    ChunkEntry *e = &g.entries[slot];
+    if (!(e->level_flags & SV_IN_USE)) return;
+    e->level_flags = 0;                      /* the cull pass skips it once the frames have their copy */
+    trans_track((uint32_t)slot, 0);
+    for (int r = 0; r < 4; r++) { sa_release(&g_quads, (Range){ e->first[r], e->count[r] }, g.frame_no); e->first[r] = 0; e->count[r] = 0; }
+    sa_release(&g_loose, (Range){ e->first[4], e->count[4] }, g.frame_no); e->first[4] = 0; e->count[4] = 0;
+    touch((uint32_t)slot);
+}
+
+/* Give model [index] its drawing geometry: [nquads] quads of 21 floats
+ * (Strata.Model). Chunks uploaded afterwards draw it; ones already uploaded
+ * keep what they had until they are uploaded again. */
+int64_t sv_model_set(int64_t index, void *floats, int64_t nquads) {
+    if (index < 0 || index >= SV_MAX_MODELS || nquads < 0 || nquads > 4096) return 0;
+    if (nquads > 0 && (!floats || narr_len(floats) < nquads * 21)) return 0;
+    float *copy = nquads > 0 ? malloc((size_t)nquads * 21 * sizeof(float)) : NULL;
+    if (nquads > 0 && !copy) return 0;
+    if (nquads > 0) memcpy(copy, narr_data(floats), (size_t)nquads * 21 * sizeof(float));
+    free(g.models[index]);
+    g.models[index] = copy; g.model_quads[index] = (uint32_t)nquads;
+    return 1;
+}
 
 /* Append [n] zero-count commands to every indirect call, to measure what
  * the driver charges for commands that draw nothing. */
@@ -949,7 +1001,7 @@ static int rebuild_swapchain(void) {
     vkDeviceWaitIdle(g.dev);
     destroy_swapchain();
     if (!make_swapchain() || !make_framebuffers()) { destroy_swapchain(); return 0; }
-    g.swap_ok = 1;
+    g.swap_ok = 1; g.rebuilds++;
     return 1;
 }
 
@@ -1016,6 +1068,16 @@ int64_t sv_frame(void) {
     /* cull: one compute invocation per slot writes the indirect commands */
     int32_t *misc = (int32_t *)(g.ubo_map + 32);
     misc[0] = (int32_t)g.hi_slot; misc[1] = SV_CMD_STRIDE; misc[2] = (int32_t)g.layers; misc[3] = (int32_t)g.nblocks;
+    /* this Frame's fence has been waited on, so the GPU is done with its
+     * copies: bring them up to date. From here to the next time this Frame
+     * comes round, nothing the CPU does can change what it draws. */
+    memcpy(F->ubo_map, g.ubo_map, UBO_FLOATS * 4);
+    for (uint32_t i = 0; i < F->npending; i++) {
+        uint32_t slot = F->pending[i];
+        F->table_map[slot] = g.entries[slot];
+        F->is_pending[slot] = 0;
+    }
+    F->npending = 0;
     vkCmdBindDescriptorSets(F->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g.layout, 0, 1, &F->dset, 0, NULL);
     if (g.hi_slot > 0) {
         /* zero the part of each compacted list that will be submitted, so

@@ -1,0 +1,58 @@
+# SDD ledger — plan: docs/2026-11-10-renderer-plan.md
+Pre-flight: T2 changes Vk.open's signature (viewer consumes); T4 Slots/Render consumed by T7 (instances in upload action) and T8; T5 gpu_table consumed by T7's cross shader; sv_stat(2) expected values 3 -> 4 -> 5 across T3, T7, T8. No conflicts found.
+Ruling: ledger kept by hand (scripts assume the plan and code share a repo root layout they do not have here) — cost: none.
+Task 1: Ruling: STRATA_VSYNC=0 selects the immediate present mode and the swapchain reports it, but MoltenVK still paces frames to the display (the block moves into vkQueueSubmit). The plan's 'vsync off' timings are therefore taken in an OFFSCREEN mode (no acquire, no present) added in Task 2; stat(0) is CPU work, stat(1) waiting — cost if wrong: uncapped numbers exclude presentation cost.
+Task 1: Ruling: the 'overview-rebuilt' golden entry is listed now and exercises nothing until Task 2 implements STRATA_REBUILD_AT — cost: none.
+Task 1: complete (golden PASS twice, identical; scripts/verify.sh PASS; baseline in RESULTS.md)
+Task 2: Ruling: added sv_set_offscreen / Vk.set_offscreen / STRATA_OFFSCREEN (render to an image, never present) as the timing mode, and sv_force_rebuild / sv_refused with bindings — beyond the plan's interface list — cost: three small calls.
+Task 2: Ruling: a failed submit heals its fence by recreating it signalled, rather than only 'reset after success' (Vulkan needs the fence unsignalled at submit) — cost: none.
+Task 2: complete (alloc_test ok; golden PASS incl. rebuild at frame 30 and offscreen; STRATA_QUADS=20000 refuses 232 uploads without crashing; offscreen baseline ~3000 fps, 0.08 ms CPU; scripts/verify.sh PASS)
+Task 3: Ruling: steps 1-2 (prove in isolation, then measure) were done on the full implementation rather than behind a switch; compute + multi-draw worked first time and the golden images matched — cost: none.
+Task 3: Ruling: measured 84 ns CPU + 43 ns GPU per empty command (12.5 ms for 50 000 x 3), far over the 0.5 ms rule, so the COMPACTED list was built. Its count is read back two frames late (frames in flight = 2), not one as the design says; allowance is seen + 25% + 256; an overflow or a first frame submits every slot — cost if wrong: up to two frames of missing chunks after a violent turn.
+Task 3: Ruling: the translucent range stays one-command-per-slot for now so its order is deterministic; Task 6 replaces it — cost: 0.26 ms of CPU until then.
+Task 3: Ruling: golden.sh asserts the draw-call count through the viewer's final line (EXPECT_DRAWS), not only 'at every printed interval' — cost: none.
+Task 3: complete (golden PASS incl. new dug-out scene; 3 draw calls; scripts/verify.sh PASS)
+Task 4: Ruling: Slots.mesh(a) became mesh_or(a, other) so the reader is total for a free action; Render also exposes slot_of — cost: none.
+Task 4: Ruling: the full-buffer retry check is not 'fly away and back at 20000 quads' (a buffer smaller than the scene can never empty its waiting list) but a carve with capacity = the scene's need + 2100 quads: uploads are refused while old ranges are held, then land; golden.sh asserts refused > 0 and waiting == 0 — cost: none.
+Task 4: complete (134 tests; golden PASS incl. retry check; scripts/verify.sh PASS)
+Task 5: Ruling: texture layer 0 in the viewer is a magenta/black 'missing' tile, so an out-of-range texture id is visible as such; the shim's default (before a game uploads anything) is one magenta texel — cost: none.
+Task 5: Ruling: side faces flip the texture's v so image rows run down the world; corner shading keeps its own unflipped coordinate — cost: none.
+Task 5: Ruling: tile sizes 1..256 are accepted (the plan said 4..256; 1 is needed for the default texture) — cost: none.
+Task 5: Ruling: the per-voxel brightness grain was removed from the shader; textures carry the detail now — cost: none.
+Task 5: complete (136 tests; goldens re-stored and inspected: tiling per block, grass side lip, leaf holes, bad-ids wall draws 'missing' and the unregistered block draws nothing; scripts/verify.sh PASS)
+Task 6: Ruling: the ordering artefact could not show with one translucent block type (same colour blends the same in any order), so the viewer gained a red glass block and two scenes that look through glass and water from both sides; an underwater scene was added too — cost: none.
+Task 6: Ruling: the translucent pipeline culls no faces, so see-through surfaces show from behind (water from below); a one-voxel pane therefore blends twice — cost: thin panes look denser than their alpha.
+Task 6: Ruling: the translucent commands live in a per-frame-in-flight region of the command buffer (the CPU writes them; a frame the GPU is still drawing must not see them change) — cost: none.
+Task 6: complete (goldens: glass-front, glass-back, underwater stored and inspected; 3 draw calls; 4 us to order 18 chunks; scripts/verify.sh PASS)
+Task 7: Ruling: no scene carries 'a cross instance with an unregistered id' — the mesher never emits one (an unregistered id has no style), so the case cannot be produced through the public path; the shader's guard (id past the block table's length draws nothing) covers a game that forgot upload_blocks — cost: that guard is untested.
+Task 7: Ruling: cross instances live in the quad buffer (same 8-byte records, same allocator) as range 3, drawn as a 12-vertex triangle list per instance — cost: none.
+Task 7: complete (meadow golden stored and inspected; all goldens refreshed for plants; 4 draw calls; scripts/verify.sh PASS)
+Task 8: Ruling: a loose quad is one 64-byte INSTANCE (four corners of four words) drawn as a 4-vertex strip, so it shares the draw structure of packed quads and needs no index buffer; that is 16 bytes a vertex as the design allows — cost: none.
+Task 8: Ruling: loose quads draw with no face culling and take their lighting direction from the quad's own normal snapped to an axis — cost: slanted model faces light as the nearest axis.
+Task 8: Ruling: loose positions are fixed point, 1/256 voxel with a one-voxel margin, so a model may overhang its cell by up to a voxel; texture coordinates 1/256 tile within +-64 tiles — cost: finer or larger models clamp.
+Task 8: complete (141 tests; post golden stored and inspected; 5 draw calls; scripts/verify.sh PASS)
+Task 9: Ruling: the walker's implementation was written in the same step as its tests (the RED run was a capability error, not an assertion); to confirm the tests bite, gravity was set to 0 and four of eight failed, then restored — cost: none.
+Task 9: Ruling: Walker gained body_with and speed_y so the viewer can carry the body's state in its camera record; scripted runs use a fixed 1/60 s step so they are deterministic; scene 0 (the default) is interactive walking, scene 11 the scripted walk — cost: none.
+Task 9: complete (8 viewer tests; walk golden identical across two runs, stored; scripts/verify.sh PASS)
+Task 10: Ruling: the soak takes no screenshot (reading the image back was its slowest frame, 100 ms) and names any frame over 25 ms or with over 4 ms of March time — cost: none.
+Task 10: Ruling: the soak's first worst frame was 25.8 ms (21 ms in March). Fixed in Strata.Stream, under the existing tests: one-pass queue building, a de-duplicated mesh to-do list, generated-chunk hashes computed by the worker (World.insert_hashed), and tasks collected TWO ticks after they start (was one). Worst frame now 14.4-16.3 ms over four runs — cost if wrong: one more frame of latency before a new chunk or an edit appears.
+Task 10: Ruling: `scripts/soak.sh <quads>` with a buffer smaller than the scene only has to finish cleanly; the plan expected waiting == 0, which cannot happen when the scene does not fit. Waiting meshes are retried every frame (2.4 million refusals over the run) — cost: wasted CPU while a buffer is over-full.
+Task 10: Ruling: the design's 5 km targets are reported as not yet measurable; the per-chunk-crossing cost in set_focus (5-7 ms) is recorded as the thing the far-field plan must make incremental — cost: none now.
+Task 10: complete (soak PASS; 141 + 8 tests; golden PASS; scripts/verify.sh PASS; RESULTS.md and README updated)
+Final review: fresh reviewer (most capable model). No Critical. Five Important, eleven Minor.
+Final: fixed frames in flight seeing the uniform block and chunk table change under them (camera mismatch between cull and draw, a reused slot drawn at the wrong origin for a frame, a torn first/count) — each frame in flight now owns a copy of the uniform block and of the chunk table, brought up to date only after its fence is waited on. No unit test can observe a one-frame GPU race; verified by all 13 golden scenes and the soak passing unchanged — NOT RED→GREEN.
+Final: fixed chunk uploads not being all-or-nothing (a chunk could show a new opaque layer with old water and plants; retries re-uploaded landed layers and pinned extra copies) — sv_chunk_begin/part/commit over sa_alloc_many and sa_cancel; alloc_test 'test_many' RED (undeclared functions) →GREEN; retry golden check passes (3 refusals, none waiting)
+Final: fixed Strata.Model.box winding three of six faces backwards for lighting — "every face of a box is wound to face outward" RED→GREEN, suite 142/142; post golden re-stored, cap top now its lightest face
+Final: fixed drawIndirectFirstInstance never enabled though every command uses a first instance — now required and enabled at device creation. Untestable on MoltenVK, which does not enforce it — NOT RED→GREEN.
+Final: fixed checks that could not fail — the dug-out scene now empties its chunk at frame 10, after the renderer has drawn it, and still matches its stored image (so old quads do disappear); a scene asking for a swapchain rebuild fails unless one happened; alloc_test's tautology replaced by a real assertion; soak.sh asserts no allocator leak, a bound on quad-buffer growth, and 20 ms (was 33.3) in place of a slot check that could not fail
+Final: minor (deferred): a skipped frame (out-of-date swapchain, failed submit) loses its cull counts, so the next submits only 256 commands per range for up to two frames
+Final: minor (deferred): sv_textures_create changes the layer count before commit, and a failed commit leaves descriptor sets pointing at a destroyed texture
+Final: minor (deferred): the overflow test compares a two-frame-old count with last frame's allowance; harmless, can cause a spurious full submit
+Final: minor (deferred): nothing is collected by the allocators while the window is minimised
+Final: minor (deferred): a failed generation task can be started twice after a refocus; skip_running rescans the whole queue every tick
+Final: minor (deferred): ppm_diff tolerates 0.5% of pixels changing by any amount, which let the model lighting bug through; a tighter or region-weighted comparison is wanted
+Final: minor (deferred): scripts/soak.sh is not part of verify.sh (it asserts on wall-clock frame times)
+Final: minor (deferred): no C test for the chunk table (the design asked for one); the full-list leak paths of the allocator are untested
+Final: minor (deferred): a waiting mesh is retried every frame while the buffer is over-full
+Final: Ruling: the reviewer's finding 7 (sv_chunk_free leaving instance ranges behind when layers were refused but instances landed) no longer has a path: a chunk is committed whole — cost: none.
+Final: Ruling: declined-to-judge items stand as they are — frame N+1's fill of the shared command regions relies on a queue executing command buffers in order (true for one queue); non-tail recursion in skip_running and Slots.append has not been tried at far-field queue sizes; mip-averaged cutout alpha thins distant leaves — cost: each is a thing to watch in the far-field plan.

@@ -54,6 +54,10 @@ for line in $(echo "$SCENES" | tr ' ' ','); do
   if ! grep -q "draw calls $EXPECT_DRAWS\$" "$OUT/$name.log"; then
     echo "FAIL: $name did not issue $EXPECT_DRAWS draw calls: $(grep 'done after' "$OUT/$name.log")"; FAILED=1; continue
   fi
+  # a scene that asks for a swapchain rebuild must have had one
+  case "$envs" in *STRATA_REBUILD_AT*)
+    if grep -q "rebuilds 0;" "$OUT/$name.log"; then echo "FAIL: $name asked for a swapchain rebuild and none happened"; FAILED=1; continue; fi;;
+  esac
   if [ $UPDATE -eq 1 ]; then
     [ "$stored" = "$name" ] && gzip -9 -c "$shot" > "test/golden/$name.ppm.gz" && echo "updated $name"
     continue
