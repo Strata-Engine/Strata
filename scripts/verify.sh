@@ -9,14 +9,14 @@ run() { # dir, command...
     echo "FAIL: ($d) $*"; tail -40 .verify.log; exit 1
   fi
 }
-for d in . demo viewer; do
+for d in . demo viewer soundcheck; do
   [ -f "$d/forge.toml" ] || continue
   run "$d" forge check
   run "$d" forge build --release
   run "$d" forge lint --strict
   if [ -d "$d/test" ]; then run "$d" forge test; fi
 done
-# C tests, then the golden images; both need a compiler, the second a GPU
+# C tests, the audio goldens, then the golden images; all need a compiler, the last a GPU
 mkdir -p native/tests/bin
 for t in native/tests/*_test.c; do
   [ -f "$t" ] || continue
@@ -25,6 +25,8 @@ for t in native/tests/*_test.c; do
     echo "FAIL: $t"; tail -20 .verify.log; exit 1
   fi
 done
+# the audio goldens: rendered in game time, no device opened, nothing played aloud
+if ! scripts/audio_golden.sh > .verify.log 2>&1; then echo "FAIL: scripts/audio_golden.sh"; tail -20 .verify.log; exit 1; fi
 if [ "${STRATA_NO_GPU:-0}" != "1" ]; then
   if ! scripts/golden.sh > .verify.log 2>&1; then echo "FAIL: scripts/golden.sh"; tail -20 .verify.log; exit 1; fi
 fi

@@ -111,6 +111,37 @@ viewer feeds it from the fluid's events.
 ![A breached lake draining](docs/fluid-lake.png)
 ![The same breach from below](docs/fluid-waterfall.png)
 
+## Sound
+
+`Strata.Sound` is what a game hears, as a value: it plays, moves, retunes
+and stops voices, and once a frame hands the frame's calls to the mixer in
+`native/strata_audio.c` (miniaudio, vendored). The mixer runs on its own
+thread and never waits for the frame, nor the frame for it. Design:
+`docs/2026-11-11-audio-design.md`.
+
+```march
+let opened = Strata.Ffi.Audio.open(false)              -- speakers; false when there is no device
+let (s1, strike) = Strata.Sound.upload(Strata.Sound.new(), Strata.Sound.strike())
+let (s2, v) = Strata.Sound.play_flat(s1, strike, 0.9, 0.0, 1.0)
+let s3 = Strata.Sound.control(s2, v, 0, 0.8)           -- hardness
+
+-- once a frame, last
+let (s4, cmds) = Strata.Sound.update(s3, world, fluid, dt)
+let _took = Strata.Ffi.Audio.send(cmds)
+Strata.Ffi.Audio.advance(dt)                           -- mixes only when rendering in game time
+```
+
+A patch is built from fixed pieces (four sources, two filters, two
+envelopes, two modulators, four live controls): `Strata.Sound.patch()` and
+its `with_*` calls. `Strata.Ffi.Audio.render(path)` renders in game time to
+a WAV with no device; `scripts/audio_golden.sh` renders `soundcheck/`'s
+scenes that way and compares their loudness by band with
+`test/golden-audio/`. The gate opens no device.
+
+In the viewer, `STRATA_AUDIO=0`, `1`, `null` or `wav:path` turn sound off,
+on, onto the silent null device, or into a file; scripted runs default to
+off. Carving and building strike.
+
 ## Using it from a game
 
     [deps]
@@ -120,12 +151,13 @@ A game that draws also lists Strata's C shim itself, because forge does not
 build a dependency's C sources:
 
     [ffi]
-    sources = ["../strata/native/strata_vk.c"]
+    sources = ["../strata/native/strata_vk.c", "../strata/native/strata_audio.c"]
     link = ["-I../strata/native", "-I/opt/homebrew/include", "-L/opt/homebrew/lib",
             "-lglfw", "-lvulkan", "-Wl,-rpath,/opt/homebrew/lib"]
 
 and must run with `MARCH_PIN_MAIN=1`. A game that only uses the core needs
-neither.
+neither; one that only plays sound lists `strata_audio.c` alone, which needs
+no library beyond the system's.
 
 ```march
 -- register blocks

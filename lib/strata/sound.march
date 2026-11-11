@@ -1,0 +1,225 @@
+-- Strata.Sound — what a game hears, as a pure value. A game plays, moves,
+-- retunes and stops voices through it; once a frame `update` hands over that
+-- frame's calls as command records, which `Strata.Ffi.Audio.send` gives to
+-- the mixer in native/strata_audio.c. Nothing here touches a device, so all
+-- of it is tested headless.
+--
+-- Voices are numbered here, by a counter, so `play` answers at once without
+-- asking the mixer. A source is a patch id (`upload`) or a recording id.
+mod Strata.Sound do
+
+  -- one command record: op, voice, a, b, and up to twelve floats
+  type Cmd = Cmd(Int, Int, Int, Int, List(Float))
+  -- a frame's records: four ints and twelve floats each, and the count
+  type Commands = Commands(NativeI32Arr, NativeF32Arr, Int)
+  -- a patch: 72 floats, laid out as native/strata_mix.h's SM_P_* offsets
+  type Patch = Patch(NativeF32Arr)
+  -- next voice, next patch id, the frame's commands (newest first),
+  -- plays refused so far, plays sent this frame
+  type Sound = Sound(Int, Int, List(Cmd), Int, Int)
+
+  doc "The op codes of a command record, as native/strata_mix.h numbers them."
+  fn op_patch() : Int do 1 end
+  fn op_play() : Int do 2 end
+  fn op_move() : Int do 3 end
+  fn op_control() : Int do 4 end
+  fn op_stop() : Int do 5 end
+  fn op_listener() : Int do 6 end
+  fn op_occlude() : Int do 7 end
+  fn op_environ() : Int do 8 end
+  fn op_group() : Int do 9 end
+  fn op_output() : Int do 10 end
+
+  doc "New voices a frame may start; plays past it are refused and counted."
+  fn new_per_frame() : Int do 64 end
+  pfn max_voice() : Int do 16777215 end
+  pfn max_patch() : Int do 2047 end
+
+  doc "Nothing playing, nothing sent."
+  fn new() : Sound do Sound(1, 1, Nil, 0, 0) end
+
+  doc "Plays refused so far: past the per-frame limit, or past the last patch id."
+  fn refused(s : Sound) : Int do match s do Sound(_, _, _, r, _) -> r end end
+
+  pfn push(s : Sound, c : Cmd) : Sound do match s do Sound(v, p, cs, r, f) -> Sound(v, p, Cons(c, cs), r, f) end end
+  pfn known(s : Sound, voice : Int) : Bool do match s do Sound(v, _, _, _, _) -> voice >= 1 && voice < v end end
+
+  pfn start(s : Sound, src : Int, b : Int, fs : List(Float)) : (Sound, Int) do
+    match s do
+      Sound(v, p, cs, r, fresh) ->
+        if fresh >= new_per_frame() do (Sound(v, p, cs, r + 1, fresh), 0)
+        else
+          let next = if v >= max_voice() do 1 else v + 1 end
+          (Sound(next, p, Cons(Cmd(op_play(), v, src, b, fs), cs), r, fresh + 1), v)
+        end
+    end
+  end
+
+  doc "Play source [src] at (x, y, z) metres, at [gain] and [pitch] (a rate: 1 is as made), ranked by [priority] when there are more voices than can be mixed. Answers the voice, or 0 when the play is refused."
+  fn play(s : Sound, src : Int, x : Float, y : Float, z : Float, gain : Float, pitch : Float, priority : Float) : (Sound, Int) do
+    start(s, src, 0, Cons(gain, Cons(pitch, Cons(priority, Cons(x, Cons(y, Cons(z, Cons(0.0, Cons(0.0, Nil)))))))))
+  end
+
+  doc "Play source [src] with no position, panned by [pan] from -1 (left) to 1 (right). For interface sounds and anything the game places itself."
+  fn play_flat(s : Sound, src : Int, gain : Float, pan : Float, pitch : Float) : (Sound, Int) do
+    start(s, src, 0, Cons(gain, Cons(pitch, Cons(1.0, Cons(0.0, Cons(0.0, Cons(0.0, Cons(1.0, Cons(pan, Nil)))))))))
+  end
+
+  doc "Move a playing voice to (x, y, z) metres."
+  fn move(s : Sound, voice : Int, x : Float, y : Float, z : Float) : Sound do
+    if known(s, voice) do push(s, Cmd(op_move(), voice, 0, 0, Cons(x, Cons(y, Cons(z, Nil))))) else s end
+  end
+
+  doc "Set control [n] (0..3) of a playing voice to [value], 0..1; the patch maps it. The voice glides there."
+  fn control(s : Sound, voice : Int, n : Int, value : Float) : Sound do
+    if known(s, voice) do push(s, Cmd(op_control(), voice, n, 0, Cons(value, Nil))) else s end
+  end
+
+  doc "Stop a voice, fading over [fade] seconds; a negative fade lets its patch's envelope release it."
+  fn stop(s : Sound, voice : Int, fade : Float) : Sound do
+    if known(s, voice) do push(s, Cmd(op_stop(), voice, 0, 0, Cons(fade, Nil))) else s end
+  end
+
+  doc "The gain of group [g] (0..3); every voice plays in group 0 unless told otherwise."
+  fn set_group(s : Sound, g : Int, gain : Float) : Sound do push(s, Cmd(op_group(), 0, g, 0, Cons(gain, Nil))) end
+
+  doc "Headphones (rendered in 3D for two ears) or speakers (panned stereo)."
+  fn set_output(s : Sound, headphones : Bool) : Sound do push(s, Cmd(op_output(), 0, if headphones do 1 else 0 end, 0, Nil)) end
+
+  pfn patch_cmds(s : Sound, id : Int, fl : NativeF32Arr, r : Int) : Sound do
+    if r >= 6 do s else patch_cmds(push(s, Cmd(op_patch(), id, r, 0, floats_of(fl, r * 12, 0))), id, fl, r + 1) end
+  end
+  pfn floats_of(fl : NativeF32Arr, at : Int, k : Int) : List(Float) do
+    if k >= 12 do Nil else Cons(NativeArray.get_f32(fl, at + k), floats_of(fl, at, k + 1)) end
+  end
+
+  doc "Give the mixer a patch; answers its id, which `play` takes as a source. Ids run from 1 to 2047; past that the upload is refused (id 0)."
+  fn upload(s : Sound, p : Patch) : (Sound, Int) do
+    match s do
+      Sound(v, id, cs, r, f) ->
+        if id > max_patch() do (Sound(v, id, cs, r + 1, f), 0)
+        else (patch_cmds(Sound(v, id + 1, cs, r, f), id, patch_floats(p), 0), id) end
+    end
+  end
+
+  doc "Once a frame, last: hands over the frame's commands. [w] and [fl] are the world and the fluid the frame ended with; [dt] the frame's seconds."
+  fn update(s : Sound, w : Strata.World.World, fl : Strata.Fluid.Fluid, dt : Float) : (Sound, Commands) do
+    let _unused = (w, fl, dt)
+    match s do
+      Sound(v, p, cs, r, _) -> (Sound(v, p, Nil, r, 0), encode(List.reverse(cs)))
+    end
+  end
+
+  pfn encode(cs : List(Cmd)) : Commands do
+    let n = List.length(cs)
+    fill(cs, NativeArray.make_i32(4 * n + 4, 0), NativeArray.make_f32(12 * n + 12, 0.0), 0)
+  end
+  pfn fill(cs : List(Cmd), ia : NativeI32Arr, fa : NativeF32Arr, i : Int) : Commands do
+    match cs do
+      Nil -> Commands(ia, fa, i)
+      Cons(Cmd(op, v, a, b, fs), t) ->
+        let ia2 = NativeArray.set_i32(NativeArray.set_i32(NativeArray.set_i32(NativeArray.set_i32(ia, 4 * i, op), 4 * i + 1, v), 4 * i + 2, a), 4 * i + 3, b)
+        fill(t, ia2, put_floats(fa, 12 * i, fs), i + 1)
+    end
+  end
+  pfn put_floats(fa : NativeF32Arr, at : Int, fs : List(Float)) : NativeF32Arr do
+    match fs do
+      Nil -> fa
+      Cons(x, t) -> put_floats(NativeArray.set_f32(fa, at, x), at + 1, t)
+    end
+  end
+
+  doc "How many records."
+  fn cmd_count(c : Commands) : Int do match c do Commands(_, _, n) -> n end end
+  fn cmd_op(c : Commands, i : Int) : Int do match c do Commands(ia, _, _) -> NativeArray.get_i32(ia, 4 * i) end end
+  fn cmd_voice(c : Commands, i : Int) : Int do match c do Commands(ia, _, _) -> NativeArray.get_i32(ia, 4 * i + 1) end end
+  fn cmd_a(c : Commands, i : Int) : Int do match c do Commands(ia, _, _) -> NativeArray.get_i32(ia, 4 * i + 2) end end
+  fn cmd_b(c : Commands, i : Int) : Int do match c do Commands(ia, _, _) -> NativeArray.get_i32(ia, 4 * i + 3) end end
+  doc "Float [k] (0..11) of record [i]."
+  fn cmd_f(c : Commands, i : Int, k : Int) : Float do match c do Commands(_, fa, _) -> NativeArray.get_f32(fa, 12 * i + k) end end
+  doc "The records' ints, four a record, for Strata.Ffi.Audio."
+  fn cmd_ints(c : Commands) : NativeI32Arr do match c do Commands(ia, _, _) -> ia end end
+  doc "The records' floats, twelve a record, for Strata.Ffi.Audio."
+  fn cmd_floats(c : Commands) : NativeF32Arr do match c do Commands(_, fa, _) -> fa end end
+
+  -- ---- patches ----
+
+  doc "Source kinds for `with_source`."
+  fn source_off() : Int do 0 end
+  fn source_sine() : Int do 1 end
+  fn source_triangle() : Int do 2 end
+  fn source_saw() : Int do 3 end
+  fn source_square() : Int do 4 end
+  fn source_white() : Int do 5 end
+  fn source_pink() : Int do 6 end
+  fn source_brown() : Int do 7 end
+  doc "Filter kinds for `with_filter`."
+  fn filter_off() : Int do 0 end
+  fn filter_low() : Int do 1 end
+  fn filter_high() : Int do 2 end
+  fn filter_band() : Int do 3 end
+  fn filter_peak() : Int do 4 end
+  doc "Modulator kinds for `with_mod`: a sine, or a smoothed random walk."
+  fn mod_lfo() : Int do 1 end
+  fn mod_walk() : Int do 2 end
+  doc "What a modulator or control moves: the pitch, filter 0's cutoff, the gain; a control may also set source 0's level or filter 1's cutoff."
+  fn target_pitch() : Int do 0 end
+  fn target_cutoff() : Int do 1 end
+  fn target_gain() : Int do 2 end
+  fn target_level() : Int do 3 end
+  fn target_cutoff2() : Int do 4 end
+
+  pfn clampi(v : Int, lo : Int, hi : Int) : Int do if v < lo do lo else if v > hi do hi else v end end end
+  pfn put(p : Patch, i : Int, x : Float) : Patch do match p do Patch(a) -> Patch(NativeArray.set_f32(a, i, x)) end end
+
+  doc "An empty patch: no sources, no filters, an envelope fully open with a 5 ms release, gain 1."
+  fn patch() : Patch do
+    put(put(put(Patch(NativeArray.make_f32(72, 0.0)), 65, 1.0), 28, 1.0), 29, 0.005)
+  end
+  doc "The patch's 72 floats."
+  fn patch_floats(p : Patch) : NativeF32Arr do match p do Patch(a) -> a end end
+
+  doc "Source [slot] (0..3): a kind, a pitch in Hz (unused by noise), a level, a detune in cents."
+  fn with_source(p : Patch, slot : Int, kind : Int, pitch : Float, level : Float, detune : Float) : Patch do
+    let o = 5 * clampi(slot, 0, 3)
+    put(put(put(put(p, o, int_to_float(kind)), o + 1, pitch), o + 2, level), o + 3, detune)
+  end
+  doc "Filter [slot] (0 or 1, in series): a kind, a cutoff in Hz, a resonance (0.707 is flat)."
+  fn with_filter(p : Patch, slot : Int, kind : Int, cutoff : Float, res : Float) : Patch do
+    let o = 20 + 3 * clampi(slot, 0, 1)
+    put(put(put(p, o, int_to_float(kind)), o + 1, cutoff), o + 2, res)
+  end
+  doc "Envelope [which]: 0 the gain's attack, decay, sustain (0..1) and release in seconds; 1 sweeps filter 0's cutoff by [depth] octaves along the gain envelope."
+  fn with_env(p : Patch, which : Int, a : Float, d : Float, s : Float, r : Float, depth : Float) : Patch do
+    let o = 26 + 5 * clampi(which, 0, 1)
+    put(put(put(put(put(p, o, a), o + 1, d), o + 2, s), o + 3, r), o + 4, depth)
+  end
+  doc "Modulator [slot] (0 or 1): a kind, a rate in Hz, a target, a depth (semitones, octaves, or a share of the gain)."
+  fn with_mod(p : Patch, slot : Int, kind : Int, rate : Float, target : Int, depth : Float) : Patch do
+    let o = 36 + 4 * clampi(slot, 0, 1)
+    put(put(put(put(p, o, int_to_float(kind)), o + 1, rate), o + 2, int_to_float(target)), o + 3, depth)
+  end
+  doc "Control [slot] (0..3): `control` sets it 0..1 and it moves [target] from [low] to [high], straight ([exponential] false) or by ratio. It starts at [initial]."
+  fn with_control(p : Patch, slot : Int, target : Int, low : Float, high : Float, exponential : Bool, initial : Float) : Patch do
+    let o = 44 + 5 * clampi(slot, 0, 3)
+    put(put(put(put(put(p, o, int_to_float(target)), o + 1, low), o + 2, high), o + 3, if exponential do 1.0 else 0.0 end), o + 4, initial)
+  end
+  doc "Release by itself after [seconds] (0: only when stopped). For one-shots."
+  fn with_hold(p : Patch, seconds : Float) : Patch do put(p, 64, seconds) end
+  doc "The patch's overall gain."
+  fn with_gain(p : Patch, g : Float) : Patch do put(p, 65, g) end
+
+  doc "A short impact: a noise burst through a resonant body. Controls: 0 hardness (soft and dull to hard and bright), 1 size (small and high to large and low), 2 energy (quiet to loud). Releases by itself."
+  fn strike() : Patch do
+    patch()
+    |> with_source(0, source_white(), 0.0, 0.7, 0.0)
+    |> with_source(1, source_brown(), 0.0, 0.6, 0.0)
+    |> with_filter(0, filter_low(), 2000.0, 0.8)
+    |> with_filter(1, filter_peak(), 600.0, 2.5)
+    |> with_env(0, 0.001, 0.07, 0.0, 0.04, 0.0)
+    |> with_control(0, target_cutoff(), 400.0, 9000.0, true, 0.5)
+    |> with_control(1, target_cutoff2(), 2400.0, 120.0, true, 0.5)
+    |> with_control(2, target_gain(), 0.08, 1.0, true, 0.7)
+    |> with_hold(0.09)
+  end
+end

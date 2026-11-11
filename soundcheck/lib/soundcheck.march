@@ -1,0 +1,125 @@
+-- soundcheck — Strata's audio scenes, rendered in game time to a WAV with no
+-- device, for listening and for the audio goldens (scripts/audio_golden.sh).
+--
+--   SOUNDCHECK_SCENE=name SOUNDCHECK_OUT=path.wav ./soundcheck
+--
+-- A scene is timed calls on a Strata.Sound value. The render advances 1/60 s
+-- a frame, as a scripted viewer run does, so it repeats exactly.
+mod Soundcheck do
+
+  needs IO
+  needs IO.Process
+  needs IO.Foreign
+  needs Audio
+
+  alias Strata.Sound as Sn
+
+  -- (seconds, what happens then)
+  type Ev = Ev(Float, Strata.Sound.Sound -> Strata.Sound.Sound)
+
+  pfn frame() : Float do 0.016667 end
+
+  pfn up(p : Strata.Sound.Patch) : Strata.Sound.Sound -> Strata.Sound.Sound do fn s -> match Sn.upload(s, p) do (s2, _) -> s2 end end
+  pfn flat(src : Int, gain : Float, pan : Float) : Strata.Sound.Sound -> Strata.Sound.Sound do fn s -> match Sn.play_flat(s, src, gain, pan, 1.0) do (s2, _) -> s2 end end
+  pfn ctl(v : Int, n : Int, x : Float) : Strata.Sound.Sound -> Strata.Sound.Sound do fn s -> Sn.control(s, v, n, x) end
+  pfn release(v : Int) : Strata.Sound.Sound -> Strata.Sound.Sound do fn s -> Sn.stop(s, v, -1.0) end
+
+  -- blocks: each source kind in turn, half a second each, flat
+  pfn tone(kind : Int) : Strata.Sound.Patch do
+    Sn.with_env(Sn.with_source(Sn.patch(), 0, kind, 220.0, 0.4, 0.0), 0, 0.01, 0.0, 1.0, 0.1, 0.0)
+  end
+  @[no_warn_recursion]
+  pfn blocks_go(k : Int) : List(Ev) do
+    if k > 7 do Nil
+    else
+      let t = int_to_float(k - 1) *. 0.6
+      Cons(Ev(0.0, up(tone(k))), Cons(Ev(t, flat(k, 0.8, 0.0)), Cons(Ev(t +. 0.5, release(k)), blocks_go(k + 1))))
+    end
+  end
+
+  -- strike: twelve strikes, hardness across, size down
+  @[no_warn_recursion]
+  pfn strikes_go(i : Int) : List(Ev) do
+    if i >= 12 do Nil
+    else
+      let t = 0.1 +. int_to_float(i) *. 0.25
+      let v = i + 1
+      Cons(Ev(t, flat(1, 0.8, 0.0)), Cons(Ev(t, ctl(v, 0, int_to_float(i % 4) /. 3.0)), Cons(Ev(t, ctl(v, 1, int_to_float(i / 4) /. 2.0)), Cons(Ev(t, ctl(v, 2, 0.8)), strikes_go(i + 1)))))
+    end
+  end
+
+  -- a scene: its events and its length in seconds
+  pfn scene(name : String) : (List(Ev), Float) do
+    if name == "blocks" do (blocks_go(1), 4.5)
+    else if name == "strike" do (Cons(Ev(0.0, up(Sn.strike())), strikes_go(0)), 3.5)
+    else (Nil, 0.0) end end
+  end
+
+  @[no_warn_recursion]
+  pfn due(evs : List(Ev), until : Float, s : Strata.Sound.Sound) : (List(Ev), Strata.Sound.Sound) do
+    match evs do
+      Nil -> (Nil, s)
+      Cons(Ev(t, f), rest) ->
+        if t < until do due(rest, until, f(s))
+        else match due(rest, until, s) do (later, s2) -> (Cons(Ev(t, f), later), s2) end end
+    end
+  end
+
+  pfn run(evs : List(Ev), s : Strata.Sound.Sound, w : Strata.World.World, fl : Strata.Fluid.Fluid, n : Int, frames : Int) : Strata.Sound.Sound do
+    if n >= frames do s
+    else
+      match due(evs, int_to_float(n + 1) *. frame(), s) do
+        (rest, s1) ->
+          match Sn.update(s1, w, fl, frame()) do
+            (s2, cmds) ->
+              let took = Strata.Ffi.Audio.send(cmds)
+              if took < Sn.cmd_count(cmds) do println("soundcheck: the ring refused " ++ int_to_string(Sn.cmd_count(cmds) - took) ++ " records") else () end
+              Strata.Ffi.Audio.advance(frame())
+              run(rest, s2, w, fl, n + 1, frames)
+          end
+      end
+    end
+  end
+
+  pfn world() : Strata.World.World do
+    Strata.World.new(Strata.Blocks.empty(), Strata.Terrain.gen(fn (k, seed) -> Strata.Chunk.uniform(0)), 1, 1.0)
+  end
+
+  -- with no device: open fails, the game goes on, and every record is counted
+  pfn nodevice() : Int do
+    let opened = Strata.Ffi.Audio.open(false)
+    let s0 = match Sn.upload(Sn.new(), Sn.strike()) do (s, _) -> s end
+    let s1 = match Sn.play_flat(s0, 1, 1.0, 0.0, 1.0) do (s, _) -> s end
+    match Sn.update(s1, world(), Strata.Fluid.new(Strata.Blocks.empty(), Nil), frame()) do
+      (_, cmds) ->
+        let took = Strata.Ffi.Audio.send(cmds)
+        let counted = float_to_int(Strata.Ffi.Audio.stat(3))
+        Strata.Ffi.Audio.advance(frame())
+        println("nodevice: opened=" ++ bool_to_string(opened) ++ " took=" ++ int_to_string(took) ++ " counted=" ++ int_to_string(counted) ++ " of " ++ int_to_string(Sn.cmd_count(cmds)))
+        if !opened && took == 0 && counted == Sn.cmd_count(cmds) do 0 else 1 end
+    end
+  end
+
+  fn main(_cap : Cap(IO)) : Unit do
+    let name = Env.get("SOUNDCHECK_SCENE", "")
+    let out = Env.get("SOUNDCHECK_OUT", "soundcheck.wav")
+    if name == "nodevice" do process_exit(nodevice())
+    else
+      match scene(name) do
+        (evs, secs) ->
+          if secs <= 0.0 do
+            println("soundcheck: no scene named '" ++ name ++ "'")
+            process_exit(2)
+          else if !Strata.Ffi.Audio.render(out) do
+            println("soundcheck: cannot render to " ++ out)
+            process_exit(1)
+          else
+            let frames = float_to_int(secs /. frame())
+            let s = run(evs, Sn.new(), world(), Strata.Fluid.new(Strata.Blocks.empty(), Nil), 0, frames)
+            Strata.Ffi.Audio.close()
+            println("soundcheck: " ++ name ++ " -> " ++ out ++ " (" ++ int_to_string(frames) ++ " frames, " ++ int_to_string(Sn.refused(s)) ++ " refused)")
+          end end
+      end
+    end
+  end
+end

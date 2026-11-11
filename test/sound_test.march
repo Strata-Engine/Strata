@@ -1,0 +1,108 @@
+-- Sound: the pure value a game plays through. It numbers voices, keeps the
+-- frame's commands, and hands them over once a frame as command records.
+mod SoundTest do
+  needs IO.Clock      -- charged to every test module once any uses Check.all (GAPS S3)
+  needs IO.Process
+  needs IO.Spawn
+
+  alias Strata.Sound as Snd
+
+  pfn world() : Strata.World.World do
+    Strata.World.new(Strata.Blocks.empty(), Strata.Terrain.gen(fn (k, seed) -> Strata.Chunk.uniform(0)), 1, 1.0)
+  end
+  pfn fluid() : Strata.Fluid.Fluid do Strata.Fluid.new(Strata.Blocks.empty(), Nil) end
+  pfn flush(s : Strata.Sound.Sound) : (Strata.Sound.Sound, Strata.Sound.Commands) do Snd.update(s, world(), fluid(), 0.016667) end
+
+  pfn play_n(s : Strata.Sound.Sound, n : Int) : Strata.Sound.Sound do
+    if n <= 0 do s else match Snd.play(s, 1, 0.0, 0.0, 0.0, 0.5, 1.0, 1.0) do (s2, _) -> play_n(s2, n - 1) end end
+  end
+  pfn count_op(c : Strata.Sound.Commands, op : Int, i : Int, acc : Int) : Int do
+    if i >= Snd.cmd_count(c) do acc else count_op(c, op, i + 1, if Snd.cmd_op(c, i) == op do acc + 1 else acc end) end
+  end
+  -- every PATCH record's floats against the patch's own, in order
+  pfn patch_matches(c : Strata.Sound.Commands, fl : NativeF32Arr, i : Int, r : Int) : Bool do
+    if i >= Snd.cmd_count(c) do r == 6
+    else if Snd.cmd_op(c, i) != Snd.op_patch() do patch_matches(c, fl, i + 1, r)
+    else
+      let a = Snd.cmd_a(c, i)
+      let same = all_k(c, fl, i, a, 0)
+      if same && a == r do patch_matches(c, fl, i + 1, r + 1) else false end
+    end end
+  end
+  pfn all_k(c : Strata.Sound.Commands, fl : NativeF32Arr, i : Int, a : Int, k : Int) : Bool do
+    if k >= 12 do true
+    else if Snd.cmd_f(c, i, k) == NativeArray.get_f32(fl, a * 12 + k) do all_k(c, fl, i, a, k + 1) else false end end
+  end
+
+  describe "Strata.Sound" do
+    test "play answers voice numbers in order and update sends them" do
+      let s0 = Snd.new()
+      let (s1, v1) = Snd.play(s0, 1, 0.0, 0.0, 0.0, 0.5, 1.0, 1.0)
+      let (s2, v2) = Snd.play(s1, 1, 0.0, 0.0, 0.0, 0.25, 1.0, 1.0)
+      let (s3, v3) = Snd.play_flat(s2, 1, 0.75, 0.0, 1.0)
+      Test.assert_eq_int(v1, 1, "first voice")
+      Test.assert_eq_int(v2, 2, "second voice")
+      Test.assert_eq_int(v3, 3, "third voice")
+      let (_, c) = flush(s3)
+      Test.assert_eq_int(Snd.cmd_count(c), 3, "three records")
+      Test.assert_eq_int(Snd.cmd_op(c, 0), Snd.op_play(), "a play")
+      Test.assert_eq_int(Snd.cmd_voice(c, 0), 1, "voice 1 first")
+      Test.assert_eq_int(Snd.cmd_voice(c, 2), 3, "voice 3 last")
+      Test.assert_true(Snd.cmd_f(c, 1, 0) == 0.25, "the second's gain")
+      Test.assert_true(Snd.cmd_f(c, 2, 6) == 1.0, "the third is flat")
+    end
+    test "at most 64 new voices a frame; the rest are refused and counted" do
+      let (s1, c) = flush(play_n(Snd.new(), 70))
+      Test.assert_eq_int(count_op(c, Snd.op_play(), 0, 0), 64, "64 plays sent")
+      Test.assert_eq_int(Snd.refused(s1), 6, "six refused")
+      let (s2, c2) = flush(play_n(s1, 3))
+      Test.assert_eq_int(count_op(c2, Snd.op_play(), 0, 0), 3, "the cap is per frame")
+      Test.assert_eq_int(Snd.refused(s2), 6, "nothing more refused")
+    end
+    test "a refused play answers voice 0" do
+      match Snd.play(play_n(Snd.new(), 64), 1, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0) do
+        (_, v) -> Test.assert_eq_int(v, 0, "no voice")
+      end
+    end
+    test "stop and control on a voice never played send and count nothing" do
+      let s1 = Snd.control(Snd.stop(Snd.new(), 9, 0.1), 9, 0, 1.0)
+      let (s2, c) = flush(s1)
+      Test.assert_eq_int(Snd.cmd_count(c), 0, "nothing sent")
+      Test.assert_eq_int(Snd.refused(s2), 0, "nothing counted")
+      let (s3, v) = Snd.play(s2, 1, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0)
+      let (_, c2) = flush(Snd.stop(Snd.control(s3, v, 2, 0.5), v, 0.2))
+      Test.assert_eq_int(Snd.cmd_count(c2), 3, "a played voice's control and stop are sent")
+      Test.assert_eq_int(Snd.cmd_op(c2, 1), Snd.op_control(), "control second")
+      Test.assert_eq_int(Snd.cmd_a(c2, 1), 2, "control 2")
+      Test.assert_eq_int(Snd.cmd_op(c2, 2), Snd.op_stop(), "stop last")
+    end
+    test "upload sends a patch as six records that round-trip" do
+      let p = Snd.strike()
+      let (s1, id) = Snd.upload(Snd.new(), p)
+      Test.assert_eq_int(id, 1, "the first patch id")
+      let (_, c) = flush(s1)
+      Test.assert_eq_int(count_op(c, Snd.op_patch(), 0, 0), 6, "six records")
+      Test.assert_eq_int(Snd.cmd_voice(c, 0), 1, "for patch 1")
+      Test.assert_true(patch_matches(c, Snd.patch_floats(p), 0, 0), "carrying the patch's floats in order")
+    end
+    test "a frame with no calls sends nothing" do
+      let (s1, c) = flush(Snd.new())
+      Test.assert_eq_int(Snd.cmd_count(c), 0, "empty")
+      let (_, c2) = flush(s1)
+      Test.assert_eq_int(Snd.cmd_count(c2), 0, "and again")
+    end
+    test "commands sent once are not sent again" do
+      let (s1, _) = flush(play_n(Snd.new(), 2))
+      let (_, c) = flush(s1)
+      Test.assert_eq_int(Snd.cmd_count(c), 0, "the next frame is empty")
+    end
+    test "group gains and the output mode are sent" do
+      let (_, c) = flush(Snd.set_output(Snd.set_group(Snd.new(), 2, 0.5), true))
+      Test.assert_eq_int(Snd.cmd_count(c), 2, "two records")
+      Test.assert_eq_int(Snd.cmd_op(c, 0), Snd.op_group(), "group")
+      Test.assert_eq_int(Snd.cmd_a(c, 0), 2, "group 2")
+      Test.assert_eq_int(Snd.cmd_op(c, 1), Snd.op_output(), "output")
+      Test.assert_eq_int(Snd.cmd_a(c, 1), 1, "headphones")
+    end
+  end
+end
