@@ -35,10 +35,11 @@ glass-front:STRATA_SCENE=6
 glass-back:STRATA_SCENE=7
 underwater:STRATA_SCENE=8
 meadow:STRATA_SCENE=9
+post:STRATA_SCENE=10
 overview-offscreen:STRATA_SCENE=1 STRATA_OFFSCREEN=1 GOLDEN_AS=overview
 '
 # indirect draw calls a frame must issue, whatever the scene holds
-EXPECT_DRAWS=4
+EXPECT_DRAWS=5
 FAILED=0
 for line in $(echo "$SCENES" | tr ' ' ','); do
   name="${line%%:*}"; envs="$(echo "${line#*:}" | tr ',' ' ')"
