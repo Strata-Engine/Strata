@@ -12,7 +12,7 @@
  * world's ids are contiguous and an_x_play / an_x_blend translate a rig's
  * mask number to the world's id. -1 means every part. */
 /* Rewritten by stamp_anim.sh whenever strata_anim.h changes (GAPS S14). */
-#define STRATA_ANIM_STAMP "9daac90c3091f8f3"
+#define STRATA_ANIM_STAMP "14510560aff033f9"
 #include <stdint.h>
 #include "strata_anim.h"
 
@@ -93,7 +93,7 @@ int64_t an_x_spawn(int64_t rig, double x, double y, double z, double qx, double 
     if (id < 0) return id;
     AnFig *f = an_fig(g_w, id);
     an_place(g_w, id, pos, q);
-    an_pose(g_w, f);
+    an_pose(g_w, f, 0);
     return id;
 }
 void an_x_remove(int64_t fig) { if (g_w) an_remove(g_w, (int)fig); }
@@ -134,6 +134,58 @@ int64_t an_x_matrices(int64_t fig, void *out_f32) {
     memcpy((char *)out_f32 + 32, m, (size_t)parts * 12 * sizeof(float));
     return parts;
 }
+/* ---- the procedural stage ---- */
+void an_x_override(int64_t fig, int64_t part, double qx, double qy, double qz, double qw, double x, double y, double z, double weight) {
+    if (!g_w) return;
+    float q[4] = {(float)qx, (float)qy, (float)qz, (float)qw}, m[3] = {(float)x, (float)y, (float)z};
+    an_override(g_w, (int)fig, (int)part, q, m, (float)weight);
+}
+/* chain: n i32, the parts from the top of the chain down */
+void an_x_aim(int64_t fig, int64_t slot, int64_t n, void *chain, double ax, double ay, double az, double tx, double ty, double tz,
+              double limit, double weight) {
+    if (!g_w) return;
+    if (weight > 0 && (n < 1 || n > 4 || an_x_len(chain) < n)) { an_refuse(g_w, AN_R_PART); return; }
+    float axis[3] = {(float)ax, (float)ay, (float)az}, t[3] = {(float)tx, (float)ty, (float)tz};
+    an_aim(g_w, (int)fig, (int)slot, (int)n, an_x_i32(chain), axis, t, (float)limit, (float)weight);
+}
+/* fade 0 sets the weight at once; above 0 the weight moves there at 1/fade a second (a new reach starts at 0) */
+void an_x_reach(int64_t fig, int64_t slot, int64_t upper, int64_t lower, int64_t end, double tx, double ty, double tz,
+                double px, double py, double pz, double weight, double fade) {
+    if (!g_w) return;
+    int32_t chain[3] = {(int32_t)upper, (int32_t)lower, (int32_t)end};
+    float t[3] = {(float)tx, (float)ty, (float)tz}, p[3] = {(float)px, (float)py, (float)pz};
+    an_reach_to(g_w, (int)fig, (int)slot, chain, t, p, (float)weight, (float)fade);
+}
+/* only the weight: the slot keeps its chain, target and pole; nothing if the slot is empty */
+void an_x_reach_fade(int64_t fig, int64_t slot, double weight, double fade) {
+    if (g_w) an_reach_to(g_w, (int)fig, (int)slot, NULL, NULL, NULL, (float)weight, (float)fade);
+}
+void an_x_spring(int64_t fig, int64_t part, double stiffness, double damping) {
+    if (g_w) an_spring(g_w, (int)fig, (int)part, (float)stiffness, (float)damping);
+}
+void an_x_drop(int64_t fig, double metres) { if (g_w) an_drop(g_w, (int)fig, (float)metres); }
+/* part's world origin into a caller-owned NativeF32Arr of 3: stage 0 the
+ * animated pose (layers and overrides), 1 before the springs. 1, or 0 if no
+ * such figure or part (or the array is short). */
+int64_t an_x_origin(int64_t fig, int64_t part, int64_t stage, void *out_f32) {
+    if (!g_w || an_x_len(out_f32) < 3) return 0;
+    return an_part_origin_at(g_w, (int)fig, (int)part, stage > 0 ? 1 : 0, (float *)((char *)out_f32 + 32));
+}
+/* figure fig's rig id; -1 if no such figure */
+int64_t an_x_fig_rig(int64_t fig) {
+    if (!g_w) return -1;
+    AnFig *f = an_fig(g_w, (int)fig);
+    return f ? f->rig : -1;
+}
+/* figure fig's placement rotation (xyzw) into a NativeF32Arr of 4; 1, or 0 */
+int64_t an_x_facing(int64_t fig, void *out_f32) {
+    if (!g_w || an_x_len(out_f32) < 4) return 0;
+    AnFig *f = an_fig(g_w, (int)fig);
+    if (!f) return 0;
+    memcpy((char *)out_f32 + 32, f->q, 4 * sizeof(float));
+    return 1;
+}
+
 int64_t an_x_mark_count(void) { return g_w ? g_w->nevents : 0; }
 /* mark i of the last update: k 0 figure, 1 layer, 2 tag */
 int64_t an_x_mark_int(int64_t i, int64_t k) {

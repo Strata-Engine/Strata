@@ -1,6 +1,8 @@
 /* The pose kernel, headless: sampling, slerp, the hierarchy, masks and
  * additive layers, crossfades, blends in phase, marks, the dt edge cases,
- * degenerate clips, removed figures, refusals and determinism. */
+ * degenerate clips, removed figures, refusals and determinism; then the
+ * procedural stage: overrides, aim, reach (and its degenerate targets),
+ * springs, the drop. */
 #include <stdio.h>
 #include <string.h>
 #include <math.h>
@@ -420,6 +422,314 @@ static void test_determinism(void) {
     CHECK(a == b, "a scripted 600-update run of 50 figures hashes the same twice");
 }
 
+/* ---- the procedural stage ---- */
+
+/* a rig of n parts from parents and pivots, rest identity, unit boxes */
+static int rig_of(AnWorld *w, int n, const int32_t *parent, const float *pivot) {
+    float rest[16 * 4], box[16 * 6];
+    for (int i = 0; i < n; i++) {
+        rest[i * 4] = rest[i * 4 + 1] = rest[i * 4 + 2] = 0; rest[i * 4 + 3] = 1;
+        for (int k = 0; k < 3; k++) { box[i * 6 + k] = -0.1f; box[i * 6 + 3 + k] = 0.1f; }
+    }
+    return an_rig(w, n, parent, pivot, rest, box);
+}
+/* the turn between two parts' world rotations, degrees, from their matrices */
+static float between(const float *m, int a, int b) {
+    float tr = 0;
+    for (int i = 0; i < 3; i++)
+        for (int k = 0; k < 3; k++) tr += m[a * 12 + i * 3 + k] * m[b * 12 + i * 3 + k];
+    float c = (tr - 1) / 2;
+    c = c > 1 ? 1 : (c < -1 ? -1 : c);
+    return acosf(c) * 180.0f / PI_F;
+}
+static float dot3(const float *a, const float *b) { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]; }
+
+static void test_override(void) {
+    AnWorld *w = an_open(4);
+    int rig = chain(w, 0);
+    TK hold[1] = {{1, 0, 0, 60}};
+    int c = turns(w, rig, 1, 1, 1, hold, 0, NULL, NULL);
+    int f = an_spawn(w, rig);
+    an_play(w, f, 0, c, 0, 1, 1, -1, 0);
+    an_update(w, 0.1f);
+    CHECK(near(angle(an_matrices(w, f), 1), 60, 1e-3f), "the clip turns the arm to 60");
+    float q20[4], id[4] = {0, 0, 0, 1}, zero[3] = {0, 0, 0};
+    qz(20, q20);
+    an_override(w, f, 1, q20, zero, 1);
+    an_update(w, 0.1f);
+    CHECK(near(angle(an_matrices(w, f), 1), 20, 1e-3f), "an override at weight 1 replaces the clip's rotation exactly");
+    CHECK(near(an_matrices(w, f)[12 + 9], 0, 1e-6f) && near(an_matrices(w, f)[12 + 10], 1, 1e-6f), "and its movement (none)");
+    an_override(w, f, 1, id, zero, 0.5f);
+    an_update(w, 0.1f);
+    CHECK(near(angle(an_matrices(w, f), 1), 30, 1e-3f), "an override to rest at weight 0.5 halves the clip's 60");
+    an_override(w, f, 1, id, zero, 0);
+    an_update(w, 0.1f);
+    CHECK(near(angle(an_matrices(w, f), 1), 60, 1e-3f), "weight 0 clears the override");
+    CHECK(an_stat(w, 7) == 0, "a cleared override holds no record");
+    double before = an_stat(w, 3);
+    an_override(w, f, 3, q20, zero, 1);
+    CHECK(an_stat(w, 3) == before + 1 && an_stat(w, 5) == AN_R_PART, "an override of a part the rig lacks is refused");
+    an_close(w);
+}
+
+/* a root and two parts all turning about the origin: a, then b on a */
+static void test_aim(void) {
+    AnWorld *w = an_open(4);
+    int32_t parent[3] = {-1, 0, 1};
+    float pivot[9] = {0};
+    int rig = rig_of(w, 3, parent, pivot);
+    int f = an_spawn(w, rig);
+    int32_t ch[2] = {1, 2};
+    float ax[3] = {1, 0, 0}, t[3] = {10 * cosf(PI_F / 4), 10 * sinf(PI_F / 4), 0};
+    an_aim(w, f, 0, 2, ch, ax, t, 30, 1);
+    an_update(w, 0.1f);
+    const float *m = an_matrices(w, f);
+    CHECK(near(angle(m, 1), 22.5f, 1e-3f), "aim 45 off over 2 parts, limit 30: the first turns 22.5");
+    CHECK(near(angle(m, 2), 45, 1e-3f), "and the second 22.5 more, pointing at the target");
+    CHECK(near(between(m, 1, 2), 22.5f, 1e-2f), "the second's own turn is 22.5");
+    an_aim(w, f, 0, 2, ch, ax, t, 10, 1);
+    an_update(w, 0.1f);
+    m = an_matrices(w, f);
+    CHECK(near(angle(m, 1), 10, 1e-3f) && near(angle(m, 2), 20, 1e-3f), "with limit 10 a part it stops at 20");
+    an_aim(w, f, 0, 2, ch, ax, t, 30, 0.5f);
+    an_update(w, 0.1f);
+    CHECK(near(angle(an_matrices(w, f), 2), 22.5f, 1e-3f), "at weight 0.5 it turns half as far");
+    float behind[3] = {-10, 0, 0};
+    an_aim(w, f, 0, 2, ch, ax, behind, 180, 1);
+    an_update(w, 0.1f);
+    CHECK(all_finite(an_matrices(w, f), 3), "a target straight behind gives finite matrices");
+    CHECK(near(fabsf(angle(an_matrices(w, f), 2)), 180, 1e-2f) || between(an_matrices(w, f), 0, 2) > 179.9f, "and turns the axis onto it");
+    an_aim(w, f, 0, 2, ch, ax, t, 30, 0);
+    an_update(w, 0.1f);
+    CHECK(near(angle(an_matrices(w, f), 2), 0, 1e-4f), "weight 0 clears the aim");
+    double before = an_stat(w, 3);
+    an_aim(w, f, 4, 2, ch, ax, t, 30, 1);
+    int32_t back[2] = {2, 1};
+    an_aim(w, f, 0, 2, back, ax, t, 30, 1);
+    CHECK(an_stat(w, 3) == before + 2 && an_stat(w, 5) == AN_R_PART, "slot 4 and a chain not running down the rig are refused");
+    an_close(w);
+}
+
+/* root; upper on it at the origin; lower 1 m below; foot 1 m below that.
+ * The lower part rests bent 10 degrees about x so the knee has a side. */
+static int leg(AnWorld *w) {
+    int32_t parent[4] = {-1, 0, 1, 2};
+    float pivot[12] = {0, 0, 0, 0, 0, 0, 0, -1, 0, 0, -1, 0};
+    float rest[16] = {0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1}, box[24];
+    float h = 10 * PI_F / 360;
+    rest[8] = sinf(h); rest[11] = cosf(h);
+    for (int i = 0; i < 24; i++) box[i] = (i % 6) < 3 ? -0.1f : 0.1f;
+    return an_rig(w, 4, parent, pivot, rest, box);
+}
+static void origin(const float *m, int p, float o[3]) { o[0] = m[p * 12 + 9]; o[1] = m[p * 12 + 10]; o[2] = m[p * 12 + 11]; }
+static float dist3(const float *a, const float *b) {
+    float d[3] = {a[0] - b[0], a[1] - b[1], a[2] - b[2]};
+    return sqrtf(dot3(d, d));
+}
+/* the knee's offset from the line root..target, made unit */
+static void knee_side(const float *m, const float *t, float out[3]) {
+    float a[3], k[3], u[3], v[3];
+    origin(m, 1, a); origin(m, 2, k);
+    for (int i = 0; i < 3; i++) { u[i] = t[i] - a[i]; v[i] = k[i] - a[i]; }
+    float ul = sqrtf(dot3(u, u));
+    if (ul > 1e-6f) for (int i = 0; i < 3; i++) u[i] /= ul;
+    float d = ul > 1e-6f ? dot3(v, u) : 0;
+    for (int i = 0; i < 3; i++) out[i] = v[i] - d * u[i];
+    float l = sqrtf(dot3(out, out));
+    if (l > 0) for (int i = 0; i < 3; i++) out[i] /= l;
+}
+
+static void test_reach(void) {
+    AnWorld *w = an_open(4);
+    int rig = leg(w);
+    int f = an_spawn(w, rig);
+    int32_t ch[3] = {1, 2, 3};
+    float t[3] = {0.5f, -1.5f, 0.3f}, pole[3] = {0, -1, 5}, o[3];
+    an_reach(w, f, 0, ch, t, pole, 1);
+    an_update(w, 1.0f / 60);
+    const float *m = an_matrices(w, f);
+    origin(m, 3, o);
+    CHECK(dist3(o, t) <= 1e-4f, "reach places the end within 1e-4 of a reachable target");
+    float a[3], k[3];
+    origin(m, 1, a); origin(m, 2, k);
+    CHECK(near(dist3(a, k), 1, 1e-4f) && near(dist3(k, o), 1, 1e-4f), "the bones keep their lengths");
+    float side[3], pp[3] = {pole[0] - a[0], pole[1] - a[1], pole[2] - a[2]};
+    knee_side(m, t, side);
+    CHECK(dot3(side, pp) > 0, "the knee is on the pole's side");
+    an_drop(w, f, 0.3f);
+    an_update(w, 1.0f / 60);
+    origin(an_matrices(w, f), 0, o);
+    CHECK(near(o[1], -0.3f, 1e-6f), "the drop lowers the root");
+    origin(an_matrices(w, f), 3, o);
+    CHECK(dist3(o, t) <= 1e-4f, "and the end still reaches the target");
+    an_drop(w, f, 0);
+
+    /* out of reach: straight toward the target */
+    float far[3] = {0, -5, 1};
+    an_reach(w, f, 0, ch, far, pole, 1);
+    an_update(w, 1.0f / 60);
+    m = an_matrices(w, f);
+    origin(m, 3, o);
+    float l = sqrtf(dot3(far, far)), want[3] = {2 * far[0] / l, 2 * far[1] / l, 2 * far[2] / l};
+    CHECK(dist3(o, want) <= 1e-4f, "a target beyond reach straightens the chain toward it");
+    origin(m, 2, k);
+    float half[3] = {want[0] / 2, want[1] / 2, want[2] / 2};
+    CHECK(dist3(k, half) <= 1e-3f, "with the knee on the line");
+
+    /* the target at the root, moving 1 mm a step through it */
+    float prev[3] = {0, 0, 0};
+    int finite = 1, flips = 0;
+    for (int i = 0; i < 100; i++) {
+        float tr[3] = {-0.05f + 0.001f * i, 0, 0};
+        an_reach(w, f, 0, ch, tr, pole, 1);
+        an_update(w, 1.0f / 60);
+        m = an_matrices(w, f);
+        if (!all_finite(m, 4)) finite = 0;
+        float kk[3];
+        origin(m, 2, kk);
+        if (i > 0 && dot3(kk, prev) <= 0) flips++;
+        memcpy(prev, kk, sizeof prev);
+    }
+    CHECK(finite, "a target at the root gives finite matrices");
+    CHECK(flips == 0, "and the knee does not flip as it moves through the root");
+
+    /* the pole on the chain line, the target moving 1 mm a step */
+    finite = 1; flips = 0;
+    for (int i = 0; i < 100; i++) {
+        float tr[3] = {0.3f + 0.001f * i, -1.2f, 0.2f}, pl[3] = {3 * tr[0], 3 * tr[1], 3 * tr[2]};
+        an_reach(w, f, 0, ch, tr, pl, 1);
+        an_update(w, 1.0f / 60);
+        m = an_matrices(w, f);
+        if (!all_finite(m, 4)) finite = 0;
+        float s[3];
+        knee_side(m, tr, s);
+        if (i > 0 && dot3(s, prev) <= 0) flips++;
+        memcpy(prev, s, sizeof prev);
+        origin(m, 3, o);
+        if (dist3(o, tr) > 1e-4f) finite = 0;
+    }
+    CHECK(finite, "a pole on the chain line gives finite matrices and still reaches");
+    CHECK(flips == 0, "and the knee side does not change over 100 updates");
+
+    /* weight: half a reach, then a fade to 0 */
+    an_reach(w, f, 0, ch, t, pole, 0);
+    an_update(w, 1.0f / 60);
+    origin(an_matrices(w, f), 3, o);
+    float rest_foot[3] = {0, -1 - cosf(10 * PI_F / 180), -sinf(10 * PI_F / 180)};
+    CHECK(dist3(o, rest_foot) <= 1e-4f, "weight 0 clears the reach: the foot is back at rest");
+    an_reach(w, f, 0, ch, t, pole, 1);
+    an_reach_to(w, f, 0, NULL, NULL, NULL, 0, 0.15f);
+    an_update(w, 0.075f);
+    origin(an_matrices(w, f), 3, o);
+    CHECK(dist3(o, t) > 1e-3f && dist3(o, rest_foot) > 1e-3f, "halfway through a 0.15 s fade the foot is between");
+    an_update(w, 0.075f);
+    origin(an_matrices(w, f), 3, o);
+    CHECK(dist3(o, rest_foot) <= 1e-4f, "after 0.15 s the reach has faded to the clip");
+    CHECK(an_stat(w, 7) == 0, "a reach faded out holds no record");
+
+    double before = an_stat(w, 3);
+    an_reach(w, f, 8, ch, t, pole, 1);
+    int32_t bad[3] = {1, 3, 2};
+    an_reach(w, f, 0, bad, t, pole, 1);
+    CHECK(an_stat(w, 3) == before + 2 && an_stat(w, 5) == AN_R_PART, "slot 8 and a chain out of order are refused");
+    an_close(w);
+}
+
+/* root; tail on it at the origin; tip 1 m along the tail's z */
+static int tail(AnWorld *w) {
+    int32_t parent[3] = {-1, 0, 1};
+    float pivot[9] = {0, 0, 0, 0, 0, 0, 0, 0, 1};
+    return rig_of(w, 3, parent, pivot);
+}
+static void qy(float deg, float q[4]) {
+    float h = deg * PI_F / 360.0f;
+    q[0] = 0; q[1] = sinf(h); q[2] = 0; q[3] = cosf(h);
+}
+static float yaw(const float *m, int part) {   /* a part's world turn about y, degrees, from its z axis */
+    return atan2f(m[part * 12 + 6], m[part * 12 + 8]) * 180.0f / PI_F;
+}
+
+static void test_spring(void) {
+    AnWorld *w = an_open(4);
+    int rig = tail(w);
+    int f = an_spawn(w, rig);
+    an_spring(w, f, 1, 60, 8);
+    an_update(w, 1.0f / 60);
+    CHECK(near(yaw(an_matrices(w, f), 1), 0, 1e-4f), "a fresh spring starts at its animated rotation");
+    float pos[3] = {0, 0, 0}, q[4];
+    qy(90, q);
+    an_place(w, f, pos, q);
+    an_update(w, 1.0f / 60);
+    const float *m = an_matrices(w, f);
+    CHECK(near(yaw(m, 0), 90, 1e-3f), "the figure turned 90 in one update");
+    CHECK(yaw(m, 1) < 45, "the spring part lags behind");
+    float o[3], pre[3];
+    origin(m, 2, o);
+    CHECK(an_part_origin(w, f, 2, pre) == 1, "an_part_origin answers a live figure");
+    CHECK(near(pre[0], 1, 1e-4f) && near(pre[2], 0, 1e-4f), "an_part_origin is before springs: the tip where the turn puts it");
+    CHECK(dist3(o, pre) > 0.1f, "while the drawn tip lags");
+    float most = 0, late = 0;
+    for (int i = 1; i < 180; i++) {
+        an_update(w, 1.0f / 60);
+        float y = yaw(an_matrices(w, f), 1);
+        if (y > most) most = y;
+        if (i >= 119 && fabsf(y - 90) > late) late = fabsf(y - 90);
+    }
+    CHECK(most > 91, "it overshoots");
+    CHECK(late < 1, "and settles within 2 s at stiffness 60 damping 8");
+    an_spring(w, f, 1, 0, 0);
+    CHECK(an_stat(w, 7) == 0, "stiffness 0 clears the spring");
+    double before = an_stat(w, 3);
+    an_spring(w, f, 1, -1, 0);
+    CHECK(an_stat(w, 3) == before + 1 && an_stat(w, 5) == AN_R_VALUE, "a negative stiffness is refused");
+    CHECK(an_part_origin(w, 999, 0, pre) == 0, "an_part_origin answers 0 for no such figure");
+    an_close(w);
+}
+
+static uint64_t spring_script(int nudge) {
+    AnWorld *w = an_open(8);
+    int rig = tail(w);
+    int f = an_spawn(w, rig);
+    an_spring(w, f, 1, 40, 3);
+    an_spring(w, f, 2, 90, 5);
+    float pos[3] = {0, 0, 0}, q[4];
+    for (int i = 0; i < 300; i++) {
+        qy((float)(i % 50) * 3.0f, q);
+        an_place(w, f, pos, q);
+        an_update(w, 1.0f / 60);
+    }
+    if (nudge)   /* the same matrices, a different velocity */
+        for (int i = w->figs[0].proc; i >= 0; i = w->procs[i].next)
+            if (w->procs[i].kind == AN_K_SPRING) { w->procs[i].v[6] += 0.5f; break; }
+    uint64_t h = an_hash(w);
+    an_close(w);
+    return h;
+}
+
+static void test_spring_hash(void) {
+    uint64_t a = spring_script(0), b = spring_script(0), c = spring_script(1);
+    CHECK(a == b, "springs repeat: two runs hash the same");
+    CHECK(a != c, "spring state is in the hash");
+}
+
+static void test_proc_removed(void) {
+    AnWorld *w = an_open(2);
+    int rig = leg(w);
+    int f = an_spawn(w, rig);
+    int32_t ch[3] = {1, 2, 3};
+    float t[3] = {0, -1.5f, 0}, pole[3] = {0, 0, 1}, id[4] = {0, 0, 0, 1};
+    an_reach(w, f, 0, ch, t, pole, 1);
+    an_spring(w, f, 3, 10, 1);
+    an_override(w, f, 0, id, NULL, 1);
+    CHECK(an_stat(w, 7) == 3, "three records in use");
+    an_remove(w, f);
+    CHECK(an_stat(w, 7) == 0, "removing the figure frees them");
+    int g = an_spawn(w, rig);
+    an_update(w, 0.1f);
+    CHECK(near(an_matrices(w, g)[3 * 12 + 10], -1 - cosf(10 * PI_F / 180), 1e-5f), "a figure in a freed slot starts with no stage");
+    an_close(w);
+}
+
 int main(void) {
     test_sampling();
     test_antipodal();
@@ -432,6 +742,12 @@ int main(void) {
     test_removed();
     test_refusals();
     test_determinism();
+    test_override();
+    test_aim();
+    test_reach();
+    test_spring();
+    test_spring_hash();
+    test_proc_removed();
     if (fails == 0) printf("anim_test: ok\n");
     return fails == 0 ? 0 : 1;
 }

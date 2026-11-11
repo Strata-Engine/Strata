@@ -183,3 +183,11 @@ such a type. Reproduced in a 15-line app (a `List(Holder(Int, Qq))` mapped
 to its `Qq`s). Workaround: `Strata.Rig` and `Strata.Clip` keep rotations as
 `(Float, Float, Float, Float)` tuples inside lists and constructors, and
 build a `Quat` only at the edges.
+
+## S24: a call of a function a module lacks reads "Unknown module"
+
+`Strata.Anim.ground_targets(...)` in a test, before `ground_targets` was
+written, failed with "Unknown module `Strata.Anim`. [unbound_variable]",
+though `Strata.Anim` exists and compiles. The message names the module, not
+the missing function. Workaround: read it as "no such function in that
+module" and check the name.
