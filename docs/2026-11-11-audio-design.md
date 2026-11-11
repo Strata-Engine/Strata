@@ -165,8 +165,8 @@ is heavy), results handed to C whole.
 - **An audio hitch** (an overrun callback) cannot reach the frame: nothing
   on the main thread waits for the device thread.
 
-Handles: the C main-thread side numbers voices itself as it enqueues them,
-so `play` returns a handle at once without asking the device thread. A
+Handles: `Strata.Sound` numbers voices itself (a counter in the value), so
+`play` returns a handle at once without asking the device thread. A
 handle whose voice has ended is ignored by later commands.
 
 **Two clocks** (designer's call). The mixer is the same code under both:
