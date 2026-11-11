@@ -83,7 +83,7 @@ vec3 sky_light(vec3 at, vec3 n, ivec2 px, int frame, int rays) {
         float rad = sqrt(r.x), ang = r.y * 6.2831853;
         vec3 dir = normalize(a * (rad * cos(ang)) + b * (rad * sin(ang)) + n * sqrt(max(1.0 - r.x, 0.0)));
         Hit h;
-        if (!trace_steps(at + n * 0.02, dir, 48.0, false, 40, 12.0, h)) sum += sky_base(dir) + h.glow * GLOW;
+        if (!trace_steps(at + n * 0.02, dir, 48.0, false, 40, 12.0, -1000000, h)) sum += sky_base(dir) + h.glow * GLOW;
         else {
             vec3 hn = NORMALS[h.face];
             sum += class_emission(h.cls) * GLOW + h.glow * GLOW

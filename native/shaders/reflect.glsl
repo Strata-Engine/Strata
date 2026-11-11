@@ -29,10 +29,11 @@ vec3 mirror_dir(vec3 toward_eye, vec3 m, vec3 n) {
 // was on screen last frame takes its surface colour from the screen and its
 // sun visibility from the light pass's memory; any other hit takes its class's
 // colour and one shadow ray; a miss is sky.
-vec3 reflected(vec3 at, vec3 dir) {
+// [skip_y] is the layer of see-through voxels the ray may pass (the water it leaves), or a layer that does not exist.
+vec3 reflected(vec3 at, vec3 dir, int skip_y) {
     Hit h;
     // exact for the first 40 voxels, every third voxel beyond: far reflections lose thin things
-    if (!trace_steps(at, dir, 400.0, true, 200, 40.0, h)) return sky_color(dir) + h.glow * GLOW;
+    if (!trace_steps(at, dir, 400.0, true, 200, 40.0, skip_y, h)) return sky_color(dir) + h.glow * GLOW;
     vec3 hv = at + dir * h.t;
     vec3 hp = hv * u.eye.w;
     vec3 hn = NORMALS[h.face];

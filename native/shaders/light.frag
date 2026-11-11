@@ -91,7 +91,7 @@ void main() {
         vec3 toward_eye = normalize(u.eye.xyz - world);
         if (rough < 0.25 && u.sun_color.w > 0.5) {
             float share = mirror_share(n, toward_eye, 0.12) * (1.0 - rough);
-            col = mix(col, reflected(at + n * 0.02, mirror_dir(toward_eye, n, n)), share);
+            col = mix(col, reflected(at + n * 0.02, mirror_dir(toward_eye, n, n), -1000000), share);
         }
         col += sun_highlight(n, toward_eye, rough, sun_vis);
     }

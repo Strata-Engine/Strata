@@ -61,7 +61,11 @@ bool skip_cell(uint top, float y, float dy) { return top == 0u || (dy >= 0.0 && 
 // nothing stopped it, including when it left the loaded world or ran out of
 // [steps]: a ray that skims a surface spends a step per voxel. Past
 // [fine_until] voxels from its start the ray looks at every third voxel only.
-bool trace_steps(vec3 ro, vec3 rd, float tmax, bool stop_glass, int steps, float fine_until, out Hit h) {
+// See-through voxels in layer [skip_y] and the one above never stop it: a
+// ray leaving a water surface starts inside that water's own layer, or
+// just over it beside cells of the same surface that reach a layer higher,
+// and the volume holds every one of those voxels as full.
+bool trace_steps(vec3 ro, vec3 rd, float tmax, bool stop_glass, int steps, float fine_until, int skip_y, out Hit h) {
     h.glow = vec3(0.0); h.t = tmax; h.cls = 0u; h.face = 0; h.voxel = ivec3(0);
     ivec3 dims = u.vol.xyz;                       // the volume's size in chunks
     vec3 d = rd + (1.0 - step(1.0e-6, abs(rd))) * 1.0e-6;      // no exact zeros to divide by
@@ -97,7 +101,7 @@ bool trace_steps(vec3 ro, vec3 rd, float tmax, bool stop_glass, int steps, float
             uint c = texelFetch(vol, v + shift * 32, 0).r;
             if (c != 0u) {
                 int kind = class_kind(c);
-                bool stops = kind == 1 || (kind == 2 && c != before && cutout_blocks(c, p, face)) || (kind == 3 && stop_glass);
+                bool stops = kind == 1 || (kind == 2 && c != before && cutout_blocks(c, p, face)) || (kind == 3 && stop_glass && v.y != skip_y && v.y != skip_y + 1);
                 if (stops && strode) {
                     // found by a stride: go back and walk the last stretch exactly, for a true point and face
                     t -= 3.0; fine = t + 4.0; strode = false; before = 0u;
@@ -128,7 +132,7 @@ bool trace_steps(vec3 ro, vec3 rd, float tmax, bool stop_glass, int steps, float
 }
 
 // A ray with the usual step limit: enough for shadows, which leave the loaded world upward.
-bool trace(vec3 ro, vec3 rd, float tmax, bool stop_glass, out Hit h) { return trace_steps(ro, rd, tmax, stop_glass, 160, 1.0e9, h); }
+bool trace(vec3 ro, vec3 rd, float tmax, bool stop_glass, out Hit h) { return trace_steps(ro, rd, tmax, stop_glass, 160, 1.0e9, -1000000, h); }
 
 // The light class of the voxel holding [p] (voxel units); 0 outside the loaded world.
 uint class_at(vec3 p) {

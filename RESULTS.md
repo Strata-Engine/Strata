@@ -467,3 +467,40 @@ The review found two faults in the rules, both fixed: a cell whose landing
 place was taken by another fell out of the active set with its water still
 in the air, and an edit made while a worker step ran was forgotten when it
 touched a cell that was already active.
+
+# Light and water together
+
+A pass over how the two behave side by side, after both were built. Scenes
+were made to show each question, looked at, and the faults fixed.
+
+| question | found | done |
+|---|---|---|
+| Does partly full water reflect? | No. Its mirror ray began inside its own voxel, which the light volume holds as full, and stopped there: flat blue instead of a reflection. | Fixed: a mirror ray leaving water passes see-through voxels in the water's own layer and the one above. Golden `water-reflects`. |
+| Does a draining surface stay even under light? | No. Cells dropped by up to six eighths in a step and showed as pits with walls. Two causes: a cell evening out could give to four far cells at once, and water under water poured all it had into a shallower neighbour. | Fixed: a cell gives away two eighths a step at most while evening out; water under water pours half the difference into a neighbour that holds some. Tests first. |
+| Does moving water unsettle the light around it? | Yes: each fluid step was treated as an edit, so nearby pixels never settled and sampled four times as often. | Fixed: only a change in what blocks or emits light is an edit. Water does neither. |
+| Is spray lit sensibly in shade? | No: it took the sun's full light anywhere. | Fixed: a particle takes the sun only where one ray reaches it, and less sky under a roof. Golden `splash-shaded`. |
+| Is a tilted water surface lit as tilted? | No, it is lit as level. | Left: per-cell tilts of an eighth would show as facets. |
+| Do light rays see partly full water as full blocks? | Yes. | Left: water does not block the sun or sky rays; only reflections OF water in other mirrors are affected. |
+| The light and dark patches on a lake at a low sun | The rim's and the trees' shadows on the lake bed, seen through the water. | Correct as it is. Golden `lake-low-sun`. |
+
+What moving water costs the lighting now, offscreen at 2560 x 1600:
+
+| view | GPU, water at rest | GPU, lake draining | before this pass, the difference |
+|---|---|---|---|
+| over the lake | 7.8 ms | 8.5 ms | 2.5 ms |
+| the valley below | 6.8 ms | 7.1 ms | 4.9 ms |
+
+Beside a running stream, two consecutive frames differ by more than 4 in
+0.16% of pixels, and those are the water itself.
+
+The even surface has a price: the test lake now takes about 8 minutes to
+drain, up from 5.5, with 2.9% left. The 2 minute target was already missed.
+
+Not judged: the soak's frame-time limit. The machine's load average was 54
+during this pass (other work), and the soak was as slow with spray off as
+with it on. Its other checks pass. The last quiet soak, before this pass,
+had a worst frame of 18.8 ms.
+
+Not checked: stillness of lit water at rest, because water ripples by
+design; whether many overlapping spray particles, each tracing two rays,
+cost too much in a large waterfall.

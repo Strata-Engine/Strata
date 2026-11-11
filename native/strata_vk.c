@@ -27,7 +27,7 @@
 /* Rewritten by build_shaders.sh whenever the shaders change: forge decides
  * whether to recompile this file from its text alone, not from the headers
  * it includes (GAPS S14). */
-#define STRATA_SHADERS_STAMP "2fc78c2ea647bee4"
+#define STRATA_SHADERS_STAMP "29947aeee4f4c013"
 #include "strata_shaders.h"
 #include "strata_spray.h"
 #include "strata_alloc.h"
@@ -127,7 +127,7 @@ static struct {
     int vn, vnv;                   /* its size in chunks: vn across (x and z), vnv up */
     VkBuffer ltable; VkDeviceMemory ltable_mem; int32_t *ltable_map;
     float *tex_mean; uint32_t tex_mean_n;   /* each texture layer's mean colour, linear, three floats a layer */
-    struct LightCell { int32_t chunk[3]; int valid; int uniform; uint32_t hash; } *cells;   /* per cell, as last queued: its chunk, and its class if it is one class throughout, else -1 */
+    struct LightCell { int32_t chunk[3]; int valid; int uniform; uint32_t hash, solid; } *cells;   /* per cell, as last queued: its chunk, and its class if it is one class throughout, else -1 */
     struct LightWrite { int cell[3]; int32_t chunk[3]; int valid; int uniform; int edit; unsigned char *bytes; } *lq;   /* writes waiting to be copied in, oldest first */
     uint32_t nlq, lq_cap;
     int32_t edit_lo[3], edit_hi[3];   /* the chunks an edit changed, while light_edit counts down */
@@ -802,11 +802,24 @@ static void light_queue(const int32_t *chunk, int valid, int uniform, unsigned c
     /* nothing to do when the cell already holds exactly this: an air chunk re-uploaded, say */
     if (valid == c->valid && (!valid || same_owner) && !bytes && uniform >= 0 && c->uniform == uniform) return;
     /* the same voxels for the chunk the cell already holds (a neighbour's edit remeshed it): nothing to write */
-    uint32_t hash = 2166136261u;
-    if (bytes) for (int i = 0; i < 32768; i++) hash = (hash ^ bytes[i]) * 16777619u;
+    /* Two fingerprints of the voxels: all of them, and only those that block
+     * or emit light. A see-through block (water) does neither, so water
+     * moving changes the first and not the second, and the light pass keeps
+     * what it remembers. */
+    uint32_t hash = 2166136261u, solid = 2166136261u;
+    if (bytes) for (int i = 0; i < 32768; i++) {
+        unsigned char c = bytes[i];
+        hash = (hash ^ c) * 16777619u;
+        const int32_t *row = g.ltable_map ? g.ltable_map + c * 8 : NULL;
+        int matters = row && (row[0] == 1 || row[0] == 2 || row[0] == 4 || row[3] != 0);
+        solid = (solid ^ (matters ? c : 0)) * 16777619u;
+    } else if (uniform > 0 && g.ltable_map) {
+        const int32_t *row = g.ltable_map + uniform * 8;
+        solid = (row[0] == 1 || row[0] == 2 || row[0] == 4 || row[3] != 0) ? (uint32_t)uniform * 16777619u : 2166136261u;
+    }
     if (valid && same_owner && bytes && c->uniform < 0 && c->hash == hash) { free(bytes); return; }
     /* new voxels for a chunk the volume already held: an edit, whose lighting must be re-estimated */
-    int edit = valid && same_owner;
+    int edit = valid && same_owner && c->solid != solid;
     if (g.nlq == g.lq_cap) {
         uint32_t cap = g.lq_cap ? g.lq_cap * 2 : 256;
         struct LightWrite *grown = realloc(g.lq, cap * sizeof *grown);
@@ -818,7 +831,7 @@ static void light_queue(const int32_t *chunk, int valid, int uniform, unsigned c
     w->chunk[0] = chunk[0]; w->chunk[1] = chunk[1]; w->chunk[2] = chunk[2];
     w->valid = valid; w->uniform = bytes ? -1 : uniform; w->bytes = bytes; w->edit = edit;
     c->chunk[0] = chunk[0]; c->chunk[1] = chunk[1]; c->chunk[2] = chunk[2];
-    c->valid = valid; c->uniform = w->uniform; c->hash = hash;
+    c->valid = valid; c->uniform = w->uniform; c->hash = hash; c->solid = solid;
 }
 
 /* Record, in this frame's commands, the copies that bring the volume up to

@@ -37,7 +37,7 @@ void main() {
                 m = normalize(m + 0.010 * vec3(sin(q.x * 2.3 + t * 1.3) + sin(q.y * 1.1 - t * 0.9), 0.0, sin(q.y * 2.9 + t * 1.6) + sin(q.x * 0.7 + t * 1.1)));
             }
             float share = mirror_share(m, toward_eye, 0.03) * (1.0 - rough);
-            if (u.sun_color.w > 0.5) col = mix(col, reflected(v_world / u.eye.w + sign(dot(n, toward_eye)) * n * 0.02, mirror_dir(toward_eye, m, sign(dot(n, toward_eye)) * n)), share);
+            if (u.sun_color.w > 0.5) col = mix(col, reflected(v_world / u.eye.w + sign(dot(n, toward_eye)) * n * 0.02, mirror_dir(toward_eye, m, sign(dot(n, toward_eye)) * n), int(floor(v_world.y / u.eye.w - 0.001))), share);
             col += sun_highlight(m, toward_eye, rough, sun_vis);
             alpha = mix(alpha, 1.0, share);
         }
