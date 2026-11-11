@@ -1,0 +1,96 @@
+-- The atlas: a coarse global grid in metres, its island mask and regions,
+-- and sampling it at any point.
+mod Strata.Test.Atlas do
+
+  needs IO.Clock
+  needs IO.Process
+
+  import Test
+  alias Strata.Atlas as At
+
+  pfn small() : Strata.Atlas.Def do At.def(64, 4.0, 100.0, 40.0, 5, 0.0) end
+
+  pfn pos(i : Int) : Float do int_to_float(i - 32) *. 4.0 end
+
+  -- every sample (i, j) satisfying [ok]: [pred] is 0 far from the centre, 1 inside the island
+  pfn far_go(a : Strata.Atlas.Atlas, i : Int) : Bool do
+    if i >= 4096 do true
+    else
+      let x = pos(i % 64)
+      let z = pos(i / 64)
+      if Math.sqrt(x *. x +. z *. z) > 108.0 && At.height_at(a, x, z) > 0.0 do false else far_go(a, i + 1) end
+    end
+  end
+
+  pfn above_go(a : Strata.Atlas.Atlas, i : Int, n : Int) : Int do
+    if i >= 4096 do n else above_go(a, i + 1, if At.height_ij(a, i % 64, i / 64) > 0.0 do n + 1 else n end) end
+  end
+
+  -- a bit set per region id found on land; false if land has a region outside 0..4
+  pfn regions_go(a : Strata.Atlas.Atlas, i : Int, bits : Int) : Int do
+    if i >= 4096 do bits
+    else
+      let r = At.region_ij(a, i % 64, i / 64)
+      let land = At.height_ij(a, i % 64, i / 64) > 0.0
+      if land && (r < 0 || r > 4) do 0 - 1
+      else if land do regions_go(a, i + 1, int_or(bits, int_shl(1, r)))
+      else if r != 0 - 1 do 0 - 1
+      else regions_go(a, i + 1, bits) end end end
+    end
+  end
+
+  pfn lerp_go(a : Strata.Atlas.Atlas, i : Int) : Bool do
+    if i >= 63 * 63 do true
+    else
+      let ci = i % 63
+      let cj = i / 63
+      let h00 = At.height_ij(a, ci, cj)
+      let h10 = At.height_ij(a, ci + 1, cj)
+      let h01 = At.height_ij(a, ci, cj + 1)
+      let mid_x = At.height_at(a, pos(ci) +. 2.0, pos(cj))
+      let mid_z = At.height_at(a, pos(ci), pos(cj) +. 2.0)
+      let own = At.height_at(a, pos(ci), pos(cj))
+      if Math.abs(own -. h00) < 0.0001 && Math.abs(mid_x -. (h00 +. h10) *. 0.5) < 0.0001 && Math.abs(mid_z -. (h00 +. h01) *. 0.5) < 0.0001 do lerp_go(a, i + 5) else false end
+    end
+  end
+
+  describe "Atlas" do
+    test "the sea surrounds the island, and some land is above it" do
+      let a = At.build(small(), 7)
+      Test.assert_true(far_go(a, 0), "nothing above sea beyond the island radius plus two steps")
+      Test.assert_true(above_go(a, 0, 0) > 100, "an island")
+    end
+    test "regions cover the island and only the island" do
+      let a = At.build(small(), 7)
+      Test.assert_true(regions_go(a, 0, 0) == 31, "every region 0..4 appears, none in the sea")
+      Test.assert_true(At.region_at(a, 10000.0, 10000.0) == 0 - 1, "beyond the grid")
+    end
+    test "height_at is bilinear between samples" do
+      Test.assert_true(lerp_go(At.build(small(), 7), 0), "own value at a sample, the mean halfway")
+    end
+    test "beyond the grid the height is sea minus 20" do
+      let a = At.build(At.def(64, 4.0, 100.0, 40.0, 5, 12.0), 7)
+      Test.assert_true(At.height_at(a, 10000.0, 10000.0) == 0.0 -. 8.0, "sea - 20")
+      Test.assert_true(At.height_at(a, 0.0 -. 10000.0, 3.0) == 0.0 -. 8.0, "sea - 20 on the other side")
+    end
+    test "the layers a later task fills answer their none values" do
+      let a = At.build(small(), 7)
+      Test.assert_true(At.lake_at(a, 0.0, 0.0) == 0.0 -. 1.0, "no lake")
+      Test.assert_true(At.river_width_at(a, 0.0, 0.0) == 0.0, "no river")
+      Test.assert_true(At.drainage_at(a, 0.0, 0.0) == 0.0, "no drainage")
+    end
+    test "the same seed gives the same atlas, another seed a different one" do
+      Test.assert_true(At.hash(At.build(small(), 7)) == At.hash(At.build(small(), 7)), "same")
+      Test.assert_true(At.hash(At.build(small(), 7)) != At.hash(At.build(small(), 8)), "different")
+      Test.assert_true(At.hash(At.build(small(), 7)) != At.hash(At.build(At.def(64, 4.0, 100.0, 40.0, 5, 1.0), 7)), "the Def counts")
+    end
+    test "a layer image is a P6 header and three bytes a sample" do
+      let a = At.build(small(), 7)
+      let header = "P6\n64 64\n255\n"
+      let want = string_byte_length(header) + 3 * 64 * 64
+      Test.assert_true(string_byte_length(At.layer_ppm(a, 0)) == want, "height")
+      Test.assert_true(string_byte_length(At.layer_ppm(a, 1)) == want, "region")
+      Test.assert_true(string_starts_with(At.layer_ppm(a, 4), header), "river width")
+    end
+  end
+end
