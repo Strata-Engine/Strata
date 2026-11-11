@@ -893,6 +893,9 @@ int64_t sv_open(int64_t w, int64_t h, int64_t capture_mouse, int64_t quad_capaci
     if (!glfwInit()) { die("glfwInit", 0); return 0; }
     if (!glfwVulkanSupported()) { die("glfwVulkanSupported (is the Vulkan loader installed?)", 0); return 0; }
     glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
+    /* STRATA_PIXELS=1: the size asked for is in pixels, whatever the display's
+     * scale, so a scripted run draws the same image on any screen */
+    if (getenv("STRATA_PIXELS") && getenv("STRATA_PIXELS")[0] == '1') glfwWindowHint(GLFW_COCOA_RETINA_FRAMEBUFFER, GLFW_FALSE);
     g.win = glfwCreateWindow((int)w, (int)h, "Strata", NULL, NULL);
     if (!g.win) { die("glfwCreateWindow", 0); return 0; }
     glfwSetKeyCallback(g.win, on_key);

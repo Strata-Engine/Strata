@@ -29,7 +29,8 @@ the shaders (`native/build_shaders.sh`).
 
 In the viewer: W A S D move, the mouse looks, space jumps, F switches
 between walking and flying (space and left shift then rise and sink), left
-click carves a sphere, right click builds one, escape quits. `L` steps
+click carves a sphere, right click builds one, escape quits. Carve the
+rim of a lake in the hills and it drains. `L` steps
 through the light modes and `[` and `]` lower and raise the sun.
 
 Environment switches for scripted runs are listed at the top of
@@ -74,6 +75,41 @@ Costs and what misses its target are in `RESULTS.md`.
 ![A lake at a low sun](docs/light-lake.png)
 ![Snow and ice on high ground](docs/light-snow.png)
 ![Lanterns at dusk](docs/light-lantern.png)
+
+## Fluids
+
+Water is a finite amount that moves. Dig out the bank of a lake and it runs
+downhill, pools in any hollow, and otherwise carries on to the sea, while
+the lake's surface drops as one level sheet. Design:
+`docs/2026-11-10-fluid-design.md`.
+
+A fluid is a family of eight block states, one per eighth of a voxel it
+fills, so it is ordinary blocks changed by ordinary edits: meshing, lighting
+and collision follow with no path of their own.
+
+```march
+-- eight states of water; a sea block that swallows what reaches it
+let (reg1, lake) = match Strata.Blocks.register_fluid(reg0, water_def) do Ok(p) -> p  Err(_) -> (reg0, 0) end
+let fluid0 = Strata.Fluid.new(reg1, Cons((lake, Strata.Fluid.flowing()), Cons((sea, Strata.Fluid.sink()), Nil)))
+
+-- every edit the game makes: tell the fluid
+let o = Strata.Edit.fill_sphere(Strata.Stream.world(s), x, y, z, 4, 0)
+let s1 = Strata.Stream.apply(s, o)
+let f1 = Strata.Fluid.wake(f, Strata.Edit.world(o), o)
+
+-- ten times a second: end the step begun last time, begin the next
+let (f2, s2) = Strata.Fluid.finish(job, f1, s1)
+let (f3, job2) = Strata.Fluid.begin(f2, Strata.Stream.world(s2), focus)
+-- Strata.Fluid.events(f2) says where water fell, how much, and how far: spray and sound
+```
+
+A step is worked out on a worker and costs the frame about half a
+millisecond. `Strata.Fluid.step` does one at once instead, for tools and
+tests. `Strata.Render.spray` draws particles that fly on the clock; the
+viewer feeds it from the fluid's events.
+
+![A breached lake draining](docs/fluid-lake.png)
+![The same breach from below](docs/fluid-waterfall.png)
 
 ## Using it from a game
 
@@ -132,6 +168,7 @@ let s4 = Strata.Stream.apply(s3, Strata.Edit.fill_sphere(Strata.Stream.world(s3)
 | `Strata.Edit` | single, list, box and sphere edits |
 | `Strata.Stream` | loading around focus points; task-built chunks and meshes |
 | `Strata.Query` | raycast and swept box collision |
+| `Strata.Fluid` | finite fluids: fall, run to a drop, stay level, sink, rest |
 | `Strata.Slots`, `Strata.Render` | renderer slot bookkeeping; keeping the renderer in step with a stream |
 | `Strata.Model` | a model block's drawing geometry |
 | `Strata.Ffi.Vk` | window, input and the Vulkan renderer |
@@ -139,7 +176,14 @@ let s4 = Strata.Stream.apply(s3, Strata.Edit.fill_sphere(Strata.Stream.world(s3)
 
 ## Known limits
 
-- No save format: edited chunks stay in memory.
+- No save format: edited chunks stay in memory. A save would have to keep
+  the fluid's active cells too.
+- Water has no pressure: it does not rise in a pipe or push uphill behind a
+  dam. It leaves a lake only over the lip of its outlet, so a big lake
+  takes minutes to drain, and a wet bed keeps a film of an eighth or two.
+- Water moves only in loaded chunks; at the edge of the loaded world it
+  waits.
+- Spray is a picture: it meets nothing and carries no water.
 - Lighting reaches as far as the stream does and no further: nothing outside
   the loaded chunks casts a shadow or is reflected.
 - One bounce of light. No light shafts, no refraction, no coloured shadows

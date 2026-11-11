@@ -420,3 +420,36 @@ vertex shader; one draw (two where the ring wraps), only when any are live.
 Measured with the machine under a load average of 29, so both rows are slow;
 the difference, 0.3 ms for a full ring, is what the particles cost. The
 target (50 000 live at 120 fps or better) is met.
+
+## Task 7: fluids, measured against their targets
+
+| target | result | |
+|---|---|---|
+| main-thread time per fluid step: 2 ms | 0.2 to 0.7 ms presenting; up to 3.5 ms offscreen, where six frames are shorter than the worker's step and the frame waits for it | met presenting |
+| active cells a step (cap): 4096 | never reached by the test lake (about 1500 at most) | not exercised |
+| worst frame while a lake drains: 16.7 ms | 15.9 ms (soak, offscreen, 3000 frames, everything lit) | met |
+| lake empty: 2 minutes | 5.5 minutes for 10 280 voxels | missed |
+| what is left: under 2%, no cell over an eighth | 3.1%, a film on the bed | missed |
+| at rest: within 5 seconds of the last change | on the next step | met |
+| water conserved | exactly, in every property test; the soak's lake only ever falls | met |
+| 50 000 live particles at 120 fps | a full ring of 65 536 costs 0.3 ms of GPU time | met |
+
+What moving water costs the lighting, offscreen at 2560 x 1378 (the display
+this was run on is smaller than the 2560 x 1600 used before):
+
+| view | GPU, water at rest | GPU, lake draining |
+|---|---|---|
+| over the lake | 6.7 ms | 9.2 ms |
+| the valley below, waterfall in view | 3.3 ms | 8.2 ms |
+
+Each fluid step is an edit, and an edit makes nearby pixels sample every
+frame instead of one in four until they settle; with water moving ten times
+a second they never do. This is the largest cost fluids add.
+
+The soak now circles the test lake, breaches it at frame 300, and runs
+offscreen by default: presenting to a display that is asleep or hidden,
+MoltenVK holds a frame for a whole second.
+
+Found on the way (GAPS S15): passing the shared block registry into the
+mesher's per-face function made meshing seven times slower. The soak caught
+it; chunk streaming is back to 0.27 s for 1183 chunks.

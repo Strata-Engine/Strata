@@ -89,3 +89,13 @@ headers they include. A change to `native/strata_shaders.h` alone (a shader
 edit) produced a binary with the old shaders. Workaround:
 `native/build_shaders.sh` rewrites a stamp line in `strata_vk.c` with the
 header's hash.
+
+## S15: a value shared by worker tasks is slow to pass around a hot loop
+
+`Strata.Mesh` ran seven times slower (1183 chunks in 1.95 s, from 0.27 s)
+when the block registry was passed down to the per-face function, although
+only fluid faces used it. The registry is one value shared by all eight
+meshing tasks; handing it to a function 200 000 times a chunk on each of
+them is, it seems, a reference-count update on shared memory each time.
+Workaround: read what the faces need from the registry once per chunk into
+arrays the task owns, and pass those.
