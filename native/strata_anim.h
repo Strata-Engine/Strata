@@ -183,6 +183,7 @@ typedef struct {
     float pos[3], q[4];
     int32_t proc;                /* the first of its procedural records, -1 for none */
     float drop;                  /* metres the root is lowered after the layers */
+    float drop_goal, drop_rate;  /* where the drop is moving and how fast (metres a second; 0 holds) */
     AnLayer layer[AN_LAYERS];
 } AnFig;
 typedef struct { float u; int32_t fig, layer, tag; float weight; } AnEvent;   /* u: how far through the update */
@@ -670,6 +671,12 @@ static inline void an_advance(AnWorld *w, AnFig *f, float dt) {
             }
         }
     }
+    /* the drop moving toward its goal at its speed */
+    if (f->drop_rate > 0) {
+        float step = f->drop_rate * dt, d = f->drop_goal - f->drop;
+        if (fabsf(d) <= step) f->drop = f->drop_goal;
+        else f->drop += d > 0 ? step : -step;
+    }
     /* reach weights fading; one that has faded to 0 is let go */
     for (int32_t *link = &f->proc; *link >= 0;) {
         AnProc *p = &w->procs[*link];
@@ -1146,8 +1153,19 @@ static inline void an_drop(AnWorld *w, int fig, float metres) {
     AnFig *f = an_fig(w, fig);
     if (!f) { an_refuse(w, AN_R_FIGURE); return; }
     if (!isfinite(metres)) { an_refuse(w, AN_R_VALUE); return; }
-    f->drop = metres;
+    f->drop = f->drop_goal = metres;
+    f->drop_rate = 0;
     f->dirty = 1;
+}
+/* the drop moving toward metres at speed metres a second through the
+ * updates (speed 0 or less: at once) */
+static inline void an_drop_to(AnWorld *w, int fig, float metres, float speed) {
+    AnFig *f = an_fig(w, fig);
+    if (!f) { an_refuse(w, AN_R_FIGURE); return; }
+    if (!isfinite(metres) || !isfinite(speed)) { an_refuse(w, AN_R_VALUE); return; }
+    if (speed <= 0) { an_drop(w, fig, metres); return; }
+    f->drop_goal = metres;
+    f->drop_rate = speed;
 }
 
 /* a part's origin in world space before the springs: stage 1 with the drop,
@@ -1186,11 +1204,16 @@ static inline uint64_t an_hash(const AnWorld *w) {
         p = (const unsigned char *)an_fig_mats(w, f);
         size_t len = (size_t)w->rigs[f->rig].nparts * 12 * sizeof(float);
         for (size_t i = 0; i < len; i++) { h ^= p[i]; h *= 1099511628211ull; }
-        for (int i = f->proc; i >= 0; i = w->procs[i].next) {   /* spring state: what the matrices do not show */
+        /* what the matrices do not show: the drop and its motion, and every
+         * procedural record (spring state, reach fades, settings), in list order */
+        float dr[3] = {f->drop, f->drop_goal, f->drop_rate};
+        p = (const unsigned char *)dr;
+        for (size_t i = 0; i < sizeof dr; i++) { h ^= p[i]; h *= 1099511628211ull; }
+        for (int i = f->proc; i >= 0; i = w->procs[i].next) {
             const AnProc *q = &w->procs[i];
-            if (q->kind != AN_K_SPRING) continue;
-            unsigned char tag[2] = {q->slot, q->fresh};
-            for (size_t k = 0; k < 2; k++) { h ^= tag[k]; h *= 1099511628211ull; }
+            unsigned char tag[8] = {q->kind, q->slot, q->n, q->fresh, (unsigned char)q->chain[0], (unsigned char)q->chain[1],
+                                    (unsigned char)q->chain[2], (unsigned char)q->chain[3]};
+            for (size_t k = 0; k < sizeof tag; k++) { h ^= tag[k]; h *= 1099511628211ull; }
             p = (const unsigned char *)q->v;
             for (size_t k = 0; k < sizeof q->v; k++) { h ^= p[k]; h *= 1099511628211ull; }
         }

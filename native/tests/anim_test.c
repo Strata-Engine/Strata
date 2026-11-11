@@ -730,6 +730,49 @@ static void test_proc_removed(void) {
     an_close(w);
 }
 
+/* a reach fading out and a drop moving: nudge = 1 changes the fade speed, 2 the drop's speed, 3 the drop's goal */
+static uint64_t carried_script(int nudge) {
+    AnWorld *w = an_open(4);
+    int rig = leg(w);
+    int f = an_spawn(w, rig);
+    int32_t ch[3] = {1, 2, 3};
+    float t[3] = {0.5f, -1.5f, 0.3f}, pole[3] = {0, -1, 5};
+    an_reach(w, f, 0, ch, t, pole, 1);
+    an_drop_to(w, f, 0.3f, 2.0f);
+    an_update(w, 1.0f / 60);
+    an_reach_to(w, f, 0, NULL, NULL, NULL, 0, 0.15f);
+    an_update(w, 1.0f / 60);
+    for (int i = w->figs[0].proc; i >= 0; i = w->procs[i].next)
+        if (w->procs[i].kind == AN_K_REACH && nudge == 1) w->procs[i].v[8] += 0.5f;   /* the same matrices, a different fade */
+    if (nudge == 2) w->figs[0].drop_rate += 0.5f;
+    if (nudge == 3) w->figs[0].drop_goal += 0.1f;
+    uint64_t h = an_hash(w);
+    an_close(w);
+    return h;
+}
+
+static void test_carried_hash(void) {
+    uint64_t a = carried_script(0), b = carried_script(0);
+    CHECK(a == b, "a fading reach and a moving drop repeat");
+    CHECK(a != carried_script(1), "a reach's fade progress is in the hash");
+    CHECK(a != carried_script(2) && a != carried_script(3), "the drop's goal and speed are in the hash");
+}
+
+static void test_drop_to(void) {
+    AnWorld *w = an_open(2);
+    int rig = leg(w);
+    int f = an_spawn(w, rig);
+    an_drop_to(w, f, 0.3f, 2.0f);
+    an_update(w, 1.0f / 60);
+    CHECK(near(an_matrices(w, f)[10], -2.0f / 60, 1e-5f), "a drop toward 0.3 at 2 m/s moves 1/30 m in one update");
+    an_update(w, 0.2f);
+    CHECK(near(an_matrices(w, f)[10], -0.3f, 1e-6f), "and stops at its goal");
+    an_drop_to(w, f, 0.1f, 0);
+    an_update(w, 1.0f / 60);
+    CHECK(near(an_matrices(w, f)[10], -0.1f, 1e-6f), "speed 0 sets it at once");
+    an_close(w);
+}
+
 int main(void) {
     test_sampling();
     test_antipodal();
@@ -748,6 +791,8 @@ int main(void) {
     test_spring();
     test_spring_hash();
     test_proc_removed();
+    test_carried_hash();
+    test_drop_to();
     if (fails == 0) printf("anim_test: ok\n");
     return fails == 0 ? 0 : 1;
 }

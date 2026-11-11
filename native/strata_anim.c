@@ -12,7 +12,7 @@
  * world's ids are contiguous and an_x_play / an_x_blend translate a rig's
  * mask number to the world's id. -1 means every part. */
 /* Rewritten by stamp_anim.sh whenever strata_anim.h changes (GAPS S14). */
-#define STRATA_ANIM_STAMP "14510560aff033f9"
+#define STRATA_ANIM_STAMP "39a6e2726d0946ad"
 #include <stdint.h>
 #include "strata_anim.h"
 
@@ -164,6 +164,8 @@ void an_x_spring(int64_t fig, int64_t part, double stiffness, double damping) {
     if (g_w) an_spring(g_w, (int)fig, (int)part, (float)stiffness, (float)damping);
 }
 void an_x_drop(int64_t fig, double metres) { if (g_w) an_drop(g_w, (int)fig, (float)metres); }
+/* the drop moving toward metres at speed metres a second (0: at once) */
+void an_x_drop_to(int64_t fig, double metres, double speed) { if (g_w) an_drop_to(g_w, (int)fig, (float)metres, (float)speed); }
 /* part's world origin into a caller-owned NativeF32Arr of 3: stage 0 the
  * animated pose (layers and overrides), 1 before the springs. 1, or 0 if no
  * such figure or part (or the array is short). */
