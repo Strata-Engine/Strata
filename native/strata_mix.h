@@ -25,6 +25,7 @@
 #define SM_REC_FIRST 2048        /* recording ids 2048..4095 */
 #define SM_RECS 2048
 #define SM_GROUPS 4
+#define SM_OCC_GLIDE (SM_RATE / 10)   /* muffling glides to a new value over 100 ms, the acoustics' update interval */
 #define SM_LIMIT 0.8912f         /* -1 dBFS */
 #ifndef SM_PI
 #define SM_PI 3.14159265358979323846
@@ -123,7 +124,8 @@ typedef struct {
     int fading; int64_t fade_left, fade_len;
     /* in the world */
     int flat; float pos[3], ref, maxd, prio;
-    float occ_gain, occ_cut;       /* set by OCCLUDE (muffling through blocks) */
+    float occ_gain, occ_cut;       /* muffling through blocks, as it is now */
+    float occ_gain_from, occ_cut_from, occ_gain_to, occ_cut_to; int occ_left;   /* gliding to OCCLUDE's values over SM_OCC_GLIDE */
     float loud;                    /* this block's rank: how loud it would be at the listener */
     int mixed;                     /* mixed last block: entering or leaving the mix fades */
     float coef[16];                /* last block's bus gains, to glide from */
@@ -309,7 +311,12 @@ static inline void sm_command(SmMixer *m, const SmCmd *c) {
         break; }
     case SM_OP_OCCLUDE: {
         SmVoice *v = sm_find(m, c->voice);
-        if (v) { v->occ_gain = sm_clampf(c->f[0], 0.0f, 1.0f); v->occ_cut = sm_clampf(c->f[1], 200.0f, 20000.0f); }
+        if (v) {
+            float g = sm_clampf(c->f[0], 0.0f, 1.0f), cu = sm_clampf(c->f[1], 200.0f, 20000.0f);
+            if (v->age == 0) { v->occ_gain = g; v->occ_cut = cu; v->occ_left = 0; }   /* not yet heard: at once */
+            else { v->occ_gain_from = v->occ_gain; v->occ_cut_from = v->occ_cut; v->occ_left = SM_OCC_GLIDE; }
+            v->occ_gain_to = g; v->occ_cut_to = cu;
+        }
         break; }
     case SM_OP_LISTENER: sm_listener(m, c->f); break;
     case SM_OP_OUTPUT: m->headphones = c->a == 1; break;
@@ -574,7 +581,15 @@ static inline void sm_sh(float X, float Y, float Z, float *o) {
 static inline int sm_sh_odd(int k) { int n = k < 1 ? 0 : k < 4 ? 1 : k < 9 ? 2 : 3; return k - n * (n + 1) < 0; }
 
 /* place a positional voice's mono block: air absorption, distance, then the bus (headphones) or a pan (speakers) */
+static inline void sm_occ_step(SmVoice *v, int frames) {
+    if (v->occ_left <= 0) return;
+    v->occ_left = v->occ_left > frames ? v->occ_left - frames : 0;
+    float t = 1.0f - (float)v->occ_left / (float)SM_OCC_GLIDE;
+    v->occ_gain = v->occ_gain_from + (v->occ_gain_to - v->occ_gain_from) * t;
+    v->occ_cut = v->occ_cut_from * powf(v->occ_cut_to / v->occ_cut_from, t);
+}
 static inline void sm_place(SmMixer *m, SmVoice *v, float *out, int frames) {
+    sm_occ_step(v, frames);
     float d[3] = { v->pos[0] - m->lis[0], v->pos[1] - m->lis[1], v->pos[2] - m->lis[2] };
     float dist = sqrtf(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
     float X = 1.0f, Y = 0.0f, Z = 0.0f;
@@ -653,7 +668,7 @@ static inline void sm_mix_block(SmMixer *m, float *out, int frames, int *playing
             }
             v->mixed = want;
             if (want) mixed++;
-        } else ended = sm_voice_skip(v, frames);
+        } else { sm_occ_step(v, frames); ended = sm_voice_skip(v, frames); }
         if (ended) sm_voice_release(v);
         else (*playing)++;
     }

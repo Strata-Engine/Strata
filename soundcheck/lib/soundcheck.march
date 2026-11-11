@@ -107,6 +107,36 @@ mod Soundcheck do
   end
   pfn load64() : List(Ev) do Cons(Ev(0.0, output(true)), Cons(Ev(0.0, face()), Cons(Ev(0.0, up(rich())), ring_go(0, Nil)))) end
 
+  -- a hand-built world: stone (id 1) and air, chunks -2..1 on each axis loaded
+  pfn stone_reg() : Strata.Blocks.Registry do
+    match Strata.Blocks.register(Strata.Blocks.empty(), Strata.Blocks.def()) do
+      Ok((r, _)) -> r
+      Err(_) -> Strata.Blocks.empty()
+    end
+  end
+  pfn load_go(w : Strata.World.World, i : Int) : Strata.World.World do
+    if i >= 64 do w else load_go(Strata.World.insert(w, Strata.Coord.key(i % 4 - 2, (i / 4) % 4 - 2, i / 16 - 2), Strata.Chunk.uniform(0)), i + 1) end
+  end
+  pfn built() : Strata.World.World do load_go(Strata.World.new(stone_reg(), Strata.Terrain.gen(fn (k, seed) -> Strata.Chunk.uniform(0)), 1, 1.0), 0) end
+  -- a stone wall 2 m thick, 7 m wide, between z = -6 and -5
+  pfn walled() : Strata.World.World do Strata.Edit.world(Strata.Edit.fill_box(built(), -3, -10, -6, 3, 10, -5, 1)) end
+
+  -- wall: pink noise passing behind the wall, left to right, 10 m out, and back
+  pfn pass_go(i : Int, n : Int, acc : List(Ev)) : List(Ev) do
+    if i > n do acc
+    else
+      let t = int_to_float(i) *. frame()
+      let x = if t < 4.0 do -16.0 +. 8.0 *. t else 48.0 -. 8.0 *. t end
+      pass_go(i + 1, n, Cons(Ev(t, mv(1, x, 0.5, -10.5)), acc))
+    end
+  end
+  pfn wall_scene() : List(Ev) do
+    Cons(Ev(0.0, face()), Cons(Ev(0.0, up(noise_patch())), Cons(Ev(0.0, at(1, -16.0, 0.5, -10.5, 1.0)), List.reverse(pass_go(1, 480, Nil)))))
+  end
+
+  -- the world a scene plays in
+  pfn world_of(name : String) : Strata.World.World do if name == "wall" do walled() else world() end end
+
   -- a scene: its events and its length in seconds
   pfn scene(name : String) : (List(Ev), Float) do
     if name == "blocks" do (blocks_go(1), 4.5)
@@ -116,7 +146,8 @@ mod Soundcheck do
     else if name == "orbit-headphones" do (orbit(true), 8.0)
     else if name == "distance" do (distance(), 8.0)
     else if name == "load64" do (load64(), 3.0)
-    else (Nil, 0.0) end end end end end end end
+    else if name == "wall" do (wall_scene(), 8.0)
+    else (Nil, 0.0) end end end end end end end end
   end
 
   @[no_warn_recursion]
@@ -218,12 +249,35 @@ mod Soundcheck do
     end end
   end
 
+  -- what an acoustics update costs: 64 voices round the wall, 20 times
+  pfn ring_voices(i : Int, acc : List((Int, Float, Float, Float))) : List((Int, Float, Float, Float)) do
+    if i >= 64 do acc
+    else
+      let a = int_to_float(i) *. 0.0981747704
+      ring_voices(i + 1, Cons((i + 1, 20.0 *. Math.cos(a), 0.5, 20.0 *. Math.sin(a)), acc))
+    end
+  end
+  pfn time_jobs(w : Strata.World.World, vs : List((Int, Float, Float, Float)), n : Int, acc : Int) : Int do
+    if n <= 0 do acc
+    else time_jobs(w, vs, n - 1, acc + List.length(Strata.Acoustics.finish(Strata.Acoustics.begin(w, Strata.World.registry(w), (0.5, 0.5, 0.5), vs)))) end
+  end
+  pfn acoustics64() : Int do
+    let w = walled()
+    let vs = ring_voices(0, Nil)
+    let t0 = sys_uptime_ms()
+    let answered = time_jobs(w, vs, 20, 0)
+    let t1 = sys_uptime_ms()
+    println("acoustics64: " ++ int_to_string(answered) ++ " answers; " ++ float_to_string(int_to_float(t1 - t0) /. 20.0) ++ " ms an update for 64 voices (5 walks each)")
+    if answered == 64 * 20 do 0 else 1 end
+  end
+
   fn main(_cap : Cap(IO)) : Unit do
     let name = Env.get("SOUNDCHECK_SCENE", "")
     let out = Env.get("SOUNDCHECK_OUT", "soundcheck.wav")
     if name == "nodevice" do process_exit(nodevice())
     else if name == "recording" do process_exit(recording(out))
     else if name == "budget" do process_exit(budget(out))
+    else if name == "acoustics64" do process_exit(acoustics64())
     else
       match scene(name) do
         (evs, secs) ->
@@ -235,11 +289,11 @@ mod Soundcheck do
             process_exit(1)
           else
             let frames = float_to_int(secs /. frame())
-            let s = run(evs, Sn.new(), world(), Strata.Fluid.new(Strata.Blocks.empty(), Nil), 0, frames)
+            let s = run(evs, Sn.new(), world_of(name), Strata.Fluid.new(Strata.Blocks.empty(), Nil), 0, frames)
             Strata.Ffi.Audio.close()
             println("soundcheck: " ++ name ++ " -> " ++ out ++ " (" ++ int_to_string(frames) ++ " frames, " ++ int_to_string(Sn.refused(s)) ++ " refused, mixing " ++ float_to_string(Math.round(Strata.Ffi.Audio.stat(5) *. 1000.0) /. 10.0) ++ "% of real time)")
           end end
       end
-    end end end
+    end end end end
   end
 end

@@ -1,0 +1,127 @@
+-- Acoustics: sound through the blocks. A walk sums what each voxel crossed
+-- cuts; occlusion takes the least obstructed of five paths.
+mod AcousticsTest do
+  needs IO.Clock      -- charged to every test module once any uses Check.all (GAPS S3)
+  needs IO.Process
+  needs IO.Spawn
+
+  alias Strata.Acoustics as Ac
+  alias Strata.Blocks as Bac
+  alias Strata.Coord as Cac
+  alias Strata.Chunk as Chac
+
+  -- 1 stone; 2 leaves (see-through, cutout); 3 wool (absorbent, set by the game)
+  pfn reg() : Strata.Blocks.Registry do
+    let leaves = Bac.with_layer(Bac.with_opacity(Bac.def(), Strata.Blocks.SeeThrough), Strata.Blocks.Cutout)
+    let wool = Bac.with_sound(Bac.def(), 230, 30, 255)
+    match Bac.register(Bac.empty(), Bac.def()) do
+      Ok((r1, _)) -> match Bac.register(r1, leaves) do
+        Ok((r2, _)) -> match Bac.register(r2, wool) do
+          Ok((r3, _)) -> r3
+          Err(_) -> r2
+        end
+        Err(_) -> r1
+      end
+      Err(_) -> Bac.empty()
+    end
+  end
+
+  -- an air world at [scale], with chunks -2..1 on each axis loaded
+  pfn load_all(w : Strata.World.World, i : Int) : Strata.World.World do
+    if i >= 64 do w
+    else load_all(Strata.World.insert(w, Cac.key(i % 4 - 2, (i / 4) % 4 - 2, i / 16 - 2), Chac.uniform(0)), i + 1) end
+  end
+  pfn air(scale : Float) : Strata.World.World do
+    load_all(Strata.World.new(reg(), Strata.Terrain.gen(fn (k, seed) -> Chac.uniform(0)), 1, scale), 0)
+  end
+  pfn fill(w : Strata.World.World, x0 : Int, y0 : Int, z0 : Int, x1 : Int, y1 : Int, z1 : Int, id : Int) : Strata.World.World do
+    Strata.Edit.world(Strata.Edit.fill_box(w, x0, y0, z0, x1, y1, z1, id))
+  end
+  pfn near(a : Float, b : Float, tol : Float) : Bool do a -. b <= tol && b -. a <= tol end
+  pfn db(g : Float) : Float do 20.0 *. Math.log10(if g < 0.000000001 do 0.000000001 else g end) end
+
+  -- the same walk by brute force: 1 cm steps, each voxel's loss a metre times the step
+  pfn brute(w : Strata.World.World, x0 : Float, y0 : Float, z0 : Float, x1 : Float, y1 : Float, z1 : Float, i : Int, n : Int, acc : Float) : Float do
+    if i >= n do acc
+    else
+      let t = (int_to_float(i) +. 0.5) /. int_to_float(n)
+      let sc = Strata.World.scale(w)
+      let vx = float_to_int(Math.floor((x0 +. (x1 -. x0) *. t) /. sc))
+      let vy = float_to_int(Math.floor((y0 +. (y1 -. y0) *. t) /. sc))
+      let vz = float_to_int(Math.floor((z0 +. (z1 -. z0) *. t) /. sc))
+      let len = Math.sqrt((x1 -. x0) *. (x1 -. x0) +. (y1 -. y0) *. (y1 -. y0) +. (z1 -. z0) *. (z1 -. z0)) /. int_to_float(n)
+      match Bac.sound_of(Strata.World.registry(w), Strata.World.get_block(w, vx, vy, vz)) do
+        (_, loss, _) -> brute(w, x0, y0, z0, x1, y1, z1, i + 1, n, acc +. int_to_float(loss) *. len)
+      end
+    end
+  end
+
+  pfn loss_of(p : (Float, Float)) : Float do match p do (l, _) -> l end end
+
+  describe "Strata.Acoustics" do
+    test "a walk through 3 m of stone loses 75 dB, of leaves 12, of air nothing" do
+      let w = fill(fill(air(1.0), 2, 0, 0, 4, 3, 3, 1), 2, 10, 0, 4, 13, 3, 2)
+      Test.assert_true(near(loss_of(Ac.walk(w, 0.5, 1.5, 1.5, 7.5, 1.5, 1.5)), 75.0, 1.0), "stone")
+      Test.assert_true(near(loss_of(Ac.walk(w, 0.5, 11.5, 1.5, 7.5, 11.5, 1.5)), 12.0, 1.0), "leaves")
+      Test.assert_true(near(loss_of(Ac.walk(w, 0.5, 20.5, 1.5, 7.5, 20.5, 1.5)), 0.0, 0.01), "air")
+    end
+    test "the same wall at 10 cm voxels loses the same" do
+      let w = fill(air(0.1), 20, 0, 0, 49, 9, 9, 1)
+      Test.assert_true(near(loss_of(Ac.walk(w, 0.5, 0.5, 0.5, 6.5, 0.5, 0.5)), 75.0, 1.0), "30 voxels of 10 cm")
+    end
+    test "an unloaded chunk is air" do
+      let w = fill(air(1.0), 2, 0, 0, 4, 3, 3, 1)
+      Test.assert_true(near(loss_of(Ac.walk(w, 0.5, 1.5, 1.5, 200.5, 1.5, 1.5)), 75.0, 1.0), "only the loaded wall counts")
+    end
+    test "the walk agrees with a brute-force sum" do
+      Check.all(Gen.tuple2(Gen.int(0, 1000000), Gen.int(0, 1000000)), fn p ->
+        match p do
+          (a, b) ->
+            let w = fill(fill(air(1.0), a % 7, b % 5, 0, a % 7 + 3, b % 5 + 6, 15, 1), 8, (a / 7) % 9, 2, 12, 15, 9, 2)
+            let x0 = int_to_float(a % 16) +. 0.3
+            let y0 = int_to_float((a / 16) % 16) +. 0.7
+            let z0 = int_to_float(b % 16) +. 0.2
+            let x1 = int_to_float((b / 16) % 16) +. 0.6
+            let y1 = int_to_float((a / 256) % 16) +. 0.1
+            let z1 = int_to_float((b / 256) % 16) +. 0.9
+            near(loss_of(Ac.walk(w, x0, y0, z0, x1, y1, z1)), brute(w, x0, y0, z0, x1, y1, z1, 0, 3000, 0.0), 2.0)
+        end)
+    end
+    test "behind a 2 m wall is below -40 dB; round a corner it is above -12 dB" do
+      let w = fill(air(1.0), -10, -10, 4, 10, 10, 5, 1)
+      match Ac.occlusion(w, Strata.World.registry(w), (0.5, 0.5, 0.5), (0.5, 0.5, 10.5)) do
+        (g, _) -> Test.assert_true(db(g) < -40.0, "behind the wall")
+      end
+      -- a wall reaching to x = 0 only: the straight line is blocked, a metre to the side is clear
+      let w2 = fill(air(1.0), -10, -10, 4, 0, 10, 5, 1)
+      match Ac.occlusion(w2, Strata.World.registry(w2), (0.3, 0.5, 0.5), (0.3, 0.5, 10.5)) do
+        (g, cut) ->
+          Test.assert_true(db(g) > -12.0, "round the corner, muffled not lost")
+          Test.assert_true(cut < 19000.0, "and duller")
+      end
+      match Ac.occlusion(air(1.0), reg(), (0.5, 0.5, 0.5), (0.5, 0.5, 10.5)) do
+        (g, cut) -> Test.assert_true(near(g, 1.0, 0.0001) && cut >= 19000.0, "in the open, nothing")
+      end
+    end
+    test "a listener inside stone gets finite numbers" do
+      let w = fill(air(1.0), -5, -5, -5, 5, 5, 5, 1)
+      match Ac.occlusion(w, Strata.World.registry(w), (0.5, 0.5, 0.5), (0.5, 0.5, 0.5)) do
+        (g, cut) -> Test.assert_true(g >= 0.0 && g <= 1.0 && cut >= 200.0 && cut <= 20000.0, "a finite gain and cutoff")
+      end
+    end
+    test "the job answers what occlusion answers" do
+      let w = fill(air(1.0), -10, -10, 4, 0, 10, 5, 1)
+      let vs = Cons((7, 0.3, 0.5, 10.5), Cons((9, 5.0, 0.5, 0.5), Nil))
+      let got = Ac.finish(Ac.begin(w, Strata.World.registry(w), (0.3, 0.5, 0.5), vs))
+      match got do
+        Cons((v1, g1, c1), Cons((v2, g2, c2), Nil)) ->
+          match (Ac.occlusion(w, Strata.World.registry(w), (0.3, 0.5, 0.5), (0.3, 0.5, 10.5)), Ac.occlusion(w, Strata.World.registry(w), (0.3, 0.5, 0.5), (5.0, 0.5, 0.5))) do
+            ((ga, ca), (gb, cb)) ->
+              Test.assert_true(v1 == 7 && v2 == 9, "for each voice, in order")
+              Test.assert_true(near(g1, ga, 0.0001) && near(c1, ca, 0.01) && near(g2, gb, 0.0001) && near(c2, cb, 0.01), "the same numbers")
+          end
+        _ -> Test.fail("two answers")
+      end
+    end
+  end
+end

@@ -19,10 +19,14 @@ SC=soundcheck/.march/build/release/soundcheck
 # no device: open fails, the game goes on, every record is counted
 STRATA_AUDIO_FAIL=1 SOUNDCHECK_SCENE=nodevice $SC > "$OUT/nodevice.log" 2>&1 || { echo "FAIL: nodevice"; cat "$OUT/nodevice.log"; exit 1; }
 
+# what an acoustics update costs (reported, not judged here)
+SOUNDCHECK_SCENE=acoustics64 $SC > "$OUT/acoustics64.log" 2>&1 || { echo "FAIL: acoustics64"; cat "$OUT/acoustics64.log"; exit 1; }
+cat "$OUT/acoustics64.log"
+
 # a decoded budget refuses a recording past it, and counts it
 SOUNDCHECK_SCENE=budget SOUNDCHECK_OUT="$OUT/budget.wav" $SC > "$OUT/budget.log" 2>&1 || { echo "FAIL: budget"; cat "$OUT/budget.log"; exit 1; }
 
-SCENES='blocks strike tone recording orbit-speakers orbit-headphones distance load64'
+SCENES='blocks strike tone recording orbit-speakers orbit-headphones distance load64 wall'
 fail=0
 [ $UPDATE -eq 1 ] && mkdir -p "$LISTEN"
 for s in $SCENES; do

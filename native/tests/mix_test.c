@@ -379,6 +379,35 @@ static void test_space(void) {
     }
 }
 
+static void mu_occlude(SmMixer *m, int voice, float gain, float cutoff) {
+    SmCmd c; memset(&c, 0, sizeof c); c.op = SM_OP_OCCLUDE; c.voice = voice; c.f[0] = gain; c.f[1] = cutoff; sm_command(m, &c);
+}
+static void test_occlusion(void) {
+    SmMixer *m = sm_open();
+    mu_listener(m, 0, 0, 0, 0, 0, -1);
+    tone_patch(m, 1, SM_SRC_SINE, 100.0f, 0.5f);
+    mu_play_at(m, 1, 1, 1.0f, 1.0f, 0.0f, 0.0f, -1.0f);
+    render(m, SEC(0.1));
+    double before = mu_db(mu_rms(buf, SEC(0.05), SEC(0.1)));
+    mu_occlude(m, 1, 0.01f, 400.0f);
+    render(m, SEC(0.3));
+    double soon = mu_db(mu_rms(buf, 0, SEC(0.02))), later = mu_db(mu_rms(buf, SEC(0.15), SEC(0.3)));
+    CHECK(before - soon < 6.0, "muffling glides: 20 ms after it is set the level has not dropped 6 dB");
+    CHECK(before - later > 35.0, "and after 150 ms it has dropped by the 40 dB asked");
+    float jump = 0.0f; for (int i = 1; i < SEC(0.3); i++) { float d = fabsf(buf[2 * i] - buf[2 * i - 2]); if (d > jump) jump = d; }
+    CHECK(jump < 0.02f, "with no jump on the way");
+    sm_close(m);
+    /* an occluded voice ranks below a clear one of the same level */
+    m = sm_open();
+    mu_listener(m, 0, 0, 0, 0, 0, -1);
+    tone_patch(m, 1, SM_SRC_SINE, 100.0f, 0.01f);
+    for (int v = 1; v <= 65; v++) mu_play_at(m, v, 1, 1.0f, 1.0f, 0.0f, 0.0f, -2.0f);
+    mu_occlude(m, 1, 0.1f, 2000.0f);
+    render(m, SM_BLOCK * 2);
+    CHECK(!sm_is_mixed(m, 1) && sm_is_mixed(m, 65), "the muffled voice is the one left out");
+    sm_close(m);
+}
+
 int main(void) {
     test_fp();
     test_ring();
@@ -392,6 +421,7 @@ int main(void) {
     test_wav();
     test_recordings();
     test_space();
+    test_occlusion();
     if (fails == 0) printf("mix_test: ok\n");
     return fails == 0 ? 0 : 1;
 }
