@@ -109,3 +109,25 @@ traps with "index -1 out of bounds" when k is -1 (met in `Strata.Erosion`'s
 pass test). Never guard a read, or anything else that can trap or is
 costly, with `&&` or `||`; use `if k < 0 do false else ... end`. A
 suite-wide audit of existing `&&`/`||` guards is worth doing.
+
+## S17: extern functions with the same March name in two modules collide
+
+`Strata.Ffi.Audio` declared `fn x_open(...) = "sa_open"` in its extern
+block, and `Strata.Ffi.Vk` already had `fn x_open(...) = "sv_open"`. A
+program that called only the audio wrappers failed to link with
+`_sv_open` undefined: the call bound to the other module's extern of the
+same name, though each is declared in its own module and called
+unqualified. Workaround: extern names are unique across the whole program;
+the audio bindings use an `xa_` prefix. (Numbered S17 because another branch
+took S16 for `&&` and `||`.)
+
+## S18: a constructor name used in two modules confuses type inference elsewhere
+
+`Strata.Emitters` declared `type Got = Got(...)`, a private helper, and
+`Strata.Stream` already had a constructor `Got`. Both modules checked and
+tested clean, but the viewer, which compiles both, then failed on an
+unrelated line with "expected `Strata.Stream.Stream` but got `Stream`". The
+same name in two modules is reported only as a hint ("Constructor `Leaf` is
+defined by multiple types") when it is reported at all. Workaround:
+constructor names are unique across the library; `Strata.Acoustics`'s job is
+`Listening`, since `Strata.Fluid` has a `Job`.

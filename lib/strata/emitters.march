@@ -1,0 +1,156 @@
+-- Strata.Emitters — a fluid heard as a few steady sources instead of many
+-- small events. Each fluid step's events are gathered into cells of an 8 m
+-- grid; each cell is an emitter with a flow (eighths a second), a place (the
+-- flow-weighted middle of its events, in metres) and a height (how far its
+-- water fell, in metres).
+--
+-- A flow rises to a new rate in one step and falls toward it with a time
+-- constant of a second, so ten steps a second become one continuous sound.
+-- An emitter silent for two seconds is let go. Past sixteen, the quietest
+-- merges into its nearest neighbour, which then takes its cells' water too,
+-- so no flow is lost.
+--
+-- Pure, and named for what it is: it knows fluid events, not water.
+mod Strata.Emitters do
+
+  -- id, the grid cells it covers, place (m), flow now, flow the last step
+  -- asked for, height (m), seconds since it last had an event
+  type Em = Em(Int, List((Int, Int, Int)), Float, Float, Float, Float, Float, Float, Float)
+  -- clock, when the last step was fed, the last step fed, the next id, the emitters
+  type Emitters = Emitters(Float, Float, Int, Int, List(Em))
+
+  doc "The grid's cell size, in metres."
+  fn cell() : Float do 8.0 end
+  doc "The most emitters kept."
+  fn most() : Int do 16 end
+  doc "Seconds an emitter may be silent before it is let go."
+  fn silence() : Float do 2.0 end
+
+  doc "No emitters."
+  fn new() : Emitters do Emitters(0.0, -1.0, -1, 1, Nil) end
+
+  doc "The emitters: (id, x, y, z in metres, flow in eighths a second, height fallen in metres). An id stays with its emitter while it lives."
+  fn live(e : Emitters) : List((Int, Float, Float, Float, Float, Float)) do
+    match e do
+      Emitters(_, _, _, _, ems) -> List.map(ems, fn q -> match q do Em(id, _, x, y, z, f, _, h, _) -> (id, x, y, z, f, h) end)
+    end
+  end
+
+  pfn key_of(x : Float, y : Float, z : Float) : (Int, Int, Int) do
+    (float_to_int(Math.floor(x /. cell())), float_to_int(Math.floor(y /. cell())), float_to_int(Math.floor(z /. cell())))
+  end
+  pfn same_key(a : (Int, Int, Int), b : (Int, Int, Int)) : Bool do
+    match (a, b) do ((a1, a2, a3), (b1, b2, b3)) -> a1 == b1 && a2 == b2 && a3 == b3 end
+  end
+
+  -- a step's events by cell: key, eighths, and eighths-weighted sums of x, y, z and height
+  type Gathered = Gathered((Int, Int, Int), Float, Float, Float, Float, Float)
+
+  pfn gather(es : List(Strata.Fluid.Event), sc : Float, acc : List(Gathered)) : List(Gathered) do
+    match es do
+      Nil -> acc
+      Cons(ev, t) ->
+        let n = int_to_float(Strata.Fluid.ev_eighths(ev))
+        let x = (int_to_float(Strata.Fluid.ev_x(ev)) +. 0.5) *. sc
+        let y = (int_to_float(Strata.Fluid.ev_y(ev)) +. 0.5) *. sc
+        let z = (int_to_float(Strata.Fluid.ev_z(ev)) +. 0.5) *. sc
+        let h = int_to_float(Strata.Fluid.ev_fell(ev)) *. sc
+        let k = key_of(x, y, z)
+        gather(t, sc, add_got(acc, k, n, x, y, z, h, Nil))
+    end
+  end
+  pfn add_got(gs : List(Gathered), k : (Int, Int, Int), n : Float, x : Float, y : Float, z : Float, h : Float, seen : List(Gathered)) : List(Gathered) do
+    match gs do
+      Nil -> Cons(Gathered(k, n, n *. x, n *. y, n *. z, n *. h), seen)
+      Cons(Gathered(k2, n2, sx, sy, sz, sh), t) ->
+        if same_key(k, k2) do List.append(List.reverse(seen), Cons(Gathered(k2, n2 +. n, sx +. n *. x, sy +. n *. y, sz +. n *. z, sh +. n *. h), t))
+        else add_got(t, k, n, x, y, z, h, Cons(Gathered(k2, n2, sx, sy, sz, sh), seen)) end
+    end
+  end
+
+  pfn covers(q : Em, k : (Int, Int, Int)) : Bool do match q do Em(_, ks, _, _, _, _, _, _, _) -> List.any(ks, fn c -> same_key(c, k)) end end
+
+  -- what this step brought each emitter: the cells' gathered water that falls to it
+  pfn brought(gs : List(Gathered), q : Em) : (Float, Float, Float, Float, Float) do
+    List.fold_left(List.filter(gs, fn g -> match g do Gathered(k, _, _, _, _, _) -> covers(q, k) end), (0.0, 0.0, 0.0, 0.0, 0.0),
+      fn (acc, g) -> match (acc, g) do ((a, b, c, d, f), Gathered(_, n, sx, sy, sz, sh)) -> (a +. n, b +. sx, c +. sy, d +. sz, f +. sh) end)
+  end
+
+  pfn update_em(gs : List(Gathered), interval : Float, q : Em) : Em do
+    match (brought(gs, q), q) do
+      ((n, sx, sy, sz, sh), Em(id, ks, x, y, z, f, _, h, quiet)) ->
+        if n <= 0.0 do Em(id, ks, x, y, z, f, 0.0, h, quiet)
+        else
+          let rate = n /. interval
+          Em(id, ks, sx /. n, sy /. n, sz /. n, if rate > f do rate else f end, rate, sh /. n, 0.0)
+        end
+    end
+  end
+
+  pfn fresh_ems(gs : List(Gathered), ems : List(Em), interval : Float, next : Int, acc : List(Em)) : (List(Em), Int) do
+    match gs do
+      Nil -> (acc, next)
+      Cons(Gathered(k, n, sx, sy, sz, sh), t) ->
+        if n <= 0.0 || List.any(ems, fn q -> covers(q, k)) do fresh_ems(t, ems, interval, next, acc)
+        else fresh_ems(t, ems, interval, next + 1, Cons(Em(next, Cons(k, Nil), sx /. n, sy /. n, sz /. n, n /. interval, n /. interval, sh /. n, 0.0), acc)) end
+    end
+  end
+
+  pfn flow(q : Em) : Float do match q do Em(_, _, _, _, _, f, _, _, _) -> f end end
+  pfn d2(a : Em, b : Em) : Float do
+    match (a, b) do (Em(_, _, x1, y1, z1, _, _, _, _), Em(_, _, x2, y2, z2, _, _, _, _)) -> (x1 -. x2) *. (x1 -. x2) +. (y1 -. y2) *. (y1 -. y2) +. (z1 -. z2) *. (z1 -. z2) end
+  end
+  pfn id_of(q : Em) : Int do match q do Em(id, _, _, _, _, _, _, _, _) -> id end end
+
+  -- past most(), the quietest merges into its nearest neighbour
+  pfn cap(ems : List(Em)) : List(Em) do
+    if List.length(ems) <= most() do ems
+    else
+      match List.sort_by(ems, fn (a, b) -> flow(a) < flow(b)) do
+        Nil -> Nil
+        Cons(q, rest) ->
+          match List.sort_by(rest, fn (a, b) -> d2(q, a) < d2(q, b)) do
+            Nil -> Nil
+            Cons(n, _) ->
+              match (q, n) do
+                (Em(_, qk, _, _, _, qf, qt, _, _), Em(nid, nk, x, y, z, nf, nt, h, quiet)) ->
+                  cap(Cons(Em(nid, List.append(nk, qk), x, y, z, nf +. qf, nt +. qt, h, quiet), List.filter(rest, fn r -> id_of(r) != nid)))
+              end
+          end
+      end
+    end
+  end
+
+  doc "Feed fluid step [step]'s events (`Strata.Fluid.events`); [scale] is the world's metres per voxel. A step already fed is ignored, so a step the fluid dropped is not heard twice."
+  fn feed(e : Emitters, events : List(Strata.Fluid.Event), step : Int, scale : Float) : Emitters do
+    match e do
+      Emitters(clock, last, fed, next, ems) ->
+        if step == fed do e
+        else
+          let since = clock -. last
+          let interval = if last < 0.0 || since < 0.02 do 0.1 else if since > 0.5 do 0.5 else since end end
+          let gs = gather(events, scale, Nil)
+          let kept = List.map(ems, fn q -> update_em(gs, interval, q))
+          match fresh_ems(gs, kept, interval, next, Nil) do
+            (born, next2) -> Emitters(clock, clock, step, next2, cap(List.append(kept, List.reverse(born))))
+          end
+        end
+    end
+  end
+
+  pfn age(q : Em, dt : Float, k : Float) : Em do
+    match q do
+      Em(id, ks, x, y, z, f, t, h, quiet) -> Em(id, ks, x, y, z, if f > t do t +. (f -. t) *. k else f end, t, h, quiet +. dt)
+    end
+  end
+  pfn heard(q : Em) : Bool do match q do Em(_, _, _, _, _, _, _, _, quiet) -> quiet <= silence() end end
+
+  doc "Let [dt] seconds pass: flows fall toward what the last step asked, and emitters silent too long are let go."
+  fn tick(e : Emitters, dt : Float) : Emitters do
+    match e do
+      Emitters(clock, last, fed, next, ems) ->
+        let k = Math.exp(0.0 -. dt)
+        Emitters(clock +. dt, last, fed, next, List.filter(List.map(ems, fn q -> age(q, dt, k)), fn q -> heard(q)))
+    end
+  end
+end

@@ -134,8 +134,23 @@ mod Soundcheck do
     Cons(Ev(0.0, face()), Cons(Ev(0.0, up(noise_patch())), Cons(Ev(0.0, at(1, -16.0, 0.5, -10.5, 1.0)), List.reverse(pass_go(1, 480, Nil)))))
   end
 
+  -- a cave: a stone room 12 m across, shut; a field: stone ground and open sky
+  pfn cave() : Strata.World.World do
+    Strata.Edit.world(Strata.Edit.fill_box(Strata.Edit.world(Strata.Edit.fill_box(built(), -8, -4, -8, 7, 8, 7, 1)), -6, -2, -6, 5, 6, 5, 0))
+  end
+  pfn field() : Strata.World.World do Strata.Edit.world(Strata.Edit.fill_box(built(), -64, -64, -64, 63, -3, 63, 1)) end
+  -- strikes 3 m ahead, one a second, from 0.3 s, the listener standing still
+  pfn echo_scene() : List(Ev) do
+    Cons(Ev(0.0, face()), Cons(Ev(0.0, up(Sn.strike())),
+      Cons(Ev(0.3, at(1, 0.5, 0.0, -3.0, 0.9)), Cons(Ev(0.3, ctl(1, 0, 0.8)), Cons(Ev(0.3, ctl(1, 2, 0.9)),
+      Cons(Ev(1.3, at(1, 0.5, 0.0, -3.0, 0.9)), Cons(Ev(1.3, ctl(2, 0, 0.8)), Cons(Ev(1.3, ctl(2, 2, 0.9)),
+      Cons(Ev(2.3, at(1, 0.5, 0.0, -3.0, 0.9)), Cons(Ev(2.3, ctl(3, 0, 0.8)), Cons(Ev(2.3, ctl(3, 2, 0.9)), Nil)))))))))))
+  end
+
   -- the world a scene plays in
-  pfn world_of(name : String) : Strata.World.World do if name == "wall" do walled() else world() end end
+  pfn world_of(name : String) : Strata.World.World do
+    if name == "wall" do walled() else if name == "cave" do cave() else if name == "field" do field() else world() end end end
+  end
 
   -- a scene: its events and its length in seconds
   pfn scene(name : String) : (List(Ev), Float) do
@@ -147,7 +162,8 @@ mod Soundcheck do
     else if name == "distance" do (distance(), 8.0)
     else if name == "load64" do (load64(), 3.0)
     else if name == "wall" do (wall_scene(), 8.0)
-    else (Nil, 0.0) end end end end end end end end
+    else if name == "cave" || name == "field" do (echo_scene(), 3.2)
+    else (Nil, 0.0) end end end end end end end end end
   end
 
   @[no_warn_recursion]
@@ -271,6 +287,48 @@ mod Soundcheck do
     if answered == 64 * 20 do 0 else 1 end
   end
 
+  -- falls: a column of fluid kept full at [h] cells, falling onto stone, heard from 6 m at half its height
+  pfn wet_reg() : Strata.Blocks.Registry do
+    match Strata.Blocks.register_fluid(stone_reg(), Strata.Blocks.with_opacity(Strata.Blocks.def(), Strata.Blocks.SeeThrough)) do
+      Ok((r, _)) -> r
+      Err(_) -> stone_reg()
+    end
+  end
+  pfn wet_world() : Strata.World.World do
+    let w0 = load_go(Strata.World.new(wet_reg(), Strata.Terrain.gen(fn (k, seed) -> Strata.Chunk.uniform(0)), 1, 1.0), 0)
+    Strata.Edit.world(Strata.Edit.fill_box(w0, -8, -2, -8, 7, -1, 7, 1))
+  end
+  pfn refill(fl : Strata.Fluid.Fluid, w : Strata.World.World, h : Int) : (Strata.Fluid.Fluid, Strata.World.World) do
+    let o = Strata.Edit.fill_box(w, 0, h, 0, 1, h, 1, 9)
+    (Strata.Fluid.wake(fl, Strata.Edit.world(o), o), Strata.Edit.world(o))
+  end
+  pfn fall_run(s : Strata.Sound.Sound, w : Strata.World.World, fl : Strata.Fluid.Fluid, h : Int, n : Int, frames : Int) : Strata.Sound.Sound do
+    if n >= frames do s
+    else
+      let (fl2, w2) = if n % 6 == 0 do
+          match refill(fl, w, h) do
+            (f1, w1) -> match Strata.Fluid.step_world(f1, w1, Nil) do (f2, o) -> (f2, Strata.Edit.world(o)) end
+          end
+        else (fl, w) end
+      match Sn.update(s, w2, fl2, frame()) do
+        (s2, cmds) ->
+          let _took = Strata.Ffi.Audio.send(cmds)
+          Strata.Ffi.Audio.advance(frame())
+          fall_run(s2, w2, fl2, h, n + 1, frames)
+      end
+    end
+  end
+  pfn falls(out : String, h : Int) : Int do
+    if !Strata.Ffi.Audio.render(out) do 1
+    else
+      let s0 = Sn.listener(Sn.new(), 7.0, int_to_float(h) /. 2.0, 1.0, -1.0, 0.0, 0.0, 0.0, 1.0, 0.0)
+      let s = fall_run(s0, wet_world(), Strata.Fluid.new(wet_reg(), Cons((2, Strata.Fluid.flowing()), Nil)), h, 0, float_to_int(4.0 /. frame()))
+      Strata.Ffi.Audio.close()
+      println("soundcheck: falls " ++ int_to_string(h) ++ " -> " ++ out ++ " (" ++ int_to_string(Sn.refused(s)) ++ " refused)")
+      0
+    end
+  end
+
   fn main(_cap : Cap(IO)) : Unit do
     let name = Env.get("SOUNDCHECK_SCENE", "")
     let out = Env.get("SOUNDCHECK_OUT", "soundcheck.wav")
@@ -278,6 +336,9 @@ mod Soundcheck do
     else if name == "recording" do process_exit(recording(out))
     else if name == "budget" do process_exit(budget(out))
     else if name == "acoustics64" do process_exit(acoustics64())
+    else if name == "falls-4" do process_exit(falls(out, 4))
+    else if name == "falls-12" do process_exit(falls(out, 12))
+    else if name == "falls-24" do process_exit(falls(out, 24))
     else
       match scene(name) do
         (evs, secs) ->
@@ -294,6 +355,6 @@ mod Soundcheck do
             println("soundcheck: " ++ name ++ " -> " ++ out ++ " (" ++ int_to_string(frames) ++ " frames, " ++ int_to_string(Sn.refused(s)) ++ " refused, mixing " ++ float_to_string(Math.round(Strata.Ffi.Audio.stat(5) *. 1000.0) /. 10.0) ++ "% of real time)")
           end end
       end
-    end end end end
+    end end end end end end end
   end
 end

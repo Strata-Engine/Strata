@@ -24,7 +24,12 @@ mod Strata.Sound do
   type Place = Place((Float, Float, Float), List(Pv), Option(Strata.Acoustics.Job), Int, Float, Float, Int, List((Int, Float)))
   -- next voice, next patch id, the frame's commands (newest first),
   -- plays refused so far, plays sent this frame, placing
-  type Sound = Sound(Int, Int, List(Cmd), Int, Int, Place)
+  -- what the fluid and the wind add: the fluid's emitters, the pour patch
+  -- (0 until needed), each emitter's voice, the gust voice (0 for none),
+  -- and the gust's following of openness (Nil: not following; else the
+  -- openness last heard)
+  type Water = Water(Strata.Emitters.Emitters, Int, List((Int, Int)), Int, List(Float))
+  type Sound = Sound(Int, Int, List(Cmd), Int, Int, Place, Water)
 
   doc "The op codes of a command record, as native/strata_mix.h numbers them."
   fn op_patch() : Int do 1 end
@@ -45,12 +50,12 @@ mod Strata.Sound do
   pfn max_patch() : Int do 2047 end
 
   doc "Nothing playing, nothing sent."
-  fn new() : Sound do Sound(1, 1, Nil, 0, 0, Place((0.0, 0.0, 0.0), Nil, None, 0, 0.0, 0.0, 0, Nil)) end
+  fn new() : Sound do Sound(1, 1, Nil, 0, 0, Place((0.0, 0.0, 0.0), Nil, None, 0, 0.0, 0.0, 0, Nil), Water(Strata.Emitters.new(), 0, Nil, 0, Nil)) end
 
   doc "Placed voices started but not yet walked through the blocks, because more than 8 started in one frame; they are muffled from the next acoustics update."
-  fn unwalked(s : Sound) : Int do match s do Sound(_, _, _, _, _, Place(_, _, _, _, _, _, u, _)) -> u end end
+  fn unwalked(s : Sound) : Int do match s do Sound(_, _, _, _, _, Place(_, _, _, _, _, _, u, _), _) -> u end end
   doc "Placed voices the acoustics follow: started, not stopped, not past their patch's length."
-  fn tracked(s : Sound) : Int do match s do Sound(_, _, _, _, _, Place(_, pvs, _, _, _, _, _, _)) -> List.length(pvs) end end
+  fn tracked(s : Sound) : Int do match s do Sound(_, _, _, _, _, Place(_, pvs, _, _, _, _, _, _), _) -> List.length(pvs) end end
   doc "Placed voices walked at once in the frame they start; more wait for the next acoustics update."
   fn walks_per_frame() : Int do 8 end
   doc "Seconds between acoustics updates."
@@ -58,10 +63,10 @@ mod Strata.Sound do
   pfn most_tracked() : Int do 256 end
 
   doc "Plays refused so far: past the per-frame limit, or past the last patch id."
-  fn refused(s : Sound) : Int do match s do Sound(_, _, _, r, _, _) -> r end end
+  fn refused(s : Sound) : Int do match s do Sound(_, _, _, r, _, _, _) -> r end end
 
-  pfn push(s : Sound, c : Cmd) : Sound do match s do Sound(v, p, cs, r, f, pl) -> Sound(v, p, Cons(c, cs), r, f, pl) end end
-  pfn known(s : Sound, voice : Int) : Bool do match s do Sound(v, _, _, _, _, _) -> voice >= 1 && voice < v end end
+  pfn push(s : Sound, c : Cmd) : Sound do match s do Sound(v, p, cs, r, f, pl, wa) -> Sound(v, p, Cons(c, cs), r, f, pl, wa) end end
+  pfn known(s : Sound, voice : Int) : Bool do match s do Sound(v, _, _, _, _, _, _) -> voice >= 1 && voice < v end end
 
   pfn length_of(ls : List((Int, Float)), src : Int) : Float do
     match ls do
@@ -81,8 +86,8 @@ mod Strata.Sound do
   end
   pfn start(s : Sound, src : Int, b : Int, fs : List(Float), at : Option((Float, Float, Float))) : (Sound, Int) do
     match s do
-      Sound(v, p, cs, r, fresh, pl) ->
-        if fresh >= new_per_frame() do (Sound(v, p, cs, r + 1, fresh, pl), 0)
+      Sound(v, p, cs, r, fresh, pl, wa) ->
+        if fresh >= new_per_frame() do (Sound(v, p, cs, r + 1, fresh, pl, wa), 0)
         else
           let next = if v >= max_voice() do 1 else v + 1 end
           let pl2 = match (at, pl) do
@@ -91,7 +96,7 @@ mod Strata.Sound do
               Place(lis, take_pv(Cons(Pv(v, x, y, z, false, if len > 0.0 do clock +. len else 1000000000000.0 end), pvs), most_tracked()), job, jf, clock, due, uw, lens)
             _ -> pl
           end
-          (Sound(next, p, Cons(Cmd(op_play(), v, src, b, fs), cs), r, fresh + 1, pl2), v)
+          (Sound(next, p, Cons(Cmd(op_play(), v, src, b, fs), cs), r, fresh + 1, pl2, wa), v)
         end
     end
   end
@@ -110,8 +115,8 @@ mod Strata.Sound do
   fn move(s : Sound, voice : Int, x : Float, y : Float, z : Float) : Sound do
     if known(s, voice) do
       match push(s, Cmd(op_move(), voice, 0, 0, Cons(x, Cons(y, Cons(z, Nil))))) do
-        Sound(v, p, cs, r, f, Place(lis, pvs, job, jf, clock, due, uw, lens)) ->
-          Sound(v, p, cs, r, f, Place(lis, List.map(pvs, fn q -> match q do Pv(n, _, _, _, wk, e) -> if n == voice do Pv(n, x, y, z, wk, e) else q end end), job, jf, clock, due, uw, lens))
+        Sound(v, p, cs, r, f, Place(lis, pvs, job, jf, clock, due, uw, lens), wa) ->
+          Sound(v, p, cs, r, f, Place(lis, List.map(pvs, fn q -> match q do Pv(n, _, _, _, wk, e) -> if n == voice do Pv(n, x, y, z, wk, e) else q end end), job, jf, clock, due, uw, lens), wa)
       end
     else s end
   end
@@ -125,8 +130,8 @@ mod Strata.Sound do
   fn stop(s : Sound, voice : Int, fade : Float) : Sound do
     if known(s, voice) do
       match push(s, Cmd(op_stop(), voice, 0, 0, Cons(fade, Nil))) do
-        Sound(v, p, cs, r, f, Place(lis, pvs, job, jf, clock, due, uw, lens)) ->
-          Sound(v, p, cs, r, f, Place(lis, List.filter(pvs, fn q -> match q do Pv(n, _, _, _, _, _) -> n != voice end), job, jf, clock, due, uw, lens))
+        Sound(v, p, cs, r, f, Place(lis, pvs, job, jf, clock, due, uw, lens), wa) ->
+          Sound(v, p, cs, r, f, Place(lis, List.filter(pvs, fn q -> match q do Pv(n, _, _, _, _, _) -> n != voice end), job, jf, clock, due, uw, lens), wa)
       end
     else s end
   end
@@ -134,7 +139,7 @@ mod Strata.Sound do
   doc "Where the listener is, in metres, which way it faces and which way is up (the camera, normally). Set it every frame; sounds are placed against the latest."
   fn listener(s : Sound, x : Float, y : Float, z : Float, fx : Float, fy : Float, fz : Float, ux : Float, uy : Float, uz : Float) : Sound do
     match push(s, Cmd(op_listener(), 0, 0, 0, Cons(x, Cons(y, Cons(z, Cons(fx, Cons(fy, Cons(fz, Cons(ux, Cons(uy, Cons(uz, Nil))))))))))) do
-      Sound(v, p, cs, r, f, Place(_, pvs, job, jf, clock, due, uw, lens)) -> Sound(v, p, cs, r, f, Place((x, y, z), pvs, job, jf, clock, due, uw, lens))
+      Sound(v, p, cs, r, f, Place(_, pvs, job, jf, clock, due, uw, lens), wa) -> Sound(v, p, cs, r, f, Place((x, y, z), pvs, job, jf, clock, due, uw, lens), wa)
     end
   end
 
@@ -159,23 +164,22 @@ mod Strata.Sound do
   doc "Give the mixer a patch; answers its id, which `play` takes as a source. Ids run from 1 to 2047; past that the upload is refused (id 0)."
   fn upload(s : Sound, p : Patch) : (Sound, Int) do
     match s do
-      Sound(v, id, cs, r, f, Place(lis, pvs, job, jf, clock, due, uw, lens)) ->
-        if id > max_patch() do (Sound(v, id, cs, r + 1, f, Place(lis, pvs, job, jf, clock, due, uw, lens)), 0)
+      Sound(v, id, cs, r, f, Place(lis, pvs, job, jf, clock, due, uw, lens), wa) ->
+        if id > max_patch() do (Sound(v, id, cs, r + 1, f, Place(lis, pvs, job, jf, clock, due, uw, lens), wa), 0)
         else
           -- a patch that releases by itself lasts its hold and its release
           let fl = patch_floats(p)
           let hold = NativeArray.get_f32(fl, 64)
           let len = if hold > 0.0 do hold +. NativeArray.get_f32(fl, 29) +. 0.05 else 0.0 end
-          (patch_cmds(Sound(v, id + 1, cs, r, f, Place(lis, pvs, job, jf, clock, due, uw, Cons((id, len), lens))), id, fl, 0), id)
+          (patch_cmds(Sound(v, id + 1, cs, r, f, Place(lis, pvs, job, jf, clock, due, uw, Cons((id, len), lens)), wa), id, fl, 0), id)
         end
     end
   end
 
   doc "Once a frame, last: hands over the frame's commands. [w] and [fl] are the world and the fluid the frame ended with; [dt] the frame's seconds."
   fn update(s : Sound, w : Strata.World.World, fl : Strata.Fluid.Fluid, dt : Float) : (Sound, Commands) do
-    let _unused = fl
-    match place(s, w, dt) do
-      Sound(v, p, cs, r, _, pl) -> (Sound(v, p, Nil, r, 0, pl), encode(List.reverse(cs)))
+    match water(place(s, w, dt), w, fl, dt) do
+      Sound(v, p, cs, r, _, pl, wa) -> (Sound(v, p, Nil, r, 0, pl, wa), encode(List.reverse(cs)))
     end
   end
 
@@ -200,6 +204,26 @@ mod Strata.Sound do
         end end
     end
   end
+  -- the space as ENVIRON records: a header (decay, damping, wet, how many
+  -- reflections), then two reflections a record (delay, x, y, z, gain each)
+  pfn refl_floats(rs : List((Float, Float, Float, Float, Float))) : List(Float) do
+    match rs do
+      Nil -> Nil
+      Cons((d, x, y, z, g), t) -> Cons(d, Cons(x, Cons(y, Cons(z, Cons(g, refl_floats(t))))))
+    end
+  end
+  @[no_warn_recursion]
+  pfn refl_cmds(fs : List(Float), a : Int, cs : List(Cmd)) : List(Cmd) do
+    match fs do
+      Nil -> cs
+      _ -> refl_cmds(List.drop(fs, 10), a + 1, Cons(Cmd(op_environ(), 0, a, 0, List.take(fs, 10)), cs))
+    end
+  end
+  pfn environ_cmds(cs : List(Cmd), sp : Strata.Acoustics.Space) : List(Cmd) do
+    let rs = Strata.Acoustics.reflections(sp)
+    let head = Cmd(op_environ(), 0, 0, 0, Cons(Strata.Acoustics.decay(sp), Cons(Strata.Acoustics.damping(sp), Cons(Strata.Acoustics.wet(sp), Cons(int_to_float(List.length(rs)), Nil)))))
+    refl_cmds(refl_floats(rs), 1, Cons(head, cs))
+  end
   pfn any_new(pvs : List(Pv)) : Bool do List.any(pvs, fn q -> match q do Pv(_, _, _, _, walked, _) -> !walked end) end
   pfn d2(lis : (Float, Float, Float), q : Pv) : Float do
     match (lis, q) do ((a, b, c), Pv(_, x, y, z, _, _)) -> (x -. a) *. (x -. a) +. (y -. b) *. (y -. b) +. (z -. c) *. (z -. c) end
@@ -214,7 +238,7 @@ mod Strata.Sound do
   -- the new ones at once, finish the job begun two frames ago, begin the next
   pfn place(s : Sound, w : Strata.World.World, dt : Float) : Sound do
     match s do
-      Sound(v, p, cs, r, f, Place(lis, pvs0, job, jf, clock0, due, uw, lens)) ->
+      Sound(v, p, cs, r, f, Place(lis, pvs0, job, jf, clock0, due, uw, lens), wa) ->
         let clock = clock0 +. dt
         let pvs1 = List.filter(pvs0, fn q -> match q do Pv(_, _, _, _, _, e) -> e > clock end)
         let reg = Strata.World.registry(w)
@@ -225,17 +249,22 @@ mod Strata.Sound do
             end
           else (pvs1, cs, uw) end
         -- a job runs two frames, then its answers are sent
-        let (job2, jf2, cs3) = match job do
-          Some(j) -> if jf + 1 >= 2 do (None, 0, push_all(cs2, Strata.Acoustics.finish(j))) else (job, jf + 1, cs2) end
-          None -> (None, 0, cs2)
+        let (job2, jf2, cs3, wa2) = match job do
+          Some(j) ->
+            if jf + 1 >= 2 do
+              match Strata.Acoustics.finish_space(j) do
+                (occ, sp) -> (None, 0, environ_cmds(push_all(cs2, occ), sp), heard_open(wa, Strata.Acoustics.openness(sp)))
+              end
+            else (job, jf + 1, cs2, wa) end
+          None -> (None, 0, cs2, wa)
         end
         let begin_now = match job2 do
-          None -> clock >= due && !List.is_empty(pvs2)
+          None -> clock >= due
           Some(_) -> false
         end
         if begin_now do
-          Sound(v, p, cs3, r, f, Place(lis, pvs2, Some(Strata.Acoustics.begin(w, reg, lis, job_voices(lis, pvs2))), 0, clock, clock +. acoustics_interval(), uw2, lens))
-        else Sound(v, p, cs3, r, f, Place(lis, pvs2, job2, jf2, clock, due, uw2, lens)) end
+          Sound(v, p, cs3, r, f, Place(lis, pvs2, Some(Strata.Acoustics.begin(w, reg, lis, job_voices(lis, pvs2))), 0, clock, clock +. acoustics_interval(), uw2, lens), wa2)
+        else Sound(v, p, cs3, r, f, Place(lis, pvs2, job2, jf2, clock, due, uw2, lens), wa2) end
     end
   end
 
@@ -357,5 +386,108 @@ mod Strata.Sound do
     |> with_control(1, target_cutoff2(), 2400.0, 120.0, true, 0.5)
     |> with_control(2, target_gain(), 0.08, 1.0, true, 0.7)
     |> with_hold(0.09)
+  end
+
+  -- ── Fluid and wind ───────────────────────────────────────────────────────
+
+  pfn heard_open(wa : Water, o : Float) : Water do
+    match wa do
+      Water(em, pour_id, map, gv, follow) -> Water(em, pour_id, map, gv, if List.is_empty(follow) do Nil else Cons(o, Nil) end)
+    end
+  end
+  pfn water_of(s : Sound) : Water do match s do Sound(_, _, _, _, _, _, wa) -> wa end end
+  pfn with_water(s : Sound, wa : Water) : Sound do match s do Sound(v, p, cs, r, f, pl, _) -> Sound(v, p, cs, r, f, pl, wa) end end
+
+  doc "Falling liquid: noise whose loudness follows control 0, the flow (0..1 for 0..400 eighths a second), and whose brightness follows control 1, the height fallen (0..1 for 0..16 m, measured as the mean fall of the water heard). Loops until stopped. `Strata.Sound.update` plays one for each place a fluid falls."
+  fn pour() : Patch do
+    patch()
+    |> with_source(0, source_pink(), 0.0, 0.7, 0.0)
+    |> with_source(1, source_white(), 0.0, 0.25, 0.0)
+    |> with_filter(0, filter_low(), 3000.0, 0.6)
+    |> with_filter(1, filter_peak(), 900.0, 0.8)
+    |> with_env(0, 0.3, 0.0, 1.0, 0.6, 0.0)
+    |> with_mod(0, mod_walk(), 7.0, target_gain(), 0.3)
+    |> with_mod(1, mod_walk(), 3.0, target_cutoff(), 0.4)
+    |> with_control(0, target_gain(), 0.02, 1.0, true, 0.0)
+    |> with_control(1, target_cutoff(), 600.0, 14000.0, true, 0.3)
+  end
+
+  doc "Turbulent air: brown and pink noise through a moving band-pass, swelling on a slow random walk. Control 0 is its strength (0..1), control 1 its roughness. Loops until stopped."
+  fn gust() : Patch do
+    patch()
+    |> with_source(0, source_brown(), 0.0, 0.8, 0.0)
+    |> with_source(1, source_pink(), 0.0, 0.25, 0.0)
+    |> with_filter(0, filter_band(), 450.0, 0.7)
+    |> with_env(0, 1.0, 0.0, 1.0, 1.0, 0.0)
+    |> with_mod(0, mod_walk(), 0.25, target_cutoff(), 1.2)
+    |> with_mod(1, mod_walk(), 0.4, target_gain(), 0.7)
+    |> with_control(0, target_gain(), 0.0, 0.6, false, 0.0)
+    |> with_control(1, target_level(), 0.4, 1.2, false, 0.5)
+  end
+
+  doc "Start a gust, flat (all round the listener). With [follow_openness] its strength follows how open the listener's space is, from each acoustics update: full under open sky, nothing shut in a cave. Without it, set its strength with `control(s, voice, 0, x)`. Answers the voice."
+  fn with_gust(s : Sound, follow_openness : Bool) : (Sound, Int) do
+    match upload(s, gust()) do
+      (s1, pid) ->
+        match play_flat(s1, pid, 1.0, 0.0, 1.0) do
+          (s2, gv) ->
+            match water_of(s2) do
+              Water(em, pour_id, map, _, _) -> (with_water(s2, Water(em, pour_id, map, gv, if follow_openness do Cons(1.0, Nil) else Nil end)), gv)
+            end
+        end
+    end
+  end
+
+  pfn unit(x : Float) : Float do if x < 0.0 do 0.0 else if x > 1.0 do 1.0 else x end end end
+  pfn voice_for(map : List((Int, Int)), eid : Int) : Int do
+    match map do
+      Nil -> 0
+      Cons((e, v), t) -> if e == eid do v else voice_for(t, eid) end
+    end
+  end
+  pfn is_live(ls : List((Int, Float, Float, Float, Float, Float)), eid : Int) : Bool do List.any(ls, fn q -> match q do (e, _, _, _, _, _) -> e == eid end) end
+
+  -- each live emitter's pour: started if new, else moved and retuned
+  pfn sound_emitters(s : Sound, ls : List((Int, Float, Float, Float, Float, Float)), pour_id : Int, map : List((Int, Int)), acc : List((Int, Int))) : (Sound, List((Int, Int))) do
+    match ls do
+      Nil -> (s, acc)
+      Cons((eid, x, y, z, flow, h), t) ->
+        let fv = unit(flow /. 400.0)
+        let hv = unit(h /. 16.0)
+        let v0 = voice_for(map, eid)
+        if v0 > 0 do sound_emitters(control(control(move(s, v0, x, y, z), v0, 0, fv), v0, 1, hv), t, pour_id, map, Cons((eid, v0), acc))
+        else
+          match play(s, pour_id, x, y, z, 0.5 +. 0.5 *. hv, 1.0, 1.0) do
+            (s2, v) ->
+              if v == 0 do sound_emitters(s2, t, pour_id, map, acc)
+              else sound_emitters(control(control(with_range(s2, v, 4.0, 150.0), v, 0, fv), v, 1, hv), t, pour_id, map, Cons((eid, v), acc)) end
+          end
+        end
+    end
+  end
+  pfn stop_gone(s : Sound, map : List((Int, Int)), ls : List((Int, Float, Float, Float, Float, Float))) : Sound do
+    match map do
+      Nil -> s
+      Cons((eid, v), t) -> stop_gone(if is_live(ls, eid) do s else stop(s, v, 0.5) end, t, ls)
+    end
+  end
+
+  -- what the fluid and the wind do once a frame
+  pfn water(s : Sound, w : Strata.World.World, fl : Strata.Fluid.Fluid, dt : Float) : Sound do
+    match water_of(s) do
+      Water(em, pour_id0, map, gv, follow) ->
+        let em2 = Strata.Emitters.tick(Strata.Emitters.feed(em, Strata.Fluid.events(fl), Strata.Fluid.steps(fl), Strata.World.scale(w)), dt)
+        let ls = Strata.Emitters.live(em2)
+        let (s1, pour_id) = if pour_id0 == 0 && !List.is_empty(ls) do upload(s, pour()) else (s, pour_id0) end
+        let s2 = stop_gone(s1, map, ls)
+        match sound_emitters(s2, ls, pour_id, map, Nil) do
+          (s3, map2) ->
+            let s4 = match follow do
+              Cons(o, _) -> if gv > 0 do control(s3, gv, 0, o) else s3 end
+              Nil -> s3
+            end
+            with_water(s4, Water(em2, pour_id, map2, gv, follow))
+        end
+    end
   end
 end
