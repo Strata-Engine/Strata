@@ -205,6 +205,84 @@ mod StrataViewer.Test.Lakes do
     end
   end
 
+  -- ── Density, caves and the early-outs (Task 7) ───────────────────────────
+  -- the viewer's own island, read from its cache (built once if missing)
+  pfn island() : Strata.Atlas.Atlas do Strata.Atlas.load_or_build(".march/atlas", Vw.island_def(), 7) end
+
+  pfn full_same(a : Strata.Chunk.Chunk, b : Strata.Chunk.Chunk, i : Int) : Bool do
+    if i >= 32768 do true else if Chl2.get_or(a, i % 32, i / 1024, (i / 32) % 32, -1) != Chl2.get_or(b, i % 32, i / 1024, (i / 32) % 32, -1) do false else full_same(a, b, i + 1) end end
+  end
+
+  -- Lake columns 3 m apart over 60 m about each lake's centre: for each, the
+  -- voxels from 4 m under the bed up to it must be solid ground (not air,
+  -- not water). (columns checked, bad voxels, distinct chunks seen as a list of keys)
+  pfn under_lakes(a : Strata.Atlas.Atlas, ls : List((Float, Float, Float)), cols : Int, bad : Int, seen : List(Int)) : (Int, Int, List(Int)) do
+    match ls do
+      Nil -> (cols, bad, seen)
+      Cons((x, z, lv), rest) ->
+        if lv < 0.0 do under_lakes(a, rest, cols, bad, seen)
+        else
+          match lake_cols(a, whole(x), whole(z), 0, cols, bad, seen) do
+            (c2, b2, s2) -> under_lakes(a, rest, c2, b2, s2)
+          end
+        end
+    end
+  end
+  pfn lake_cols(a : Strata.Atlas.Atlas, cx : Int, cz : Int, t : Int, cols : Int, bad : Int, seen : List(Int)) : (Int, Int, List(Int)) do
+    if t >= 441 do (cols, bad, seen)
+    else
+      let wx = cx - 30 + 3 * (t % 21)
+      let wz = cz - 30 + 3 * (t / 21)
+      let c = Vw.island_column(a, wx, wz, 7, 1.0)
+      if col_lake(c) == 0 do lake_cols(a, cx, cz, t + 1, cols, bad, seen)
+      else
+        let h = col_h(c)
+        let k1 = chunk_tag(wx, h, wz)
+        let k2 = chunk_tag(wx, h - 4, wz)
+        let s1 = if List.member(seen, k1) do seen else Cons(k1, seen) end
+        let s2 = if List.member(s1, k2) do s1 else Cons(k2, s1) end
+        lake_cols(a, cx, cz, t + 1, cols + 1, bad + soft_go(a, wx, wz, h - 4, h, 0), s2)
+      end
+    end
+  end
+  pfn chunk_tag(x : Int, y : Int, z : Int) : Int do (Cl2.chunk_of(x) + 512) + 1024 * ((Cl2.chunk_of(y) + 512) + 1024 * (Cl2.chunk_of(z) + 512)) end
+  -- voxels from y to top that are air or water
+  pfn soft_go(a : Strata.Atlas.Atlas, x : Int, z : Int, y : Int, top : Int, n : Int) : Int do
+    if y > top do n
+    else
+      let b = island_block(a, x, y, z)
+      let soft = if b == 0 do true else if b == 5 do true else Bl2.is_fluid(Vw.registry(), b) end end
+      soft_go(a, x, z, y + 1, top, if soft do n + 1 else n end)
+    end
+  end
+
+  -- air voxels well under the ground (20 m below the column's height less the
+  -- 12 m of density noise) in the chunks of a 4 x 4 chunk area at the origin's ground
+  pfn caves_go(a : Strata.Atlas.Atlas, k : Int, n : Int) : Int do
+    if k >= 16 * 8 do n
+    else
+      let cx = k % 4 - 2
+      let cz = (k / 4) % 4 - 2
+      let x = cx * 32 + 16
+      let z = cz * 32 + 16
+      let g = col_h(Vw.island_column(a, x, z, 7, 1.0))
+      let cy = Cl2.chunk_of(g) - k / 16
+      let ch = Vw.island_terrain(a, 1.0, cx, cy, cz, 7)
+      caves_go(a, k + 1, n + deep_air(a, ch, cx, cy, cz, 0, 0))
+    end
+  end
+  pfn deep_air(a : Strata.Atlas.Atlas, ch : Strata.Chunk.Chunk, cx : Int, cy : Int, cz : Int, i : Int, n : Int) : Int do
+    if i >= 32768 do n
+    else
+      let x = i % 32
+      let z = (i / 32) % 32
+      let y = i / 1024
+      let deep = if Chl2.get_or(ch, x, y, z, -1) != 0 do false
+        else int_to_float(cy * 32 + y) < Vw.island_height_m(a, int_to_float(cx * 32 + x), int_to_float(cz * 32 + z), 7) -. 32.0 end
+      deep_air(a, ch, cx, cy, cz, i + 37, if deep do n + 1 else n end)
+    end
+  end
+
 
   describe "Viewer lakes" do
     test "terrain with lakes is still a pure function" do
@@ -321,6 +399,37 @@ mod StrataViewer.Test.Lakes do
           Test.assert_true(same_go(Vw.island_terrain(a, 1.0, kx, ky, kz, 7), Vw.island_terrain(a, 1.0, kx, ky, kz, 7), 0), "the lake's chunk")
           Test.assert_true(same_go(Vw.island_terrain(a, 1.0, 0, 1, 0, 7), Vw.island_terrain(a, 1.0, 0, 1, 0, 7), 0), "the origin's")
       end
+    end
+    test "no cave voxel within 4 m under a lake bed, and caves elsewhere" do
+      let a = island()
+      match under_lakes(a, Strata.Atlas.lakes(a), 0, 0, Nil) do
+        (cols, bad, seen) ->
+          println("lakes: " ++ int_to_string(cols) ++ " lake columns in " ++ int_to_string(List.length(seen)) ++ " chunks checked")
+          Test.assert_true(List.length(seen) >= 20, "20 chunks or more under the lakes")
+          Test.assert_eq_int(bad, 0, "no air or water from 4 m under a lake bed to the bed")
+      end
+      Test.assert_true(caves_go(a, 0, 0) > 0, "the island has caves: air 32 m under the ground")
+    end
+    test "a chunk 200 m over the ground is uniform air, and one 200 m under it uniform stone" do
+      let a = island()
+      let g = col_h(Vw.island_column(a, 16, 16, 7, 1.0))
+      let up = Vw.island_terrain(a, 1.0, 0, Cl2.chunk_of(g + 200), 0, 7)
+      let down = Vw.island_terrain(a, 1.0, 0, Cl2.chunk_of(g - 200), 0, 7)
+      Test.assert_eq_int(Chl2.uniform_id(up), 0, "uniform(0)")
+      Test.assert_eq_int(Chl2.uniform_id(down), 1, "uniform(1)")
+    end
+    test "a chunk generated alone equals one generated after its neighbours" do
+      let a = island()
+      let g = col_h(Vw.island_column(a, 40, -70, 7, 1.0))
+      let cy = Cl2.chunk_of(g)
+      let alone = Vw.island_terrain(a, 1.0, 1, cy, -3, 7)
+      let n1 = Vw.island_terrain(a, 1.0, 0, cy, -3, 7)
+      let n2 = Vw.island_terrain(a, 1.0, 2, cy, -3, 7)
+      let n3 = Vw.island_terrain(a, 1.0, 1, cy + 1, -3, 7)
+      let n4 = Vw.island_terrain(a, 1.0, 1, cy, -2, 7)
+      let after = Vw.island_terrain(a, 1.0, 1, cy, -3, 7)
+      Test.assert_true(Chl2.form(n1) + Chl2.form(n2) + Chl2.form(n3) + Chl2.form(n4) >= 0, "the neighbours were made")
+      Test.assert_true(full_same(alone, after, 0), "every voxel the same")
     end
     test "the sea is not a fluid, and lake water is" do
       Test.assert_false(Bl2.is_fluid(Vw.registry(), 5), "the sea never moves")

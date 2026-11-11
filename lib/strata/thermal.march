@@ -1,0 +1,72 @@
+-- Thermal — loose material sliding off slopes steeper than it can stand.
+--
+-- Heights are an n x n grid of columns [step] metres apart (index i + n * j),
+-- each with its own talus angle in degrees: the steepest slope its material
+-- holds. A pass looks at every column's four neighbours at once. Where some
+-- stand lower than the talus allows, the column gives half its largest
+-- excess (the drop beyond step * tan talus), shared among those neighbours
+-- by their excess. All moves of a pass are summed before any is applied, so
+-- the order of columns does not matter and the total height is kept. A
+-- slope at or under the talus is never touched.
+mod Strata.Thermal do
+
+  pfn copy_go(src : NativeF32Arr, dst : NativeF32Arr, k : Int, cnt : Int) : NativeF32Arr do
+    if k >= cnt do dst else copy_go(src, NativeArray.set_f32(dst, k, NativeArray.get_f32(src, k)), k + 1, cnt) end
+  end
+
+  -- each column's greatest allowed drop to a neighbour, in metres
+  pfn drops_go(talus : NativeF32Arr, step : Float, out : NativeF32Arr, k : Int, cnt : Int) : NativeF32Arr do
+    if k >= cnt do out
+    else drops_go(talus, step, NativeArray.set_f32(out, k, step *. Math.tan(NativeArray.get_f32(talus, k) *. 0.017453292519943295)), k + 1, cnt) end
+  end
+
+  -- how far neighbour q stands under column k beyond the allowed drop t (0 if not)
+  pfn excess(h : NativeF32Arr, k : Int, q : Int, t : Float) : Float do
+    let e = NativeArray.get_f32(h, k) -. NativeArray.get_f32(h, q) -. t
+    if e > 0.0 do e else 0.0 end
+  end
+
+  pfn fmax(p : Float, q : Float) : Float do if p > q do p else q end end
+
+  pfn give(d : NativeF32Arr, q : Int, v : Float) : NativeF32Arr do
+    if v > 0.0 do NativeArray.set_f32(d, q, NativeArray.get_f32(d, q) +. v) else d end
+  end
+
+  -- one column's moves into d
+  pfn moves(h : NativeF32Arr, drops : NativeF32Arr, d : NativeF32Arr, n : Int, k : Int) : NativeF32Arr do
+    let i = k % n
+    let j = k / n
+    let t = NativeArray.get_f32(drops, k)
+    let el = if i > 0 do excess(h, k, k - 1, t) else 0.0 end
+    let er = if i < n - 1 do excess(h, k, k + 1, t) else 0.0 end
+    let eu = if j > 0 do excess(h, k, k - n, t) else 0.0 end
+    let ed = if j < n - 1 do excess(h, k, k + n, t) else 0.0 end
+    let total = el +. er +. eu +. ed
+    if total <= 0.0 do d
+    else
+      let most = fmax(fmax(el, er), fmax(eu, ed))
+      let share = 0.5 *. most /. total
+      let d1 = NativeArray.set_f32(d, k, NativeArray.get_f32(d, k) -. 0.5 *. most)
+      give(give(give(give(d1, k - 1, share *. el), k + 1, share *. er), k - n, share *. eu), k + n, share *. ed)
+    end
+  end
+
+  pfn moves_go(h : NativeF32Arr, drops : NativeF32Arr, d : NativeF32Arr, n : Int, k : Int) : NativeF32Arr do
+    if k >= n * n do d else moves_go(h, drops, moves(h, drops, d, n, k), n, k + 1) end
+  end
+
+  pfn apply_go(h : NativeF32Arr, d : NativeF32Arr, k : Int, cnt : Int) : NativeF32Arr do
+    if k >= cnt do h else apply_go(NativeArray.set_f32(h, k, NativeArray.get_f32(h, k) +. NativeArray.get_f32(d, k)), d, k + 1, cnt) end
+  end
+
+  pfn pass_go(h : NativeF32Arr, drops : NativeF32Arr, n : Int, left : Int) : NativeF32Arr do
+    if left <= 0 do h
+    else pass_go(apply_go(h, moves_go(h, drops, NativeArray.make_f32(n * n, 0.0), n, 0), 0, n * n), drops, n, left - 1) end
+  end
+
+  doc "The n x n column heights h (metres, index i + n * j, columns step metres apart) after [passes] passes of thermal relaxation under per-column talus angles in degrees; each pass moves half the excess over the talus slope downhill. A new array; h is not changed."
+  fn relax(h : NativeF32Arr, n : Int, step : Float, talus : NativeF32Arr, passes : Int) : NativeF32Arr do
+    let cnt = n * n
+    pass_go(copy_go(h, NativeArray.make_f32(cnt, 0.0), 0, cnt), drops_go(talus, step, NativeArray.make_f32(cnt, 0.0), 0, cnt), n, passes)
+  end
+end

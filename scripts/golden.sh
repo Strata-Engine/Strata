@@ -73,6 +73,8 @@ splash-early:STRATA_SCENE=21 STRATA_LIGHT=4 STRATA_SPLASH=30 STRATA_FRAMES=57 DR
 splash-late:STRATA_SCENE=21 STRATA_LIGHT=4 STRATA_SPLASH=30 STRATA_FRAMES=69 DRAWS=6
 island-mouth:STRATA_SCENE=22 STRATA_ISLAND=1 STRATA_LIGHT=4
 island-lake:STRATA_SCENE=23 STRATA_ISLAND=1 STRATA_LIGHT=4
+island-cliff:STRATA_SCENE=24 STRATA_ISLAND=1 STRATA_LIGHT=4
+island-cave:STRATA_SCENE=25 STRATA_ISLAND=1 STRATA_LIGHT=4
 '
 # indirect draw calls a frame must issue, whatever the scene holds; a scene
 # with a kind of geometry nowhere in it says DRAWS=n

@@ -1,0 +1,63 @@
+-- The surface scan: each voxel's depth under the open surface above it,
+-- column by column, so a generator can lay grass over dirt over stone.
+mod Strata.Test.Surface do
+
+  import Test
+  alias Strata.Surface as Sf
+
+  -- a density of +1 where solid(y) and -1 elsewhere, the same in every column
+  pfn dens_go(a : NativeF32Arr, solid : Int -> Bool, i : Int) : NativeF32Arr do
+    if i >= 32768 do a else dens_go(NativeArray.set_f32(a, i, if solid(i / 1024) do 1.0 else 0.0 -. 1.0 end), solid, i + 1) end
+  end
+  pfn dens(solid : Int -> Bool) : NativeF32Arr do dens_go(NativeArray.make_f32(32768, 0.0), solid, 0) end
+
+  pfn air_above() : NativeF32Arr do NativeArray.make_f32(1024, 0.0 -. 1.0) end
+
+  -- the rule stores the depth it was given, plus 2 (so air reads 1)
+  pfn depth_of(out : NativeI32Arr, x : Int, y : Int, z : Int) : Int do NativeArray.get_i32(out, Strata.Coord.index(x, y, z)) - 2 end
+  pfn scan_depths(d : NativeF32Arr, above : NativeF32Arr) : NativeI32Arr do Sf.scan(d, above, fn (depth, y, wet) -> depth + 2) end
+
+  describe "Surface" do
+    test "solid up to y = 10 under air: depth 0 at 10, 1 at 9, -1 above" do
+      let out = scan_depths(dens(fn y -> y <= 10), air_above())
+      Test.assert_eq_int(depth_of(out, 3, 10, 7), 0, "the surface")
+      Test.assert_eq_int(depth_of(out, 3, 9, 7), 1, "one under it")
+      Test.assert_eq_int(depth_of(out, 3, 6, 7), 4, "four under it")
+      Test.assert_eq_int(depth_of(out, 3, 11, 7), 0 - 1, "air over it")
+      Test.assert_eq_int(depth_of(out, 31, 31, 31), 0 - 1, "air at the top")
+    end
+    test "an overhang: depth 0 on both solid tops" do
+      -- solid 0..5, air 6..9, solid 10..14, air above
+      let out = scan_depths(dens(fn y -> if y <= 5 do true else if y >= 10 do y <= 14 else false end end), air_above())
+      Test.assert_eq_int(depth_of(out, 0, 14, 0), 0, "the overhang's top")
+      Test.assert_eq_int(depth_of(out, 0, 13, 0), 1, "under it")
+      Test.assert_eq_int(depth_of(out, 0, 5, 0), 0, "the floor under the overhang is a surface too")
+      Test.assert_eq_int(depth_of(out, 0, 4, 0), 1, "and the depth counts again from it")
+      Test.assert_eq_int(depth_of(out, 0, 8, 0), 0 - 1, "air between")
+    end
+    test "a ceiling voxel, solid over air, gets the sentinel 1000" do
+      let out = scan_depths(dens(fn y -> y == 20), air_above())
+      Test.assert_eq_int(depth_of(out, 5, 20, 5), 1000, "a one-voxel ceiling")
+      let thick = scan_depths(dens(fn y -> if y >= 18 do y <= 22 else false end), air_above())
+      Test.assert_eq_int(depth_of(thick, 5, 22, 5), 0, "a thicker slab's top is a surface")
+      Test.assert_eq_int(depth_of(thick, 5, 18, 5), 1000, "and its underside a ceiling")
+      Test.assert_eq_int(Sf.ceiling(), 1000, "the sentinel")
+    end
+    test "the top row uses the row above the chunk" do
+      let all = dens(fn y -> true)
+      Test.assert_eq_int(depth_of(scan_depths(all, air_above()), 2, 31, 2), 0, "air above: y = 31 is the surface")
+      let under = scan_depths(all, NativeArray.make_f32(1024, 1.0))
+      Test.assert_true(depth_of(under, 2, 31, 2) > 3, "solid above: y = 31 is deep")
+      Test.assert_true(depth_of(under, 2, 0, 2) > depth_of(under, 2, 31, 2), "and deeper down")
+    end
+    test "with a water line, a run whose top lies under it is under water" do
+      let lines = NativeArray.make_int(1024, 12)
+      let out = Sf.scan_wet(dens(fn y -> y <= 10), air_above(), lines, fn (depth, y, wet) -> if wet do 1 else 0 end)
+      Test.assert_eq_int(NativeArray.get_i32(out, Strata.Coord.index(1, 10, 1)), 1, "the surface under the line")
+      Test.assert_eq_int(NativeArray.get_i32(out, Strata.Coord.index(1, 12, 1)), 1, "air at the line")
+      Test.assert_eq_int(NativeArray.get_i32(out, Strata.Coord.index(1, 13, 1)), 0, "air over it")
+      let dry = Sf.scan(dens(fn y -> y <= 10), air_above(), fn (depth, y, wet) -> if wet do 1 else 0 end)
+      Test.assert_eq_int(NativeArray.get_i32(dry, Strata.Coord.index(1, 10, 1)), 0, "scan has no water")
+    end
+  end
+end
