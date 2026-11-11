@@ -33,6 +33,11 @@ click carves a sphere, right click builds one, escape quits. Carve the
 rim of a lake in the hills and it drains. `L` steps
 through the light modes and `[` and `]` lower and raise the sun.
 
+The world is an island 2 km across, read from `Strata.Atlas`: rivers run
+to the sea in their channels and lakes stand at their spill level. Its atlas
+takes about 4 s to build and is cached in `.march/atlas` (read in about
+30 ms after that); `STRATA_ISLAND=0` brings back the older noise terrain.
+
 Environment switches for scripted runs are listed at the top of
 `viewer/lib/strata_viewer.march`: a fixed scene (`STRATA_SCENE`), a frame
 count and screenshot (`STRATA_FRAMES`, `STRATA_SHOT`), offscreen timing
@@ -208,6 +213,48 @@ Carve into a hillside (left click), walk into the tunnel and click again:
 the strike rings, and the wind drops. Build a wall between yourself and the
 waterfall (right click) and it dulls.
 
+## Animation
+
+Jointed voxel figures (people, creatures, vehicles) built and animated in
+code. Design: `docs/2026-11-11-animation-design.md`; rulings:
+`docs/animation-ledger.md`.
+
+`Strata.Rig` describes a figure once: a voxel size in metres, a palette of
+255 entries (colour, roughness, emission; 0 is empty), up to 64 parts in a
+hierarchy, each with a grid of up to 128 voxels a side, a pivot in its
+parent's voxels, an anchor (the point of its own grid it turns about) and
+a rest rotation; sockets, masks (subtrees) and legs. `Strata.Rig.meshes`
+meshes each part greedily in pieces of 32 voxels a side, in
+`Strata.Quad`'s layout with the palette index in the texture field.
+`Strata.Clip` describes an animation against a rig: turn and move keys
+(step, straight or smooth), marks, a stride, and `swing` and `spin`, which
+write ordinary keys. `Strata.Anim` uploads them and runs the figures: the
+pose arithmetic is C (`native/strata_anim.h`, bound by
+`native/strata_anim.c`), one world per process, posed by `update(dt)`.
+
+```march
+let r0 = Strata.Rig.colour(Strata.Rig.new(0.1), 1, 0.8, 0.2, 0.2, 0.5, 0.0)
+let (r1, body) = Strata.Rig.part(r0, -1, 0.0, 0.0, 0.0, 2, 10, 2)
+let (r2, arm) = Strata.Rig.part(Strata.Rig.box(r1, body, 0, 0, 0, 1, 9, 1, 1), body, 1.0, 10.0, 1.0, 2, 10, 2)
+let rig = Strata.Rig.box(Strata.Rig.anchor(r2, arm, 1.0, 0.0, 1.0), arm, 0, 0, 0, 1, 9, 1, 1)
+let wave = Strata.Clip.mark(Strata.Clip.swing(Strata.Clip.new(rig, 1.0, true), arm, 0.0, 0.0, 1.0, 30.0, 1.0, 0.0), 0.25, 7)
+
+let (a1, rig_id) = Strata.Anim.finish_rig(Strata.Anim.open(256), rig)
+let (a2, wave_id) = Strata.Anim.finish_clip(a1, wave)
+let (a3, fig) = Strata.Anim.spawn_at(a2, rig_id, 0.0, 0.0, 0.0, Strata.Math.Quat.identity())
+let a4 = Strata.Anim.play(a3, fig, 0, wave_id, 0.2, 1.0, 1.0, -1, false)   -- layer 0, every part
+
+-- every frame
+let a5 = Strata.Anim.update(a4, dt)
+let poses = Strata.Anim.matrices(a5, fig)     -- 12 floats a part: a 3x4 in world space
+let steps = Strata.Anim.marks(a5)             -- (figure, layer, tag, weight), in time order
+```
+
+`scripts/anim_check.sh` builds `animcheck/` and runs its scenes; to see the
+chain's matrices at t = 0, 0.25 and 0.5:
+
+    (cd animcheck && forge build --release) && ANIMCHECK_SCENE=table animcheck/.march/build/release/animcheck
+
 ## Using it from a game
 
     [deps]
@@ -217,13 +264,14 @@ A game that draws also lists Strata's C shim itself, because forge does not
 build a dependency's C sources:
 
     [ffi]
-    sources = ["../strata/native/strata_vk.c", "../strata/native/strata_audio.c"]
+    sources = ["../strata/native/strata_vk.c", "../strata/native/strata_audio.c", "../strata/native/strata_anim.c"]
     link = ["-I../strata/native", "-I/opt/homebrew/include", "-L/opt/homebrew/lib",
             "-lglfw", "-lvulkan", "-Wl,-rpath,/opt/homebrew/lib"]
 
 and must run with `MARCH_PIN_MAIN=1`. A game that only uses the core needs
 neither; one that only plays sound lists `strata_audio.c` alone, which needs
-no library beyond the system's.
+no library beyond the system's, and one that animates figures lists
+`strata_anim.c`, which needs none either.
 
 ```march
 -- register blocks
@@ -269,6 +317,8 @@ let s4 = Strata.Stream.apply(s3, Strata.Edit.fill_sphere(Strata.Stream.world(s3)
 | `Strata.Fluid` | finite fluids: fall, run to a drop, stay level, sink, rest |
 | `Strata.Slots`, `Strata.Render` | renderer slot bookkeeping; keeping the renderer in step with a stream |
 | `Strata.Model` | a model block's drawing geometry |
+| `Strata.Rig`, `Strata.Clip` | a jointed figure's description and part meshes; its animations |
+| `Strata.Anim`, `Strata.Ffi.Anim` | figures posed by the C kernel in `native/strata_anim.h` |
 | `Strata.Ffi.Vk` | window, input and the Vulkan renderer |
 | `Strata.Math.*`, `Strata.Noise`, `Strata.Tree` | vectors, matrices, noise, a persistent tree |
 

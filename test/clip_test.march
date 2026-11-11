@@ -1,0 +1,78 @@
+-- Clip: keys, marks and the swing and spin helpers, built against a rig.
+mod Strata.Test.Clip do
+
+  needs IO.Clock      -- charged to every test module once any uses Check.all (GAPS S3)
+  needs IO.Process
+  import Test
+  alias Strata.Clip as Cl
+
+  pfn near(a : Float, b : Float, eps : Float) : Bool do Math.abs(a -. b) < eps end
+
+  -- root and an arm above it
+  pfn rig() : Strata.Rig.Rig do
+    match Strata.Rig.part(Strata.Rig.new(0.1), -1, 0.0, 0.0, 0.0, 2, 10, 2) do
+      (r, root) -> match Strata.Rig.part(r, root, 0.0, 10.0, 0.0, 2, 10, 2) do (r2, _) -> r2 end
+    end
+  end
+  pfn turn_z(deg : Float) : Strata.Math.Quat.Quat do Strata.Math.Quat.from_axis_angle(0.0, 0.0, 1.0, deg *. 3.14159265358979 /. 180.0) end
+
+  pfn key_time(k : (Int, Int, Int, Float, Float, Float, Float, Float)) : Float do match k do (_, _, _, t, _, _, _, _) -> t end end
+  pfn key_is(k : (Int, Int, Int, Float, Float, Float, Float, Float), part : Int, ch : Int, interp : Int) : Bool do
+    match k do (p, c, i, _, _, _, _, _) -> p == part && c == ch && i == interp end
+  end
+  pfn times(c : Strata.Clip.Clip) : List(Float) do List.map(Cl.keys(c), key_time) end
+  -- the turn of key k in degrees
+  pfn degrees(k : (Int, Int, Int, Float, Float, Float, Float, Float)) : Float do
+    match k do (_, _, _, _, _, _, _, w) -> 2.0 *. Math.acos(Math.min_float(1.0, Math.abs(w))) *. 180.0 /. 3.14159265358979 end
+  end
+  pfn key_at(c : Strata.Clip.Clip, t : Float) : Option((Int, Int, Int, Float, Float, Float, Float, Float)) do
+    List.find(Cl.keys(c), fn k -> near(key_time(k), t, 0.00001))
+  end
+
+  describe "Clip" do
+    test "keys out of order are sorted" do
+      let c = Cl.turn(Cl.turn(Cl.turn(Cl.new(rig(), 1.0, true), 1, 0.75, turn_z(30.0), Cl.straight()), 1, 0.25, turn_z(10.0), Cl.straight()), 1, 0.5, turn_z(20.0), Cl.straight())
+      Test.assert_eq_int(List.length(Cl.keys(c)), 3, "List.length(Cl.keys(c))")
+      Test.assert_true(times(c) == [0.25, 0.5, 0.75], "in time order")
+      Test.assert_eq_int(Cl.refused(c), 0, "Cl.refused(c)")
+    end
+    test "a key past the duration is refused and counted" do
+      let c = Cl.move(Cl.turn(Cl.new(rig(), 1.0, false), 1, 1.5, turn_z(30.0), Cl.straight()), 1, -0.1, 0.0, 1.0, 0.0, Cl.step())
+      Test.assert_eq_int(List.length(Cl.keys(c)), 0, "List.length(Cl.keys(c))")
+      Test.assert_eq_int(Cl.refused(c), 2, "Cl.refused(c)")
+      let c2 = Cl.turn(c, 1, 1.0, turn_z(30.0), Cl.straight())
+      Test.assert_eq_int(List.length(Cl.keys(c2)), 1, "List.length(Cl.keys(c2))")
+    end
+    test "a key for a part the rig does not have is refused" do
+      Test.assert_eq_int(Cl.refused(Cl.turn(Cl.new(rig(), 1.0, false), 2, 0.5, turn_z(30.0), Cl.straight())), 1, "Cl.refused(Cl.turn(Cl.new(rig(), 1.0, false), 2, 0.5, turn_z(30.0), Cl.straight()))")
+    end
+    test "swing of 30 degrees over 1 s writes 17 keys, the one at 0.25 s a 30-degree turn" do
+      let c = Cl.swing(Cl.new(rig(), 1.0, true), 1, 0.0, 0.0, 1.0, 30.0, 1.0, 0.0)
+      Test.assert_eq_int(List.length(Cl.keys(c)), 17, "List.length(Cl.keys(c))")
+      Test.assert_true(List.all(Cl.keys(c), fn k -> key_is(k, 1, 0, Cl.smooth())), "smooth turn keys on the arm")
+      match key_at(c, 0.25) do
+        Some(k) -> Test.assert_true(near(degrees(k), 30.0, 0.001), "30 degrees at 0.25 s")
+        None -> Test.fail("no key at 0.25 s")
+      end
+      match key_at(c, 0.5) do
+        Some(k) -> Test.assert_true(near(degrees(k), 0.0, 0.001), "back to rest at 0.5 s")
+        None -> Test.fail("no key at 0.5 s")
+      end
+    end
+    test "spin at 1 turn/s for a 2 s clip writes 9 keys, a quarter turn apart" do
+      let c = Cl.spin(Cl.new(rig(), 2.0, true), 1, 0.0, 1.0, 0.0, 1.0)
+      Test.assert_eq_int(List.length(Cl.keys(c)), 9, "List.length(Cl.keys(c))")
+      Test.assert_true(List.all(Cl.keys(c), fn k -> key_is(k, 1, 0, Cl.straight())), "linear")
+      match key_at(c, 0.25) do
+        Some(k) -> Test.assert_true(near(degrees(k), 90.0, 0.001), "a quarter turn at 0.25 s")
+        None -> Test.fail("no key at 0.25 s")
+      end
+    end
+    test "marks inside the clip are kept, outside refused; stride is kept" do
+      let c = Cl.stride(Cl.mark(Cl.mark(Cl.mark(Cl.new(rig(), 1.0, true), 0.5, 2), 0.0, 1), 1.2, 3), 1.4)
+      Test.assert_eq_int(List.length(Cl.marks(c)), 2, "List.length(Cl.marks(c))")
+      Test.assert_eq_int(Cl.refused(c), 1, "Cl.refused(c)")
+      Test.assert_true(near(Cl.stride_of(c), 1.4, 0.000001), "stride")
+    end
+  end
+end
