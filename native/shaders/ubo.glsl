@@ -11,6 +11,7 @@ layout(set = 0, binding = 0) uniform U {
     mat4 prev_vp;    // last frame's vp
     vec4 light;      // x light mode, y time in seconds, z frame number, w sky rays per pixel
     vec4 sun_color;  // rgb the sun's colour
+    ivec4 vol;       // xyz the light volume's size in chunks
 } u;
 
 // OpenGL clip space to Vulkan's: y points down, depth runs 0..1.

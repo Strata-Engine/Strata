@@ -258,3 +258,22 @@ stored images to within one level in 255.
 
 Scene 1 offscreen: about 1 500 fps, 0.60 ms of GPU (was 0.44 forward) and
 0.21 ms of CPU in the shim.
+
+## Task 2: the light volume
+
+One byte per voxel for every chunk the stream holds, a coarse copy at one
+eighth the resolution, and a per-chunk owner table. Sized from the stream's
+radii: (2 rh + 3) x (2 rv + 3) x (2 rh + 3) chunks.
+
+| stream radius | volume | memory |
+|---|---|---|
+| 6 x 3 | 15 x 9 x 15 chunks | 66 MB |
+| 8 x 3 | 19 x 9 x 19 chunks | 106 MB |
+| 10 x 3 (viewer default) | 23 x 9 x 23 chunks | 156 MB |
+
+The design's 128 MB target is missed at the viewer's default radius; it is
+met at radius 8. A frame copies at most 128 chunks into the volume; the rest
+wait for the next frame. The soak with the volume in place: worst frame
+16.6 ms, mean 8.3 ms, nothing refused or leaked. Golden scenes `volume` and
+`volume-walk` draw the volume's classes over the overview and after a walk
+(wrap addressing): the terrain's shape, no holes, no wrapped copies.

@@ -6,7 +6,6 @@ layout(location = 2) flat in uint v_w1;
 layout(location = 3) flat in uint v_face;
 layout(location = 4) in vec2 v_tex;
 
-layout(set = 0, binding = 6) uniform sampler2DArray tiles;
 
 layout(location = 0) out vec4 o_color;
 

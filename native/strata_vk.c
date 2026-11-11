@@ -35,6 +35,8 @@ static inline void   *narr_data(void *a) { return (char *)a + NARR_HDR; }
 #define SV_MAX_SLOTS 16384
 #define SV_DEFAULT_QUADS (8u * 1024u * 1024u)   /* 64 MB of 8-byte quads */
 #define SV_FRAMES 2            /* frames in flight */
+#define SV_LIGHT_PER_FRAME 128 /* chunks whose light bytes one frame may copy into the volume */
+#define SV_LIGHT_WRITE_BYTES (32768 + 64 + 8)   /* per write: the voxels, the coarse cells, the owner texel */
 #define SV_MAX_KEYS 512
 
 #define SV_RANGES 6            /* 0 opaque, 1 cutout, 2 translucent, 3 cross, 4 loose, 5 spare */
@@ -74,6 +76,7 @@ typedef struct {
     VkBuffer ubo; VkDeviceMemory ubo_mem; float *ubo_map;
     VkBuffer table; VkDeviceMemory table_mem; ChunkEntry *table_map;
     uint32_t *pending; uint32_t npending; unsigned char *is_pending;   /* slots changed since this Frame's table was last brought up to date */
+    VkBuffer lstage; VkDeviceMemory lstage_mem; unsigned char *lstage_map;   /* this frame's light-volume writes, before they are copied in */
     VkBuffer stats; VkDeviceMemory stats_mem; uint32_t *stats_map;   /* written by the cull pass: commands per range [6], chunks, quads */
     int stats_valid;           /* the cull pass has run for this Frame at least once */
     VkFence fence;             /* signalled when the frame's commands have run */
@@ -105,6 +108,16 @@ static struct {
     VkFramebuffer fb_g, fb_l;
     VkSampler nearest;             /* for reading the frame's own images, texel for texel */
     int light_mode;                /* 0: the pre-ray-tracing shading, through the deferred passes */
+    /* The light volume: a light class per voxel for every chunk held, the
+     * coarse 'anything here' copy, and which chunk each cell holds. */
+    Target vol, coarse, owner;
+    int vn, vnv;                   /* its size in chunks: vn across (x and z), vnv up */
+    VkBuffer ltable; VkDeviceMemory ltable_mem; int32_t *ltable_map;
+    struct LightCell { int32_t chunk[3]; int valid; int uniform; } *cells;   /* per cell, as last queued: its chunk, and its class if it is one class throughout, else -1 */
+    struct LightWrite { int cell[3]; int32_t chunk[3]; int valid; int uniform; unsigned char *bytes; } *lq;   /* writes waiting to be copied in, oldest first */
+    uint32_t nlq, lq_cap;
+    int light_edit;                /* frames left in which an edit's lighting is still settling */
+    unsigned char *stage_light; int stage_light_n;   /* the light bytes of the chunk being assembled */
     float prev_vp[16]; double time_s;
     /* an offscreen target the size of the window, for frames that must not
      * touch the swapchain (timing runs: presentation paces to the display) */
@@ -158,8 +171,9 @@ static struct {
  * palette colours indexed by a quad's texture id. Must match the shaders. */
 /* The uniform block, in floats (native/shaders/ubo.glsl): vp 0, sun 16,
  * sky 20, fog 24, eye 28, misc 32 (ints), inv_vp 36, prev_vp 52, light 68,
- * sun colour 72. */
-#define UBO_FLOATS 76
+ * sun colour 72, light volume size 76 (ints). */
+#define UBO_FLOATS 80
+#define UBO_VOL 76             /* ints: the light volume's size in chunks */
 #define UBO_INV_VP 36
 #define UBO_PREV_VP 52
 #define UBO_LIGHT 68
@@ -594,6 +608,172 @@ int64_t sv_blocks_set(void *words_i32, int64_t nblocks) {
     return 1;
 }
 
+/* ── The light volume ─────────────────────────────────────────────────────── */
+static int make_volume(Target *t, VkFormat fmt, uint32_t w, uint32_t h, uint32_t d) {
+    VkImageCreateInfo ici = { .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_3D, .format = fmt,
+        .extent = { w, h, d }, .mipLevels = 1, .arrayLayers = 1, .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL,
+        .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT };
+    VKOK(vkCreateImage(g.dev, &ici, NULL, &t->img), "light volume image");
+    VkMemoryRequirements mr; vkGetImageMemoryRequirements(g.dev, t->img, &mr);
+    VkMemoryAllocateInfo ai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = mr.size,
+        .memoryTypeIndex = mem_type(mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) };
+    VKOK(vkAllocateMemory(g.dev, &ai, NULL, &t->mem), "light volume memory");
+    VKOK(vkBindImageMemory(g.dev, t->img, t->mem, 0), "light volume bind");
+    VkImageViewCreateInfo vi = { .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = t->img, .viewType = VK_IMAGE_VIEW_TYPE_3D,
+        .format = fmt, .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 } };
+    VKOK(vkCreateImageView(g.dev, &vi, NULL, &t->view), "light volume view");
+    return 1;
+}
+
+static void volume_layout(VkCommandBuffer cb, VkImage img, VkImageLayout from, VkImageLayout to) {
+    VkImageMemoryBarrier b = { .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+        .srcAccessMask = from == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL ? VK_ACCESS_TRANSFER_WRITE_BIT : (from == VK_IMAGE_LAYOUT_UNDEFINED ? 0 : VK_ACCESS_SHADER_READ_BIT),
+        .dstAccessMask = to == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL ? VK_ACCESS_TRANSFER_WRITE_BIT : VK_ACCESS_SHADER_READ_BIT,
+        .oldLayout = from, .newLayout = to, .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .image = img, .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 } };
+    VkPipelineStageFlags ss = from == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL ? VK_PIPELINE_STAGE_TRANSFER_BIT : (from == VK_IMAGE_LAYOUT_UNDEFINED ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT : VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+    VkPipelineStageFlags ds = to == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL ? VK_PIPELINE_STAGE_TRANSFER_BIT : VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+    vkCmdPipelineBarrier(cb, ss, ds, 0, 0, NULL, 0, NULL, 1, &b);
+}
+
+/* Build the volume for a stream of the given radii, in chunks: the stream's
+ * box plus the one-chunk ring it keeps on unloading, so no two chunks it
+ * holds share a cell. Everything already in the volume is forgotten. */
+static int light_box(int64_t radius_h, int64_t radius_v) {
+    if (!g.dev || radius_h < 0 || radius_v < 0 || radius_h > 30 || radius_v > 30) return 0;
+    vkDeviceWaitIdle(g.dev);
+    drop_target(&g.vol); drop_target(&g.coarse); drop_target(&g.owner);
+    for (uint32_t i = 0; i < g.nlq; i++) free(g.lq[i].bytes);
+    g.nlq = 0;
+    g.vn = (int)(2 * radius_h + 3); g.vnv = (int)(2 * radius_v + 3);
+    uint32_t n = (uint32_t)g.vn, nv = (uint32_t)g.vnv;
+    if (!make_volume(&g.vol, VK_FORMAT_R8_UINT, n * 32, nv * 32, n * 32)) return 0;
+    if (!make_volume(&g.coarse, VK_FORMAT_R8_UINT, n * 4, nv * 4, n * 4)) return 0;
+    if (!make_volume(&g.owner, VK_FORMAT_R16G16B16A16_SINT, n, nv, n)) return 0;
+    free(g.cells);
+    g.cells = calloc((size_t)n * nv * n, sizeof *g.cells);
+    if (!g.cells) return 0;
+    /* everything starts empty and owned by nobody */
+    VkCommandBufferAllocateInfo cai = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, .commandPool = g.cpool, .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1 };
+    VkCommandBuffer cb; VKOK(vkAllocateCommandBuffers(g.dev, &cai, &cb), "light volume command buffer");
+    VkCommandBufferBeginInfo bi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
+    vkBeginCommandBuffer(cb, &bi);
+    VkImage imgs[3] = { g.vol.img, g.coarse.img, g.owner.img };
+    VkClearColorValue zero; memset(&zero, 0, sizeof zero);
+    VkImageSubresourceRange all = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+    for (int i = 0; i < 3; i++) {
+        volume_layout(cb, imgs[i], VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        vkCmdClearColorImage(cb, imgs[i], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &zero, 1, &all);
+        volume_layout(cb, imgs[i], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    }
+    vkEndCommandBuffer(cb);
+    VkSubmitInfo sub = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &cb };
+    vkQueueSubmit(g.queue, 1, &sub, VK_NULL_HANDLE);
+    vkQueueWaitIdle(g.queue);
+    vkFreeCommandBuffers(g.dev, g.cpool, 1, &cb);
+    for (int f = 0; f < SV_FRAMES; f++) {
+        if (!g.frames[f].dset) continue;
+        VkDescriptorImageInfo ii[3] = {
+            { g.nearest, g.vol.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL },
+            { g.nearest, g.coarse.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL },
+            { g.nearest, g.owner.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL } };
+        VkWriteDescriptorSet w[3];
+        for (uint32_t b = 0; b < 3; b++)
+            w[b] = (VkWriteDescriptorSet){ .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = g.frames[f].dset, .dstBinding = 11 + b, .descriptorCount = 1,
+                .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .pImageInfo = &ii[b] };
+        vkUpdateDescriptorSets(g.dev, 3, w, 0, NULL);
+    }
+    return 1;
+}
+
+/* Size the light volume for a stream of these radii (chunks). Call once,
+ * before the first chunk is uploaded: it empties the volume. */
+int64_t sv_set_light_box(int64_t radius_h, int64_t radius_v) { return light_box(radius_h, radius_v); }
+
+/* The light classes: 8 words a class (Strata.Blocks.light_table). */
+int64_t sv_light_table_set(void *words_i32, int64_t nclasses) {
+    if (!g.ltable_map || !words_i32 || nclasses < 0 || nclasses > 256 || narr_len(words_i32) < nclasses * 8) return 0;
+    memset(g.ltable_map, 0, 256 * 32);
+    memcpy(g.ltable_map, narr_data(words_i32), (size_t)nclasses * 32);
+    return 1;
+}
+
+static int wrapi(int v, int n) { int m = v % n; return m < 0 ? m + n : m; }
+static struct LightCell *cell_of(const int32_t *chunk, int *cell) {
+    cell[0] = wrapi(chunk[0], g.vn); cell[1] = wrapi(chunk[1], g.vnv); cell[2] = wrapi(chunk[2], g.vn);
+    return &g.cells[cell[0] + g.vn * (cell[1] + g.vnv * cell[2])];
+}
+
+/* Queue a write of one chunk's worth of the volume: [bytes] (32768, taken
+ * over by the queue) or, when bytes is NULL, [uniform] throughout. valid 0
+ * marks the cell as holding no chunk. Copied in at the start of a frame. */
+static void light_queue(const int32_t *chunk, int valid, int uniform, unsigned char *bytes) {
+    int cell[3];
+    struct LightCell *c = cell_of(chunk, cell);
+    int same_owner = c->valid && c->chunk[0] == chunk[0] && c->chunk[1] == chunk[1] && c->chunk[2] == chunk[2];
+    /* nothing to do when the cell already holds exactly this: an air chunk re-uploaded, say */
+    if (valid == c->valid && (!valid || same_owner) && !bytes && uniform >= 0 && c->uniform == uniform) return;
+    /* new voxels for a chunk the volume already held: an edit, whose lighting must be re-estimated */
+    if (valid && same_owner) g.light_edit = 2;
+    if (g.nlq == g.lq_cap) {
+        uint32_t cap = g.lq_cap ? g.lq_cap * 2 : 256;
+        struct LightWrite *grown = realloc(g.lq, cap * sizeof *grown);
+        if (!grown) { free(bytes); return; }
+        g.lq = grown; g.lq_cap = cap;
+    }
+    struct LightWrite *w = &g.lq[g.nlq++];
+    w->cell[0] = cell[0]; w->cell[1] = cell[1]; w->cell[2] = cell[2];
+    w->chunk[0] = chunk[0]; w->chunk[1] = chunk[1]; w->chunk[2] = chunk[2];
+    w->valid = valid; w->uniform = bytes ? -1 : uniform; w->bytes = bytes;
+    c->chunk[0] = chunk[0]; c->chunk[1] = chunk[1]; c->chunk[2] = chunk[2];
+    c->valid = valid; c->uniform = w->uniform;
+}
+
+/* Record, in this frame's commands, the copies that bring the volume up to
+ * date: as many queued writes as one frame may carry, oldest first. */
+static void light_flush(Frame *F) {
+    if (g.nlq == 0) return;
+    uint32_t n = g.nlq < SV_LIGHT_PER_FRAME ? g.nlq : SV_LIGHT_PER_FRAME;
+    static VkBufferImageCopy rv[SV_LIGHT_PER_FRAME], rc[SV_LIGHT_PER_FRAME], ro[SV_LIGHT_PER_FRAME];
+    for (uint32_t i = 0; i < n; i++) {
+        struct LightWrite *w = &g.lq[i];
+        unsigned char *dst = F->lstage_map + (size_t)i * SV_LIGHT_WRITE_BYTES;
+        unsigned char *coarse = dst + 32768;
+        int16_t *own = (int16_t *)(dst + 32768 + 64);
+        if (w->bytes) {
+            /* the chunk's flat index is x + 32 * (z + 32 * y); the volume wants x fastest, then y, then z */
+            for (int z = 0; z < 32; z++) for (int y = 0; y < 32; y++)
+                memcpy(dst + 32 * (y + 32 * z), w->bytes + 32 * (z + 32 * y), 32);
+            memset(coarse, 0, 64);
+            for (int z = 0; z < 32; z++) for (int y = 0; y < 32; y++) {
+                const unsigned char *row = dst + 32 * (y + 32 * z);
+                for (int x = 0; x < 32; x++) if (row[x]) coarse[(x >> 3) + 4 * ((y >> 3) + 4 * (z >> 3))] = 1;
+            }
+        } else {
+            memset(dst, w->uniform, 32768);
+            memset(coarse, w->uniform ? 1 : 0, 64);
+        }
+        own[0] = (int16_t)w->chunk[0]; own[1] = (int16_t)w->chunk[1]; own[2] = (int16_t)w->chunk[2]; own[3] = (int16_t)(w->valid ? 1 : 0);
+        VkDeviceSize base = (VkDeviceSize)i * SV_LIGHT_WRITE_BYTES;
+        rv[i] = (VkBufferImageCopy){ .bufferOffset = base, .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+            .imageOffset = { w->cell[0] * 32, w->cell[1] * 32, w->cell[2] * 32 }, .imageExtent = { 32, 32, 32 } };
+        rc[i] = (VkBufferImageCopy){ .bufferOffset = base + 32768, .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+            .imageOffset = { w->cell[0] * 4, w->cell[1] * 4, w->cell[2] * 4 }, .imageExtent = { 4, 4, 4 } };
+        ro[i] = (VkBufferImageCopy){ .bufferOffset = base + 32768 + 64, .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+            .imageOffset = { w->cell[0], w->cell[1], w->cell[2] }, .imageExtent = { 1, 1, 1 } };
+        free(w->bytes);
+    }
+    memmove(g.lq, g.lq + n, (size_t)(g.nlq - n) * sizeof *g.lq);
+    g.nlq -= n;
+    VkImage imgs[3] = { g.vol.img, g.coarse.img, g.owner.img };
+    VkBufferImageCopy *regs[3] = { rv, rc, ro };
+    for (int k = 0; k < 3; k++) {
+        volume_layout(F->cmd, imgs[k], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        vkCmdCopyBufferToImage(F->cmd, F->lstage, imgs[k], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, n, regs[k]);
+        volume_layout(F->cmd, imgs[k], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    }
+}
+
 /* ── Input callbacks ──────────────────────────────────────────────────────── */
 static void on_key(GLFWwindow *w, int key, int sc, int action, int mods) {
     (void)w; (void)sc; (void)mods;
@@ -689,7 +869,7 @@ int64_t sv_open(int64_t w, int64_t h, int64_t capture_mouse, int64_t quad_capaci
     g.swap_ok = 1;
 
     /* one set layout for every pipeline: 0 uniforms, 1 chunk table, 2 indirect commands, 3 cull statistics, 4 command -> slot */
-    VkDescriptorSetLayoutBinding dslb[11] = {
+    VkDescriptorSetLayoutBinding dslb[15] = {
         { .binding = 0, .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, .descriptorCount = 1,
           .stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT },
         { .binding = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1,
@@ -705,8 +885,13 @@ int64_t sv_open(int64_t w, int64_t h, int64_t capture_mouse, int64_t quad_capaci
         { .binding = 7, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT },
         { .binding = 8, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT },
         { .binding = 9, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT },
-        { .binding = 10, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT } };
-    VkDescriptorSetLayoutCreateInfo dsli = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 11, .pBindings = dslb };
+        { .binding = 10, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT },
+        /* the light volume: 11 classes, 12 the coarse copy, 13 cell owners; 14 the class table */
+        { .binding = 11, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT },
+        { .binding = 12, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT },
+        { .binding = 13, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT },
+        { .binding = 14, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT } };
+    VkDescriptorSetLayoutCreateInfo dsli = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 15, .pBindings = dslb };
     VKOK(vkCreateDescriptorSetLayout(g.dev, &dsli, NULL, &g.dsl), "descriptor set layout");
     /* where the call's range starts in draw_slot, and per-call flags (bit 0: cutout) */
     VkPushConstantRange pcr = { .stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, .offset = 0, .size = 8 };
@@ -748,7 +933,7 @@ int64_t sv_open(int64_t w, int64_t h, int64_t capture_mouse, int64_t quad_capaci
     if (!make_buffer((VkDeviceSize)SV_MAX_BLOCKS * 32, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &g.blocks, &g.blocks_mem, &map)) return 0;
     g.blocks_map = map;
     memset(g.blocks_map, 0, (size_t)SV_MAX_BLOCKS * 32);
-    VkDescriptorPoolSize dps[3] = { { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, SV_FRAMES }, { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 5 * SV_FRAMES }, { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 5 * SV_FRAMES } };
+    VkDescriptorPoolSize dps[3] = { { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, SV_FRAMES }, { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 6 * SV_FRAMES }, { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 8 * SV_FRAMES } };
     VkDescriptorPoolCreateInfo dpi = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = SV_FRAMES, .poolSizeCount = 3, .pPoolSizes = dps };
     VKOK(vkCreateDescriptorPool(g.dev, &dpi, NULL, &g.dpool), "descriptor pool");
     for (int f = 0; f < SV_FRAMES; f++) {
@@ -761,6 +946,8 @@ int64_t sv_open(int64_t w, int64_t h, int64_t capture_mouse, int64_t quad_capaci
         F->ubo_map = map; memset(F->ubo_map, 0, UBO_FLOATS * 4);
         if (!make_buffer((VkDeviceSize)SV_MAX_SLOTS * sizeof(ChunkEntry), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &F->table, &F->table_mem, &map)) return 0;
         F->table_map = map; memset(F->table_map, 0, (size_t)SV_MAX_SLOTS * sizeof(ChunkEntry));
+        if (!make_buffer((VkDeviceSize)SV_LIGHT_PER_FRAME * SV_LIGHT_WRITE_BYTES, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, &F->lstage, &F->lstage_mem, &map)) return 0;
+        F->lstage_map = map;
         F->pending = calloc(SV_MAX_SLOTS, sizeof *F->pending);
         F->is_pending = calloc(SV_MAX_SLOTS, 1);
         if (!F->pending || !F->is_pending) return 0;
@@ -772,6 +959,14 @@ int64_t sv_open(int64_t w, int64_t h, int64_t capture_mouse, int64_t quad_capaci
         vkUpdateDescriptorSets(g.dev, 6, wds, 0, NULL);
     }
     bind_targets();               /* the sets did not exist when the frame's images were made */
+    if (!make_buffer(256 * 32, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &g.ltable, &g.ltable_mem, &map)) return 0;
+    g.ltable_map = map; memset(g.ltable_map, 0, 256 * 32);
+    for (int f = 0; f < SV_FRAMES; f++) {
+        VkDescriptorBufferInfo lb = { g.ltable, 0, VK_WHOLE_SIZE };
+        VkWriteDescriptorSet w = { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = g.frames[f].dset, .dstBinding = 14, .descriptorCount = 1,
+            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &lb };
+        vkUpdateDescriptorSets(g.dev, 1, &w, 0, NULL);
+    }
     {   /* the culling pipeline */
         VkShaderModule cs = shader(strata_cull_comp, sizeof(strata_cull_comp));
         VkComputePipelineCreateInfo ci = { .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO, .layout = g.layout,
@@ -797,6 +992,7 @@ int64_t sv_open(int64_t w, int64_t h, int64_t capture_mouse, int64_t quad_capaci
         if (vkCreateQueryPool(g.dev, &qi, NULL, &g.qpool) != VK_SUCCESS) g.have_ts = 0;
     }
     g.stat[3] = -1.0;
+    if (!light_box(0, 0)) return 0;          /* a small volume until the game says how far it streams */
     {   /* until a game supplies textures: one layer, one magenta texel */
         static const unsigned char missing[4] = { 255, 0, 255, 255 };
         if (sv_textures_create(1, 1) != 1) return 0;
@@ -817,6 +1013,13 @@ void sv_close(void) {
         if (g.pipe_cull) vkDestroyPipeline(g.dev, g.pipe_cull, NULL);
         if (g.pipe_cross) vkDestroyPipeline(g.dev, g.pipe_cross, NULL);
         if (g.pipe_loose) vkDestroyPipeline(g.dev, g.pipe_loose, NULL);
+        drop_target(&g.vol); drop_target(&g.coarse); drop_target(&g.owner);
+        if (g.ltable) vkDestroyBuffer(g.dev, g.ltable, NULL);
+        if (g.ltable_mem) vkFreeMemory(g.dev, g.ltable_mem, NULL);
+        for (int f = 0; f < SV_FRAMES; f++) {
+            if (g.frames[f].lstage) vkDestroyBuffer(g.dev, g.frames[f].lstage, NULL);
+            if (g.frames[f].lstage_mem) vkFreeMemory(g.dev, g.frames[f].lstage_mem, NULL);
+        }
         if (g.pipe_light) vkDestroyPipeline(g.dev, g.pipe_light, NULL);
         if (g.pipe_composite) vkDestroyPipeline(g.dev, g.pipe_composite, NULL);
         if (g.pass_g) vkDestroyRenderPass(g.dev, g.pass_g, NULL);
@@ -865,7 +1068,9 @@ void sv_close(void) {
     if (g.win) glfwDestroyWindow(g.win);
     glfwTerminate();
     free(g.trans); free(g.trans_at); free(g.trans_keys);
-    free(g.ubo_map); free(g.entries);
+    free(g.ubo_map); free(g.entries); free(g.cells); free(g.stage_light);
+    for (uint32_t i = 0; i < g.nlq; i++) free(g.lq[i].bytes);
+    free(g.lq);
     for (int i = 0; i < 4; i++) free(g.stage.part[i]);
     memset(&g, 0, sizeof g);
 }
@@ -1003,6 +1208,7 @@ int64_t sv_chunk_begin(int64_t slot, double ox, double oy, double oz) {
     g.stage.origin[0] = (int32_t)ox; g.stage.origin[1] = (int32_t)oy; g.stage.origin[2] = (int32_t)oz;
     for (int i = 0; i < 4; i++) g.stage.n[i] = 0;
     g.stage.open = 1;
+    g.stage_light_n = 0;
     return 1;
 }
 
@@ -1022,6 +1228,18 @@ int64_t sv_chunk_part(int64_t part, void *words, int64_t n) {
 static uint32_t fixed16(float v, float offset) {
     float f = (v + offset) * 256.0f;
     return f <= 0.0f ? 0u : (f >= 65535.0f ? 65535u : (uint32_t)(f + 0.5f));
+}
+
+/* The light classes of the chunk being assembled: 32768 bytes by the
+ * chunk's flat index, or one byte when every voxel has that class. Without
+ * this call the chunk is taken to be empty of anything light meets. */
+int64_t sv_chunk_light(void *bytes, int64_t n) {
+    if (!g.stage.open || !bytes || (n != 32768 && n != 1) || narr_len(bytes) < n) return 0;
+    if (!g.stage_light) g.stage_light = malloc(32768);
+    if (!g.stage_light) return 0;
+    memcpy(g.stage_light, narr_data(bytes), (size_t)n);
+    g.stage_light_n = (int)n;
+    return 1;
 }
 
 int64_t sv_chunk_commit(void) {
@@ -1076,6 +1294,12 @@ int64_t sv_chunk_commit(void) {
     if ((uint32_t)slot + 1 > g.hi_slot) g.hi_slot = (uint32_t)slot + 1;
     trans_track((uint32_t)slot, counts[2] > 0);
     touch((uint32_t)slot);
+    /* its voxels go into the light volume at the start of the next frame */
+    int32_t chunk[3] = { e->origin[0] >> 5, e->origin[1] >> 5, e->origin[2] >> 5 };
+    if (g.stage_light_n == 32768) {
+        unsigned char *copy = malloc(32768);
+        if (copy) { memcpy(copy, g.stage_light, 32768); light_queue(chunk, 1, -1, copy); }
+    } else light_queue(chunk, 1, g.stage_light_n == 1 ? g.stage_light[0] : 0, NULL);
     return 1;
 }
 
@@ -1084,6 +1308,12 @@ void sv_chunk_free(int64_t slot) {
     ChunkEntry *e = &g.entries[slot];
     if (!(e->level_flags & SV_IN_USE)) return;
     e->level_flags = 0;                      /* the cull pass skips it once the frames have their copy */
+    {   /* and its cell of the light volume empties, if it is still this chunk's */
+        int32_t chunk[3] = { e->origin[0] >> 5, e->origin[1] >> 5, e->origin[2] >> 5 };
+        int cell[3];
+        struct LightCell *c = cell_of(chunk, cell);
+        if (c->valid && c->chunk[0] == chunk[0] && c->chunk[1] == chunk[1] && c->chunk[2] == chunk[2]) light_queue(chunk, 0, 0, NULL);
+    }
     trans_track((uint32_t)slot, 0);
     for (int r = 0; r < 4; r++) { sa_release(&g_quads, (Range){ e->first[r], e->count[r] }, g.frame_no); e->first[r] = 0; e->count[r] = 0; }
     sa_release(&g_loose, (Range){ e->first[4], e->count[4] }, g.frame_no); e->first[4] = 0; e->count[4] = 0;
@@ -1245,6 +1475,7 @@ int64_t sv_frame(void) {
     memcpy(g.prev_vp, g.ubo_map, sizeof g.prev_vp);
     g.ubo_map[UBO_LIGHT + 0] = (float)g.light_mode; g.ubo_map[UBO_LIGHT + 1] = (float)g.time_s;
     g.ubo_map[UBO_LIGHT + 2] = (float)(g.frame_no & 0xFFFFFF);
+    { int32_t *vol = (int32_t *)(g.ubo_map + UBO_VOL); vol[0] = g.vn; vol[1] = g.vnv; vol[2] = g.vn; vol[3] = 0; }
     /* this Frame's fence has been waited on, so the GPU is done with its
      * copies: bring them up to date. From here to the next time this Frame
      * comes round, nothing the CPU does can change what it draws. */
@@ -1255,6 +1486,7 @@ int64_t sv_frame(void) {
         F->is_pending[slot] = 0;
     }
     F->npending = 0;
+    light_flush(F);               /* queued chunks into the light volume, before anything reads it */
     vkCmdBindDescriptorSets(F->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g.layout, 0, 1, &F->dset, 0, NULL);
     if (g.hi_slot > 0) {
         /* zero the part of each compacted list that will be submitted, so

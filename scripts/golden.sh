@@ -38,6 +38,8 @@ meadow:STRATA_SCENE=9
 post:STRATA_SCENE=10
 walk:STRATA_SCENE=11 STRATA_FRAMES=200
 overview-offscreen:STRATA_SCENE=1 STRATA_OFFSCREEN=1 GOLDEN_AS=overview
+volume:STRATA_SCENE=1 STRATA_LIGHT=9
+volume-walk:STRATA_SCENE=11 STRATA_FRAMES=200 STRATA_LIGHT=9
 '
 # indirect draw calls a frame must issue, whatever the scene holds
 EXPECT_DRAWS=5

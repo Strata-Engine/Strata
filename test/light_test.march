@@ -1,0 +1,144 @@
+-- Light classes: what a block is to a ray, and a chunk's class bytes.
+mod Strata.Test.Light do
+
+  needs IO.Clock      -- charged to every test module once any uses Check.all (GAPS S3)
+  needs IO.Process
+  import Test
+  alias Strata.Blocks as B
+  alias Strata.Chunk as C
+
+  pfn reg1(r : Strata.Blocks.Registry, d : Strata.Blocks.Def) : (Strata.Blocks.Registry, Int) do
+    match B.register(r, d) do
+      Ok(p) -> p
+      Err(_) -> (r, -1)
+    end
+  end
+  pfn add(r : Strata.Blocks.Registry, d : Strata.Blocks.Def) : Strata.Blocks.Registry do
+    match reg1(r, d) do (r2, _) -> r2 end
+  end
+  pfn row(r : Strata.Blocks.Registry, class : Int, k : Int) : Int do NativeArray.get_i32(B.light_table(r), 8 * class + k) end
+
+  pfn many(r : Strata.Blocks.Registry, i : Int, n : Int) : Strata.Blocks.Registry do
+    -- n blocks that differ only in a texture id
+    if i >= n do r else many(add(r, B.with_faces(B.def(), 100 + i, 100 + i, 100 + i)), i + 1, n) end
+  end
+
+  pfn alone(c : Strata.Chunk.Chunk) : Strata.Mesh.Around do
+    Strata.Mesh.around_from(fn (dx, dy, dz) -> if dx == 0 && dy == 0 && dz == 0 do c else C.uniform(0) end)
+  end
+  pfn bytes_match(r : Strata.Blocks.Registry, c : Strata.Chunk.Chunk, b : NativeU8Arr, i : Int) : Bool do
+    if i >= 32768 do true
+    else if NativeArray.get_u8(b, i) == B.light_class(r, C.get_idx(c, i)) do bytes_match(r, c, b, i + 1)
+    else false end end
+  end
+  pfn scatter(c : Strata.Chunk.Chunk, i : Int) : Strata.Chunk.Chunk do
+    if i >= 32768 do c else scatter(C.set_idx(c, i, (i * 7 + i / 13) % 4), i + 1) end
+  end
+  pfn flags_ok(r : Strata.Blocks.Registry, a : Strata.Mesh.Around, m : Strata.Mesh.Meshed, l : Int, k : Int) : Bool do
+    if k >= Strata.Mesh.quad_count_at(m, l) do true
+    else
+      let w0 = NativeArray.get_i32(Strata.Mesh.quads_at(m, l), 2 * k)
+      let w1 = NativeArray.get_i32(Strata.Mesh.quads_at(m, l), 2 * k + 1)
+      let id = Strata.Mesh.around_get(a, Strata.Quad.x_of(w0), Strata.Quad.y_of(w0), Strata.Quad.z_of(w0))
+      if Strata.Quad.flags_of(w1) == B.light_class(r, id) do flags_ok(r, a, m, l, k + 1) else false end
+    end
+  end
+
+  describe "Blocks light classes" do
+    test "an empty registry has only the empty class, and air is in it" do
+      let r = B.empty()
+      Test.assert_eq_int(B.light_class_count(r), 1, "class 0 alone")
+      Test.assert_eq_int(B.light_class(r, 0), 0, "air")
+      Test.assert_eq_int(B.light_class(r, 60000), 0, "an id nobody registered")
+      Test.assert_eq_int(B.light_class(r, -1), 0, "a negative id")
+      Test.assert_eq_int(B.light_overflow(r), 0, "nothing overflowed")
+    end
+    test "blocks that are the same to a ray share a class" do
+      let (r1, a) = reg1(B.empty(), B.with_faces(B.def(), 3, 4, 5))
+      let (r2, b) = reg1(r1, B.with_faces(B.def(), 3, 4, 5))
+      Test.assert_eq_int(B.light_class(r2, a), 1, "the first block opens class 1")
+      Test.assert_eq_int(B.light_class(r2, b), 1, "an identical one joins it")
+      Test.assert_eq_int(B.light_class_count(r2), 2, "two classes: empty and that one")
+    end
+    test "the bottom texture does not matter to a ray; the top and side do" do
+      let r = add(add(add(add(B.empty(), B.with_faces(B.def(), 3, 4, 5)), B.with_faces(B.def(), 3, 9, 5)), B.with_faces(B.def(), 8, 4, 5)), B.with_faces(B.def(), 3, 4, 8))
+      Test.assert_eq_int(B.light_class(r, 2), B.light_class(r, 1), "another bottom: the same class")
+      Test.assert_true(B.light_class(r, 3) != B.light_class(r, 1), "another top: a new class")
+      Test.assert_true(B.light_class(r, 4) != B.light_class(r, 1) && B.light_class(r, 4) != B.light_class(r, 3), "another side: a new class")
+    end
+    test "roughness, emission and kind each make a new class" do
+      let base = B.with_faces(B.def(), 3, 3, 3)
+      let r = add(add(add(add(B.empty(), base), B.with_material(base, 40, 0)), B.with_emission(base, 255, 200, 100, 200)), B.with_opacity(base, Strata.Blocks.SeeThrough))
+      Test.assert_eq_int(B.light_class_count(r), 5, "four blocks, four classes, plus empty")
+    end
+    test "the table row says what the class is" do
+      let leaf = B.with_material(B.with_faces(B.with_layer(B.with_opacity(B.def(), Strata.Blocks.SeeThrough), Strata.Blocks.Cutout), 8, 8, 7), 200, 0)
+      let lamp = B.with_emission(B.with_faces(B.def(), 6, 6, 6), 255, 200, 120, 220)
+      let glass = B.with_faces(B.with_layer(B.with_opacity(B.def(), Strata.Blocks.SeeThrough), Strata.Blocks.Translucent), 10, 10, 10)
+      let (r1, l) = reg1(B.empty(), leaf)
+      let (r2, e) = reg1(r1, lamp)
+      let (r3, g) = reg1(r2, glass)
+      Test.assert_eq_int(row(r3, B.light_class(r3, l), 0), 2, "a see-through cutout cube is kind 2")
+      Test.assert_eq_int(row(r3, B.light_class(r3, l), 1), 8, "its top texture")
+      Test.assert_eq_int(row(r3, B.light_class(r3, l), 2), 7, "its side texture")
+      Test.assert_eq_int(row(r3, B.light_class(r3, l), 4), 200, "its roughness")
+      Test.assert_eq_int(row(r3, B.light_class(r3, e), 0), 1, "a solid cube is kind 1")
+      Test.assert_eq_int(int_and(row(r3, B.light_class(r3, e), 3), 4294967295), B.emission(r3, e), "its emission")
+      Test.assert_eq_int(row(r3, B.light_class(r3, g), 0), 3, "a see-through translucent cube is kind 3")
+      Test.assert_eq_int(row(r3, 0, 0), 0, "class 0 is empty")
+      Test.assert_eq_int(NativeArray.length_i32(B.light_table(r3)), 8 * B.light_class_count(r3), "eight words a class")
+    end
+    test "a cross is empty to a ray; a model is thin" do
+      let plant = B.with_style(B.with_opacity(B.def(), Strata.Blocks.Clear), Strata.Blocks.Cross)
+      let post = B.with_emission(B.with_style(B.with_opacity(B.def(), Strata.Blocks.Clear), Strata.Blocks.Model(0)), 255, 180, 90, 200)
+      let (r1, p) = reg1(B.empty(), plant)
+      let (r2, m) = reg1(r1, post)
+      Test.assert_eq_int(B.light_class(r2, p), 0, "a cross")
+      Test.assert_eq_int(row(r2, B.light_class(r2, m), 0), 4, "a model is kind 4")
+    end
+    test "the default block is fully rough" do
+      let (r, id) = reg1(B.empty(), B.def())
+      Test.assert_eq_int(B.roughness(r, id), 255, "no block is a mirror unless it says so")
+    end
+    test "past 255 classes the rest share the last one, and the overflow is counted" do
+      let r = many(B.empty(), 0, 300)
+      Test.assert_eq_int(B.light_class_count(r), 256, "256 classes, the empty one included")
+      Test.assert_eq_int(B.light_class(r, 255), 255, "the 255th block has the last class of its own")
+      Test.assert_eq_int(B.light_class(r, 300), 255, "the 300th shares it")
+      Test.assert_eq_int(B.light_overflow(r), 45, "45 blocks had to share")
+    end
+    test "the block table carries the class in bits 8-15 of its flags word" do
+      let (r, id) = reg1(add(B.empty(), B.def()), B.with_faces(B.def(), 3, 4, 5))
+      Test.assert_eq_int(int_and(NativeArray.get_i32(B.gpu_table(r), 8 * id + 6) / 256, 255), B.light_class(r, id), "class")
+      Test.assert_eq_int(int_and(NativeArray.get_i32(B.gpu_table(r), 8 * id + 6), 255), 3, "the low byte is still the flags")
+    end
+  end
+
+  describe "Mesh light data" do
+    test "every quad's flags byte is its block's class" do
+      let r = add(add(add(B.empty(), B.def()), B.with_faces(B.def(), 3, 4, 5)), B.with_faces(B.with_layer(B.with_opacity(B.def(), Strata.Blocks.SeeThrough), Strata.Blocks.Translucent), 7, 7, 7))
+      let a = alone(scatter(C.uniform(0), 0))
+      let m = Strata.Mesh.build(r, a)
+      Test.assert_true(Strata.Mesh.quad_count_at(m, 0) > 100, "there are quads to check")
+      Test.assert_true(flags_ok(r, a, m, 0, 0) && flags_ok(r, a, m, 2, 0), "opaque and translucent layers")
+    end
+    test "a mixed chunk's light bytes are each voxel's class" do
+      let r = add(add(add(B.empty(), B.def()), B.with_faces(B.def(), 3, 4, 5)), B.with_faces(B.def(), 9, 9, 9))
+      let c = scatter(C.uniform(0), 0)
+      let b = Strata.Mesh.light_bytes(Strata.Mesh.build(r, alone(c)))
+      Test.assert_eq_int(NativeArray.length_u8(b), 32768, "one byte a voxel")
+      Test.assert_true(bytes_match(r, c, b, 0), "every voxel")
+    end
+    test "a chunk of one block is one byte" do
+      let r = add(B.empty(), B.def())
+      let air = Strata.Mesh.light_bytes(Strata.Mesh.build(r, alone(C.uniform(0))))
+      Test.assert_eq_int(NativeArray.length_u8(air), 1, "air: one byte")
+      Test.assert_eq_int(NativeArray.get_u8(air, 0), 0, "class 0")
+      let stone = Strata.Mesh.light_bytes(Strata.Mesh.build(r, alone(C.uniform(1))))
+      Test.assert_eq_int(NativeArray.length_u8(stone), 1, "stone: one byte")
+      Test.assert_eq_int(NativeArray.get_u8(stone, 0), B.light_class(r, 1), "stone's class")
+      let buried = Strata.Mesh.light_bytes(Strata.Mesh.build(r, Strata.Mesh.around_from(fn (dx, dy, dz) -> C.uniform(1))))
+      Test.assert_eq_int(NativeArray.get_u8(buried, 0), B.light_class(r, 1), "buried stone still reports its class")
+    end
+  end
+end

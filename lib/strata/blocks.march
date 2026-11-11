@@ -40,8 +40,8 @@ mod Strata.Blocks do
   pfn clamp8(v : Int) : Int do if v < 0 do 0 else if v > 255 do 255 else v end end end
   pfn clamp16(v : Int) : Int do if v < 0 do 0 else if v > 65535 do 65535 else v end end end
 
-  doc "A collidable, solid, opaque cube with texture 0 on every face and no light."
-  fn def() : Def do Def(3, 0, 0, 0, 0, 0, 0, 0, 0, 0) end
+  doc "A collidable, solid, opaque cube with texture 0 on every face, fully rough and giving no light."
+  fn def() : Def do Def(3, 0, 0, 255, 0, 0, 0, 0, 0, 0) end
 
   pfn d_flags(d : Def) : Int do match d do Def(f, _, _, _, _, _, _, _, _, _) -> f end end
   pfn set_flags(d : Def, f : Int) : Def do match d do Def(_, m, e, mt, t0, t1, t2, t3, t4, t5) -> Def(f, m, e, mt, t0, t1, t2, t3, t4, t5) end end
@@ -125,18 +125,24 @@ mod Strata.Blocks do
   -- count, capacity, flags (one byte per id), ints (stride() per id: model,
   -- emission, material, family base, family size, six face textures),
   -- models (newest first), model count
-  type Registry = Registry(Int, Int, NativeU8Arr, NativeIntArr, List(ModelDef), Int)
+  -- What the blocks are to a ray of light: each block's class (one byte per
+  -- id, same capacity as the flags), the class table (8 words a class, 256
+  -- rows: kind, top texture, side texture, emission, roughness, 3 spare),
+  -- classes in use, and blocks that had to share the last class.
+  type Light = Light(NativeU8Arr, NativeIntArr, Int, Int)
+
+  type Registry = Registry(Int, Int, NativeU8Arr, NativeIntArr, List(ModelDef), Int, Light)
 
   doc "A registry holding only air, as id 0."
   fn empty() : Registry do
     let cap = 64
     let flags = NativeArray.set_u8(NativeArray.make_u8(cap, air_flags()), 0, air_flags())
     let ints = NativeArray.set_int(NativeArray.make_int(cap * stride(), 0), 4, 1)
-    Registry(1, cap, flags, ints, Nil, 0)
+    Registry(1, cap, flags, ints, Nil, 0, Light(NativeArray.make_u8(cap, 0), NativeArray.make_int(8 * 256, 0), 1, 0))
   end
 
   doc "How many ids are registered, air included."
-  fn count(r : Registry) : Int do match r do Registry(n, _, _, _, _, _) -> n end end
+  fn count(r : Registry) : Int do match r do Registry(n, _, _, _, _, _, _) -> n end end
 
   pfn copy_u8(dst : NativeU8Arr, src : NativeU8Arr, i : Int, n : Int) : NativeU8Arr do
     if i >= n do dst else copy_u8(NativeArray.set_u8(dst, i, NativeArray.get_u8(src, i)), src, i + 1, n) end
@@ -147,20 +153,68 @@ mod Strata.Blocks do
 
   pfn grown(r : Registry, need : Int) : Registry do
     match r do
-      Registry(n, cap, flags, ints, ms, mc) ->
+      Registry(n, cap, flags, ints, ms, mc, lt) ->
         if need <= cap do r
         else
           let cap2 = if cap * 2 >= need do cap * 2 else need end
           let f2 = copy_u8(NativeArray.make_u8(cap2, air_flags()), flags, 0, n)
           let i2 = copy_int(NativeArray.make_int(cap2 * stride(), 0), ints, 0, n * stride())
-          Registry(n, cap2, f2, i2, ms, mc)
+          match lt do
+            Light(cls, table, lc, lo) -> Registry(n, cap2, f2, i2, ms, mc, Light(copy_u8(NativeArray.make_u8(cap2, 0), cls, 0, n), table, lc, lo))
+          end
+        end
+    end
+  end
+
+  -- ── Light classes ────────────────────────────────────────────────────────
+  -- What kind of thing a block is to a ray, from its flags byte: 0 empty
+  -- (air, crosses, anything with no mesh, a clear cube), 1 a solid cube,
+  -- 2 a see-through cube on the cutout layer (its texture decides where it
+  -- blocks), 3 any other see-through cube, 4 a model (thin: never blocks).
+  pfn light_kind(flags : Int) : Int do
+    let opac = int_and(flags / 2, 3)
+    let lay = int_and(flags / 8, 3)
+    let sty = int_and(flags / 32, 3)
+    if sty == 2 do 4
+    else if sty != 0 do 0
+    else if opac == 1 do 1
+    else if opac == 2 do (if lay == 1 do 2 else 3 end)
+    else 0 end end end end
+  end
+
+  -- The class among 1 .. n - 1 whose row is exactly these five values, or -1.
+  pfn class_find(table : NativeIntArr, n : Int, kind : Int, top : Int, side : Int, em : Int, rough : Int, c : Int) : Int do
+    if c >= n do -1
+    else
+      let o = 8 * c
+      if NativeArray.get_int(table, o) == kind && NativeArray.get_int(table, o + 1) == top && NativeArray.get_int(table, o + 2) == side && NativeArray.get_int(table, o + 3) == em && NativeArray.get_int(table, o + 4) == rough do c
+      else class_find(table, n, kind, top, side, em, rough, c + 1) end
+    end
+  end
+
+  -- Give block [id] its class: an existing one it agrees with, else a new
+  -- one, else (all 255 taken) the last, counting the overflow.
+  pfn classed(lt : Light, id : Int, flags : Int, top : Int, side : Int, em : Int, rough : Int) : Light do
+    let kind = light_kind(flags)
+    match lt do
+      Light(cls, table, n, over) ->
+        if kind == 0 do Light(NativeArray.set_u8(cls, id, 0), table, n, over)
+        else
+          let have = class_find(table, n, kind, top, side, em, rough, 1)
+          if have > 0 do Light(NativeArray.set_u8(cls, id, have), table, n, over)
+          else if n >= 256 do Light(NativeArray.set_u8(cls, id, 255), table, n, over + 1)
+          else
+            let o = 8 * n
+            let t = NativeArray.set_int(NativeArray.set_int(NativeArray.set_int(NativeArray.set_int(NativeArray.set_int(table, o, kind), o + 1, top), o + 2, side), o + 3, em), o + 4, rough)
+            Light(NativeArray.set_u8(cls, id, n), t, n + 1, over)
+          end end
         end
     end
   end
 
   pfn put_def(r : Registry, d : Def, base : Int, size : Int) : Registry do
     match r do
-      Registry(n, cap, flags, ints, ms, mc) ->
+      Registry(n, cap, flags, ints, ms, mc, lt) ->
         match d do
           Def(f, m, e, mt, t0, t1, t2, t3, t4, t5) ->
             let o = n * stride()
@@ -175,7 +229,7 @@ mod Strata.Blocks do
             let i8 = NativeArray.set_int(i7, o + 8, t3)
             let i9 = NativeArray.set_int(i8, o + 9, t4)
             let i10 = NativeArray.set_int(i9, o + 10, t5)
-            Registry(n + 1, cap, NativeArray.set_u8(flags, n, f), i10, ms, mc)
+            Registry(n + 1, cap, NativeArray.set_u8(flags, n, f), i10, ms, mc, classed(lt, n, f, t0, t2, e, int_and(mt, 255)))
         end
     end
   end
@@ -198,14 +252,14 @@ mod Strata.Blocks do
   @[no_alloc]
   pfn flags_of(r : Registry, id : Int) : Int do
     match r do
-      Registry(n, _, flags, _, _, _) -> if id < 0 || id >= n do air_flags() else NativeArray.get_u8(flags, id) end
+      Registry(n, _, flags, _, _, _, _) -> if id < 0 || id >= n do air_flags() else NativeArray.get_u8(flags, id) end
     end
   end
 
   -- Field [k] of id's int row, or [default] for an id nobody registered.
   pfn int_of(r : Registry, id : Int, k : Int, default : Int) : Int do
     match r do
-      Registry(n, _, _, ints, _, _) -> if id < 0 || id >= n do default else NativeArray.get_int(ints, id * stride() + k) end
+      Registry(n, _, _, ints, _, _, _) -> if id < 0 || id >= n do default else NativeArray.get_int(ints, id * stride() + k) end
     end
   end
 
@@ -285,12 +339,37 @@ mod Strata.Blocks do
       let t3 = NativeArray.set_i32(t2, o + 3, face_tex(r, id, 3))
       let t4 = NativeArray.set_i32(t3, o + 4, face_tex(r, id, 4))
       let t5 = NativeArray.set_i32(t4, o + 5, face_tex(r, id, 5))
-      let t6 = NativeArray.set_i32(t5, o + 6, flags_of(r, id))
+      let t6 = NativeArray.set_i32(t5, o + 6, flags_of(r, id) + 256 * light_class(r, id))
       gpu_go(NativeArray.set_i32(t6, o + 7, emission(r, id)), r, id + 1, n)
     end
   end
 
-  doc "The registry as the renderer's shaders read it: eight 32-bit words a block id. Words 0-5 are the face textures (0 +y, 1 -y, 2 +x, 3 -x, 4 +z, 5 -z); word 6 the flags (bit 0 collides, bits 1-2 opacity, bits 3-4 layer, bits 5-6 style); word 7 the emission as `emission` packs it."
+  doc "The block's light class, 0..255: what it is to a ray. 0 is empty: air, an id nobody registered, a cross, anything without a mesh. Blocks agreeing on kind, top and side texture, emission and roughness share a class."
+  @[no_alloc]
+  fn light_class(r : Registry, id : Int) : Int do
+    match r do
+      Registry(n, _, _, _, _, _, Light(cls, _, _, _)) -> if id < 0 || id >= n do 0 else NativeArray.get_u8(cls, id) end
+    end
+  end
+
+  doc "How many light classes are in use, the empty class 0 included; at most 256."
+  fn light_class_count(r : Registry) : Int do match r do Registry(_, _, _, _, _, _, Light(_, _, n, _)) -> n end end
+
+  doc "How many blocks could not have a class of their own and share class 255. 0 unless a game has more than 255 kinds of block as far as light can tell."
+  fn light_overflow(r : Registry) : Int do match r do Registry(_, _, _, _, _, _, Light(_, _, _, over)) -> over end end
+
+  pfn light_go(t : NativeI32Arr, table : NativeIntArr, i : Int, n : Int) : NativeI32Arr do
+    if i >= n do t else light_go(NativeArray.set_i32(t, i, NativeArray.get_int(table, i)), table, i + 1, n) end
+  end
+
+  doc "The light classes as the renderer reads them: eight 32-bit words a class. Word 0 is the kind (0 empty, 1 solid, 2 cutout, 3 see-through, 4 thin), 1 the top texture, 2 the side texture, 3 the emission as `emission` packs it, 4 the roughness 0..255; the rest are spare."
+  fn light_table(r : Registry) : NativeI32Arr do
+    match r do
+      Registry(_, _, _, _, _, _, Light(_, table, n, _)) -> light_go(NativeArray.make_i32(8 * n, 0), table, 0, 8 * n)
+    end
+  end
+
+  doc "The registry as the renderer's shaders read it: eight 32-bit words a block id. Words 0-5 are the face textures (0 +y, 1 -y, 2 +x, 3 -x, 4 +z, 5 -z); word 6 the flags (bit 0 collides, bits 1-2 opacity, bits 3-4 layer, bits 5-6 style) with the light class in bits 8-15; word 7 the emission as `emission` packs it."
   fn gpu_table(r : Registry) : NativeI32Arr do
     gpu_go(NativeArray.make_i32(8 * count(r), 0), r, 0, count(r))
   end
@@ -313,12 +392,12 @@ mod Strata.Blocks do
   doc "Add a model: [quads] for drawing, [boxes] for collision and ray casting. Returns its index."
   fn add_model(r : Registry, quads : NativeF32Arr, boxes : List(Box)) : (Registry, Int) do
     match r do
-      Registry(n, cap, flags, ints, ms, mc) -> (Registry(n, cap, flags, ints, Cons(ModelDef(quads, boxes), ms), mc + 1), mc)
+      Registry(n, cap, flags, ints, ms, mc, lt) -> (Registry(n, cap, flags, ints, Cons(ModelDef(quads, boxes), ms), mc + 1, lt), mc)
     end
   end
 
   doc "How many models the registry holds; their indices are 0 .. count - 1."
-  fn model_count(r : Registry) : Int do match r do Registry(_, _, _, _, _, mc) -> mc end end
+  fn model_count(r : Registry) : Int do match r do Registry(_, _, _, _, _, mc, _) -> mc end end
 
   -- Models are stored newest first: index m is at position (count - 1 - m).
   pfn model_at(ms : List(ModelDef), i : Int) : Option(ModelDef) do
@@ -330,7 +409,7 @@ mod Strata.Blocks do
 
   pfn find_model(r : Registry, m : Int) : Option(ModelDef) do
     match r do
-      Registry(_, _, _, _, ms, mc) -> if m < 0 || m >= mc do None else model_at(ms, mc - 1 - m) end
+      Registry(_, _, _, _, ms, mc, _) -> if m < 0 || m >= mc do None else model_at(ms, mc - 1 - m) end
     end
   end
 

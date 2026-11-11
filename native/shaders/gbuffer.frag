@@ -8,9 +8,6 @@ layout(location = 2) flat in uint v_w1;
 layout(location = 3) flat in uint v_face;
 layout(location = 4) in vec2 v_tex;
 
-// One layer per texture id; repeat addressing, so a merged quad tiles its
-// texture once per block.
-layout(set = 0, binding = 6) uniform sampler2DArray tiles;
 layout(push_constant) uniform PC { uint base; uint flags; } pc;   // flags bit 0: discard see-through pixels (cutout)
 
 layout(location = 0) out vec4 o_albedo;

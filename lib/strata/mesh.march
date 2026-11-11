@@ -99,12 +99,13 @@ mod Strata.Mesh do
   pfn qb_arr(q : QBuf) : NativeI32Arr do match q do QBuf(a, _) -> a end end
   pfn qb_len(q : QBuf) : Int do match q do QBuf(_, n) -> n end end
 
-  -- opaque, cutout, translucent quads; instances; the centre's occupancy
-  type Meshed = Meshed(QBuf, QBuf, QBuf, QBuf, NativeU8Arr)
+  -- opaque, cutout, translucent quads; instances; the centre's occupancy;
+  -- its light classes (32768 bytes by flat index, or 1 when it is one class throughout)
+  type Meshed = Meshed(QBuf, QBuf, QBuf, QBuf, NativeU8Arr, NativeU8Arr)
 
   pfn layer_buf(m : Meshed, l : Int) : QBuf do
     match m do
-      Meshed(q0, q1, q2, _, _) -> if l == 1 do q1 else if l == 2 do q2 else q0 end end
+      Meshed(q0, q1, q2, _, _, _) -> if l == 1 do q1 else if l == 2 do q2 else q0 end end
     end
   end
 
@@ -115,20 +116,32 @@ mod Strata.Mesh do
   fn quads(m : Meshed, l : Strata.Blocks.Layer) : NativeI32Arr do quads_at(m, B.layer_number(l)) end
   fn quad_count(m : Meshed, l : Strata.Blocks.Layer) : Int do quad_count_at(m, B.layer_number(l)) end
   doc "The cross and model instances: two words each. Read `instance_count`."
-  fn instances(m : Meshed) : NativeI32Arr do match m do Meshed(_, _, _, qi, _) -> qb_arr(qi) end end
-  fn instance_count(m : Meshed) : Int do match m do Meshed(_, _, _, qi, _) -> qb_len(qi) / 2 end end
+  fn instances(m : Meshed) : NativeI32Arr do match m do Meshed(_, _, _, qi, _, _) -> qb_arr(qi) end end
+  fn instance_count(m : Meshed) : Int do match m do Meshed(_, _, _, qi, _, _) -> qb_len(qi) / 2 end end
   doc "The centre chunk's occupancy mask (Strata.Occupancy)."
-  fn occupancy(m : Meshed) : NativeU8Arr do match m do Meshed(_, _, _, _, o) -> o end end
+  fn occupancy(m : Meshed) : NativeU8Arr do match m do Meshed(_, _, _, _, o, _) -> o end end
+  doc "The centre chunk's light classes for the renderer's light volume: 32768 bytes by flat index, or a single byte when every voxel has the same class."
+  fn light_bytes(m : Meshed) : NativeU8Arr do match m do Meshed(_, _, _, _, _, lb) -> lb end end
   doc "The level of detail the mesh was built at. Always 0 for now."
   fn level(m : Meshed) : Int do
-    match m do Meshed(_, _, _, _, _) -> 0 end
+    match m do Meshed(_, _, _, _, _, _) -> 0 end
   end
   doc "Bytes of mesh: eight per quad and per instance."
   fn bytes(m : Meshed) : Int do
     (quad_count_at(m, 0) + quad_count_at(m, 1) + quad_count_at(m, 2) + instance_count(m)) * 8
   end
 
-  pfn no_mesh(occ : NativeU8Arr) : Meshed do Meshed(qb_new(), qb_new(), qb_new(), qb_new(), occ) end
+  pfn no_mesh(occ : NativeU8Arr, lb : NativeU8Arr) : Meshed do Meshed(qb_new(), qb_new(), qb_new(), qb_new(), occ, lb) end
+
+  pfn light_go(lb : NativeU8Arr, r : Strata.Blocks.Registry, c : Strata.Chunk.Chunk, i : Int) : NativeU8Arr do
+    if i < 0 || i >= 32768 do lb else light_go(NativeArray.set_u8(lb, i, B.light_class(r, C.get_idx(c, i))), r, c, i + 1) end
+  end
+
+  -- The chunk's light classes: one byte when it is uniform, else one a voxel.
+  pfn light_of(r : Strata.Blocks.Registry, c : Strata.Chunk.Chunk) : NativeU8Arr do
+    let u = C.uniform_id(c)
+    if u >= 0 do NativeArray.make_u8(1, B.light_class(r, u)) else light_go(NativeArray.make_u8(32768, 0), r, c, 0) end
+  end
 
   -- ── The padded grids ─────────────────────────────────────────────────────
   -- The centre chunk and a one-voxel shell of its neighbours: 34 x 34 x 34,
@@ -269,7 +282,8 @@ mod Strata.Mesh do
     let y = if f < 2 do n else b end
     let z = if f < 2 do b else if f < 4 do a else n end end
     let w0 = Q.pack0(x, y, z, w, h, f)
-    let w1 = Q.pack1(B.face_tex(r, id, f), ao, 0)
+    -- the flags byte carries the block's light class: what the surface is to the lighting
+    let w1 = Q.pack1(B.face_tex(r, id, f), ao, B.light_class(r, id))
     let l = B.layer_index(r, id)
     match bufs do
       Bufs(q0, q1, q2) ->
@@ -349,14 +363,15 @@ mod Strata.Mesh do
     let u = C.uniform_id(centre)
     -- the two commonest chunks touch no array: nothing to draw at all, and
     -- solid rock walled in by solid rock
-    if u >= 0 && B.style_index(r, u) == 3 do no_mesh(occ)
-    else if u >= 0 && B.is_solid_opaque(r, u) && wall(r, a, 1, 0, 0) && wall(r, a, -1, 0, 0) && wall(r, a, 0, 1, 0) && wall(r, a, 0, -1, 0) && wall(r, a, 0, 0, 1) && wall(r, a, 0, 0, -1) do no_mesh(occ)
+    let lb = light_of(r, centre)
+    if u >= 0 && B.style_index(r, u) == 3 do no_mesh(occ, lb)
+    else if u >= 0 && B.is_solid_opaque(r, u) && wall(r, a, 1, 0, 0) && wall(r, a, -1, 0, 0) && wall(r, a, 0, 1, 0) && wall(r, a, 0, -1, 0) && wall(r, a, 0, 0, 1) && wall(r, a, 0, 0, -1) do no_mesh(occ, lb)
     else
       let ids = pad(a, centre)
       match kind_go(NativeArray.make_u8(pvol(), 0), NativeArray.make_int(204, 0), ids, r, 0) do
         Kinds(kind, tally) ->
           match faces(Bufs(qb_new(), qb_new(), qb_new()), NativeArray.make_int(1024, 0), ids, kind, tally, r, 0) do
-            Bufs(q0, q1, q2) -> Meshed(q0, q1, q2, instances_go(qb_new(), ids, kind, r, 0), occ)
+            Bufs(q0, q1, q2) -> Meshed(q0, q1, q2, instances_go(qb_new(), ids, kind, r, 0), occ, lb)
           end
       end
     end end
