@@ -27,7 +27,7 @@
 /* Rewritten by build_shaders.sh whenever the shaders change: forge decides
  * whether to recompile this file from its text alone, not from the headers
  * it includes (GAPS S14). */
-#define STRATA_SHADERS_STAMP "d0248b1d57656c5a"
+#define STRATA_SHADERS_STAMP "dbcc871703a63dda"
 #include "strata_shaders.h"
 #include "strata_spray.h"
 #include "strata_alloc.h"
@@ -62,7 +62,7 @@ static inline void   *narr_data(void *a) { return (char *)a + NARR_HDR; }
 
 typedef SaRange Range;
 
-/* One entry of the chunk table, as the shaders read it (std430, 64 bytes).
+/* One entry of the chunk table, as the shaders read it (std430, 96 bytes).
  * The CPU writes entries straight into the mapped buffer. A frame in flight
  * may read an entry while it changes; either version is drawable, because a
  * replaced range stays intact for two frames. */
@@ -71,8 +71,11 @@ typedef struct {
     int32_t  level_flags;      /* bits 0-7 level, bit 8 in use */
     uint32_t first[SV_RANGES];
     uint32_t count[SV_RANGES];
+    float    pos[4];           /* a body slot: its low corner in metres */
+    float    rot[4];           /* and its rotation x y z w; the identity for a chunk of the world */
 } ChunkEntry;
 #define SV_IN_USE 256
+#define SV_BODY   512          /* a part of a body: drawn at its pose, never in the light volume */
 
 /* An image a pass renders to and a later pass samples. */
 typedef struct { VkImage img; VkDeviceMemory mem; VkImageView view; } Target;
@@ -190,7 +193,7 @@ static struct {
     int vsync_off;                 /* ask for the immediate present mode */
     double stat[6];                /* last frame: CPU ms, ms waiting, draw calls, GPU ms, translucent chunks drawn, microseconds ordering them */
     /* a chunk being assembled by sv_chunk_begin .. sv_chunk_commit */
-    struct { int64_t slot; int32_t origin[3]; uint32_t *part[4]; uint32_t n[4], cap[4]; int open; } stage;
+    struct { int64_t slot; int32_t origin[3]; uint32_t *part[4]; uint32_t n[4], cap[4]; int open; int body; } stage;
     VkQueryPool qpool; int have_ts; float ts_period;
     int64_t refused;               /* uploads turned away because the buffer was full */
     /* stats of the last frame */
@@ -1455,6 +1458,34 @@ static void trans_track(uint32_t slot, int has) {
 }
 
 /* Is the chunk's box outside the clip volume of the view-projection? */
+static void qrot3(const float *q, const float *v, float *out) {
+    float t[3] = { 2.0f * (q[1] * v[2] - q[2] * v[1]), 2.0f * (q[2] * v[0] - q[0] * v[2]), 2.0f * (q[0] * v[1] - q[1] * v[0]) };
+    out[0] = v[0] + q[3] * t[0] + (q[1] * t[2] - q[2] * t[1]);
+    out[1] = v[1] + q[3] * t[1] + (q[2] * t[0] - q[0] * t[2]);
+    out[2] = v[2] + q[3] * t[2] + (q[0] * t[1] - q[1] * t[0]);
+}
+/* A body part's turned box of [side] metres: out of view? [mid] gets its centre. */
+static int culled_body(const float *m, const ChunkEntry *e, float side, float *mid) {
+    float c[8][4];
+    for (int i = 0; i < 8; i++) {
+        float v[3] = { (i & 1) ? side : 0.0f, (i & 2) ? side : 0.0f, (i & 4) ? side : 0.0f }, w[3];
+        qrot3(e->rot, v, w);
+        float x = e->pos[0] + w[0], y = e->pos[1] + w[1], z = e->pos[2] + w[2];
+        for (int r = 0; r < 4; r++) c[i][r] = m[r] * x + m[4 + r] * y + m[8 + r] * z + m[12 + r];
+    }
+    {   float h[3] = { side * 0.5f, side * 0.5f, side * 0.5f }, w[3];
+        qrot3(e->rot, h, w);
+        mid[0] = e->pos[0] + w[0]; mid[1] = e->pos[1] + w[1]; mid[2] = e->pos[2] + w[2]; }
+    for (int p = 0; p < 6; p++) {
+        int out = 0;
+        for (int i = 0; i < 8; i++) {
+            float w = c[i][3], v = c[i][p >> 1];
+            if ((p & 1) ? (v > w) : (v < -w)) out++;
+        }
+        if (out == 8) return 1;
+    }
+    return 0;
+}
 static int culled(const float *m, const int32_t *o, float side, float scale) {
     float c[8][4];
     for (int i = 0; i < 8; i++) {
@@ -1490,10 +1521,17 @@ static uint32_t order_translucent(uint32_t region) {
     for (uint32_t i = 0; i < g.ntrans; i++) {
         const ChunkEntry *e = &g.entries[g.trans[i]];
         float side = (float)(32 << (e->level_flags & 255));
-        if (culled(g.ubo_map, e->origin, side, scale)) continue;
-        float cx = ((float)e->origin[0] + side * 0.5f) * scale - eye[0];
-        float cy = ((float)e->origin[1] + side * 0.5f) * scale - eye[1];
-        float cz = ((float)e->origin[2] + side * 0.5f) * scale - eye[2];
+        float cx, cy, cz;
+        if (e->level_flags & SV_BODY) {
+            float c[3];
+            if (culled_body(g.ubo_map, e, 32.0f * scale, c)) continue;
+            cx = c[0] - eye[0]; cy = c[1] - eye[1]; cz = c[2] - eye[2];
+        } else {
+            if (culled(g.ubo_map, e->origin, side, scale)) continue;
+            cx = ((float)e->origin[0] + side * 0.5f) * scale - eye[0];
+            cy = ((float)e->origin[1] + side * 0.5f) * scale - eye[1];
+            cz = ((float)e->origin[2] + side * 0.5f) * scale - eye[2];
+        }
         g.trans_keys[n].dist = cx * cx + cy * cy + cz * cz;
         g.trans_keys[n].slot = g.trans[i];
         n++;
@@ -1542,10 +1580,28 @@ int64_t sv_chunk_begin(int64_t slot, double ox, double oy, double oz) {
     g.stage.origin[0] = (int32_t)ox; g.stage.origin[1] = (int32_t)oy; g.stage.origin[2] = (int32_t)oz;
     for (int i = 0; i < 4; i++) g.stage.n[i] = 0;
     g.stage.open = 1;
+    g.stage.body = 0;
     g.stage_light_n = 0;
     return 1;
 }
 
+/* Begin uploading one part of a body (a 32-cubed piece of its grid) into
+ * [slot]; parts and commit as for a chunk. It is drawn at the pose
+ * sv_slot_pose gives and never written into the light volume. */
+int64_t sv_body_begin(int64_t slot) {
+    if (!sv_chunk_begin(slot, 0.0, 0.0, 0.0)) return 0;
+    g.stage.body = 1;
+    return 1;
+}
+/* Where a body part is drawn: its low corner in metres, and its rotation. */
+void sv_slot_pose(int64_t slot, double px, double py, double pz, double qx, double qy, double qz, double qw) {
+    if (!g.ok || slot < 0 || slot >= SV_MAX_SLOTS) return;
+    ChunkEntry *e = &g.entries[slot];
+    if (!(e->level_flags & SV_BODY)) return;
+    e->pos[0] = (float)px; e->pos[1] = (float)py; e->pos[2] = (float)pz; e->pos[3] = 0.0f;
+    e->rot[0] = (float)qx; e->rot[1] = (float)qy; e->rot[2] = (float)qz; e->rot[3] = (float)qw;
+    touch((uint32_t)slot);
+}
 int64_t sv_chunk_part(int64_t part, void *words, int64_t n) {
     if (!g.stage.open || part < 0 || part > 3 || n < 0 || n > 0x4000000) return 0;
     if (n > 0 && (!words || narr_len(words) < n * 2)) { g.stage.open = 0; return 0; }
@@ -1624,10 +1680,12 @@ int64_t sv_chunk_commit(void) {
     e->origin[0] = g.stage.origin[0]; e->origin[1] = g.stage.origin[1]; e->origin[2] = g.stage.origin[2];
     for (int r = 0; r < 4; r++) { e->first[r] = firsts[r]; e->count[r] = counts[r]; }
     e->first[4] = lfirst; e->count[4] = nloose;
-    e->level_flags = SV_IN_USE;
+    e->level_flags = SV_IN_USE | (g.stage.body ? SV_BODY : 0);
+    if (!g.stage.body) { e->pos[0] = e->pos[1] = e->pos[2] = e->pos[3] = 0.0f; e->rot[0] = e->rot[1] = e->rot[2] = 0.0f; e->rot[3] = 1.0f; }
     if ((uint32_t)slot + 1 > g.hi_slot) g.hi_slot = (uint32_t)slot + 1;
     trans_track((uint32_t)slot, counts[2] > 0);
     touch((uint32_t)slot);
+    if (g.stage.body) return 1;            /* a body is not in the light volume */
     /* its voxels go into the light volume at the start of the next frame */
     int32_t chunk[3] = { e->origin[0] >> 5, e->origin[1] >> 5, e->origin[2] >> 5 };
     if (g.stage_light_n == 32768) {
@@ -1641,8 +1699,9 @@ void sv_chunk_free(int64_t slot) {
     if (!g.ok || slot < 0 || slot >= SV_MAX_SLOTS) return;
     ChunkEntry *e = &g.entries[slot];
     if (!(e->level_flags & SV_IN_USE)) return;
+    int body = (e->level_flags & SV_BODY) != 0;
     e->level_flags = 0;                      /* the cull pass skips it once the frames have their copy */
-    {   /* and its cell of the light volume empties, if it is still this chunk's */
+    if (!body) {   /* and its cell of the light volume empties, if it is still this chunk's */
         int32_t chunk[3] = { e->origin[0] >> 5, e->origin[1] >> 5, e->origin[2] >> 5 };
         int cell[3];
         struct LightCell *c = cell_of(chunk, cell);

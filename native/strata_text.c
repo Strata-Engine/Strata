@@ -785,7 +785,7 @@ int64_t st_text(int64_t font, const char *s, int64_t n, const float *params, flo
 /* ── What March calls ─────────────────────────────────────────────────────── */
 /* A March String reaches C as its runtime value: a pointer to a counted heap
  * string, or, for seven bytes or fewer, the bytes packed into the pointer
- * itself (march_runtime.h: march_string, MARCH_SSO_BIT). GAPS S24. */
+ * itself (march_runtime.h: march_string, MARCH_SSO_BIT). GAPS S25. */
 #define NARR_HDR 32
 static int64_t narr_len(void *a) { return *(int64_t *)((char *)a + 16); }
 static void *narr_data(void *a) { return (char *)a + NARR_HDR; }

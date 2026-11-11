@@ -133,6 +133,14 @@ same name in two modules is reported only as a hint ("Constructor `Leaf` is
 defined by multiple types") when it is reported at all. Workaround:
 constructor names are unique across the library; `Strata.Acoustics`'s job is
 `Listening`, since `Strata.Fluid` has a `Job`.
+Met again merging physics with the island work: the viewer's lakes test
+declared its own `type Box = Box(Int, Int, Int, ...)` beside
+`Strata.Blocks.Box(Float, ...)`. On main it compiled; with one more test
+module in the program (which changes the order modules are compiled in)
+the code generator laid `Strata.Blocks.Box` out with the test's integer
+fields, and clang rejected the LLVM ("floating point constant invalid for
+type" in `Strata.Query.lim_cells`). Renamed to `LakeBox`.
+
 ## S19: a record field typed by a short type name another module also defines breaks a consumer
 
 `Strata.Physics` declared `type Event = ...` and a record
@@ -184,7 +192,15 @@ to its `Qq`s). Workaround: `Strata.Rig` and `Strata.Clip` keep rotations as
 `(Float, Float, Float, Float)` tuples inside lists and constructors, and
 build a `Quat` only at the edges.
 
-## S24: a String reaches a C extern as the runtime's own value
+## S24: a call of a function a module lacks reads "Unknown module"
+
+`Strata.Anim.ground_targets(...)` in a test, before `ground_targets` was
+written, failed with "Unknown module `Strata.Anim`. [unbound_variable]",
+though `Strata.Anim` exists and compiles. The message names the module, not
+the missing function. Workaround: read it as "no such function in that
+module" and check the name.
+
+## S25: a String reaches a C extern as the runtime's own value
 
 An `extern` parameter of type `String` arrives in C as the runtime's string
 value: a pointer to a counted heap string (`march_string`: 16 bytes of

@@ -23,7 +23,7 @@ Plan: `docs/2026-11-11-ui-text-plan.md`. Branch `interface`, cut from `swim`
   pure so its tests link without C; text calls into C. Cost if wrong: two
   module names where the design sketched one.
 - Ruling: a March String crosses as the runtime's own value and is decoded
-  in C (GAPS S24), not as a byte array. Cost if wrong: breaks if the runtime's
+  in C (GAPS S25), not as a byte array. Cost if wrong: breaks if the runtime's
   string layout changes; a test guards it.
 - Ruling: the distance field is worked out here from FreeType's coverage,
   not by FreeType's own distance-field renderer as the plan says. Measured:

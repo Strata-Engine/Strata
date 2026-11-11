@@ -9,11 +9,7 @@ layout(location = 1) in uint w1;
 
 
 // The chunk table.
-struct Chunk {
-    ivec4 origin_level;     // xyz: low corner in voxels; w: bits 0-7 level, bit 8 in use
-    uint first[6];
-    uint count[6];
-};
+struct Chunk { ivec4 origin_level; uint first[6]; uint count[6]; vec4 pos; vec4 rot; };   // a body slot (w bit 9) is drawn at pos (metres), turned by rot
 layout(std430, set = 0, binding = 1) readonly buffer Table { Chunk chunks[]; } table;
 // Which slot each indirect command draws; [base] is where this call's range starts.
 layout(std430, set = 0, binding = 4) readonly buffer DrawSlot { uint slot[]; } draw_slot;
@@ -24,6 +20,7 @@ layout(location = 4) out vec2 v_tex;          // texture coordinate: one tile pe
 layout(location = 1) out vec3 v_world;        // metres
 layout(location = 2) flat out uint v_w1;
 layout(location = 3) flat out uint v_face;
+layout(location = 5) flat out vec4 v_rot;        // the rotation of the body drawn; identity for the world
 
 void main() {
     uint face = (w0 >> 25) & 7u;
@@ -51,10 +48,13 @@ void main() {
     if (face < 2u)      q = p + vec3(du, face == 0u ? 1.0 - drop - dip : 0.0, dv);
     else if (face < 4u) q = p + vec3(face == 2u ? 1.0 : 0.0, up, du);
     else                q = p + vec3(du, up, face == 4u ? 1.0 : 0.0);
-    ivec4 ol = table.chunks[draw_slot.slot[pc.base + uint(gl_DrawID)]].origin_level;
+    Chunk ch = table.chunks[draw_slot.slot[pc.base + uint(gl_DrawID)]];
+    ivec4 ol = ch.origin_level;
     // a level-L chunk's voxels are 2^L world voxels on a side
     float lod = float(1 << (ol.w & 255));
-    vec3 world = (vec3(ol.xyz) + q * lod) * u.eye.w;
+    bool body = (ol.w & 512) != 0;
+    vec3 world = body ? ch.pos.xyz + qrot(ch.rot, q * u.eye.w) : (vec3(ol.xyz) + q * lod) * u.eye.w;
+    v_rot = body ? ch.rot : vec4(0.0, 0.0, 0.0, 1.0);
     // side faces have v running up the world; an image's rows run down
     v_tex = (face < 2u ? vec2(du, dv) : vec2(du, h - up)) * lod;
     v_uv = vec2(du, dv);

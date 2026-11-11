@@ -4,7 +4,8 @@
 --   ANIMCHECK_SCENE=name ./animcheck
 --
 -- prints "scene name: ok", or the failure and exits 1. scripts/anim_check.sh
--- builds it and runs every scene. `table` prints the chain's matrices.
+-- builds it and runs every scene. `table` prints the chain's matrices;
+-- `stairs` is foot placement on a flight of steps.
 mod Animcheck do
 
   needs IO
@@ -264,6 +265,108 @@ mod Animcheck do
     end
   end
 
+  -- ── stairs: foot placement ────────────────────────────────────────────────
+  -- A two-legged rig at voxel 0.1: a pelvis 1 m up, hips 0.15 m either side
+  -- along x, thigh and shin 0.5 m each, soles 0.05 m below the feet.
+  pfn biped() : Strata.Rig.Rig do
+    let r0 = Rg.colour(Rg.new(0.1), 1, 0.3, 0.3, 0.8, 0.5, 0.0)
+    match Rg.part(r0, -1, 0.0, 10.0, 0.0, 4, 2, 2) do
+      (r1, root) ->
+        match leg_parts(Rg.anchor(r1, root, 2.0, 0.0, 1.0), root, 0.5) do
+          (r2, lu, ll, lf) ->
+            match leg_parts(r2, root, 3.5) do
+              (r3, ru, rl, rf) -> Rg.leg(Rg.leg(r3, lu, ll, lf, 0.05), ru, rl, rf, 0.05)
+            end
+        end
+    end
+  end
+  -- a thigh at x (pelvis grid voxels), a shin and a foot under it
+  pfn leg_parts(r : Strata.Rig.Rig, root : Int, x : Float) : (Strata.Rig.Rig, Int, Int, Int) do
+    match Rg.part(r, root, x, 0.0, 1.0, 1, 5, 1) do
+      (r1, upper) ->
+        match Rg.part(Rg.anchor(r1, upper, 0.5, 5.0, 0.5), upper, 0.5, 0.0, 0.5, 1, 5, 1) do
+          (r2, lower) ->
+            match Rg.part(Rg.anchor(r2, lower, 0.5, 5.0, 0.5), lower, 0.5, 0.0, 0.5, 1, 1, 2) do
+              (r3, foot) -> (Rg.anchor(r3, foot, 0.5, 0.5, 0.5), upper, lower, foot)
+            end
+        end
+    end
+  end
+
+  pfn stairs_reg() : Strata.Blocks.Registry do
+    match Strata.Blocks.register(Strata.Blocks.empty(), Strata.Blocks.def()) do
+      Ok((r, _)) -> r
+      Err(_) -> Strata.Blocks.empty()
+    end
+  end
+  pfn load_go(w : Strata.World.World, i : Int) : Strata.World.World do
+    if i >= 8 do w
+    else load_go(Strata.World.insert(w, Strata.Coord.key(i % 2 - 1, (i / 2) % 2 - 1, i / 4 - 1), Strata.Chunk.uniform(0)), i + 1) end
+  end
+  pfn fill(w : Strata.World.World, x0 : Int, y0 : Int, z0 : Int, x1 : Int, y1 : Int, z1 : Int) : Strata.World.World do
+    Strata.Edit.world(Strata.Edit.fill_box(w, x0, y0, z0, x1, y1, z1, 1))
+  end
+  -- voxels of 0.05 m: the floor's top at 0, then steps 0.25 m high and 0.3 m deep rising along +x from x = 0
+  pfn stairs_world() : Strata.World.World do
+    let w0 = load_go(Strata.World.new(stairs_reg(), Strata.Terrain.gen(fn (k, seed) -> Strata.Chunk.uniform(0)), 1, 0.05), 0)
+    fill(fill(fill(w0, -32, -32, -32, 31, -1, 31), 0, 0, -32, 31, 4, 31), 6, 5, -32, 31, 9, 31)
+  end
+
+  -- the top of the stairs under x (metres): the floor, then a step 0.25 m high at x >= 0 and 0.5 m at x >= 0.3
+  pfn step_at(x : Float) : Float do if x < 0.0 do 0.0 else if x < 0.3 do 0.25 else 0.5 end end end
+  -- how far a foot's sole is below the step under it (negative: above)
+  pfn sunk(m : NativeF32Arr, foot : Int) : Float do step_at(NativeArray.get_f32(m, 12 * foot + 9)) -. (NativeArray.get_f32(m, 12 * foot + 10) -. 0.05) end
+  pfn most(a : Float, b : Float) : Float do if a > b do a else b end end
+
+  -- n updates of ground then update, the figure placed at x0 + dx k; the worst sinking of a sole and the largest move of the root in one update
+  pfn ground_go(a : Strata.Anim.Anim, f : Int, w : Strata.World.World, k : Int, n : Int, x0 : Float, dx : Float, worst : Float, jump : Float, root : Float) : (Strata.Anim.Anim, Float, Float, Float) do
+    if k >= n do (a, worst, jump, root)
+    else
+      let a1 = An.update(An.ground(An.place(a, f, x0 +. dx *. int_to_float(k), 0.32, 0.0, Qt.identity()), f, w, 1.0), 1.0 /. 60.0)
+      let m = An.matrices(a1, f)
+      let r = NativeArray.get_f32(m, 10)
+      ground_go(a1, f, w, k + 1, n, x0, dx, most(worst, most(sunk(m, 3), sunk(m, 6))), most(jump, Math.abs(r -. root)), r)
+    end
+  end
+
+  -- stairs: walking in place with the left foot on the floor and the right on the first step, then carried 0.3 m up the stairs so each foot climbs a step; after 30 updates each sole is within 0.02 m of its step, no sole is ever more than 0.02 m below its step, and the root never moves more than 0.04 m in an update
+  pfn stairs_scene() : Int do
+    let r = biped()
+    let walk = Cl.swing(Cl.swing(Cl.swing(Cl.swing(Cl.new(r, 1.0, true), 1, 1.0, 0.0, 0.0, 20.0, 1.0, 0.0), 4, 1.0, 0.0, 0.0, 20.0, 1.0, 0.5), 2, 1.0, 0.0, 0.0, 10.0, 1.0, 0.25), 5, 1.0, 0.0, 0.0, 10.0, 1.0, 0.75)
+    let w = stairs_world()
+    match An.finish_rig(An.open(4), r) do
+      (a1, rig) ->
+        match An.finish_clip(a1, walk) do
+          (a2, clip) ->
+            match An.spawn_at(a2, rig, 0.0, 0.32, 0.0, Qt.identity()) do
+              (a3, f) ->
+                match ground_go(An.play(a3, f, 0, clip, 0.0, 1.0, 1.0, -1, false), f, w, 0, 30, 0.0, 0.0, -1.0, 0.0, 1.32) do
+                  (a4, worst1, jump1, root1) ->
+                    let m = An.matrices(a4, f)
+                    let left = NativeArray.get_f32(m, 12 * 3 + 10) -. 0.05
+                    let right = NativeArray.get_f32(m, 12 * 6 + 10) -. 0.05
+                    println("  left sole " ++ float_to_string(left) ++ ", right sole " ++ float_to_string(right) ++ ", pelvis " ++ float_to_string(root1))
+                    match ground_go(a4, f, w, 0, 30, 0.005, 0.01, worst1, jump1, root1) do
+                      (a5, worst, jump, _) ->
+                        let m5 = An.matrices(a5, f)
+                        println("  climbed: left sole " ++ float_to_string(NativeArray.get_f32(m5, 12 * 3 + 10) -. 0.05) ++ ", right sole " ++ float_to_string(NativeArray.get_f32(m5, 12 * 6 + 10) -. 0.05) ++ "; worst sinking " ++ float_to_string(worst) ++ ", largest root move " ++ float_to_string(jump))
+                        let bad = check(rig >= 0 && clip >= 0, "the rig and the walk are accepted")
+                          + check(near(left, 0.0, 0.02), "the left sole on the floor (0 m)")
+                          + check(near(right, 0.25, 0.02), "the right sole on the first step (0.25 m)")
+                          + check(root1 < 1.32 -. 0.1, "the root lowered for the longer leg")
+                          + check(worst <= 0.02, "no sole more than 0.02 m below its step at any update")
+                          + check(jump <= 0.04, "the root never moves more than 0.04 m in one update")
+                          + check(near(sunk(m5, 3), 0.0, 0.02) && near(sunk(m5, 6), 0.0, 0.02), "after the climb each sole is on its new step")
+                          + check(finite_go(m5, 0), "finite")
+                          + check(An.stat(a5, 3) == 0.0, "nothing refused")
+                        report("stairs", bad + check(An.capacity(An.close(a5)) == 0, "closed"))
+                    end
+                end
+            end
+        end
+    end
+  end
+
   fn main(_cap : Cap(IO)) : Unit do
     let name = Env.get("ANIMCHECK_SCENE", "")
     if name == "chain" do process_exit(chain_scene())
@@ -272,9 +375,10 @@ mod Animcheck do
     else if name == "marks" do process_exit(marks_scene())
     else if name == "mask" do process_exit(mask_scene())
     else if name == "empty" do process_exit(empty_scene())
+    else if name == "stairs" do process_exit(stairs_scene())
     else
-      println("animcheck: no scene named '" ++ name ++ "' (chain, table, determinism, marks, mask, empty)")
+      println("animcheck: no scene named '" ++ name ++ "' (chain, table, determinism, marks, mask, empty, stairs)")
       process_exit(2)
-    end end end end end end
+    end end end end end end end
   end
 end

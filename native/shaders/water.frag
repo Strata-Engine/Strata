@@ -5,6 +5,7 @@ layout(location = 1) in vec3 v_world;
 layout(location = 2) flat in uint v_w1;
 layout(location = 3) flat in uint v_face;
 layout(location = 4) in vec2 v_tex;
+layout(location = 5) flat in vec4 v_rot;
 
 
 layout(location = 0) out vec4 o_color;
@@ -17,7 +18,7 @@ void main() {
     vec2 f = fract(v_uv);
     float a0 = float(ao & 3u), a1 = float((ao >> 2) & 3u), a2 = float((ao >> 4) & 3u), a3 = float((ao >> 6) & 3u);
     float occ = mix(mix(a0, a1, f.x), mix(a2, a3, f.x), f.y) / 3.0;
-    vec3 n = NORMALS[min(v_face, 5u)];
+    vec3 n = qrot(v_rot, NORMALS[min(v_face, 5u)]);
     if (u.light.x < 1.0 || u.light.x >= 9.0) { o_color = vec4(shade_flat(base.rgb, n, occ, v_world), base.a); return; }
     vec3 toward = normalize(u.eye.xyz - v_world);
     if (submerged() && v_face == 0u && toward.y < 0.0) {

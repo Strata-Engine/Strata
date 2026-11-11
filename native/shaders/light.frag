@@ -24,8 +24,9 @@ void main() {
     }
     vec3 albedo = texture(gb_albedo, v_uv).rgb;
     vec4 nm = texture(gb_nm, v_uv);
-    int face = min(int(nm.r * 255.0 + 0.5), 5);
-    vec3 n = NORMALS[face];
+    int r8 = int(nm.r * 255.0 + 0.5);
+    vec3 n = r8 < 16 ? NORMALS[min(r8, 5)] : oct_dec(vec2(float(r8 - 16) / 239.0, nm.g));
+    int face = r8 < 16 ? min(r8, 5) : nearest_face(n);
     vec3 world = world_at(v_uv, depth);
     if (mode == 9) {
         // look at the light volume: step back off the surface, trace into it,

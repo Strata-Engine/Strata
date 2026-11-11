@@ -127,6 +127,148 @@ mod Strata.Anim do
     a
   end
 
+  -- ── The procedural stage ─────────────────────────────────────────────────
+  -- After the layers, in this order: the drop, overrides, aim, reach, then
+  -- springs. Each has a weight. Settings stay until changed or cleared.
+
+  doc "Pull part [part]'s rotation (in its parent's frame) toward [q] and its move toward (x, y, z) metres by [weight] 0..1, over what the layers made. Weight 0 clears it."
+  fn override(a : Anim, f : Int, part : Int, q : Strata.Math.Quat.Quat, x : Float, y : Float, z : Float, weight : Float) : Anim do
+    Strata.Ffi.Anim.override(f, part, Qt.x(q), Qt.y(q), Qt.z(q), Qt.w(q), x, y, z, weight)
+    a
+  end
+
+  doc "Aim slot [slot] (0..3): the last part of [chain] (up to four parts, each below the one before) turns its axis (ax, ay, az), in its own frame, toward the world point (tx, ty, tz). The turn is shared equally along the chain, each part turning at most [limit] degrees. Weight 0 clears it."
+  fn aim(a : Anim, f : Int, slot : Int, chain : List(Int), ax : Float, ay : Float, az : Float, tx : Float, ty : Float, tz : Float, limit : Float, weight : Float) : Anim do
+    Strata.Ffi.Anim.aim(f, slot, List.length(chain), NativeArray.from_list_i32(chain), ax, ay, az, tx, ty, tz, limit, weight)
+    a
+  end
+
+  doc "Reach slot [slot] (0..7): two-bone IK. The chain [upper], [lower], [end_part] puts its end at the world point (tx, ty, tz), bending toward the pole (px, py, pz); out of reach it straightens toward the point. Weight 0 clears it."
+  fn reach(a : Anim, f : Int, slot : Int, upper : Int, lower : Int, end_part : Int, tx : Float, ty : Float, tz : Float, px : Float, py : Float, pz : Float, weight : Float) : Anim do
+    Strata.Ffi.Anim.reach(f, slot, upper, lower, end_part, tx, ty, tz, px, py, pz, weight, 0.0)
+    a
+  end
+
+  doc "Make part [part] springy: its world rotation follows its animated one with lag and overshoot, [stiffness] and [damping] per second. Stiffness 0 clears it."
+  fn spring(a : Anim, f : Int, part : Int, stiffness : Float, damping : Float) : Anim do
+    Strata.Ffi.Anim.spring(f, part, stiffness, damping)
+    a
+  end
+
+  doc "Lower figure [f]'s root by [metres] after the layers (what `ground` sets)."
+  fn drop(a : Anim, f : Int, metres : Float) : Anim do
+    Strata.Ffi.Anim.drop(f, metres)
+    a
+  end
+
+  pfn origin_at(f : Int, part : Int, stage : Int) : Option((Float, Float, Float)) do
+    let out = NativeArray.make_f32(3, 0.0)
+    if Strata.Ffi.Anim.origin(f, part, stage, out) == 1 do Some((NativeArray.get_f32(out, 0), NativeArray.get_f32(out, 1), NativeArray.get_f32(out, 2))) else None end
+  end
+  doc "Part [part]'s origin in world space as last posed, before springs (with the drop, aim and reach); none if there is no such figure or part."
+  fn origin(_a : Anim, f : Int, part : Int) : Option((Float, Float, Float)) do origin_at(f, part, 1) end
+  doc "Part [part]'s origin as the layers and overrides alone put it: no drop, aim, reach or springs. What `ground` casts its rays from."
+  fn animated_origin(_a : Anim, f : Int, part : Int) : Option((Float, Float, Float)) do origin_at(f, part, 0) end
+
+  -- ── Foot placement ───────────────────────────────────────────────────────
+
+  pfn ground_stop(reg : Strata.Blocks.Registry) : Int -> Bool do
+    fn id -> id != 0 && Strata.Blocks.collides(reg, id) && Strata.Blocks.style_index(reg, id) != 1
+  end
+
+  -- one leg: a ray from 0.5 m above the foot to the leg's length below it; (target, the drop it asks for)
+  pfn leg_target(r : Strata.Rig.Rig, leg : (Int, Int, Int, Float), foot : (Float, Float, Float), w : Strata.World.World) : (Option((Float, Float, Float)), Float) do
+    match leg do
+      (upper, _, end_part, sole) ->
+        match foot do
+          (fx, fy, fz) ->
+            let reach = Strata.Rig.reach_length(r, upper, end_part)
+            let h = Strata.Query.raycast(w, fx, fy +. 0.5, fz, 0.0, -1.0, 0.0, 0.5 +. reach, ground_stop(Strata.World.registry(w)))
+            if Strata.Query.is_hit(h) do
+              let ty = fy +. 0.5 -. Strata.Query.hit_dist(h) +. sole
+              let d = fy -. ty
+              (Some((fx, ty, fz)), if d > reach do reach else d end)
+            else (None, 0.0) end
+        end
+    end
+  end
+
+  pfn targets_go(r : Strata.Rig.Rig, legs : List((Int, Int, Int, Float)), feet : List((Float, Float, Float)), w : Strata.World.World, acc : List(Option((Float, Float, Float))), drop : Float) : (List(Option((Float, Float, Float))), Float) do
+    match legs do
+      Nil -> (List.reverse(acc), drop)
+      Cons(l, ls) ->
+        match feet do
+          Nil -> targets_go(r, ls, Nil, w, Cons(None, acc), drop)
+          Cons(ft, fs) ->
+            match leg_target(r, l, ft, w) do
+              (t, d) -> targets_go(r, ls, fs, w, Cons(t, acc), if d > drop do d else drop end)
+            end
+        end
+    end
+  end
+
+  doc "The pure part of `ground`. For each of [r]'s legs, in leg order, [feet] gives its foot's animated origin (metres); a ray goes straight down from 0.5 m above it to the leg's length below. Answers, per leg, the reach target where the sole meets the ground (the ground's top plus the sole), or none when the ray finds no ground (none within reach, or the chunk not loaded); and the drop: the largest (foot height - target) over the legs that found ground, each at most its leg's length, and never below 0. Ground is any block that collides, but not a cross."
+  fn ground_targets(r : Strata.Rig.Rig, feet : List((Float, Float, Float)), w : Strata.World.World) : (List(Option((Float, Float, Float))), Float) do
+    targets_go(r, Strata.Rig.legs(r), feet, w, Nil, 0.0)
+  end
+
+  pfn foot_of(f : Int, leg : (Int, Int, Int, Float)) : (Float, Float, Float) do
+    match leg do (_, _, foot, _) -> unwrap_or(origin_at(f, foot, 0), (0.0, 0.0, 0.0)) end
+  end
+
+  -- each leg's reach slot (its place in leg order): at its target at once, or fading to the clip.
+  -- A grounded leg is never faded in: with every grounded leg at full weight, a root that lags
+  -- its drop leaves a foot short of the ground (above it), never below.
+  pfn ground_go(f : Int, legs : List((Int, Int, Int, Float)), ts : List(Option((Float, Float, Float))), slot : Int, fwd : (Float, Float, Float), weight : Float) : Unit do
+    match legs do
+      Nil -> ()
+      Cons((upper, lower, end_part, _), ls) ->
+        match ts do
+          Nil -> ()
+          Cons(t, rest) ->
+            match t do
+              Some((tx, ty, tz)) ->
+                match (unwrap_or(origin_at(f, lower, 0), (tx, ty, tz)), fwd) do
+                  ((kx, ky, kz), (dx, dy, dz)) -> Strata.Ffi.Anim.reach(f, slot, upper, lower, end_part, tx, ty, tz, kx +. dx, ky +. dy, kz +. dz, weight, 0.0)
+                end
+              None -> Strata.Ffi.Anim.reach_fade(f, slot, 0.0, 0.15)
+            end
+            ground_go(f, ls, rest, slot + 1, fwd, weight)
+        end
+    end
+  end
+
+  -- the figure's facing: its placement turning +z
+  pfn forward(f : Int) : (Float, Float, Float) do
+    let q = NativeArray.make_f32(4, 0.0)
+    if Strata.Ffi.Anim.facing(f, q) == 1 do
+      let x = NativeArray.get_f32(q, 0)
+      let y = NativeArray.get_f32(q, 1)
+      let z = NativeArray.get_f32(q, 2)
+      let w = NativeArray.get_f32(q, 3)
+      (2.0 *. (x *. z +. w *. y), 2.0 *. (y *. z -. w *. x), 1.0 -. 2.0 *. (x *. x +. y *. y))
+    else (0.0, 0.0, 1.0) end
+  end
+
+  doc "How fast `ground` moves a figure's drop, metres a second: a 0.25 m step in 0.125 s."
+  fn drop_speed() : Float do 2.0 end
+
+  doc "Foot placement for figure [f] over world [w], at [weight] 0..1: call it each frame before `update`. For each of the rig's legs (reach slots 0, 1, ... in leg order) it casts a ray down from 0.5 m above the foot's animated origin to the leg's length below; on ground the leg reaches for where the sole meets it, its knee bending toward a point 1 m ahead of the knee in the figure's facing (+z turned by its placement), and the root is lowered by the largest drop so that the longer leg reaches, moving toward it at `drop_speed` (so a step does not pop the root). A leg that finds ground reaches at once; a leg with no ground fades back to the clip over 0.15 s."
+  fn ground(a : Anim, f : Int, w : Strata.World.World, weight : Float) : Anim do
+    match rig(a, Strata.Ffi.Anim.fig_rig(f)) do
+      None -> a
+      Some(r) ->
+        let legs = Strata.Rig.legs(r)
+        let k = if weight < 0.0 do 0.0 else if weight > 1.0 do 1.0 else weight end end
+        match ground_targets(r, List.map(legs, fn l -> foot_of(f, l)), w) do
+          (ts, d) ->
+            ground_go(f, legs, ts, 0, forward(f), k)
+            Strata.Ffi.Anim.drop_to(f, d *. k, drop_speed())
+            a
+        end
+    end
+  end
+
   doc "Advance every figure by [dt] seconds and pose it. A negative dt changes nothing and is counted."
   fn update(a : Anim, dt : Float) : Anim do
     Strata.Ffi.Anim.update(dt)
@@ -154,6 +296,6 @@ mod Strata.Anim do
   fn stats(_a : Anim) : (Int, Int, Int, Int) do
     (float_to_int(Strata.Ffi.Anim.stat(0)), float_to_int(Strata.Ffi.Anim.stat(1)), float_to_int(Strata.Ffi.Anim.stat(2)), float_to_int(Strata.Ffi.Anim.stat(3)))
   end
-  doc "A figure of the kernel's: 0 figures, 1 posed, 2 stale, 3 refused calls, 4 negative dt, 5 the last refusal's reason (AN_R_* in strata_anim.h), 6 marks dropped."
+  doc "A figure of the kernel's: 0 figures, 1 posed, 2 stale, 3 refused calls, 4 negative dt, 5 the last refusal's reason (AN_R_* in strata_anim.h), 6 marks dropped, 7 procedural records in use."
   fn stat(_a : Anim, which : Int) : Float do Strata.Ffi.Anim.stat(which) end
 end
