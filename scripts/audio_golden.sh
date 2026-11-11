@@ -18,7 +18,10 @@ SC=soundcheck/.march/build/release/soundcheck
 # no device: open fails, the game goes on, every record is counted
 STRATA_AUDIO_FAIL=1 SOUNDCHECK_SCENE=nodevice $SC > "$OUT/nodevice.log" 2>&1 || { echo "FAIL: nodevice"; cat "$OUT/nodevice.log"; exit 1; }
 
-SCENES='blocks strike'
+# a decoded budget refuses a recording past it, and counts it
+SOUNDCHECK_SCENE=budget SOUNDCHECK_OUT="$OUT/budget.wav" $SC > "$OUT/budget.log" 2>&1 || { echo "FAIL: budget"; cat "$OUT/budget.log"; exit 1; }
+
+SCENES='blocks strike tone recording'
 fail=0
 [ $UPDATE -eq 1 ] && mkdir -p "$LISTEN"
 for s in $SCENES; do
@@ -35,5 +38,9 @@ for s in $SCENES; do
     echo "FAIL: $s differs from its fingerprint"; head -8 "$OUT/$s.diff"; fail=1
   fi
 done
+# a recording of the tone, loaded back and played, sounds as the tone did
+if [ $UPDATE -eq 0 ] && ! native/tests/bin/fp_diff "$OUT/tone.fp" "$OUT/recording.fp" 2> "$OUT/rec.diff"; then
+  echo "FAIL: the tone played back from a file differs from the tone"; head -8 "$OUT/rec.diff"; fail=1
+fi
 [ $fail -eq 0 ] && echo "audio goldens: all match"
 exit $fail

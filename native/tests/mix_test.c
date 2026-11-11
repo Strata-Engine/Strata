@@ -171,6 +171,58 @@ static void test_fp(void) {
     CHECK(sm_fp_compare(a, b, 1.5f, 0.5f) == 1, "everything 1 dB louder fails on the total at 0.5 dB");
 }
 
+static SmRec *mk_rec(int frames, int channels, float hz) {
+    SmRec *r = (SmRec *)calloc(1, sizeof(SmRec));
+    r->data = (float *)calloc((size_t)frames * channels, sizeof(float));
+    r->frames = frames; r->channels = channels;
+    for (int i = 0; i < frames; i++) for (int c = 0; c < channels; c++) r->data[i * channels + c] = 0.5f * (float)sin(2.0 * SM_PI * hz * i / SM_RATE);
+    return r;
+}
+
+static void test_recordings(void) {
+    SmMixer *m = sm_open();
+    /* a play of a recording that has not arrived is refused and counted */
+    mu_play_flat(m, 1, SM_REC_FIRST, 1.0f, 0.0f);
+    CHECK(sm_stats(m).refused == 1, "a recording not ready is refused and counted");
+    /* half a second of a 1 kHz tone, mono */
+    SmRec *r = mk_rec(SM_RATE / 2, 1, 1000.0f);
+    sm_rec_publish(m, SM_REC_FIRST, r);
+    mu_play_flat(m, 2, SM_REC_FIRST, 1.0f, 0.0f);
+    CHECK(atomic_load(&r->refs) == 1, "a voice holds its recording");
+    render(m, SEC(0.25));
+    CHECK(fabs(mu_db(mu_rms(buf, SEC(0.05), SEC(0.25))) - mu_db(0.5 / sqrt(2.0))) < 0.5, "a recording plays at its level");
+    /* withdrawn while playing: it keeps playing to its end, then lets go */
+    sm_rec_withdraw(m, SM_REC_FIRST);
+    render(m, SEC(0.2));
+    CHECK(mu_peak(buf, SEC(0.1), SEC(0.2)) > 0.3f, "a recording withdrawn while it plays keeps playing");
+    render(m, SEC(0.2));
+    CHECK(sm_stats(m).playing == 0 && atomic_load(&r->refs) == 0, "and when it ends the voice lets go of it");
+    mu_play_flat(m, 3, SM_REC_FIRST, 1.0f, 0.0f);
+    CHECK(sm_stats(m).refused == 2, "a withdrawn recording cannot be played again");
+    CHECK(sm_blocks(m) > 0, "the mixer counts its blocks, so a loader knows when a withdrawn recording is safe to free");
+    free(r->data); free(r);
+    /* a stereo recording played flat keeps its two channels */
+    SmRec *st = mk_rec(SM_RATE / 4, 2, 500.0f);
+    for (int i = 0; i < st->frames; i++) st->data[2 * i + 1] = 0.0f;   /* left only */
+    sm_rec_publish(m, SM_REC_FIRST + 1, st);
+    mu_play_flat(m, 4, SM_REC_FIRST + 1, 1.0f, 0.0f);
+    render(m, SEC(0.2));
+    CHECK(mu_peak(buf, 0, SEC(0.2)) > 0.3f, "a stereo recording plays");
+    float right = 0.0f; for (int i = 0; i < SEC(0.2); i++) if (fabsf(buf[2 * i + 1]) > right) right = fabsf(buf[2 * i + 1]);
+    CHECK(right < 0.001f, "and its silent right channel stays silent");
+    /* a patch with a recording source, looping */
+    SmRec *lp = mk_rec(SM_RATE / 10, 1, 440.0f);
+    sm_rec_publish(m, SM_REC_FIRST + 2, lp);
+    float p[SM_PATCH_FLOATS]; mu_patch_clear(p);
+    p[SM_P_SRC(0)] = SM_SRC_RECORDING; p[SM_P_SRC(0) + 1] = 1.0f; p[SM_P_SRC(0) + 2] = 1.0f; p[SM_P_SRC(0) + 4] = (float)(SM_REC_FIRST + 2);
+    p[SM_P_LOOP] = 1.0f;
+    mu_send_patch(m, 1, p);
+    mu_play_flat(m, 5, 1, 1.0f, 0.0f);
+    render(m, SEC(0.5));
+    CHECK(mu_peak(buf, SEC(0.4), SEC(0.5)) > 0.3f, "a looping recording source is still playing after five of its lengths");
+    sm_close(m);
+}
+
 int main(void) {
     test_fp();
     test_ring();
@@ -182,6 +234,7 @@ int main(void) {
     test_handles();
     test_repeatable();
     test_wav();
+    test_recordings();
     if (fails == 0) printf("mix_test: ok\n");
     return fails == 0 ? 0 : 1;
 }

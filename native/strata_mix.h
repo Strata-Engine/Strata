@@ -20,7 +20,9 @@
 #define SM_BLOCK 256
 #define SM_MIXED 64
 #define SM_TRACKED 1024
-#define SM_PATCHES 4096          /* patch (and later recording) ids 1..4095 */
+#define SM_PATCHES 2048          /* patch ids 1..2047 */
+#define SM_REC_FIRST 2048        /* recording ids 2048..4095 */
+#define SM_RECS 2048
 #define SM_GROUPS 4
 #define SM_LIMIT 0.8912f         /* -1 dBFS */
 #ifndef SM_PI
@@ -52,6 +54,7 @@ enum {
 #define SM_P_CTL(i) (44 + (i) * 5)     /* target, low, high, curve, initial value */
 #define SM_P_HOLD 64                   /* seconds before release begins by itself; 0 = until stopped */
 #define SM_P_GAIN 65
+#define SM_P_LOOP 66                   /* 1: recording sources loop */
 enum { SM_SRC_OFF, SM_SRC_SINE, SM_SRC_TRIANGLE, SM_SRC_SAW, SM_SRC_SQUARE, SM_SRC_WHITE, SM_SRC_PINK, SM_SRC_BROWN, SM_SRC_RECORDING };
 enum { SM_FLT_OFF, SM_FLT_LOW, SM_FLT_HIGH, SM_FLT_BAND, SM_FLT_PEAK };
 enum { SM_MOD_OFF, SM_MOD_LFO, SM_MOD_WALK };
@@ -85,12 +88,21 @@ static inline int sm_ring_pop(SmRing *r, SmCmd *out) {
     return 1;
 }
 
+/* ---- recordings ----
+ * Decoded audio at SM_RATE, interleaved, one or two channels. Owned by
+ * whoever publishes it (strata_audio.c's loader thread): the mixer only reads
+ * it and counts the voices holding it in [refs]. A withdrawn recording may be
+ * freed once refs is 0 and the mixer has finished a block since. */
+typedef struct { float *data; int frames, channels; _Atomic int refs; } SmRec;
+
 /* ---- the mixer ---- */
 typedef struct { int playing, virtual_, refused, ring_refused, underruns; float cpu, peak_db, rms_db; } SmStats;
 
 typedef struct { float ic1, ic2; } SmSvf;
 typedef struct {
     int32_t number;                /* the game's voice number; 0 = free */
+    SmRec *rec[4]; double rpos[4]; uint8_t rec_done[4];
+    int stereo;                    /* a stereo recording played flat, both channels kept */
     int src, group;
     float p[SM_PATCH_FLOATS];      /* the patch as it was when played */
     double phase[4];
@@ -116,7 +128,24 @@ typedef struct {
     float group_gain[SM_GROUPS], group_now[SM_GROUPS];
     float lim_env;
     SmStats st;
+    _Atomic(SmRec *) recs[SM_RECS];
+    _Atomic uint64_t blocks;
 } SmMixer;
+
+static inline void sm_rec_publish(SmMixer *m, int id, SmRec *r) {
+    if (id >= SM_REC_FIRST && id < SM_REC_FIRST + SM_RECS) atomic_store(&m->recs[id - SM_REC_FIRST], r);
+}
+static inline void sm_rec_withdraw(SmMixer *m, int id) { sm_rec_publish(m, id, NULL); }
+/* blocks mixed so far: a loader that withdrew a recording frees it once this has moved on and its refs are 0 */
+static inline uint64_t sm_blocks(SmMixer *m) { return atomic_load(&m->blocks); }
+static inline SmRec *sm_rec_get(SmMixer *m, int id) {
+    if (id < SM_REC_FIRST || id >= SM_REC_FIRST + SM_RECS) return NULL;
+    return atomic_load(&m->recs[id - SM_REC_FIRST]);
+}
+static inline void sm_voice_release(SmVoice *v) {
+    for (int i = 0; i < 4; i++) if (v->rec[i]) { atomic_fetch_sub(&v->rec[i]->refs, 1); v->rec[i] = NULL; }
+    v->number = 0;
+}
 
 static inline SmMixer *sm_open(void) {
     SmMixer *m = (SmMixer *)calloc(1, sizeof(SmMixer));
@@ -147,13 +176,31 @@ static inline void sm_env_stage(SmVoice *v, int stage) {
 
 static inline void sm_play(SmMixer *m, const SmCmd *c) {
     int src = c->a;
-    if (src <= 0 || src >= SM_PATCHES || !m->patch_ok[src] || c->voice == 0 || sm_find(m, c->voice)) { m->st.refused++; return; }
+    int direct = src >= SM_REC_FIRST;
+    SmRec *held[4] = { NULL, NULL, NULL, NULL };
+    if (c->voice == 0 || sm_find(m, c->voice)) { m->st.refused++; return; }
+    if (direct) {
+        held[0] = sm_rec_get(m, src);
+        if (!held[0]) { m->st.refused++; return; }
+    } else {
+        if (src <= 0 || src >= SM_PATCHES || !m->patch_ok[src]) { m->st.refused++; return; }
+        for (int i = 0; i < 4; i++) if ((int)m->patches[src][SM_P_SRC(i)] == SM_SRC_RECORDING) {
+            held[i] = sm_rec_get(m, (int)m->patches[src][SM_P_SRC(i) + 4]);
+            if (!held[i]) { m->st.refused++; return; }
+        }
+    }
     SmVoice *v = NULL;
     for (int i = 0; i < SM_TRACKED; i++) if (m->voices[i].number == 0) { v = &m->voices[i]; break; }
     if (!v) { m->st.refused++; return; }
     memset(v, 0, sizeof *v);
     v->number = c->voice; v->src = src; v->group = c->b >= 0 && c->b < SM_GROUPS ? c->b : 0;
-    memcpy(v->p, m->patches[src], sizeof v->p);
+    if (direct) {
+        memset(v->p, 0, sizeof v->p);
+        v->p[SM_P_SRC(0)] = SM_SRC_RECORDING; v->p[SM_P_SRC(0) + 1] = 1.0f; v->p[SM_P_SRC(0) + 2] = 1.0f; v->p[SM_P_SRC(0) + 4] = (float)src;
+        v->p[SM_P_ENV(0) + 2] = 1.0f; v->p[SM_P_ENV(0) + 3] = 0.005f; v->p[SM_P_GAIN] = 1.0f;
+        v->stereo = held[0]->channels == 2 && c->f[6] != 0.0f;
+    } else memcpy(v->p, m->patches[src], sizeof v->p);
+    for (int i = 0; i < 4; i++) if (held[i]) { v->rec[i] = held[i]; atomic_fetch_add(&held[i]->refs, 1); }
     v->rng = 0x9e3779b9u ^ (uint32_t)c->voice * 2654435761u; if (!v->rng) v->rng = 1;
     v->gain = c->f[0]; v->pitch = c->f[1] > 0.0f ? c->f[1] : 1.0f; v->pan = sm_clampf(c->f[7], -1.0f, 1.0f);
     for (int i = 0; i < 4; i++) { v->ctl[i] = v->ctl_to[i] = sm_clampf(v->p[SM_P_CTL(i) + 4], 0.0f, 1.0f); }
@@ -218,6 +265,17 @@ static inline float sm_source(SmVoice *v, int i, float pitch_mul) {
         }
         t += dt; if (t >= 1.0) t -= 1.0;
         v->phase[i] = t;
+    } else if (kind == SM_SRC_RECORDING) {
+        SmRec *r = v->rec[i];
+        if (!r || v->rec_done[i]) return 0.0f;
+        double rate = (s[1] > 0.0f ? s[1] : 1.0f) * pitch_mul;
+        int at = (int)v->rpos[i]; double fr = v->rpos[i] - at;
+        int nx = at + 1 < r->frames ? at + 1 : (v->p[SM_P_LOOP] != 0.0f ? 0 : at);
+        float a = 0.0f, b = 0.0f;
+        for (int c = 0; c < r->channels; c++) { a += r->data[at * r->channels + c]; b += r->data[nx * r->channels + c]; }
+        out = (float)((a + (b - a) * fr) / r->channels);
+        v->rpos[i] += rate;
+        if (v->rpos[i] >= r->frames) { if (v->p[SM_P_LOOP] != 0.0f) v->rpos[i] -= r->frames; else v->rec_done[i] = 1; }
     } else if (kind == SM_SRC_WHITE) {
         out = sm_white(v);
     } else if (kind == SM_SRC_PINK) {           /* Paul Kellet's refined filter */
@@ -330,6 +388,23 @@ static inline int sm_voice_mix(SmMixer *m, SmVoice *v, float *out, int frames) {
         }
         if (v->gain_now < 0.0f) v->gain_now = gain_mul;
         v->gain_now += (gain_mul - v->gain_now) * sm_smooth;
+        int recs = 0, done = 0, others = 0;
+        for (int i = 0; i < 4; i++) {
+            int kd = (int)v->p[SM_P_SRC(i)];
+            if (kd == SM_SRC_RECORDING) { recs++; if (v->rec_done[i]) done++; } else if (kd != SM_SRC_OFF) others++;
+        }
+        if (recs > 0 && done == recs && others == 0) return 1;
+        if (v->stereo) {   /* a stereo recording played flat: both channels, balanced by pan, no filters */
+            SmRec *r = v->rec[0];
+            int at = (int)v->rpos[0];
+            float amp = v->env * v->gain_now * m->group_now[v->group];
+            if (v->fading) { if (v->fade_left <= 0) return 1; amp *= (float)v->fade_left / (float)v->fade_len; v->fade_left--; }
+            float gl = v->pan > 0.0f ? 1.0f - v->pan : 1.0f, gr = v->pan < 0.0f ? 1.0f + v->pan : 1.0f;
+            out[2 * n] += r->data[2 * at] * amp * gl; out[2 * n + 1] += r->data[2 * at + 1] * amp * gr;
+            v->rpos[0] += v->pitch;
+            if (v->rpos[0] >= r->frames) v->rec_done[0] = 1;
+            continue;
+        }
         float x = 0.0f;
         for (int i = 0; i < 4; i++) {
             float s = sm_source(v, i, pitch_mul);
@@ -365,7 +440,7 @@ static inline void sm_mix(SmMixer *m, float *out, int frames) {
         if (v->number == 0) continue;
         if (mixed < SM_MIXED) {
             mixed++;
-            if (sm_voice_mix(m, v, out, frames)) { v->number = 0; continue; }
+            if (sm_voice_mix(m, v, out, frames)) { sm_voice_release(v); continue; }
         }
         playing++;
     }
@@ -384,6 +459,7 @@ static inline void sm_mix(SmMixer *m, float *out, int frames) {
         sum += (double)out[2 * n] * out[2 * n] + (double)out[2 * n + 1] * out[2 * n + 1];
     }
     m->st.playing = playing; m->st.virtual_ = 0;
+    atomic_fetch_add(&m->blocks, 1);
     m->st.peak_db = (float)(20.0 * log10(peak > 1e-6f ? peak : 1e-6f));
     double rms = frames > 0 ? sqrt(sum / (2.0 * frames)) : 0.0;
     m->st.rms_db = (float)(20.0 * log10(rms > 1e-6 ? rms : 1e-6));
