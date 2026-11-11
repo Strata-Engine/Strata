@@ -29,6 +29,7 @@ overview:STRATA_SCENE=1
 shore:STRATA_SCENE=2
 forest:STRATA_SCENE=3
 overview-rebuilt:STRATA_SCENE=1 STRATA_REBUILD_AT=30 GOLDEN_AS=overview
+overview-offscreen:STRATA_SCENE=1 STRATA_OFFSCREEN=1 GOLDEN_AS=overview
 '
 FAILED=0
 for line in $(echo "$SCENES" | tr ' ' ','); do

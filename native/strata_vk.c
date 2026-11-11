@@ -25,6 +25,7 @@
 #include <math.h>
 
 #include "strata_shaders.h"
+#include "strata_alloc.h"
 
 #define NARR_HDR 32
 static inline int64_t narr_len(void *a)  { return *(int64_t *)((char *)a + 16); }
@@ -32,17 +33,26 @@ static inline void   *narr_data(void *a) { return (char *)a + NARR_HDR; }
 
 #define SV_LAYERS 3            /* opaque, cutout, translucent */
 #define SV_MAX_SLOTS 16384
-#define SV_GIGA_QUADS (8u * 1024u * 1024u)   /* 64 MB of 8-byte quads */
-#define SV_MAX_FREE 8192
-#define SV_MAX_IMAGES 8
+#define SV_DEFAULT_QUADS (8u * 1024u * 1024u)   /* 64 MB of 8-byte quads */
+#define SV_FRAMES 2            /* frames in flight */
 #define SV_MAX_KEYS 512
 
-typedef struct { uint32_t first, count; } Range;
+typedef SaRange Range;
 typedef struct {
     Range layer[SV_LAYERS];
     float origin[3];           /* chunk's low corner, in voxels */
     int   used;
 } Slot;
+
+/* What one frame in flight owns. */
+typedef struct {
+    VkCommandBuffer cmd;
+    VkFence fence;             /* signalled when the frame's commands have run */
+    VkSemaphore sem_image, sem_done;
+    int ts_written;            /* its two timestamp queries hold values */
+} Frame;
+
+static SaAlloc g_quads;        /* ranges of the quad buffer, in quads */
 
 static struct {
     GLFWwindow *win;
@@ -56,30 +66,29 @@ static struct {
     VkFormat format;
     VkExtent2D extent;
     uint32_t nimages;
-    VkImage images[SV_MAX_IMAGES];
-    VkImageView views[SV_MAX_IMAGES];
-    VkFramebuffer fbs[SV_MAX_IMAGES];
+    VkImage *images; VkImageView *views; VkFramebuffer *fbs;     /* nimages of each */
     VkImage depth; VkDeviceMemory depth_mem; VkImageView depth_view;
-    VkRenderPass pass;
+    /* an offscreen target the size of the window, for frames that must not
+     * touch the swapchain (timing runs: presentation paces to the display) */
+    VkImage off; VkDeviceMemory off_mem; VkImageView off_view; VkFramebuffer off_fb;
+    int offscreen;
+    VkRenderPass pass, pass_off;
     VkPipelineLayout layout;
     VkPipeline pipe_opaque, pipe_blend;
     VkDescriptorSetLayout dsl;
     VkDescriptorPool dpool;
     VkDescriptorSet dset;
     VkCommandPool cpool;
-    VkCommandBuffer cmd;
-    VkSemaphore sem_image, sem_done;
-    VkFence fence;
-    VkBuffer giga; VkDeviceMemory giga_mem; uint32_t *giga_map;
+    Frame frames[SV_FRAMES];
+    uint64_t frame_no;         /* frames begun; frame_no % SV_FRAMES picks the Frame */
+    VkBuffer giga; VkDeviceMemory giga_mem; uint32_t *giga_map; uint32_t quad_cap;
     VkBuffer ubo;  VkDeviceMemory ubo_mem;  float *ubo_map;
-    int ok, resized;
+    int ok, swap_ok, resized;
     int vsync_off;                 /* ask for the immediate present mode */
     double stat[4];                /* last frame: CPU ms, ms waiting, draw calls, GPU ms */
-    VkQueryPool qpool; int have_ts; float ts_period; int ts_written;
-    /* gigabuffer free list, in quads, sorted by first */
-    Range free_list[SV_MAX_FREE]; int nfree;
-    uint32_t quads_live;
+    VkQueryPool qpool; int have_ts; float ts_period;
     Slot *slots;
+    int64_t refused;               /* uploads turned away because the buffer was full */
     /* stats of the last frame */
     int64_t drawn_chunks, drawn_quads;
     /* input */
@@ -96,44 +105,6 @@ static void die(const char *what, int code) {
     fprintf(stderr, "strata_vk: %s failed (%d)\n", what, code);
 }
 #define VKOK(call, what) do { VkResult r_ = (call); if (r_ != VK_SUCCESS) { die(what, (int)r_); return 0; } } while (0)
-
-/* ── Gigabuffer allocator ─────────────────────────────────────────────────── */
-static int giga_alloc(uint32_t n, uint32_t *first) {
-    for (int i = 0; i < g.nfree; i++) {
-        if (g.free_list[i].count >= n) {
-            *first = g.free_list[i].first;
-            g.free_list[i].first += n; g.free_list[i].count -= n;
-            if (g.free_list[i].count == 0) {
-                memmove(&g.free_list[i], &g.free_list[i + 1], (size_t)(g.nfree - i - 1) * sizeof(Range));
-                g.nfree--;
-            }
-            g.quads_live += n;
-            return 1;
-        }
-    }
-    return 0;
-}
-static void giga_free(Range r) {
-    if (r.count == 0) return;
-    g.quads_live -= r.count;
-    int i = 0;
-    while (i < g.nfree && g.free_list[i].first < r.first) i++;
-    /* merge with the range before and after where they touch */
-    int merged_prev = (i > 0 && g.free_list[i - 1].first + g.free_list[i - 1].count == r.first);
-    int merged_next = (i < g.nfree && r.first + r.count == g.free_list[i].first);
-    if (merged_prev && merged_next) {
-        g.free_list[i - 1].count += r.count + g.free_list[i].count;
-        memmove(&g.free_list[i], &g.free_list[i + 1], (size_t)(g.nfree - i - 1) * sizeof(Range));
-        g.nfree--;
-    } else if (merged_prev) {
-        g.free_list[i - 1].count += r.count;
-    } else if (merged_next) {
-        g.free_list[i].first = r.first; g.free_list[i].count += r.count;
-    } else if (g.nfree < SV_MAX_FREE) {
-        memmove(&g.free_list[i + 1], &g.free_list[i], (size_t)(g.nfree - i) * sizeof(Range));
-        g.free_list[i] = r; g.nfree++;
-    } /* else: the range leaks until the list has room; never corrupts */
-}
 
 /* ── Vulkan helpers ───────────────────────────────────────────────────────── */
 static uint32_t mem_type(uint32_t bits, VkMemoryPropertyFlags want) {
@@ -163,36 +134,62 @@ static VkShaderModule shader(const uint32_t *code, size_t bytes) {
 
 static void destroy_swapchain(void) {
     for (uint32_t i = 0; i < g.nimages; i++) {
-        if (g.fbs[i]) vkDestroyFramebuffer(g.dev, g.fbs[i], NULL);
-        if (g.views[i]) vkDestroyImageView(g.dev, g.views[i], NULL);
-        g.fbs[i] = VK_NULL_HANDLE; g.views[i] = VK_NULL_HANDLE;
+        if (g.fbs && g.fbs[i]) vkDestroyFramebuffer(g.dev, g.fbs[i], NULL);
+        if (g.views && g.views[i]) vkDestroyImageView(g.dev, g.views[i], NULL);
     }
+    free(g.images); free(g.views); free(g.fbs);
+    g.images = NULL; g.views = NULL; g.fbs = NULL; g.nimages = 0;
+    if (g.off_fb) vkDestroyFramebuffer(g.dev, g.off_fb, NULL);
+    if (g.off_view) vkDestroyImageView(g.dev, g.off_view, NULL);
+    if (g.off) vkDestroyImage(g.dev, g.off, NULL);
+    if (g.off_mem) vkFreeMemory(g.dev, g.off_mem, NULL);
+    g.off_fb = VK_NULL_HANDLE; g.off_view = VK_NULL_HANDLE; g.off = VK_NULL_HANDLE; g.off_mem = VK_NULL_HANDLE;
     if (g.depth_view) vkDestroyImageView(g.dev, g.depth_view, NULL);
     if (g.depth) vkDestroyImage(g.dev, g.depth, NULL);
     if (g.depth_mem) vkFreeMemory(g.dev, g.depth_mem, NULL);
     g.depth_view = VK_NULL_HANDLE; g.depth = VK_NULL_HANDLE; g.depth_mem = VK_NULL_HANDLE;
-    g.nimages = 0;
 }
 
 /* FIFO (vsync) unless the immediate mode was asked for and the surface offers it. */
 static VkPresentModeKHR pick_present_mode(void) {
     if (!g.vsync_off) return VK_PRESENT_MODE_FIFO_KHR;
     uint32_t n = 16; VkPresentModeKHR modes[16];
-    if (vkGetPhysicalDeviceSurfacePresentModesKHR(g.phys, g.surface, &n, modes) != VK_SUCCESS && n == 0) return VK_PRESENT_MODE_FIFO_KHR;
+    VkResult r = vkGetPhysicalDeviceSurfacePresentModesKHR(g.phys, g.surface, &n, modes);
+    if (r != VK_SUCCESS && r != VK_INCOMPLETE) return VK_PRESENT_MODE_FIFO_KHR;
     for (uint32_t i = 0; i < n; i++) if (modes[i] == VK_PRESENT_MODE_IMMEDIATE_KHR) return VK_PRESENT_MODE_IMMEDIATE_KHR;
     return VK_PRESENT_MODE_FIFO_KHR;
 }
 
+/* A 2D image with its memory and view. */
+static int make_image(VkFormat fmt, VkImageUsageFlags usage, VkImageAspectFlags aspect, VkImage *img, VkDeviceMemory *mem, VkImageView *view) {
+    VkImageCreateInfo ici = { .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D, .format = fmt,
+        .extent = { g.extent.width, g.extent.height, 1 }, .mipLevels = 1, .arrayLayers = 1, .samples = VK_SAMPLE_COUNT_1_BIT,
+        .tiling = VK_IMAGE_TILING_OPTIMAL, .usage = usage };
+    VKOK(vkCreateImage(g.dev, &ici, NULL, img), "vkCreateImage");
+    VkMemoryRequirements mr; vkGetImageMemoryRequirements(g.dev, *img, &mr);
+    VkMemoryAllocateInfo ai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = mr.size,
+        .memoryTypeIndex = mem_type(mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) };
+    VKOK(vkAllocateMemory(g.dev, &ai, NULL, mem), "image memory");
+    VKOK(vkBindImageMemory(g.dev, *img, *mem, 0), "image bind");
+    VkImageViewCreateInfo vi = { .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = *img, .viewType = VK_IMAGE_VIEW_TYPE_2D,
+        .format = fmt, .subresourceRange = { aspect, 0, 1, 0, 1 } };
+    VKOK(vkCreateImageView(g.dev, &vi, NULL, view), "image view");
+    return 1;
+}
+
+/* Build the swapchain and everything sized by it. On failure nothing is
+ * left half-built: the caller sees 0 and tries again on a later frame. */
 static int make_swapchain(void) {
     VkSurfaceCapabilitiesKHR caps;
     VKOK(vkGetPhysicalDeviceSurfaceCapabilitiesKHR(g.phys, g.surface, &caps), "surface caps");
     int fw, fh; glfwGetFramebufferSize(g.win, &fw, &fh);
     VkExtent2D ext = caps.currentExtent;
     if (ext.width == UINT32_MAX) { ext.width = (uint32_t)fw; ext.height = (uint32_t)fh; }
-    if (ext.width == 0 || ext.height == 0) return 0;
+    if (ext.width == 0 || ext.height == 0) return 0;          /* minimised */
     uint32_t nfmt = 0; vkGetPhysicalDeviceSurfaceFormatsKHR(g.phys, g.surface, &nfmt, NULL);
     VkSurfaceFormatKHR fmts[64]; if (nfmt > 64) nfmt = 64;
     vkGetPhysicalDeviceSurfaceFormatsKHR(g.phys, g.surface, &nfmt, fmts);
+    if (nfmt == 0) return 0;
     VkSurfaceFormatKHR pick = fmts[0];
     for (uint32_t i = 0; i < nfmt; i++)
         if (fmts[i].format == VK_FORMAT_B8G8R8A8_SRGB && fmts[i].colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) pick = fmts[i];
@@ -205,26 +202,22 @@ static int make_swapchain(void) {
         .imageSharingMode = VK_SHARING_MODE_EXCLUSIVE, .preTransform = caps.currentTransform,
         .compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR, .presentMode = pick_present_mode(), .clipped = VK_TRUE,
         .oldSwapchain = old };
-    VKOK(vkCreateSwapchainKHR(g.dev, &sci, NULL, &g.swap), "vkCreateSwapchainKHR");
-    if (getenv("STRATA_DEBUG")) fprintf(stderr, "strata_vk: swapchain %ux%u, present mode %d, %u images wanted\n", ext.width, ext.height, (int)sci.presentMode, want);
+    VkSwapchainKHR fresh = VK_NULL_HANDLE;
+    VKOK(vkCreateSwapchainKHR(g.dev, &sci, NULL, &fresh), "vkCreateSwapchainKHR");
     if (old) vkDestroySwapchainKHR(g.dev, old, NULL);
-    g.format = pick.format; g.extent = ext;
-    g.nimages = SV_MAX_IMAGES;
-    VkResult r = vkGetSwapchainImagesKHR(g.dev, g.swap, &g.nimages, g.images);
-    if (r != VK_SUCCESS && r != VK_INCOMPLETE) { die("swapchain images", (int)r); return 0; }
+    g.swap = fresh; g.format = pick.format; g.extent = ext;
+    if (getenv("STRATA_DEBUG")) fprintf(stderr, "strata_vk: swapchain %ux%u, present mode %d\n", ext.width, ext.height, (int)sci.presentMode);
 
-    VkImageCreateInfo ici = { .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D, .format = VK_FORMAT_D32_SFLOAT,
-        .extent = { ext.width, ext.height, 1 }, .mipLevels = 1, .arrayLayers = 1, .samples = VK_SAMPLE_COUNT_1_BIT,
-        .tiling = VK_IMAGE_TILING_OPTIMAL, .usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT };
-    VKOK(vkCreateImage(g.dev, &ici, NULL, &g.depth), "depth image");
-    VkMemoryRequirements mr; vkGetImageMemoryRequirements(g.dev, g.depth, &mr);
-    VkMemoryAllocateInfo ai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = mr.size,
-        .memoryTypeIndex = mem_type(mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) };
-    VKOK(vkAllocateMemory(g.dev, &ai, NULL, &g.depth_mem), "depth memory");
-    VKOK(vkBindImageMemory(g.dev, g.depth, g.depth_mem, 0), "depth bind");
-    VkImageViewCreateInfo dvi = { .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = g.depth, .viewType = VK_IMAGE_VIEW_TYPE_2D,
-        .format = VK_FORMAT_D32_SFLOAT, .subresourceRange = { VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1 } };
-    VKOK(vkCreateImageView(g.dev, &dvi, NULL, &g.depth_view), "depth view");
+    uint32_t n = 0;
+    VKOK(vkGetSwapchainImagesKHR(g.dev, g.swap, &n, NULL), "swapchain image count");
+    g.images = calloc(n ? n : 1, sizeof *g.images);
+    g.views = calloc(n ? n : 1, sizeof *g.views);
+    g.fbs = calloc(n ? n : 1, sizeof *g.fbs);
+    if (!g.images || !g.views || !g.fbs || n == 0) return 0;
+    VKOK(vkGetSwapchainImagesKHR(g.dev, g.swap, &n, g.images), "swapchain images");
+    g.nimages = n;
+    if (!make_image(VK_FORMAT_D32_SFLOAT, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, VK_IMAGE_ASPECT_DEPTH_BIT, &g.depth, &g.depth_mem, &g.depth_view)) return 0;
+    if (!make_image(g.format, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, VK_IMAGE_ASPECT_COLOR_BIT, &g.off, &g.off_mem, &g.off_view)) return 0;
     return 1;
 }
 
@@ -238,14 +231,21 @@ static int make_framebuffers(void) {
             .pAttachments = att, .width = g.extent.width, .height = g.extent.height, .layers = 1 };
         VKOK(vkCreateFramebuffer(g.dev, &fi, NULL, &g.fbs[i]), "framebuffer");
     }
+    VkImageView att[2] = { g.off_view, g.depth_view };
+    VkFramebufferCreateInfo fi = { .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO, .renderPass = g.pass_off, .attachmentCount = 2,
+        .pAttachments = att, .width = g.extent.width, .height = g.extent.height, .layers = 1 };
+    VKOK(vkCreateFramebuffer(g.dev, &fi, NULL, &g.off_fb), "offscreen framebuffer");
     return 1;
 }
 
-static int make_render_pass(void) {
+/* The colour + depth pass. [final] is the layout the colour image is left in:
+ * PRESENT_SRC for a swapchain image, TRANSFER_SRC for the offscreen target.
+ * The two passes are compatible, so one set of pipelines serves both. */
+static int make_render_pass(VkImageLayout final, VkRenderPass *out) {
     VkAttachmentDescription att[2] = {
         { .format = g.format, .samples = VK_SAMPLE_COUNT_1_BIT, .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR, .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
           .stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE, .stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
-          .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED, .finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR },
+          .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED, .finalLayout = final },
         { .format = VK_FORMAT_D32_SFLOAT, .samples = VK_SAMPLE_COUNT_1_BIT, .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR, .storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
           .stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE, .stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
           .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED, .finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL } };
@@ -257,7 +257,7 @@ static int make_render_pass(void) {
         .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT };
     VkRenderPassCreateInfo rpi = { .sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO, .attachmentCount = 2, .pAttachments = att,
         .subpassCount = 1, .pSubpasses = &sub, .dependencyCount = 1, .pDependencies = &dep };
-    VKOK(vkCreateRenderPass(g.dev, &rpi, NULL, &g.pass), "vkCreateRenderPass");
+    VKOK(vkCreateRenderPass(g.dev, &rpi, NULL, out), "vkCreateRenderPass");
     return 1;
 }
 
@@ -310,7 +310,9 @@ static void on_cursor(GLFWwindow *w, double x, double y) {
 static void on_resize(GLFWwindow *w, int width, int height) { (void)w; (void)width; (void)height; g.resized = 1; }
 
 /* ── Open / close ─────────────────────────────────────────────────────────── */
-int64_t sv_open(int64_t w, int64_t h, int64_t capture_mouse) {
+/* Open a window and build the renderer. [quad_capacity] is how many quads
+ * the GPU buffer holds; zero or less means the default, 8 388 608 (64 MB). */
+int64_t sv_open(int64_t w, int64_t h, int64_t capture_mouse, int64_t quad_capacity) {
     memset(&g, 0, sizeof g);
     if (!glfwInit()) { die("glfwInit", 0); return 0; }
     if (!glfwVulkanSupported()) { die("glfwVulkanSupported (is the Vulkan loader installed?)", 0); return 0; }
@@ -369,8 +371,10 @@ int64_t sv_open(int64_t w, int64_t h, int64_t capture_mouse) {
     vkGetDeviceQueue(g.dev, g.qfam, 0, &g.queue);
 
     if (!make_swapchain()) return 0;
-    if (!make_render_pass()) return 0;
+    if (!make_render_pass(VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, &g.pass)) return 0;
+    if (!make_render_pass(VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, &g.pass_off)) return 0;
     if (!make_framebuffers()) return 0;
+    g.swap_ok = 1;
 
     VkDescriptorSetLayoutBinding dslb = { .binding = 0, .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, .descriptorCount = 1,
         .stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT };
@@ -384,12 +388,13 @@ int64_t sv_open(int64_t w, int64_t h, int64_t capture_mouse) {
     if (!make_pipeline(1, &g.pipe_blend)) return 0;
 
     void *map = NULL;
-    if (!make_buffer((VkDeviceSize)SV_GIGA_QUADS * 8, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, &g.giga, &g.giga_mem, &map)) return 0;
+    g.quad_cap = (quad_capacity > 0 && quad_capacity < 0x20000000) ? (uint32_t)quad_capacity : SV_DEFAULT_QUADS;
+    if (!make_buffer((VkDeviceSize)g.quad_cap * 8, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, &g.giga, &g.giga_mem, &map)) return 0;
     g.giga_map = map;
     if (!make_buffer(UBO_FLOATS * 4, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, &g.ubo, &g.ubo_mem, &map)) return 0;
     g.ubo_map = map;
     memset(g.ubo_map, 0, UBO_FLOATS * 4);
-    g.free_list[0] = (Range){ 0, SV_GIGA_QUADS }; g.nfree = 1;
+    sa_init(&g_quads, g.quad_cap);
     g.slots = calloc(SV_MAX_SLOTS, sizeof(Slot));
     if (!g.slots) { die("slot table", 0); return 0; }
 
@@ -405,15 +410,17 @@ int64_t sv_open(int64_t w, int64_t h, int64_t capture_mouse) {
 
     VkCommandPoolCreateInfo cpi = { .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, .queueFamilyIndex = g.qfam };
     VKOK(vkCreateCommandPool(g.dev, &cpi, NULL, &g.cpool), "command pool");
-    VkCommandBufferAllocateInfo cai = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, .commandPool = g.cpool, .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1 };
-    VKOK(vkAllocateCommandBuffers(g.dev, &cai, &g.cmd), "command buffer");
-    VkSemaphoreCreateInfo si = { .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
-    VKOK(vkCreateSemaphore(g.dev, &si, NULL, &g.sem_image), "semaphore");
-    VKOK(vkCreateSemaphore(g.dev, &si, NULL, &g.sem_done), "semaphore");
-    VkFenceCreateInfo fi = { .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO, .flags = VK_FENCE_CREATE_SIGNALED_BIT };
-    VKOK(vkCreateFence(g.dev, &fi, NULL, &g.fence), "fence");
+    for (int f = 0; f < SV_FRAMES; f++) {
+        VkCommandBufferAllocateInfo cai = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, .commandPool = g.cpool, .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1 };
+        VKOK(vkAllocateCommandBuffers(g.dev, &cai, &g.frames[f].cmd), "command buffer");
+        VkSemaphoreCreateInfo si = { .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
+        VKOK(vkCreateSemaphore(g.dev, &si, NULL, &g.frames[f].sem_image), "semaphore");
+        VKOK(vkCreateSemaphore(g.dev, &si, NULL, &g.frames[f].sem_done), "semaphore");
+        VkFenceCreateInfo fi = { .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO, .flags = VK_FENCE_CREATE_SIGNALED_BIT };
+        VKOK(vkCreateFence(g.dev, &fi, NULL, &g.frames[f].fence), "fence");
+    }
     if (g.have_ts) {
-        VkQueryPoolCreateInfo qi = { .sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, .queryType = VK_QUERY_TYPE_TIMESTAMP, .queryCount = 2 };
+        VkQueryPoolCreateInfo qi = { .sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, .queryType = VK_QUERY_TYPE_TIMESTAMP, .queryCount = 2 * SV_FRAMES };
         if (vkCreateQueryPool(g.dev, &qi, NULL, &g.qpool) != VK_SUCCESS) g.have_ts = 0;
     }
     g.stat[3] = -1.0;
@@ -436,9 +443,12 @@ void sv_close(void) {
         if (g.giga_mem) vkFreeMemory(g.dev, g.giga_mem, NULL);
         if (g.ubo) vkDestroyBuffer(g.dev, g.ubo, NULL);
         if (g.ubo_mem) vkFreeMemory(g.dev, g.ubo_mem, NULL);
-        if (g.sem_image) vkDestroySemaphore(g.dev, g.sem_image, NULL);
-        if (g.sem_done) vkDestroySemaphore(g.dev, g.sem_done, NULL);
-        if (g.fence) vkDestroyFence(g.dev, g.fence, NULL);
+        for (int f = 0; f < SV_FRAMES; f++) {
+            if (g.frames[f].sem_image) vkDestroySemaphore(g.dev, g.frames[f].sem_image, NULL);
+            if (g.frames[f].sem_done) vkDestroySemaphore(g.dev, g.frames[f].sem_done, NULL);
+            if (g.frames[f].fence) vkDestroyFence(g.dev, g.frames[f].fence, NULL);
+        }
+        if (g.pass_off) vkDestroyRenderPass(g.dev, g.pass_off, NULL);
         if (g.qpool) vkDestroyQueryPool(g.dev, g.qpool, NULL);
         if (g.cpool) vkDestroyCommandPool(g.dev, g.cpool, NULL);
         vkDestroyDevice(g.dev, NULL);
@@ -471,7 +481,14 @@ void sv_set_vsync(int64_t on) { int off = on ? 0 : 1; if (g.ok && off != g.vsync
 double sv_stat(int64_t which) { return (which >= 0 && which < 4) ? g.stat[which] : -1.0; }
 int64_t sv_drawn_chunks(void) { return g.drawn_chunks; }
 int64_t sv_drawn_quads(void) { return g.drawn_quads; }
-int64_t sv_live_quads(void) { return (int64_t)g.quads_live; }
+int64_t sv_live_quads(void) { return (int64_t)sa_live(&g_quads); }
+/* Uploads turned away so far because the quad buffer was full. */
+int64_t sv_refused(void) { return g.refused; }
+/* Rebuild the swapchain before the next frame, as a resize would. */
+void sv_force_rebuild(void) { g.resized = 1; }
+/* 1: frames render to an offscreen image and are never presented, so they
+ * are not paced by the display. For timing; the window shows nothing new. */
+void sv_set_offscreen(int64_t on) { g.offscreen = on ? 1 : 0; }
 
 /* ── Chunk uploads ────────────────────────────────────────────────────────── */
 /* Replace one layer of a slot with [nquads] quads from a NativeI32Arr (two
@@ -484,11 +501,12 @@ int64_t sv_chunk_upload(int64_t slot, int64_t layer, void *quads, int64_t nquads
     Slot *s = &g.slots[slot];
     Range fresh = { 0, (uint32_t)nquads };
     if (nquads > 0) {
-        if (!giga_alloc((uint32_t)nquads, &fresh.first)) return 0;
+        if (!sa_alloc(&g_quads, (uint32_t)nquads, &fresh.first)) { g.refused++; return 0; }
+        /* the range has been idle for two frames or was never used: no frame in flight reads it */
         memcpy(g.giga_map + (size_t)fresh.first * 2, narr_data(quads), (size_t)nquads * 8);
     }
-    /* the GPU may still be reading the old range for the frame in flight */
-    if (s->layer[layer].count) { vkWaitForFences(g.dev, 1, &g.fence, VK_TRUE, UINT64_MAX); giga_free(s->layer[layer]); }
+    /* a frame in flight may still read the old range: hold it two frames instead of waiting */
+    sa_release(&g_quads, s->layer[layer], g.frame_no);
     s->layer[layer] = fresh;
     s->origin[0] = (float)ox; s->origin[1] = (float)oy; s->origin[2] = (float)oz;
     s->used = 1;
@@ -499,8 +517,7 @@ void sv_chunk_free(int64_t slot) {
     if (!g.ok || slot < 0 || slot >= SV_MAX_SLOTS) return;
     Slot *s = &g.slots[slot];
     if (!s->used) return;
-    vkWaitForFences(g.dev, 1, &g.fence, VK_TRUE, UINT64_MAX);
-    for (int l = 0; l < SV_LAYERS; l++) { giga_free(s->layer[l]); s->layer[l] = (Range){ 0, 0 }; }
+    for (int l = 0; l < SV_LAYERS; l++) { sa_release(&g_quads, s->layer[l], g.frame_no); s->layer[l] = (Range){ 0, 0 }; }
     s->used = 0;
 }
 
@@ -560,64 +577,83 @@ static int culled(const float *m, const float *o, float scale) {
     return 0;
 }
 
-static void write_shot(uint32_t image_index);
+static void write_shot(Frame *F, VkImage image, VkImageLayout layout);
 
 /* ── Draw ─────────────────────────────────────────────────────────────────── */
 static int rebuild_swapchain(void) {
     int w = 0, h = 0; glfwGetFramebufferSize(g.win, &w, &h);
+    g.swap_ok = 0;
     if (w == 0 || h == 0) return 0;
     vkDeviceWaitIdle(g.dev);
     destroy_swapchain();
-    if (!make_swapchain()) return 0;
-    return make_framebuffers();
+    if (!make_swapchain() || !make_framebuffers()) { destroy_swapchain(); return 0; }
+    g.swap_ok = 1;
+    return 1;
+}
+
+/* A fence that can no longer be signalled (its submit failed) would hang
+ * every later wait: replace it with a signalled one. */
+static void heal_fence(Frame *F) {
+    vkDestroyFence(g.dev, F->fence, NULL);
+    VkFenceCreateInfo fi = { .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO, .flags = VK_FENCE_CREATE_SIGNALED_BIT };
+    if (vkCreateFence(g.dev, &fi, NULL, &F->fence) != VK_SUCCESS) { F->fence = VK_NULL_HANDLE; g.ok = 0; }
 }
 
 /* Draw every used slot that survives the frustum test: opaque and cutout
- * first, then translucent with blending. Returns 1 when a frame was
- * presented, 0 when it was skipped (minimised, swapchain out of date). */
+ * first, then translucent with blending. Returns 1 when a frame was drawn,
+ * 0 when it was skipped (minimised, swapchain being rebuilt, submit failed). */
 int64_t sv_frame(void) {
     if (!g.ok) return 0;
-    if (g.resized) { g.resized = 0; if (!rebuild_swapchain()) return 0; }
+    if (g.resized || !g.swap_ok) { g.resized = 0; if (!rebuild_swapchain()) return 0; }
+    Frame *F = &g.frames[g.frame_no % SV_FRAMES];
+    uint32_t q0 = (uint32_t)(g.frame_no % SV_FRAMES) * 2;
     double t_start = glfwGetTime();
-    vkWaitForFences(g.dev, 1, &g.fence, VK_TRUE, UINT64_MAX);
-    double fence_ms = (glfwGetTime() - t_start) * 1000.0;
-    if (g.have_ts && g.ts_written) {          /* the previous frame is complete: read its two timestamps */
+    /* this Frame was last used two frames ago; when its fence is signalled,
+     * everything released up to then is idle */
+    vkWaitForFences(g.dev, 1, &F->fence, VK_TRUE, UINT64_MAX);
+    double wait_ms = (glfwGetTime() - t_start) * 1000.0;
+    sa_collect(&g_quads, g.frame_no);
+    if (g.have_ts && F->ts_written) {
         uint64_t ts[2] = { 0, 0 };
-        if (vkGetQueryPoolResults(g.dev, g.qpool, 0, 2, sizeof ts, ts, sizeof ts[0], VK_QUERY_RESULT_64_BIT) == VK_SUCCESS)
+        if (vkGetQueryPoolResults(g.dev, g.qpool, q0, 2, sizeof ts, ts, sizeof ts[0], VK_QUERY_RESULT_64_BIT) == VK_SUCCESS)
             g.stat[3] = (double)(ts[1] - ts[0]) * (double)g.ts_period / 1.0e6;
     }
     uint32_t idx = 0;
-    double t_acq = glfwGetTime();
-    VkResult ar = vkAcquireNextImageKHR(g.dev, g.swap, UINT64_MAX, g.sem_image, VK_NULL_HANDLE, &idx);
-    if (ar == VK_ERROR_OUT_OF_DATE_KHR) { rebuild_swapchain(); return 0; }
-    if (ar != VK_SUCCESS && ar != VK_SUBOPTIMAL_KHR) { die("vkAcquireNextImageKHR", (int)ar); return 0; }
-    double wait_ms = fence_ms + (glfwGetTime() - t_acq) * 1000.0;
+    int offscreen = g.offscreen;
+    if (!offscreen) {
+        double t_acq = glfwGetTime();
+        VkResult ar = vkAcquireNextImageKHR(g.dev, g.swap, UINT64_MAX, F->sem_image, VK_NULL_HANDLE, &idx);
+        if (ar == VK_ERROR_OUT_OF_DATE_KHR) { g.resized = 1; return 0; }
+        if (ar != VK_SUCCESS && ar != VK_SUBOPTIMAL_KHR) { die("vkAcquireNextImageKHR", (int)ar); return 0; }
+        if (idx >= g.nimages) { die("swapchain image index out of range", (int)idx); return 0; }
+        wait_ms += (glfwGetTime() - t_acq) * 1000.0;
+    }
     int draws = 0;
-    vkResetFences(g.dev, 1, &g.fence);
-    vkResetCommandBuffer(g.cmd, 0);
+    vkResetCommandBuffer(F->cmd, 0);
     VkCommandBufferBeginInfo bi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
-    vkBeginCommandBuffer(g.cmd, &bi);
-    if (g.have_ts) { vkCmdResetQueryPool(g.cmd, g.qpool, 0, 2); vkCmdWriteTimestamp(g.cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, g.qpool, 0); }
+    vkBeginCommandBuffer(F->cmd, &bi);
+    if (g.have_ts) { vkCmdResetQueryPool(F->cmd, g.qpool, q0, 2); vkCmdWriteTimestamp(F->cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, g.qpool, q0); }
     VkClearValue clear[2];
     clear[0].color.float32[0] = g.ubo_map[20]; clear[0].color.float32[1] = g.ubo_map[21];
     clear[0].color.float32[2] = g.ubo_map[22]; clear[0].color.float32[3] = 1.0f;
     clear[1].depthStencil.depth = 1.0f; clear[1].depthStencil.stencil = 0;
-    VkRenderPassBeginInfo rbi = { .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO, .renderPass = g.pass, .framebuffer = g.fbs[idx],
+    VkRenderPassBeginInfo rbi = { .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
+        .renderPass = offscreen ? g.pass_off : g.pass, .framebuffer = offscreen ? g.off_fb : g.fbs[idx],
         .renderArea = { { 0, 0 }, g.extent }, .clearValueCount = 2, .pClearValues = clear };
-    vkCmdBeginRenderPass(g.cmd, &rbi, VK_SUBPASS_CONTENTS_INLINE);
+    vkCmdBeginRenderPass(F->cmd, &rbi, VK_SUBPASS_CONTENTS_INLINE);
     VkViewport vpt = { 0, 0, (float)g.extent.width, (float)g.extent.height, 0.0f, 1.0f };
     VkRect2D sc = { { 0, 0 }, g.extent };
-    vkCmdSetViewport(g.cmd, 0, 1, &vpt); vkCmdSetScissor(g.cmd, 0, 1, &sc);
+    vkCmdSetViewport(F->cmd, 0, 1, &vpt); vkCmdSetScissor(F->cmd, 0, 1, &sc);
     VkDeviceSize zero = 0;
-    vkCmdBindVertexBuffers(g.cmd, 0, 1, &g.giga, &zero);
-    vkCmdBindDescriptorSets(g.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g.layout, 0, 1, &g.dset, 0, NULL);
+    vkCmdBindVertexBuffers(F->cmd, 0, 1, &g.giga, &zero);
+    vkCmdBindDescriptorSets(F->cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g.layout, 0, 1, &g.dset, 0, NULL);
 
     float scale = g.ubo_map[31] > 0.0f ? g.ubo_map[31] : 1.0f;
     g.drawn_chunks = 0; g.drawn_quads = 0;
     static unsigned char *vis = NULL;
     if (!vis) vis = malloc(SV_MAX_SLOTS);
     for (int pass = 0; pass < 2; pass++) {
-        vkCmdBindPipeline(g.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pass == 0 ? g.pipe_opaque : g.pipe_blend);
+        vkCmdBindPipeline(F->cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pass == 0 ? g.pipe_opaque : g.pipe_blend);
         for (int i = 0; i < SV_MAX_SLOTS; i++) {
             Slot *s = &g.slots[i];
             if (!s->used) continue;
@@ -628,33 +664,46 @@ int64_t sv_frame(void) {
                 if (!s->layer[l].count) continue;
                 if (!pushed) {
                     float pc[4] = { s->origin[0], s->origin[1], s->origin[2], 0.0f };
-                    vkCmdPushConstants(g.cmd, g.layout, VK_SHADER_STAGE_VERTEX_BIT, 0, 16, pc);
+                    vkCmdPushConstants(F->cmd, g.layout, VK_SHADER_STAGE_VERTEX_BIT, 0, 16, pc);
                     pushed = 1; if (pass == 0) g.drawn_chunks++;
                 }
-                vkCmdDraw(g.cmd, 4, s->layer[l].count, 0, s->layer[l].first); draws++;
+                vkCmdDraw(F->cmd, 4, s->layer[l].count, 0, s->layer[l].first); draws++;
                 g.drawn_quads += s->layer[l].count;
             }
         }
     }
-    vkCmdEndRenderPass(g.cmd);
-    if (g.have_ts) { vkCmdWriteTimestamp(g.cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, g.qpool, 1); g.ts_written = 1; }
-    vkEndCommandBuffer(g.cmd);
+    vkCmdEndRenderPass(F->cmd);
+    if (g.have_ts) vkCmdWriteTimestamp(F->cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, g.qpool, q0 + 1);
+    vkEndCommandBuffer(F->cmd);
     VkPipelineStageFlags wait = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-    VkSubmitInfo sub = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .waitSemaphoreCount = 1, .pWaitSemaphores = &g.sem_image, .pWaitDstStageMask = &wait,
-        .commandBufferCount = 1, .pCommandBuffers = &g.cmd, .signalSemaphoreCount = 1, .pSignalSemaphores = &g.sem_done };
-    VkResult sr = vkQueueSubmit(g.queue, 1, &sub, g.fence);
-    if (sr != VK_SUCCESS) { die("vkQueueSubmit", (int)sr); return 0; }
-    if (g.shot_pending) { g.shot_pending = 0; write_shot(idx); }
-    VkPresentInfoKHR pi = { .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR, .waitSemaphoreCount = 1, .pWaitSemaphores = &g.sem_done,
-        .swapchainCount = 1, .pSwapchains = &g.swap, .pImageIndices = &idx };
-    double t_pres = glfwGetTime();
-    VkResult pr = vkQueuePresentKHR(g.queue, &pi);
-    double t_end = glfwGetTime();
-    if (pr == VK_ERROR_OUT_OF_DATE_KHR || pr == VK_SUBOPTIMAL_KHR) g.resized = 1;
-    wait_ms += (t_end - t_pres) * 1000.0;
-    g.stat[0] = (t_end - t_start) * 1000.0 - wait_ms;
+    VkSubmitInfo sub = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &F->cmd };
+    if (!offscreen) {
+        sub.waitSemaphoreCount = 1; sub.pWaitSemaphores = &F->sem_image; sub.pWaitDstStageMask = &wait;
+        sub.signalSemaphoreCount = 1; sub.pSignalSemaphores = &F->sem_done;
+    }
+    /* the fence is reset only now, and healed if the submit fails, so no
+     * later wait can hang on a fence nothing will signal */
+    vkResetFences(g.dev, 1, &F->fence);
+    double t_sub = glfwGetTime();
+    VkResult sr = vkQueueSubmit(g.queue, 1, &sub, F->fence);
+    if (sr != VK_SUCCESS) { die("vkQueueSubmit", (int)sr); heal_fence(F); return 0; }
+    F->ts_written = g.have_ts;
+    double submit_ms = (glfwGetTime() - t_sub) * 1000.0;
+    if (g.shot_pending) { g.shot_pending = 0; write_shot(F, offscreen ? g.off : g.images[idx], offscreen ? VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL : VK_IMAGE_LAYOUT_PRESENT_SRC_KHR); }
+    if (!offscreen) {
+        /* on MoltenVK the display's pacing is paid inside the submit that carries a presentable image */
+        wait_ms += submit_ms;
+        double t_pres = glfwGetTime();
+        VkPresentInfoKHR pi = { .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR, .waitSemaphoreCount = 1, .pWaitSemaphores = &F->sem_done,
+            .swapchainCount = 1, .pSwapchains = &g.swap, .pImageIndices = &idx };
+        VkResult pr = vkQueuePresentKHR(g.queue, &pi);
+        if (pr == VK_ERROR_OUT_OF_DATE_KHR || pr == VK_SUBOPTIMAL_KHR) g.resized = 1;
+        wait_ms += (glfwGetTime() - t_pres) * 1000.0;
+    }
+    g.stat[0] = (glfwGetTime() - t_start) * 1000.0 - wait_ms;
     g.stat[1] = wait_ms;
     g.stat[2] = (double)draws;
+    g.frame_no++;
     return 1;
 }
 
@@ -667,8 +716,8 @@ void sv_request_shot(void) {
     g.shot_pending = 1;
 }
 
-static void write_shot(uint32_t idx) {
-    vkWaitForFences(g.dev, 1, &g.fence, VK_TRUE, UINT64_MAX);     /* the frame just submitted */
+static void write_shot(Frame *F, VkImage image, VkImageLayout layout) {
+    vkWaitForFences(g.dev, 1, &F->fence, VK_TRUE, UINT64_MAX);     /* the frame just submitted */
     VkDeviceSize size = (VkDeviceSize)g.extent.width * g.extent.height * 4;
     VkBuffer buf; VkDeviceMemory mem; void *map = NULL;
     if (!make_buffer(size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, &buf, &mem, &map)) return;
@@ -677,16 +726,19 @@ static void write_shot(uint32_t idx) {
     VkCommandBufferBeginInfo bi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
     vkBeginCommandBuffer(cb, &bi);
     VkImageMemoryBarrier to_src = { .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, .srcAccessMask = 0, .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
-        .oldLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .image = g.images[idx],
+        .oldLayout = layout, .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .image = image,
         .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 } };
-    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &to_src);
+    if (layout != VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL)
+        vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &to_src);
     VkBufferImageCopy reg = { .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 }, .imageExtent = { g.extent.width, g.extent.height, 1 } };
-    vkCmdCopyImageToBuffer(cb, g.images[idx], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buf, 1, &reg);
-    VkImageMemoryBarrier back = to_src;
-    back.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT; back.dstAccessMask = 0;
-    back.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL; back.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
-    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, NULL, 0, NULL, 1, &back);
+    vkCmdCopyImageToBuffer(cb, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buf, 1, &reg);
+    if (layout != VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL) {
+        VkImageMemoryBarrier back = to_src;
+        back.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT; back.dstAccessMask = 0;
+        back.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL; back.newLayout = layout;
+        vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, NULL, 0, NULL, 1, &back);
+    }
     vkEndCommandBuffer(cb);
     VkSubmitInfo sub = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &cb };
     vkQueueSubmit(g.queue, 1, &sub, VK_NULL_HANDLE);

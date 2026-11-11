@@ -103,3 +103,24 @@ wait into `vkQueueSubmit`, where the driver takes the next drawable. Three
 MoltenVK settings were tried and none lifts it. Timestamp queries do work,
 so GPU time is real. An uncapped CPU figure needs a frame that never
 touches the swapchain; Task 2 adds an offscreen mode for that.
+
+## Two frames in flight and an offscreen timing mode (Task 2)
+
+Uploads and frees no longer wait for the GPU: a released range is held two
+frames and then reused. With `STRATA_OFFSCREEN=1` a frame renders to an
+image the size of the window and is never presented, so nothing paces it.
+
+Scene 1, radius 10 x 3, 2560 x 1600, offscreen, still CPU culling and one
+draw per chunk layer:
+
+| | |
+|---|---|
+| frame rate | about 3000 fps |
+| CPU time in the shim | 0.08 to 0.09 ms |
+| GPU time, by timestamp query | 0.2 to 0.3 ms |
+| draw calls | 242 |
+
+So at this scene size the old path is nowhere near a limit; the GPU-driven
+path that follows is about scaling to many more chunks, not about this
+number. With the quad buffer cut to 20 000 quads the same scene refuses
+232 uploads and carries on without a crash.
