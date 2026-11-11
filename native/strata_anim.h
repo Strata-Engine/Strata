@@ -10,7 +10,8 @@
  * Nothing here allocates after an_open.
  *
  * Refused calls change nothing; they are counted in an_stat(3) and the
- * reason (AN_R_*) is kept in an_stat(5). */
+ * reason (AN_R_*) is kept in an_stat(5). Marks that cannot be reported are
+ * counted in an_stat(6), never dropped silently. */
 #ifndef STRATA_ANIM_H
 #define STRATA_ANIM_H
 #include <stdint.h>
@@ -22,14 +23,14 @@
 #define AN_LAYERS 8
 #define AN_PARTS 64
 #define AN_BLEND 4
-#define AN_RIGS 1024
+#define AN_RIGS 256
 #define AN_MASKS 4096
 #define AN_CLIPS 4096
-#define AN_KEY_POOL (1 << 19)      /* keys over every clip */
-#define AN_MARK_POOL (1 << 16)     /* marks over every clip */
-#define AN_EVENTS 16384            /* marks reported by one update; more are dropped */
-#define AN_FADES 4                 /* sources one layer holds while crossfading */
-#define AN_WRAPS 64                /* loops of one clip walked for marks in one update */
+#define AN_KEY_POOL (1 << 18)      /* keys over every clip; at most 65 535 in one clip */
+#define AN_MARK_POOL (1 << 15)     /* marks over every clip */
+#define AN_FIG_EVENTS 8            /* marks one figure reports from one update; more are counted in stat 6 */
+#define AN_FADES 3                 /* sources one layer holds while crossfading */
+#define AN_WRAPS 64                /* loops of one clip walked for marks in one update; more are counted in stat 6 */
 #define AN_IDS (1 << 20)           /* figure ids: the n-th spawn is id n mod 2^20 */
 
 /* why the last refused call was refused: an_stat(5) */
@@ -103,62 +104,62 @@ static inline void an_ramp_step(AnRamp *r, float dt) { r->t = r->t + dt < r->len
 
 typedef struct {
     int nparts;
-    int32_t parent[AN_PARTS];
+    int8_t parent[AN_PARTS];
     float pivot[AN_PARTS][3], rest[AN_PARTS][4], box[AN_PARTS][6];
 } AnRig;
 typedef struct { int rig; uint64_t parts; } AnMask;
-typedef struct { float t, v[4]; int32_t interp; } AnKey;   /* v: xyzw for a turn, xyz for a move */
+typedef struct { float t, v[4]; } AnKey;   /* v: xyzw for a turn, xyz for a move; interpolation kept beside, in key_interp */
 typedef struct {
     int rig, loops;
     float duration, stride;
-    int32_t first[AN_PARTS][2], count[AN_PARTS][2];   /* each part's track per channel in the key pool */
+    int32_t key_base;                                  /* the clip's keys in the pool start here */
+    uint16_t first[AN_PARTS][2], count[AN_PARTS][2];   /* each part's track per channel, from key_base */
     int32_t mark_first, nmarks;
 } AnClip;
 
 /* one clip or one blend playing in a layer. A layer holds up to AN_FADES of
  * them: the newest fades in, the rest keep running while they fade out. */
 typedef struct {
-    int n;                       /* clips: 1 for an_play, 1..AN_BLEND for an_blend */
-    int blend;                   /* time is a normalised phase 0..1 */
-    int32_t clip[AN_BLEND];
-    float pos[AN_BLEND];
-    AnRamp value;                /* where the blend sits along pos */
-    double t;                    /* seconds into the clip, or the blend's phase */
+    float t;                     /* seconds into the clip, or the blend's phase 0..1 */
     float rate;
-    int paused, fresh, loops;    /* fresh: the first step includes its starting point (for marks) */
-    int additive;
-    uint64_t mask;
     float w, base;               /* share of the layer, and its share when the newest began */
+    AnRamp value;                /* where the blend sits along pos */
+    float pos[AN_BLEND];
+    int16_t clip[AN_BLEND];
+    int16_t mask;                /* a mask id, or -1 for every part */
+    uint8_t n;                   /* clips: 1 for an_play, 1..AN_BLEND for an_blend */
+    uint8_t blend;               /* time is a normalised phase */
+    uint8_t paused, fresh, loops, additive;   /* fresh: the next step includes its starting point (for marks) */
 } AnSource;
 typedef struct {
     AnRamp weight;
-    int nsrc;                    /* src[nsrc-1] is the newest */
     float fade_t, fade_len;      /* the newest source's crossfade */
+    int32_t nsrc;                /* src[nsrc-1] is the newest */
     AnSource src[AN_FADES];
 } AnLayer;
 typedef struct {
-    int id;                      /* -1: free */
-    int rig, dirty;
+    int32_t id;                  /* -1: free */
+    int32_t rig, dirty;
     float pos[3], q[4];
     AnLayer layer[AN_LAYERS];
 } AnFig;
-typedef struct { double u; int32_t fig, layer, tag; float weight; } AnEvent;
+typedef struct { float u; int32_t fig, layer, tag; float weight; } AnEvent;   /* u: how far through the update */
 
 struct AnWorld {
     int capacity;
     AnRig *rigs; int nrigs;
     AnMask *masks; int nmasks;
     AnClip *clips; int nclips;
-    AnKey *keys; int nkeys;
+    AnKey *keys; uint8_t *key_interp; int nkeys;
     float *mark_t; int32_t *mark_tag; int nmarks_pool;
     AnFig *figs;
     float *mats;                 /* capacity x AN_PARTS x 12: column-major 3x4, world space */
-    int32_t *slot_of;            /* AN_IDS: id -> slot, -1 if none */
+    int32_t *ids; uint32_t ids_mask;   /* id -> slot: open addressing, linear probing, -1 empty; 2 x capacity rounded up to a power of two */
     int32_t *free_slots; int nfree;
     int32_t next_id;
-    AnEvent *events, *events_tmp; int nevents;
+    AnEvent *events, *events_tmp; int nevents, fig_events;   /* capacity x AN_FIG_EVENTS */
     int live, posed;
-    double refused, negative_dt; int reason;
+    double refused, negative_dt, dropped; int reason;
 };
 typedef struct AnWorld AnWorld;
 
@@ -166,9 +167,9 @@ static inline int an_refuse(AnWorld *w, int reason) { w->refused += 1; w->reason
 
 static inline void an_close(AnWorld *w) {
     if (!w) return;
-    free(w->rigs); free(w->masks); free(w->clips); free(w->keys);
+    free(w->rigs); free(w->masks); free(w->clips); free(w->keys); free(w->key_interp);
     free(w->mark_t); free(w->mark_tag); free(w->figs); free(w->mats);
-    free(w->slot_of); free(w->free_slots); free(w->events); free(w->events_tmp);
+    free(w->ids); free(w->free_slots); free(w->events); free(w->events_tmp);
     free(w);
 }
 
@@ -181,17 +182,21 @@ static inline AnWorld *an_open(int capacity) {
     w->masks = (AnMask *)calloc(AN_MASKS, sizeof *w->masks);
     w->clips = (AnClip *)calloc(AN_CLIPS, sizeof *w->clips);
     w->keys = (AnKey *)calloc(AN_KEY_POOL, sizeof *w->keys);
+    w->key_interp = (uint8_t *)calloc(AN_KEY_POOL, 1);
     w->mark_t = (float *)calloc(AN_MARK_POOL, sizeof *w->mark_t);
     w->mark_tag = (int32_t *)calloc(AN_MARK_POOL, sizeof *w->mark_tag);
     w->figs = (AnFig *)calloc((size_t)capacity, sizeof *w->figs);
     w->mats = (float *)calloc((size_t)capacity * AN_PARTS * 12, sizeof *w->mats);
-    w->slot_of = (int32_t *)malloc(AN_IDS * sizeof *w->slot_of);
+    uint32_t hn = 2;
+    while (hn < 2u * (uint32_t)capacity) hn *= 2;
+    w->ids_mask = hn - 1;
+    w->ids = (int32_t *)malloc(hn * sizeof *w->ids);
     w->free_slots = (int32_t *)malloc((size_t)capacity * sizeof *w->free_slots);
-    w->events = (AnEvent *)calloc(AN_EVENTS, sizeof *w->events);
-    w->events_tmp = (AnEvent *)calloc(AN_EVENTS, sizeof *w->events_tmp);
-    if (!w->rigs || !w->masks || !w->clips || !w->keys || !w->mark_t || !w->mark_tag || !w->figs ||
-        !w->mats || !w->slot_of || !w->free_slots || !w->events || !w->events_tmp) { an_close(w); return NULL; }
-    for (int i = 0; i < AN_IDS; i++) w->slot_of[i] = -1;
+    w->events = (AnEvent *)calloc((size_t)capacity * AN_FIG_EVENTS, sizeof *w->events);
+    w->events_tmp = (AnEvent *)calloc((size_t)capacity * AN_FIG_EVENTS, sizeof *w->events_tmp);
+    if (!w->rigs || !w->masks || !w->clips || !w->keys || !w->key_interp || !w->mark_t || !w->mark_tag || !w->figs ||
+        !w->mats || !w->ids || !w->free_slots || !w->events || !w->events_tmp) { an_close(w); return NULL; }
+    for (uint32_t i = 0; i < hn; i++) w->ids[i] = -1;
     for (int i = 0; i < capacity; i++) { w->figs[i].id = -1; w->free_slots[i] = capacity - 1 - i; }   /* slot 0 handed out first */
     w->nfree = capacity;
     return w;
@@ -214,7 +219,7 @@ static inline int an_rig(AnWorld *w, int nparts, const int32_t *parent, const fl
     AnRig *r = &w->rigs[w->nrigs];
     r->nparts = nparts;
     for (int i = 0; i < nparts; i++) {
-        r->parent[i] = parent[i];
+        r->parent[i] = (int8_t)parent[i];
         memcpy(r->pivot[i], pivot + i * 3, sizeof r->pivot[i]);
         memcpy(r->rest[i], rest_q + i * 4, sizeof r->rest[i]);
         an_qnorm(r->rest[i]);
@@ -258,7 +263,7 @@ static inline int an_clip(AnWorld *w, int rig, float duration, int loops, float 
         }
     }
     if (!an_finite(mark_t, nmarks)) return an_refuse(w, AN_R_VALUE);
-    if (w->nclips >= AN_CLIPS || w->nkeys + nkeys > AN_KEY_POOL || w->nmarks_pool + nmarks > AN_MARK_POOL)
+    if (w->nclips >= AN_CLIPS || nkeys > 65535 || w->nkeys + nkeys > AN_KEY_POOL || w->nmarks_pool + nmarks > AN_MARK_POOL)
         return an_refuse(w, AN_R_FULL);
 
     AnClip *c = &w->clips[w->nclips];
@@ -266,21 +271,23 @@ static inline int an_clip(AnWorld *w, int rig, float duration, int loops, float 
     c->rig = rig; c->loops = loops != 0; c->duration = duration; c->stride = stride;
     /* tracks are laid out part by part, turn then move; within a track keys
      * are in time order, keys at the same time in the order given */
-    int at = w->nkeys;
+    c->key_base = w->nkeys;
+    int at = 0;
     for (int i = 0; i < nkeys; i++) c->count[key_ints[i * 3]][key_ints[i * 3 + 1]]++;
     for (int p = 0; p < AN_PARTS; p++)
-        for (int ch = 0; ch < 2; ch++) { c->first[p][ch] = at; at += c->count[p][ch]; c->count[p][ch] = 0; }
+        for (int ch = 0; ch < 2; ch++) { c->first[p][ch] = (uint16_t)at; at += c->count[p][ch]; c->count[p][ch] = 0; }
     for (int i = 0; i < nkeys; i++) {
         int p = key_ints[i * 3], ch = key_ints[i * 3 + 1];
-        AnKey *k = &w->keys[c->first[p][ch] + c->count[p][ch]++];
+        int start = c->key_base + c->first[p][ch], j = start + c->count[p][ch]++;
+        AnKey k;
         const float *f = key_floats + i * 5;
-        k->t = f[0] < 0 ? 0 : (f[0] > duration ? duration : f[0]);
-        memcpy(k->v, f + 1, sizeof k->v);
-        if (ch == 0) an_qnorm(k->v); else k->v[3] = 0;
-        k->interp = key_ints[i * 3 + 2];
-        for (AnKey *j = k; j > &w->keys[c->first[p][ch]] && j[-1].t > j->t; j--) { AnKey s = j[-1]; j[-1] = *j; *j = s; }
+        k.t = f[0] < 0 ? 0 : (f[0] > duration ? duration : f[0]);
+        memcpy(k.v, f + 1, sizeof k.v);
+        if (ch == 0) an_qnorm(k.v); else k.v[3] = 0;
+        for (; j > start && w->keys[j - 1].t > k.t; j--) { w->keys[j] = w->keys[j - 1]; w->key_interp[j] = w->key_interp[j - 1]; }
+        w->keys[j] = k; w->key_interp[j] = (uint8_t)key_ints[i * 3 + 2];
     }
-    w->nkeys = at;
+    w->nkeys += at;
     /* marks in time order; on a loop a mark at the duration is the mark at 0 */
     c->mark_first = w->nmarks_pool; c->nmarks = nmarks;
     for (int i = 0; i < nmarks; i++) {
@@ -295,23 +302,46 @@ static inline int an_clip(AnWorld *w, int rig, float duration, int loops, float 
 }
 
 /* a track's value at time t: hold before the first key and after the last */
-static inline void an_sample(const AnKey *k, int n, float t, int turn, float o[4]) {
+static inline void an_sample(const AnKey *k, const uint8_t *interp, int n, float t, int turn, float o[4]) {
     if (n == 1 || t <= k[0].t) { memcpy(o, k[0].v, 4 * sizeof(float)); return; }
     if (t >= k[n - 1].t) { memcpy(o, k[n - 1].v, 4 * sizeof(float)); return; }
     int lo = 0, hi = n - 1;                    /* k[lo].t <= t < k[hi].t */
     while (hi - lo > 1) { int mid = (lo + hi) / 2; if (k[mid].t <= t) lo = mid; else hi = mid; }
     const AnKey *a = &k[lo], *b = &k[hi];      /* b->t > t >= a->t, so the span is never 0 */
-    if (a->interp == 0) { memcpy(o, a->v, 4 * sizeof(float)); return; }
+    if (interp[lo] == 0) { memcpy(o, a->v, 4 * sizeof(float)); return; }
     float u = (t - a->t) / (b->t - a->t);
-    if (a->interp == 2) u = u * u * (3.0f - 2.0f * u);
+    if (interp[lo] == 2) u = u * u * (3.0f - 2.0f * u);
     if (turn) an_slerp(a->v, b->v, u, o);
     else for (int i = 0; i < 4; i++) o[i] = a->v[i] + (b->v[i] - a->v[i]) * u;
 }
 
 /* ---- figures ---- */
+static inline uint32_t an_id_home(const AnWorld *w, int id) { return (uint32_t)id & w->ids_mask; }
+static inline int an_slot(const AnWorld *w, int id) {   /* -1 if no live figure has this id */
+    if (id < 0 || id >= AN_IDS) return -1;
+    for (uint32_t i = an_id_home(w, id);; i = (i + 1) & w->ids_mask) {
+        int s = w->ids[i];
+        if (s < 0) return -1;
+        if (w->figs[s].id == id) return s;
+    }
+}
+static inline void an_id_insert(AnWorld *w, int id, int slot) {
+    uint32_t i = an_id_home(w, id);
+    while (w->ids[i] >= 0) i = (i + 1) & w->ids_mask;
+    w->ids[i] = slot;
+}
+static inline void an_id_erase(AnWorld *w, int id) {   /* backward-shift deletion keeps every probe chain whole */
+    uint32_t i = an_id_home(w, id);
+    while (w->figs[w->ids[i]].id != id) i = (i + 1) & w->ids_mask;
+    w->ids[i] = -1;
+    for (uint32_t j = (i + 1) & w->ids_mask; w->ids[j] >= 0; j = (j + 1) & w->ids_mask) {
+        uint32_t home = an_id_home(w, w->figs[w->ids[j]].id);
+        /* the entry at j may move to the hole at i if its home is not in (i, j] */
+        if (((j - home) & w->ids_mask) >= ((j - i) & w->ids_mask)) { w->ids[i] = w->ids[j]; w->ids[j] = -1; i = j; }
+    }
+}
 static inline AnFig *an_fig(AnWorld *w, int fig) {
-    if (fig < 0 || fig >= AN_IDS) return NULL;
-    int s = w->slot_of[fig];
+    int s = an_slot(w, fig);
     return s < 0 ? NULL : &w->figs[s];
 }
 static inline float *an_fig_mats(const AnWorld *w, const AnFig *f) { return w->mats + (size_t)(f - w->figs) * AN_PARTS * 12; }
@@ -320,14 +350,14 @@ static inline void an_pose(AnWorld *w, AnFig *f);
 static inline int an_spawn(AnWorld *w, int rig) {
     if (rig < 0 || rig >= w->nrigs) return an_refuse(w, AN_R_RIG);
     if (w->nfree == 0) return an_refuse(w, AN_R_FULL);
-    while (w->slot_of[w->next_id] >= 0) w->next_id = (w->next_id + 1) & (AN_IDS - 1);   /* at most capacity live ids */
+    while (an_slot(w, w->next_id) >= 0) w->next_id = (w->next_id + 1) & (AN_IDS - 1);   /* at most capacity live ids */
     int id = w->next_id;
     w->next_id = (w->next_id + 1) & (AN_IDS - 1);
     int s = w->free_slots[--w->nfree];
     AnFig *f = &w->figs[s];
     memset(f, 0, sizeof *f);
     f->id = id; f->rig = rig; f->q[3] = 1;
-    w->slot_of[id] = s;
+    an_id_insert(w, id, s);
     w->live++;
     an_pose(w, f);                             /* the rest pose, at the origin */
     return id;
@@ -336,7 +366,7 @@ static inline int an_spawn(AnWorld *w, int rig) {
 static inline void an_remove(AnWorld *w, int fig) {
     AnFig *f = an_fig(w, fig);
     if (!f) { an_refuse(w, AN_R_FIGURE); return; }
-    w->slot_of[fig] = -1;
+    an_id_erase(w, fig);
     f->id = -1;
     w->free_slots[w->nfree++] = (int32_t)(f - w->figs);
     w->live--;
@@ -396,9 +426,9 @@ static inline void an_play(AnWorld *w, int fig, int layer, int clip, float fade,
     if (clip < 0 || clip >= w->nclips || w->clips[clip].rig != f->rig) { an_refuse(w, AN_R_CLIP); return; }
     AnSource s;
     memset(&s, 0, sizeof s);
-    s.n = 1; s.clip[0] = clip; s.rate = rate; s.fresh = 1; s.loops = w->clips[clip].loops;
+    s.n = 1; s.clip[0] = (int16_t)clip; s.rate = rate; s.fresh = 1; s.loops = (uint8_t)w->clips[clip].loops;
     s.additive = additive != 0;
-    s.mask = mask < 0 ? ~0ull : w->masks[mask].parts;
+    s.mask = (int16_t)(mask < 0 ? -1 : mask);
     an_push(L, &s, fade, weight);
     f->dirty = 1;
 }
@@ -411,15 +441,15 @@ static inline void an_blend(AnWorld *w, int fig, int layer, int n, const int32_t
     if (n < 1 || n > AN_BLEND || !clips || !positions || !isfinite(value)) { an_refuse(w, AN_R_BLEND); return; }
     AnSource s;
     memset(&s, 0, sizeof s);
-    s.n = n; s.blend = 1; s.rate = 1; s.fresh = 1; s.loops = 1;
+    s.n = (uint8_t)n; s.blend = 1; s.rate = 1; s.fresh = 1; s.loops = 1;
     for (int i = 0; i < n; i++) {
         if (clips[i] < 0 || clips[i] >= w->nclips || w->clips[clips[i]].rig != f->rig) { an_refuse(w, AN_R_CLIP); return; }
         if (!isfinite(positions[i]) || (i > 0 && !(positions[i] > positions[i - 1]))) { an_refuse(w, AN_R_BLEND); return; }
-        s.clip[i] = clips[i]; s.pos[i] = positions[i];
+        s.clip[i] = (int16_t)clips[i]; s.pos[i] = positions[i];
         if (!w->clips[clips[i]].loops) s.loops = 0;
     }
     s.value.from = s.value.to = value;
-    s.mask = mask < 0 ? ~0ull : w->masks[mask].parts;
+    s.mask = (int16_t)(mask < 0 ? -1 : mask);
     an_push(L, &s, fade, weight);
     f->dirty = 1;
 }
@@ -435,15 +465,15 @@ static inline void an_set(AnWorld *w, int fig, int layer, int what, float v, flo
     AnSource *s = &L->src[L->nsrc - 1];
     if (what == 0) s->rate = v;
     else if (what == 2) {
-        double len = s->blend ? 1.0 : w->clips[s->clip[0]].duration;
-        double t = v < 0 ? 0 : v;
-        if (s->loops && len > 0) t = fmod(t, len);
+        float len = s->blend ? 1.0f : w->clips[s->clip[0]].duration;
+        float t = v < 0 ? 0 : v;
+        if (s->loops && len > 0) t = fmodf(t, len);
         else if (t > len) t = len;
         s->t = t; s->fresh = 1;
     } else if (what == 3) {
         if (!s->blend) { an_refuse(w, AN_R_WHAT); return; }
         an_ramp_to(&s->value, v, fade);
-    } else s->paused = v != 0;
+    } else s->paused = v != 0 ? 1 : 0;
     f->dirty = 1;
 }
 
@@ -467,17 +497,19 @@ typedef struct { double a, b, trav; int incl, fwd; } AnSeg;   /* a step from a t
  * ends, and cuts the move into segments for the marks. Forward segments
  * cover (a, b], backward ones [b, a); a segment that starts the source or
  * starts after a wrap includes its start. */
-static inline int an_step(double *t, int *fresh, double delta, double len, int loops, AnSeg *seg) {
+static inline int an_step(float *t, uint8_t *fresh, double delta, double len, int loops, AnSeg *seg, double *skipped) {
+    *skipped = 0;
     if (!(len > 0) || delta == 0) return 0;
     int n = 0, incl = *fresh, carry = 0;
     double left = fabs(delta), trav = 0;
-    if (loops && left > AN_WRAPS * len) {     /* skip whole loops past the cap */
+    if (loops && left > AN_WRAPS * len) {     /* skip whole loops past the cap; the caller counts their marks */
         double skip = floor(left / len) - AN_WRAPS;
         left -= skip * len; trav += skip * len;
+        *skipped = skip;
     }
     double x = *t;
     if (delta > 0) {
-        while (left > 0 && n < AN_WRAPS + 2) {
+        while (left > 0 && n < AN_WRAPS + 3) {
             double room = len - x;
             if (left < room || !loops) {
                 double b = left < room ? x + left : len;
@@ -490,7 +522,7 @@ static inline int an_step(double *t, int *fresh, double delta, double len, int l
             }
         }
     } else {
-        while (left > 0 && n < AN_WRAPS + 2) {
+        while (left > 0 && n < AN_WRAPS + 3) {
             double room = x;
             if (left < room || !loops) {
                 double b = left < room ? x - left : 0;
@@ -503,7 +535,7 @@ static inline int an_step(double *t, int *fresh, double delta, double len, int l
         }
     }
     if (loops && (x >= len || x < 0)) x = 0;
-    *t = x; *fresh = carry;
+    *t = (float)x; *fresh = (uint8_t)carry;
     return n;
 }
 
@@ -519,9 +551,10 @@ static inline void an_emit(AnWorld *w, const AnClip *c, double scale, const AnSe
             int in = fwd ? ((s->incl ? m >= s->a : m > s->a) && m <= s->b)
                          : ((s->incl ? m <= s->a : m < s->a) && m >= s->b);
             if (!in) continue;
-            if (w->nevents >= AN_EVENTS) return;
+            if (w->fig_events >= AN_FIG_EVENTS) { w->dropped += 1; continue; }   /* this figure's share is full */
+            w->fig_events++;
             AnEvent *e = &w->events[w->nevents++];
-            e->u = total > 0 ? (s->trav + fabs(m - s->a)) / total : 0;
+            e->u = total > 0 ? (float)((s->trav + fabs(m - s->a)) / total) : 0;
             e->fig = fig; e->layer = layer; e->tag = w->mark_tag[c->mark_first + m_i]; e->weight = weight;
         }
     }
@@ -529,7 +562,9 @@ static inline void an_emit(AnWorld *w, const AnClip *c, double scale, const AnSe
 
 /* advances one figure's layers by dt: ramps, crossfades, clip times, marks */
 static inline void an_advance(AnWorld *w, AnFig *f, float dt) {
-    AnSeg seg[AN_WRAPS + 2];
+    AnSeg seg[AN_WRAPS + 3];
+    double skipped;
+    w->fig_events = 0;
     for (int l = 0; l < AN_LAYERS; l++) {
         AnLayer *L = &f->layer[l];
         if (L->nsrc == 0) continue;
@@ -553,7 +588,8 @@ static inline void an_advance(AnWorld *w, AnFig *f, float dt) {
             if (!s->blend) {
                 const AnClip *c = &w->clips[s->clip[0]];
                 double delta = (double)dt * s->rate;
-                int n = an_step(&s->t, &s->fresh, delta, c->duration, s->loops, seg);
+                int n = an_step(&s->t, &s->fresh, delta, c->duration, s->loops, seg, &skipped);
+                w->dropped += skipped * c->nmarks;
                 an_emit(w, c, 1.0, seg, n, fabs(delta), f->id, l, lw * s->w);
             } else {
                 int a, b; float share;
@@ -562,7 +598,8 @@ static inline void an_advance(AnWorld *w, AnFig *f, float dt) {
                 double len = da + (db - da) * share;
                 if (!(len > 0)) continue;
                 double delta = (double)dt * s->rate / len;
-                int n = an_step(&s->t, &s->fresh, delta, 1.0, s->loops, seg);
+                int n = an_step(&s->t, &s->fresh, delta, 1.0, s->loops, seg, &skipped);
+                w->dropped += skipped * (w->clips[s->clip[a]].nmarks + (b != a ? w->clips[s->clip[b]].nmarks : 0));
                 if (da > 0) an_emit(w, &w->clips[s->clip[a]], 1.0 / da, seg, n, fabs(delta), f->id, l, lw * s->w * (1.0f - share));
                 if (b != a && db > 0) an_emit(w, &w->clips[s->clip[b]], 1.0 / db, seg, n, fabs(delta), f->id, l, lw * s->w * share);
             }
@@ -586,11 +623,12 @@ static inline void an_pose(AnWorld *w, AnFig *f) {
         for (int i = 0; i < L->nsrc; i++) {
             const AnSource *s = &L->src[i];
             if (!(s->w > 0)) continue;
-            if (!s->blend) { tap[nt++] = (AnTap){s->clip[0], (float)s->t, s->w, s->additive, s->mask}; continue; }
+            uint64_t mask = s->mask < 0 ? ~0ull : w->masks[s->mask].parts;
+            if (!s->blend) { tap[nt++] = (AnTap){s->clip[0], s->t, s->w, s->additive, mask}; continue; }
             int a, b; float share;
             an_neighbours(s, &a, &b, &share);
-            tap[nt++] = (AnTap){s->clip[a], (float)(s->t * w->clips[s->clip[a]].duration), s->w * (1.0f - share), s->additive, s->mask};
-            if (b != a) tap[nt++] = (AnTap){s->clip[b], (float)(s->t * w->clips[s->clip[b]].duration), s->w * share, s->additive, s->mask};
+            tap[nt++] = (AnTap){s->clip[a], s->t * w->clips[s->clip[a]].duration, s->w * (1.0f - share), s->additive, mask};
+            if (b != a) tap[nt++] = (AnTap){s->clip[b], s->t * w->clips[s->clip[b]].duration, s->w * share, s->additive, mask};
         }
         for (int p = 0; p < r->nparts; p++) {
             /* the layer's pose of the part: the taps that have a track for
@@ -604,9 +642,10 @@ static inline void an_pose(AnWorld *w, AnFig *f) {
                 int nr = c->count[p][0], nm = c->count[p][1];
                 if (nr == 0 && nm == 0) continue;
                 float sq[4], sm[4] = {0, 0, 0, 0};
-                const AnKey *kr = &w->keys[c->first[p][0]], *km = &w->keys[c->first[p][1]];
-                if (nr) an_sample(kr, nr, t->t, 1, sq);
-                if (nm) an_sample(km, nm, t->t, 0, sm);
+                int ir = c->key_base + c->first[p][0], im = c->key_base + c->first[p][1];
+                const AnKey *kr = &w->keys[ir], *km = &w->keys[im];
+                if (nr) an_sample(kr, &w->key_interp[ir], nr, t->t, 1, sq);
+                if (nm) an_sample(km, &w->key_interp[im], nm, t->t, 0, sm);
                 if (t->additive) {
                     /* relative to the track's first key */
                     if (nr) { float inv[4] = {-kr[0].v[0], -kr[0].v[1], -kr[0].v[2], kr[0].v[3]}; an_qmul(sq, inv, sq); }
@@ -691,8 +730,8 @@ static inline void an_update(AnWorld *w, float dt) {
 }
 
 static inline const float *an_matrices(const AnWorld *w, int fig) {
-    if (fig < 0 || fig >= AN_IDS || w->slot_of[fig] < 0) return NULL;
-    return w->mats + (size_t)w->slot_of[fig] * AN_PARTS * 12;
+    int s = an_slot(w, fig);
+    return s < 0 ? NULL : w->mats + (size_t)s * AN_PARTS * 12;
 }
 
 static inline int an_marks(const AnWorld *w, int max, int32_t *ints, float *weights) {
@@ -720,6 +759,7 @@ static inline uint64_t an_hash(const AnWorld *w) {
     return h;
 }
 
+/* 0 figures, 1 posed, 2 stale, 3 refused calls, 4 negative dt, 5 last refusal reason, 6 marks dropped */
 static inline double an_stat(const AnWorld *w, int which) {
     switch (which) {
     case 0: return w->live;
@@ -732,6 +772,7 @@ static inline double an_stat(const AnWorld *w, int which) {
     case 3: return w->refused;
     case 4: return w->negative_dt;
     case 5: return w->reason;
+    case 6: return w->dropped;
     default: return 0;
     }
 }

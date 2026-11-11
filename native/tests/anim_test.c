@@ -278,6 +278,37 @@ static void test_dt_and_marks(void) {
     for (int k = 0; k < 3; k++) { an_update(w, steps[k]); counts[k] = an_marks(w, 10, ints, wts); }
     CHECK(counts[0] == 1 && counts[1] == 0 && counts[2] == 1, "a mark at 0 fires at the start and once after the wrap");
     an_close(w);
+
+    /* dt 100 over a 1 s loop with two marks crosses 200 marks: past 64 loops they are skipped, past
+     * a figure's share they are not reported; either way every one is counted */
+    w = an_open(4);
+    rig = chain(w, 0);
+    c = turns(w, rig, 1, 1, 2, swing, 2, mt, tags);
+    f = an_spawn(w, rig);
+    an_play(w, f, 0, c, 0, 1, 1, -1, 0);
+    an_update(w, 100.0f);
+    n = an_marks(w, 10, ints, wts);
+    CHECK(n == AN_FIG_EVENTS && n + an_stat(w, 6) == 200, "marks past 64 loops and past the cap are counted in stat 6");
+    an_close(w);
+
+    /* more marks than the cap: every figure keeps its share, whatever its slot */
+    w = an_open(64);
+    rig = chain(w, 0);
+    c = turns(w, rig, 1, 1, 2, swing, 2, mt, tags);
+    int per[64];
+    for (int i = 0; i < 64; i++) {
+        per[i] = an_spawn(w, rig);
+        for (int l = 0; l < AN_LAYERS; l++) an_play(w, per[i], l, c, 0, 1, 0, -1, 0);   /* zero weight still fires */
+    }
+    an_update(w, 0.8f);   /* 8 layers x 2 marks = 16 a figure, twice the share */
+    static int32_t many[64 * 16 * 3]; static float many_w[64 * 16];
+    n = an_marks(w, 64 * 16, many, many_w);
+    int each[64] = {0}, fair = n == 64 * AN_FIG_EVENTS;
+    for (int i = 0; i < n; i++) for (int k = 0; k < 64; k++) if (many[i * 3] == per[k]) each[k]++;
+    for (int k = 0; k < 64; k++) if (each[k] != AN_FIG_EVENTS) fair = 0;
+    CHECK(fair, "past the cap every figure reports its share of marks, the last slot too");
+    CHECK(an_stat(w, 6) == 64 * 8, "and the rest are counted in stat 6");
+    an_close(w);
 }
 
 static void test_degenerate(void) {
