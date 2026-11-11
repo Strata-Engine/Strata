@@ -8,6 +8,8 @@
 --   left click   carve a sphere out of what you are looking at
 --   right click  build a sphere of stone onto it
 --   L   step through the light modes        [ and ]   lower and raise the sun
+--   N   play a recording from viewer/sounds/ (WAV, FLAC, MP3) 5 m ahead
+--   H   switch sound between headphones (3D) and speakers
 --
 -- The world streams in around the camera and has no edge.
 --
@@ -38,6 +40,9 @@
 -- STRATA_REBUILD_AT=f  rebuild the swapchain at frame f, as a resize would (scripted runs)
 --
 -- STRATA_SOAK=n     fly a fixed circuit for n frames, carving a sphere every 100, then report
+-- STRATA_AUDIO=0|1|null|wav:path   sound off (scripted default), the device (playing default), the silent null device, or rendered to a WAV in game time
+-- STRATA_AUDIO_METER=1   a line of voices, refusals, underruns, CPU and level once a second
+-- STRATA_STALL=n    hold the main thread 100 ms every n frames, as a hitch would (soak runs)
 --                   the worst and mean frame time and what the renderer still holds
 --
 -- With STRATA_FRAMES or STRATA_SOAK set the run is scripted: keyboard and mouse are ignored.
@@ -46,6 +51,8 @@ mod StrataViewer do
   needs IO
   needs IO.Process
   needs IO.Spawn
+  needs IO.Foreign
+  needs Audio
 
   alias Strata.Blocks as Bk
   alias Strata.Chunk as Ch
@@ -117,62 +124,107 @@ mod StrataViewer do
   end
 
   -- ── Terrain: a pure function of chunk coordinates and seed ───────────────
-  pfn sea() : Int do 40 end
+  -- The land is described in metres: frequencies in cycles per metre,
+  -- amplitudes in metres. The world's scale (metres a voxel) only decides how
+  -- finely that shape is cut into voxels; the viewer runs at 1 m a voxel.
+  --
+  -- Seeds: Strata.Seed.mix(seed, 1) the base, 2 the hills, 3 the ridges.
+  -- Salts for Strata.Seed.cell: 21 trees, 22 / 23 / 24 a lake's centre x, centre z
+  -- and radius, 25 lantern posts, 26 tall grass. Salt 27 seeds the snow-patch noise.
+  pfn fbm_s() : Strata.Noise.Settings do Ns.settings(0, 3, 2.0, 0.5, 1, 0.0) end
+  pfn ridge_s() : Strata.Noise.Settings do Ns.settings(1, 3, 2.0, 0.5, 2, 0.0) end
+  pfn clamp01(v : Float) : Float do if v < 0.0 do 0.0 else if v > 1.0 do 1.0 else v end end end
 
-  pfn height(wx : Int, wz : Int, seed : Int) : Int do
-    let x = int_to_float(wx)
-    let z = int_to_float(wz)
-    let base = Ns.fbm(x *. 0.005, z *. 0.005, seed)
-    let hills = Ns.fbm(x *. 0.021, z *. 0.021, seed + 10)
-    let ridge = Ns.ridged_fbm(x *. 0.009, z *. 0.009, seed + 20)
-    let mount = Ns.clamp01((base -. 0.5) *. 4.0)
-    float_to_int(22.0 +. base *. 34.0 +. hills *. 12.0 +. ridge *. mount *. 52.0)
+  -- Noise in [-1, 1] mapped around 0.5 with spread [k]. The old value-noise
+  -- fBm clustered near 0.5 (sd 0.126 base, 0.143 hills); OpenSimplex2 fBm has
+  -- sd 0.365, so 0.5 + 0.5 v made the land far hillier. Measured at seed 7 over
+  -- 1000 m sampled every 4 m: old height mean 51.78 sd 12.32; with k 0.30 for
+  -- the base and 0.40 for the hills, mean 51.14 sd 12.46. The ridge is as it was.
+  pfn unit_noise(seed : Int, freq : Float, k : Float, xm : Float, zm : Float) : Float do
+    0.5 +. k *. Ns.sample2(fbm_s(), seed, freq, xm, zm)
+  end
+
+  -- a fresh [0, 1) value for a column, from its own salt
+  pfn roll(wx : Int, wz : Int, seed : Int, salt : Int) : Float do
+    Strata.Seed.unit(Strata.Seed.cell(seed, salt, wx, 0, wz))
+  end
+
+  -- whole voxels of [scale] metres in [m] metres (a hair over, so 34 m at 0.1 is 340)
+  pfn vox(m : Float, scale : Float) : Int do float_to_int(Math.floor(m /. scale +. 0.000001)) end
+
+  -- The sea stands 40 m up. [sea] is whole metres; [sea_v] the same in voxels.
+  pfn sea() : Int do 40 end
+  pfn sea_v(scale : Float) : Int do vox(int_to_float(sea()), scale) end
+
+  doc "The natural ground height in metres at (xm, zm), lakes not included."
+  fn height_m(xm : Float, zm : Float, seed : Int) : Float do
+    let base = unit_noise(Strata.Seed.mix(seed, 1), 0.005, 0.30, xm, zm)
+    let hills = unit_noise(Strata.Seed.mix(seed, 2), 0.021, 0.40, xm, zm)
+    let ridge = Ns.sample2(ridge_s(), Strata.Seed.mix(seed, 3), 0.009, xm, zm)
+    let mount = clamp01((base -. 0.5) *. 4.0)
+    22.0 +. base *. 34.0 +. hills *. 12.0 +. ridge *. mount *. 52.0
+  end
+
+  doc "The natural ground height in whole metres at whole-metre column (wx, wz): the viewer's scripted scenes work in 1 m voxels."
+  fn height(wx : Int, wz : Int, seed : Int) : Int do
+    float_to_int(height_m(int_to_float(wx), int_to_float(wz), seed))
   end
 
   -- ── Lakes above sea level ────────────────────────────────────────────────
-  -- The map is cut into squares 192 voxels on a side (six chunks). A square
-  -- whose chosen centre stands between heights 50 and 68 holds a round lake:
-  -- a flat-bedded basin 5 to 8 deep, filled to one below the centre's height,
-  -- inside a rim three voxels wide raised to at least one above the water.
+  -- The map is cut into squares 192 m on a side (six chunks at 1 m a voxel).
+  -- A square whose chosen centre stands between 50 and 68 m holds a round
+  -- lake: a flat-bedded basin 5 to 8 m deep, filled to one metre below the
+  -- centre's height, inside a rim three metres wide raised to at least one
+  -- above the water. Lake figures are whole metres.
   pfn fdiv(a : Int, b : Int) : Int do if a >= 0 do a / b else 0 - ((b - 1 - a) / b) end end
 
-  doc "The lake of map square (gx, gz): (centre x, centre z, radius, water line). A radius of 0 means the square has none."
+  doc "The lake of map square (gx, gz): (centre x, centre z, radius, water line), whole metres. A radius of 0 means the square has none."
   fn lake_of(gx : Int, gz : Int, seed : Int) : (Int, Int, Int, Int) do
-    let cx = gx * 192 + 40 + float_to_int(Ns.hash2(gx, gz, seed + 1301) *. 112.0)
-    let cz = gz * 192 + 40 + float_to_int(Ns.hash2(gx, gz, seed + 1302) *. 112.0)
+    let cx = gx * 192 + 40 + float_to_int(roll(gx, gz, seed, 22) *. 112.0)
+    let cz = gz * 192 + 40 + float_to_int(roll(gx, gz, seed, 23) *. 112.0)
     let hc = height(cx, cz, seed)
-    if hc < 50 || hc > 68 do (cx, cz, 0, 0) else (cx, cz, 14 + float_to_int(Ns.hash2(gx, gz, seed + 1300) *. 14.99), hc - 1) end
+    if hc < 50 || hc > 68 do (cx, cz, 0, 0) else (cx, cz, 14 + float_to_int(roll(gx, gz, seed, 24) *. 14.99), hc - 1) end
   end
 
-  doc "How deep a lake of radius [rad] is: its bed is flat, 5 to 8 voxels under the water line."
+  doc "How deep a lake of radius [rad] is, in metres: its bed is flat, 5 to 8 m under the water line."
   fn lake_depth(rad : Int) : Int do 3 + rad / 5 end
 
   -- A column's ground height once its square's lake is taken into account,
-  -- and the lake's water line over it (0 where there is no lake water).
-  pfn lake_column(lk : (Int, Int, Int, Int), x : Int, z : Int, h : Int) : (Int, Int) do
+  -- and the lake's water line over it (0 where there is no lake water), both
+  -- in voxels of [scale] metres. (xm, zm) is the column's place and hm its
+  -- natural ground height, in metres.
+  pfn lake_column(lk : (Int, Int, Int, Int), xm : Float, zm : Float, hm : Float, scale : Float) : (Int, Int) do
     match lk do
       (cx, cz, rad, line) ->
-        let d2 = (x - cx) * (x - cx) + (z - cz) * (z - cz)
-        if rad == 0 || d2 > (rad + 3) * (rad + 3) do (h, 0)
-        else if d2 > rad * rad do (if h > line + 1 do h else line + 1 end, 0)
+        let dx = xm -. int_to_float(cx)
+        let dz = zm -. int_to_float(cz)
+        let d2 = dx *. dx +. dz *. dz
+        let r = int_to_float(rad)
+        let l = int_to_float(line)
+        if rad == 0 || d2 > (r +. 3.0) *. (r +. 3.0) do (vox(hm, scale), 0)
+        else if d2 > r *. r do (vox(if hm > l +. 1.0 do hm else l +. 1.0 end, scale), 0)
         else
-          (line - lake_depth(rad), line)
+          (vox(l -. int_to_float(lake_depth(rad)), scale), vox(l, scale))
         end end
     end
   end
 
-  doc "The ground height at a column, lakes included."
+  doc "The ground height in whole metres at a whole-metre column, lakes included."
   fn ground(wx : Int, wz : Int, seed : Int) : Int do
-    match lake_column(lake_of(fdiv(wx, 192), fdiv(wz, 192), seed), wx, wz, height(wx, wz, seed)) do (h, _) -> h end
+    let xm = int_to_float(wx)
+    let zm = int_to_float(wz)
+    match lake_column(lake_of(fdiv(wx, 192), fdiv(wz, 192), seed), xm, zm, height_m(xm, zm, seed), 1.0) do (h, _) -> h end
   end
 
   -- a chunk's 32 x 32 ground heights, and its lake water lines
   type Columns = Columns(NativeIntArr, NativeIntArr)
-  pfn heights_go(hs : NativeIntArr, ws : NativeIntArr, lk : (Int, Int, Int, Int), x0 : Int, z0 : Int, seed : Int, i : Int) : Columns do
+  pfn heights_go(hs : NativeIntArr, ws : NativeIntArr, lk : (Int, Int, Int, Int), x0 : Int, z0 : Int, seed : Int, scale : Float, i : Int) : Columns do
     if i >= 1024 do Columns(hs, ws)
     else
-      match lake_column(lk, x0 + i % 32, z0 + i / 32, height(x0 + i % 32, z0 + i / 32, seed)) do
-        (h, line) -> heights_go(NativeArray.set_int(hs, i, h), NativeArray.set_int(ws, i, line), lk, x0, z0, seed, i + 1)
+      let xm = int_to_float(x0 + i % 32) *. scale
+      let zm = int_to_float(z0 + i / 32) *. scale
+      match lake_column(lk, xm, zm, height_m(xm, zm, seed), scale) do
+        (h, line) -> heights_go(NativeArray.set_int(hs, i, h), NativeArray.set_int(ws, i, line), lk, x0, z0, seed, scale, i + 1)
       end
     end
   end
@@ -183,34 +235,38 @@ mod StrataViewer do
     if i >= 1024 do m else max_go(hs, i + 1, if NativeArray.get_int(hs, i) > m do NativeArray.get_int(hs, i) else m end) end
   end
 
-  pfn has_post(wx : Int, wz : Int, h : Int, seed : Int) : Bool do
-    h > sea() + 1 && h <= 72 && Ns.hash2(wx, wz, seed + 710) > 0.994
+  -- hm is a column's ground height in metres; grass grows between one metre over the sea and 72 m
+  pfn grassy(hm : Float) : Bool do hm > int_to_float(sea()) +. 1.0 && hm <= 72.0 end
+
+  pfn has_post(wx : Int, wz : Int, hm : Float, seed : Int) : Bool do
+    grassy(hm) && roll(wx, wz, seed, 25) > 0.994
   end
 
-  pfn block_at(wx : Int, wy : Int, wz : Int, h : Int, line : Int, seed : Int) : Int do
+  pfn block_at(wx : Int, wy : Int, wz : Int, h : Int, line : Int, sv : Int, scale : Float, seed : Int) : Int do
+    let hm = int_to_float(h) *. scale
     -- a lake column: full lake water over a sandy bed
     if line > 0 do (if wy > h do (if wy <= line do lake_base() + 7 else 0 end) else if wy >= h - 3 do 4 else 1 end end)
     else
     -- a lantern post on a few grass columns, tall grass on about a seventh of the rest
-    if wy == h + 1 && has_post(wx, wz, h, seed) do 12
-    else if wy == h + 1 && h > sea() + 1 && h <= 72 && Ns.hash2(wx, wz, seed + 700) > 0.86 do 11
-    else if wy > h do (if wy <= sea() do 5 else 0 end)
-    else if wy == h do (if h <= sea() + 1 do 4 else if h > 84 do (if Ns.fbm(int_to_float(wx) *. 0.06, int_to_float(wz) *. 0.06, seed + 900) > 0.62 do 13 else 6 end) else if h > 72 do 1 else 3 end end end)
-    else if wy >= h - 3 do (if h <= sea() + 1 do 4 else if h > 72 do 1 else 2 end end)
+    if wy == h + 1 && has_post(wx, wz, hm, seed) do 12
+    else if wy == h + 1 && grassy(hm) && roll(wx, wz, seed, 26) > 0.86 do 11
+    else if wy > h do (if wy <= sv do 5 else 0 end)
+    else if wy == h do (if hm <= int_to_float(sea()) +. 1.0 do 4 else if hm > 84.0 do (if unit_noise(Strata.Seed.mix(seed, 27), 0.06, 0.40, int_to_float(wx) *. scale, int_to_float(wz) *. scale) > 0.62 do 13 else 6 end) else if hm > 72.0 do 1 else 3 end end end)
+    else if wy >= h - 3 do (if hm <= int_to_float(sea()) +. 1.0 do 4 else if hm > 72.0 do 1 else 2 end end)
     else 1 end end end end end
     end
   end
 
-  pfn ground_go(a : NativeI32Arr, hs : NativeIntArr, ws : NativeIntArr, x0 : Int, y0 : Int, z0 : Int, seed : Int, i : Int) : NativeI32Arr do
+  pfn ground_go(a : NativeI32Arr, hs : NativeIntArr, ws : NativeIntArr, x0 : Int, y0 : Int, z0 : Int, sv : Int, scale : Float, seed : Int, i : Int) : NativeI32Arr do
     if i >= 32768 do a
-    else ground_go(NativeArray.set_i32(a, i, block_at(x0 + i % 32, y0 + i / 1024, z0 + (i / 32) % 32, NativeArray.get_int(hs, i % 1024), NativeArray.get_int(ws, i % 1024), seed)), hs, ws, x0, y0, z0, seed, i + 1) end
+    else ground_go(NativeArray.set_i32(a, i, block_at(x0 + i % 32, y0 + i / 1024, z0 + (i / 32) % 32, NativeArray.get_int(hs, i % 1024), NativeArray.get_int(ws, i % 1024), sv, scale, seed)), hs, ws, x0, y0, z0, sv, scale, seed, i + 1) end
   end
 
   -- A tree stands on a grass column well inside the chunk's footprint, so
   -- its canopy never crosses a chunk's sides; it may cross the top, and each
   -- chunk in the column draws the part of it that falls in its own y range.
-  pfn has_tree(wx : Int, wz : Int, h : Int, seed : Int) : Bool do
-    h > sea() + 1 && h <= 72 && Ns.hash2(wx, wz, seed + 500) > 0.988
+  pfn has_tree(wx : Int, wz : Int, hm : Float, seed : Int) : Bool do
+    grassy(hm) && roll(wx, wz, seed, 21) > 0.988
   end
 
   pfn put(a : NativeI32Arr, x : Int, wy : Int, z : Int, y0 : Int, id : Int, over : Bool) : NativeI32Arr do
@@ -239,31 +295,34 @@ mod StrataViewer do
     if wy > top do a else trunk_go(put(a, x, wy, z, y0, 7, true), x, z, wy + 1, top, y0) end
   end
 
-  pfn trees_go(a : NativeI32Arr, hs : NativeIntArr, ws : NativeIntArr, x0 : Int, y0 : Int, z0 : Int, seed : Int, i : Int) : NativeI32Arr do
+  pfn trees_go(a : NativeI32Arr, hs : NativeIntArr, ws : NativeIntArr, x0 : Int, y0 : Int, z0 : Int, scale : Float, seed : Int, i : Int) : NativeI32Arr do
     if i >= 1024 do a
     else
       let x = i % 32
       let z = i / 32
       let h = NativeArray.get_int(hs, i)
-      if x >= 2 && x <= 29 && z >= 2 && z <= 29 && NativeArray.get_int(ws, i) == 0 && has_tree(x0 + x, z0 + z, h, seed) do
+      if x >= 2 && x <= 29 && z >= 2 && z <= 29 && NativeArray.get_int(ws, i) == 0 && has_tree(x0 + x, z0 + z, int_to_float(h) *. scale, seed) do
         let top = h + 5
-        trees_go(trunk_go(canopy_go(a, x, z, top, y0, 0), x, z, h + 1, top, y0), hs, ws, x0, y0, z0, seed, i + 1)
-      else trees_go(a, hs, ws, x0, y0, z0, seed, i + 1) end
+        trees_go(trunk_go(canopy_go(a, x, z, top, y0, 0), x, z, h + 1, top, y0), hs, ws, x0, y0, z0, scale, seed, i + 1)
+      else trees_go(a, hs, ws, x0, y0, z0, scale, seed, i + 1) end
     end
   end
 
-  doc "The chunk at chunk coordinates (cx, cy, cz) for [seed]. Pure: the same inputs give the same chunk."
-  fn terrain(cx : Int, cy : Int, cz : Int, seed : Int) : Strata.Chunk.Chunk do
+  doc "The chunk at chunk coordinates (cx, cy, cz) for [seed], in a world of [scale] metres a voxel. Pure: the same inputs give the same chunk."
+  fn terrain(scale : Float, cx : Int, cy : Int, cz : Int, seed : Int) : Strata.Chunk.Chunk do
     let y0 = cy * 32
-    match heights_go(NativeArray.make_int(1024, 0), NativeArray.make_int(1024, 0), lake_of(fdiv(cx * 32, 192), fdiv(cz * 32, 192), seed), cx * 32, cz * 32, seed, 0) do
+    let sv = sea_v(scale)
+    -- the lake squares are 192 m, so the square of a chunk's corner is found in metres
+    let lk = lake_of(fdiv(float_to_int(Math.floor(int_to_float(cx * 32) *. scale)), 192), fdiv(float_to_int(Math.floor(int_to_float(cz * 32) *. scale)), 192), seed)
+    match heights_go(NativeArray.make_int(1024, 0), NativeArray.make_int(1024, 0), lk, cx * 32, cz * 32, seed, scale, 0) do
       Columns(hs, ws) ->
         let lo = min_go(hs, 0, 100000)
         let hi = max_go(hs, 0, -100000)
-        let wet = max_go(ws, 0, sea())
+        let wet = max_go(ws, 0, sv)
         let roof = (if hi > wet do hi else wet end) + 8
         if y0 > roof do Ch.uniform(0)
         else if y0 + 31 < lo - 3 do Ch.uniform(1)
-        else Ch.from_flat(trees_go(ground_go(NativeArray.make_i32(32768, 0), hs, ws, cx * 32, y0, cz * 32, seed, 0), hs, ws, cx * 32, y0, cz * 32, seed, 0)) end end
+        else Ch.from_flat(trees_go(ground_go(NativeArray.make_i32(32768, 0), hs, ws, cx * 32, y0, cz * 32, sv, scale, seed, 0), hs, ws, cx * 32, y0, cz * 32, scale, seed, 0)) end end
     end
   end
 
@@ -389,13 +448,119 @@ mod StrataViewer do
     end
   end
 
+  -- Sound. STRATA_AUDIO=0 off (the default for scripted runs), 1 the device
+  -- (the default when playing), null the silent null device, wav:path the
+  -- whole session rendered in game time to a file with no device.
+  pfn audio_start(frames : Int) : Strata.Sound.Sound do
+    let mode = Env.get("STRATA_AUDIO", if frames > 0 do "0" else "1" end)
+    let opened = if mode == "1" do Strata.Ffi.Audio.open(false)
+      else if mode == "null" do Strata.Ffi.Audio.open_null()
+      else if String.starts_with(mode, "wav:") do Strata.Ffi.Audio.render(String.slice_bytes(mode, 4, String.byte_size(mode) - 4))
+      else false end end end
+    if mode != "0" do println("strata_viewer: sound " ++ (if opened do "on (" ++ mode ++ ")" else "unavailable; running silent" end)) else () end
+    let loaded = if opened do load_all(sound_files(), 0) else 0 end
+    if loaded > 0 do println("strata_viewer: " ++ int_to_string(loaded) ++ " recordings from viewer/sounds/; N plays one") else () end
+    -- the strike patch first (id 1), then a gust whose strength follows how open the sky is
+    let s1 = match Strata.Sound.upload(Strata.Sound.new(), Strata.Sound.strike()) do (s, _) -> s end
+    match Strata.Sound.with_gust(s1, true) do (s2, _) -> s2 end
+  end
+  -- the WAV files in viewer/sounds/, in the order listed; loaded at start, so the nth has recording id 2048 + n
+  pfn sound_files() : List(String) do
+    match Dir.list("sounds") do
+      Ok(names) -> List.filter(names, fn n -> String.ends_with(n, ".wav") || String.ends_with(n, ".flac") || String.ends_with(n, ".mp3"))
+      Err(_) -> Nil
+    end
+  end
+  pfn load_all(names : List(String), n : Int) : Int do
+    match names do
+      Nil -> n
+      Cons(h, t) -> load_all(t, if Strata.Ffi.Audio.load("sounds/" ++ h) > 0 do n + 1 else n end)
+    end
+  end
+  pfn place_recording(snd : Strata.Sound.Sound, frame : Int, x : Float, y : Float, z : Float) : Strata.Sound.Sound do
+    let n = List.length(sound_files())
+    if n == 0 do
+      println("strata_viewer: no recordings in viewer/sounds/")
+      snd
+    else
+      let id = 2048 + frame % n
+      if !Strata.Ffi.Audio.ready(id) do
+        println("strata_viewer: recording " ++ int_to_string(id - 2048) ++ " is not ready")
+        snd
+      else match Strata.Sound.play(Strata.Sound.recorded(snd, id, Strata.Ffi.Audio.length(id)), id, x, y, z, 0.9, 1.0, 1.0) do (s, v) -> Strata.Sound.with_range(s, v, 3.0, 150.0) end end
+    end
+  end
+  -- the strike patch is the first uploaded
+  pfn strike_patch() : Int do 1 end
+  -- how the viewer's blocks sound underfoot: (hardness, size), its own table
+  pfn underfoot(id : Int) : (Float, Float) do
+    if id == 1 do (0.9, 0.4)
+    else if id == 2 do (0.3, 0.6)
+    else if id == 3 || id == 11 do (0.2, 0.5)
+    else if id == 4 do (0.12, 0.7)
+    else if id == 6 do (0.08, 0.6)
+    else if id == 7 do (0.6, 0.6)
+    else if id == 13 do (1.0, 0.3)
+    else (0.5, 0.5) end end end end end end end
+  end
+  pfn footstep(snd : Strata.Sound.Sound, id : Int, x : Float, y : Float, z : Float, energy : Float) : Strata.Sound.Sound do
+    match underfoot(id) do
+      (hard, size) ->
+        match Strata.Sound.play(snd, strike_patch(), x, y, z, 0.5, 1.0, 0.5) do
+          (s1, v) -> Strata.Sound.control(Strata.Sound.control(Strata.Sound.control(s1, v, 0, hard), v, 1, size), v, 2, energy)
+        end
+    end
+  end
+  -- a strike where the view's ray meets the world, or 3 m ahead when it meets nothing
+  pfn strike_at(snd : Strata.Sound.Sound, w : Strata.World.World, reg : Strata.Blocks.Registry, x : Float, y : Float, z : Float, fx : Float, fy : Float, fz : Float, hardness : Float, size : Float) : Strata.Sound.Sound do
+    let h = Strata.Query.raycast(w, x, y, z, fx, fy, fz, 250.0, Strata.Query.targetable(reg))
+    let d = if Strata.Query.is_hit(h) do Strata.Query.hit_dist(h) else 3.0 end
+    match Strata.Sound.play(snd, strike_patch(), x +. fx *. d, y +. fy *. d, z +. fz *. d, 0.9, 1.0, 1.0) do
+      (s1, v) -> Strata.Sound.control(Strata.Sound.control(Strata.Sound.control(Strata.Sound.with_range(s1, v, 4.0, 250.0), v, 0, hardness), v, 1, size), v, 2, 0.8)
+    end
+  end
+  -- once a frame, last: hand over the frame's sound, mix it in game time if rendering, and with STRATA_AUDIO_METER=1 report once a second
+  pfn audio_frame(snd : Strata.Sound.Sound, w : Strata.World.World, fl : Strata.Fluid.Fluid, dt : Float, frame : Int, scripted : Bool, now : Float, t_prev : Float) : Strata.Sound.Sound do
+    match Strata.Sound.update(snd, w, fl, dt) do
+      (s2, cmds) ->
+        let took = Strata.Ffi.Audio.send(cmds)
+        Strata.Ffi.Audio.advance(dt)
+        let second = if scripted do frame % 60 == 59 else Math.floor(now) != Math.floor(t_prev) end
+        if second && took >= 0 && Env.get_int("STRATA_AUDIO_METER", 0) == 1 do
+          println("audio: playing " ++ int_to_string(float_to_int(Strata.Ffi.Audio.stat(0))) ++ " virtual " ++ int_to_string(float_to_int(Strata.Ffi.Audio.stat(1))) ++ " refused " ++ int_to_string(float_to_int(Strata.Ffi.Audio.stat(2)) + Strata.Sound.refused(s2)) ++ " ring " ++ int_to_string(float_to_int(Strata.Ffi.Audio.stat(3))) ++ " underruns " ++ int_to_string(float_to_int(Strata.Ffi.Audio.stat(4))) ++ " cpu " ++ ms2(Strata.Ffi.Audio.stat(5) *. 100.0) ++ "% peak " ++ ms2(Strata.Ffi.Audio.stat(6)) ++ "dB rms " ++ ms2(Strata.Ffi.Audio.stat(7)) ++ "dB")
+        else () end
+        s2
+    end
+  end
+
+  -- the soak line's sound figures: the mixer's state, the worst frame's sound
+  -- work on the main thread, and an acoustics update for 64 voices round
+  -- the camera timed here on the real terrain
+  pfn ring64(x : Float, y : Float, z : Float, i : Int, acc : List((Int, Float, Float, Float))) : List((Int, Float, Float, Float)) do
+    if i >= 64 do acc
+    else
+      let a = int_to_float(i) *. 0.0981747704
+      ring64(x, y, z, i + 1, Cons((i + 1, x +. 30.0 *. Math.cos(a), y -. 5.0 +. int_to_float(i % 8), z +. 30.0 *. Math.sin(a)), acc))
+    end
+  end
+  pfn audio_summary(s : Strata.Stream.Stream, reg : Strata.Blocks.Registry, cam : Cam, aworst : Float) : String do
+    match cam do
+      Cam(x, y, z, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _) ->
+        let t0 = Strata.Ffi.Vk.time()
+        let n = List.length(Strata.Acoustics.finish(Strata.Acoustics.begin(Strata.Stream.world(s), reg, (x, y, z), ring64(x, y, z, 0, Nil))))
+        let acoustics_ms = (Strata.Ffi.Vk.time() -. t0) *. 1000.0
+        " audio_underruns=" ++ int_to_string(float_to_int(Strata.Ffi.Audio.stat(4))) ++ " audio_ring_refused=" ++ int_to_string(float_to_int(Strata.Ffi.Audio.stat(3))) ++ " audio_refused=" ++ int_to_string(float_to_int(Strata.Ffi.Audio.stat(2))) ++ " audio_cpu=" ++ ms2(Strata.Ffi.Audio.stat(5) *. 100.0) ++ " audio_main_ms=" ++ ms2(aworst) ++ " audio_latency_ms=" ++ ms2(Strata.Ffi.Audio.stat(10)) ++ " audio_mem_kb=" ++ int_to_string(float_to_int(Strata.Ffi.Audio.stat(11)) / 1024) ++ " acoustics_ms=" ++ ms2(acoustics_ms) ++ " acoustics_voices=" ++ int_to_string(n)
+    end
+  end
+
   pfn ms2(v : Float) : String do float_to_string(Math.round(v *. 100.0) /. 100.0) end
 
   -- eye position, yaw, pitch, the chunk the camera was last in, mouse buttons
   -- last frame, flying or walking, vertical speed, on the ground, F last frame
-  -- ..., then the sun's height in degrees, the light mode, whether L was down,
-  -- and the hotbar slot chosen
-  type Cam = Cam(Float, Float, Float, Float, Float, Int, Int, Int, Bool, Bool, Bool, Float, Bool, Bool, Float, Int, Bool, Int)
+  -- ..., then the sun's height in degrees, the light mode, and whether L was down,
+  -- then the sound keys down last frame (bit 0 N, bit 1 H) and bit 2: headphones,
+  -- then the metres walked since the last footstep, then the hotbar slot chosen
+  type Cam = Cam(Float, Float, Float, Float, Float, Int, Int, Int, Bool, Bool, Bool, Float, Bool, Bool, Float, Int, Bool, Int, Float, Int)
 
   -- the hotbar slot a number key held this frame asks for, else the one already chosen
   pfn slot_key(i : Int, chosen : Int) : Int do
@@ -436,18 +601,19 @@ mod StrataViewer do
     end
   end
 
-  pfn frame_loop(s : Strata.Stream.Stream, fl : Strata.Fluid.Fluid, job : Option(Strata.Fluid.Job), sl : Strata.Render.Render, reg : Strata.Blocks.Registry, cam : Cam, frame : Int, frames : Int, script : Int, hole : (Int, Int, Int), worst : Float, total : Float, fworst : Float, t_prev : Float, t_mark : Float, vp : NativeF32Arr) : Unit do
+  pfn frame_loop(s : Strata.Stream.Stream, fl : Strata.Fluid.Fluid, job : Option(Strata.Fluid.Job), sl : Strata.Render.Render, reg : Strata.Blocks.Registry, cam : Cam, frame : Int, frames : Int, script : Int, hole : (Int, Int, Int), worst : Float, total : Float, fworst : Float, t_prev : Float, t_mark : Float, vp : NativeF32Arr, snd : Strata.Sound.Sound, aworst : Float) : Unit do
     Strata.Ffi.Vk.poll()
     if Strata.Ffi.Vk.should_close() || Strata.Ffi.Vk.key(256) || (frames > 0 && frame >= frames) do
       println("strata_viewer: done after " ++ int_to_string(frame) ++ " frames; uploads refused " ++ int_to_string(Strata.Ffi.Vk.refused()) ++ ", still waiting " ++ int_to_string(Strata.Render.waiting(sl)) ++ "; rebuilds " ++ int_to_string(float_to_int(Strata.Ffi.Vk.stat(6))) ++ "; draw calls " ++ int_to_string(float_to_int(Strata.Ffi.Vk.stat(2))))
       if Strata.Render.ui_dropped() > 0 do println("ui: dropped " ++ int_to_string(Strata.Render.ui_dropped()) ++ " quads") else () end
       if script == 2 do
-        println("soak: frames=" ++ int_to_string(frame) ++ " worst_ms=" ++ ms2(worst *. 1000.0) ++ " mean_ms=" ++ ms2(total *. 1000.0 /. int_to_float(if frame > 10 do frame - 10 else 1 end)) ++ " refused=" ++ int_to_string(Strata.Ffi.Vk.refused()) ++ " waiting=" ++ int_to_string(Strata.Render.waiting(sl)) ++ " slots=" ++ int_to_string(Strata.Render.used(sl)) ++ " live_quads=" ++ int_to_string(Strata.Ffi.Vk.live_quads()) ++ " leaked=" ++ int_to_string(float_to_int(Strata.Ffi.Vk.stat(7))) ++ " loaded=" ++ int_to_string(Strata.Stream.loaded_count(s)) ++ " fluid_worst_ms=" ++ ms2(fworst) ++ " fluid_active=" ++ int_to_string(Strata.Fluid.active_count(fl)) ++ " fluid_waiting=" ++ int_to_string(Strata.Fluid.waiting_count(fl)) ++ " ui_dropped=" ++ int_to_string(Strata.Render.ui_dropped()) ++ " text_waiting=" ++ int_to_string(Strata.Text.waited_last_frame()) ++ " atlas_bytes=" ++ int_to_string(Strata.Text.atlas_bytes()) ++ (if soak_lake() do " lake_end=" ++ int_to_string(lake_voxels(Strata.Stream.world(s), reg)) else "" end))
+        println("soak: frames=" ++ int_to_string(frame) ++ " worst_ms=" ++ ms2(worst *. 1000.0) ++ " mean_ms=" ++ ms2(total *. 1000.0 /. int_to_float(if frame > 10 do frame - 10 else 1 end)) ++ " refused=" ++ int_to_string(Strata.Ffi.Vk.refused()) ++ " waiting=" ++ int_to_string(Strata.Render.waiting(sl)) ++ " slots=" ++ int_to_string(Strata.Render.used(sl)) ++ " live_quads=" ++ int_to_string(Strata.Ffi.Vk.live_quads()) ++ " leaked=" ++ int_to_string(float_to_int(Strata.Ffi.Vk.stat(7))) ++ " loaded=" ++ int_to_string(Strata.Stream.loaded_count(s)) ++ " fluid_worst_ms=" ++ ms2(fworst) ++ " fluid_active=" ++ int_to_string(Strata.Fluid.active_count(fl)) ++ " fluid_waiting=" ++ int_to_string(Strata.Fluid.waiting_count(fl)) ++ " ui_dropped=" ++ int_to_string(Strata.Render.ui_dropped()) ++ " text_waiting=" ++ int_to_string(Strata.Text.waited_last_frame()) ++ " atlas_bytes=" ++ int_to_string(Strata.Text.atlas_bytes()) ++ (if soak_lake() do " lake_end=" ++ int_to_string(lake_voxels(Strata.Stream.world(s), reg)) else "" end) ++ audio_summary(s, reg, cam, aworst))
       else () end
       Strata.Stream.stop(s)
+      Strata.Ffi.Audio.close()
     else
       match cam do
-        Cam(x, y, z, yaw, pitch, kx0, ky0, kz0, lb0, rb0, fly0, vy0, ground0, f0, sun0, mode0, l0, slot0) ->
+        Cam(x, y, z, yaw, pitch, kx0, ky0, kz0, lb0, rb0, fly0, vy0, ground0, f0, sun0, mode0, l0, keys0, stride0, slot0) ->
           let now = Strata.Ffi.Vk.time()
           let scripted = frames > 0
           let dt = if scripted do 0.016667 else clampf(now -. t_prev, 0.0, 0.1) end
@@ -511,7 +677,36 @@ mod StrataViewer do
           let slot = if scripted do slot0 else slot_key(0, slot0) end
           let lb = !scripted && Strata.Ffi.Vk.mouse_button(0)
           let rb = !scripted && Strata.Ffi.Vk.mouse_button(1)
-          let m4 = act(m3, reg, x2, y2, z2, fx, fy, fz, (lb && !lb0) || (frame == 10 && Env.get_int("STRATA_DIG", 0) == 1) || (script == 2 && frame % 100 == 50), rb && !rb0, StrataViewer.Hud.slot_block(slot))
+          let dig_now = (lb && !lb0) || (frame == 10 && Env.get_int("STRATA_DIG", 0) == 1) || (script == 2 && frame % 100 == 50)
+          let build_now = rb && !rb0
+          let m4 = act(m3, reg, x2, y2, z2, fx, fy, fz, dig_now, build_now, StrataViewer.Hud.slot_block(slot))
+          -- sound: the camera is the listener; a carve or a build strikes where it lands
+          let sndl = Strata.Sound.listener(snd, x2, y2, z2, fx, fy, fz, 0.0, 1.0, 0.0)
+          let snd0 = if dig_now do strike_at(sndl, w0, reg, x2, y2, z2, fx, fy, fz, 0.55, 0.85) else if build_now do strike_at(sndl, w0, reg, x2, y2, z2, fx, fy, fz, 0.95, 0.3) else sndl end end
+          -- footsteps every half metre walked on the ground, from the block underfoot; a landing, by how hard
+          let walked = !fly && StrataViewer.Walker.grounded(moved)
+          let dx_w = StrataViewer.Walker.eye_x(moved) -. x
+          let dz_w = StrataViewer.Walker.eye_z(moved) -. z
+          let stride1 = if walked do stride0 +. Math.sqrt(dx_w *. dx_w +. dz_w *. dz_w) else 0.0 end
+          let step_now = stride1 >= 0.5
+          let stride = if step_now do stride1 -. 0.5 else stride1 end
+          let feet_y = y2 -. 1.6
+          let under = Strata.World.get_block(w0, float_to_int(Math.floor(x2)), float_to_int(Math.floor(feet_y -. 0.1)), float_to_int(Math.floor(z2)))
+          let landed = !fly && !ground0 && StrataViewer.Walker.grounded(moved) && vy0 < -3.0
+          let snd_f = if step_now do footstep(snd0, under, x2, feet_y, z2, 0.45)
+            else if landed do footstep(snd0, under, x2, feet_y, z2, clampf((0.0 -. vy0) /. 15.0, 0.4, 1.0)) else snd0 end end
+          -- N plays the next recording from viewer/sounds/ 5 m ahead; H switches headphones and speakers
+          let nkey = !scripted && Strata.Ffi.Vk.key(78)
+          let hkey = !scripted && Strata.Ffi.Vk.key(72)
+          let hp_was = int_and(keys0, 4) != 0
+          let hp_now = if hkey && int_and(keys0, 2) == 0 do !hp_was else hp_was end
+          let keys = (if nkey do 1 else 0 end) + (if hkey do 2 else 0 end) + (if hp_now do 4 else 0 end)
+          let snd_n = if nkey && int_and(keys0, 1) == 0 do place_recording(snd_f, frame, x2 +. fx *. 5.0, y2 +. fy *. 5.0, z2 +. fz *. 5.0) else snd_f end
+          let snd1 = if hkey && int_and(keys0, 2) == 0 do
+              let hp = int_and(keys, 4) != 0
+              println("strata_viewer: sound on " ++ (if hp do "headphones" else "speakers" end))
+              Strata.Sound.set_output(snd_n, hp)
+            else snd_n end
           -- the fluid: ten steps a second (a scripted run: every sixth frame)
           let t_fluid = Strata.Ffi.Vk.time()
           let due = Env.get_int("STRATA_FLUID", 1) != 0 && (if scripted do frame % 6 == 0 else Math.floor(now *. 10.0) != Math.floor(t_prev *. 10.0) end)
@@ -569,6 +764,14 @@ mod StrataViewer do
               if scripted && script != 2 && frame == frames - 3 do Strata.Ffi.Vk.request_shot() else () end
               if scripted && frame == Env.get_int("STRATA_REBUILD_AT", -1) do Strata.Ffi.Vk.force_rebuild() else () end
               -- the result is used, not dropped: a zero-argument extern bound to an unused name is optimised away (cube_forge GAPS G16)
+              let t_audio = Strata.Ffi.Vk.time()
+              let snd2 = audio_frame(snd1, Strata.Stream.world(s3), fl2, dt, frame, scripted, now, t_prev)
+              let audio_ms = (Strata.Ffi.Vk.time() -. t_audio) *. 1000.0
+              let aworst2 = if frame >= 10 && audio_ms > aworst do audio_ms else aworst end
+              -- STRATA_STALL=n: hold the main thread 100 ms every n frames, as a hitch would (soak runs)
+              let stall = Env.get_int("STRATA_STALL", 0)
+              -- nested, not &&: both sides of && are evaluated (GAPS S16 on main), and frame % 0 panics
+              if stall > 0 do (if frame % stall == stall - 1 do Strata.Ffi.Audio.debug_stall(100) else () end) else () end
               let next = if Strata.Ffi.Vk.frame() do frame + 1 else frame end
               let spent = now -. t_prev
               -- in a soak, name any frame slower than 25 ms and where its time went
@@ -576,7 +779,7 @@ mod StrataViewer do
               let worst2 = if frame >= 10 && spent > worst do spent else worst end
               let fworst2 = if fluid_ms > fworst do fluid_ms else fworst end
               let total2 = if frame >= 10 do total +. spent else total end
-              let cam2 = Cam(x2, y2, z2, yaw2, pitch2, kx, ky, kz, lb, rb, fly, StrataViewer.Walker.speed_y(moved), StrataViewer.Walker.grounded(moved), fkey, sun, mode, lkey, slot)
+              let cam2 = Cam(x2, y2, z2, yaw2, pitch2, kx, ky, kz, lb, rb, fly, StrataViewer.Walker.speed_y(moved), StrataViewer.Walker.grounded(moved), fkey, sun, mode, lkey, keys, stride, slot)
               if next != frame && frame % 240 == 239 do
                 println("  " ++ float_to_string(Math.round(240.0 /. (now -. t_mark))) ++ " fps; march " ++ ms2(march_ms) ++ " ms, shim " ++ ms2(Strata.Ffi.Vk.stat(0)) ++ " ms, waiting " ++ ms2(Strata.Ffi.Vk.stat(1)) ++ " ms, gpu " ++ ms2(Strata.Ffi.Vk.stat(3)) ++ " ms; " ++ int_to_string(float_to_int(Strata.Ffi.Vk.stat(2))) ++ " draw calls, " ++ int_to_string(float_to_int(Strata.Ffi.Vk.stat(4))) ++ " see-through chunks ordered in " ++ int_to_string(float_to_int(Strata.Ffi.Vk.stat(5))) ++ " us, " ++ int_to_string(Strata.Ffi.Vk.drawn_chunks()) ++ " chunks, " ++ int_to_string(Strata.Ffi.Vk.drawn_quads()) ++ " quads; " ++ int_to_string(Strata.Stream.loaded_count(s3)) ++ " chunks loaded")
                 if scripted && script != 2 && (Env.get_int("STRATA_BREACH", -1) >= 0 || Env.get_int("STRATA_DRAIN", -1) >= 0) do
@@ -585,8 +788,8 @@ mod StrataViewer do
                   end
                 else () end
                 if Strata.Fluid.active_count(fl2) + Strata.Fluid.dormant_count(fl2) > 0 do println("  fluid: active " ++ int_to_string(Strata.Fluid.active_count(fl2)) ++ ", waiting " ++ int_to_string(Strata.Fluid.waiting_count(fl2)) ++ ", dormant " ++ int_to_string(Strata.Fluid.dormant_count(fl2)) ++ "; last step " ++ ms2(fluid_ms) ++ " ms") else () end
-                frame_loop(s3, fl2, job2, sl2, reg, cam2, next, frames, script, hole, worst2, total2, fworst2, now, now, vp2)
-              else frame_loop(s3, fl2, job2, sl2, reg, cam2, next, frames, script, hole, worst2, total2, fworst2, now, t_mark, vp2) end
+                frame_loop(s3, fl2, job2, sl2, reg, cam2, next, frames, script, hole, worst2, total2, fworst2, now, now, vp2, snd2, aworst2)
+              else frame_loop(s3, fl2, job2, sl2, reg, cam2, next, frames, script, hole, worst2, total2, fworst2, now, t_mark, vp2, snd2, aworst2) end
           end
       end
     end
@@ -638,7 +841,7 @@ mod StrataViewer do
       let x = i % 128 - 64
       let z = i / 128 - 64
       let h = height(x, z, seed)
-      if has_post(x, z, h, seed) && !has_tree(x, z, h, seed) do (x, z) else first_post(seed, i + 1) end
+      if has_post(x, z, int_to_float(h), seed) && !has_tree(x, z, int_to_float(h), seed) do (x, z) else first_post(seed, i + 1) end
     end
   end
 
@@ -673,16 +876,16 @@ mod StrataViewer do
         (wx, wz) -> (int_to_float(wx) +. 0.5, int_to_float(sea()) +. 3.5, int_to_float(wz) +. 0.5, 0.9, -0.15)
       end
     else if scene == 13 || scene == 14 do
-      -- the lake, looking toward the sun (13) or steeply down at the water (14)
+      -- the lake, looking across it to catch the sun's glints (13; the sun itself now stands behind a hill at the old bearing) or steeply down at the water (14)
       match deep_water(seed, 0) do
-        (wx, wz) -> (int_to_float(wx) +. 0.5, int_to_float(sea()) +. 3.5, int_to_float(wz) +. 0.5, if scene == 13 do 2.23 else 0.9 end, if scene == 13 do -0.12 else -0.75 end)
+        (wx, wz) -> (int_to_float(wx) +. 0.5, int_to_float(sea()) +. 3.5, int_to_float(wz) +. 0.5, if scene == 13 do 1.2 else 0.9 end, if scene == 13 do -0.12 else -0.75 end)
       end
     else if scene == 15 do
       -- high ground, from 30 m back and 14 m up, looking across the top toward the sun
       match peak_go(seed, 0, 0, 0, -1000) do
         (px, pz, ph) -> (int_to_float(px) -. 23.7, int_to_float(ph) +. 12.0, int_to_float(pz) -. 18.4, 2.23, -0.4)
       end
-    else if scene == 12 do (-44.3, int_to_float(height(-35, 53, seed)) +. 11.0, 66.0, 0.62, -0.5)
+    else if scene == 12 do (-45.0, int_to_float(height(-35, 53, seed)) +. 11.0, 40.0, 2.5, -0.45)
     else if scene == 6 do (16.5, 150.0, -8.0, 3.14159265, 0.0)
     else if scene == 7 do (16.5, 150.0, 68.0, 0.0, 0.0)
     else if scene == 8 do
@@ -706,17 +909,18 @@ mod StrataViewer do
           if scene == 18 do (int_to_float(at_x(cx, d, 0 - (rad * 6) / 10)), int_to_float(line) +. 16.0, int_to_float(at_z(cz, d, 0 - (rad * 6) / 10)), int_to_float(d) *. 0.39269908, -0.5)
           else (int_to_float(at_x(cx, d, rad + 44)), int_to_float(height(at_x(cx, d, rad + 44), at_z(cz, d, rad + 44), seed)) +. 14.0, int_to_float(at_z(cz, d, rad + 44)), int_to_float(d) *. 0.39269908 +. 3.14159265, -0.25) end
       end
-    else if scene == 22 do (-44.5, int_to_float(height(-35, 53, seed)) +. 6.4, 53.5, 1.5708, -0.16)
-    else if scene == 21 || scene == 23 do (-35.5, int_to_float(height(-35, 53, seed)) +. 9.0, 66.0, 0.0, -0.3)
+    else if scene == 22 do (-40.5, int_to_float(height(-35, 53, seed)) +. 6.0, 53.5, 1.5708, -0.3)
+    else if scene == 21 || scene == 23 do (-45.0, int_to_float(height(-35, 53, seed)) +. 10.0, 40.0, 2.5, -0.4)
     else if scene == 20 do (-35.5, int_to_float(height(-35, 53, seed)) +. 12.0, 60.5, 0.0, -0.95)
     else if scene == 16 do (-34.5, int_to_float(height(-35, 53, seed)) -. 1.3, 58.2, 0.0, -0.03)
     else if scene == 10 || scene == 17 do
       match first_post(seed, 0) do
         (px, pz) -> (int_to_float(px) -. 2.7, int_to_float(height(px, pz, seed)) +. 2.3, int_to_float(pz) +. 2.9, 0.927, -0.22)
       end
-    else if scene == 9 do (-40.0, int_to_float(height(-40, 60, seed)) +. 1.9, 60.0, 0.62, -0.16)
-    else if scene == 3 || scene == 5 do (-40.0, int_to_float(height(-40, 60, seed)) +. 2.6, 60.0, 0.62, -0.05)
-    else (-70.0, int_to_float(height(0, 0, seed)) +. 46.0, 96.0, 0.62, -0.42) end end end end end end end end end end end end end end end end end end
+    else if scene == 9 do (-44.0, int_to_float(height(-44, 42, seed)) +. 1.9, 42.0, 2.5, -0.12)
+    else if scene == 5 do (-42.0, int_to_float(height(-35, 53, seed)) +. 7.0, 44.0, 2.5, -0.25)
+    else if scene == 3 do (-45.0, int_to_float(height(-45, 40, seed)) +. 2.6, 40.0, 2.5, -0.05)
+    else (-70.0, int_to_float(height(0, 0, seed)) +. 46.0, 96.0, 0.62, -0.42) end end end end end end end end end end end end end end end end end end end
   end
 
   fn main(_cap : Cap(IO)) : Unit do
@@ -748,7 +952,7 @@ mod StrataViewer do
       let ez = match start do (_, _, z, _, _) -> z end
       let yaw0 = match start do (_, _, _, a, _) -> a end
       let pitch0 = match start do (_, _, _, _, a) -> a end
-      let world = Strata.World.new(reg, Strata.Terrain.gen(fn (k, sd) -> terrain(Strata.Coord.kx(k), Strata.Coord.ky(k), Strata.Coord.kz(k), sd)), seed, 1.0)
+      let world = Strata.World.new(reg, Strata.Terrain.gen(fn (k, sd) -> terrain(1.0, Strata.Coord.kx(k), Strata.Coord.ky(k), Strata.Coord.kz(k), sd)), seed, 1.0)
       let t0 = Strata.Ffi.Vk.time()
       let s0 = Strata.Stream.run_until_settled(Strata.Stream.set_focus(Strata.Stream.start(world, Strata.Stream.config(r, 3, 32, 8)), Cons((ex, ey, ez), Nil)), 1000000)
       let t1 = Strata.Ffi.Vk.time()
@@ -806,8 +1010,8 @@ mod StrataViewer do
         (sl, s1) ->
           println("strata_viewer: " ++ int_to_string(Strata.Stream.loaded_count(s1)) ++ " chunks streamed in " ++ float_to_string(Math.round((t1 -. t0) *. 1000.0)) ++ " ms; " ++ int_to_string(Strata.Ffi.Vk.live_quads()) ++ " quads, " ++ int_to_string(Strata.Ffi.Vk.live_quads() * 8 / 1024) ++ " KB on the GPU")
           -- the fixed scenes fly, holding their pose; the default and the walk scene stand on the ground
-          let cam = Cam(ex, ey, ez, yaw0, pitch0, Strata.Coord.chunk_of(float_to_int(Math.floor(ex))), Strata.Coord.chunk_of(float_to_int(Math.floor(ey))), Strata.Coord.chunk_of(float_to_int(Math.floor(ez))), false, false, soak > 0 || (scene != 0 && scene != 11), 0.0, false, false, int_to_float(Env.get_int("STRATA_SUN", 55)), Env.get_int("STRATA_LIGHT", 4), false, 0)
-          frame_loop(s1, Strata.Fluid.with_limits(Strata.Fluid.new(reg, Cons((lake_base(), Strata.Fluid.flowing()), Cons((5, Strata.Fluid.sea()), Nil))), Env.get_int("STRATA_FLUID_CAP", 4096), Env.get_int("STRATA_FLUID_REACH", 16), 4), None, sl, reg, cam, 0, frames, if soak > 0 do 2 else if scene == 11 && frames > 0 do 1 else if scene == 4 && frames > 0 do 3 else 0 end end end, hole, 0.0, 0.0, 0.0, Strata.Ffi.Vk.time(), Strata.Ffi.Vk.time(), NativeArray.make_f32(16, 0.0))
+          let cam = Cam(ex, ey, ez, yaw0, pitch0, Strata.Coord.chunk_of(float_to_int(Math.floor(ex))), Strata.Coord.chunk_of(float_to_int(Math.floor(ey))), Strata.Coord.chunk_of(float_to_int(Math.floor(ez))), false, false, soak > 0 || (scene != 0 && scene != 11), 0.0, false, false, int_to_float(Env.get_int("STRATA_SUN", 55)), Env.get_int("STRATA_LIGHT", 4), false, 0, 0.0, 0)
+          frame_loop(s1, Strata.Fluid.with_limits(Strata.Fluid.new(reg, Cons((lake_base(), Strata.Fluid.flowing()), Cons((5, Strata.Fluid.sea()), Nil))), Env.get_int("STRATA_FLUID_CAP", 4096), Env.get_int("STRATA_FLUID_REACH", 16), 4), None, sl, reg, cam, 0, frames, if soak > 0 do 2 else if scene == 11 && frames > 0 do 1 else if scene == 4 && frames > 0 do 3 else 0 end end end, hole, 0.0, 0.0, 0.0, Strata.Ffi.Vk.time(), Strata.Ffi.Vk.time(), NativeArray.make_f32(16, 0.0), audio_start(frames), 0.0)
       end
       Strata.Ffi.Vk.close()
     end

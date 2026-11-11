@@ -1,0 +1,75 @@
+-- Emitters: a fluid's events, ten steps a second, become a few steady
+-- sources of sound on an 8 m grid.
+mod EmittersTest do
+  needs IO.Clock      -- charged to every test module once any uses Check.all (GAPS S3)
+  needs IO.Process
+  needs IO.Spawn
+
+  alias Strata.Emitters as Em
+
+  -- [n] events of [eighths] each, at voxel (x, y, z), having fallen [fell] cells
+  pfn evs(x : Int, y : Int, z : Int, eighths : Int, fell : Int, n : Int, acc : List(Strata.Fluid.Event)) : List(Strata.Fluid.Event) do
+    if n <= 0 do acc else evs(x, y, z, eighths, fell, n - 1, Cons(Strata.Fluid.Event(x, y, z, eighths, fell, true), acc)) end
+  end
+  -- feed the same events every 0.1 s for [steps] steps
+  pfn steady(e : Strata.Emitters.Emitters, es : List(Strata.Fluid.Event), step : Int, steps : Int, scale : Float) : Strata.Emitters.Emitters do
+    if steps <= 0 do e else steady(Em.tick(Em.feed(e, es, step, scale), 0.1), es, step + 1, steps - 1, scale) end
+  end
+  pfn quiet(e : Strata.Emitters.Emitters, step : Int, steps : Int) : Strata.Emitters.Emitters do
+    if steps <= 0 do e else quiet(Em.tick(Em.feed(e, Nil, step, 1.0), 0.1), step + 1, steps - 1) end
+  end
+  pfn flow_of(e : Strata.Emitters.Emitters) : Float do
+    match Em.live(e) do
+      Cons((_, _, _, _, f, _), _) -> f
+      Nil -> -1.0
+    end
+  end
+  pfn total(e : Strata.Emitters.Emitters) : Float do List.fold_left(Em.live(e), 0.0, fn (a, q) -> match q do (_, _, _, _, f, _) -> a +. f end) end
+  pfn near(a : Float, b : Float, tol : Float) : Bool do a -. b <= tol && b -. a <= tol end
+  -- twenty falls 40 m apart in a row, each a different flow
+  pfn twenty(i : Int, acc : List(Strata.Fluid.Event)) : List(Strata.Fluid.Event) do
+    if i >= 20 do acc else twenty(i + 1, evs(i * 40, 0, 0, 8, 6, i + 1, acc)) end
+  end
+
+  describe "Strata.Emitters" do
+    test "a steady 80 eighths a step, ten steps a second, is a flow of 800 eighths a second" do
+      let e = steady(Em.new(), evs(5, 10, 5, 8, 6, 10, Nil), 1, 30, 1.0)
+      Test.assert_true(near(flow_of(e), 800.0, 40.0), "within 5%")
+      match Em.live(e) do
+        Cons((_, _, _, _, _, h), _) -> Test.assert_true(near(h, 6.0, 0.01), "fallen 6 m at 1 m a voxel")
+        Nil -> Test.fail("one emitter")
+      end
+    end
+    test "twice the water is twice the flow" do
+      let a = flow_of(steady(Em.new(), evs(5, 10, 5, 8, 6, 10, Nil), 1, 30, 1.0))
+      let b = flow_of(steady(Em.new(), evs(5, 10, 5, 8, 6, 20, Nil), 1, 30, 1.0))
+      Test.assert_true(near(b, 2.0 *. a, 0.05 *. a), "double")
+    end
+    test "a step fed twice is counted once" do
+      let once = Em.feed(Em.new(), evs(5, 10, 5, 8, 6, 10, Nil), 1, 1.0)
+      let twice = Em.feed(once, evs(5, 10, 5, 8, 6, 10, Nil), 1, 1.0)
+      Test.assert_true(near(flow_of(twice), flow_of(once), 0.001), "the same flow")
+    end
+    test "an emitter silent for two seconds is let go" do
+      let e = steady(Em.new(), evs(5, 10, 5, 8, 6, 10, Nil), 1, 10, 1.0)
+      Test.assert_eq_int(List.length(Em.live(quiet(e, 11, 15))), 1, "still there after 1.5 s, fading")
+      Test.assert_true(flow_of(quiet(e, 11, 10)) < flow_of(e) *. 0.5, "falling over about a second")
+      Test.assert_eq_int(List.length(Em.live(quiet(e, 11, 25))), 0, "gone after 2.5 s")
+    end
+    test "past sixteen, the quietest merge into their neighbours and no flow is lost" do
+      let e = steady(Em.new(), twenty(0, Nil), 1, 10, 1.0)
+      Test.assert_eq_int(List.length(Em.live(e)), 16, "sixteen kept")
+      let expect = 10.0 *. 8.0 *. 210.0
+      Test.assert_true(near(total(e), expect, expect *. 0.05), "the flow of all twenty")
+    end
+    test "positions are in metres, whatever the voxel scale" do
+      let e = steady(Em.new(), evs(100, 0, 0, 8, 6, 10, Nil), 1, 5, 0.1)
+      match Em.live(e) do
+        Cons((_, x, _, _, _, h), _) ->
+          Test.assert_true(near(x, 10.05, 0.01), "voxel 100 at 10 cm is 10 m out")
+          Test.assert_true(near(h, 0.6, 0.01), "six cells of 10 cm is a 60 cm fall")
+        Nil -> Test.fail("one emitter")
+      end
+    end
+  end
+end

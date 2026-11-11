@@ -73,7 +73,7 @@ mod Strata.Fluid do
   -- beside chunks that are not loaded; the last step's events; how many
   -- active cells the last step left for later; the cells woken since a
   -- step was last begun on a worker
-  type Fluid = Fluid(Strata.Blocks.Registry, List(Int), List(Int), Int, Int, Int, Strata.Store.Store(Int), Strata.Store.Store(Int), List(Event), Int, List((Int, Int, Int)))
+  type Fluid = Fluid(Strata.Blocks.Registry, List(Int), List(Int), Int, Int, Int, Strata.Store.Store(Int), Strata.Store.Store(Int), List(Event), Int, List((Int, Int, Int)), Int)
 
   doc "The kind of a family whose water moves."
   fn flowing() : Int do 0 end
@@ -100,32 +100,34 @@ mod Strata.Fluid do
 
   doc "A fluid simulation over [r]'s blocks. [families] lists (base id, kind): a `flowing` family must be one registered with `Strata.Blocks.register_fluid`; a `sink` or a `sea` is any block. Nothing is active until something wakes it."
   fn new(r : Strata.Blocks.Registry, families : List((Int, Int))) : Fluid do
-    Fluid(r, bases(families, 0), List.append(bases(families, 1), sea_codes(bases(families, 2))), 4096, 16, 4, Sq.empty(-1), Sq.empty(-1), Nil, 0, Nil)
+    Fluid(r, bases(families, 0), List.append(bases(families, 1), sea_codes(bases(families, 2))), 4096, 16, 4, Sq.empty(-1), Sq.empty(-1), Nil, 0, Nil, 0)
   end
 
   doc "The same simulation with other limits: at most [cap] active cells handled a step, a way down sought within [reach] cells, a fall of at most [fall] cells a step. The defaults are 4096, 16 and 4."
   fn with_limits(f : Fluid, cap : Int, reach : Int, fall : Int) : Fluid do
     match f do
-      Fluid(r, fl, sk, _, _, _, a, d, ev, wt, nw) -> Fluid(r, fl, sk, if cap < 1 do 1 else cap end, if reach < 0 do 0 else reach end, if fall < 1 do 1 else fall end, a, d, ev, wt, nw)
+      Fluid(r, fl, sk, _, _, _, a, d, ev, wt, nw, st) -> Fluid(r, fl, sk, if cap < 1 do 1 else cap end, if reach < 0 do 0 else reach end, if fall < 1 do 1 else fall end, a, d, ev, wt, nw, st)
     end
   end
 
   doc "How many cells are active."
-  fn active_count(f : Fluid) : Int do match f do Fluid(_, _, _, _, _, _, a, _, _, _, _) -> Sq.size(a) end end
+  fn active_count(f : Fluid) : Int do match f do Fluid(_, _, _, _, _, _, a, _, _, _, _, _) -> Sq.size(a) end end
   doc "How many active cells the last step left for later because of the cap."
-  fn waiting_count(f : Fluid) : Int do match f do Fluid(_, _, _, _, _, _, _, _, _, wt, _) -> wt end end
+  fn waiting_count(f : Fluid) : Int do match f do Fluid(_, _, _, _, _, _, _, _, _, wt, _, _) -> wt end end
   doc "How many cells are set aside in or beside chunks that are not loaded."
-  fn dormant_count(f : Fluid) : Int do match f do Fluid(_, _, _, _, _, _, _, d, _, _, _) -> Sq.size(d) end end
+  fn dormant_count(f : Fluid) : Int do match f do Fluid(_, _, _, _, _, _, _, d, _, _, _, _) -> Sq.size(d) end end
   doc "What fell in the last step."
-  fn events(f : Fluid) : List(Event) do match f do Fluid(_, _, _, _, _, _, _, _, ev, _, _) -> ev end end
+  fn events(f : Fluid) : List(Event) do match f do Fluid(_, _, _, _, _, _, _, _, ev, _, _, _) -> ev end end
+  doc "How many steps have been applied. A step its worker computed but `finish_world` dropped is not counted, so a game reading `events` once per new count hears each step once."
+  fn steps(f : Fluid) : Int do match f do Fluid(_, _, _, _, _, _, _, _, _, _, _, st) -> st end end
 
   doc "Make the cell at (x, y, z) active."
   fn wake_cell(f : Fluid, x : Int, y : Int, z : Int) : Fluid do
     match f do
-      Fluid(r, fl, sk, cap, reach, fall, a, d, ev, wt, nw) ->
+      Fluid(r, fl, sk, cap, reach, fall, a, d, ev, wt, nw, st) ->
         let k = Kq.key(x, y, z)
         -- recorded even when already active: a step running on a worker may be about to put this very cell to rest
-        Fluid(r, fl, sk, cap, reach, fall, if Sq.has(a, k) do a else Sq.put(a, k, 0) end, d, ev, wt, Cons((x, y, z), nw))
+        Fluid(r, fl, sk, cap, reach, fall, if Sq.has(a, k) do a else Sq.put(a, k, 0) end, d, ev, wt, Cons((x, y, z), nw), st)
     end
   end
 
@@ -522,14 +524,16 @@ mod Strata.Fluid do
     end
   end
 
-  pfn drains(s : Settled, r : Strata.Blocks.Registry, w : Strata.World.World, ds : List((Int, Int, Int, Int))) : Settled do
+  pfn drains(s : Settled, r : Strata.Blocks.Registry, w : Strata.World.World, ds : List((Int, Int, Int, Int)), active : Strata.Store.Store(Int)) : Settled do
     match ds do
       Nil -> s
       Cons((x, y, z, n), t) ->
         match s do
           Settled(delta, fams, fells, evs, short, claims) ->
             let k = Kq.key(x, y, z)
-            drains(Settled(add_delta(delta, k, 0 - n), Sq.put(fams, k, Bq.fluid_base(r, Wq.get_block(w, x, y, z))), fells, evs, short, claims), r, w, t)
+            -- water a sink swallows lands there: an event, so it is heard and sprays
+            let fell = max2(0, Sq.get(active, k)) % 4096
+            drains(Settled(add_delta(delta, k, 0 - n), Sq.put(fams, k, Bq.fluid_base(r, Wq.get_block(w, x, y, z))), fells, Cons(Event(x, y, z, n, fell, true), evs), short, claims), r, w, t, active)
         end
     end
   end
@@ -757,7 +761,7 @@ mod Strata.Fluid do
   -- A step, with the sink cells its drains relied on.
   pfn step_full(f : Fluid, w : Strata.World.World, focus : List((Float, Float, Float))) : (Fluid, Strata.Edit.Outcome, List((Int, Int, Int))) do
     match f do
-      Fluid(r, fl, sk, cap, reach, fall, active0, dormant0, _, _, _) ->
+      Fluid(r, fl, sk, cap, reach, fall, active0, dormant0, _, _, _, st) ->
         match revive(w, active0, dormant0) do
           Revived(active, dormant) ->
             -- a woken cell that holds no flowing fluid has nothing to do and takes no place under the cap
@@ -768,7 +772,7 @@ mod Strata.Fluid do
                 match Sq.fold(by_chunk(now, Sq.empty(Nil)), Plan(Nil, Nil, Nil, Nil), fn (p, k, cells) -> plan_cells(r, fl, sk, view_of(w, k), reach, fall, p, cells)) do
                   Plan(os, ds, es, sinks) ->
                     let taken = Sq.fold(by_target(os, Sq.empty(Nil)), Settled(Sq.empty(0), Sq.empty(-1), Sq.empty(0), Nil, Nil, Nil), fn (s, k, offers) -> settle_target(s, r, w, k, offers))
-                    match drains(taken, r, w, ds) do
+                    match drains(taken, r, w, ds, active) do
                       Settled(delta, fams, fells, evs, short, claims) ->
                         let granted = grant(claims, delta, Sq.empty(false), Nil)
                         let o = Eq.set_many(w, List.append(granted, Sq.fold(delta, Nil, fn (acc, k, d) -> cell_after(acc, r, w, fams, k, d))))
@@ -777,7 +781,7 @@ mod Strata.Fluid do
                         let moved = Sq.fold(delta, Sq.empty(-1), fn (a, k, d) -> if d == 0 do a else if seas do seas_for(join_around(a, active, fells, r, fl, sk, w2, k), r, sk, w2, k, reach) else join_around(a, active, fells, r, fl, sk, w2, k) end end)
                         -- a giver that could not give all it offered stays active: its target was taken by another
                         match keep_waiting(join_short(join_granted(moved, active, fells, r, fl, sk, w2, granted), active, fells, r, fl, sk, w2, short), later, 0) do
-                          (active2, waiting) -> (Fluid(r, fl, sk, cap, reach, fall, active2, set_aside(dormant, es), evs, waiting, Nil), o, sinks)
+                          (active2, waiting) -> (Fluid(r, fl, sk, cap, reach, fall, active2, set_aside(dormant, es), evs, waiting, Nil, st + 1), o, sinks)
                         end
                     end
                 end
@@ -796,7 +800,7 @@ mod Strata.Fluid do
   -- ── Waking from an edit ──────────────────────────────────────────────────
   pfn wake_if(f : Fluid, w : Strata.World.World, x : Int, y : Int, z : Int) : Fluid do
     match f do
-      Fluid(r, fl, sk, _, _, _, _, _, _, _, _) -> if acts(r, fl, sk, w, x, y, z) do wake_cell(f, x, y, z) else f end
+      Fluid(r, fl, sk, _, _, _, _, _, _, _, _, _) -> if acts(r, fl, sk, w, x, y, z) do wake_cell(f, x, y, z) else f end
     end
   end
 
@@ -877,8 +881,8 @@ mod Strata.Fluid do
   doc "Begin a step on a worker. Answers the fluid to go on waking in the meantime and the job to hand to `finish`."
   fn begin(f : Fluid, w : Strata.World.World, focus : List((Float, Float, Float))) : (Fluid, Job) do
     match f do
-      Fluid(r, fl, sk, cap, reach, fall, a, d, ev, wt, _) ->
-        (Fluid(r, fl, sk, cap, reach, fall, a, d, ev, wt, Nil), Job(task_spawn(fn _ -> worked(f, w, focus))))
+      Fluid(r, fl, sk, cap, reach, fall, a, d, ev, wt, _, st) ->
+        (Fluid(r, fl, sk, cap, reach, fall, a, d, ev, wt, Nil, st), Job(task_spawn(fn _ -> worked(f, w, focus))))
     end
   end
 
@@ -894,7 +898,7 @@ mod Strata.Fluid do
       Nil -> true
       Cons((x, y, z), t) ->
         match f do
-          Fluid(r, _, sk, _, _, _, _, _, _, _, _) -> if has_int(sk, Bq.base_of(r, Wq.get_block(w, x, y, z))) || is_sea(r, sk, w, x, y, z) do still_sinks(f, w, t) else false end
+          Fluid(r, _, sk, _, _, _, _, _, _, _, _, _) -> if has_int(sk, Bq.base_of(r, Wq.get_block(w, x, y, z))) || is_sea(r, sk, w, x, y, z) do still_sinks(f, w, t) else false end
         end
     end
   end
@@ -932,7 +936,7 @@ mod Strata.Fluid do
           Ok((f2, cs, sinks)) ->
             if still_true(w, cs) && still_sinks(f, w, sinks) do
               match f do
-                Fluid(_, _, _, _, _, _, _, _, _, _, nw) -> (wake_list(f2, nw), Eq.set_many(w, as_cells(cs, Nil)))
+                Fluid(_, _, _, _, _, _, _, _, _, _, nw, _) -> (wake_list(f2, nw), Eq.set_many(w, as_cells(cs, Nil)))
               end
             else (f, Eq.set_many(w, Nil)) end
           Err(_) -> (f, Eq.set_many(w, Nil))
@@ -964,7 +968,7 @@ mod Strata.Fluid do
   -- 0 for anything else.
   pfn liquid(f : Fluid, w : Strata.World.World, x : Int, y : Int, z : Int) : Int do
     match f do
-      Fluid(r, fl, sk, _, _, _, _, _, _, _, _) ->
+      Fluid(r, fl, sk, _, _, _, _, _, _, _, _, _) ->
         let id = Wq.get_block(w, x, y, z)
         if id == 0 do 0
         else if has_int(sk, Bq.base_of(r, id)) || has_int(sk, sea_code(Bq.base_of(r, id))) do 8
@@ -1024,7 +1028,7 @@ mod Strata.Fluid do
   -- nothing toward higher fluid, nothing toward a wall.
   pfn pull(f : Fluid, w : Strata.World.World, base : Int, l : Int, x : Int, y : Int, z : Int) : Float do
     match f do
-      Fluid(r, _, sk, _, _, _, _, _, _, _, _) ->
+      Fluid(r, _, sk, _, _, _, _, _, _, _, _, _) ->
         let id = Wq.get_block(w, x, y, z)
         if !Wq.is_loaded(w, Kq.key_of_voxel(x, y, z)) do 0.0
         else if Bq.fluid_base(r, id) == base do int_to_float(l - liquid(f, w, x, y, z)) /. 8.0
@@ -1042,7 +1046,7 @@ mod Strata.Fluid do
   doc "Which way, and how strongly, the fluid in cell (x, y, z) is moving, as a vector: toward lower fluid and, twice as hard, toward drops; each component about -2 to 2, and (0, -1, 0) for fluid that is falling. Zero for still water, for a sink, and for a cell with no flowing fluid. A game multiplies it by how hard its water should push."
   fn flow(f : Fluid, w : Strata.World.World, x : Int, y : Int, z : Int) : (Float, Float, Float) do
     match f do
-      Fluid(r, fl, sk, _, _, _, _, _, _, _, _) ->
+      Fluid(r, fl, sk, _, _, _, _, _, _, _, _, _) ->
         let id = Wq.get_block(w, x, y, z)
         let base = Bq.fluid_base(r, id)
         if base < 0 || !has_int(fl, base) do (0.0, 0.0, 0.0)

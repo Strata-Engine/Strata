@@ -1,0 +1,594 @@
+-- Contact — the per-voxel and per-contact work of a physics step, all over
+-- native arrays owned by the step.
+--
+-- A body touches things through the corners of its surface voxels
+-- (`Strata.Body.corners`), so a box stands flat on its face and tips over
+-- its edge, as a box does. A contact is a corner near or in a colliding
+-- cell of the world (a window of the world copied once per step), with a
+-- normal, a gap (negative when it is in) and the point where it touches.
+-- Contacts are found a little ahead of where a point is going
+-- (speculative: a contact with a gap allows the point to close that gap
+-- this step and no more), so a fast body cannot pass through a wall.
+--
+-- The solver is sequential impulses: a fixed number of passes over the
+-- contacts in the order they were found (body by body, voxel by voxel), so
+-- the result is the same every run. Penetration is pushed out by a second
+-- set of velocities that move the bodies but are then forgotten, so pushing
+-- out never throws a body upward.
+--
+-- Body state, per body, 32 floats from k * 32:
+--   0-2 centre of mass (metres)   3-6 rotation x y z w   7-9 velocity
+--   10-12 spin (world, rad/s)     13 inverse mass        14-22 world inverse inertia, row-major
+--   23-31 rotation matrix, row-major
+-- A contact, 28 floats from c * 28:
+--   0 body a   1 body b (-1 the world)   2-4 a's arm   5-7 b's arm   8-10 normal (out of b toward a)
+--   11 gap (m)   12 velocity target   13 push-out target   14 normal mass   15-17 tangent 1   18-20 tangent 2
+--   21-22 tangent masses   23 normal impulse   24-25 tangent impulses   26 push-out impulse   27 approach speed
+mod Strata.Contact do
+
+  fn body_stride() : Int do 32 end
+  fn contact_stride() : Int do 28 end
+
+  pfn cget(a : NativeFloatArr, i : Int) : Float do NativeArray.get_float(a, i) end
+  pfn cset(a : NativeFloatArr, i : Int, v : Float) : NativeFloatArr do NativeArray.set_float(a, i, v) end
+  pfn absf(v : Float) : Float do if v < 0.0 do 0.0 -. v else v end end
+  pfn minf(a : Float, b : Float) : Float do if a < b do a else b end end
+  pfn maxf(a : Float, b : Float) : Float do if a > b do a else b end end
+  pfn floori(v : Float) : Int do float_to_int(Math.floor(v)) end
+
+  -- ── The world window ─────────────────────────────────────────────────────
+  -- low corner in voxels, sizes, and one byte a cell: 1 when it stops a body
+  -- (a colliding block, or a chunk that is not loaded), else 0
+  type Win3 = Win3(Int, Int, Int, Int, Int, Int, NativeU8Arr)
+
+  doc "A byte per registered id: 1 when the block collides."
+  fn collide_table(r : Strata.Blocks.Registry) : NativeU8Arr do
+    table_go(r, NativeArray.make_u8(Strata.Blocks.count(r) + 1, 0), 0, Strata.Blocks.count(r))
+  end
+  pfn table_go(r : Strata.Blocks.Registry, t : NativeU8Arr, i : Int, n : Int) : NativeU8Arr do
+    if i >= n do t else table_go(r, if Strata.Blocks.collides(r, i) do NativeArray.set_u8(t, i, 1) else t end, i + 1, n) end
+  end
+  pfn collides_id(t : NativeU8Arr, id : Int) : Int do
+    if id < 0 || id >= NativeArray.length_u8(t) do 0 else NativeArray.get_u8(t, id) end
+  end
+
+  pfn put_row(a : NativeU8Arr, i : Int, n : Int, v : Int) : NativeU8Arr do
+    if n <= 0 do a else put_row(NativeArray.set_u8(a, i, v), i + 1, n - 1, v) end
+  end
+  -- fill the window cells of world box x0..x1, y0..y1, z0..z1 with v
+  pfn fill_box(a : NativeU8Arr, ox : Int, oy : Int, oz : Int, sx : Int, sy : Int, x0 : Int, x1 : Int, y : Int, y1 : Int, z : Int, z0 : Int, z1 : Int, v : Int) : NativeU8Arr do
+    if y > y1 do a
+    else if z > z1 do fill_box(a, ox, oy, oz, sx, sy, x0, x1, y + 1, y1, z0, z0, z1, v)
+    else fill_box(put_row(a, (x0 - ox) + sx * ((y - oy) + sy * (z - oz)), x1 - x0 + 1, v), ox, oy, oz, sx, sy, x0, x1, y, y1, z + 1, z0, z1, v) end end
+  end
+  pfn copy_row(a : NativeU8Arr, i : Int, c : Strata.Chunk.Chunk, t : NativeU8Arr, lx : Int, ly : Int, lz : Int, n : Int) : NativeU8Arr do
+    if n <= 0 do a else copy_row(NativeArray.set_u8(a, i, collides_id(t, Strata.Chunk.get_or(c, lx, ly, lz, 0))), i + 1, c, t, lx + 1, ly, lz, n - 1) end
+  end
+  pfn copy_box(a : NativeU8Arr, ox : Int, oy : Int, oz : Int, sx : Int, sy : Int, c : Strata.Chunk.Chunk, t : NativeU8Arr, bx : Int, by0 : Int, bz : Int, x0 : Int, x1 : Int, y : Int, y1 : Int, z : Int, z0 : Int, z1 : Int) : NativeU8Arr do
+    if y > y1 do a
+    else if z > z1 do copy_box(a, ox, oy, oz, sx, sy, c, t, bx, by0, bz, x0, x1, y + 1, y1, z0, z0, z1)
+    else copy_box(copy_row(a, (x0 - ox) + sx * ((y - oy) + sy * (z - oz)), c, t, x0 - bx, y - by0, z - bz, x1 - x0 + 1), ox, oy, oz, sx, sy, c, t, bx, by0, bz, x0, x1, y, y1, z + 1, z0, z1) end end
+  end
+
+  pfn chunk_in(a : NativeU8Arr, w : Strata.World.World, t : NativeU8Arr, ox : Int, oy : Int, oz : Int, sx : Int, sy : Int, sz : Int, cx : Int, cy : Int, cz : Int) : NativeU8Arr do
+    let bx = cx * 32
+    let by0 = cy * 32
+    let bz = cz * 32
+    let x0 = if bx > ox do bx else ox end
+    let y0 = if by0 > oy do by0 else oy end
+    let z0 = if bz > oz do bz else oz end
+    let x1 = if bx + 31 < ox + sx - 1 do bx + 31 else ox + sx - 1 end
+    let y1 = if by0 + 31 < oy + sy - 1 do by0 + 31 else oy + sy - 1 end
+    let z1 = if bz + 31 < oz + sz - 1 do bz + 31 else oz + sz - 1 end
+    let k = Strata.Coord.key(cx, cy, cz)
+    if !Strata.World.is_loaded(w, k) do fill_box(a, ox, oy, oz, sx, sy, x0, x1, y0, y1, z0, z0, z1, 1)
+    else
+      let c = Strata.Store.get(Strata.World.chunks(w), k)
+      let u = Strata.Chunk.uniform_id(c)
+      if u >= 0 do (if collides_id(t, u) == 1 do fill_box(a, ox, oy, oz, sx, sy, x0, x1, y0, y1, z0, z0, z1, 1) else a end)
+      else copy_box(a, ox, oy, oz, sx, sy, c, t, bx, by0, bz, x0, x1, y0, y1, z0, z0, z1) end
+    end
+  end
+  pfn chunks_in(a : NativeU8Arr, w : Strata.World.World, t : NativeU8Arr, ox : Int, oy : Int, oz : Int, sx : Int, sy : Int, sz : Int, c0x : Int, c0z : Int, c1x : Int, c1y : Int, c1z : Int, cx : Int, cy : Int, cz : Int) : NativeU8Arr do
+    if cy > c1y do a
+    else if cz > c1z do chunks_in(a, w, t, ox, oy, oz, sx, sy, sz, c0x, c0z, c1x, c1y, c1z, c0x, cy + 1, c0z)
+    else if cx > c1x do chunks_in(a, w, t, ox, oy, oz, sx, sy, sz, c0x, c0z, c1x, c1y, c1z, c0x, cy, cz + 1)
+    else chunks_in(chunk_in(a, w, t, ox, oy, oz, sx, sy, sz, cx, cy, cz), w, t, ox, oy, oz, sx, sy, sz, c0x, c0z, c1x, c1y, c1z, cx + 1, cy, cz) end end end
+  end
+
+  doc "The world's cells x0..x1, y0..y1, z0..z1 (voxels): which stop a body. A chunk that is not loaded stops one everywhere."
+  fn window(w : Strata.World.World, t : NativeU8Arr, x0 : Int, y0 : Int, z0 : Int, x1 : Int, y1 : Int, z1 : Int) : Win3 do
+    let sx = x1 - x0 + 1
+    let sy = y1 - y0 + 1
+    let sz = z1 - z0 + 1
+    let a = NativeArray.make_u8(if sx * sy * sz > 0 do sx * sy * sz else 1 end, 0)
+    let c0x = Strata.Coord.chunk_of(x0)
+    let c0y = Strata.Coord.chunk_of(y0)
+    let c0z = Strata.Coord.chunk_of(z0)
+    Win3(x0, y0, z0, sx, sy, sz, chunks_in(a, w, t, x0, y0, z0, sx, sy, sz, c0x, c0z, Strata.Coord.chunk_of(x1), Strata.Coord.chunk_of(y1), Strata.Coord.chunk_of(z1), c0x, c0y, c0z))
+  end
+
+  doc "Does the window's cell (x, y, z) stop a body? Outside the window, no."
+  fn solid(win : Win3, x : Int, y : Int, z : Int) : Bool do
+    match win do
+      Win3(ox, oy, oz, sx, sy, sz, a) ->
+        let i = x - ox
+        let j = y - oy
+        let k = z - oz
+        if i >= 0 && j >= 0 && k >= 0 && i < sx && j < sy && k < sz do NativeArray.get_u8(a, i + sx * (j + sy * k)) == 1 else false end
+    end
+  end
+
+  -- ── Finding contacts against the world ───────────────────────────────────
+  -- the nearest solid cell to point (ux, uy, uz) within reach (all in voxels):
+  -- distance, and the touched point; -1 for none
+  type NearHit = NearHit(Float, Float, Float, Float, Int, Int, Int)
+
+  pfn clampf(v : Float, lo : Float, hi : Float) : Float do if v < lo do lo else if v > hi do hi else v end end end
+
+  pfn near_cells(win : Win3, ux : Float, uy : Float, uz : Float, x0 : Int, x1 : Int, y0 : Int, y1 : Int, z0 : Int, z1 : Int, x : Int, y : Int, z : Int, best : NearHit) : NearHit do
+    if z > z1 do best
+    else if y > y1 do near_cells(win, ux, uy, uz, x0, x1, y0, y1, z0, z1, x0, y0, z + 1, best)
+    else if x > x1 do near_cells(win, ux, uy, uz, x0, x1, y0, y1, z0, z1, x0, y + 1, z, best)
+    else
+      let b2 = if !solid(win, x, y, z) do best
+        else
+          let qx = clampf(ux, int_to_float(x), int_to_float(x + 1))
+          let qy = clampf(uy, int_to_float(y), int_to_float(y + 1))
+          let qz = clampf(uz, int_to_float(z), int_to_float(z + 1))
+          let d = Math.sqrt((ux -. qx) *. (ux -. qx) +. (uy -. qy) *. (uy -. qy) +. (uz -. qz) *. (uz -. qz))
+          match best do
+            NearHit(bd, _, _, _, _, _, _) -> if bd < 0.0 || d < bd do NearHit(d, qx, qy, qz, x, y, z) else best end
+          end
+        end
+      near_cells(win, ux, uy, uz, x0, x1, y0, y1, z0, z1, x + 1, y, z, b2)
+    end end end
+  end
+
+  -- a point inside solid cell (x, y, z): the nearest face that opens onto a
+  -- free cell: (distance to it, normal); distance -1 when none opens
+  pfn face_out(win : Win3, ux : Float, uy : Float, uz : Float, x : Int, y : Int, z : Int) : (Float, Float, Float, Float) do
+    let cand = fn (best, free, d, nx, ny, nz) ->
+      match best do
+        (bd, _, _, _) -> if free && (bd < 0.0 || d < bd) do (d, nx, ny, nz) else best end
+      end
+    let b0 = cand((-1.0, 0.0, 0.0, 0.0), !solid(win, x, y + 1, z), int_to_float(y + 1) -. uy, 0.0, 1.0, 0.0)
+    let b1 = cand(b0, !solid(win, x, y - 1, z), uy -. int_to_float(y), 0.0, -1.0, 0.0)
+    let b2 = cand(b1, !solid(win, x + 1, y, z), int_to_float(x + 1) -. ux, 1.0, 0.0, 0.0)
+    let b3 = cand(b2, !solid(win, x - 1, y, z), ux -. int_to_float(x), -1.0, 0.0, 0.0)
+    let b4 = cand(b3, !solid(win, x, y, z + 1), int_to_float(z + 1) -. uz, 0.0, 0.0, 1.0)
+    cand(b4, !solid(win, x, y, z - 1), uz -. int_to_float(z), 0.0, 0.0, -1.0)
+  end
+
+  pfn put_contact(cs : NativeFloatArr, c : Int, a : Int, b : Int, rax : Float, ray : Float, raz : Float, rbx : Float, rby : Float, rbz : Float, nx : Float, ny : Float, nz : Float, gap : Float) : NativeFloatArr do
+    let o = c * 28
+    let c1 = cset(cset(cset(cset(cset(cs, o, int_to_float(a)), o + 1, int_to_float(b)), o + 2, rax), o + 3, ray), o + 4, raz)
+    let c2 = cset(cset(cset(cset(cset(cset(c1, o + 5, rbx), o + 6, rby), o + 7, rbz), o + 8, nx), o + 9, ny), o + 10, nz)
+    cset(cset(cset(cset(cset(c2, o + 11, gap), o + 23, 0.0), o + 24, 0.0), o + 25, 0.0), o + 26, 0.0)
+  end
+
+  -- the frame of what a point is tested against: body b's centre and rotation
+  -- (row-major), or the world's (origin, no turn) when b < 0
+  type Frame = Frame(Float, Float, Float, Float, Float, Float, Float, Float, Float, Float, Float, Float)
+  pfn frame_of(st : NativeFloatArr, b : Int) : Frame do
+    if b < 0 do Frame(0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0)
+    else
+      let o = b * 32
+      Frame(cget(st, o), cget(st, o + 1), cget(st, o + 2), cget(st, o + 23), cget(st, o + 24), cget(st, o + 25), cget(st, o + 26), cget(st, o + 27), cget(st, o + 28), cget(st, o + 29), cget(st, o + 30), cget(st, o + 31))
+    end
+  end
+
+  -- one corner of body a (at (lx, ly, lz) metres from its centre, in its own
+  -- frame) against [win]: the world's cells (b < 0), or body b's grid, whose
+  -- centre is (lbx, lby, lbz) metres from that grid's low corner
+  pfn point_vs(cs : NativeFloatArr, nc : Int, st : NativeFloatArr, a : Int, b : Int, win : Win3, scale : Float, dt : Float, lx : Float, ly : Float, lz : Float, lbx : Float, lby : Float, lbz : Float) : (NativeFloatArr, Int) do
+    let o = a * 32
+    -- the corner in the world, relative to a's centre
+    let rx = cget(st, o + 23) *. lx +. cget(st, o + 24) *. ly +. cget(st, o + 25) *. lz
+    let ry = cget(st, o + 26) *. lx +. cget(st, o + 27) *. ly +. cget(st, o + 28) *. lz
+    let rz = cget(st, o + 29) *. lx +. cget(st, o + 30) *. ly +. cget(st, o + 31) *. lz
+    let wpx = cget(st, o) +. rx
+    let wpy = cget(st, o + 1) +. ry
+    let wpz = cget(st, o + 2) +. rz
+    match frame_of(st, b) do
+      Frame(bx, yb, bz, r0, r1, r2, r3, r4, r5, r6, r7, r8) ->
+        let (vax, vay, vaz) = point_vel(st, a, rx, ry, rz)
+        let (vbx, vby, vbz) = point_vel(st, b, wpx -. bx, wpy -. yb, wpz -. bz)
+        let dvx = vax -. vbx
+        let dvy = vay -. vby
+        let dvz = vaz -. vbz
+        let speed = Math.sqrt(dvx *. dvx +. dvy *. dvy +. dvz *. dvz)
+        let margin = minf(0.5, speed *. dt /. scale +. 0.02)
+        -- into the target's frame, in voxels
+        let dx = wpx -. bx
+        let dy = wpy -. yb
+        let dz = wpz -. bz
+        let ux = (r0 *. dx +. r3 *. dy +. r6 *. dz +. lbx) /. scale
+        let uy = (r1 *. dx +. r4 *. dy +. r7 *. dz +. lby) /. scale
+        let uz = (r2 *. dx +. r5 *. dy +. r8 *. dz +. lbz) /. scale
+        -- a touched point (in the target's voxels) and normal (in its frame) back to the world
+        let emit = fn (qx, qy, qz, nx, ny, nz, gap) ->
+          let tx = qx *. scale -. lbx
+          let ty = qy *. scale -. lby
+          let tz = qz *. scale -. lbz
+          let qwx = bx +. r0 *. tx +. r1 *. ty +. r2 *. tz
+          let qwy = yb +. r3 *. tx +. r4 *. ty +. r5 *. tz
+          let qwz = bz +. r6 *. tx +. r7 *. ty +. r8 *. tz
+          let nwx = r0 *. nx +. r1 *. ny +. r2 *. nz
+          let nwy = r3 *. nx +. r4 *. ny +. r5 *. nz
+          let nwz = r6 *. nx +. r7 *. ny +. r8 *. nz
+          (put_contact(cs, nc, a, b, qwx -. cget(st, o), qwy -. cget(st, o + 1), qwz -. cget(st, o + 2), qwx -. bx, qwy -. yb, qwz -. bz, nwx, nwy, nwz, gap *. scale), nc + 1)
+        match near_cells(win, ux, uy, uz, floori(ux -. margin), floori(ux +. margin), floori(uy -. margin), floori(uy +. margin), floori(uz -. margin), floori(uz +. margin),
+                         floori(ux -. margin), floori(uy -. margin), floori(uz -. margin), NearHit(-1.0, 0.0, 0.0, 0.0, 0, 0, 0)) do
+          NearHit(d, qx, qy, qz, cx, cy, cz) ->
+            if d < 0.0 do (cs, nc)
+            else if d > 0.000001 do
+              if d >= margin do (cs, nc)
+              else emit(qx, qy, qz, (ux -. qx) /. d, (uy -. qy) /. d, (uz -. qz) /. d, d) end
+            else
+              match face_out(win, ux, uy, uz, cx, cy, cz) do
+                (fd, nx, ny, nz) ->
+                  if fd < 0.0 do (cs, nc)
+                  else emit(ux +. nx *. fd, uy +. ny *. fd, uz +. nz *. fd, nx, ny, nz, 0.0 -. fd) end
+              end
+            end end
+        end
+    end
+  end
+
+  pfn points_vs(cs : NativeFloatArr, nc : Int, st : NativeFloatArr, a : Int, b : Int, win : Win3, scale : Float, dt : Float, sx : Int, sy : Int, surf : NativeIntArr, cx : Float, cy : Float, cz : Float, lbx : Float, lby : Float, lbz : Float, i : Int, n : Int) : (NativeFloatArr, Int) do
+    if i >= n do (cs, nc)
+    else
+      let v = NativeArray.get_int(surf, i)
+      let lx = int_to_float(v % (sx + 1)) *. scale -. cx
+      let ly = int_to_float((v / (sx + 1)) % (sy + 1)) *. scale -. cy
+      let lz = int_to_float(v / ((sx + 1) * (sy + 1))) *. scale -. cz
+      match point_vs(cs, nc, st, a, b, win, scale, dt, lx, ly, lz, lbx, lby, lbz) do
+        (cs2, nc2) -> points_vs(cs2, nc2, st, a, b, win, scale, dt, sx, sy, surf, cx, cy, cz, lbx, lby, lbz, i + 1, n)
+      end
+    end
+  end
+
+  doc "Contacts of body [a] (its grid is [sx] x [sy] voxels in x and y, its surface corner indices [surf] (`Strata.Body.corners`), its centre at (cx, cy, cz) metres from the grid's low corner) against the world window, appended to [cs] from [nc]. [cs] must have room for one contact per corner."
+  fn gen_world(cs : NativeFloatArr, nc : Int, st : NativeFloatArr, a : Int, win : Win3, scale : Float, dt : Float, sx : Int, sy : Int, surf : NativeIntArr, cx : Float, cy : Float, cz : Float) : (NativeFloatArr, Int) do
+    points_vs(cs, nc, st, a, -1, win, scale, dt, sx, sy, surf, cx, cy, cz, 0.0, 0.0, 0.0, 0, NativeArray.length_int(surf))
+  end
+
+  doc "Contacts of body [a]'s corners (as for `gen_world`) against body [b]'s grid, given as a window from `grid_window` and b's centre (lbx, lby, lbz) metres from its grid's low corner. Normals point out of b toward a."
+  fn gen_body(cs : NativeFloatArr, nc : Int, st : NativeFloatArr, a : Int, b : Int, winb : Win3, scale : Float, dt : Float, sx : Int, sy : Int, surf : NativeIntArr, cx : Float, cy : Float, cz : Float, lbx : Float, lby : Float, lbz : Float) : (NativeFloatArr, Int) do
+    points_vs(cs, nc, st, a, b, winb, scale, dt, sx, sy, surf, cx, cy, cz, lbx, lby, lbz, 0, NativeArray.length_int(surf))
+  end
+
+  pfn grid_go(ids : NativeI32Arr, t : NativeU8Arr, out : NativeU8Arr, i : Int, n : Int) : NativeU8Arr do
+    if i >= n do out else grid_go(ids, t, NativeArray.set_u8(out, i, collides_id(t, NativeArray.get_i32(ids, i))), i + 1, n) end
+  end
+  doc "A body's grid as a window in its own voxels (low corner 0, 0, 0): which voxels stop another body."
+  fn grid_window(g : Strata.Body.Grid, t : NativeU8Arr) : Win3 do
+    let sx = Strata.Body.size_x(g)
+    let sy = Strata.Body.size_y(g)
+    let sz = Strata.Body.size_z(g)
+    Win3(0, 0, 0, sx, sy, sz, grid_go(Strata.Body.ids(g), t, NativeArray.make_u8(sx * sy * sz, 0), 0, sx * sy * sz))
+  end
+
+
+  -- ── Driven boxes ─────────────────────────────────────────────────────────
+  -- A driven body is an axis-aligned box (half extents hx, hy, hz about its
+  -- centre). A body's corner against it: inside, pushed out through the
+  -- nearest face; outside but within reach, a speculative contact.
+  pfn corner_box(cs : NativeFloatArr, nc : Int, st : NativeFloatArr, a : Int, b : Int, scale : Float, dt : Float, lx : Float, ly : Float, lz : Float, hx : Float, hy : Float, hz : Float) : (NativeFloatArr, Int) do
+    let o = a * 32
+    let rx = cget(st, o + 23) *. lx +. cget(st, o + 24) *. ly +. cget(st, o + 25) *. lz
+    let ry = cget(st, o + 26) *. lx +. cget(st, o + 27) *. ly +. cget(st, o + 28) *. lz
+    let rz = cget(st, o + 29) *. lx +. cget(st, o + 30) *. ly +. cget(st, o + 31) *. lz
+    let ob = b * 32
+    let bx = cget(st, ob)
+    let yb = cget(st, ob + 1)
+    let bz = cget(st, ob + 2)
+    let dx = cget(st, o) +. rx -. bx
+    let dy = cget(st, o + 1) +. ry -. yb
+    let dz = cget(st, o + 2) +. rz -. bz
+    let (vax, vay, vaz) = point_vel(st, a, rx, ry, rz)
+    let (vbx, vby, vbz) = point_vel(st, b, dx, dy, dz)
+    let sp = Math.sqrt((vax -. vbx) *. (vax -. vbx) +. (vay -. vby) *. (vay -. vby) +. (vaz -. vbz) *. (vaz -. vbz))
+    let margin = minf(0.5, sp *. dt /. scale +. 0.02) *. scale
+    let put = fn (qx, qy, qz, nx, ny, nz, gap) ->
+      (put_contact(cs, nc, a, b, bx +. qx -. cget(st, o), yb +. qy -. cget(st, o + 1), bz +. qz -. cget(st, o + 2), qx, qy, qz, nx, ny, nz, gap), nc + 1)
+    let ex = hx -. absf(dx)
+    let ey = hy -. absf(dy)
+    let ez = hz -. absf(dz)
+    if ex > 0.0 && ey > 0.0 && ez > 0.0 do
+      let sx = if dx < 0.0 do -1.0 else 1.0 end
+      let sy = if dy < 0.0 do -1.0 else 1.0 end
+      let sz = if dz < 0.0 do -1.0 else 1.0 end
+      if ex <= ey && ex <= ez do put(sx *. hx, dy, dz, sx, 0.0, 0.0, 0.0 -. ex)
+      else if ey <= ez do put(dx, sy *. hy, dz, 0.0, sy, 0.0, 0.0 -. ey)
+      else put(dx, dy, sz *. hz, 0.0, 0.0, sz, 0.0 -. ez) end end
+    else
+      let qx = clampf(dx, 0.0 -. hx, hx)
+      let qy = clampf(dy, 0.0 -. hy, hy)
+      let qz = clampf(dz, 0.0 -. hz, hz)
+      let d = Math.sqrt((dx -. qx) *. (dx -. qx) +. (dy -. qy) *. (dy -. qy) +. (dz -. qz) *. (dz -. qz))
+      if d >= margin || d <= 0.0 do (cs, nc)
+      else put(qx, qy, qz, (dx -. qx) /. d, (dy -. qy) /. d, (dz -. qz) /. d, d) end
+    end
+  end
+  pfn corners_box(cs : NativeFloatArr, nc : Int, st : NativeFloatArr, a : Int, b : Int, scale : Float, dt : Float, sx : Int, sy : Int, surf : NativeIntArr, cx : Float, cy : Float, cz : Float, hx : Float, hy : Float, hz : Float, i : Int, n : Int) : (NativeFloatArr, Int) do
+    if i >= n do (cs, nc)
+    else
+      let v = NativeArray.get_int(surf, i)
+      let lx = int_to_float(v % (sx + 1)) *. scale -. cx
+      let ly = int_to_float((v / (sx + 1)) % (sy + 1)) *. scale -. cy
+      let lz = int_to_float(v / ((sx + 1) * (sy + 1))) *. scale -. cz
+      match corner_box(cs, nc, st, a, b, scale, dt, lx, ly, lz, hx, hy, hz) do
+        (cs2, nc2) -> corners_box(cs2, nc2, st, a, b, scale, dt, sx, sy, surf, cx, cy, cz, hx, hy, hz, i + 1, n)
+      end
+    end
+  end
+  doc "Contacts of body [a]'s corners (as for `gen_world`) against driven body [b], an axis-aligned box of half extents (hx, hy, hz) metres about its centre. Normals point out of the box toward a."
+  fn gen_box(cs : NativeFloatArr, nc : Int, st : NativeFloatArr, a : Int, b : Int, scale : Float, dt : Float, sx : Int, sy : Int, surf : NativeIntArr, cx : Float, cy : Float, cz : Float, hx : Float, hy : Float, hz : Float) : (NativeFloatArr, Int) do
+    corners_box(cs, nc, st, a, b, scale, dt, sx, sy, surf, cx, cy, cz, hx, hy, hz, 0, NativeArray.length_int(surf))
+  end
+
+  pfn pts_go(cs : NativeFloatArr, nc : Int, st : NativeFloatArr, a : Int, b : Int, win : Win3, scale : Float, dt : Float, pts : NativeFloatArr, lbx : Float, lby : Float, lbz : Float, i : Int, n : Int) : (NativeFloatArr, Int) do
+    if i >= n do (cs, nc)
+    else
+      match point_vs(cs, nc, st, a, b, win, scale, dt, cget(pts, i * 3), cget(pts, i * 3 + 1), cget(pts, i * 3 + 2), lbx, lby, lbz) do
+        (cs2, nc2) -> pts_go(cs2, nc2, st, a, b, win, scale, dt, pts, lbx, lby, lbz, i + 1, n)
+      end
+    end
+  end
+  doc "Contacts of the points [pts] (three floats each, metres from body a's centre in its own frame) against body [b]'s grid window, as `gen_body` does for corners."
+  fn gen_points(cs : NativeFloatArr, nc : Int, st : NativeFloatArr, a : Int, b : Int, winb : Win3, scale : Float, dt : Float, pts : NativeFloatArr, lbx : Float, lby : Float, lbz : Float) : (NativeFloatArr, Int) do
+    pts_go(cs, nc, st, a, b, winb, scale, dt, pts, lbx, lby, lbz, 0, NativeArray.length_float(pts) / 3)
+  end
+
+  doc "Points on the surface of a box of half extents (hx, hy, hz), no more than [spacing] apart, about its centre: three floats each."
+  fn box_points(hx : Float, hy : Float, hz : Float, spacing : Float) : NativeFloatArr do
+    let nx = float_to_int(Math.ceil(2.0 *. hx /. spacing)) + 1
+    let ny = float_to_int(Math.ceil(2.0 *. hy /. spacing)) + 1
+    let nz = float_to_int(Math.ceil(2.0 *. hz /. spacing)) + 1
+    let n = box_count(nx, ny, nz, 0, 0)
+    box_fill(NativeArray.make_float(n * 3 + 1, 0.0), nx, ny, nz, hx, hy, hz, 0, 0)
+  end
+  pfn on_shell(nx : Int, ny : Int, nz : Int, i : Int) : Bool do
+    let x = i % nx
+    let y = (i / nx) % ny
+    let z = i / (nx * ny)
+    x == 0 || y == 0 || z == 0 || x == nx - 1 || y == ny - 1 || z == nz - 1
+  end
+  pfn box_count(nx : Int, ny : Int, nz : Int, i : Int, acc : Int) : Int do
+    if i >= nx * ny * nz do acc else box_count(nx, ny, nz, i + 1, if on_shell(nx, ny, nz, i) do acc + 1 else acc end) end
+  end
+  pfn frac(k : Int, n : Int, h : Float) : Float do if n <= 1 do 0.0 else 0.0 -. h +. 2.0 *. h *. int_to_float(k) /. int_to_float(n - 1) end end
+  pfn box_fill(a : NativeFloatArr, nx : Int, ny : Int, nz : Int, hx : Float, hy : Float, hz : Float, i : Int, k : Int) : NativeFloatArr do
+    if i >= nx * ny * nz do a
+    else if !on_shell(nx, ny, nz, i) do box_fill(a, nx, ny, nz, hx, hy, hz, i + 1, k)
+    else
+      let a2 = cset(cset(cset(a, k * 3, frac(i % nx, nx, hx)), k * 3 + 1, frac((i / nx) % ny, ny, hy)), k * 3 + 2, frac(i / (nx * ny), nz, hz))
+      box_fill(a2, nx, ny, nz, hx, hy, hz, i + 1, k + 1)
+    end end
+  end
+
+  -- ── Solving ──────────────────────────────────────────────────────────────
+  -- velocity of body k's point at arm r
+  pfn point_vel(st : NativeFloatArr, k : Int, rx : Float, ry : Float, rz : Float) : (Float, Float, Float) do
+    if k < 0 do (0.0, 0.0, 0.0)
+    else
+      let o = k * 32
+      let wx = cget(st, o + 10)
+      let wy = cget(st, o + 11)
+      let wz = cget(st, o + 12)
+      (cget(st, o + 7) +. wy *. rz -. wz *. ry, cget(st, o + 8) +. wz *. rx -. wx *. rz, cget(st, o + 9) +. wx *. ry -. wy *. rx)
+    end
+  end
+  -- (r x d) . I (r x d) + inverse mass: how hard body k is to move along d at arm r
+  pfn mass_term(st : NativeFloatArr, k : Int, rx : Float, ry : Float, rz : Float, dx : Float, dy : Float, dz : Float) : Float do
+    if k < 0 do 0.0
+    else
+      let o = k * 32
+      let cx = ry *. dz -. rz *. dy
+      let cy = rz *. dx -. rx *. dz
+      let cz = rx *. dy -. ry *. dx
+      let ix = cget(st, o + 14) *. cx +. cget(st, o + 15) *. cy +. cget(st, o + 16) *. cz
+      let iy = cget(st, o + 17) *. cx +. cget(st, o + 18) *. cy +. cget(st, o + 19) *. cz
+      let iz = cget(st, o + 20) *. cx +. cget(st, o + 21) *. cy +. cget(st, o + 22) *. cz
+      cget(st, o + 13) +. cx *. ix +. cy *. iy +. cz *. iz
+    end
+  end
+  -- apply impulse (jx, jy, jz) to body k at arm r, to the velocities at [vo] (7: real, or a pseudo set laid out the same)
+  pfn apply(st : NativeFloatArr, k : Int, vo : Int, rx : Float, ry : Float, rz : Float, jx : Float, jy : Float, jz : Float) : NativeFloatArr do
+    if k < 0 do st
+    else
+      let o = k * 32
+      let im = cget(st, o + 13)
+      let tx = ry *. jz -. rz *. jy
+      let ty = rz *. jx -. rx *. jz
+      let tz = rx *. jy -. ry *. jx
+      let ax = cget(st, o + 14) *. tx +. cget(st, o + 15) *. ty +. cget(st, o + 16) *. tz
+      let ay = cget(st, o + 17) *. tx +. cget(st, o + 18) *. ty +. cget(st, o + 19) *. tz
+      let az = cget(st, o + 20) *. tx +. cget(st, o + 21) *. ty +. cget(st, o + 22) *. tz
+      let s1 = cset(cset(cset(st, o + vo, cget(st, o + vo) +. jx *. im), o + vo + 1, cget(st, o + vo + 1) +. jy *. im), o + vo + 2, cget(st, o + vo + 2) +. jz *. im)
+      cset(cset(cset(s1, o + vo + 3, cget(s1, o + vo + 3) +. ax), o + vo + 4, cget(s1, o + vo + 4) +. ay), o + vo + 5, cget(s1, o + vo + 5) +. az)
+    end
+  end
+
+  pfn ival(v : Float) : Int do float_to_int(v) end
+  pfn restitution() : Float do 0.0 end
+
+  pfn prep_go(cs : NativeFloatArr, st : NativeFloatArr, c : Int, nc : Int, dt : Float, slop : Float, push_max : Float) : NativeFloatArr do
+    if c >= nc do cs
+    else
+      let o = c * 28
+      let a = ival(cget(cs, o))
+      let b = ival(cget(cs, o + 1))
+      let rax = cget(cs, o + 2)
+      let ray = cget(cs, o + 3)
+      let raz = cget(cs, o + 4)
+      let rbx = cget(cs, o + 5)
+      let rby = cget(cs, o + 6)
+      let rbz = cget(cs, o + 7)
+      let nx = cget(cs, o + 8)
+      let ny = cget(cs, o + 9)
+      let nz = cget(cs, o + 10)
+      let gap = cget(cs, o + 11)
+      -- tangents
+      let (t1x, t1y, t1z) = if absf(ny) < 0.9 do
+          let l = Math.sqrt(nz *. nz +. nx *. nx)
+          (nz /. l, 0.0, 0.0 -. nx /. l)
+        else
+          let l = Math.sqrt(ny *. ny +. nz *. nz)
+          (0.0, 0.0 -. nz /. l, ny /. l)
+        end
+      let t2x = ny *. t1z -. nz *. t1y
+      let t2y = nz *. t1x -. nx *. t1z
+      let t2z = nx *. t1y -. ny *. t1x
+      let kn = mass_term(st, a, rax, ray, raz, nx, ny, nz) +. mass_term(st, b, rbx, rby, rbz, nx, ny, nz)
+      let k1 = mass_term(st, a, rax, ray, raz, t1x, t1y, t1z) +. mass_term(st, b, rbx, rby, rbz, t1x, t1y, t1z)
+      let k2 = mass_term(st, a, rax, ray, raz, t2x, t2y, t2z) +. mass_term(st, b, rbx, rby, rbz, t2x, t2y, t2z)
+      let (vax, vay, vaz) = point_vel(st, a, rax, ray, raz)
+      let (vbx, vby, vbz) = point_vel(st, b, rbx, rby, rbz)
+      let vn = (vax -. vbx) *. nx +. (vay -. vby) *. ny +. (vaz -. vbz) *. nz
+      let tgt0 = if gap > 0.0 do 0.0 -. gap /. dt else 0.0 end
+      let tgt = if gap <= slop && vn < -1.0 do maxf(tgt0, 0.0 -. restitution() *. vn) else tgt0 end
+      let bias = if gap < 0.0 -. slop do minf(0.8 *. (0.0 -. gap -. slop) /. dt, push_max /. dt) else 0.0 end
+      let c1 = cset(cset(cset(cset(cset(cs, o + 12, tgt), o + 13, bias), o + 14, if kn > 0.0 do 1.0 /. kn else 0.0 end), o + 15, t1x), o + 16, t1y)
+      let c2 = cset(cset(cset(cset(cset(c1, o + 17, t1z), o + 18, t2x), o + 19, t2y), o + 20, t2z), o + 21, if k1 > 0.0 do 1.0 /. k1 else 0.0 end)
+      prep_go(cset(cset(c2, o + 22, if k2 > 0.0 do 1.0 /. k2 else 0.0 end), o + 27, vn), st, c + 1, nc, dt, slop, push_max)
+    end
+  end
+
+  doc "Work out each contact's targets, masses and tangents from the bodies as they move now."
+  fn prepare(cs : NativeFloatArr, nc : Int, st : NativeFloatArr, dt : Float, scale : Float) : NativeFloatArr do
+    prep_go(cs, st, 0, nc, dt, 0.02 *. scale, 0.2 *. scale)
+  end
+
+  -- one contact's normal and friction impulses
+  pfn solve_one(cs : NativeFloatArr, st : NativeFloatArr, c : Int, mu : Float) : (NativeFloatArr, NativeFloatArr) do
+    let o = c * 28
+    let a = ival(cget(cs, o))
+    let b = ival(cget(cs, o + 1))
+    let rax = cget(cs, o + 2)
+    let ray = cget(cs, o + 3)
+    let raz = cget(cs, o + 4)
+    let rbx = cget(cs, o + 5)
+    let rby = cget(cs, o + 6)
+    let rbz = cget(cs, o + 7)
+    let nx = cget(cs, o + 8)
+    let ny = cget(cs, o + 9)
+    let nz = cget(cs, o + 10)
+    let (vax, vay, vaz) = point_vel(st, a, rax, ray, raz)
+    let (vbx, vby, vbz) = point_vel(st, b, rbx, rby, rbz)
+    let dvx = vax -. vbx
+    let dvy = vay -. vby
+    let dvz = vaz -. vbz
+    let vn = dvx *. nx +. dvy *. ny +. dvz *. nz
+    let ln = cget(cs, o + 23)
+    let ln2 = maxf(0.0, ln +. (cget(cs, o + 12) -. vn) *. cget(cs, o + 14))
+    let dl = ln2 -. ln
+    let s1 = apply(apply(st, a, 7, rax, ray, raz, nx *. dl, ny *. dl, nz *. dl), b, 7, rbx, rby, rbz, 0.0 -. nx *. dl, 0.0 -. ny *. dl, 0.0 -. nz *. dl)
+    let cs1 = cset(cs, o + 23, ln2)
+    -- friction, bounded by mu times the normal impulse
+    let lim = mu *. ln2
+    let fric = fn (cs0, s0, ti, ki, li) ->
+      let tx = cget(cs0, o + ti)
+      let ty = cget(cs0, o + ti + 1)
+      let tz = cget(cs0, o + ti + 2)
+      let (ax, ay, az) = point_vel(s0, a, rax, ray, raz)
+      let (bx, yb, bz) = point_vel(s0, b, rbx, rby, rbz)
+      let vt = (ax -. bx) *. tx +. (ay -. yb) *. ty +. (az -. bz) *. tz
+      let lt = cget(cs0, o + li)
+      let lt2 = clampf(lt -. vt *. cget(cs0, o + ki), 0.0 -. lim, lim)
+      let d = lt2 -. lt
+      (cset(cs0, o + li, lt2), apply(apply(s0, a, 7, rax, ray, raz, tx *. d, ty *. d, tz *. d), b, 7, rbx, rby, rbz, 0.0 -. tx *. d, 0.0 -. ty *. d, 0.0 -. tz *. d))
+    match fric(cs1, s1, 15, 21, 24) do
+      (cs2, s2) -> fric(cs2, s2, 18, 22, 25)
+    end
+  end
+
+  pfn pass(cs : NativeFloatArr, st : NativeFloatArr, c : Int, nc : Int, mu : Float) : (NativeFloatArr, NativeFloatArr) do
+    if c >= nc do (cs, st)
+    else
+      match solve_one(cs, st, c, mu) do
+        (cs2, st2) -> pass(cs2, st2, c + 1, nc, mu)
+      end
+    end
+  end
+
+  doc "[iters] passes of normal and friction impulses over every contact, in order; returns the contacts (with their impulses) and the bodies' new velocities."
+  fn solve(cs : NativeFloatArr, nc : Int, st : NativeFloatArr, iters : Int, mu : Float) : (NativeFloatArr, NativeFloatArr) do
+    if iters <= 0 do (cs, st)
+    else
+      match pass(cs, st, 0, nc, mu) do
+        (cs2, st2) -> solve(cs2, nc, st2, iters - 1, mu)
+      end
+    end
+  end
+
+  -- push-out: the same passes on the pseudo velocities, kept in a second state
+  -- array laid out like the first (only 7-12 are written)
+  pfn push_one(cs : NativeFloatArr, st : NativeFloatArr, ps : NativeFloatArr, c : Int) : (NativeFloatArr, NativeFloatArr) do
+    let o = c * 28
+    let bias = cget(cs, o + 13)
+    if bias <= 0.0 do (cs, ps)
+    else
+      let a = ival(cget(cs, o))
+      let b = ival(cget(cs, o + 1))
+      let rax = cget(cs, o + 2)
+      let ray = cget(cs, o + 3)
+      let raz = cget(cs, o + 4)
+      let rbx = cget(cs, o + 5)
+      let rby = cget(cs, o + 6)
+      let rbz = cget(cs, o + 7)
+      let nx = cget(cs, o + 8)
+      let ny = cget(cs, o + 9)
+      let nz = cget(cs, o + 10)
+      let (vax, vay, vaz) = point_vel(ps, a, rax, ray, raz)
+      let (vbx, vby, vbz) = point_vel(ps, b, rbx, rby, rbz)
+      let vn = (vax -. vbx) *. nx +. (vay -. vby) *. ny +. (vaz -. vbz) *. nz
+      let lp = cget(cs, o + 26)
+      let lp2 = maxf(0.0, lp +. (bias -. vn) *. cget(cs, o + 14))
+      let d = lp2 -. lp
+      -- the pseudo set borrows the real set's masses: apply reads 13-22 from [st]
+      (cset(cs, o + 26, lp2), apply_with(st, ps, a, rax, ray, raz, nx *. d, ny *. d, nz *. d, b, rbx, rby, rbz))
+    end
+  end
+  pfn apply_with(st : NativeFloatArr, ps : NativeFloatArr, a : Int, rax : Float, ray : Float, raz : Float, jx : Float, jy : Float, jz : Float, b : Int, rbx : Float, rby : Float, rbz : Float) : NativeFloatArr do
+    pseudo_apply(st, pseudo_apply(st, ps, a, rax, ray, raz, jx, jy, jz), b, rbx, rby, rbz, 0.0 -. jx, 0.0 -. jy, 0.0 -. jz)
+  end
+  pfn pseudo_apply(st : NativeFloatArr, ps : NativeFloatArr, k : Int, rx : Float, ry : Float, rz : Float, jx : Float, jy : Float, jz : Float) : NativeFloatArr do
+    if k < 0 do ps
+    else
+      let o = k * 32
+      let im = cget(st, o + 13)
+      let tx = ry *. jz -. rz *. jy
+      let ty = rz *. jx -. rx *. jz
+      let tz = rx *. jy -. ry *. jx
+      let ax = cget(st, o + 14) *. tx +. cget(st, o + 15) *. ty +. cget(st, o + 16) *. tz
+      let ay = cget(st, o + 17) *. tx +. cget(st, o + 18) *. ty +. cget(st, o + 19) *. tz
+      let az = cget(st, o + 20) *. tx +. cget(st, o + 21) *. ty +. cget(st, o + 22) *. tz
+      let p1 = cset(cset(cset(ps, o + 7, cget(ps, o + 7) +. jx *. im), o + 8, cget(ps, o + 8) +. jy *. im), o + 9, cget(ps, o + 9) +. jz *. im)
+      cset(cset(cset(p1, o + 10, cget(p1, o + 10) +. ax), o + 11, cget(p1, o + 11) +. ay), o + 12, cget(p1, o + 12) +. az)
+    end
+  end
+  pfn push_pass(cs : NativeFloatArr, st : NativeFloatArr, ps : NativeFloatArr, c : Int, nc : Int) : (NativeFloatArr, NativeFloatArr) do
+    if c >= nc do (cs, ps)
+    else
+      match push_one(cs, st, ps, c) do
+        (cs2, ps2) -> push_pass(cs2, st, ps2, c + 1, nc)
+      end
+    end
+  end
+
+  doc "The push-out velocities that take penetrating contacts out over [iters] passes, in a state array the size of [st] (only velocity and spin are set)."
+  fn push_out(cs : NativeFloatArr, nc : Int, st : NativeFloatArr, nbodies : Int, iters : Int) : NativeFloatArr do
+    push_iter(cs, nc, st, NativeArray.make_float(nbodies * 32 + 1, 0.0), iters)
+  end
+  pfn push_iter(cs : NativeFloatArr, nc : Int, st : NativeFloatArr, ps : NativeFloatArr, iters : Int) : NativeFloatArr do
+    if iters <= 0 do ps
+    else
+      match push_pass(cs, st, ps, 0, nc) do
+        (cs2, ps2) -> push_iter(cs2, nc, st, ps2, iters - 1)
+      end
+    end
+  end
+end
