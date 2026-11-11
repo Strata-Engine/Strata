@@ -22,7 +22,7 @@ for t in native/tests/*_test.c; do
   [ -f "$t" ] || continue
   b="native/tests/bin/$(basename "$t" .c)"
   # the text test links the text module and what it stands on
-  extra=""; [ "$(basename "$t")" = "text_test.c" ] && extra="native/strata_text.c -I/opt/homebrew/include/freetype2 -L/opt/homebrew/lib -lfreetype"
+  extra=""; [ "$(basename "$t")" = "text_test.c" ] && extra="native/strata_text.c -Inative/sheenbidi/Headers -I/opt/homebrew/include/freetype2 -I/opt/homebrew/include/harfbuzz -L/opt/homebrew/lib -lfreetype -lharfbuzz"
   if ! cc -O1 -Wall -Wextra -Inative -o "$b" "$t" $extra > .verify.log 2>&1 || ! "$b" >> .verify.log 2>&1; then
     echo "FAIL: $t"; tail -20 .verify.log; exit 1
   fi

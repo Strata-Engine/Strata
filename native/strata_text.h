@@ -49,7 +49,7 @@ void st_set_raster_budget(int64_t microseconds);       /* a frame; default 1000 
 /* 0 glyphs in the atlas, 1 glyphs that waited since the last frame began,
  * 2 evictions so far, 3 atlas bytes held, 4 glyphs rasterised so far,
  * 5 microseconds spent rasterising this frame, 6 layouts worked out so far
- * (a cached one is not counted). */
+ * (a cached one is not counted), 7 runs HarfBuzz has shaped so far. */
 double st_stat(int64_t which);
 
 /* Lay out [n] bytes of UTF-8 and write its glyphs as quads, in device pixels.
@@ -68,6 +68,13 @@ double st_stat(int64_t which);
 int64_t st_text(int64_t font, const char *s, int64_t n, const float *params, float *out, int64_t cap);
 /* The same layout, measured: out = width, height, lines, first line's ascent. */
 int64_t st_measure(int64_t font, const char *s, int64_t n, const float *params, float out[4]);
+/* A line as shaped: per glyph six floats, in visual order, left to right:
+ * font handle, glyph index, x and y (pixels from the line's left end and
+ * baseline), cluster (the byte its characters start at), advance. Text is
+ * put in visual order (the Unicode bidirectional algorithm), split into runs
+ * of one direction, script and font, and each run shaped by HarfBuzz.
+ * Returns the glyph count, at most [cap]. */
+int64_t st_shape(int64_t font, const char *s, int64_t n, double size, float *out, int64_t cap);
 /* Quads st_text can write for [n] bytes at most. */
 int64_t st_text_bound(int64_t n);
 

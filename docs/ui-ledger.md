@@ -56,3 +56,21 @@ Plan: `docs/2026-11-11-ui-text-plan.md`. Branch `interface`, cut from `swim`
   quads) is built and handed over in 0.09 ms unchanged, 0.11 ms when every
   line changes each frame. The viewer's display adds 0.03 ms of GPU time at
   2560 x 1600 and one draw call.
+- HarfBuzz 15.1 installed from Homebrew (it also upgraded FreeType to 2.15).
+- Ruling: the plan's Arabic test expected four glyphs for the word; the test
+  font gives four, in visual order with clusters running backwards, and the
+  test also checks the first letter is not its stand-alone form.
+- Ruling: a font file loaded twice gives the same handle, so a game (and the
+  viewer's script sheet) can ask for a font each frame. Cost if wrong: a
+  file changed on disk is not reloaded.
+- Ruling: each script line on the sheet uses its own font with Latin as the
+  fallback. One list holding Chinese before Japanese would draw the shared
+  characters of the Japanese line in the Chinese font: Strata has no
+  language tag to choose by. Stated in the README.
+- Ruling: the plan's comparison of each script line against macOS's own
+  rendering was not done: it needs an app opened on the owner's screen. The
+  lines were checked by eye for joining, direction and the number's order.
+  Cost if wrong: a shaping fault a native reader would see is unnoticed.
+- Measured: the six-script sheet's 121 glyphs arrive over 6 frames, each
+  frame spending 1.0 to 1.08 ms drawing glyphs against the 1 ms budget.
+- Tasks 5 and 6: complete. C tests 91 checks.

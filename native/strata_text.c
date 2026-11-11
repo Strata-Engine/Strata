@@ -17,6 +17,11 @@
 #include FT_FREETYPE_H
 #include FT_ADVANCES_H
 #include FT_MODULE_H
+#include <hb.h>
+#include <hb-ot.h>
+/* SheenBidi (native/sheenbidi, Apache 2.0) is compiled into this file: see the end. */
+#define SB_CONFIG_UNITY
+#include <SheenBidi/SheenBidi.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -62,7 +67,9 @@ int64_t st_utf8_count(const char *s, int64_t n) {
 
 typedef struct {
     FT_Face face;
+    hb_font_t *hb;             /* the same file, for shaping; positions come back in font units */
     unsigned char *owned;      /* the file's bytes, when loaded from a path */
+    char *path; int64_t face_index;   /* where it came from: loading the same file again gives the same handle */
     int nfb; int fb[MAX_FALLBACKS];
     float asc, desc, lineh;    /* in ems */
 } Font;
@@ -76,7 +83,7 @@ typedef struct {
 
 typedef struct { int16_t page, x, y, cw, ch; } Cell;
 typedef struct { int16_t page, y, h, x; } Shelf;
-typedef struct { int32_t font; uint32_t gid; float x; int32_t line; } LGlyph;
+typedef struct { int32_t font; uint32_t gid; float x, y; int32_t line, cluster; float adv; } LGlyph;   /* x, y, adv in ems; cluster: the byte its characters start at */
 typedef struct {
     uint64_t hash, used; int font, n, align; float wrap_em;
     char *bytes; LGlyph *g; int ng, nlines; float width;
@@ -94,7 +101,8 @@ static struct {
     struct { int16_t page, x, y, w, h; } dirty[DIRTY_CAP]; uint32_t dirty_head, dirty_n;
     uint64_t frame;
     int64_t budget_us; double spent_us;
-    uint64_t waited, evictions, rasterised, layouts;
+    uint64_t waited, evictions, rasterised, layouts, shapes;
+    hb_buffer_t *hb;
     Layout cache[LC_CAP]; uint64_t tick;
 } T;
 
@@ -113,7 +121,8 @@ static int init(void) {
     T.init = -1;
     if (FT_Init_FreeType(&T.lib)) return 0;
     T.glyphs = calloc(GL_CAP, sizeof(Glyph));
-    if (!T.glyphs) return 0;
+    T.hb = hb_buffer_create();
+    if (!T.glyphs || !T.hb || !hb_buffer_allocation_successful(T.hb)) return 0;
     T.page_px = 2048; T.max_pages = 4; T.budget_us = 1000; T.nfonts = 1; T.frame = 1;
     T.init = 1;
     if (font_from(strata_default_font, strata_default_font_len, 0, NULL) != 1) { T.init = -1; return 0; }
@@ -144,9 +153,15 @@ static int64_t font_from(const unsigned char *bytes, int64_t n, int64_t face_ind
     FT_Face face;
     if (FT_New_Memory_Face(T.lib, bytes, (FT_Long)n, (FT_Long)(face_index < 0 ? 0 : face_index), &face)) return 0;
     if (!FT_IS_SCALABLE(face) || face->units_per_EM == 0 || FT_Set_Pixel_Sizes(face, 0, ST_EM)) { FT_Done_Face(face); return 0; }
+    hb_blob_t *blob = hb_blob_create((const char *)bytes, (unsigned)n, HB_MEMORY_MODE_READONLY, NULL, NULL);
+    hb_face_t *hface = hb_face_create(blob, (unsigned)(face_index < 0 ? 0 : face_index));
+    hb_font_t *hfont = hb_font_create(hface);
+    hb_face_destroy(hface); hb_blob_destroy(blob);
+    if (!hfont || hfont == hb_font_get_empty()) { FT_Done_Face(face); return 0; }
+    hb_ot_font_set_funcs(hfont);
     Font *f = &T.fonts[T.nfonts];
     memset(f, 0, sizeof *f);
-    f->face = face; f->owned = owned;
+    f->face = face; f->hb = hfont; f->owned = owned;
     float upem = (float)face->units_per_EM;
     f->asc = (float)face->ascender / upem; f->desc = -(float)face->descender / upem; f->lineh = (float)face->height / upem;
     if (f->lineh < f->asc + f->desc) f->lineh = f->asc + f->desc;
@@ -161,6 +176,7 @@ int64_t st_font_load_mem(const unsigned char *bytes, int64_t n, int64_t face_ind
 int64_t st_font_load(const char *path, int64_t nbytes, int64_t face_index) {
     if (!init() || !path || nbytes <= 0 || nbytes > 4095) return 0;
     char p[4096]; memcpy(p, path, (size_t)nbytes); p[nbytes] = 0;
+    for (int i = 2; i < T.nfonts; i++) if (T.fonts[i].path && T.fonts[i].face_index == face_index && strcmp(T.fonts[i].path, p) == 0) return i;
     FILE *fp = fopen(p, "rb");
     if (!fp) return 0;
     unsigned char *bytes = NULL; long size = 0;
@@ -172,6 +188,7 @@ int64_t st_font_load(const char *path, int64_t nbytes, int64_t face_index) {
     if (!bytes) return 0;
     int64_t h = font_from(bytes, size, face_index, bytes);
     if (!h) free(bytes);
+    else { T.fonts[h].path = strdup(p); T.fonts[h].face_index = face_index; }
     return h;
 }
 
@@ -216,6 +233,7 @@ double st_stat(int64_t which) {
         case 4: return (double)T.rasterised;
         case 5: return T.spent_us;
         case 6: return (double)T.layouts;
+        case 7: return (double)T.shapes;
         default: return -1.0;
     }
 }
@@ -465,41 +483,34 @@ static int is_cjk(uint32_t c) {
     return (c >= 0x2e80 && c <= 0x9fff) || (c >= 0xac00 && c <= 0xd7af) || (c >= 0xf900 && c <= 0xfaff) || (c >= 0xff00 && c <= 0xffef) || (c >= 0x20000 && c <= 0x3ffff);
 }
 static int is_space(uint32_t c) { return c == ' ' || c == '\t' || c == 0x3000; }
-
-/* One character of a paragraph, ready to place: the font that has it, its glyph and advance (ems). */
-typedef struct { uint32_t cp; int font; uint32_t gid; float adv; } Item;
-
-/* The font of [font]'s list that has [cp]: the one the run is already in if
- * it has it, then the font itself, then its fallbacks. The font itself if
- * none has: its missing-glyph box is drawn. */
-static int font_for(int font, int running, uint32_t cp, uint32_t *gid) {
-    Font *f = &T.fonts[font];
-    uint32_t g;
-    if (running && (g = FT_Get_Char_Index(T.fonts[running].face, cp))) { *gid = g; return running; }
-    if ((g = FT_Get_Char_Index(f->face, cp))) { *gid = g; return font; }
-    for (int i = 0; i < f->nfb; i++)
-        if ((g = FT_Get_Char_Index(T.fonts[f->fb[i]].face, cp))) { *gid = g; return f->fb[i]; }
-    *gid = 0;
-    return font;
+static int is_mark(uint32_t c) {
+    SBGeneralCategory k = SBCodepointGetGeneralCategory(c);
+    return k == SBGeneralCategoryMN || k == SBGeneralCategoryMC || k == SBGeneralCategoryME;
 }
 
-static float advance_em(int font, uint32_t gid) {
-    FT_Fixed adv = 0;
-    FT_Face face = T.fonts[font].face;
-    if (FT_Get_Advance(face, gid, FT_LOAD_NO_SCALE, &adv)) return 0.0f;
-    return (float)adv / (float)face->units_per_EM;
+/* The font of [font]'s list that has [cp]: the one the run is already in if
+ * it has it and [stay] (a space or a mark belongs with what it follows),
+ * then the font itself, then its fallbacks. The font itself if none has:
+ * its missing-glyph box is drawn. */
+static int font_for(int font, int running, int stay, uint32_t cp) {
+    Font *f = &T.fonts[font];
+    if (stay && running && FT_Get_Char_Index(T.fonts[running].face, cp)) return running;
+    if (FT_Get_Char_Index(f->face, cp)) return font;
+    for (int i = 0; i < f->nfb; i++)
+        if (FT_Get_Char_Index(T.fonts[f->fb[i]].face, cp)) return f->fb[i];
+    return font;
 }
 
 typedef struct { LGlyph *g; int n, cap; float *line_w; int nlines, line_cap; int failed; } Build;
 
-static void build_glyph(Build *b, int font, uint32_t gid, float x) {
+static void build_glyph(Build *b, int font, uint32_t gid, float x, float y, int cluster, float adv) {
     if (b->n == b->cap) {
         int cap = b->cap ? b->cap * 2 : 64;
         LGlyph *grown = realloc(b->g, sizeof(LGlyph) * (size_t)cap);
         if (!grown) { b->failed = 1; return; }
         b->g = grown; b->cap = cap;
     }
-    b->g[b->n++] = (LGlyph){ font, gid, x, b->nlines };
+    b->g[b->n++] = (LGlyph){ font, gid, x, y, b->nlines, cluster, adv };
 }
 
 static void build_line_end(Build *b, float width) {
@@ -512,36 +523,128 @@ static void build_line_end(Build *b, float width) {
     b->line_w[b->nlines++] = width;
 }
 
-/* Place items [a, e) as one line. */
-static void place_line(Build *b, const Item *it, int a, int e) {
-    float x = 0.0f, inked = 0.0f;
-    for (int i = a; i < e; i++) {
-        build_glyph(b, it[i].font, it[i].gid, x);
-        x += it[i].adv;
-        if (!is_space(it[i].cp)) inked = x;
-    }
-    build_line_end(b, inked);
+/* A paragraph being laid out: its bytes, and per byte the font and script of
+ * the character it belongs to. */
+typedef struct {
+    const char *s; int n;          /* the paragraph, no newline in it */
+    int base;                      /* its offset in the whole text: what clusters are counted from */
+    uint8_t *font, *script;        /* per byte */
+    SBParagraphRef para;
+} Para;
+
+/* Shape bytes [a, e) of the paragraph, one font, one script, one direction.
+ * The buffer holds the glyphs in visual order, left to right. */
+static void shape_run(const Para *p, int a, int e, int rtl) {
+    hb_buffer_reset(T.hb);
+    hb_buffer_add_utf8(T.hb, p->s, p->n, (unsigned)a, e - a);
+    hb_buffer_set_direction(T.hb, rtl ? HB_DIRECTION_RTL : HB_DIRECTION_LTR);
+    hb_buffer_set_script(T.hb, hb_script_from_iso15924_tag(SBScriptGetUnicodeTag(p->script[a])));
+    hb_buffer_set_language(T.hb, hb_language_get_default());
+    hb_shape(T.fonts[p->font[a]].hb, T.hb, NULL, 0);
+    T.shapes++;
 }
 
-/* Break one paragraph (no newlines in it) into lines no wider than
- * [wrap_em], at spaces and around CJK characters; a word that is too long
- * breaks where it must. */
-static void place_paragraph(Build *b, const Item *it, int n, float wrap_em) {
-    int start = 0;
-    if (n == 0) { build_line_end(b, 0.0f); return; }
-    while (start < n) {
-        float w = 0.0f;
-        int brk = -1, end = n;
-        for (int i = start; i < n; i++) {
-            if (wrap_em > 0.0f && !is_space(it[i].cp) && w + it[i].adv > wrap_em && i > start) { end = brk > start ? brk : i; break; }
-            w += it[i].adv;
-            if (i + 1 < n && (is_space(it[i].cp) || is_cjk(it[i].cp) || is_cjk(it[i + 1].cp)) && !is_space(it[i + 1].cp)) brk = i + 1;
+/* Walk bytes [ls, le) of the paragraph in visual order, as runs of one
+ * direction, script and font, shaping each. With [b], place the glyphs as a
+ * line, leaving out everything from byte [trim] on (the spaces at its end);
+ * with [adv], add each glyph's advance to its cluster's first byte. */
+static void visit_line(const Para *p, int ls, int le, int trim, Build *b, float *adv) {
+    SBLineRef line = le > ls ? SBParagraphCreateLine(p->para, (SBUInteger)ls, (SBUInteger)(le - ls)) : NULL;
+    float x = 0.0f;
+    if (line) {
+        const SBRun *runs = SBLineGetRunsPtr(line);
+        SBUInteger nruns = SBLineGetRunCount(line);
+        for (SBUInteger r = 0; r < nruns; r++) {
+            int ra = (int)runs[r].offset, re = ra + (int)runs[r].length, rtl = runs[r].level & 1;
+            /* pieces of one font and script; a right-to-left run's pieces are met last first */
+            int at = rtl ? re : ra;
+            while (rtl ? at > ra : at < re) {
+                int a, e;
+                if (rtl) { e = at; a = e - 1; while (a > ra && p->font[a - 1] == p->font[e - 1] && p->script[a - 1] == p->script[e - 1]) a--; at = a; }
+                else { a = at; e = a + 1; while (e < re && p->font[e] == p->font[a] && p->script[e] == p->script[a]) e++; at = e; }
+                shape_run(p, a, e, rtl);
+                unsigned count = 0;
+                hb_glyph_info_t *info = hb_buffer_get_glyph_infos(T.hb, &count);
+                hb_glyph_position_t *pos = hb_buffer_get_glyph_positions(T.hb, &count);
+                float upem = (float)T.fonts[p->font[a]].face->units_per_EM;
+                for (unsigned i = 0; i < count; i++) {
+                    int cl = (int)info[i].cluster;
+                    float ga = (float)pos[i].x_advance / upem;
+                    if (adv && cl >= 0 && cl < p->n) adv[cl] += ga;
+                    if (b && cl < trim) {
+                        build_glyph(b, p->font[a], info[i].codepoint, x + (float)pos[i].x_offset / upem, (float)pos[i].y_offset / upem, p->base + cl, ga);
+                        x += ga;
+                    }
+                }
+            }
         }
-        place_line(b, it, start, end);
-        start = end;
-        while (start < n && end < n && is_space(it[start].cp)) start++;      /* a wrapped line does not begin with the space it broke at */
-        if (start >= n && end < n) break;
+        SBLineRelease(line);
     }
+    if (b) build_line_end(b, x);
+}
+
+/* Lay out one paragraph: mark fonts, scripts and directions, break it into
+ * lines no wider than [wrap_em] (at spaces and around CJK characters; a
+ * word that is too long breaks at a cluster), and place each line. */
+static void place_paragraph(Build *b, int font, const char *s, int n, int base, float wrap_em) {
+    if (n == 0) { build_line_end(b, 0.0f); return; }
+    Para p = { s, n, base, malloc((size_t)n), malloc((size_t)n), NULL };
+    uint32_t *cps = malloc(sizeof(uint32_t) * (size_t)n);
+    float *adv = wrap_em > 0.0f ? calloc((size_t)n, sizeof(float)) : NULL;
+    SBCodepointSequence seq = { SBStringEncodingUTF8, (void *)s, (SBUInteger)n };
+    SBAlgorithmRef alg = SBAlgorithmCreate(&seq);
+    p.para = alg ? SBAlgorithmCreateParagraph(alg, 0, (SBUInteger)n, SBLevelDefaultLTR) : NULL;
+    SBScriptLocatorRef loc = SBScriptLocatorCreate();
+    if (!p.font || !p.script || !cps || (wrap_em > 0.0f && !adv) || !p.para || !loc) b->failed = 1;
+    else {
+        /* per byte: the character's code point (at its first byte, 0 after), font and script */
+        int running = 0;
+        for (int i = 0; i < n;) {
+            uint32_t cp = 0; int len = utf8_next((const unsigned char *)s, n, i, &cp);
+            if (!len) { len = 1; cp = 0xfffd; }
+            int f = font_for(font, running, is_space(cp) || is_mark(cp), cp);
+            if (!is_space(cp)) running = f;
+            for (int k = 0; k < len; k++) { p.font[i + k] = (uint8_t)f; cps[i + k] = k == 0 ? cp : 0; }
+            i += len;
+        }
+        memset(p.script, SBScriptZYYY, (size_t)n);
+        SBScriptLocatorLoadCodepoints(loc, &seq);
+        const SBScriptAgent *agent = SBScriptLocatorGetAgent(loc);
+        while (SBScriptLocatorMoveNext(loc))
+            for (SBUInteger k = 0; k < agent->length && agent->offset + k < (SBUInteger)n; k++) p.script[agent->offset + k] = (uint8_t)agent->script;
+        if (wrap_em <= 0.0f) {
+            int trim = n;
+            while (trim > 0 && (cps[trim - 1] == 0 ? 0 : is_space(cps[trim - 1]))) trim--;
+            visit_line(&p, 0, n, trim, b, NULL);
+        } else {
+            visit_line(&p, 0, n, n, NULL, adv);             /* how wide each cluster is */
+            int start = 0;
+            while (start < n) {
+                float w = 0.0f;
+                int brk = -1, end = n;
+                for (int i = start; i < n; i++) {
+                    if (cps[i] == 0) continue;
+                    int space = is_space(cps[i]);
+                    /* a break is allowed before a character that follows a space, or with CJK on either side of the gap */
+                    if (i > start && !space && adv[i] > 0.0f) {
+                        int prev = i - 1; while (prev > start && cps[prev] == 0) prev--;
+                        if (is_space(cps[prev]) || is_cjk(cps[prev]) || is_cjk(cps[i])) brk = i;
+                    }
+                    if (!space && adv[i] > 0.0f && w + adv[i] > wrap_em && i > start) { end = brk > start ? brk : i; break; }
+                    w += adv[i];
+                }
+                int trim = end;
+                while (trim > start && (cps[trim - 1] == 0 ? 0 : is_space(cps[trim - 1]))) trim--;
+                visit_line(&p, start, end, trim, b, NULL);
+                start = end;
+                while (start < n && end < n && cps[start] != 0 && is_space(cps[start])) start++;    /* a wrapped line does not begin with the space it broke at */
+            }
+        }
+    }
+    if (loc) SBScriptLocatorRelease(loc);
+    if (p.para) SBParagraphRelease(p.para);
+    if (alg) SBAlgorithmRelease(alg);
+    free(p.font); free(p.script); free(cps); free(adv);
 }
 
 static uint64_t fnv(const char *s, int64_t n, uint64_t h) { for (int64_t i = 0; i < n; i++) { h ^= (unsigned char)s[i]; h *= 0x100000001b3ull; } return h; }
@@ -556,29 +659,21 @@ static const Layout *layout(int font, const char *s, int64_t n, float wrap_em, i
     for (int probe = 0; probe < 4; probe++) {
         Layout *l = &T.cache[(h + (uint64_t)probe) % LC_CAP];
         if (l->hash == h && l->font == font && l->n == (int)n && l->align == align && l->wrap_em == wrap_em && (n == 0 || memcmp(l->bytes, s, (size_t)n) == 0)) { l->used = ++T.tick; return l; }
-        if (!slot || l->hash == 0 || (slot->hash != 0 && l->used < slot->used)) slot = (slot && slot->hash == 0) ? slot : l;
+        if (!slot || (slot->hash != 0 && (l->hash == 0 || l->used < slot->used))) slot = l;
     }
     T.layouts++;
     Build b = { 0 };
-    Item *it = n > 0 ? malloc(sizeof(Item) * (size_t)n) : NULL;
-    int valid = st_utf8_count(s, n) >= 0 && (n == 0 || it);
+    int valid = n < (1 << 24) && st_utf8_count(s, n) >= 0;
     if (valid) {
-        int count = 0, running = 0;
-        for (int64_t i = 0; i <= n;) {
-            uint32_t cp = '\n'; int len = 1;
-            if (i < n) len = utf8_next((const unsigned char *)s, n, i, &cp);
-            if (cp == '\n') { place_paragraph(&b, it, count, wrap_em); count = 0; running = 0; }
-            else if (cp != '\r') {
-                Item *t = &it[count++];
-                t->cp = cp;
-                t->font = font_for(font, is_space(cp) ? running : 0, cp, &t->gid);
-                if (!is_space(cp)) running = t->font == font ? 0 : t->font;
-                t->adv = advance_em(t->font, t->gid);
-            }
-            i += len;
+        int64_t from = 0;
+        for (int64_t i = 0; i <= n; i++) {
+            if (i < n && s[i] != '\n') continue;
+            int64_t to = i;
+            if (to > from && s[to - 1] == '\r') to--;
+            place_paragraph(&b, font, s + from, (int)(to - from), (int)from, wrap_em);
+            from = i + 1;
         }
     }
-    free(it);
     if (!valid || b.failed) { b.n = 0; b.nlines = 0; }
     if (b.nlines == 0) { free(b.line_w); b.line_w = NULL; b.line_cap = 0; build_line_end(&b, 0.0f); }
     float width = 0.0f;
@@ -592,6 +687,19 @@ static const Layout *layout(int font, const char *s, int64_t n, float wrap_em, i
     slot->g = b.g; slot->ng = b.n; slot->nlines = b.nlines ? b.nlines : 1; slot->width = width; slot->used = ++T.tick;
     free(b.line_w);
     return slot;
+}
+
+int64_t st_shape(int64_t font, const char *s, int64_t n, double size, float *out, int64_t cap) {
+    if (!init() || !out || cap <= 0 || n <= 0 || !s || !(size > 0.0)) return 0;
+    const Layout *l = layout(font_ok(font), s, n, 0.0f, 0);
+    if (!l) return 0;
+    int64_t count = l->ng < cap ? l->ng : cap;
+    for (int64_t i = 0; i < count; i++) {
+        float *o = out + i * 6;
+        o[0] = (float)l->g[i].font; o[1] = (float)l->g[i].gid; o[2] = l->g[i].x * (float)size; o[3] = l->g[i].y * (float)size;
+        o[4] = (float)l->g[i].cluster; o[5] = l->g[i].adv * (float)size;
+    }
+    return count;
 }
 
 int64_t st_text_bound(int64_t n) { return n > 0 ? 3 * n : 0; }
@@ -649,7 +757,7 @@ int64_t st_text(int64_t font, const char *s, int64_t n, const float *params, flo
             if (st_glyph(l->g[i].font, l->g[i].gid, big, g) != 1 || g[3] <= 0.0f) continue;
             float *q = out + written * ST_QUAD_FLOATS;
             q[0] = pl.left + l->g[i].x * size + g[5] * scale + dx;
-            q[1] = pl.base + (float)l->g[i].line * pl.lh - g[6] * scale + dy;
+            q[1] = pl.base + (float)l->g[i].line * pl.lh - l->g[i].y * size - g[6] * scale + dy;
             q[2] = q[0] + g[3] * scale; q[3] = q[1] + g[4] * scale;
             q[4] = g[1]; q[5] = g[2]; q[6] = g[1] + g[3]; q[7] = g[2] + g[4];
             q[8] = rgba[0]; q[9] = rgba[1]; q[10] = rgba[2]; q[11] = rgba[3];
@@ -712,3 +820,6 @@ int64_t stm_measure(int64_t font, void *s, void *params, void *out) {
 }
 double stm_stat(int64_t which) { return st_stat(which); }
 void stm_set_raster_budget(int64_t us) { st_set_raster_budget(us); }
+
+/* ── SheenBidi, compiled in ───────────────────────────────────────────────── */
+#include "sheenbidi/Source/SheenBidi.c"

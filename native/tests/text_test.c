@@ -39,6 +39,7 @@ static void test_fonts(void) {
     int64_t f = load("test/fonts/NotoSans-Latin.ttf");
     CHECK(f > 1, "a font file loads");
     CHECK(load("test/fonts/no-such-font.ttf") == 0, "a missing file fails");
+    CHECK(load("test/fonts/NotoSans-Latin.ttf") == f, "loading the same file again gives the same handle");
     CHECK(load("test/fonts/OFL.txt") == 0, "a text file is not a font");
     /* the first 3000 bytes of a font: its table directory with most tables cut off */
     FILE *in = fopen("test/fonts/NotoSans-Latin.ttf", "rb"), *out = fopen("native/tests/bin/truncated.ttf", "wb");
@@ -222,6 +223,51 @@ static void test_fallback(void) {
     CHECK(m[2] == 1 && m2[2] == 2, "a CJK run breaks between characters");
 }
 
+static int64_t shape(int64_t font, const char *s, float *out, int64_t cap) { return st_shape(font, s, (int64_t)strlen(s), 100.0, out, cap); }
+
+static void test_shaping(void) {
+    int64_t latin = st_font_default(), arabic = load("test/fonts/NotoSansArabic-Sub.ttf");
+    CHECK(arabic > 0, "the Arabic font loads");
+    float g[6 * 32], a1[6], v1[6];
+    /* kerning: AV is narrower set together than its letters set apart */
+    CHECK(shape(latin, "AV", g, 32) == 2 && shape(latin, "A", a1, 1) == 1 && shape(latin, "V", v1, 1) == 1, "AV is two glyphs");
+    CHECK(g[5] + g[11] < a1[5] + v1[5] - 1.0f, "AV is kerned");
+    CHECK(shape(latin, "fi", g, 32) == 1, "fi is one glyph: a ligature");
+    CHECK(shape(latin, "f i", g, 32) == 3, "f, space, i are three");
+    /* Arabic: joined forms, right to left */
+    const char *salam = "\xd8\xb3\xd9\x84\xd8\xa7\xd9\x85";
+    float iso[6];
+    CHECK(shape(arabic, salam, g, 32) == 4, "the word is four glyphs");
+    CHECK(g[4] > g[10] && g[10] > g[16] && g[16] > g[22], "in visual order the clusters run backwards: right to left");
+    CHECK(g[2] < g[8] && g[8] < g[14] && g[14] < g[20], "and the glyphs are placed left to right");
+    CHECK(st_shape(arabic, salam, 2, 100.0, iso, 1) == 1 && iso[1] != g[19], "the first letter in the word is not its form standing alone: it is joined");
+    /* a number inside a right-to-left line reads left to right */
+    const char *count = "\xd8\xb9\xd8\xaf\xd8\xaf 120";
+    int64_t n = shape(arabic, count, g, 32);
+    float x1 = -1, x2 = -1, x0 = -1, xa = -1;
+    for (int64_t i = 0; i < n; i++) { int c = (int)g[i * 6 + 4]; if (c == 7) x1 = g[i * 6 + 2]; if (c == 8) x2 = g[i * 6 + 2]; if (c == 9) x0 = g[i * 6 + 2]; if (c == 0) xa = g[i * 6 + 2]; }
+    CHECK(n == 7, "three letters, a space, three digits");
+    CHECK(x1 >= 0 && x1 < x2 && x2 < x0, "1, 2, 0 stay in that order, left to right");
+    CHECK(xa > x0, "and the word's first letter is to the right of the number");
+    /* nothing to shape */
+    CHECK(shape(latin, "", g, 32) == 0, "an empty string shapes to nothing");
+    CHECK(st_shape(latin, "a\xc3\x28", 3, 100.0, g, 32) == 0, "invalid UTF-8 shapes to nothing");
+    /* the same line is shaped once */
+    double before = st_stat(7);
+    shape(latin, "shape me once", g, 32); shape(latin, "shape me once", g, 32);
+    CHECK(st_stat(7) == before + 1, "the same line reaches HarfBuzz once");
+    /* Hebrew and Devanagari at least come out whole */
+    int64_t he = load("test/fonts/NotoSansHebrew-Sub.ttf"), hi = load("test/fonts/NotoSansDevanagari-Sub.ttf");
+    CHECK(he > 0 && shape(he, "\xd7\xa9\xd7\x9c\xd7\x95\xd7\x9d", g, 32) == 4 && g[4] > g[22], "Hebrew is right to left");
+    n = hi > 0 ? shape(hi, "\xe0\xa4\xa8\xe0\xa4\xae\xe0\xa4\xb8\xe0\xa5\x8d\xe0\xa4\xa4\xe0\xa5\x87", g, 32) : 0;
+    int notdef = 0; for (int64_t i = 0; i < n; i++) if (g[i * 6 + 1] == 0) notdef = 1;
+    CHECK(n >= 3 && n <= 5 && !notdef, "Devanagari joins its conjunct: six characters, fewer glyphs, none missing");
+    /* a long word still breaks without splitting a cluster: wrap the Devanagari word narrowly */
+    float p[ST_PARAMS], m[4]; params(p, 32, 20);
+    st_measure(hi, "\xe0\xa4\xa8\xe0\xa4\xae\xe0\xa4\xb8\xe0\xa5\x8d\xe0\xa4\xa4\xe0\xa5\x87", 18, p, m);
+    CHECK(m[2] >= 2 && m[2] <= 4, "a narrow wrap breaks the word at clusters, not at every character");
+}
+
 int main(void) {
     test_utf8();
     test_fonts();
@@ -229,6 +275,7 @@ int main(void) {
     test_budget_and_pressure();
     test_layout();
     test_fallback();
+    test_shaping();
     printf("text_test: %d checks, %d failed\n", checks, fails);
     return fails ? 1 : 0;
 }
