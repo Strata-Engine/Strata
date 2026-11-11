@@ -1,0 +1,506 @@
+-- Physics: rigid voxel bodies stepped against the world. Worlds here are
+-- stone below y = 0 and air above, with the chunks x -2..1, y -1..2,
+-- z -2..1 loaded (voxels x -64..63, y -32..95, z -64..63). Block 1 stone.
+mod Strata.Test.Physics do
+
+  needs IO.Clock      -- charged to every test module once any uses Check.all (GAPS S3)
+  needs IO.Process
+  import Test
+  alias Strata.Physics as Ph
+  alias Strata.Body as Bg
+  alias Strata.Blocks as B
+  alias Strata.World as Wd
+  alias Strata.Edit as Ed
+  alias Strata.Coord as Cd
+  alias Strata.Chunk as C
+  alias Strata.Math.Quat as Qt
+
+  pfn reg() : Strata.Blocks.Registry do
+    match B.register(B.empty(), B.def()) do
+      Ok((r1, _)) -> r1
+      Err(_) -> B.empty()
+    end
+  end
+  pfn flat() : Strata.Terrain.Gen do
+    Strata.Terrain.gen(fn (k, seed) -> if Cd.ky(k) < 0 do C.uniform(1) else C.uniform(0) end)
+  end
+  pfn load(w : Strata.World.World, cx : Int, cy : Int, cz : Int) : Strata.World.World do
+    let k = Cd.key(cx, cy, cz)
+    Wd.insert(w, k, Strata.Terrain.run(Wd.terrain(w), k, Wd.seed(w)))
+  end
+  pfn load_box(w : Strata.World.World, i : Int) : Strata.World.World do
+    if i >= 64 do w else load_box(load(w, i % 4 - 2, (i / 4) % 4 - 1, i / 16 - 2), i + 1) end
+  end
+  pfn world_at(scale : Float) : Strata.World.World do load_box(Wd.new(reg(), flat(), 7, scale), 0) end
+  pfn world() : Strata.World.World do world_at(1.0) end
+
+  pfn phys_at(scale : Float) : Strata.Physics.Physics do Ph.new(reg(), Ph.with_scale(Ph.config(), scale)) end
+  pfn phys() : Strata.Physics.Physics do phys_at(1.0) end
+
+  pfn fill(g : Strata.Body.Grid, sx : Int, sy : Int, sz : Int, i : Int) : Strata.Body.Grid do
+    if i >= sx * sy * sz do g else fill(Bg.grid_set(g, i % sx, (i / sx) % sy, i / (sx * sy), 1), sx, sy, sz, i + 1) end
+  end
+  pfn block(sx : Int, sy : Int, sz : Int) : Strata.Body.Grid do fill(Bg.grid(sx, sy, sz), sx, sy, sz, 0) end
+
+  pfn absf(v : Float) : Float do if v < 0.0 do 0.0 -. v else v end end
+  pfn near(a : Float, b : Float, tol : Float) : Bool do absf(a -. b) <= tol end
+  pfn deg(d : Float) : Float do d *. 3.14159265358979 /. 180.0 end
+
+  pfn add(p : Strata.Physics.Physics, g : Strata.Body.Grid, x : Float, y : Float, z : Float, q : Strata.Math.Quat.Quat) : (Strata.Physics.Physics, Int) do
+    Ph.add(p, g, x, y, z, q, Ph.dynamic())
+  end
+
+  type Sim = Sim(Strata.Physics.Physics, Strata.World.World)
+  pfn sp(s : Sim) : Strata.Physics.Physics do match s do Sim(p, _) -> p end end
+  pfn sw(s : Sim) : Strata.World.World do match s do Sim(_, w) -> w end end
+  pfn run(s : Sim, n : Int) : Sim do
+    if n <= 0 do s
+    else
+      match s do
+        Sim(p, w) ->
+          match Ph.step_world(p, w, Nil) do
+            (p2, o) -> run(Sim(p2, Ed.world(o)), n - 1)
+          end
+      end
+    end
+  end
+  pfn py(s : Sim, id : Int) : Float do match Ph.position(sp(s), id) do (_, y, _) -> y end end
+  pfn px(s : Sim, id : Int) : Float do match Ph.position(sp(s), id) do (x, _, _) -> x end end
+
+  -- the lowest centre height over n steps
+  pfn lowest(s : Sim, id : Int, n : Int, low : Float) : (Sim, Float) do
+    if n <= 0 do (s, low)
+    else
+      let s2 = run(s, 1)
+      let y = py(s2, id)
+      lowest(s2, id, n - 1, if y < low do y else low end)
+    end
+  end
+
+  -- step until the body first stops falling (vertical velocity no longer below -0.5), at most n steps
+  pfn until_contact(s : Sim, id : Int, n : Int) : Sim do
+    if n <= 0 do s
+    else
+      let s2 = run(s, 1)
+      match Ph.velocity(sp(s2), id) do
+        (_, vy, _) -> if vy > -0.5 && py(s2, id) < 3.0 do s2 else until_contact(s2, id, n - 1) end
+      end
+    end
+  end
+  pfn highest(s : Sim, id : Int, n : Int, high : Float) : Float do
+    if n <= 0 do high
+    else
+      let s2 = run(s, 1)
+      let y = py(s2, id)
+      highest(s2, id, n - 1, if y > high do y else high end)
+    end
+  end
+
+  -- an impact event against the world anywhere in n steps
+  pfn saw_impact(s : Sim, n : Int) : Bool do
+    if n <= 0 do false
+    else
+      let s2 = run(s, 1)
+      if List.any(Ph.events(sp(s2)), fn e -> Ph.ev_kind(e) == 0 && Ph.ev_other(e) == -1 && Ph.ev_size(e) > 0.0) do true
+      else saw_impact(s2, n - 1) end
+    end
+  end
+
+  describe "Physics free fall" do
+    test "a body falls by semi-implicit Euler" do
+      match add(phys(), block(2, 2, 2), 0.0, 50.0, 0.0, Qt.identity()) do
+        (p, id) ->
+          let s = run(Sim(p, world()), 30)
+          let dt = 1.0 /. 60.0
+          match Ph.velocity(sp(s), id) do
+            (_, vy, _) -> Test.assert_true(near(vy, 0.0 -. 9.8 *. 30.0 /. 60.0, 0.000000001), "v = -g n dt")
+          end
+          Test.assert_true(near(py(s, id), 51.0 -. 9.8 *. dt *. dt *. 30.0 *. 31.0 /. 2.0, 0.000000001), "drop = g dt2 n (n + 1) / 2")
+      end
+    end
+  end
+
+  describe "Physics against the ground" do
+    test "a crate dropped from 5 m lands, never sinks in, and sleeps" do
+      match add(phys(), block(2, 2, 2), 0.0, 5.0, 0.0, Qt.identity()) do
+        (p, id) ->
+          match lowest(Sim(p, world()), id, 240, 100.0) do
+            (s, low) ->
+              Test.assert_true(low >= 0.75, "never more than a quarter voxel into the ground")
+              Test.assert_true(near(py(s, id), 1.0, 0.05), "resting with its bottom at y = 0")
+              Test.assert_true(Ph.is_asleep(sp(s), id), "asleep by step 240")
+              let s2 = run(s, 120)
+              Test.assert_true(py(s2, id) == py(s, id) && px(s2, id) == px(s, id), "and does not move afterwards")
+          end
+      end
+    end
+
+    test "a column released tilted topples and lies down" do
+      -- a 1 x 4 column tips over once its centre is past its edge: beyond 14 degrees
+      match add(phys(), block(1, 4, 1), 0.0, 0.01, 0.0, Qt.from_axis_angle(0.0, 0.0, 1.0, deg(25.0))) do
+        (p, id) ->
+          let s = run(Sim(p, world()), 300)
+          let up = Strata.Math.Vec3.y(Qt.rotate(Ph.rotation(sp(s), id), Strata.Math.Vec3.new(0.0, 1.0, 0.0)))
+          Test.assert_true(absf(up) < 0.1, "the long axis is horizontal")
+          Test.assert_true(Ph.is_asleep(sp(s), id), "and at rest")
+      end
+    end
+
+    test "friction stops a sliding crate in about v2 / (2 mu g)" do
+      match add(phys(), block(2, 2, 2), 0.0, 0.0, 0.0, Qt.identity()) do
+        (p, id) ->
+          let s = run(Sim(p, world()), 60)
+          let x0 = px(s, id)
+          match Ph.position(sp(s), id) do
+            (cx, cy, cz) ->
+              let s2 = run(Sim(Ph.push(sp(s), id, cx, cy, cz, 5.0 *. 16000.0, 0.0, 0.0), sw(s)), 300)
+              let d = px(s2, id) -. x0
+              Test.assert_true(d >= 1.7 && d <= 2.6, "slid between 1.7 and 2.6 m")
+          end
+      end
+    end
+
+    test "a dropped crate hardly bounces" do
+      match add(phys(), block(2, 2, 2), 0.0, 5.0, 0.0, Qt.identity()) do
+        (p, id) ->
+          let s = until_contact(Sim(p, world()), id, 200)
+          let y0 = py(s, id)
+          Test.assert_true(highest(s, id, 120, y0) -. y0 <= 0.25, "rises at most 0.25 m after first contact")
+      end
+    end
+  end
+
+  pfn tunnel_case(scale : Float) : Bool do
+    -- a wall two voxels thick at voxel x 0 and 1; a one-voxel cube 50 voxels away, no gravity, at 30 m/s
+    let w = Ed.world(Ed.fill_box(world_at(scale), 0, 30, -10, 1, 70, 10, 1))
+    let p0 = Ph.new(reg(), Ph.with_gravity(Ph.with_scale(Ph.config(), scale), 0.0))
+    match add(p0, block(1, 1, 1), 0.0 -. 50.0 *. scale, 50.0 *. scale, 0.0, Qt.identity()) do
+      (p, id) ->
+        match Ph.position(p, id) do
+          (cx, cy, cz) ->
+            let m = 2000.0 *. scale *. scale *. scale
+            let s = run(Sim(Ph.push(p, id, cx, cy, cz, 30.0 *. m, 0.0, 0.0), w), 60)
+            px(s, id) < 0.0
+        end
+    end
+  end
+
+  describe "Physics does not tunnel" do
+    test "a cube at 30 m/s stops at a wall two voxels thick, at 1 m" do
+      Test.assert_true(tunnel_case(1.0), "still on the near side")
+    end
+    test "and at 10 cm" do
+      Test.assert_true(tunnel_case(0.1), "still on the near side")
+    end
+  end
+
+  -- centres within 0.1 m: 2% of the 5 m fall
+  pfn close(a : Sim, ia : Int, b : Sim, ib : Int) : Bool do
+    match (Ph.position(sp(a), ia), Ph.position(sp(b), ib)) do
+      ((ax, ay, az), (bx, yb, bz)) -> near(ax, bx, 0.1) && near(ay, yb, 0.1) && near(az, bz, 0.1)
+    end
+  end
+
+  describe "Physics at two scales" do
+    test "scale does not change the motion" do
+      let q = Qt.from_axis_angle(0.0, 0.0, 1.0, deg(10.0))
+      match (add(phys_at(1.0), block(2, 2, 2), 0.0, 5.0, 0.0, q), add(phys_at(0.1), block(20, 20, 20), 0.0, 5.0, 0.0, q)) do
+        ((pa, ia), (pb, ib)) ->
+          let sa = run(Sim(pa, world_at(1.0)), 30)
+          let sb = run(Sim(pb, world_at(0.1)), 30)
+          Test.assert_true(close(sa, ia, sb, ib), "step 30, in the air")
+          let sa2 = run(sa, 30)
+          let sb2 = run(sb, 30)
+          Test.assert_true(close(sa2, ia, sb2, ib), "step 60, landing")
+          Test.assert_true(close(run(sa2, 60), ia, run(sb2, 60), ib), "step 120, at rest")
+      end
+    end
+  end
+
+  describe "Physics wakes and the loaded edge" do
+    test "an edit under a sleeping body wakes it" do
+      match add(phys(), block(2, 2, 2), 0.0, 0.0, 0.0, Qt.identity()) do
+        (p, id) ->
+          let s = run(Sim(p, world()), 120)
+          Test.assert_true(Ph.is_asleep(sp(s), id), "asleep on the ground")
+          let o = Ed.fill_box(sw(s), -1, -4, -1, 2, -1, 2, 0)
+          let y0 = py(s, id)
+          let s2 = run(Sim(Ph.wake(sp(s), o), Ed.world(o)), 60)
+          Test.assert_true(py(s2, id) <= y0 -. 0.5, "fell into the hole")
+      end
+    end
+
+    test "a body at the loaded edge sleeps there, and falls once the chunk loads" do
+      -- only chunk (0, 0, 0) is loaded: below it is unloaded
+      let w0 = load(Wd.new(reg(), flat(), 7, 1.0), 0, 0, 0)
+      match add(phys(), block(2, 2, 2), 4.0, 0.0, 4.0, Qt.identity()) do
+        (p, id) ->
+          let s = run(Sim(p, w0), 60)
+          Test.assert_true(Ph.is_asleep(sp(s), id), "asleep at the edge")
+          Test.assert_true(near(py(s, id), 1.0, 0.000001), "and has not fallen")
+          let w1 = Wd.insert(sw(s), Cd.key(0, -1, 0), C.uniform(0))
+          let s2 = run(Sim(sp(s), w1), 60)
+          Test.assert_true(py(s2, id) <= 0.5, "falls into the chunk once it is loaded")
+      end
+    end
+
+    test "a body outlives its chunk" do
+      match add(phys(), block(2, 2, 2), 0.0, 0.0, 0.0, Qt.identity()) do
+        (p, id) ->
+          let s = run(Sim(p, world()), 120)
+          let y0 = py(s, id)
+          let s2 = run(Sim(sp(s), Wd.unload(sw(s), Cd.key(0, 0, 0))), 60)
+          Test.assert_true(Ph.exists(sp(s2), id) && Ph.is_asleep(sp(s2), id), "kept, asleep")
+          Test.assert_true(py(s2, id) == y0, "and unmoved")
+          let s3 = run(Sim(sp(s2), load(sw(s2), 0, 0, 0)), 30)
+          Test.assert_true(py(s3, id) == y0, "unchanged when the chunk is back")
+      end
+    end
+  end
+
+  describe "Physics events" do
+    test "landing makes an impact against the world" do
+      match add(phys(), block(2, 2, 2), 0.0, 5.0, 0.0, Qt.identity()) do
+        (p, _) -> Test.assert_true(saw_impact(Sim(p, world()), 120), "an impact of kind 0 with the world, size above 0")
+      end
+    end
+  end
+
+
+  -- ── Bodies against bodies ────────────────────────────────────────────────
+  pfn crate_at(p : Strata.Physics.Physics, x : Float, y : Float, z : Float) : (Strata.Physics.Physics, Int) do add(p, block(2, 2, 2), x, y, z, Qt.identity()) end
+  pfn ids_of(p : Strata.Physics.Physics, n : Int, x : Float, y : Float, z : Float, dy : Float, acc : List(Int)) : (Strata.Physics.Physics, List(Int)) do
+    if n <= 0 do (p, reverse(acc))
+    else
+      match crate_at(p, x, y, z) do
+        (p2, id) -> ids_of(p2, n - 1, x, y +. dy, z, dy, Cons(id, acc))
+      end
+    end
+  end
+  pfn pos_list(p : Strata.Physics.Physics, ids : List(Int)) : List((Float, Float, Float)) do List.map(ids, fn i -> Ph.position(p, i)) end
+  pfn moved_less(a : List((Float, Float, Float)), b : List((Float, Float, Float)), tol : Float) : Bool do
+    match (a, b) do
+      (Cons((ax, ay, az), at), Cons((bx, yb, bz), bt)) -> near(ax, bx, tol) && near(ay, yb, tol) && near(az, bz, tol) && moved_less(at, bt, tol)
+      _ -> true
+    end
+  end
+  pfn all_asleep(p : Strata.Physics.Physics, ids : List(Int)) : Bool do List.all(ids, fn i -> Ph.is_asleep(p, i)) end
+  -- steps until no impact for [quiet] steps or [n] run out: (sim, step of the last impact)
+  pfn last_impact(s : Sim, n : Int, step : Int, last : Int) : (Sim, Int) do
+    if n <= 0 do (s, last)
+    else
+      let s2 = run(s, 1)
+      let hit = List.any(Ph.events(sp(s2)), fn e -> Ph.ev_kind(e) == 0)
+      last_impact(s2, n - 1, step + 1, if hit do step + 1 else last end)
+    end
+  end
+  pfn run_f(s : Sim, n : Int, focus : List((Float, Float, Float))) : Sim do
+    if n <= 0 do s
+    else
+      match s do
+        Sim(p, w) ->
+          match Ph.step_world(p, w, focus) do
+            (p2, o) -> run_f(Sim(p2, Ed.world(o)), n - 1, focus)
+          end
+      end
+    end
+  end
+  -- the most bodies that moved in one step over n steps
+  pfn most_moved(s : Sim, ids : List(Int), n : Int, most : Int) : (Sim, Int) do
+    if n <= 0 do (s, most)
+    else
+      let before = pos_list(sp(s), ids)
+      let s2 = run(s, 1)
+      let after = pos_list(sp(s2), ids)
+      let k = List.length(List.filter(List.zip(before, after), fn pr -> differs(pr)))
+      most_moved(s2, ids, n - 1, if k > most do k else most end)
+    end
+  end
+  pfn lay_row(p : Strata.Physics.Physics, n : Int, i : Int, acc : List(Int)) : (Strata.Physics.Physics, List(Int)) do
+    if i >= n do (p, reverse(acc))
+    else
+      match crate_at(p, int_to_float((i % 20) * 3 - 30), 20.0 +. int_to_float(i / 20) * 3.0, int_to_float(((i / 20) % 5) * 3 - 10)) do
+        (p2, id) -> lay_row(p2, n, i + 1, Cons(id, acc))
+      end
+    end
+  end
+
+  pfn same_column(c : Strata.Edit.Change, cs : List(Strata.Edit.Change)) : Bool do
+    match (Ed.low(c), cs) do
+      ((x, _, z), Cons(h, _)) -> match Ed.low(h) do (hx, _, hz) -> x == hx && z == hz end
+      _ -> false
+    end
+  end
+  pfn faster(s : Sim, id : Int, v : Float) : Bool do match Ph.velocity(sp(s), id) do (x, y, z) -> x *. x +. y *. y +. z *. z > v *. v end end
+  pfn differs(pr : ((Float, Float, Float), (Float, Float, Float))) : Bool do match pr do ((ax, ay, az), (bx, yb, bz)) -> ax != bx || ay != yb || az != bz end end
+  pfn heap_one(p : Strata.Physics.Physics, i : Int) : Strata.Physics.Physics do
+    match add(p, block(2, 2, 2), int_to_float(i % 3) *. 0.7, 2.0 +. int_to_float(i) *. 2.2, int_to_float(i % 2) *. 0.6, Qt.from_axis_angle(0.0, 1.0, 0.0, int_to_float(i) *. 0.4)) do
+      (p2, _) -> p2
+    end
+  end
+
+  describe "Physics bodies against bodies" do
+    test "a stack of three crates stands" do
+      match ids_of(phys(), 3, 0.0, 0.0, 0.0, 2.0, Nil) do
+        (p, ids) ->
+          let s = run(Sim(p, world()), 300)
+          let settled = pos_list(sp(s), ids)
+          let s2 = run(s, 300)
+          Test.assert_true(moved_less(settled, pos_list(sp(s2), ids), 0.05), "each moved under 0.05 voxel after settling")
+          Test.assert_true(all_asleep(sp(s2), ids), "all asleep")
+          match Ph.position(sp(s2), 3) do (_, y, _) -> Test.assert_true(y > 4.5, "the top crate is still on top") end
+      end
+    end
+
+    test "a heap of ten crates settles and sleeps" do
+      let p = List.fold_left(List.range(0, 10), phys(), fn (p0, i) -> heap_one(p0, i))
+      let ids = List.range(1, 11)
+      match last_impact(Sim(p, world()), 900, 0, 0) do
+        (_, last) ->
+          let s = run(Sim(p, world()), last + 180)
+          Test.assert_true(all_asleep(sp(s), ids), "all asleep within 180 steps of the last impact")
+          let still = pos_list(sp(s), ids)
+          Test.assert_true(moved_less(still, pos_list(sp(run(s, 120)), ids), 0.0), "and nothing moves after")
+      end
+    end
+
+    test "two overlapping crates separate gently" do
+      let p0 = Ph.new(reg(), Ph.with_gravity(Ph.config(), 0.0))
+      match crate_at(p0, 0.0, 10.0, 0.0) do
+        (p1, a) ->
+          match crate_at(p1, 1.5, 10.0, 0.0) do
+            (p2, b) ->
+              let s = run(Sim(p2, world()), 10)
+              Test.assert_true(px(s, b) -. px(s, a) >= 1.97, "apart within 10 steps (to within the contact slop of 0.02 voxel)")
+              Test.assert_false(faster(s, a, 2.0) || faster(s, b, 2.0), "neither faster than 2 m/s")
+          end
+      end
+    end
+
+    test "a body on a body that leaves wakes" do
+      match ids_of(phys(), 2, 0.0, 0.0, 0.0, 2.0, Nil) do
+        (p, ids) ->
+          let s = run(Sim(p, world()), 240)
+          Test.assert_true(all_asleep(sp(s), ids), "both asleep")
+          let y0 = py(s, 2)
+          let s2 = run(Sim(Ph.remove(sp(s), 1), sw(s)), 60)
+          Test.assert_true(py(s2, 2) <= y0 -. 0.5, "the upper one falls when the lower is removed")
+          match Ph.to_blocks(sp(s), sw(s), 1) do
+            (p3, o) ->
+              let s3 = run(Sim(p3, Ed.world(o)), 60)
+              Test.assert_false(Ph.exists(sp(s3), 1), "the lower is blocks now")
+              Test.assert_true(py(s3, 2) >= y0 -. 0.5, "and the upper rests on them")
+          end
+      end
+    end
+
+    test "the awake cap: no more than the cap move in a step, the rest wait, none is lost" do
+      -- the default cap of 256 over 300 crates behaves alike; 16 over 20 keeps the suite quick
+      match lay_row(Ph.new(reg(), Ph.with_caps(Ph.config(), 16, 4096)), 20, 0, Nil) do
+        (p, ids) ->
+          let s1 = run(Sim(p, world()), 1)
+          Test.assert_eq_int(Ph.waiting_count(sp(s1)), 4, "4 wait after the first step")
+          match most_moved(s1, ids, 20, 0) do
+            (s2, most) ->
+              Test.assert_true(most <= 16, "no step moves more than 16")
+              let s3 = run(s2, 580)
+              Test.assert_true(List.all(ids, fn i -> py(s3, i) < 1.1), "every crate has landed by step 600")
+          end
+      end
+    end
+
+    test "the total cap snaps the farthest sleeping bodies outside the view" do
+      -- twelve crates in a row along x, 4 m apart; the view looks down +x from x = 30 at the six nearest
+      let p0 = Ph.new(reg(), Ph.with_caps(Ph.config(), 256, 10))
+      match ids_of_row(p0, 12, 0, Nil) do
+        (p, ids) ->
+          let s = run_f(Sim(p, world()), 120, Cons((40.0, 1.0, 0.0), Nil))
+          Test.assert_eq_int(Ph.count(sp(s)), 10, "two snapped")
+          Test.assert_false(Ph.exists(sp(s), 1) || Ph.exists(sp(s), 2), "the two farthest from the focus")
+          Test.assert_eq_int(Strata.World.get_block(sw(s), 1, 0, 1), 1, "are blocks in the world")
+          let seen = Ph.with_view(Ph.new(reg(), Ph.with_caps(Ph.config(), 256, 10)), -10.0, 1.0, 0.0, 1.0, 0.0, 0.0, 0.5)
+          match ids_of_row(seen, 12, 0, Nil) do
+            (p2, _) ->
+              let s2 = run_f(Sim(p2, world()), 120, Cons((40.0, 1.0, 0.0), Nil))
+              Test.assert_eq_int(Ph.count(sp(s2)), 12, "with all in view none is snapped")
+              Test.assert_eq_int(Ph.over_cap(sp(s2)), 2, "two over the cap")
+          end
+      end
+    end
+
+    test "to_blocks turns a body to the nearest axis-aligned orientation" do
+      match add(phys(), block(3, 1, 1), 0.0, 0.0, 0.0, Qt.from_axis_angle(0.0, 1.0, 0.0, deg(40.0))) do
+        (p, id) ->
+          let s = run(Sim(p, world()), 120)
+          match Ph.to_blocks(sp(s), sw(s), id) do
+            (_, o) ->
+              let w = Ed.world(o)
+              let along_x = fn (x0, z0) -> Strata.World.get_block(w, x0, 0, z0) == 1 && Strata.World.get_block(w, x0 + 1, 0, z0) == 1 && Strata.World.get_block(w, x0 + 2, 0, z0) == 1
+              Test.assert_eq_int(List.length(Ed.changes(o)), 3, "three blocks written")
+              Test.assert_true(List.any(List.range(-3, 3), fn x0 -> List.any(List.range(-3, 3), fn z0 -> along_x(x0, z0))), "a bar along x")
+          end
+      end
+      match add(phys(), block(1, 3, 1), 0.0, 5.0, 0.0, Qt.from_axis_angle(1.0, 0.0, 0.0, deg(44.0))) do
+        (p, id) ->
+          match Ph.to_blocks(p, world(), id) do
+            (_, o) ->
+              let cs = Ed.changes(o)
+              Test.assert_eq_int(List.length(cs), 3, "three blocks written")
+              Test.assert_true(List.all(cs, fn c -> same_column(c, cs)), "standing along y in one column")
+          end
+      end
+    end
+  end
+
+  pfn ids_of_row(p : Strata.Physics.Physics, n : Int, i : Int, acc : List(Int)) : (Strata.Physics.Physics, List(Int)) do
+    if i >= n do (p, reverse(acc))
+    else
+      match crate_at(p, int_to_float(i * 4) -. 3.0, 0.0, 0.0) do
+        (p2, id) -> ids_of_row(p2, n, i + 1, Cons(id, acc))
+      end
+    end
+  end
+
+  -- a world shaped by a 16 x 16 heightmap (heights 0..6) and up to six crates dropped on it
+  pfn shaped(w : Strata.World.World, hs : List(Int), i : Int) : Strata.World.World do
+    match hs do
+      Nil -> w
+      Cons(h, t) -> if i >= 256 do w else shaped(if h > 0 do Ed.world(Ed.fill_box(w, i % 16, 0, i / 16, i % 16, h - 1, i / 16, 1)) else w end, t, i + 1) end
+    end
+  end
+  pfn dropped(p : Strata.Physics.Physics, bs : List(((Int, Int), (Int, Int))), n : Int) : Strata.Physics.Physics do
+    match bs do
+      Nil -> p
+      Cons(((x, z), (h, sz)), t) ->
+        if n >= 6 do p
+        else
+          match Ph.add(p, block(sz, sz, sz), int_to_float(x / 3), 8.0 +. int_to_float(n) *. 3.0, int_to_float(z / 3), Qt.from_axis_angle(0.0, 1.0, 0.0, int_to_float(h) *. 0.3), Ph.dynamic()) do
+            (p2, _) -> dropped(p2, t, n + 1)
+          end
+        end
+    end
+  end
+  pfn same_hashes(a : Sim, b : Sim, n : Int) : Bool do
+    if n <= 0 do true
+    else
+      let a2 = run(a, 1)
+      let b2 = run(b, 1)
+      if Ph.hash(sp(a2)) != Ph.hash(sp(b2)) do false else same_hashes(a2, b2, n - 1) end
+    end
+  end
+
+  pfn det_prop(c : (List(Int), List(((Int, Int), (Int, Int))))) : Bool do
+    match c do
+      (hs, bs) ->
+        let w = shaped(world(), hs, 0)
+        let p = dropped(phys(), bs, 0)
+        same_hashes(Sim(p, w), Sim(p, w), 120)
+    end
+  end
+
+  describe "Physics determinism" do
+    test "two runs give equal hashes at every step" do
+      Check.all_with(Gen.tuple2(Gen.list(Gen.int(0, 6)), Gen.list(Gen.tuple2(Gen.tuple2(Gen.int(0, 13), Gen.int(0, 13)), Gen.tuple2(Gen.int(0, 3), Gen.int(1, 3))))), fn c -> det_prop(c), { Check.default_config() with num_runs: 8 })
+    end
+  end
+end

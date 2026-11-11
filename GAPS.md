@@ -108,7 +108,9 @@ no helper involved). So `k >= 0 && NativeArray.get_int(bs, k) != ...`
 traps with "index -1 out of bounds" when k is -1 (met in `Strata.Erosion`'s
 pass test). Never guard a read, or anything else that can trap or is
 costly, with `&&` or `||`; use `if k < 0 do false else ... end`. A
-suite-wide audit of existing `&&`/`||` guards is worth doing.
+suite-wide audit of existing `&&`/`||` guards is worth doing. Met again in
+`Strata.Contact.solid` (physics branch): a window read guarded by `&&` died
+with "index -11 out of bounds".
 
 ## S17: extern functions with the same March name in two modules collide
 
@@ -131,3 +133,26 @@ same name in two modules is reported only as a hint ("Constructor `Leaf` is
 defined by multiple types") when it is reported at all. Workaround:
 constructor names are unique across the library; `Strata.Acoustics`'s job is
 `Listening`, since `Strata.Fluid` has a `Job`.
+## S19: a record field typed by a short type name another module also defines breaks a consumer
+
+`Strata.Physics` declared `type Event = ...` and a record
+`type Physics = { ..., events : List(Event) }`. The library typechecked and
+its tests passed, but the viewer, which also uses `Strata.Fluid.Event`,
+failed `forge check` with "expected `Strata.Stream.Stream` but got
+`Stream`" at fluid calls that have nothing to do with physics. A field
+typed `Int` in the same place, or an `Event` type used outside a record,
+did not trigger it. Workaround: a type named in a record field gets a name
+no other module uses (`PhysEvent`).
+The same symptom as S18, from a type name rather than a constructor; the
+workaround is the same: names unique across the library. Physics also
+renamed `View` to `Sight` (Strata.Fluid has a `View`).
+
+## S20: three parser traps met while writing Strata.Physics
+
+- A record literal, or an expression ending in one, followed by a line
+  that opens with `(` is read as a call of the record: `let b = { ... }`
+  then `(p2, id)` on the next line failed with "this is not a function".
+  Workaround: end the block with a named call (`with_id(p2, id)`).
+- `f(x).field` is a parse error. Workaround: an accessor function.
+- A `match` inside a one-line lambda, as an argument (`fn c -> match ... end`),
+  is a parse error. Workaround: a named function.
