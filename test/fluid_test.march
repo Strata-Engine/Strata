@@ -1,0 +1,263 @@
+-- Fluid: finite water that falls, spreads toward a way down, is taken by a
+-- sink, and comes to rest. Worlds here are stone below y = 0 and air above,
+-- shaped by edits; block ids: 1 stone, 2..9 water (one eighth .. full), 10 a
+-- sink.
+mod FluidTest do
+  needs IO.Clock      -- charged to every test module once any uses Check.all (GAPS S3)
+  needs IO.Process
+
+  alias Strata.World as Wf
+  alias Strata.Edit as Ef
+  alias Strata.Coord as Cf
+  alias Strata.Chunk as Chf
+  alias Strata.Blocks as Bf
+  alias Strata.Fluid as F
+
+  pfn flat() : Strata.Terrain.Gen do
+    Strata.Terrain.gen(fn (k, seed) -> if Cf.ky(k) < 0 do Chf.uniform(1) else Chf.uniform(0) end)
+  end
+  pfn reg() : Strata.Blocks.Registry do
+    match Bf.register(Bf.empty(), Bf.def()) do
+      Ok((r1, _)) ->
+        match Bf.register_fluid(r1, Bf.with_collide(Bf.with_layer(Bf.with_opacity(Bf.def(), Strata.Blocks.SeeThrough), Strata.Blocks.Translucent), false)) do
+          Ok((r2, _)) ->
+            match Bf.register(r2, Bf.def()) do
+              Ok((r3, _)) -> r3
+              Err(_) -> r2
+            end
+          Err(_) -> r1
+        end
+      Err(_) -> Bf.empty()
+    end
+  end
+  pfn load(w : Strata.World.World, cx : Int, cy : Int, cz : Int) : Strata.World.World do
+    let k = Cf.key(cx, cy, cz)
+    Wf.insert(w, k, Strata.Terrain.run(Wf.terrain(w), k, Wf.seed(w)))
+  end
+  -- the 4 x 4 x 4 box of chunks -2..1 on each axis: voxels -64..63
+  pfn load_box(w : Strata.World.World, i : Int) : Strata.World.World do
+    if i >= 64 do w else load_box(load(w, i % 4 - 2, (i / 4) % 4 - 2, i / 16 - 2), i + 1) end
+  end
+  pfn fresh() : Strata.World.World do load_box(Wf.new(reg(), flat(), 7, 1.0), 0) end
+  pfn fluid() : Strata.Fluid.Fluid do F.new(reg(), Cons((2, F.flowing()), Cons((10, F.sink()), Nil))) end
+
+  pfn box(w : Strata.World.World, x0 : Int, y0 : Int, z0 : Int, x1 : Int, y1 : Int, z1 : Int, id : Int) : Strata.World.World do
+    Ef.world(Ef.fill_box(w, x0, y0, z0, x1, y1, z1, id))
+  end
+  pfn put(w : Strata.World.World, x : Int, y : Int, z : Int, id : Int) : Strata.World.World do Ef.world(Ef.set_block(w, x, y, z, id)) end
+  -- water of [level] eighths
+  pfn water(level : Int) : Int do 1 + level end
+
+  -- wake every cell of a box
+  pfn wake_box(f : Strata.Fluid.Fluid, x0 : Int, y0 : Int, z0 : Int, x1 : Int, y1 : Int, z1 : Int, x : Int, y : Int, z : Int) : Strata.Fluid.Fluid do
+    if y > y1 do f
+    else if z > z1 do wake_box(f, x0, y0, z0, x1, y1, z1, x0, y + 1, z0)
+    else if x > x1 do wake_box(f, x0, y0, z0, x1, y1, z1, x0, y, z + 1)
+    else wake_box(F.wake_cell(f, x, y, z), x0, y0, z0, x1, y1, z1, x + 1, y, z) end end end
+  end
+  pfn wake_all(f : Strata.Fluid.Fluid) : Strata.Fluid.Fluid do wake_box(f, -20, -8, -20, 20, 20, 20, -20, -8, -20) end
+
+  type Run = Run(Strata.Fluid.Fluid, Strata.World.World)
+  pfn run(f : Strata.Fluid.Fluid, w : Strata.World.World, n : Int) : Run do
+    if n <= 0 do Run(f, w)
+    else
+      match F.step_world(f, w, Nil) do
+        (f2, o) -> run(f2, Ef.world(o), n - 1)
+      end
+    end
+  end
+  pfn world_of(r : Run) : Strata.World.World do match r do Run(_, w) -> w end end
+  pfn fluid_of(r : Run) : Strata.Fluid.Fluid do match r do Run(f, _) -> f end end
+  -- step until nothing is active, at most n steps; the steps taken, or -1
+  pfn until_rest(f : Strata.Fluid.Fluid, w : Strata.World.World, n : Int, taken : Int) : (Run, Int) do
+    if F.active_count(f) == 0 do (Run(f, w), taken)
+    else if n <= 0 do (Run(f, w), -1)
+    else
+      match F.step_world(f, w, Nil) do
+        (f2, o) -> until_rest(f2, Ef.world(o), n - 1, taken + 1)
+      end
+    end end
+  end
+  pfn total(w : Strata.World.World) : Int do F.amount(w, reg(), -24, -8, -24, 24, 24, 24) end
+  pfn level(w : Strata.World.World, x : Int, y : Int, z : Int) : Int do
+    let id = Wf.get_block(w, x, y, z)
+    if Bf.is_fluid(reg(), id) do Bf.fill(reg(), id) else 0 end
+  end
+
+  -- no cell of the box holds flowing water over air (water at rest is supported)
+  pfn hangs(w : Strata.World.World, x : Int, y : Int, z : Int) : Bool do
+    if y > 12 do false
+    else if z > 18 do hangs(w, -2, y + 1, -2)
+    else if x > 18 do hangs(w, -2, y, z + 1)
+    else if level(w, x, y, z) > 0 && Wf.get_block(w, x, y - 1, z) == 0 do true
+    else hangs(w, x + 1, y, z) end end end end
+  end
+  -- a signature of the box's contents
+  pfn stamp(w : Strata.World.World, x : Int, y : Int, z : Int, acc : Int) : Int do
+    if y > 12 do acc
+    else if z > 18 do stamp(w, -2, y + 1, -2, acc)
+    else if x > 18 do stamp(w, -2, y, z + 1, acc)
+    else stamp(w, x + 1, y, z, int_and(acc * 31 + Wf.get_block(w, x, y, z) * (1 + x + 40 * z + 1600 * y), 1152921504606846975)) end end end
+  end
+
+  -- a 16 x 16 terrain of stone columns, heights from the list, then water cells
+  pfn columns(w : Strata.World.World, hs : List(Int), i : Int) : Strata.World.World do
+    match hs do
+      Nil -> w
+      Cons(h, t) -> if i >= 256 do w else columns(if h > 0 do box(w, i % 16, 0, i / 16, i % 16, h - 1, i / 16, 1) else w end, t, i + 1) end
+    end
+  end
+  pfn pour(w : Strata.World.World, cells : List(((Int, Int), (Int, Int)))) : Strata.World.World do
+    match cells do
+      Nil -> w
+      Cons(((x, z), (y, l)), t) -> pour(if Wf.get_block(w, x, y, z) == 0 do put(w, x, y, z, water(l)) else w end, t)
+    end
+  end
+  pfn wake_field(f : Strata.Fluid.Fluid) : Strata.Fluid.Fluid do wake_box(f, 0, 0, 0, 15, 12, 15, 0, 0, 0) end
+  -- a wall round the 16 x 16 field so nothing leaves it
+  pfn walled(w : Strata.World.World) : Strata.World.World do
+    box(box(box(box(w, -1, 0, -1, -1, 14, 16, 1), 16, 0, -1, 16, 14, 16, 1), -1, 0, -1, 16, 14, -1, 1), -1, 0, 16, 16, 14, 16, 1)
+  end
+  pfn same_sigs(fa : Strata.Fluid.Fluid, wa : Strata.World.World, fb : Strata.Fluid.Fluid, wb : Strata.World.World, n : Int) : Bool do
+    if n <= 0 do true
+    else if stamp(wa, -2, 0, -2, 7) != stamp(wb, -2, 0, -2, 7) do false
+    else
+      match F.step_world(fa, wa, Nil) do
+        (fa2, oa) ->
+          match F.step_world(fb, wb, Nil) do
+            (fb2, ob) -> same_sigs(fa2, Ef.world(oa), fb2, Ef.world(ob), n - 1)
+          end
+      end
+    end end
+  end
+  -- the walled 16 x 16 field only
+  pfn field_total(w : Strata.World.World) : Int do F.amount(w, reg(), 0, 0, 0, 15, 14, 15) end
+  pfn never_over(f : Strata.Fluid.Fluid, w : Strata.World.World, n : Int, want : Int) : Bool do
+    if n <= 0 do true
+    else if field_total(w) != want do false
+    else
+      match F.step_world(f, w, Nil) do
+        (f2, o) -> never_over(f2, Ef.world(o), n - 1, want)
+      end
+    end end
+  end
+
+  describe "Fluid rules" do
+    test "water over air falls" do
+      let w = put(fresh(), 3, 2, 3, water(8))
+      let r = run(wake_all(fluid()), w, 1)
+      Test.assert_eq_int(level(world_of(r), 3, 2, 3), 0, "it left")
+      Test.assert_eq_int(level(world_of(r), 3, 0, 3), 8, "and is two cells down, on the stone")
+      Test.assert_eq_int(total(world_of(r)), 8, "all of it")
+    end
+    test "it falls at most four cells a step" do
+      let w = put(fresh(), 3, 10, 3, water(8))
+      let r = run(wake_all(fluid()), w, 1)
+      Test.assert_eq_int(level(world_of(r), 3, 6, 3), 8, "four down after one step")
+      let r2 = run(fluid_of(r), world_of(r), 2)
+      Test.assert_eq_int(level(world_of(r2), 3, 0, 3), 8, "landed after three")
+      Test.assert_eq_int(total(world_of(r2)), 8, "all of it")
+    end
+    test "falling water fills what is below before it stays above" do
+      -- a one-cell shaft so nothing spreads
+      let pit = box(box(fresh(), 2, 0, 2, 4, 3, 4, 1), 3, 0, 3, 3, 3, 3, 0)
+      let w = put(put(pit, 3, 0, 3, water(5)), 3, 1, 3, water(8))
+      let r = run(wake_all(fluid()), w, 1)
+      Test.assert_eq_int(level(world_of(r), 3, 0, 3), 8, "the lower cell is full")
+      Test.assert_eq_int(level(world_of(r), 3, 1, 3), 5, "the rest stays above")
+    end
+    test "water on a floor spreads and keeps its amount" do
+      let w = put(fresh(), 0, 0, 0, water(8))
+      let r = run(wake_all(fluid()), w, 1)
+      Test.assert_true(level(world_of(r), 0, 0, 0) < 8, "the cell gave some away")
+      Test.assert_true(level(world_of(r), 1, 0, 0) > 0, "to a neighbour")
+      Test.assert_eq_int(total(world_of(r)), 8, "none lost")
+      match until_rest(fluid_of(r), world_of(r), 200, 0) do
+        (rr, taken) ->
+          Test.assert_true(taken >= 0, "it comes to rest")
+          Test.assert_eq_int(total(world_of(rr)), 8, "with all of it")
+      end
+    end
+    test "water with a way down nearby goes that way" do
+      -- a platform one cell high, 9 wide in x and 19 deep in z; the nearest
+      -- edge to the water on it is the +x one, 4 cells away
+      let w = put(box(fresh(), -5, 0, -9, 3, 0, 9, 1), 0, 1, 0, water(8))
+      match until_rest(wake_all(fluid()), w, 300, 0) do
+        (rr, taken) ->
+          Test.assert_true(taken >= 0, "it comes to rest")
+          Test.assert_eq_int(F.amount(world_of(rr), reg(), -5, 1, -9, 3, 1, 9), 0, "nothing is left on the platform")
+          Test.assert_eq_int(F.amount(world_of(rr), reg(), -24, 0, -24, -6, 0, 24), 0, "and none went over the far edge")
+          Test.assert_eq_int(total(world_of(rr)), 8, "all of it is on the ground")
+      end
+    end
+    test "a single eighth on wide flat ground stays where it is" do
+      let w = put(fresh(), 0, 0, 0, water(1))
+      match until_rest(wake_all(fluid()), w, 50, 0) do
+        (rr, taken) ->
+          Test.assert_true(taken >= 0 && taken <= 2, "at rest at once")
+          Test.assert_eq_int(level(world_of(rr), 0, 0, 0), 1, "unmoved")
+      end
+    end
+    test "a hollow keeps its puddle" do
+      -- a 3 x 3 pit one deep in a raised floor, water poured over its middle
+      let w = put(box(box(fresh(), -6, 0, -6, 6, 0, 6, 1), -1, 0, -1, 1, 0, 1, 0), 0, 3, 0, water(8))
+      match until_rest(wake_all(fluid()), w, 300, 0) do
+        (rr, taken) ->
+          Test.assert_true(taken >= 0, "it comes to rest")
+          Test.assert_eq_int(F.amount(world_of(rr), reg(), -1, 0, -1, 1, 0, 1), 8, "all of it in the pit")
+      end
+    end
+    test "a sink takes water above it, beside it and falling onto it, and never changes" do
+      let sea = box(fresh(), -3, 0, 5, 3, 0, 9, 10)
+      let w = put(put(put(sea, 0, 1, 7, water(8)), 0, 0, 4, water(8)), 2, 6, 7, water(8))
+      match until_rest(wake_all(fluid()), w, 100, 0) do
+        (rr, taken) ->
+          Test.assert_true(taken >= 0, "it comes to rest")
+          Test.assert_eq_int(total(world_of(rr)), 0, "all the water is gone")
+          Test.assert_eq_int(F.amount(world_of(rr), reg(), -24, -8, -24, 24, 24, 24), 0, "none anywhere")
+          Test.assert_eq_int(Wf.get_block(world_of(rr), 0, 0, 7), 10, "the sink is as it was")
+          Test.assert_eq_int(Wf.get_block(world_of(rr), 3, 0, 9), 10, "all of it")
+      end
+    end
+    test "two cells into one never overfill it" do
+      -- a shaft with a full cell either side of its mouth
+      let pit = box(box(fresh(), -3, 0, -1, 3, 4, 1, 1), 0, 0, 0, 0, 4, 0, 0)
+      let w = put(put(pit, -1, 5, 0, water(8)), 1, 5, 0, water(8))
+      Test.assert_eq_int(total(world_of(run(wake_all(fluid()), w, 7))), 16, "sixteen eighths part way")
+      match until_rest(wake_all(fluid()), w, 300, 0) do
+        (rr, taken) ->
+          Test.assert_true(taken >= 0, "it comes to rest")
+          Test.assert_eq_int(total(world_of(rr)), 16, "with sixteen")
+      end
+    end
+    test "the amount of flowing water in a box is counted in eighths" do
+      let w = put(put(fresh(), 0, 0, 0, water(3)), 1, 0, 0, water(8))
+      Test.assert_eq_int(total(w), 11, "three and eight")
+      Test.assert_eq_int(total(box(w, 4, 0, 4, 5, 0, 5, 10)), 11, "a sink is not counted")
+    end
+  end
+
+  describe "Fluid properties" do
+    test "the amount is conserved, nothing overfills, and everything comes to rest supported" do
+      Check.all(Gen.tuple2(Gen.list(Gen.int(0, 6)), Gen.list(Gen.tuple2(Gen.tuple2(Gen.int(0, 15), Gen.int(0, 15)), Gen.tuple2(Gen.int(0, 10), Gen.int(1, 8))))), fn p ->
+        match p do
+          (hs, cells) ->
+            let w = pour(columns(walled(fresh()), hs, 0), cells)
+            let before = field_total(w)
+            match until_rest(wake_field(fluid()), w, 400, 0) do
+              (rr, taken) -> taken >= 0 && field_total(world_of(rr)) == before && !hangs(world_of(rr), -2, 0, -2) && never_over(wake_field(fluid()), w, 60, before)
+            end
+        end
+      )
+    end
+    test "two runs of the same world are the same step for step" do
+      Check.all(Gen.tuple2(Gen.list(Gen.int(0, 6)), Gen.list(Gen.tuple2(Gen.tuple2(Gen.int(0, 15), Gen.int(0, 15)), Gen.tuple2(Gen.int(0, 10), Gen.int(1, 8))))), fn p ->
+        match p do
+          (hs, cells) ->
+            let w = pour(columns(walled(fresh()), hs, 0), cells)
+            same_sigs(wake_field(fluid()), w, wake_field(fluid()), w, 40)
+        end
+      )
+    end
+  end
+end

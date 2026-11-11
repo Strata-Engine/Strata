@@ -1,0 +1,387 @@
+-- Fluid — finite fluids that fall, spread toward a way down, are taken by a
+-- sink, and come to rest.
+--
+-- A fluid is a block family of eight states, one per fill level in eighths
+-- of a voxel (Strata.Blocks.register_fluid). This module keeps a set of
+-- ACTIVE cells, the only ones it looks at, and each step turns them into
+-- one Strata.Edit outcome: the fluid is ordinary blocks changed by an
+-- ordinary edit, so meshing, lighting and collision follow with no path of
+-- their own.
+--
+-- A step reads the world as it stands and decides every move from that
+-- state, so the result does not depend on the order cells are visited in:
+--
+--   * Sink.   A cell above or beside a sink block loses all it holds.
+--   * Fall.   Else, with room below, it offers all it holds to the lowest
+--             cell it can reach straight down, at most `fall` cells away.
+--   * Seek.   Else, if within `reach` cells along one of the four side
+--             directions there is a cell with room under it, it offers
+--             half of what it holds above the neighbour that way (at least
+--             one eighth) to that neighbour. Water runs to a drop instead of
+--             spreading.
+--   * Level.  Else it shares with lower side neighbours toward their
+--             common level, rounding down, so a single eighth stays put.
+--
+-- A cell takes offers until it holds eight eighths: from above first, then
+-- from its -x, +x, -z and +z neighbours. What it cannot take stays with the
+-- giver. So nothing is created or lost except into a sink.
+--
+-- Fluid moves into air and into blocks that do not collide (plants), which
+-- it replaces. A chunk that is not loaded is a wall.
+mod Strata.Fluid do
+
+  alias Strata.World as Wq
+  alias Strata.Blocks as Bq
+  alias Strata.Coord as Kq
+  alias Strata.Store as Sq
+  alias Strata.Edit as Eq
+
+  -- where falling water arrived: x, y, z, eighths, cells fallen without landing, landed
+  type Event = Event(Int, Int, Int, Int, Int, Bool)
+
+  fn ev_x(e : Event) : Int do match e do Event(x, _, _, _, _, _) -> x end end
+  fn ev_y(e : Event) : Int do match e do Event(_, y, _, _, _, _) -> y end end
+  fn ev_z(e : Event) : Int do match e do Event(_, _, z, _, _, _) -> z end end
+  doc "How many eighths arrived."
+  fn ev_eighths(e : Event) : Int do match e do Event(_, _, _, n, _, _) -> n end end
+  doc "How many cells that water has fallen without landing."
+  fn ev_fell(e : Event) : Int do match e do Event(_, _, _, _, d, _) -> d end end
+  doc "Did it land: is the cell under it something other than air?"
+  fn ev_landed(e : Event) : Bool do match e do Event(_, _, _, _, _, l) -> l end end
+
+  -- registry; flowing family bases; sink bases; cap, reach, fall; the active
+  -- cells (each with how far its water has fallen); cells set aside in or
+  -- beside chunks that are not loaded; the last step's events; how many
+  -- active cells the last step left for later
+  type Fluid = Fluid(Strata.Blocks.Registry, List(Int), List(Int), Int, Int, Int, Strata.Store.Store(Int), Strata.Store.Store(Int), List(Event), Int)
+
+  doc "The kind of a family whose water moves."
+  fn flowing() : Int do 0 end
+  doc "The kind of a block that swallows flowing fluid that reaches it and never changes."
+  fn sink() : Int do 1 end
+
+  pfn bases(fams : List((Int, Int)), kind : Int) : List(Int) do
+    match fams do
+      Nil -> Nil
+      Cons((b, k), t) -> if k == kind do Cons(b, bases(t, kind)) else bases(t, kind) end
+    end
+  end
+
+  doc "A fluid simulation over [r]'s blocks. [families] lists (base id, kind): a `flowing` family must be one registered with `Strata.Blocks.register_fluid`; a `sink` is any block. Nothing is active until something wakes it."
+  fn new(r : Strata.Blocks.Registry, families : List((Int, Int))) : Fluid do
+    Fluid(r, bases(families, 0), bases(families, 1), 4096, 8, 4, Sq.empty(-1), Sq.empty(-1), Nil, 0)
+  end
+
+  doc "The same simulation with other limits: at most [cap] active cells handled a step, a way down sought within [reach] cells, a fall of at most [fall] cells a step. The defaults are 4096, 8 and 4."
+  fn with_limits(f : Fluid, cap : Int, reach : Int, fall : Int) : Fluid do
+    match f do
+      Fluid(r, fl, sk, _, _, _, a, d, ev, wt) -> Fluid(r, fl, sk, if cap < 1 do 1 else cap end, if reach < 0 do 0 else reach end, if fall < 1 do 1 else fall end, a, d, ev, wt)
+    end
+  end
+
+  doc "How many cells are active."
+  fn active_count(f : Fluid) : Int do match f do Fluid(_, _, _, _, _, _, a, _, _, _) -> Sq.size(a) end end
+  doc "How many active cells the last step left for later because of the cap."
+  fn waiting_count(f : Fluid) : Int do match f do Fluid(_, _, _, _, _, _, _, _, _, wt) -> wt end end
+  doc "How many cells are set aside in or beside chunks that are not loaded."
+  fn dormant_count(f : Fluid) : Int do match f do Fluid(_, _, _, _, _, _, _, d, _, _) -> Sq.size(d) end end
+  doc "What fell in the last step."
+  fn events(f : Fluid) : List(Event) do match f do Fluid(_, _, _, _, _, _, _, _, ev, _) -> ev end end
+
+  doc "Make the cell at (x, y, z) active."
+  fn wake_cell(f : Fluid, x : Int, y : Int, z : Int) : Fluid do
+    match f do
+      Fluid(r, fl, sk, cap, reach, fall, a, d, ev, wt) ->
+        let k = Kq.key(x, y, z)
+        if Sq.has(a, k) do f else Fluid(r, fl, sk, cap, reach, fall, Sq.put(a, k, 0), d, ev, wt) end
+    end
+  end
+
+  pfn has_int(l : List(Int), v : Int) : Bool do
+    match l do
+      Nil -> false
+      Cons(h, t) -> if h == v do true else has_int(t, v) end
+    end
+  end
+  pfn min2(a : Int, b : Int) : Int do if a < b do a else b end end
+  pfn max2(a : Int, b : Int) : Int do if a > b do a else b end end
+
+  -- What the cell is to fluid of family [base]: -2 its chunk is not loaded;
+  -- -1 blocked; 0 empty (air or something fluid washes away); 1..8 the same
+  -- fluid at that level; 9 a sink.
+  pfn look(r : Strata.Blocks.Registry, sk : List(Int), w : Strata.World.World, base : Int, x : Int, y : Int, z : Int) : Int do
+    if !Wq.is_loaded(w, Kq.key_of_voxel(x, y, z)) do -2
+    else
+      let id = Wq.get_block(w, x, y, z)
+      if id == 0 do 0
+      else if Bq.is_fluid(r, id) do (if Bq.fluid_base(r, id) == base do Bq.fill(r, id) else -1 end)
+      else if has_int(sk, Bq.base_of(r, id)) do 9
+      else if Bq.collides(r, id) do -1
+      else 0 end end end end
+    end
+  end
+
+  -- One move on offer: target, the order its target hears it in (0 from
+  -- above, then from -x, +x, -z, +z), eighths, the giver, the family, how far
+  -- the water will have fallen on arrival (0 for a sideways move), landed.
+  type Offer = Offer(Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Bool)
+
+  -- What a step gathers: offers, cells a sink empties (x, y, z, eighths),
+  -- cells that touch a chunk that is not loaded (x, y, z, fell).
+  type Plan = Plan(List(Offer), List((Int, Int, Int, Int)), List((Int, Int, Int, Int)))
+
+  pfn bid(p : Plan, o : Offer) : Plan do match p do Plan(os, ds, es) -> Plan(Cons(o, os), ds, es) end end
+  pfn drain(p : Plan, x : Int, y : Int, z : Int, n : Int) : Plan do match p do Plan(os, ds, es) -> Plan(os, Cons((x, y, z, n), ds), es) end end
+  pfn edge(p : Plan, x : Int, y : Int, z : Int, fell : Int) : Plan do match p do Plan(os, ds, es) -> Plan(os, ds, Cons((x, y, z, fell), es)) end end
+
+  -- Scan down from (x, y, z): k is the cell being looked at, last the lowest
+  -- empty one so far. Answers (cells down to the target, what stopped it):
+  -- 0 the target is empty, 1 it is this fluid with room, 2 a sink is there.
+  pfn fall_scan(r : Strata.Blocks.Registry, sk : List(Int), w : Strata.World.World, base : Int, x : Int, y : Int, z : Int, k : Int, last : Int, limit : Int) : (Int, Int) do
+    if k > limit do (last, 0)
+    else
+      let c = look(r, sk, w, base, x, y - k, z)
+      if c == 0 do fall_scan(r, sk, w, base, x, y, z, k + 1, k, limit)
+      else if c >= 1 && c <= 7 do (k, 1)
+      else if c == 9 do (k, 2)
+      else (last, 0) end end end
+    end
+  end
+
+  -- How many cells along (dx, dz) from (x, y, z) to one with room under it,
+  -- walking only through cells fluid can be in; 0 for none within [reach].
+  pfn probe(r : Strata.Blocks.Registry, sk : List(Int), w : Strata.World.World, base : Int, x : Int, y : Int, z : Int, dx : Int, dz : Int, i : Int, reach : Int) : Int do
+    if i > reach do 0
+    else
+      let c = look(r, sk, w, base, x + i * dx, y, z + i * dz)
+      if c == 9 do i
+      else if c < 0 do 0
+      else
+        let under = look(r, sk, w, base, x + i * dx, y - 1, z + i * dz)
+        if under == 0 || under == 9 || (under >= 1 && under <= 7) do i
+        else probe(r, sk, w, base, x, y, z, dx, dz, i + 1, reach) end
+      end end
+    end
+  end
+
+  -- The nearer of two ways down; 0 is none. Ties keep the first.
+  pfn nearer(da : Int, db : Int) : Bool do db > 0 && (da == 0 || db < da) end
+
+  -- Share level L with the lower side neighbours: each is brought up to the
+  -- common level, rounded down. n* are the neighbours' looks.
+  pfn lower(l : Int, n : Int) : Int do if n >= 0 && n < l do 1 else 0 end end
+  pfn part(l : Int, n : Int) : Int do if n >= 0 && n < l do n else 0 end end
+  pfn level_to(p : Plan, base : Int, x : Int, y : Int, z : Int, tx : Int, tz : Int, order : Int, n : Int, l : Int, common : Int) : Plan do
+    if n >= 0 && n < l && common > n do bid(p, Offer(tx, y, tz, order, common - n, x, y, z, base, 0, false)) else p end
+  end
+
+  -- What the fluid cell at (x, y, z), holding [l] eighths of family [base],
+  -- wants to do.
+  pfn decide(r : Strata.Blocks.Registry, sk : List(Int), w : Strata.World.World, reach : Int, fall : Int, p : Plan, base : Int, l : Int, x : Int, y : Int, z : Int, fell : Int) : Plan do
+    let below = look(r, sk, w, base, x, y - 1, z)
+    let nxm = look(r, sk, w, base, x - 1, y, z)
+    let nxp = look(r, sk, w, base, x + 1, y, z)
+    let nzm = look(r, sk, w, base, x, y, z - 1)
+    let nzp = look(r, sk, w, base, x, y, z + 1)
+    -- a cell that touches a chunk that is not loaded is remembered, so the chunk's arrival wakes it
+    let p1 = if below == -2 || nxm == -2 || nxp == -2 || nzm == -2 || nzp == -2 do edge(p, x, y, z, fell) else p end
+    if below == 9 || nxm == 9 || nxp == 9 || nzm == 9 || nzp == 9 do drain(p1, x, y, z, l)
+    else if below == 0 do
+      match fall_scan(r, sk, w, base, x, y, z, 1, 0, fall) do
+        (k, what) ->
+          if what == 2 do drain(p1, x, y, z, l)
+          else if what == 1 do bid(p1, Offer(x, y - k, z, 0, l, x, y, z, base, fell + k, true))
+          else bid(p1, Offer(x, y - k, z, 0, l, x, y, z, base, fell + k, look(r, sk, w, base, x, y - k - 1, z) != 0)) end end
+      end
+    else if below >= 1 && below <= 7 do bid(p1, Offer(x, y - 1, z, 0, l, x, y, z, base, fell + 1, true))
+    else
+      -- cannot fall: look for a way down, nearest first, in the order -x, +x, -z, +z
+      let dxm = if nxm >= 0 do probe(r, sk, w, base, x, y, z, -1, 0, 1, reach) else 0 end
+      let dxp = if nxp >= 0 do probe(r, sk, w, base, x, y, z, 1, 0, 1, reach) else 0 end
+      let dzm = if nzm >= 0 do probe(r, sk, w, base, x, y, z, 0, -1, 1, reach) else 0 end
+      let dzp = if nzp >= 0 do probe(r, sk, w, base, x, y, z, 0, 1, 1, reach) else 0 end
+      let b1 = if nearer(dxm, dxp) do 2 else if dxm > 0 do 1 else 0 end end
+      let d1 = if b1 == 2 do dxp else dxm end
+      let b2 = if nearer(d1, dzm) do 3 else b1 end
+      let d2 = if b2 == 3 do dzm else d1 end
+      let b3 = if nearer(d2, dzp) do 4 else b2 end
+      -- the neighbour that way takes water only while it holds no more than this cell; else this cell waits for it to move on
+      if b3 == 1 do (if nxm <= l && nxm < 8 do bid(p1, Offer(x - 1, y, z, 2, max2(1, (l - nxm) / 2), x, y, z, base, 0, false)) else p1 end)
+      else if b3 == 2 do (if nxp <= l && nxp < 8 do bid(p1, Offer(x + 1, y, z, 1, max2(1, (l - nxp) / 2), x, y, z, base, 0, false)) else p1 end)
+      else if b3 == 3 do (if nzm <= l && nzm < 8 do bid(p1, Offer(x, y, z - 1, 4, max2(1, (l - nzm) / 2), x, y, z, base, 0, false)) else p1 end)
+      else if b3 == 4 do (if nzp <= l && nzp < 8 do bid(p1, Offer(x, y, z + 1, 3, max2(1, (l - nzp) / 2), x, y, z, base, 0, false)) else p1 end)
+      else
+        let k = lower(l, nxm) + lower(l, nxp) + lower(l, nzm) + lower(l, nzp)
+        if k == 0 do p1
+        else
+          let common = (l + part(l, nxm) + part(l, nxp) + part(l, nzm) + part(l, nzp)) / (k + 1)
+          level_to(level_to(level_to(level_to(p1, base, x, y, z, x - 1, z, 2, nxm, l, common), base, x, y, z, x + 1, z, 1, nxp, l, common), base, x, y, z, x, z - 1, 4, nzm, l, common), base, x, y, z, x, z + 1, 3, nzp, l, common)
+        end
+      end end end end
+    end end end
+  end
+
+  -- The plan for one active cell, if it holds a flowing fluid.
+  pfn consider(r : Strata.Blocks.Registry, fl : List(Int), sk : List(Int), w : Strata.World.World, reach : Int, fall : Int, p : Plan, k : Strata.Coord.Key, fell : Int) : Plan do
+    let x = Kq.kx(k)
+    let y = Kq.ky(k)
+    let z = Kq.kz(k)
+    if !Wq.is_loaded(w, Kq.key_of_voxel(x, y, z)) do edge(p, x, y, z, fell)
+    else
+      let id = Wq.get_block(w, x, y, z)
+      let base = Bq.fluid_base(r, id)
+      if base < 0 || !has_int(fl, base) do p else decide(r, sk, w, reach, fall, p, base, Bq.fill(r, id), x, y, z, fell) end
+    end
+  end
+
+  -- ── Settling the offers ──────────────────────────────────────────────────
+  pfn order_of(o : Offer) : Int do match o do Offer(_, _, _, ord, _, _, _, _, _, _, _) -> ord end end
+
+  pfn insert_offer(l : List(Offer), o : Offer) : List(Offer) do
+    match l do
+      Nil -> Cons(o, Nil)
+      Cons(h, t) -> if order_of(o) < order_of(h) do Cons(o, l) else Cons(h, insert_offer(t, o)) end
+    end
+  end
+
+  pfn by_target(os : List(Offer), m : Strata.Store.Store(List(Offer))) : Strata.Store.Store(List(Offer)) do
+    match os do
+      Nil -> m
+      Cons(o, t) ->
+        match o do
+          Offer(tx, ty, tz, _, _, _, _, _, _, _, _) ->
+            let k = Kq.key(tx, ty, tz)
+            by_target(t, Sq.put(m, k, insert_offer(Sq.get(m, k), o)))
+        end
+    end
+  end
+
+  -- What settling builds: each cell's change in eighths; the family of each
+  -- cell that changes; how far the water in a cell that was fallen into has
+  -- fallen; events.
+  type Settled = Settled(Strata.Store.Store(Int), Strata.Store.Store(Int), Strata.Store.Store(Int), List(Event))
+
+  pfn add_delta(m : Strata.Store.Store(Int), k : Strata.Coord.Key, d : Int) : Strata.Store.Store(Int) do Sq.put(m, k, Sq.get(m, k) + d) end
+
+  -- One target takes its offers in order while it has room; an offer of
+  -- another family than the first it took is refused.
+  pfn take(s : Settled, os : List(Offer), room : Int, fam : Int) : Settled do
+    match os do
+      Nil -> s
+      Cons(o, t) ->
+        match o do
+          Offer(tx, ty, tz, ord, n, sx, sy, sz, base, fell, landed) ->
+            let got = if fam >= 0 && fam != base do 0 else min2(n, room) end
+            if got <= 0 do take(s, t, room, fam)
+            else
+              match s do
+                Settled(delta, fams, fells, evs) ->
+                  let tk = Kq.key(tx, ty, tz)
+                  let sk = Kq.key(sx, sy, sz)
+                  let d2 = add_delta(add_delta(delta, tk, got), sk, 0 - got)
+                  let f2 = Sq.put(Sq.put(fams, tk, base), sk, base)
+                  let arrived = if landed do 0 else fell end
+                  let fe2 = if ord == 0 do Sq.put(fells, tk, max2(Sq.get(fells, tk), arrived)) else fells end
+                  let ev2 = if ord == 0 do Cons(Event(tx, ty, tz, got, fell, landed), evs) else evs end
+                  take(Settled(d2, f2, fe2, ev2), t, room - got, base)
+              end
+            end
+        end
+    end
+  end
+
+  pfn drains(s : Settled, r : Strata.Blocks.Registry, w : Strata.World.World, ds : List((Int, Int, Int, Int))) : Settled do
+    match ds do
+      Nil -> s
+      Cons((x, y, z, n), t) ->
+        match s do
+          Settled(delta, fams, fells, evs) ->
+            let k = Kq.key(x, y, z)
+            drains(Settled(add_delta(delta, k, 0 - n), Sq.put(fams, k, Bq.fluid_base(r, Wq.get_block(w, x, y, z))), fells, evs), r, w, t)
+        end
+    end
+  end
+
+  -- The level of family [base] the cell holds now.
+  pfn held(r : Strata.Blocks.Registry, w : Strata.World.World, base : Int, k : Strata.Coord.Key) : Int do
+    let id = Wq.get_block(w, Kq.kx(k), Kq.ky(k), Kq.kz(k))
+    if Bq.fluid_base(r, id) == base do Bq.fill(r, id) else 0 end
+  end
+
+  -- ── A step ───────────────────────────────────────────────────────────────
+  pfn is_flowing(r : Strata.Blocks.Registry, fl : List(Int), w : Strata.World.World, x : Int, y : Int, z : Int) : Bool do
+    let b = Bq.fluid_base(r, Wq.get_block(w, x, y, z))
+    b >= 0 && has_int(fl, b)
+  end
+
+  -- A cell of the new world joins the active set if it holds flowing fluid.
+  pfn join(a : Strata.Store.Store(Int), old : Strata.Store.Store(Int), fells : Strata.Store.Store(Int), r : Strata.Blocks.Registry, fl : List(Int), w : Strata.World.World, x : Int, y : Int, z : Int) : Strata.Store.Store(Int) do
+    if !is_flowing(r, fl, w, x, y, z) do a
+    else
+      let k = Kq.key(x, y, z)
+      if Sq.has(a, k) do a
+      else if Sq.has(fells, k) do Sq.put(a, k, Sq.get(fells, k))
+      else Sq.put(a, k, max2(0, Sq.get(old, k))) end end
+    end
+  end
+
+  pfn join_around(a : Strata.Store.Store(Int), old : Strata.Store.Store(Int), fells : Strata.Store.Store(Int), r : Strata.Blocks.Registry, fl : List(Int), w : Strata.World.World, k : Strata.Coord.Key) : Strata.Store.Store(Int) do
+    let x = Kq.kx(k)
+    let y = Kq.ky(k)
+    let z = Kq.kz(k)
+    join(join(join(join(join(join(join(a, old, fells, r, fl, w, x, y, z), old, fells, r, fl, w, x - 1, y, z), old, fells, r, fl, w, x + 1, y, z), old, fells, r, fl, w, x, y - 1, z), old, fells, r, fl, w, x, y + 1, z), old, fells, r, fl, w, x, y, z - 1), old, fells, r, fl, w, x, y, z + 1)
+  end
+
+  pfn settle_target(s : Settled, r : Strata.Blocks.Registry, w : Strata.World.World, k : Strata.Coord.Key, offers : List(Offer)) : Settled do
+    match offers do
+      Nil -> s
+      Cons(first, _) ->
+        match first do
+          Offer(_, _, _, _, _, _, _, _, base, _, _) -> take(s, offers, 8 - held(r, w, base, k), -1)
+        end
+    end
+  end
+
+  -- The block a changed cell holds after the step, as an (x, y, z, id) for the edit.
+  pfn cell_after(acc : List((Int, Int, Int, Int)), r : Strata.Blocks.Registry, w : Strata.World.World, fams : Strata.Store.Store(Int), k : Strata.Coord.Key, d : Int) : List((Int, Int, Int, Int)) do
+    if d == 0 do acc
+    else
+      let base = Sq.get(fams, k)
+      let now = held(r, w, base, k) + d
+      Cons((Kq.kx(k), Kq.ky(k), Kq.kz(k), if now <= 0 do 0 else base + min2(now, 8) - 1 end), acc)
+    end
+  end
+
+  doc "One step over world [w]: every active cell decides its move from the world as it stands, the moves are settled, and the result is one edit. The new fluid holds the cells still active and the step's events. [focus] is where players are, in voxels: when more cells are active than the cap, the nearest go first."
+  fn step_world(f : Fluid, w : Strata.World.World, _focus : List((Float, Float, Float))) : (Fluid, Strata.Edit.Outcome) do
+    match f do
+      Fluid(r, fl, sk, cap, reach, fall, active, dormant, _, _) ->
+        match Sq.fold(active, Plan(Nil, Nil, Nil), fn (p, k, fell) -> consider(r, fl, sk, w, reach, fall, p, k, fell)) do
+          Plan(os, ds, _) ->
+            let taken = Sq.fold(by_target(os, Sq.empty(Nil)), Settled(Sq.empty(0), Sq.empty(-1), Sq.empty(0), Nil), fn (s, k, offers) -> settle_target(s, r, w, k, offers))
+            match drains(taken, r, w, ds) do
+              Settled(delta, fams, fells, evs) ->
+                let o = Eq.set_many(w, Sq.fold(delta, Nil, fn (acc, k, d) -> cell_after(acc, r, w, fams, k, d)))
+                let w2 = Eq.world(o)
+                let active2 = Sq.fold(delta, Sq.empty(-1), fn (a, k, d) -> if d == 0 do a else join_around(a, active, fells, r, fl, w2, k) end)
+                (Fluid(r, fl, sk, cap, reach, fall, active2, dormant, evs, 0), o)
+            end
+        end
+    end
+  end
+
+  pfn amount_go(w : Strata.World.World, r : Strata.Blocks.Registry, x0 : Int, z0 : Int, x1 : Int, y1 : Int, z1 : Int, x : Int, y : Int, z : Int, acc : Int) : Int do
+    if y > y1 do acc
+    else if z > z1 do amount_go(w, r, x0, z0, x1, y1, z1, x0, y + 1, z0, acc)
+    else if x > x1 do amount_go(w, r, x0, z0, x1, y1, z1, x0, y, z + 1, acc)
+    else
+      let id = Wq.get_block(w, x, y, z)
+      amount_go(w, r, x0, z0, x1, y1, z1, x + 1, y, z, if Bq.is_fluid(r, id) do acc + Bq.fill(r, id) else acc end)
+    end end end
+  end
+
+  doc "The eighths of fluid in the box with inclusive corners (x0, y0, z0) and (x1, y1, z1)."
+  fn amount(w : Strata.World.World, r : Strata.Blocks.Registry, x0 : Int, y0 : Int, z0 : Int, x1 : Int, y1 : Int, z1 : Int) : Int do
+    amount_go(w, r, x0, z0, x1, y1, z1, x0, y0, z0, 0)
+  end
+end
