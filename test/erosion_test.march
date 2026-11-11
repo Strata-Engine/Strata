@@ -1,0 +1,103 @@
+-- Stream-power erosion: flow never runs uphill, lakes spill at their lowest
+-- pass, and the result does not depend on the number of workers.
+mod Strata.Test.Erosion do
+
+  needs IO.Clock
+  needs IO.Process
+  needs IO.Spawn
+
+  import Test
+  alias Strata.Erosion as Ero
+
+  -- an n x n array of v
+  pfn plain(n : Int, v : Float) : NativeF32Arr do NativeArray.make_f32(n * n, v) end
+
+  -- a cone 4 m a sample: 40 m at the centre, falling 1.5 m a metre, down to -5 m (sea)
+  pfn cone_go(hs : NativeF32Arr, n : Int, i : Int) : NativeF32Arr do
+    if i >= n * n do hs
+    else
+      let x = int_to_float(i % n - n / 2) *. 4.0
+      let z = int_to_float(i / n - n / 2) *. 4.0
+      let v = 40.0 -. 1.5 *. Math.sqrt(x *. x +. z *. z)
+      cone_go(NativeArray.set_f32(hs, i, if v < 0.0 -. 5.0 do 0.0 -. 5.0 else v end), n, i + 1)
+    end
+  end
+
+  pfn cone(n : Int) : NativeF32Arr do cone_go(plain(n, 0.0), n, 0) end
+
+  pfn mean_go(hs : NativeF32Arr, i : Int, cnt : Int, acc : Float) : Float do
+    if i >= cnt do acc /. int_to_float(cnt) else mean_go(hs, i + 1, cnt, acc +. NativeArray.get_f32(hs, i)) end
+  end
+
+  -- every land sample flows to a sample no higher than itself
+  pfn downhill_go(hs : NativeF32Arr, rs : NativeIntArr, i : Int, cnt : Int) : Bool do
+    if i >= cnt do true
+    else
+      let r = NativeArray.get_int(rs, i)
+      let h = NativeArray.get_f32(hs, i)
+      let up = if r < 0 do false else h > 0.0 && NativeArray.get_f32(hs, r) > h end
+      if up do false else downhill_go(hs, rs, i + 1, cnt) end
+    end
+  end
+
+  -- following receivers from i reaches an outlet (-1) within [left] steps
+  pfn reaches_go(rs : NativeIntArr, i : Int, left : Int) : Bool do
+    if i < 0 do true else if left <= 0 do false else reaches_go(rs, NativeArray.get_int(rs, i), left - 1) end end
+  end
+
+  pfn same_go(a : NativeF32Arr, b : NativeF32Arr, i : Int, cnt : Int) : Bool do
+    if i >= cnt do true else if NativeArray.get_f32(a, i) == NativeArray.get_f32(b, i) do same_go(a, b, i + 1, cnt) else false end end
+  end
+
+  -- a 16 x 16 plate 10 m above sea with a 5 m pit at (8, 8)
+  pfn pitted() : NativeF32Arr do NativeArray.set_f32(plain(16, 10.0), 8 + 16 * 8, 5.0) end
+
+  pfn one() : Strata.Erosion.Params do
+    let d = Ero.default_params()
+    Ero.params(1, Ero.p_dt(d), Ero.p_k(d), Ero.p_m(d), Ero.p_n_exp(d), Ero.p_uplift(d), Ero.p_talus_lo(d), Ero.p_talus_hi(d))
+  end
+
+  -- strength-like noise in [0, 1] that is not uniform
+  pfn ripple_go(arr : NativeF32Arr, n : Int, i : Int) : NativeF32Arr do
+    if i >= n * n do arr else ripple_go(NativeArray.set_f32(arr, i, 0.5 +. 0.5 *. Math.sin(int_to_float(i % n) *. 0.7 +. int_to_float(i / n) *. 0.3)), n, i + 1) end
+  end
+
+  describe "Erosion" do
+    test "a pit has no receiver, a slope has its lowest neighbour, the edge has none" do
+      let rs = Ero.receivers(16, 4.0, pitted())
+      Test.assert_true(NativeArray.get_int(rs, 8 + 16 * 8) == 0 - 1, "the pit")
+      Test.assert_true(NativeArray.get_int(rs, 7 + 16 * 8) == 8 + 16 * 8, "beside the pit")
+      Test.assert_true(NativeArray.get_int(rs, 0) == 0 - 1, "the edge")
+    end
+    -- mask 0.5 everywhere: uplift 0.31 m an iteration; at mask 1 (1.25 m) uplift outpaces erosion on a 40 m cone
+    test "an eroded cone drains downhill everywhere and has lost height" do
+      let n = 32
+      let before = mean_go(cone(n), 0, n * n, 0.0)
+      let hs = Ero.run(Ero.default_params(), n, 4.0, cone(n), plain(n, 0.5), plain(n, 0.5), 1)
+      Test.assert_true(downhill_go(hs, Ero.lake_receivers(n, 4.0, hs), 0, n * n), "no uphill flow")
+      Test.assert_true(mean_go(hs, 0, n * n, 0.0) < before, "the mean height dropped")
+    end
+    test "a pit spills over its lowest pass and its water reaches the edge" do
+      let hs = Ero.run(one(), 16, 4.0, pitted(), plain(16, 0.0), plain(16, 0.5), 1)
+      let rs = Ero.lake_receivers(16, 4.0, hs)
+      let r = NativeArray.get_int(rs, 8 + 16 * 8)
+      Test.assert_true(r >= 0, "the pit has a receiver")
+      Test.assert_true(NativeArray.get_f32(hs, r) >= NativeArray.get_f32(hs, 8 + 16 * 8), "it spills over its rim")
+      Test.assert_true(reaches_go(rs, 8 + 16 * 8, 256), "and on to an outlet")
+    end
+    test "one worker and four give the same heights" do
+      let n = 48
+      let s = ripple_go(plain(n, 0.0), n, 0)
+      let a = Ero.run(Ero.default_params(), n, 4.0, cone(n), plain(n, 1.0), s, 1)
+      let b = Ero.run(Ero.default_params(), n, 4.0, cone(n), plain(n, 1.0), s, 4)
+      Test.assert_true(same_go(a, b, 0, n * n), "identical")
+    end
+    test "50 iterations on 128 x 128" do
+      let n = 128
+      let t0 = unix_time_ms()
+      let hs = Ero.run(Ero.default_params(), n, 4.0, cone(n), plain(n, 1.0), plain(n, 0.5), 4)
+      println("erosion: 50 iterations on 128 x 128 in " ++ int_to_string(unix_time_ms() - t0) ++ " ms")
+      Test.assert_true(NativeArray.length_f32(hs) == n * n, "a height a sample")
+    end
+  end
+end

@@ -11,6 +11,8 @@
  *
  * March values: a NativeArray arrives as its heap pointer, element count at
  * +16, data at +32; a String through march_str_borrow. */
+/* Rewritten by stamp_audio.sh whenever strata_mix.h or strata_hrir.h changes (GAPS S14). */
+#define STRATA_AUDIO_STAMP "d5fee09a63781e4b"
 #define MA_NO_ENCODING
 #define MA_NO_GENERATION
 #define MA_NO_RESOURCE_MANAGER

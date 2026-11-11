@@ -1,0 +1,339 @@
+-- Strata.Acoustics — what the blocks do to sound. Pure, and testable
+-- headless.
+--
+-- A walk follows a straight line through the voxels, as Strata.Query.raycast
+-- does, but does not stop at the first block: it sums what each voxel it
+-- crosses cuts (the block's loss, in decibels a metre, times the metres
+-- crossed) and how much of that falls on the highs (the loss times the
+-- block's damping). Unloaded chunks are air.
+--
+-- Occlusion takes the least obstructed of five paths from listener to
+-- source: the straight line, and the same line moved a metre left, right,
+-- up and down as the listener sees it, with the short legs out and back.
+-- A moved path pays 6 dB and some brightness for bending round an edge, so
+-- a sound round a corner is muffled, not lost, and one behind a hill nearly
+-- is.
+--
+-- The walk reads a table of the blocks' sound values built once from the
+-- registry, and each chunk once as it is entered, never the shared registry
+-- per voxel (GAPS S15).
+mod Strata.Acoustics do
+
+  needs IO.Spawn      -- a job is worked out on a worker
+
+  alias Strata.Store as Stac
+  alias Strata.Coord as Coac
+  alias Strata.Chunk as Chuac
+
+  -- each block id's sound: absorption + 256 * loss + 65536 * damping
+  pfn table_go(t : NativeIntArr, r : Strata.Blocks.Registry, i : Int, n : Int) : NativeIntArr do
+    if i >= n do t
+    else
+      match Strata.Blocks.sound_of(r, i) do
+        (ab, lo, da) -> table_go(NativeArray.set_int(t, i, ab + 256 * lo + 65536 * da), r, i + 1, n)
+      end
+    end
+  end
+  doc "The registry's sound values as one array, an int a block id: absorption + 256 * loss + 65536 * damping. Built once and handed to the walks, so they never read the shared registry per voxel."
+  fn table(r : Strata.Blocks.Registry) : NativeIntArr do
+    let n = Strata.Blocks.count(r)
+    table_go(NativeArray.make_int(if n < 1 do 1 else n end, 0), r, 0, n)
+  end
+  pfn packed(t : NativeIntArr, id : Int) : Int do if id <= 0 || id >= NativeArray.length_int(t) do 0 else NativeArray.get_int(t, id) end end
+
+  pfn absf(v : Float) : Float do if v < 0.0 do 0.0 -. v else v end end
+  pfn big() : Float do 1000000000000.0 end
+  pfn first_cross(p : Float, u : Float, v : Int) : Float do
+    if absf(u) < 0.000000000001 do big()
+    else if u > 0.0 do (int_to_float(v + 1) -. p) /. u
+    else (int_to_float(v) -. p) /. u end end
+  end
+  pfn step_of(u : Float) : Float do if absf(u) < 0.000000000001 do big() else absf(1.0 /. u) end end
+  pfn dir_of(u : Float) : Int do if u > 0.0 do 1 else -1 end end
+  pfn min3(a : Float, b : Float, c : Float) : Float do if a <= b && a <= c do a else if b <= c do b else c end end end
+
+  -- the current chunk: its coordinates, and what it holds (an absent chunk reads as air)
+  type Window = Window(Int, Int, Int, Strata.Chunk.Chunk)
+
+  pfn block_at(w : Strata.World.World, win : Window, x : Int, y : Int, z : Int) : (Window, Int) do
+    let cx = Coac.chunk_of(x)
+    let cy = Coac.chunk_of(y)
+    let cz = Coac.chunk_of(z)
+    let win2 = match win do
+      Window(wx, wy, wz, c) -> if wx == cx && wy == cy && wz == cz do win else Window(cx, cy, cz, Stac.get(Strata.World.chunks(w), Coac.key(cx, cy, cz))) end
+    end
+    match win2 do
+      Window(_, _, _, c) -> (win2, Chuac.get(c, Coac.local_of(x), Coac.local_of(y), Coac.local_of(z)))
+    end
+  end
+
+  -- step through voxels: t in voxel units, entered at [t], leaving at the
+  -- nearest of (nx, ny, nz) or [tmax]; [sc] metres a voxel
+  pfn go(w : Strata.World.World, tb : NativeIntArr, sc : Float, tmax : Float, win : Window, vx : Int, vy : Int, vz : Int, ux : Float, uy : Float, uz : Float, t : Float, nx : Float, ny : Float, nz : Float, loss : Float, dull : Float, steps : Int) : (Float, Float) do
+    if t >= tmax || steps <= 0 do (loss, dull)
+    else
+      let out = min3(min3(nx, ny, nz), tmax, tmax)
+      match block_at(w, win, vx, vy, vz) do
+        (win2, id) ->
+          let p = packed(tb, id)
+          let lo = int_to_float(int_and(p / 256, 255))
+          let da = int_to_float(int_and(p / 65536, 255))
+          let metres = (out -. t) *. sc
+          let loss2 = loss +. lo *. metres
+          let dull2 = dull +. lo *. metres *. da /. 255.0
+          if nx <= ny && nx <= nz do go(w, tb, sc, tmax, win2, vx + dir_of(ux), vy, vz, ux, uy, uz, nx, nx +. step_of(ux), ny, nz, loss2, dull2, steps - 1)
+          else if ny <= nz do go(w, tb, sc, tmax, win2, vx, vy + dir_of(uy), vz, ux, uy, uz, ny, nx, ny +. step_of(uy), nz, loss2, dull2, steps - 1)
+          else go(w, tb, sc, tmax, win2, vx, vy, vz + dir_of(uz), ux, uy, uz, nz, nx, ny, nz +. step_of(uz), loss2, dull2, steps - 1) end end
+      end
+    end
+  end
+
+  doc "The walk with a prebuilt `table`: (loss, dull) in decibels from (x0, y0, z0) to (x1, y1, z1), in metres. [dull] is the part of the loss that falls on the highs."
+  fn walk_with(w : Strata.World.World, tb : NativeIntArr, x0 : Float, y0 : Float, z0 : Float, x1 : Float, y1 : Float, z1 : Float) : (Float, Float) do
+    let sc = Strata.World.scale(w)
+    let px = x0 /. sc
+    let py = y0 /. sc
+    let pz = z0 /. sc
+    let dx = x1 /. sc -. px
+    let dy = y1 /. sc -. py
+    let dz = z1 /. sc -. pz
+    let len = Math.sqrt(dx *. dx +. dy *. dy +. dz *. dz)
+    if len < 0.000000001 || float_is_nan(len) || float_is_infinite(len) do (0.0, 0.0)
+    else
+      let ux = dx /. len
+      let uy = dy /. len
+      let uz = dz /. len
+      let vx = float_to_int(Math.floor(px))
+      let vy = float_to_int(Math.floor(py))
+      let vz = float_to_int(Math.floor(pz))
+      go(w, tb, sc, len, Window(Coac.chunk_of(vx) + 1, 0, 0, Chuac.uniform(0)), vx, vy, vz, ux, uy, uz, 0.0, first_cross(px, ux, vx), first_cross(py, uy, vy), first_cross(pz, uz, vz), 0.0, 0.0, 8192)
+    end
+  end
+
+  doc "The decibels the blocks between (x0, y0, z0) and (x1, y1, z1), in metres, cut from a sound, and the part of that falling on the highs, as (loss, dull)."
+  fn walk(w : Strata.World.World, x0 : Float, y0 : Float, z0 : Float, x1 : Float, y1 : Float, z1 : Float) : (Float, Float) do
+    walk_with(w, table(Strata.World.registry(w)), x0, y0, z0, x1, y1, z1)
+  end
+
+  pfn gain_of(db : Float) : Float do Math.pow(10.0, 0.0 -. db /. 20.0) end
+  doc "The low-pass cutoff, in Hz, for a path whose highs lose [dull] decibels more: 20 kHz, closing by a decade every 40 dB, never under 200 Hz."
+  fn cutoff_of(dull : Float) : Float do
+    let c = 20000.0 *. Math.pow(10.0, 0.0 -. dull /. 40.0)
+    if c < 200.0 do 200.0 else c end
+  end
+
+  -- a moved path: out [o], along, and back; plus what bending costs
+  pfn moved(w : Strata.World.World, tb : NativeIntArr, lx : Float, ly : Float, lz : Float, sx : Float, sy : Float, sz : Float, ox : Float, oy : Float, oz : Float) : (Float, Float) do
+    match (walk_with(w, tb, lx, ly, lz, lx +. ox, ly +. oy, lz +. oz), walk_with(w, tb, lx +. ox, ly +. oy, lz +. oz, sx +. ox, sy +. oy, sz +. oz), walk_with(w, tb, sx +. ox, sy +. oy, sz +. oz, sx, sy, sz)) do
+      ((a, da), (b, db), (c, dc)) -> (a +. b +. c +. 6.0, da +. db +. dc +. 12.0)
+    end
+  end
+  pfn better(p : (Float, Float), q : (Float, Float)) : (Float, Float) do
+    match (p, q) do ((a, _), (b, _)) -> if b < a do q else p end end
+  end
+
+  doc "Occlusion with a prebuilt `table`."
+  fn occlusion_with(w : Strata.World.World, tb : NativeIntArr, listener : (Float, Float, Float), source : (Float, Float, Float)) : (Float, Float) do
+    match (listener, source) do
+      ((lx, ly, lz), (sx, sy, sz)) ->
+        let straight = walk_with(w, tb, lx, ly, lz, sx, sy, sz)
+        let best = match straight do
+          (l, _) ->
+            if l < 0.5 do straight
+            else
+              -- a side and an up, square to the line from listener to source
+              let dx = sx -. lx
+              let dy = sy -. ly
+              let dz = sz -. lz
+              let n = Math.sqrt(dx *. dx +. dy *. dy +. dz *. dz)
+              let (fx, fy, fz) = if n < 0.000001 do (0.0, 0.0, -1.0) else (dx /. n, dy /. n, dz /. n) end
+              let (ax, ay, az) = if absf(fy) > 0.9 do (1.0, 0.0, 0.0) else (0.0, 1.0, 0.0) end
+              let rx0 = fy *. az -. fz *. ay
+              let ry0 = fz *. ax -. fx *. az
+              let rz0 = fx *. ay -. fy *. ax
+              let rn = Math.sqrt(rx0 *. rx0 +. ry0 *. ry0 +. rz0 *. rz0)
+              let rx = rx0 /. rn
+              let ry = ry0 /. rn
+              let rz = rz0 /. rn
+              let ux = ry *. fz -. rz *. fy
+              let uy = rz *. fx -. rx *. fz
+              let uz = rx *. fy -. ry *. fx
+              let m1 = better(straight, moved(w, tb, lx, ly, lz, sx, sy, sz, rx, ry, rz))
+              let m2 = better(m1, moved(w, tb, lx, ly, lz, sx, sy, sz, 0.0 -. rx, 0.0 -. ry, 0.0 -. rz))
+              let m3 = better(m2, moved(w, tb, lx, ly, lz, sx, sy, sz, ux, uy, uz))
+              better(m3, moved(w, tb, lx, ly, lz, sx, sy, sz, 0.0 -. ux, 0.0 -. uy, 0.0 -. uz))
+            end
+        end
+        match best do (loss, dull) -> (gain_of(loss), cutoff_of(dull)) end
+    end
+  end
+
+  doc "What the blocks between [listener] and [source] (metres) do to the sound: a gain (0..1) and a low-pass cutoff in Hz, from the least obstructed of five paths."
+  fn occlusion(w : Strata.World.World, r : Strata.Blocks.Registry, listener : (Float, Float, Float), source : (Float, Float, Float)) : (Float, Float) do
+    occlusion_with(w, table(r), listener, source)
+  end
+
+  pfn all_voices(w : Strata.World.World, tb : NativeIntArr, l : (Float, Float, Float), vs : List((Int, Float, Float, Float)), acc : List((Int, Float, Float))) : List((Int, Float, Float)) do
+    match vs do
+      Nil -> List.reverse(acc)
+      Cons((v, x, y, z), t) ->
+        match occlusion_with(w, tb, l, (x, y, z)) do
+          (g, c) -> all_voices(w, tb, l, t, Cons((v, g, c), acc))
+        end
+    end
+  end
+
+  -- ── The listener's space ───────────────────────────────────────────────
+
+  -- openness, mean free path (m), mean absorption and damping of what the
+  -- rays hit (0..1), decay (s), and the reflections nearest first:
+  -- (delay s, direction towards the surface x, y, z, gain)
+  type Space = Space(Float, Float, Float, Float, Float, List((Float, Float, Float, Float, Float)))
+
+  doc "The share of rays from the listener that met nothing within 64 m: 1 in the open sky, 0 shut in."
+  fn openness(sp : Space) : Float do match sp do Space(o, _, _, _, _, _) -> o end end
+  doc "How long the space rings, in seconds: the time for its echo to fall 60 dB."
+  fn decay(sp : Space) : Float do match sp do Space(_, _, _, _, t, _) -> t end end
+  doc "How much the surfaces dull the echo, 0..1."
+  fn damping(sp : Space) : Float do match sp do Space(_, _, _, d, _, _) -> d end end
+  doc "Up to eight early reflections, nearest first: (delay in seconds, the direction to the surface as x, y, z, gain)."
+  fn reflections(sp : Space) : List((Float, Float, Float, Float, Float)) do match sp do Space(_, _, _, _, _, rs) -> rs end end
+  doc "How strong the echo is against the dry sound, 0..1: none in the open."
+  fn wet(sp : Space) : Float do 0.6 *. (1.0 -. openness(sp)) end
+
+  doc "Rays cast from the listener, and how far each looks, in metres."
+  fn rays() : Int do 64 end
+  fn ray_reach() : Float do 64.0 end
+
+  -- a ray's first hit: (metres, packed sound, axis 0..2, step sign, voxel coordinate on that axis), or metres < 0 for none
+  pfn hit_go(w : Strata.World.World, tb : NativeIntArr, sc : Float, tmax : Float, win : Window, vx : Int, vy : Int, vz : Int, ux : Float, uy : Float, uz : Float, t : Float, nx : Float, ny : Float, nz : Float, axis : Int, sign : Int, steps : Int) : (Float, Int, Int, Int, Int) do
+    if t >= tmax || steps <= 0 do (-1.0, 0, 0, 0, 0)
+    else
+      match block_at(w, win, vx, vy, vz) do
+        (win2, id) ->
+          let p = packed(tb, id)
+          if int_and(p / 256, 255) >= 10 && t > 0.0 do (t *. sc, p, axis, sign, if axis == 0 do vx else if axis == 1 do vy else vz end end)
+          else if nx <= ny && nx <= nz do hit_go(w, tb, sc, tmax, win2, vx + dir_of(ux), vy, vz, ux, uy, uz, nx, nx +. step_of(ux), ny, nz, 0, dir_of(ux), steps - 1)
+          else if ny <= nz do hit_go(w, tb, sc, tmax, win2, vx, vy + dir_of(uy), vz, ux, uy, uz, ny, nx, ny +. step_of(uy), nz, 1, dir_of(uy), steps - 1)
+          else hit_go(w, tb, sc, tmax, win2, vx, vy, vz + dir_of(uz), ux, uy, uz, nz, nx, ny, nz +. step_of(uz), 2, dir_of(uz), steps - 1) end end end
+      end
+    end
+  end
+
+  -- a reflecting face: axis, the side the listener sees it from, its plane (voxel units), how far (m), absorption, damping
+  type Face = Face(Int, Int, Int, Float, Float, Float)
+
+  pfn same_face(a : Face, b : Face) : Bool do
+    match (a, b) do (Face(x1, s1, p1, _, _, _), Face(x2, s2, p2, _, _, _)) -> x1 == x2 && s1 == s2 && p1 == p2 end
+  end
+  pfn add_face(fs : List(Face), f : Face) : List(Face) do if List.any(fs, fn g -> same_face(g, f)) do fs else Cons(f, fs) end end
+
+  -- (hits, escaped, total metres, total absorption, total damping, faces)
+  type Rays = Rays(Int, Int, Float, Float, Float, List(Face))
+
+  pfn cast(w : Strata.World.World, tb : NativeIntArr, l : (Float, Float, Float), i : Int, acc : Rays) : Rays do
+    let n = rays()
+    if i >= n do acc
+    else
+      let sc = Strata.World.scale(w)
+      let fz = 1.0 -. 2.0 *. (int_to_float(i) +. 0.5) /. int_to_float(n)
+      let rr = Math.sqrt(1.0 -. fz *. fz)
+      let az = int_to_float(i) *. 2.39996322972865332
+      let ux = rr *. Math.cos(az)
+      let uy = fz
+      let uz = rr *. Math.sin(az)
+      match l do
+        (lx, ly, lz) ->
+          let px = lx /. sc
+          let py = ly /. sc
+          let pz = lz /. sc
+          let vx = float_to_int(Math.floor(px))
+          let vy = float_to_int(Math.floor(py))
+          let vz = float_to_int(Math.floor(pz))
+          let hit = hit_go(w, tb, sc, ray_reach() /. sc, Window(Coac.chunk_of(vx) + 1, 0, 0, Chuac.uniform(0)), vx, vy, vz, ux, uy, uz, 0.0, first_cross(px, ux, vx), first_cross(py, uy, vy), first_cross(pz, uz, vz), 0, 1, 8192)
+          match (hit, acc) do
+            ((d, p, axis, sign, plane_v), Rays(h, e, m, ab, da, fs)) ->
+              if d < 0.0 do cast(w, tb, l, i + 1, Rays(h, e + 1, m, ab, da, fs))
+              else
+                -- the face entered: on the near side of the voxel the ray stepped into
+                let plane = if sign > 0 do plane_v else plane_v + 1 end
+                let lc = if axis == 0 do px else if axis == 1 do py else pz end end
+                let perp = absf(int_to_float(plane) -. lc) *. sc
+                let ab1 = int_to_float(int_and(p, 255)) /. 255.0
+                let da1 = int_to_float(int_and(p / 65536, 255)) /. 255.0
+                cast(w, tb, l, i + 1, Rays(h + 1, e, m +. d, ab +. ab1, da +. da1, add_face(fs, Face(axis, sign, plane, perp, ab1, da1))))
+              end
+          end
+      end
+    end
+  end
+
+  pfn reflection(f : Face) : (Float, Float, Float, Float, Float) do
+    match f do
+      Face(axis, sign, _, perp, ab, _) ->
+        let d = if perp < 0.25 do 0.25 else perp end
+        let s = int_to_float(sign)
+        (2.0 *. d /. 343.0, if axis == 0 do s else 0.0 end, if axis == 1 do s else 0.0 end, if axis == 2 do s else 0.0 end, (1.0 -. ab) /. (1.0 +. d))
+    end
+  end
+  pfn face_d(f : Face) : Float do match f do Face(_, _, _, d, _, _) -> d end end
+  @[no_warn_recursion]
+  pfn take_faces(fs : List(Face), n : Int) : List(Face) do
+    if n <= 0 do Nil
+    else
+      match fs do
+        Nil -> Nil
+        Cons(h, t) -> Cons(h, take_faces(t, n - 1))
+      end
+    end
+  end
+
+  doc "The space with a prebuilt `table`."
+  fn space_with(w : Strata.World.World, tb : NativeIntArr, listener : (Float, Float, Float)) : Space do
+    match cast(w, tb, listener, 0, Rays(0, 0, 0.0, 0.0, 0.0, Nil)) do
+      Rays(h, e, m, ab, da, fs) ->
+        let open = int_to_float(e) /. int_to_float(rays())
+        let mfp = if h > 0 do m /. int_to_float(h) else ray_reach() end
+        let a = if h > 0 do ab /. int_to_float(h) else 1.0 end
+        let damp = if h > 0 do da /. int_to_float(h) else 0.0 end
+        -- Eyring: what escapes counts as absorbed, twice over, since a ray
+        -- that leaves takes the echo's way back with it
+        let keep = (1.0 -. a) *. (1.0 -. open) *. (1.0 -. open)
+        let path = if mfp > 30.0 do 30.0 else mfp end
+        let t0 = if keep <= 0.000001 do 0.1 else 0.04 *. path /. (0.0 -. Math.log(keep)) end
+        let t = if t0 < 0.1 do 0.1 else if t0 > 6.0 do 6.0 else t0 end end
+        let near = take_faces(List.sort_by(fs, fn (x, y) -> face_d(x) < face_d(y)), 8)
+        Space(open, mfp, a, damp, t, List.map(near, fn f -> reflection(f)))
+    end
+  end
+
+  doc "The listener's space: 64 rays to 64 m say how open it is, how long it rings, how dull its echo is, and where its nearest surfaces are. Unloaded chunks are air."
+  fn space(w : Strata.World.World, r : Strata.Blocks.Registry, listener : (Float, Float, Float)) : Space do
+    space_with(w, table(r), listener)
+  end
+
+  doc "Nothing to hear: the open sky."
+  fn open_space() : Space do Space(1.0, ray_reach(), 1.0, 0.0, 0.1, Nil) end
+
+  type Job = Listening(Task((List((Int, Float, Float)), Space)))
+
+  doc "Work out, on a worker, the occlusion of every voice in [voices] (voice, x, y, z) from [listener], and the listener's space. Hand the job to `finish_space` two frames later, so it is normally done."
+  fn begin(w : Strata.World.World, r : Strata.Blocks.Registry, listener : (Float, Float, Float), voices : List((Int, Float, Float, Float))) : Job do
+    Listening(task_spawn(fn _ ->
+      let tb = table(r)
+      (all_voices(w, tb, listener, voices, Nil), space_with(w, tb, listener))))
+  end
+
+  doc "The job's answers: (voice, gain, cutoff) for each voice, in order, and the listener's space; none and the open sky if the worker failed. Waits if it is not done."
+  fn finish_space(j : Job) : (List((Int, Float, Float)), Space) do
+    match j do
+      Listening(t) -> match task_await(t) do
+        Ok(answers) -> answers
+        Err(_) -> (Nil, open_space())
+      end
+    end
+  end
+
+  doc "The job's occlusion answers alone."
+  fn finish(j : Job) : List((Int, Float, Float)) do match finish_space(j) do (vs, _) -> vs end end
+end

@@ -169,6 +169,12 @@ static void test_fp(void) {
     for (int i = 0; i < SM_FP_VALUES * 3; i++) fp[i] = -40.0f + (float)(i % 7) + 1.0f;
     sm_fp_write(b, fp, 3);
     CHECK(sm_fp_compare(a, b, 1.5f, 0.5f) == 1, "everything 1 dB louder fails on the total at 0.5 dB");
+    for (int i = 0; i < SM_FP_VALUES * 3; i++) fp[i] = -40.0f + (float)(i % 7);
+    fp[3] = -120.0f; sm_fp_write(a, fp, 3);
+    fp[3] = -95.0f; sm_fp_write(b, fp, 3);
+    CHECK(sm_fp_compare(a, b, 1.5f, 0.5f) == 0, "bands below -80 dB on both sides are not compared: near silence is noise");
+    fp[3] = -60.0f; sm_fp_write(b, fp, 3);
+    CHECK(sm_fp_compare(a, b, 1.5f, 0.5f) == 1, "but silence against sound is a difference");
 }
 
 static SmRec *mk_rec(int frames, int channels, float hz) {
@@ -223,6 +229,266 @@ static void test_recordings(void) {
     sm_close(m);
 }
 
+static void mu_listener(SmMixer *m, float x, float y, float z, float fx, float fy, float fz) {
+    SmCmd c; memset(&c, 0, sizeof c);
+    c.op = SM_OP_LISTENER; c.f[0] = x; c.f[1] = y; c.f[2] = z; c.f[3] = fx; c.f[4] = fy; c.f[5] = fz; c.f[6] = 0.0f; c.f[7] = 1.0f; c.f[8] = 0.0f;
+    sm_command(m, &c);
+}
+static void mu_play_at(SmMixer *m, int voice, int src, float gain, float priority, float x, float y, float z) {
+    SmCmd c; memset(&c, 0, sizeof c);
+    c.op = SM_OP_PLAY; c.voice = voice; c.a = src;
+    c.f[0] = gain; c.f[1] = 1.0f; c.f[2] = priority; c.f[3] = x; c.f[4] = y; c.f[5] = z; c.f[6] = 0.0f;
+    sm_command(m, &c);
+}
+static void mu_output(SmMixer *m, int headphones) { mu_cmd(m, SM_OP_OUTPUT, 0, headphones, 0.0f); }
+static double chan_db(int ch, int from, int to) {
+    double s = 0; for (int i = from; i < to; i++) s += (double)buf[2 * i + ch] * buf[2 * i + ch];
+    return mu_db(sqrt(s / (to - from)));
+}
+static int tone_patch(SmMixer *m, int id, int kind, float hz, float level) {
+    float p[SM_PATCH_FLOATS]; mu_patch_clear(p); mu_source(p, 0, kind, hz, level); mu_send_patch(m, id, p); return id;
+}
+
+static void test_sides(int headphones) {
+    for (int side = -1; side <= 1; side += 2) {
+        SmMixer *m = sm_open();
+        mu_output(m, headphones);
+        mu_listener(m, 0, 0, 0, 0, 0, -1);
+        tone_patch(m, 1, SM_SRC_PINK, 0.0f, 0.5f);
+        mu_play_at(m, 1, 1, 1.0f, 1.0f, 10.0f * side, 0.0f, 0.0f);
+        render(m, SEC(0.5));
+        double l = chan_db(0, SEC(0.1), SEC(0.5)), r = chan_db(1, SEC(0.1), SEC(0.5));
+        if (headphones) {   /* a head shadows the highs: compare the 4 kHz octave, ears left and right */
+            static float fp[SM_FP_VALUES * 6];
+            int w = sm_fingerprint(buf, SEC(0.5), fp); l = r = 0;
+            for (int i = 1; i < w; i++) { l += fp[i * SM_FP_VALUES + 7]; r += fp[i * SM_FP_VALUES + SM_FP_BANDS + 7]; }
+            l /= (w - 1); r /= (w - 1);
+        }
+        CHECK(side > 0 ? r - l >= 6.0 : l - r >= 6.0, headphones ? "binaural: a source to one side is 6 dB louder in that ear" : "speakers: a source to one side is 6 dB louder on that side");
+        sm_close(m);
+    }
+}
+
+static double band_balance(int front) {   /* the 4-8 kHz octave against 500 Hz-1 kHz, both ears */
+    SmMixer *m = sm_open();
+    mu_output(m, 1);
+    mu_listener(m, 0, 0, 0, 0, 0, -1);
+    tone_patch(m, 1, SM_SRC_PINK, 0.0f, 0.5f);
+    mu_play_at(m, 1, 1, 1.0f, 1.0f, 0.0f, 0.0f, front ? -5.0f : 5.0f);
+    render(m, SEC(1.0));
+    static float fp[SM_FP_VALUES * 12];
+    int w = sm_fingerprint(buf, SEC(1.0), fp);
+    double hi = 0, lo = 0;
+    for (int i = 2; i < w; i++) { hi += fp[i * SM_FP_VALUES + 7] + fp[i * SM_FP_VALUES + 17]; lo += fp[i * SM_FP_VALUES + 4] + fp[i * SM_FP_VALUES + 14]; }
+    sm_close(m);
+    return (hi - lo) / (2.0 * (w - 2));
+}
+
+static double diffuse_db(int mode) {      /* 0 flat mono, 1 speakers, 2 headphones: 40 noise sources all round */
+    SmMixer *m = sm_open();
+    if (mode) mu_output(m, mode == 2);
+    mu_listener(m, 0, 0, 0, 0, 0, -1);
+    tone_patch(m, 1, SM_SRC_PINK, 0.0f, 0.05f);
+    for (int i = 0; i < 40; i++) {
+        double zf = 1.0 - 2.0 * (i + 0.5) / 40.0, rr = sqrt(1.0 - zf * zf), a = i * 2.39996323;
+        if (mode == 0) mu_play_flat(m, i + 1, 1, 1.0f, 0.0f);
+        else mu_play_at(m, i + 1, 1, 1.0f, 1.0f, (float)(rr * cos(a)), (float)zf, (float)(rr * sin(a)));
+    }
+    render(m, SEC(1.0));
+    double e = mu_rms(buf, SEC(0.2), SEC(1.0));
+    sm_close(m);
+    return mu_db(e);
+}
+
+static void test_space(void) {
+    test_sides(0);
+    test_sides(1);
+    CHECK(fabs(band_balance(1) - band_balance(0)) >= 3.0, "binaural: a source behind has a 4-8 kHz balance 3 dB from one in front");
+    double flat = diffuse_db(0);
+    CHECK(fabs(diffuse_db(1) - flat) <= 1.0, "speakers keep a diffuse field's energy within 1 dB");
+    CHECK(fabs(diffuse_db(2) - flat) <= 1.0, "headphones keep a diffuse field's energy within 1 dB");
+
+    /* distance: twice as far beyond the reference is 6 dB quieter */
+    double at[2];
+    for (int k = 0; k < 2; k++) {
+        SmMixer *m = sm_open();
+        mu_listener(m, 0, 0, 0, 0, 0, -1);
+        tone_patch(m, 1, SM_SRC_SINE, 200.0f, 0.5f);
+        mu_play_at(m, 1, 1, 1.0f, 1.0f, 0.0f, 0.0f, k ? -8.0f : -4.0f);
+        render(m, SEC(0.5));
+        at[k] = mu_db(mu_rms(buf, SEC(0.1), SEC(0.5)));
+        sm_close(m);
+    }
+    CHECK(fabs((at[0] - at[1]) - 6.02) <= 0.5, "twice as far is 6 dB quieter");
+
+    /* degenerate: a source at the listener, a zero facing vector */
+    for (int hp = 0; hp < 2; hp++) {
+        SmMixer *m = sm_open();
+        mu_output(m, hp);
+        mu_listener(m, 1, 2, 3, 0, 0, 0);
+        tone_patch(m, 1, SM_SRC_SINE, 300.0f, 0.5f);
+        mu_play_at(m, 1, 1, 1.0f, 1.0f, 1.0f, 2.0f, 3.0f);
+        render(m, SEC(0.3));
+        int finite = 1; for (int i = 0; i < 2 * SEC(0.3); i++) if (!isfinite(buf[i])) finite = 0;
+        double lvl = mu_db(mu_rms(buf, SEC(0.1), SEC(0.3)));
+        CHECK(finite && fabs(lvl - mu_db(0.5 / sqrt(2.0))) <= 3.0, hp ? "binaural: a source at the listener, facing nowhere, plays finite at its gain" : "speakers: a source at the listener, facing nowhere, plays finite at its gain");
+        sm_close(m);
+    }
+
+    /* ranking: of 100 voices the 64 loudest mix; the rest are virtual and keep time */
+    {
+        SmMixer *m = sm_open();
+        mu_listener(m, 0, 0, 0, 0, 0, -1);
+        tone_patch(m, 1, SM_SRC_SINE, 100.0f, 0.1f);
+        for (int v = 1; v <= 100; v++) mu_play_at(m, v, 1, (float)v / 100.0f, 1.0f, 0.0f, 0.0f, -2.0f);
+        render(m, SEC(0.1));
+        CHECK(sm_stats(m).playing == 100 && sm_stats(m).virtual_ == 36, "of 100 voices 64 mix and 36 are virtual");
+        CHECK(sm_is_mixed(m, 100) && sm_is_mixed(m, 37) && !sm_is_mixed(m, 36) && !sm_is_mixed(m, 1), "the loudest 64 are the ones mixed");
+        float jump = 0.0f;
+        for (int i = 1; i < SEC(0.1); i++) { float d = fabsf(buf[2 * i] - buf[2 * i - 2]); if (d > jump) jump = d; }
+        sm_close(m);
+        CHECK(jump < 0.3f, "voices entering the mix fade in: no jump");
+    }
+    {   /* a looping recording that goes virtual comes back where it would have been */
+        SmMixer *m = sm_open();
+        mu_listener(m, 0, 0, 0, 0, 0, -1);
+        SmRec *r = mk_rec(SM_RATE, 1, 50.0f);   /* one second */
+        for (int i = 0; i < r->frames; i++) r->data[i] = (float)i / r->frames;   /* a ramp: its value is its position */
+        sm_rec_publish(m, SM_REC_FIRST, r);
+        float p[SM_PATCH_FLOATS]; mu_patch_clear(p);
+        p[SM_P_SRC(0)] = SM_SRC_RECORDING; p[SM_P_SRC(0) + 1] = 1.0f; p[SM_P_SRC(0) + 2] = 1.0f; p[SM_P_SRC(0) + 4] = (float)SM_REC_FIRST; p[SM_P_LOOP] = 1.0f;
+        mu_send_patch(m, 1, p);
+        tone_patch(m, 2, SM_SRC_SINE, 100.0f, 0.01f);
+        mu_play_at(m, 1, 1, 0.001f, 1.0f, 0.0f, 0.0f, -1.0f);            /* quiet: it will be outranked */
+        for (int v = 2; v <= 65; v++) mu_play_at(m, v, 2, 1.0f, 1.0f, 0.0f, 0.0f, -1.0f);
+        render(m, SEC(0.3));
+        CHECK(!sm_is_mixed(m, 1), "the quiet loop is virtual while 64 louder voices play");
+        double pos = sm_voice_position(m, 1, 0);
+        CHECK(fabs(pos - SEC(0.3)) < SM_BLOCK * 2, "and its place in the recording has moved on with time");
+        free(r->data); free(r);
+        sm_close(m);
+    }
+    {   /* past 1024 tracked, the lowest-ranked go and are counted */
+        SmMixer *m = sm_open();
+        mu_listener(m, 0, 0, 0, 0, 0, -1);
+        tone_patch(m, 1, SM_SRC_SINE, 100.0f, 0.01f);
+        for (int v = 1; v <= 1100; v++) mu_play_at(m, v, 1, 1.0f, 1.0f, 0.0f, 0.0f, -2.0f);
+        render(m, SM_BLOCK);
+        CHECK(sm_stats(m).refused == 76 && sm_stats(m).playing == 1024, "1100 voices: 1024 tracked, 76 dropped and counted");
+        sm_close(m);
+    }
+}
+
+static void mu_occlude(SmMixer *m, int voice, float gain, float cutoff) {
+    SmCmd c; memset(&c, 0, sizeof c); c.op = SM_OP_OCCLUDE; c.voice = voice; c.f[0] = gain; c.f[1] = cutoff; sm_command(m, &c);
+}
+static void test_occlusion(void) {
+    SmMixer *m = sm_open();
+    mu_listener(m, 0, 0, 0, 0, 0, -1);
+    tone_patch(m, 1, SM_SRC_SINE, 100.0f, 0.5f);
+    mu_play_at(m, 1, 1, 1.0f, 1.0f, 0.0f, 0.0f, -1.0f);
+    render(m, SEC(0.1));
+    double before = mu_db(mu_rms(buf, SEC(0.05), SEC(0.1)));
+    mu_occlude(m, 1, 0.01f, 400.0f);
+    render(m, SEC(0.3));
+    double soon = mu_db(mu_rms(buf, 0, SEC(0.02))), later = mu_db(mu_rms(buf, SEC(0.15), SEC(0.3)));
+    CHECK(before - soon < 6.0, "muffling glides: 20 ms after it is set the level has not dropped 6 dB");
+    CHECK(before - later > 35.0, "and after 150 ms it has dropped by the 40 dB asked");
+    float jump = 0.0f; for (int i = 1; i < SEC(0.3); i++) { float d = fabsf(buf[2 * i] - buf[2 * i - 2]); if (d > jump) jump = d; }
+    CHECK(jump < 0.02f, "with no jump on the way");
+    sm_close(m);
+    /* an occluded voice ranks below a clear one of the same level */
+    m = sm_open();
+    mu_listener(m, 0, 0, 0, 0, 0, -1);
+    tone_patch(m, 1, SM_SRC_SINE, 100.0f, 0.01f);
+    for (int v = 1; v <= 65; v++) mu_play_at(m, v, 1, 1.0f, 1.0f, 0.0f, 0.0f, -2.0f);
+    mu_occlude(m, 1, 0.1f, 2000.0f);
+    render(m, SM_BLOCK * 2);
+    CHECK(!sm_is_mixed(m, 1) && sm_is_mixed(m, 65), "the muffled voice is the one left out");
+    sm_close(m);
+}
+
+static void mu_environ(SmMixer *m, float decay, float damping, float wet, int nrefl, const float *refl) {
+    SmCmd c; memset(&c, 0, sizeof c); c.op = SM_OP_ENVIRON; c.a = 0;
+    c.f[0] = decay; c.f[1] = damping; c.f[2] = wet; c.f[3] = (float)nrefl;
+    sm_command(m, &c);
+    for (int r = 0; r * 2 < nrefl; r++) {
+        memset(&c, 0, sizeof c); c.op = SM_OP_ENVIRON; c.a = r + 1;
+        for (int k = 0; k < 10 && r * 10 + k < nrefl * 5; k++) c.f[k] = refl[r * 10 + k];
+        sm_command(m, &c);
+    }
+}
+/* RT60 from a Schroeder backward integration of the output's energy, between -5 and -25 dB */
+static double rt60(const float *st, int from, int to) {
+    static double e[SM_RATE * 5];
+    double acc = 0.0;
+    for (int i = to - 1; i >= from; i--) { acc += (double)st[2 * i] * st[2 * i] + (double)st[2 * i + 1] * st[2 * i + 1]; e[i - from] = acc; }
+    double top = e[0]; int a = -1, b = -1;
+    for (int i = 0; i < to - from; i++) {
+        double db = 10.0 * log10(e[i] / top + 1e-30);
+        if (a < 0 && db <= -5.0) a = i;
+        if (b < 0 && db <= -25.0) { b = i; break; }
+    }
+    return a < 0 || b < 0 ? -1.0 : 3.0 * (double)(b - a) / SM_RATE;
+}
+static int click_patch(SmMixer *m, int id) {
+    float p[SM_PATCH_FLOATS]; mu_patch_clear(p); mu_source(p, 0, SM_SRC_WHITE, 0.0f, 0.8f);
+    p[SM_P_HOLD] = 0.004f; p[SM_P_ENV(0) + 3] = 0.001f; mu_send_patch(m, id, p); return id;
+}
+static void test_reverb(void) {
+    static float tail[2 * SM_RATE * 4];
+    /* a click into a space that rings for 2 s: the tail decays 60 dB in 2 s, within 10% */
+    SmMixer *m = sm_open();
+    mu_listener(m, 0, 0, 0, 0, 0, -1);
+    mu_environ(m, 2.0f, 0.0f, 0.6f, 0, NULL);
+    render(m, SEC(0.2));                                  /* let the space settle in */
+    click_patch(m, 1);
+    mu_play_at(m, 1, 1, 1.0f, 1.0f, 0.0f, 0.0f, -10.0f);
+    sm_mix(m, tail, SEC(3.5));
+    double t = rt60(tail, SEC(0.05), SEC(3.5));
+    CHECK(t > 1.8 && t < 2.2, "an impulse into a 2.0 s space decays in 2.0 s, within 10%");
+    sm_close(m);
+    /* damping: the highs die sooner than the lows */
+    m = sm_open();
+    mu_listener(m, 0, 0, 0, 0, 0, -1);
+    mu_environ(m, 2.0f, 0.8f, 0.6f, 0, NULL);
+    render(m, SEC(0.2));
+    click_patch(m, 1);
+    mu_play_at(m, 1, 1, 1.0f, 1.0f, 0.0f, 0.0f, -10.0f);
+    sm_mix(m, tail, SEC(2.0));
+    static float fp[SM_FP_VALUES * 24];
+    sm_fingerprint(tail, SEC(2.0), fp);
+    double lo = fp[1 * SM_FP_VALUES + 4] - fp[5 * SM_FP_VALUES + 4], hi = fp[1 * SM_FP_VALUES + 8] - fp[5 * SM_FP_VALUES + 8];
+    CHECK(hi > lo + 3.0, "a damped space's 8 kHz tail falls faster than its 500 Hz tail");
+    sm_close(m);
+    /* a change of space glides: no click */
+    m = sm_open();
+    mu_listener(m, 0, 0, 0, 0, 0, -1);
+    tone_patch(m, 1, SM_SRC_SINE, 200.0f, 0.3f);
+    mu_environ(m, 0.3f, 0.2f, 0.0f, 0, NULL);
+    mu_play_at(m, 1, 1, 1.0f, 1.0f, 0.0f, 0.0f, -3.0f);
+    render(m, SEC(0.3));
+    float refl[5] = { 0.01f, -1.0f, 0.0f, 0.0f, 0.5f };
+    mu_environ(m, 4.0f, 0.2f, 0.6f, 1, refl);
+    render(m, SEC(0.5));
+    float jump = 0.0f; for (int i = 1; i < SEC(0.5); i++) { float d = fabsf(buf[2 * i] - buf[2 * i - 2]); if (d > jump) jump = d; }
+    CHECK(jump < 0.03f, "a new space glides in: no jump");
+    sm_close(m);
+    /* a reflection from the left arrives on the left, after its delay */
+    m = sm_open();
+    mu_listener(m, 0, 0, 0, 0, 0, -1);
+    float left[5] = { 0.0117f, -1.0f, 0.0f, 0.0f, 0.8f };
+    mu_environ(m, 0.1f, 0.0f, 0.6f, 1, left);
+    render(m, SEC(0.2));
+    click_patch(m, 1);
+    mu_play_at(m, 1, 1, 1.0f, 1.0f, 0.0f, 0.0f, -10.0f);
+    sm_mix(m, tail, SEC(0.1));
+    double el = 0, er = 0;
+    for (int i = SEC(0.0117) + 30; i < SEC(0.0117) + 260; i++) { el += tail[2 * i] * tail[2 * i]; er += tail[2 * i + 1] * tail[2 * i + 1]; }
+    CHECK(el > 2.0 * er, "the reflection from the left wall is louder on the left");
+    sm_close(m);
+}
+
 int main(void) {
     test_fp();
     test_ring();
@@ -235,6 +501,9 @@ int main(void) {
     test_repeatable();
     test_wav();
     test_recordings();
+    test_space();
+    test_occlusion();
+    test_reverb();
     if (fails == 0) printf("mix_test: ok\n");
     return fails == 0 ? 0 : 1;
 }

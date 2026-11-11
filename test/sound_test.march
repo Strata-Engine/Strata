@@ -11,6 +11,41 @@ mod SoundTest do
     Strata.World.new(Strata.Blocks.empty(), Strata.Terrain.gen(fn (k, seed) -> Strata.Chunk.uniform(0)), 1, 1.0)
   end
   pfn fluid() : Strata.Fluid.Fluid do Strata.Fluid.new(Strata.Blocks.empty(), Nil) end
+
+  -- stone (id 1) in a world of loaded air chunks -1..0 on each axis
+  pfn stone_reg() : Strata.Blocks.Registry do
+    match Strata.Blocks.register(Strata.Blocks.empty(), Strata.Blocks.def()) do
+      Ok((r, _)) -> r
+      Err(_) -> Strata.Blocks.empty()
+    end
+  end
+  pfn loaded(w : Strata.World.World, i : Int) : Strata.World.World do
+    if i >= 8 do w else loaded(Strata.World.insert(w, Strata.Coord.key(i % 2 - 1, (i / 2) % 2 - 1, i / 4 - 1), Strata.Chunk.uniform(0)), i + 1) end
+  end
+  pfn open_world() : Strata.World.World do loaded(Strata.World.new(stone_reg(), Strata.Terrain.gen(fn (k, seed) -> Strata.Chunk.uniform(0)), 1, 1.0), 0) end
+  pfn walled(w : Strata.World.World) : Strata.World.World do Strata.Edit.world(Strata.Edit.fill_box(w, -20, -20, -6, 20, 20, -5, 1)) end
+  pfn upd(s : Strata.Sound.Sound, w : Strata.World.World) : (Strata.Sound.Sound, Strata.Sound.Commands) do Snd.update(s, w, fluid(), 0.016667) end
+  -- the gain of the first OCCLUDE record for [v], or -1.0
+  pfn occ_gain(c : Strata.Sound.Commands, v : Int, i : Int) : Float do
+    if i >= Snd.cmd_count(c) do -1.0
+    else if Snd.cmd_op(c, i) == Snd.op_occlude() && Snd.cmd_voice(c, i) == v do Snd.cmd_f(c, i, 0)
+    else occ_gain(c, v, i + 1) end end
+  end
+  -- frames until an OCCLUDE for [v] below [under] is sent, at most [left]
+  pfn until_muffled(s : Strata.Sound.Sound, w : Strata.World.World, v : Int, under : Float, n : Int, left : Int) : Int do
+    if left <= 0 do -1
+    else
+      match upd(s, w) do
+        (s2, c) ->
+          let g = occ_gain(c, v, 0)
+          if g >= 0.0 && g < under do n else until_muffled(s2, w, v, under, n + 1, left - 1) end
+      end
+    end
+  end
+  pfn listen(s : Strata.Sound.Sound) : Strata.Sound.Sound do Snd.listener(s, 0.5, 0.5, 0.5, 0.0, 0.0, -1.0, 0.0, 1.0, 0.0) end
+  pfn place_n(s : Strata.Sound.Sound, n : Int) : Strata.Sound.Sound do
+    if n <= 0 do s else match Snd.play(s, 1, 0.5, 0.5, -10.5, 1.0, 1.0, 1.0) do (s2, _) -> place_n(s2, n - 1) end end
+  end
   pfn flush(s : Strata.Sound.Sound) : (Strata.Sound.Sound, Strata.Sound.Commands) do Snd.update(s, world(), fluid(), 0.016667) end
 
   pfn play_n(s : Strata.Sound.Sound, n : Int) : Strata.Sound.Sound do
@@ -34,6 +69,72 @@ mod SoundTest do
     else if Snd.cmd_f(c, i, k) == NativeArray.get_f32(fl, a * 12 + k) do all_k(c, fl, i, a, k + 1) else false end end
   end
 
+  -- the first ENVIRON header record's decay within [n] frames, or -1.0
+  pfn env_decay(s : Strata.Sound.Sound, w : Strata.World.World, n : Int) : Float do
+    if n <= 0 do -1.0
+    else
+      match upd(s, w) do
+        (s2, c) -> match first_env(c, 0) do
+          Some(d) -> d
+          None -> env_decay(s2, w, n - 1)
+        end
+      end
+    end
+  end
+  pfn first_env(c : Strata.Sound.Commands, i : Int) : Option(Float) do
+    if i >= Snd.cmd_count(c) do None
+    else if Snd.cmd_op(c, i) == Snd.op_environ() && Snd.cmd_a(c, i) == 0 do Some(Snd.cmd_f(c, i, 0))
+    else first_env(c, i + 1) end end
+  end
+  pfn boxed() : Strata.World.World do
+    Strata.Edit.world(Strata.Edit.fill_box(Strata.Edit.world(Strata.Edit.fill_box(open_world(), -16, -16, -16, 15, 15, 15, 1)), -6, -6, -6, 5, 5, 5, 0))
+  end
+
+  -- stone (1), then water (2..9): a column of water falling through air
+  pfn wet_reg() : Strata.Blocks.Registry do
+    match Strata.Blocks.register_fluid(stone_reg(), Strata.Blocks.with_opacity(Strata.Blocks.def(), Strata.Blocks.SeeThrough)) do
+      Ok((r, _)) -> r
+      Err(_) -> stone_reg()
+    end
+  end
+  pfn wet_world() : Strata.World.World do
+    let w0 = loaded(Strata.World.new(wet_reg(), Strata.Terrain.gen(fn (k, seed) -> Strata.Chunk.uniform(0)), 1, 1.0), 0)
+    Strata.Edit.world(Strata.Edit.fill_box(w0, 1, 20, -6, 4, 20, -3, 9))
+  end
+  pfn falling() : (Strata.Fluid.Fluid, Strata.World.World) do
+    let w = wet_world()
+    let f0 = Strata.Fluid.new(wet_reg(), Cons((2, Strata.Fluid.flowing()), Nil))
+    let f1 = Strata.Fluid.wake(f0, w, Strata.Edit.fill_box(w, 1, 20, -6, 4, 20, -3, 9))
+    match Strata.Fluid.step_world(f1, w, Nil) do
+      (f2, o) -> (f2, Strata.Edit.world(o))
+    end
+  end
+  pfn count_ops(c : Strata.Sound.Commands, op : Int, i : Int, acc : Int) : Int do
+    if i >= Snd.cmd_count(c) do acc else count_ops(c, op, i + 1, if Snd.cmd_op(c, i) == op do acc + 1 else acc end) end
+  end
+  -- updates with this fluid for [n] frames, counting records of [op]
+  pfn ops_over(s : Strata.Sound.Sound, w : Strata.World.World, fl : Strata.Fluid.Fluid, op : Int, n : Int, acc : Int) : (Strata.Sound.Sound, Int) do
+    if n <= 0 do (s, acc)
+    else match Snd.update(s, w, fl, 0.016667) do (s2, c) -> ops_over(s2, w, fl, op, n - 1, acc + count_ops(c, op, 0, 0)) end end
+  end
+  -- the last CONTROL value sent to [v]'s control [k] within [n] frames, or -1.0
+  pfn last_ctl(s : Strata.Sound.Sound, w : Strata.World.World, v : Int, k : Int, n : Int, got : Float) : Float do
+    if n <= 0 do got
+    else
+      match upd(s, w) do
+        (s2, c) -> last_ctl(s2, w, v, k, n - 1, ctl_in(c, v, k, 0, got))
+      end
+    end
+  end
+  pfn ctl_in(c : Strata.Sound.Commands, v : Int, k : Int, i : Int, got : Float) : Float do
+    if i >= Snd.cmd_count(c) do got
+    else ctl_in(c, v, k, i + 1, if Snd.cmd_op(c, i) == Snd.op_control() && Snd.cmd_voice(c, i) == v && Snd.cmd_a(c, i) == k do Snd.cmd_f(c, i, 0) else got end) end
+  end
+
+  pfn run_frames(s : Strata.Sound.Sound, w : Strata.World.World, n : Int) : Strata.Sound.Sound do
+    if n <= 0 do s else match upd(s, w) do (s2, _) -> run_frames(s2, w, n - 1) end end
+  end
+
   describe "Strata.Sound" do
     test "play answers voice numbers in order and update sends them" do
       let s0 = Snd.new()
@@ -44,7 +145,8 @@ mod SoundTest do
       Test.assert_eq_int(v2, 2, "second voice")
       Test.assert_eq_int(v3, 3, "third voice")
       let (_, c) = flush(s3)
-      Test.assert_eq_int(Snd.cmd_count(c), 3, "three records")
+      Test.assert_eq_int(Snd.cmd_count(c), 5, "three plays, then the two placed ones' first walks")
+      Test.assert_eq_int(Snd.cmd_op(c, 3), Snd.op_occlude(), "an occlusion after the plays")
       Test.assert_eq_int(Snd.cmd_op(c, 0), Snd.op_play(), "a play")
       Test.assert_eq_int(Snd.cmd_voice(c, 0), 1, "voice 1 first")
       Test.assert_eq_int(Snd.cmd_voice(c, 2), 3, "voice 3 last")
@@ -95,6 +197,71 @@ mod SoundTest do
       let (s1, _) = flush(play_n(Snd.new(), 2))
       let (_, c) = flush(s1)
       Test.assert_eq_int(Snd.cmd_count(c), 0, "the next frame is empty")
+    end
+    test "the listener and a voice's range are sent" do
+      let (s1, v) = Snd.play(Snd.new(), 1, 3.0, 4.0, 5.0, 1.0, 1.0, 1.0)
+      let s2 = Snd.with_range(Snd.listener(s1, 1.0, 2.0, 3.0, 0.0, 0.0, -1.0, 0.0, 1.0, 0.0), v, 2.0, 50.0)
+      let (_, c) = flush(s2)
+      Test.assert_eq_int(Snd.cmd_count(c), 4, "play, listener, range, and the play's first walk")
+      Test.assert_eq_int(Snd.cmd_op(c, 1), Snd.op_listener(), "the listener")
+      Test.assert_true(Snd.cmd_f(c, 1, 2) == 3.0 && Snd.cmd_f(c, 1, 5) == -1.0 && Snd.cmd_f(c, 1, 7) == 1.0, "its position, facing and up")
+      Test.assert_eq_int(Snd.cmd_op(c, 2), Snd.op_range(), "the range")
+      Test.assert_true(Snd.cmd_f(c, 2, 0) == 2.0 && Snd.cmd_f(c, 2, 1) == 50.0, "reference and maximum")
+      Test.assert_true(Snd.cmd_f(c, 0, 3) == 3.0 && Snd.cmd_f(c, 0, 5) == 5.0 && Snd.cmd_f(c, 0, 6) == 0.0, "the play is placed, not flat")
+    end
+    test "a new placed voice is sent already muffled by the wall in front of it" do
+      let (s1, v) = Snd.play(listen(Snd.new()), 1, 0.5, 0.5, -10.5, 1.0, 1.0, 1.0)
+      let (_, c) = upd(s1, walled(open_world()))
+      let g = occ_gain(c, v, 0)
+      Test.assert_true(g >= 0.0 && g < 0.01, "an OCCLUDE record in the same frame, below -40 dB")
+    end
+    test "eight new voices a frame are walked at once; the rest wait and are counted" do
+      let (s1, c) = upd(place_n(listen(Snd.new()), 10), walled(open_world()))
+      Test.assert_true(occ_gain(c, 8, 0) >= 0.0 && occ_gain(c, 9, 0) < 0.0, "voices 1 to 8 walked, 9 not")
+      Test.assert_eq_int(Snd.unwalked(s1), 2, "two counted")
+    end
+    test "a wall built between listener and sound muffles it within 250 ms" do
+      let (s1, v) = Snd.play(listen(Snd.new()), 1, 0.5, 0.5, -10.5, 1.0, 1.0, 1.0)
+      let (s2, c) = upd(s1, open_world())
+      Test.assert_true(occ_gain(c, v, 0) > 0.99, "in the open first")
+      let n = until_muffled(s2, walled(open_world()), v, 0.01, 1, 30)
+      Test.assert_true(n > 0 && n <= 15, "muffled within 15 frames of 1/60 s")
+    end
+    test "a one-shot is no longer tracked once its patch has run its length" do
+      let (s1, p) = Snd.upload(listen(Snd.new()), Snd.strike())
+      let (s2, _) = Snd.play(s1, p, 0.5, 0.5, -3.0, 1.0, 1.0, 1.0)
+      let (s3, _) = upd(s2, open_world())
+      Test.assert_eq_int(Snd.tracked(s3), 1, "tracked while it sounds")
+      let s4 = run_frames(s3, open_world(), 60)
+      Test.assert_eq_int(Snd.tracked(s4), 0, "and let go after")
+    end
+    test "the listener's space is sent ten times a second, voices or none" do
+      let d = env_decay(listen(Snd.new()), boxed(), 12)
+      Test.assert_true(d > 1.0, "shut in stone: a long decay")
+      let d2 = env_decay(listen(Snd.new()), open_world(), 12)
+      Test.assert_true(d2 >= 0.0 && d2 < 0.3, "in the open: hardly any")
+    end
+    test "falling fluid is heard: a placed pour that follows the flow, stopped when the fluid goes quiet" do
+      match falling() do
+        (fl, w) ->
+          let (s1, c1) = Snd.update(listen(Snd.new()), w, fl, 0.016667)
+          Test.assert_eq_int(count_ops(c1, Snd.op_patch(), 0, 0), 6, "the pour patch is sent once")
+          Test.assert_eq_int(count_ops(c1, Snd.op_play(), 0, 0), 1, "one emitter, one voice")
+          Test.assert_true(Snd.cmd_f(c1, 6, 6) == 0.0, "placed, not flat")
+          let (s2, ctls) = ops_over(s1, w, fl, Snd.op_control(), 30, 0)
+          Test.assert_true(ctls >= 30, "its controls follow, every frame")
+          -- the same fluid, its step already heard: no new water, so after two seconds it stops
+          let (_, stops) = ops_over(s2, w, fl, Snd.op_stop(), 200, 0)
+          Test.assert_eq_int(stops, 1, "stopped once, when the emitter goes")
+      end
+    end
+    test "a gust plays flat, its strength following how open the listener's space is" do
+      let (s1, gv) = Snd.with_gust(listen(Snd.new()), true)
+      Test.assert_true(gv > 0, "a voice")
+      let open = last_ctl(s1, open_world(), gv, 0, 12, -1.0)
+      let shut = last_ctl(s1, boxed(), gv, 0, 12, -1.0)
+      Test.assert_true(open > 0.9, "in the open, full strength")
+      Test.assert_true(shut >= 0.0 && shut < 0.05, "shut in stone, none")
     end
     test "group gains and the output mode are sent" do
       let (_, c) = flush(Snd.set_output(Snd.set_group(Snd.new(), 2, 0.5), true))
