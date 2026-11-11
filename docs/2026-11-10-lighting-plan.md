@@ -21,6 +21,17 @@
 - Every golden image is looked at before it is stored.
 - Commit after every task.
 
+## Answers to the design review
+
+Settled by the designer; the owner asked that scope not grow.
+
+- **An edit and untouched surfaces.** A frame in which a chunk's class bytes were replaced caps every pixel's history at 2 samples, so the whole picture's lighting is re-estimated at once: briefly noisier, never stale.
+- **Water** is lit forward, in the translucent pass, by the same shader functions. Its reflection and shadow are not averaged over frames: one shadow ray at the sun's centre, one reflection ray.
+- **Model and cross blocks.** A cross is empty to a ray. A model block is "thin": it never blocks a ray, but a sky ray passing through its voxel collects its emission. So a lantern lights its surroundings and casts no shadow.
+- **A lone glowing voxel is noisy.** Few sky rays find it. Averaging over frames is the only cure used; no list of emitters is kept. The lantern scene is exempt from the stillness check and its noise is reported.
+- **The light volume covers the whole stream box** (radius + 1 on every side), so nothing is drawn beyond it and there is no seam. At the viewer's radius 10 x 3 that is about 156 MB, over the design's 128 MB target; reported, not hidden.
+- **`Blocks.def()` becomes fully rough** (roughness 255). It was 0, which would make every existing block a mirror. `with_emission` is the light a block gives; `with_material`'s emissive value stays unused.
+
 ## Review Focus
 
 1. **A game with more than 255 distinct light classes.** The excess shares one class, lighting stays sane, and the overflow is reported. Task 2.
@@ -82,8 +93,8 @@ Three passes a frame: geometry (the four solid ranges write colour, normal, mate
 fn light_class(r : Registry, id : Int) : Int            -- 0 for air and for ids nobody registered; 1..255 otherwise
 fn light_class_count(r : Registry) : Int                -- classes in use, the empty class 0 included
 fn light_overflow(r : Registry) : Int                   -- blocks that had to share the last class; 0 when all fit
-fn light_table(r : Registry) : NativeI32Arr             -- 8 words a class: kind (0 empty, 1 solid, 2 cutout, 3 see-through),
-                                                        --   top texture, side texture, emission, roughness, 3 spare
+fn light_table(r : Registry) : NativeI32Arr             -- 8 words a class: kind (0 empty, 1 solid, 2 cutout, 3 see-through,
+                                                        --   4 thin), top texture, side texture, emission, roughness, 3 spare
 -- Strata.Mesh
 fn light_bytes(m : Meshed) : NativeU8Arr                -- 32768 class bytes by flat index, or 1 byte when the chunk is one class throughout
 -- Strata.Quad: word 1's flags byte now carries the block's light class
@@ -94,9 +105,9 @@ C     int64_t sv_chunk_light(void *bytes_u8, int64_t n);          -- between sv_
 C     void    sv_set_light_box(int64_t radius_h, int64_t radius_v);   -- chunks; sizes the volume, once, before the first chunk
 March Strata.Render.upload_light(r : Registry) : Bool
 ```
-Two blocks share a class when they agree on kind, top and side texture, emission and roughness. Kind: solid for solid-opaque; cutout for a see-through block on the cutout layer; see-through for other see-through blocks; cross, model and no-mesh blocks are empty (class 0). The 256th distinct class and every one after it share class 255, and `light_overflow` counts them.
+Two blocks share a class when they agree on kind, top and side texture, emission and roughness. Kind: solid for solid-opaque; cutout for a see-through block on the cutout layer; see-through for other see-through cube blocks; thin (kind 4) for a model block; cross and no-mesh blocks are empty (class 0). The 256th distinct class and every one after it share class 255, and `light_overflow` counts them.
 
-The volume is a 3D texture of one byte per voxel covering (2 * radius_h + 3) by (2 * radius_v + 3) by (2 * radius_h + 3) chunks, addressed by chunk coordinate modulo its size, with a second texture one eighth the size on each axis marking 8-voxel cells that hold anything. A chunk's bytes are copied in by commands recorded at the start of the next frame; freeing a slot clears its cells the same way. The shim also keeps, per volume cell, which chunk it holds, so a ray never reads a cell that belongs to a different chunk than the one it is in.
+The volume is a 3D texture of one byte per voxel covering the stream's whole box, (2 * radius_h + 3) by (2 * radius_v + 3) by (2 * radius_h + 3) chunks, addressed by chunk coordinate modulo its size, with a second texture one eighth the size on each axis marking 8-voxel cells that hold anything. A chunk's bytes are copied in by commands recorded at the start of the next frame; freeing a slot clears its cells the same way. The shim also keeps, per volume cell, which chunk it holds, so a ray never reads a cell that belongs to a different chunk than the one it is in.
 
 - [ ] **Step 1: failing tests.** `light_test.march`: an empty registry has 1 class; stone and a second identical definition share a class; changing roughness, emission, a texture, or the layer makes a new one; a cross block is class 0; an unregistered id is class 0; `light_table` row for a leaf-like block has kind 2 and its textures; registering 300 blocks that differ only in roughness gives `light_class_count == 256` and `light_overflow == 45` (Review Focus 1). `mesh_test.march`: every quad's flags byte equals its block's class; `light_bytes` of a mixed chunk equals `light_class` of each voxel; of a uniform air chunk is one byte, 0; of uniform stone is one byte, stone's class. `blocks_test.march`: `gpu_table` bits 8-15 of the flags word are the class.
 - [ ] **Step 2:** Run; expect failure. Implement the March side. Pass.
