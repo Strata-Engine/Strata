@@ -1,0 +1,205 @@
+-- Slots: which renderer slot each chunk's mesh lives in.
+mod Strata.Test.Slots do
+
+  needs IO.Clock      -- charged to every test module once any uses Check.all (GAPS S3)
+  needs IO.Process
+  import Test
+  alias Strata.Slots as Sl
+  alias Strata.Coord as Cd
+  alias Strata.Chunk as C
+  alias Strata.Blocks as B
+
+  pfn reg() : Strata.Blocks.Registry do
+    match B.register(B.empty(), B.def()) do
+      Ok((r, _)) -> r
+      Err(_) -> B.empty()
+    end
+  end
+  -- a mesh of n separate blocks: 6 * n opaque quads, so meshes can be told apart
+  pfn blocks_go(c : Strata.Chunk.Chunk, i : Int, n : Int) : Strata.Chunk.Chunk do
+    if i >= n do c else blocks_go(C.set(c, 2, 2, 2 + (i % 14) * 2, 1), i + 1, n) end
+  end
+  pfn mesh(n : Int) : Strata.Mesh.Meshed do
+    let c = blocks_go(C.uniform(0), 0, n)
+    Strata.Mesh.build(reg(), Strata.Mesh.around_from(fn (dx, dy, dz) -> if dx == 0 && dy == 0 && dz == 0 do c else C.uniform(0) end))
+  end
+  pfn k(n : Int) : Strata.Coord.Key do Cd.key(n, 0 - n, n * 3) end
+  pfn one(n : Int, quads : Int) : List((Strata.Coord.Key, Strata.Mesh.Meshed)) do Cons((k(n), mesh(quads)), Nil) end
+
+  pfn uploads(l : List(Strata.Slots.Action), acc : Int) : Int do
+    match l do
+      Nil -> acc
+      Cons(a, t) -> uploads(t, if Sl.is_upload(a) do acc + 1 else acc end)
+    end
+  end
+  pfn frees(l : List(Strata.Slots.Action), acc : Int) : Int do
+    match l do
+      Nil -> acc
+      Cons(a, t) -> frees(t, if Sl.is_upload(a) do acc else acc + 1 end)
+    end
+  end
+  -- true when no free action comes after an upload action
+  pfn frees_first(l : List(Strata.Slots.Action), seen_upload : Bool) : Bool do
+    match l do
+      Nil -> true
+      Cons(a, t) -> if Sl.is_upload(a) do frees_first(t, true) else if seen_upload do false else frees_first(t, false) end end
+    end
+  end
+  pfn first_upload_quads(l : List(Strata.Slots.Action)) : Int do
+    match l do
+      Nil -> -1
+      Cons(a, t) -> if Sl.is_upload(a) do Strata.Mesh.quad_count_at(Sl.mesh_or(a, mesh(0)), 0) else first_upload_quads(t) end
+    end
+  end
+  pfn first_upload_slot(l : List(Strata.Slots.Action)) : Int do
+    match l do
+      Nil -> -1
+      Cons(a, t) -> if Sl.is_upload(a) do Sl.slot(a) else first_upload_slot(t) end
+    end
+  end
+  pfn first_upload(l : List(Strata.Slots.Action)) : Option(Strata.Slots.Action) do
+    match l do
+      Nil -> None
+      Cons(a, t) -> if Sl.is_upload(a) do Some(a) else first_upload(t) end
+    end
+  end
+
+  pfn step(s : Strata.Slots.Slots, ms : List((Strata.Coord.Key, Strata.Mesh.Meshed)), gone : List(Strata.Coord.Key)) : Strata.Slots.Slots do
+    match Sl.plan(s, ms, gone) do
+      (s2, _) -> s2
+    end
+  end
+
+  -- ops: (key number 0..11, 0 = it goes, otherwise a mesh arrives)
+  pfn run(s : Strata.Slots.Slots, ops : List((Int, Int)), m : Strata.Mesh.Meshed) : Strata.Slots.Slots do
+    match ops do
+      Nil -> s
+      Cons((n, what), t) -> run(if what == 0 do step(s, Nil, Cons(k(n), Nil)) else step(s, Cons((k(n), m), Nil), Nil) end, t, m)
+    end
+  end
+  -- no two of keys 0..11 hold the same slot, and every held slot is in range
+  pfn distinct(s : Strata.Slots.Slots, a : Int, b : Int, cap : Int) : Bool do
+    if a > 11 do true
+    else if b > 11 do distinct(s, a + 1, a + 2, cap)
+    else
+      let sa = Sl.slot_of(s, k(a))
+      let sb = Sl.slot_of(s, k(b))
+      if sa >= cap || (sa >= 0 && sa == sb) do false else distinct(s, a, b + 1, cap) end
+    end end
+  end
+  pfn held(s : Strata.Slots.Slots, n : Int, acc : Int) : Int do
+    if n > 11 do acc else held(s, n + 1, if Sl.slot_of(s, k(n)) >= 0 do acc + 1 else acc end) end
+  end
+
+  describe "Slots.plan" do
+    test "the first meshes take slots 0 and 1" do
+      match Sl.plan(Sl.new(8), Cons((k(1), mesh(1)), Cons((k(2), mesh(2)), Nil)), Nil) do
+        (s, acts) ->
+          Test.assert_eq_int(uploads(acts, 0), 2, "two uploads")
+          Test.assert_eq_int(Sl.slot_of(s, k(1)), 0, "first key")
+          Test.assert_eq_int(Sl.slot_of(s, k(2)), 1, "second key")
+          Test.assert_eq_int(Sl.used(s), 2, "two in use")
+          Test.assert_eq_int(Sl.slot_of(s, k(3)), -1, "a key with no mesh holds no slot")
+      end
+    end
+    test "a new mesh for a key reuses its slot" do
+      let s1 = step(Sl.new(8), one(1, 1), Nil)
+      match Sl.plan(s1, one(1, 3), Nil) do
+        (s2, acts) ->
+          Test.assert_eq_int(first_upload_slot(acts), 0, "the same slot")
+          Test.assert_eq_int(first_upload_quads(acts), 18, "carrying the new mesh")
+          Test.assert_eq_int(Sl.used(s2), 1, "still one in use")
+      end
+    end
+    test "a freed slot is the next one handed out" do
+      let s1 = step(step(Sl.new(8), one(1, 1), Nil), one(2, 1), Nil)
+      match Sl.plan(s1, Nil, Cons(k(1), Nil)) do
+        (s2, acts) ->
+          Test.assert_eq_int(frees(acts, 0), 1, "one free")
+          Test.assert_eq_int(Sl.slot_of(s2, k(1)), -1, "the key lets go of it")
+          let s3 = step(s2, one(3, 1), Nil)
+          Test.assert_eq_int(Sl.slot_of(s3, k(3)), 0, "slot 0 again")
+          Test.assert_eq_int(Sl.used(s3), 2, "two in use")
+      end
+    end
+    test "a key that goes without a slot yields nothing" do
+      match Sl.plan(Sl.new(8), Nil, Cons(k(5), Nil)) do
+        (_, acts) -> Test.assert_eq_int(List.length(acts), 0, "no action")
+      end
+    end
+    test "frees come before uploads, so a full table can turn over in one plan" do
+      let s1 = step(step(Sl.new(2), one(1, 1), Nil), one(2, 1), Nil)
+      match Sl.plan(s1, one(3, 1), Cons(k(1), Nil)) do
+        (s2, acts) ->
+          Test.assert_true(frees_first(acts, false), "free first")
+          Test.assert_eq_int(uploads(acts, 0), 1, "then the upload fits")
+          Test.assert_eq_int(Sl.slot_of(s2, k(3)), 0, "in the freed slot")
+          Test.assert_eq_int(Sl.waiting(s2), 0, "nothing waits")
+      end
+    end
+  end
+
+  describe "Slots when there is no room" do
+    test "a mesh past the capacity waits, and is placed when a slot frees" do
+      let s2 = step(step(Sl.new(2), one(1, 1), Nil), one(2, 1), Nil)
+      match Sl.plan(s2, one(3, 2), Nil) do
+        (s3, acts) ->
+          Test.assert_eq_int(uploads(acts, 0), 0, "no upload: no slot")
+          Test.assert_eq_int(Sl.waiting(s3), 1, "it waits")
+          Test.assert_eq_int(Sl.slot_of(s3, k(3)), -1, "without a slot")
+          match Sl.plan(s3, Nil, Cons(k(2), Nil)) do
+            (s4, acts2) ->
+              Test.assert_eq_int(uploads(acts2, 0), 1, "placed once a slot is free")
+              Test.assert_eq_int(first_upload_quads(acts2), 12, "the mesh that was waiting")
+              Test.assert_eq_int(Sl.slot_of(s4, k(3)), 1, "in the freed slot")
+              Test.assert_eq_int(Sl.waiting(s4), 0, "nothing waits")
+          end
+      end
+    end
+    test "an upload the renderer refused waits and is planned again" do
+      match Sl.plan(Sl.new(8), one(1, 2), Nil) do
+        (s1, acts) ->
+          match first_upload(acts) do
+            None -> Test.assert_true(false, "there is an upload")
+            Some(a) ->
+              let s2 = Sl.refused(s1, a)
+              Test.assert_eq_int(Sl.waiting(s2), 1, "it waits")
+              Test.assert_eq_int(Sl.slot_of(s2, k(1)), 0, "keeping its slot")
+              match Sl.plan(s2, Nil, Nil) do
+                (s3, again) ->
+                  Test.assert_eq_int(uploads(again, 0), 1, "planned again")
+                  Test.assert_eq_int(first_upload_slot(again), 0, "into the same slot")
+                  Test.assert_eq_int(first_upload_quads(again), 12, "the same mesh")
+                  Test.assert_eq_int(Sl.waiting(s3), 0, "and no longer waiting")
+              end
+          end
+      end
+    end
+    test "a newer mesh replaces one that is waiting" do
+      let full = step(Sl.new(1), one(1, 1), Nil)
+      let w1 = step(full, one(2, 1), Nil)
+      let w2 = step(w1, one(2, 3), Nil)
+      Test.assert_eq_int(Sl.waiting(w2), 1, "still one waiting")
+      match Sl.plan(w2, Nil, Cons(k(1), Nil)) do
+        (_, acts) -> Test.assert_eq_int(first_upload_quads(acts), 18, "the newer mesh is the one uploaded")
+      end
+    end
+    test "a key that goes while waiting is forgotten" do
+      let w = step(step(Sl.new(1), one(1, 1), Nil), one(2, 1), Nil)
+      let g2 = step(w, Nil, Cons(k(2), Nil))
+      Test.assert_eq_int(Sl.waiting(g2), 0, "nothing waits")
+      match Sl.plan(g2, Nil, Cons(k(1), Nil)) do
+        (_, acts) -> Test.assert_eq_int(uploads(acts, 0), 0, "and nothing is uploaded later")
+      end
+    end
+  end
+
+  describe "Slots under random traffic" do
+    test "no two keys share a slot, and the count in use is the count of keys holding one" do
+      Check.all(Gen.list(Gen.tuple2(Gen.int(0, 11), Gen.int(0, 2))), fn ops ->
+        let s = run(Sl.new(5), ops, mesh(1))
+        distinct(s, 0, 1, 5) && Sl.used(s) == held(s, 0, 0) && Sl.used(s) <= 5
+      )
+    end
+  end
+end

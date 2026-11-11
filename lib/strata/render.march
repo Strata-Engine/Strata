@@ -1,0 +1,69 @@
+-- Render — keeps the renderer in step with a stream.
+--
+-- A game's frame is: tick the stream, `sync` the renderer with it, set the
+-- camera, draw. `sync` takes the stream's finished meshes and unloaded
+-- chunks, lets Strata.Slots decide which slot each belongs in, and performs
+-- the uploads and frees. An upload the renderer refuses (its quad buffer is
+-- full) is kept and tried again on the next sync; until it lands, the
+-- chunk's previous mesh stays on screen.
+mod Strata.Render do
+
+  alias Strata.Slots as Sr2
+
+  -- the slot table, and an empty mesh to stand in where one is required
+  type Render = Render(Strata.Slots.Slots, Strata.Mesh.Meshed)
+
+  pfn no_mesh() : Strata.Mesh.Meshed do
+    Strata.Mesh.build(Strata.Blocks.empty(), Strata.Mesh.around_from(fn (dx, dy, dz) -> Strata.Chunk.uniform(0)))
+  end
+
+  doc "A renderer-side table of [capacity] chunk slots. The shim holds 16384."
+  fn new(capacity : Int) : Render do Render(Sr2.new(capacity), no_mesh()) end
+
+  doc "Chunk slots in use."
+  fn used(r : Render) : Int do match r do Render(sl, _) -> Sr2.used(sl) end end
+  doc "Meshes waiting for a slot or for room in the quad buffer."
+  fn waiting(r : Render) : Int do match r do Render(sl, _) -> Sr2.waiting(sl) end end
+  doc "The slot a chunk's mesh is in, or -1."
+  fn slot_of(r : Render, k : Strata.Coord.Key) : Int do match r do Render(sl, _) -> Sr2.slot_of(sl, k) end end
+
+  -- Upload one layer; every layer is sent, empty ones too, so a layer that
+  -- lost its last quad is cleared.
+  pfn layer_ok(slot : Int, k : Strata.Coord.Key, m : Strata.Mesh.Meshed, l : Int) : Bool do
+    Strata.Ffi.Vk.chunk_upload(slot, l, Strata.Mesh.quads_at(m, l), Strata.Mesh.quad_count_at(m, l), 32 * Strata.Coord.kx(k), 32 * Strata.Coord.ky(k), 32 * Strata.Coord.kz(k))
+  end
+
+  pfn perform(sl : Strata.Slots.Slots, acts : List(Strata.Slots.Action), none : Strata.Mesh.Meshed) : Strata.Slots.Slots do
+    match acts do
+      Nil -> sl
+      Cons(a, t) ->
+        if !Sr2.is_upload(a) do
+          Strata.Ffi.Vk.chunk_free(Sr2.slot(a))
+          perform(sl, t, none)
+        else
+          let m = Sr2.mesh_or(a, none)
+          let k = Sr2.key(a)
+          let ok0 = layer_ok(Sr2.slot(a), k, m, 0)
+          let ok1 = layer_ok(Sr2.slot(a), k, m, 1)
+          let ok2 = layer_ok(Sr2.slot(a), k, m, 2)
+          perform(if ok0 && ok1 && ok2 do sl else Sr2.refused(sl, a) end, t, none)
+        end
+    end
+  end
+
+  doc "Bring the renderer up to date with the stream: upload its finished meshes, free its unloaded chunks, retry anything refused earlier."
+  fn sync(r : Render, s : Strata.Stream.Stream) : (Render, Strata.Stream.Stream) do
+    match Strata.Stream.take_meshes(s) do
+      (s2, meshes) ->
+        match Strata.Stream.take_unloads(s2) do
+          (s3, gone) ->
+            match r do
+              Render(sl, none) ->
+                match Sr2.plan(sl, meshes, gone) do
+                  (sl2, acts) -> (Render(perform(sl2, acts, none), none), s3)
+                end
+            end
+        end
+    end
+  end
+end

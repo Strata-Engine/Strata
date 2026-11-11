@@ -1,0 +1,165 @@
+-- Slots — which renderer slot each chunk's mesh lives in.
+--
+-- The renderer draws from a fixed table of slots. This module, which touches
+-- no GPU and needs no capability, decides who gets which: a chunk's first
+-- mesh takes a slot, later meshes for the same chunk reuse it, and an
+-- unloaded chunk gives it back. `plan` turns what a stream produced (finished
+-- meshes, unloaded chunks) into a list of actions for the renderer to
+-- perform. Strata.Render performs them.
+--
+-- When the table is full, or the renderer refuses an upload because its
+-- buffer is full, the mesh WAITS here and is planned again on every later
+-- call until it is placed or its chunk goes.
+mod Strata.Slots do
+
+  alias Strata.Coord as Ks
+
+  type Action = Upload(Int, Strata.Coord.Key, Strata.Mesh.Meshed) | Free(Int)
+
+  doc "Is the action an upload? Otherwise it frees a slot."
+  fn is_upload(a : Action) : Bool do
+    match a do
+      Upload(_, _, _) -> true
+      Free(_) -> false
+    end
+  end
+  doc "The slot the action is about."
+  fn slot(a : Action) : Int do
+    match a do
+      Upload(s, _, _) -> s
+      Free(s) -> s
+    end
+  end
+  doc "The chunk an upload is for. For a free, the origin chunk: frees carry no key."
+  fn key(a : Action) : Strata.Coord.Key do
+    match a do
+      Upload(_, k, _) -> k
+      Free(_) -> Ks.key(0, 0, 0)
+    end
+  end
+
+  type Waiting = Waiting(Strata.Coord.Key, Strata.Mesh.Meshed)
+
+  -- capacity, key -> slot (-1 for none), freed slots, the next never-used
+  -- slot, how many are in use, meshes waiting (oldest first)
+  type Slots = Slots(Int, Strata.Store.Store(Int), List(Int), Int, Int, List(Waiting))
+
+  doc "The mesh an upload carries. For a free there is none; the caller must check `is_upload` first, and gets the given mesh back."
+  fn mesh_or(a : Action, other : Strata.Mesh.Meshed) : Strata.Mesh.Meshed do
+    match a do
+      Upload(_, _, m) -> m
+      Free(_) -> other
+    end
+  end
+
+  doc "An empty table of [capacity] slots."
+  fn new(capacity : Int) : Slots do Slots(if capacity < 0 do 0 else capacity end, Strata.Store.empty(-1), Nil, 0, 0, Nil) end
+
+  doc "The slot [k] holds, or -1."
+  fn slot_of(s : Slots, k : Strata.Coord.Key) : Int do match s do Slots(_, owned, _, _, _, _) -> Strata.Store.get(owned, k) end end
+  doc "How many slots are in use."
+  fn used(s : Slots) : Int do match s do Slots(_, _, _, _, n, _) -> n end end
+
+  pfn count(l : List(Waiting), n : Int) : Int do
+    match l do
+      Nil -> n
+      Cons(_, t) -> count(t, n + 1)
+    end
+  end
+  doc "How many meshes are waiting for a slot or for room in the renderer."
+  fn waiting(s : Slots) : Int do match s do Slots(_, _, _, _, _, w) -> count(w, 0) end end
+
+  pfn without(l : List(Waiting), k : Strata.Coord.Key) : List(Waiting) do
+    match l do
+      Nil -> Nil
+      Cons(Waiting(k2, m), t) -> if Ks.key_eq(k2, k) do without(t, k) else Cons(Waiting(k2, m), without(t, k)) end
+    end
+  end
+
+  pfn append(a : List(Waiting), b : List(Waiting)) : List(Waiting) do
+    match a do
+      Nil -> b
+      Cons(h, t) -> Cons(h, append(t, b))
+    end
+  end
+
+  -- Give back the slots of the chunks that went, and forget anything of
+  -- theirs that was waiting. Actions accumulate newest first.
+  pfn release(s : Slots, gone : List(Strata.Coord.Key), acts : List(Action)) : (Slots, List(Action)) do
+    match gone do
+      Nil -> (s, acts)
+      Cons(k, t) ->
+        match s do
+          Slots(cap, owned, free, next, n, w) ->
+            let have = Strata.Store.get(owned, k)
+            if have < 0 do release(Slots(cap, owned, free, next, n, without(w, k)), t, acts)
+            else release(Slots(cap, Strata.Store.remove(owned, k), Cons(have, free), next, n - 1, without(w, k)), t, Cons(Free(have), acts)) end
+        end
+    end
+  end
+
+  -- Queue the new meshes behind what is already waiting; a newer mesh for a
+  -- key replaces an older one.
+  pfn enqueue(w : List(Waiting), ms : List((Strata.Coord.Key, Strata.Mesh.Meshed))) : List(Waiting) do
+    match ms do
+      Nil -> w
+      Cons((k, m), t) -> enqueue(append(without(w, k), Cons(Waiting(k, m), Nil)), t)
+    end
+  end
+
+  -- Place every waiting mesh that can get a slot; the rest keep waiting, in
+  -- order. Actions accumulate newest first; [kept] is reversed.
+  pfn place(s : Slots, todo : List(Waiting), kept : List(Waiting), acts : List(Action)) : (Slots, List(Action)) do
+    match todo do
+      Nil ->
+        match s do
+          Slots(cap, owned, free, next, n, _) -> (Slots(cap, owned, free, next, n, List.reverse(kept)), acts)
+        end
+      Cons(Waiting(k, m), t) ->
+        match s do
+          Slots(cap, owned, free, next, n, w) ->
+            let have = Strata.Store.get(owned, k)
+            if have >= 0 do place(s, t, kept, Cons(Upload(have, k, m), acts))
+            else
+              match free do
+                Cons(f, rest) -> place(Slots(cap, Strata.Store.put(owned, k, f), rest, next, n + 1, w), t, kept, Cons(Upload(f, k, m), acts))
+                Nil ->
+                  if next < cap do place(Slots(cap, Strata.Store.put(owned, k, next), Nil, next + 1, n + 1, w), t, kept, Cons(Upload(next, k, m), acts))
+                  else place(s, t, Cons(Waiting(k, m), kept), acts) end
+              end
+            end
+        end
+    end
+  end
+
+  doc "Plan what the renderer must do for these finished meshes and unloaded chunks: frees first, then uploads. A mesh takes its chunk's slot, else a freed one, else a new one; with none left it waits and is planned again next time."
+  fn plan(s : Slots, meshes : List((Strata.Coord.Key, Strata.Mesh.Meshed)), gone : List(Strata.Coord.Key)) : (Slots, List(Action)) do
+    match release(s, gone, Nil) do
+      (s1, frees) ->
+        match s1 do
+          Slots(cap, owned, free, next, n, w) ->
+            match place(Slots(cap, owned, free, next, n, Nil), enqueue(w, meshes), Nil, Nil) do
+              (s2, ups) -> (s2, append_acts(List.reverse(frees), List.reverse(ups)))
+            end
+        end
+    end
+  end
+
+  pfn append_acts(a : List(Action), b : List(Action)) : List(Action) do
+    match a do
+      Nil -> b
+      Cons(h, t) -> Cons(h, append_acts(t, b))
+    end
+  end
+
+  doc "The renderer could not take this upload (its buffer is full): keep the mesh waiting, in its slot, to be planned again. A free is never refused; passing one changes nothing."
+  fn refused(s : Slots, a : Action) : Slots do
+    match a do
+      Free(_) -> s
+      Upload(_, k, m) ->
+        match s do
+          Slots(cap, owned, free, next, n, w) -> Slots(cap, owned, free, next, n, append(without(w, k), Cons(Waiting(k, m), Nil)))
+        end
+    end
+  end
+end

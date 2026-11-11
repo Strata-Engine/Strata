@@ -56,4 +56,15 @@ for line in $(echo "$SCENES" | tr ' ' ','); do
   if res=$($DIFF "$OUT/want.ppm" "$shot" 2>&1); then echo "ok   $name: $res"
   else echo "FAIL $name: $res"; cp "$shot" "test/golden/$name.actual.ppm"; FAILED=1; fi
 done
+# A nearly full quad buffer: a carve's new meshes are refused while the old
+# ones are still held, and must land on a later frame. The capacity is the
+# scene's own need plus a little, so the check follows the terrain.
+if [ $UPDATE -eq 0 ]; then
+  RUN="env MARCH_PIN_MAIN=1 STRATA_RADIUS=6 STRATA_SIZE=640x400 STRATA_SCENE=1 STRATA_DIG=1 STRATA_FRAMES=60 STRATA_SHOT=/dev/null ./viewer/.march/build/release/strata_viewer"
+  need=$($RUN 2>&1 | sed -n 's/.*; \([0-9]*\) quads,.*/\1/p' | head -1)
+  line=$(STRATA_QUADS=$((need + 2100)) $RUN 2>&1 | grep 'done after')
+  refused=$(echo "$line" | sed -n 's/.*uploads refused \([0-9]*\),.*/\1/p')
+  if echo "$line" | grep -q 'still waiting 0;' && [ "${refused:-0}" -gt 0 ]; then echo "ok   retry: $refused uploads refused, none left waiting"
+  else echo "FAIL retry (capacity $((need + 2100))): $line"; FAILED=1; fi
+fi
 [ $FAILED -eq 0 ] && echo "golden: PASS" || { echo "golden: FAIL (actual images left in test/golden/*.actual.ppm)"; exit 1; }

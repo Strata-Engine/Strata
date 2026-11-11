@@ -162,69 +162,6 @@ mod StrataViewer do
     else Ch.from_flat(trees_go(ground_go(NativeArray.make_i32(32768, 0), hs, y0, 0), hs, cx * 32, y0, cz * 32, seed, 0)) end end
   end
 
-  -- ── Chunk slots on the GPU ───────────────────────────────────────────────
-  -- Each loaded chunk with a mesh owns one renderer slot: key -> slot, the
-  -- slots handed back by unloaded chunks, and the next never-used slot.
-  type Slots = Slots(Strata.Store.Store(Int), List(Int), Int)
-
-  pfn slot_for(sl : Slots, k : Strata.Coord.Key) : (Slots, Int) do
-    match sl do
-      Slots(owned, free, next) ->
-        let have = Strata.Store.get(owned, k)
-        if have >= 0 do (sl, have)
-        else
-          match free do
-            Cons(f, rest) -> (Slots(Strata.Store.put(owned, k, f), rest, next), f)
-            Nil -> (Slots(Strata.Store.put(owned, k, next), Nil, next + 1), next)
-          end
-        end
-    end
-  end
-
-  pfn upload_layer(slot : Int, m : Strata.Mesh.Meshed, l : Int, k : Strata.Coord.Key) : Int do
-    -- an empty layer is uploaded too: it clears what the slot held before
-    if Strata.Ffi.Vk.chunk_upload(slot, l, Mh.quads_at(m, l), Mh.quad_count_at(m, l), 32 * Strata.Coord.kx(k), 32 * Strata.Coord.ky(k), 32 * Strata.Coord.kz(k)) do 0 else 1 end
-  end
-
-  pfn upload_all(sl : Slots, ms : List((Strata.Coord.Key, Strata.Mesh.Meshed)), refused : Int) : (Slots, Int) do
-    match ms do
-      Nil -> (sl, refused)
-      Cons((k, m), t) ->
-        match slot_for(sl, k) do
-          (sl2, slot) -> upload_all(sl2, t, refused + upload_layer(slot, m, 0, k) + upload_layer(slot, m, 1, k) + upload_layer(slot, m, 2, k))
-        end
-    end
-  end
-
-  pfn free_all(sl : Slots, gone : List(Strata.Coord.Key)) : Slots do
-    match gone do
-      Nil -> sl
-      Cons(k, t) ->
-        match sl do
-          Slots(owned, free, next) ->
-            let slot = Strata.Store.get(owned, k)
-            if slot < 0 do free_all(sl, t)
-            else
-              Strata.Ffi.Vk.chunk_free(slot)
-              free_all(Slots(Strata.Store.remove(owned, k), Cons(slot, free), next), t)
-            end
-        end
-    end
-  end
-
-  -- Move finished meshes and unloads from the stream to the renderer.
-  pfn sync(s : Strata.Stream.Stream, sl : Slots) : (Strata.Stream.Stream, Slots) do
-    match Strata.Stream.take_meshes(s) do
-      (s2, ms) ->
-        match Strata.Stream.take_unloads(s2) do
-          (s3, gone) ->
-            match upload_all(free_all(sl, gone), ms, 0) do
-              (sl2, _) -> (s3, sl2)
-            end
-        end
-    end
-  end
-
   -- ── The camera and the frame loop ────────────────────────────────────────
   pfn axis(pos : Bool, neg : Bool) : Float do (if pos do 1.0 else 0.0 end) -. (if neg do 1.0 else 0.0 end) end
   pfn clampf(v : Float, lo : Float, hi : Float) : Float do if v < lo do lo else if v > hi do hi else v end end end
@@ -246,10 +183,10 @@ mod StrataViewer do
   -- position, yaw, pitch, the chunk the camera was last in, mouse buttons last frame
   type Cam = Cam(Float, Float, Float, Float, Float, Int, Int, Int, Bool, Bool)
 
-  pfn frame_loop(s : Strata.Stream.Stream, sl : Slots, reg : Strata.Blocks.Registry, cam : Cam, frame : Int, frames : Int, t_prev : Float, t_mark : Float, vp : NativeF32Arr) : Unit do
+  pfn frame_loop(s : Strata.Stream.Stream, sl : Strata.Render.Render, reg : Strata.Blocks.Registry, cam : Cam, frame : Int, frames : Int, t_prev : Float, t_mark : Float, vp : NativeF32Arr) : Unit do
     Strata.Ffi.Vk.poll()
     if Strata.Ffi.Vk.should_close() || Strata.Ffi.Vk.key(256) || (frames > 0 && frame >= frames) do
-      println("strata_viewer: done after " ++ int_to_string(frame) ++ " frames; uploads refused " ++ int_to_string(Strata.Ffi.Vk.refused()) ++ "; draw calls " ++ int_to_string(float_to_int(Strata.Ffi.Vk.stat(2))))
+      println("strata_viewer: done after " ++ int_to_string(frame) ++ " frames; uploads refused " ++ int_to_string(Strata.Ffi.Vk.refused()) ++ ", still waiting " ++ int_to_string(Strata.Render.waiting(sl)) ++ "; draw calls " ++ int_to_string(float_to_int(Strata.Ffi.Vk.stat(2))))
       Strata.Stream.stop(s)
     else
       match cam do
@@ -278,8 +215,8 @@ mod StrataViewer do
           let lb = frames == 0 && Strata.Ffi.Vk.mouse_button(0)
           let rb = frames == 0 && Strata.Ffi.Vk.mouse_button(1)
           let s2 = Strata.Stream.tick(act(s1, reg, x2, y2, z2, fx, fy, fz, (lb && !lb0) || (frame == 10 && Env.get_int("STRATA_DIG", 0) == 1), rb && !rb0))
-          match sync(s2, sl) do
-            (s3, sl2) ->
+          match Strata.Render.sync(sl, s2) do
+            (sl2, s3) ->
               let aspect = int_to_float(Strata.Ffi.Vk.fb_w()) /. int_to_float(if Strata.Ffi.Vk.fb_h() < 1 do 1 else Strata.Ffi.Vk.fb_h() end)
               let view = M4.look_at(V3.new(x2, y2, z2), V3.new(x2 +. fx, y2 +. fy, z2 +. fz), V3.new(0.0, 1.0, 0.0))
               let vp2 = M4.mul_into_f32(M4.perspective(1.15, aspect, 0.1, 1200.0), view, vp)
@@ -374,8 +311,8 @@ mod StrataViewer do
           let cz = Strata.Coord.chunk_of(pz) * 32
           Strata.Stream.run_until_settled(Strata.Stream.apply(s0, Strata.Edit.fill_box(Strata.Stream.world(s0), cx, cy, cz, cx + 31, cy + 31, cz + 31, 0)), 1000000)
         end
-      match sync(s0b, Slots(Strata.Store.empty(-1), Nil, 0)) do
-        (s1, sl) ->
+      match Strata.Render.sync(Strata.Render.new(16384), s0b) do
+        (sl, s1) ->
           println("strata_viewer: " ++ int_to_string(Strata.Stream.loaded_count(s1)) ++ " chunks streamed in " ++ float_to_string(Math.round((t1 -. t0) *. 1000.0)) ++ " ms; " ++ int_to_string(Strata.Ffi.Vk.live_quads()) ++ " quads, " ++ int_to_string(Strata.Ffi.Vk.live_quads() * 8 / 1024) ++ " KB on the GPU")
           let cam = Cam(ex, ey, ez, yaw0, pitch0, Strata.Coord.chunk_of(float_to_int(Math.floor(ex))), Strata.Coord.chunk_of(float_to_int(Math.floor(ey))), Strata.Coord.chunk_of(float_to_int(Math.floor(ez))), false, false)
           frame_loop(s1, sl, reg, cam, 0, frames, Strata.Ffi.Vk.time(), Strata.Ffi.Vk.time(), NativeArray.make_f32(16, 0.0))
