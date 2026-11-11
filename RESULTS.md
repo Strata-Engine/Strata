@@ -578,3 +578,8 @@ each:
 Not done: the comparison against macOS's own text rendering; a test of the
 upload path on the GPU; wrapping right-to-left text is checked by a probe,
 not by the suite.
+
+After the review fixes the soak's worst frame was 54.2 and 49.0 ms in two
+runs, with a load average of 40 from another session building on the same
+machine (mean 8 to 11 ms). The frame-time limit is not judged: rerun
+`scripts/soak.sh` on a quiet machine. Every other soak check passed.
