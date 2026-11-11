@@ -93,7 +93,7 @@ static struct {
     int offscreen;
     VkRenderPass pass, pass_off;
     VkPipelineLayout layout;
-    VkPipeline pipe_opaque, pipe_blend, pipe_cull;
+    VkPipeline pipe_opaque, pipe_blend, pipe_cross, pipe_cull;
     VkDescriptorSetLayout dsl;
     VkDescriptorPool dpool;
     VkBuffer table; VkDeviceMemory table_mem; ChunkEntry *entries;      /* the chunk table, SV_MAX_SLOTS entries */
@@ -293,8 +293,10 @@ static int make_render_pass(VkImageLayout final, VkRenderPass *out) {
     return 1;
 }
 
-static int make_pipeline(int blend, VkPipeline *out) {
-    VkShaderModule vs = shader(strata_quad_vert, sizeof(strata_quad_vert));
+/* kind 0: opaque and cutout quads; 1: translucent quads; 2: cross instances */
+static int make_pipeline(int kind, VkPipeline *out) {
+    int blend = kind == 1, cross = kind == 2;
+    VkShaderModule vs = cross ? shader(strata_cross_vert, sizeof(strata_cross_vert)) : shader(strata_quad_vert, sizeof(strata_quad_vert));
     VkShaderModule fs = shader(strata_quad_frag, sizeof(strata_quad_frag));
     VkPipelineShaderStageCreateInfo stages[2] = {
         { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_VERTEX_BIT, .module = vs, .pName = "main" },
@@ -306,11 +308,11 @@ static int make_pipeline(int blend, VkPipeline *out) {
         { .location = 1, .binding = 0, .format = VK_FORMAT_R32_UINT, .offset = 4 } };
     VkPipelineVertexInputStateCreateInfo vin = { .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
         .vertexBindingDescriptionCount = 1, .pVertexBindingDescriptions = &bind, .vertexAttributeDescriptionCount = 2, .pVertexAttributeDescriptions = attrs };
-    VkPipelineInputAssemblyStateCreateInfo ia = { .sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO, .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP };
+    VkPipelineInputAssemblyStateCreateInfo ia = { .sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO, .topology = cross ? VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST : VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP };
     VkPipelineViewportStateCreateInfo vp = { .sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO, .viewportCount = 1, .scissorCount = 1 };
     VkPipelineRasterizationStateCreateInfo rs = { .sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO, .polygonMode = VK_POLYGON_MODE_FILL,
         /* a see-through surface is visible from behind too: water from below */
-        .cullMode = blend ? VK_CULL_MODE_NONE : VK_CULL_MODE_BACK_BIT, .frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE, .lineWidth = 1.0f };
+        .cullMode = (blend || cross) ? VK_CULL_MODE_NONE : VK_CULL_MODE_BACK_BIT, .frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE, .lineWidth = 1.0f };
     VkPipelineMultisampleStateCreateInfo ms = { .sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO, .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT };
     VkPipelineDepthStencilStateCreateInfo ds = { .sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO, .depthTestEnable = VK_TRUE,
         .depthWriteEnable = blend ? VK_FALSE : VK_TRUE, .depthCompareOp = VK_COMPARE_OP_LESS };
@@ -553,6 +555,7 @@ int64_t sv_open(int64_t w, int64_t h, int64_t capture_mouse, int64_t quad_capaci
     VKOK(vkCreatePipelineLayout(g.dev, &pli, NULL, &g.layout), "pipeline layout");
     if (!make_pipeline(0, &g.pipe_opaque)) return 0;
     if (!make_pipeline(1, &g.pipe_blend)) return 0;
+    if (!make_pipeline(2, &g.pipe_cross)) return 0;
 
     void *map = NULL;
     g.quad_cap = (quad_capacity > 0 && quad_capacity < 0x20000000) ? (uint32_t)quad_capacity : SV_DEFAULT_QUADS;
@@ -640,6 +643,7 @@ void sv_close(void) {
         if (g.pipe_opaque) vkDestroyPipeline(g.dev, g.pipe_opaque, NULL);
         if (g.pipe_blend) vkDestroyPipeline(g.dev, g.pipe_blend, NULL);
         if (g.pipe_cull) vkDestroyPipeline(g.dev, g.pipe_cull, NULL);
+        if (g.pipe_cross) vkDestroyPipeline(g.dev, g.pipe_cross, NULL);
         if (g.table) vkDestroyBuffer(g.dev, g.table, NULL);
         if (g.table_mem) vkFreeMemory(g.dev, g.table_mem, NULL);
         if (g.cmds) vkDestroyBuffer(g.dev, g.cmds, NULL);
@@ -810,7 +814,29 @@ void sv_chunk_free(int64_t slot) {
     if (!(e->level_flags & SV_IN_USE)) return;
     e->level_flags = 0;                      /* the cull pass skips it from the next frame on */
     trans_track((uint32_t)slot, 0);
-    for (int l = 0; l < SV_LAYERS; l++) { sa_release(&g_quads, (Range){ e->first[l], e->count[l] }, g.frame_no); e->first[l] = 0; e->count[l] = 0; }
+    for (int l = 0; l < 4; l++) { sa_release(&g_quads, (Range){ e->first[l], e->count[l] }, g.frame_no); e->first[l] = 0; e->count[l] = 0; }
+}
+
+/* Replace a slot's instances: [n] two-word records (Strata.Quad). Cross
+ * instances (model -1) are stored as they are, in the quad buffer, and drawn
+ * by the cross pipeline. n == 0 clears. Returns 0 when refused, like
+ * sv_chunk_upload; the slot must already hold a chunk for its origin. */
+int64_t sv_chunk_instances(int64_t slot, void *words, int64_t n) {
+    if (!g.ok || slot < 0 || slot >= SV_MAX_SLOTS || n < 0) return 0;
+    if (n > 0 && (!words || narr_len(words) < n * 2)) return 0;
+    ChunkEntry *e = &g.entries[slot];
+    const uint32_t *src = n > 0 ? (const uint32_t *)narr_data(words) : NULL;
+    uint32_t ncross = 0;
+    for (int64_t i = 0; i < n; i++) if ((src[i * 2] >> 15) == 0) ncross++;       /* model + 1 == 0 */
+    Range fresh = { 0, ncross };
+    if (ncross > 0) {
+        if (!sa_alloc(&g_quads, ncross, &fresh.first)) { g.refused++; return 0; }
+        uint32_t *dst = g.giga_map + (size_t)fresh.first * 2;
+        for (int64_t i = 0; i < n; i++) if ((src[i * 2] >> 15) == 0) { *dst++ = src[i * 2]; *dst++ = src[i * 2 + 1]; }
+    }
+    sa_release(&g_quads, (Range){ e->first[3], e->count[3] }, g.frame_no);
+    e->first[3] = fresh.first; e->count[3] = fresh.count;
+    return 1;
 }
 
 /* Append [n] zero-count commands to every indirect call, to measure what
@@ -918,13 +944,15 @@ int64_t sv_frame(void) {
     if (g.have_ts) { vkCmdResetQueryPool(F->cmd, g.qpool, q0, 2); vkCmdWriteTimestamp(F->cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, g.qpool, q0); }
     /* cull: one compute invocation per slot writes the indirect commands */
     int32_t *misc = (int32_t *)(g.ubo_map + 32);
-    misc[0] = (int32_t)g.hi_slot; misc[1] = SV_CMD_STRIDE; misc[2] = (int32_t)g.layers;
+    misc[0] = (int32_t)g.hi_slot; misc[1] = SV_CMD_STRIDE; misc[2] = (int32_t)g.layers; misc[3] = (int32_t)g.nblocks;
     vkCmdBindDescriptorSets(F->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g.layout, 0, 1, &F->dset, 0, NULL);
     if (g.hi_slot > 0) {
         /* zero the part of each compacted list that will be submitted, so
          * commands the cull pass does not overwrite draw nothing */
         int filled = 0;
-        for (int r = 0; r < 2; r++) {
+        static const int culled_ranges[3] = { 0, 1, 3 };
+        for (int k = 0; k < 3; k++) {
+            int r = culled_ranges[k];
             uint32_t n = g.submit[r] + g.pad_cmds;
             if (n) { vkCmdFillBuffer(F->cmd, g.cmds, (VkDeviceSize)r * SV_CMD_STRIDE * 16, (VkDeviceSize)n * 16, 0); filled = 1; }
         }
@@ -954,11 +982,14 @@ int64_t sv_frame(void) {
 
     /* draw: one multi-draw-indirect call per range. The push constant tells
      * the vertex shader where the call's commands start in draw_slot. */
-    for (uint32_t r = 0; r < 2; r++) {
+    static const uint32_t solid_ranges[3] = { 0, 1, 3 };    /* opaque quads, cutout quads, cross instances */
+    for (int k = 0; k < 3; k++) {
+        uint32_t r = solid_ranges[k];
         uint32_t n = g.submit[r] + g.pad_cmds, base = r * SV_CMD_STRIDE;
         if (n == 0) continue;
         if (r == 0) vkCmdBindPipeline(F->cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g.pipe_opaque);
-        uint32_t pc[2] = { base, r == 1 ? 1u : 0u };          /* the cutout range discards see-through pixels */
+        if (r == 3) vkCmdBindPipeline(F->cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g.pipe_cross);
+        uint32_t pc[2] = { base, r >= 1 ? 1u : 0u };          /* cutout quads and crosses discard see-through pixels */
         vkCmdPushConstants(F->cmd, g.layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, 8, pc);
         vkCmdDrawIndirect(F->cmd, g.cmds, (VkDeviceSize)base * 16, n, 16); draws++;
     }

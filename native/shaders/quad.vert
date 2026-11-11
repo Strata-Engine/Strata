@@ -14,7 +14,7 @@ layout(set = 0, binding = 0) uniform U {
     vec4 sky;
     vec4 fog;       // x start, y end (metres)
     vec4 eye;       // xyz eye (metres), w metres per voxel
-    ivec4 misc;     // x slots to cull, y commands per range, z texture layers
+    ivec4 misc;     // x slots to cull, y commands per range, z texture layers, w rows in the block table
 } u;
 
 // The chunk table.
