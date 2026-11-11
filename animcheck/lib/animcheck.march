@@ -1,0 +1,280 @@
+-- animcheck — Strata's animation checks, run against the pose kernel through
+-- Strata.Rig, Strata.Clip and Strata.Anim, headless (no window, no GPU).
+--
+--   ANIMCHECK_SCENE=name ./animcheck
+--
+-- prints "scene name: ok", or the failure and exits 1. scripts/anim_check.sh
+-- builds it and runs every scene. `table` prints the chain's matrices.
+mod Animcheck do
+
+  needs IO
+  needs IO.Process
+  needs IO.Foreign
+  needs Anim
+
+  alias Strata.Rig as Rg
+  alias Strata.Clip as Cl
+  alias Strata.Anim as An
+  alias Strata.Math.Quat as Qt
+
+  pfn near(a : Float, b : Float, eps : Float) : Bool do Math.abs(a -. b) <= eps end
+  pfn deg(d : Float) : Float do d *. Math.pi() /. 180.0 end
+  pfn turn_z(d : Float) : Strata.Math.Quat.Quat do Qt.from_axis_angle(0.0, 0.0, 1.0, deg(d)) end
+  pfn turn_y(d : Float) : Strata.Math.Quat.Quat do Qt.from_axis_angle(0.0, 1.0, 0.0, deg(d)) end
+
+  -- The Task 1 chain: a root, an arm on it at (0, 1, 0) m, a hand on the arm
+  -- at (0, 1, 0) m. Voxels of 0.1 m; each part 2 x 10 x 2 turning about the
+  -- middle of its base, so the next pivot is 10 voxels up.
+  pfn chain() : Strata.Rig.Rig do
+    let r0 = Rg.colour(Rg.new(0.1), 1, 0.8, 0.2, 0.2, 0.5, 0.0)
+    match Rg.part(r0, -1, 0.0, 0.0, 0.0, 2, 10, 2) do
+      (r1, root) ->
+        match Rg.part(Rg.box(Rg.anchor(r1, root, 1.0, 0.0, 1.0), root, 0, 0, 0, 1, 9, 1, 1), root, 1.0, 10.0, 1.0, 2, 10, 2) do
+          (r2, arm) ->
+            match Rg.part(Rg.box(Rg.anchor(r2, arm, 1.0, 0.0, 1.0), arm, 0, 0, 0, 1, 9, 1, 1), arm, 1.0, 10.0, 1.0, 2, 10, 2) do
+              (r3, hand) -> Tuple.first(Rg.mask(Rg.box(Rg.anchor(r3, hand, 1.0, 0.0, 1.0), hand, 0, 0, 0, 1, 9, 1, 1), [hand]))
+            end
+        end
+    end
+  end
+
+  pfn fail(msg : String) : Int do
+    println(msg)
+    1
+  end
+  pfn report(name : String, failures : Int) : Int do
+    if failures == 0 do
+      println("scene " ++ name ++ ": ok")
+      0
+    else
+      println("scene " ++ name ++ ": FAILED")
+      1
+    end
+  end
+  pfn check(ok : Bool, msg : String) : Int do if ok do 0 else fail("  not so: " ++ msg) end end
+
+  pfn mat_near(m : NativeF32Arr, at : Int, want : List(Float), eps : Float) : Bool do
+    match want do
+      Nil -> true
+      Cons(w, rest) -> if near(NativeArray.get_f32(m, at), w, eps) do mat_near(m, at + 1, rest, eps) else false end
+    end
+  end
+  pfn finite_go(m : NativeF32Arr, i : Int) : Bool do
+    if i >= NativeArray.length_f32(m) do true
+    else
+      let v = NativeArray.get_f32(m, i)
+      if float_is_nan(v) || float_is_infinite(v) do false else finite_go(m, i + 1) end
+    end
+  end
+  -- a part's world turn about z, degrees
+  pfn angle(m : NativeF32Arr, part : Int) : Float do Math.atan2(NativeArray.get_f32(m, 12 * part + 1), NativeArray.get_f32(m, 12 * part)) *. 180.0 /. Math.pi() end
+
+  -- the chain, its arm spinning once a second
+  pfn chain_world() : (Strata.Anim.Anim, Int) do
+    let r = chain()
+    match An.finish_rig(An.open(16), r) do
+      (a1, rig) ->
+        match An.finish_clip(a1, Cl.spin(Cl.new(r, 1.0, true), 1, 0.0, 0.0, 1.0, 1.0)) do
+          (a2, clip) ->
+            match An.spawn_at(a2, rig, 0.0, 0.0, 0.0, Qt.identity()) do
+              (a3, f) -> (An.play(a3, f, 0, clip, 0.0, 1.0, 1.0, -1, false), f)
+            end
+        end
+    end
+  end
+
+  -- chain: after a quarter of a turn the arm's matrix is a 90-degree turn about z at (0, 1, 0), and the hand is at (-1, 1, 0)
+  pfn chain_scene() : Int do
+    match chain_world() do
+      (a, f) ->
+        let m = An.matrices(An.update(a, 0.25), f)
+        let bad = check(NativeArray.length_f32(m) == 36, "three parts, 12 floats each")
+          + check(mat_near(m, 12, [0.0, 1.0, 0.0, -1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 1.0, 0.0], 0.0001), "the arm's matrix after a quarter turn")
+          + check(mat_near(m, 33, [-1.0, 1.0, 0.0], 0.0001), "the hand's origin at (-1, 1, 0)")
+          + check(mat_near(m, 0, [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0], 0.0001), "the root unmoved")
+        report("chain", bad + check(An.capacity(An.close(a)) == 0, "closed"))
+    end
+  end
+
+  pfn row(m : NativeF32Arr, part : Int) : String do
+    String.join(List.map(List.range(0, 12), fn k -> float_to_string(Math.round(NativeArray.get_f32(m, 12 * part + k) *. 10000.0) /. 10000.0)), " ")
+  end
+  pfn print_pose(a : Strata.Anim.Anim, f : Int, t : String) : Unit do
+    let m = An.matrices(a, f)
+    println("t = " ++ t)
+    println("  root " ++ row(m, 0))
+    println("  arm  " ++ row(m, 1))
+    println("  hand " ++ row(m, 2))
+  end
+  -- table: the chain's three matrices (column-major 3x4: x axis, y axis, z axis, origin) at t = 0, 0.25, 0.5
+  pfn table_scene() : Int do
+    match chain_world() do
+      (a, f) ->
+        let a0 = An.update(a, 0.0)
+        print_pose(a0, f, "0")
+        let a1 = An.update(a0, 0.25)
+        print_pose(a1, f, "0.25")
+        let a2 = An.update(a1, 0.25)
+        print_pose(a2, f, "0.5")
+        report("table", check(An.capacity(An.close(a2)) == 0, "closed"))
+    end
+  end
+
+  -- four clips over the chain: a swing, a spin, a walk with a bob, and an additive breath
+  pfn clips(a : Strata.Anim.Anim, r : Strata.Rig.Rig) : (Strata.Anim.Anim, List(Int)) do
+    let swing = Cl.swing(Cl.new(r, 2.0, true), 1, 0.0, 0.0, 1.0, 40.0, 1.0, 0.0)
+    let spin = Cl.spin(Cl.new(r, 1.0, true), 2, 1.0, 0.0, 0.0, 2.0)
+    let walk = Cl.turn(Cl.turn(Cl.turn(Cl.move(Cl.move(Cl.move(Cl.new(r, 1.0, true), 0, 0.0, 0.0, 0.0, 0.0, Cl.smooth()), 0, 0.5, 0.0, 0.05, 0.0, Cl.smooth()), 0, 1.0, 0.0, 0.0, 0.0, Cl.smooth()), 1, 0.0, turn_z(-20.0), Cl.straight()), 1, 0.5, turn_z(20.0), Cl.straight()), 1, 1.0, turn_z(-20.0), Cl.straight())
+    let breathe = Cl.swing(Cl.new(r, 3.0, true), 2, 1.0, 0.0, 0.0, 5.0, 3.0, 0.25)
+    match An.finish_clip(a, swing) do
+      (a1, c1) ->
+        match An.finish_clip(a1, spin) do
+          (a2, c2) ->
+            match An.finish_clip(a2, Cl.stride(walk, 1.2)) do
+              (a3, c3) -> match An.finish_clip(a3, breathe) do (a4, c4) -> (a4, [c1, c2, c3, c4]) end
+            end
+        end
+    end
+  end
+
+  pfn spawn_go(a : Strata.Anim.Anim, rig : Int, cs : List(Int), i : Int, n : Int) : Strata.Anim.Anim do
+    if i >= n do a
+    else
+      match An.spawn_at(a, rig, int_to_float(i % 20) *. 2.0, 0.0, int_to_float(i / 20) *. 2.0, turn_y(int_to_float(i) *. 17.0)) do
+        (a1, f) ->
+          let a2 = An.play(a1, f, 0, unwrap_or(List.nth_opt(cs, i % 3), 0), 0.0, 0.5 +. int_to_float(i % 7) *. 0.1, 1.0, -1, false)
+          let a3 = if i % 5 == 0 do An.play(a2, f, 1, unwrap_or(List.nth_opt(cs, 3), 0), 0.3, 1.0, 0.6, -1, true) else a2 end
+          let a4 = if i % 9 == 0 do An.blend(a3, f, 2, [unwrap_or(List.nth_opt(cs, 0), 0), unwrap_or(List.nth_opt(cs, 2), 0)], [0.0, 1.0], 0.3, 0.2, 0.8, 0) else a3 end
+          spawn_go(a4, rig, cs, i + 1, n)
+      end
+    end
+  end
+  -- halfway, crossfade every third figure to another clip and move every seventh
+  pfn shake_go(a : Strata.Anim.Anim, cs : List(Int), i : Int, n : Int) : Strata.Anim.Anim do
+    if i >= n do a
+    else
+      let a1 = if i % 3 == 0 do An.play(a, i, 0, unwrap_or(List.nth_opt(cs, (i + 1) % 3), 0), 0.25, 1.0, 1.0, -1, false) else a end
+      let a2 = if i % 7 == 0 do An.place(a1, i, 1.0, 0.5, int_to_float(i) *. 0.1, turn_y(int_to_float(i))) else a1 end
+      let a3 = if i % 9 == 0 do An.set_value(a2, i, 2, 0.9, 0.5) else a2 end
+      shake_go(a3, cs, i + 1, n)
+    end
+  end
+  pfn run_go(a : Strata.Anim.Anim, cs : List(Int), k : Int, n : Int) : Strata.Anim.Anim do
+    if k >= n do a
+    else
+      let a1 = if k == n / 2 do shake_go(a, cs, 0, 200) else a end
+      run_go(An.update(a1, 1.0 /. 60.0), cs, k + 1, n)
+    end
+  end
+  -- one run: 200 figures, 4 clips, 1200 updates at 1/60; its hash and (figures, refused)
+  pfn determinism_run() : (Int, Int, Int) do
+    let r = chain()
+    match An.finish_rig(An.open(256), r) do
+      (a1, rig) ->
+        match clips(a1, r) do
+          (a2, cs) ->
+            let a3 = run_go(spawn_go(a2, rig, cs, 0, 200), cs, 0, 1200)
+            let h = An.hash(a3)
+            match An.stats(a3) do
+              (figs, _, _, refused) ->
+                -- after close the world is gone: no figures are counted
+                let after = match An.stats(An.close(a3)) do (n, _, _, _) -> n end
+                (h, figs + 1000 * after, refused)
+            end
+        end
+    end
+  end
+  pfn determinism_scene() : Int do
+    match determinism_run() do
+      (h1, figs, refused) ->
+        match determinism_run() do
+          (h2, _, _) ->
+            println("  hash " ++ int_to_string(h1) ++ " and " ++ int_to_string(h2))
+            report("determinism", check(h1 == h2, "two runs give one hash") + check(h1 != 0, "the hash is not 0") + check(figs == 200, "200 figures, and none once closed") + check(refused == 0, "nothing refused"))
+        end
+    end
+  end
+
+  pfn tags_go(a : Strata.Anim.Anim, k : Int, n : Int, acc : List(Int)) : (Strata.Anim.Anim, List(Int)) do
+    if k >= n do (a, List.reverse(acc))
+    else
+      let a1 = An.update(a, 1.0 /. 60.0)
+      tags_go(a1, k + 1, n, List.fold_left(An.marks(a1), acc, fn (xs, m) -> Cons(mark_tag(m), xs)))
+    end
+  end
+  pfn mark_tag(m : (Int, Int, Int, Float)) : Int do match m do (_, _, t, _) -> t end end
+  -- marks: a walk with marks 1 and 2 reports them alternately over 3 loops
+  pfn marks_scene() : Int do
+    let r = chain()
+    let walk = Cl.mark(Cl.mark(Cl.swing(Cl.new(r, 1.0, true), 1, 0.0, 0.0, 1.0, 20.0, 1.0, 0.0), 0.25, 1), 0.75, 2)
+    match An.finish_rig(An.open(4), r) do
+      (a1, rig) ->
+        match An.finish_clip(a1, walk) do
+          (a2, clip) ->
+            match An.spawn_at(a2, rig, 0.0, 0.0, 0.0, Qt.identity()) do
+              (a3, f) ->
+                match tags_go(An.play(a3, f, 0, clip, 0.0, 1.0, 1.0, -1, false), 0, 180, Nil) do
+                  (a4, tags) ->
+                    println("  tags " ++ String.join(List.map(tags, int_to_string), " "))
+                    report("marks", check(tags == [1, 2, 1, 2, 1, 2], "marks 1 and 2 alternate, three times each") + check(An.capacity(An.close(a4)) == 0, "closed"))
+                end
+            end
+        end
+    end
+  end
+
+  -- mask: a clip turning arm and hand 90 degrees, played under the rig's mask 0 ({hand}), moves only the hand; a mask the rig lacks is refused
+  pfn mask_scene() : Int do
+    let r = chain()
+    let both = Cl.turn(Cl.turn(Cl.new(r, 1.0, false), 1, 0.0, turn_z(90.0), Cl.step()), 2, 0.0, turn_z(90.0), Cl.step())
+    match An.finish_rig(An.open(4), r) do
+      (a1, rig) ->
+        match An.finish_clip(a1, both) do
+          (a2, clip) ->
+            match An.spawn_at(a2, rig, 0.0, 0.0, 0.0, Qt.identity()) do
+              (a3, f) ->
+                let m = An.matrices(An.update(An.play(a3, f, 0, clip, 0.0, 1.0, 1.0, 0, false), 0.1), f)
+                let before = An.stats(a3)
+                let a4 = An.update(An.play(a3, f, 0, clip, 0.0, 1.0, 1.0, 1, false), 0.1)
+                let refused_more = match (before, An.stats(a4)) do ((_, _, _, x), (_, _, _, y)) -> y - x end
+                let bad = check(near(angle(m, 1), 0.0, 0.001), "the arm stays at rest") + check(near(angle(m, 2), 90.0, 0.001), "the hand turns 90 degrees") + check(refused_more == 1, "mask 1 (not the rig's) is refused")
+                report("mask", bad + check(An.capacity(An.close(a4)) == 0, "closed"))
+            end
+        end
+    end
+  end
+
+  -- empty: a rig of one empty part is accepted, poses, and stays finite
+  pfn empty_scene() : Int do
+    match Rg.part(Rg.new(0.1), -1, 0.0, 0.0, 0.0, 4, 4, 4) do
+      (r, _) ->
+        match An.finish_rig(An.open(4), r) do
+          (a1, rig) ->
+            match An.finish_clip(a1, Cl.new(r, 0.0, false)) do
+              (a2, clip) ->
+                match An.spawn_at(a2, rig, 1.0, 2.0, 3.0, Qt.identity()) do
+                  (a3, f) ->
+                    let a4 = An.update(An.play(a3, f, 0, clip, 0.0, 1.0, 1.0, -1, false), 0.5)
+                    let m = An.matrices(a4, f)
+                    let bad = check(rig >= 0, "the rig is accepted") + check(clip >= 0, "a clip of no keys and no length is accepted") + check(NativeArray.length_f32(m) == 12, "one part") + check(finite_go(m, 0), "finite") + check(mat_near(m, 9, [1.0, 2.0, 3.0], 0.00001), "where it was put")
+                    report("empty", bad + check(An.capacity(An.close(a4)) == 0, "closed"))
+                end
+            end
+        end
+    end
+  end
+
+  fn main(_cap : Cap(IO)) : Unit do
+    let name = Env.get("ANIMCHECK_SCENE", "")
+    if name == "chain" do process_exit(chain_scene())
+    else if name == "table" do process_exit(table_scene())
+    else if name == "determinism" do process_exit(determinism_scene())
+    else if name == "marks" do process_exit(marks_scene())
+    else if name == "mask" do process_exit(mask_scene())
+    else if name == "empty" do process_exit(empty_scene())
+    else
+      println("animcheck: no scene named '" ++ name ++ "' (chain, table, determinism, marks, mask, empty)")
+      process_exit(2)
+    end end end end end end
+  end
+end

@@ -1,0 +1,226 @@
+-- Rig: building a jointed figure's description, and meshing its parts.
+mod Strata.Test.Rig do
+
+  needs IO.Clock      -- charged to every test module once any uses Check.all (GAPS S3)
+  needs IO.Process
+  import Test
+  alias Strata.Rig as Rg
+
+  -- a rig of one part of the given size at the origin
+  pfn one(sx : Int, sy : Int, sz : Int) : (Strata.Rig.Rig, Int) do Rg.part(Rg.new(0.1), -1, 0.0, 0.0, 0.0, sx, sy, sz) end
+
+  pfn quads_of(m : (Int, Int, Int, Int, NativeI32Arr)) : Int do
+    match m do (_, _, _, _, q) -> NativeArray.length_i32(q) / 2 end
+  end
+  pfn total(ms : List((Int, Int, Int, Int, NativeI32Arr))) : Int do List.fold_left(ms, 0, fn (acc, m) -> acc + quads_of(m)) end
+
+  -- area of the quads of piece m facing f
+  pfn area_go(q : NativeI32Arr, f : Int, i : Int, n : Int, acc : Int) : Int do
+    if i >= n do acc
+    else
+      let w0 = NativeArray.get_i32(q, 2 * i)
+      let a = if Strata.Quad.face_of(w0) == f do Strata.Quad.w_of(w0) * Strata.Quad.h_of(w0) else 0 end
+      area_go(q, f, i + 1, n, acc + a)
+    end
+  end
+  pfn piece_quads(m : (Int, Int, Int, Int, NativeI32Arr)) : NativeI32Arr do match m do (_, _, _, _, q) -> q end end
+  -- area facing f of piece m, if its x offset is ox (any when ox is -1)
+  pfn piece_area(m : (Int, Int, Int, Int, NativeI32Arr), ox : Int, f : Int) : Int do
+    match m do (_, x, _, _, q) -> if ox < 0 || x == ox do area_go(q, f, 0, NativeArray.length_i32(q) / 2, 0) else 0 end end
+  end
+  pfn piece_at(m : (Int, Int, Int, Int, NativeI32Arr), p : Int, ox : Int) : Bool do
+    match m do (pp, x, y, z, _) -> pp == p && x == ox && y == 0 && z == 0 end
+  end
+  pfn area(ms : List((Int, Int, Int, Int, NativeI32Arr)), f : Int) : Int do
+    List.fold_left(ms, 0, fn (acc, m) -> acc + piece_area(m, -1, f))
+  end
+  pfn faces_in(ms : List((Int, Int, Int, Int, NativeI32Arr)), ox : Int, f : Int) : Int do
+    List.fold_left(ms, 0, fn (acc, m) -> acc + piece_area(m, ox, f))
+  end
+
+  -- a pseudo-random 8-cubed grid of colours 0..3, the same one into the rig and into an array
+  pfn mix(seed : Int, i : Int) : Int do
+    let h = int_and((seed + 1) * 2654435761 + i * 40503, 4294967295)
+    int_and(int_xor(h, h / 65536) * 73244475, 4294967295) / 65536 % 4
+  end
+  pfn fill_go(r : Strata.Rig.Rig, g : NativeU8Arr, seed : Int, i : Int) : (Strata.Rig.Rig, NativeU8Arr) do
+    if i >= 512 do (r, g)
+    else
+      let c = mix(seed, i)
+      if c == 0 do fill_go(r, g, seed, i + 1)
+      else fill_go(Rg.voxel(r, 0, i % 8, (i / 8) % 8, i / 64, c), NativeArray.set_u8(g, i, c), seed, i + 1) end
+    end
+  end
+  pfn at(g : NativeU8Arr, x : Int, y : Int, z : Int) : Int do
+    if x < 0 || y < 0 || z < 0 || x > 7 || y > 7 || z > 7 do 0 else NativeArray.get_u8(g, x + 8 * y + 64 * z) end
+  end
+  pfn dx(f : Int) : Int do if f == 2 do 1 else if f == 3 do -1 else 0 end end end
+  pfn dy(f : Int) : Int do if f == 0 do 1 else if f == 1 do -1 else 0 end end end
+  pfn dz(f : Int) : Int do if f == 4 do 1 else if f == 5 do -1 else 0 end end end
+  -- exposed faces looking along f, counted voxel by voxel
+  pfn brute(g : NativeU8Arr, f : Int, i : Int, acc : Int) : Int do
+    if i >= 512 do acc
+    else
+      let x = i % 8
+      let y = (i / 8) % 8
+      let z = i / 64
+      let solid = at(g, x, y, z) != 0
+      let open = at(g, x + dx(f), y + dy(f), z + dz(f)) == 0
+      brute(g, f, i + 1, if solid && open do acc + 1 else acc end)
+    end
+  end
+  pfn faces_agree(ms : List((Int, Int, Int, Int, NativeI32Arr)), g : NativeU8Arr, f : Int) : Bool do
+    if f >= 6 do true else if area(ms, f) == brute(g, f, 0, 0) do faces_agree(ms, g, f + 1) else false end end
+  end
+
+  pfn tops_go(q : NativeI32Arr, i : Int, n : Int, acc : List(Int)) : List(Int) do
+    if i >= n do acc
+    else if Strata.Quad.face_of(NativeArray.get_i32(q, 2 * i)) == 0 do tops_go(q, i + 1, n, Cons(Strata.Quad.ao_of(NativeArray.get_i32(q, 2 * i + 1)), acc))
+    else tops_go(q, i + 1, n, acc) end end
+  end
+  -- the shading byte of every top quad
+  pfn tops(ms : List((Int, Int, Int, Int, NativeI32Arr))) : List(Int) do
+    List.fold_left(ms, Nil, fn (acc, m) -> tops_go(piece_quads(m), 0, NativeArray.length_i32(piece_quads(m)) / 2, acc))
+  end
+
+  describe "Rig meshes" do
+    test "a single filled voxel gives 6 quads" do
+      match one(1, 1, 1) do
+        (r, p) ->
+          let ms = Rg.meshes(Rg.voxel(r, p, 0, 0, 0, 1))
+          Test.assert_eq_int(List.length(ms), 1, "List.length(ms)")
+          Test.assert_eq_int(total(ms), 6, "total(ms)")
+      end
+    end
+    test "a 2x1x1 bar of one colour gives 6 quads, of two colours 10" do
+      match one(2, 1, 1) do
+        (r, p) ->
+          Test.assert_eq_int(total(Rg.meshes(Rg.box(r, p, 0, 0, 0, 1, 0, 0, 5))), 6, "total(Rg.meshes(Rg.box(r, p, 0, 0, 0, 1, 0, 0, 5)))")
+          Test.assert_eq_int(total(Rg.meshes(Rg.voxel(Rg.voxel(r, p, 0, 0, 0, 5), p, 1, 0, 0, 6))), 10, "total(Rg.meshes(Rg.voxel(Rg.voxel(r, p, 0, 0, 0, 5), p, 1, 0, 0, 6)))")
+      end
+    end
+    test "the palette index is in the texture field" do
+      match one(1, 1, 1) do
+        (r, p) ->
+          match Rg.meshes(Rg.voxel(r, p, 0, 0, 0, 77)) do
+            Cons((_, _, _, _, q), _) -> Test.assert_eq_int(Strata.Quad.tex_of(NativeArray.get_i32(q, 1)), 77, "texture")
+            Nil -> Test.fail("no mesh")
+          end
+      end
+    end
+    test "random grids: quad area per face equals the exposed faces" do
+      Check.all(Gen.int(0, 1000000), fn seed ->
+        match one(8, 8, 8) do
+          (r, _) ->
+            match fill_go(r, NativeArray.make_u8(512, 0), seed, 0) do
+              (r2, g) -> faces_agree(Rg.meshes(r2), g, 0)
+            end
+        end)
+    end
+    test "a 40x10x10 part is two pieces, with no face on the shared side" do
+      match one(40, 10, 10) do
+        (r, p) ->
+          let ms = Rg.meshes(Rg.box(r, p, 0, 0, 0, 39, 9, 9, 2))
+          Test.assert_eq_int(List.length(ms), 2, "List.length(ms)")
+          Test.assert_true(List.any(ms, fn m -> piece_at(m, p, 0)), "a piece at (0,0,0)")
+          Test.assert_true(List.any(ms, fn m -> piece_at(m, p, 32)), "a piece at (32,0,0)")
+          Test.assert_eq_int(faces_in(ms, 0, 2), 0, "faces_in(ms, 0, 2)")
+          Test.assert_eq_int(faces_in(ms, 32, 3), 0, "faces_in(ms, 32, 3)")
+          Test.assert_eq_int(faces_in(ms, 0, 3), 100, "faces_in(ms, 0, 3)")
+          Test.assert_eq_int(faces_in(ms, 32, 2), 100, "faces_in(ms, 32, 2)")
+          Test.assert_eq_int(area(ms, 0), 400, "area(ms, 0)")
+      end
+    end
+    test "corners are shaded as the world mesher shades them" do
+      match one(2, 2, 1) do
+        (r, p) ->
+          -- an L: (1,0,0)'s top has (0,1,0) beside it, so two of its corners are shaded; (0,1,0)'s top is open
+          let ms = Rg.meshes(Rg.voxel(Rg.voxel(Rg.voxel(r, p, 0, 0, 0, 1), p, 1, 0, 0, 1), p, 0, 1, 0, 1))
+          Test.assert_eq_int(area(ms, 0), 2, "area(ms, 0)")
+          Test.assert_true(List.any(tops(ms), fn ao -> ao == 255), "an open top")
+          Test.assert_true(List.any(tops(ms), fn ao -> ao != 255), "a shaded top")
+      end
+    end
+  end
+
+  describe "Rig refusals" do
+    test "a rig of one empty part meshes to nothing and is accepted" do
+      match one(4, 4, 4) do
+        (r, p) ->
+          Test.assert_eq_int(p, 0, "p")
+          Test.assert_eq_int(List.length(Rg.meshes(r)), 0, "List.length(Rg.meshes(r))")
+          Test.assert_eq_int(Rg.refused(r), 0, "Rg.refused(r)")
+          Test.assert_eq_int(Rg.part_count(r), 1, "Rg.part_count(r)")
+      end
+    end
+    test "a 65th part is refused and counted" do
+      let r = List.fold_left(List.range(0, 64), Rg.new(0.1), fn (acc, i) -> Tuple.first(Rg.part(acc, i - 1, 0.0, 1.0, 0.0, 1, 1, 1)))
+      Test.assert_eq_int(Rg.part_count(r), 64, "Rg.part_count(r)")
+      Test.assert_eq_int(Rg.refused(r), 0, "Rg.refused(r)")
+      match Rg.part(r, 0, 0.0, 0.0, 0.0, 1, 1, 1) do
+        (r2, p) ->
+          Test.assert_eq_int(p, -1, "p")
+          Test.assert_eq_int(Rg.part_count(r2), 64, "Rg.part_count(r2)")
+          Test.assert_eq_int(Rg.refused(r2), 1, "Rg.refused(r2)")
+      end
+    end
+    test "a 129-voxel side is refused and counted; 128 is accepted" do
+      match Rg.part(Rg.new(0.1), -1, 0.0, 0.0, 0.0, 1, 129, 1) do
+        (r, p) ->
+          Test.assert_eq_int(p, -1, "p")
+          Test.assert_eq_int(Rg.refused(r), 1, "Rg.refused(r)")
+          match Rg.part(r, -1, 0.0, 0.0, 0.0, 128, 1, 1) do
+            (r2, p2) ->
+              Test.assert_eq_int(p2, 0, "p2")
+              Test.assert_eq_int(Rg.refused(r2), 1, "Rg.refused(r2)")
+          end
+      end
+    end
+    test "colour 0 and colour 256 are refused and counted; 1 and 255 accepted" do
+      let r = Rg.colour(Rg.colour(Rg.new(0.1), 1, 1.0, 0.0, 0.0, 0.5, 0.0), 255, 0.0, 1.0, 0.0, 0.5, 0.0)
+      Test.assert_eq_int(Rg.refused(r), 0, "Rg.refused(r)")
+      let r2 = Rg.colour(r, 0, 1.0, 1.0, 1.0, 0.5, 0.0)
+      Test.assert_eq_int(Rg.refused(r2), 1, "Rg.refused(r2)")
+      let r3 = Rg.colour(r2, 256, 1.0, 1.0, 1.0, 0.5, 0.0)
+      Test.assert_eq_int(Rg.refused(r3), 2, "Rg.refused(r3)")
+      Test.assert_true(String.contains(Rg.why(r3), "colour"), "why names the colour")
+    end
+    test "a second root, a parent that does not exist and a voxel outside the grid are refused" do
+      match one(2, 2, 2) do
+        (r, _) ->
+          match Rg.part(r, -1, 0.0, 0.0, 0.0, 1, 1, 1) do
+            (r2, p2) ->
+              Test.assert_eq_int(p2, -1, "p2")
+              match Rg.part(r2, 5, 0.0, 0.0, 0.0, 1, 1, 1) do
+                (r3, p3) ->
+                  Test.assert_eq_int(p3, -1, "p3")
+                  let r4 = Rg.voxel(r3, 0, 2, 0, 0, 1)
+                  Test.assert_eq_int(Rg.refused(r4), 3, "Rg.refused(r4)")
+                  Test.assert_eq_int(List.length(Rg.meshes(r4)), 0, "List.length(Rg.meshes(r4))")
+              end
+          end
+      end
+    end
+    test "masks, sockets and legs are numbered and kept" do
+      match one(2, 2, 2) do
+        (r, root) ->
+          match Rg.part(r, root, 0.0, 2.0, 0.0, 1, 1, 1) do
+            (r2, arm) ->
+              match Rg.mask(r2, [arm]) do
+                (r3, m) ->
+                  Test.assert_eq_int(m, 0, "m")
+                  match Rg.socket(r3, arm, 0.5, 1.0, 0.5, Strata.Math.Quat.identity()) do
+                    (r4, s) ->
+                      Test.assert_eq_int(s, 0, "s")
+                      let r5 = Rg.leg(r4, root, arm, arm, 0.1)
+                      Test.assert_eq_int(Rg.mask_count(r5), 1, "Rg.mask_count(r5)")
+                      Test.assert_eq_int(List.length(Rg.sockets(r5)), 1, "List.length(Rg.sockets(r5))")
+                      Test.assert_eq_int(List.length(Rg.legs(r5)), 1, "List.length(Rg.legs(r5))")
+                      Test.assert_eq_int(Rg.refused(r5), 0, "Rg.refused(r5)")
+                  end
+              end
+          end
+      end
+    end
+  end
+end

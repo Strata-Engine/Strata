@@ -1,0 +1,182 @@
+-- Clip — an animation described against one rig: a duration, whether it
+-- loops, keys per part, marks and a stride. A value until
+-- `Strata.Anim.finish_clip` uploads it.
+--
+-- A turn key is the part's whole rotation in its parent's frame at that
+-- time (it replaces the rest rotation while the clip plays); a move key is
+-- the part's whole offset from its pivot, in metres. Each key says how to
+-- reach the next: `step` (hold), `straight` (linear; slerp for turns) or
+-- `smooth` (eased). A part with no keys in a clip holds its rest pose under
+-- it. Keys are kept sorted by part, channel and time; keys at one time keep
+-- the order given.
+--
+-- `swing` and `spin` write ordinary keys. Their axis is in the part's rest
+-- frame: each key is the rest rotation turned further about the axis.
+--
+-- A call the clip cannot take changes nothing but the count `refused`.
+mod Strata.Clip do
+
+  alias Strata.Math.Quat as Qt
+
+  -- part, channel (0 turn, 1 move), interpolation, time, x, y, z, w
+  type ClKey = ClKey(Int, Int, Int, Float, Float, Float, Float, Float)
+  type ClMark = ClMark(Float, Int)
+
+  type Clip = { rig : Strata.Rig.Rig, nparts : Int, rests : List((Float, Float, Float, Float)), length : Float, looping : Bool, stride_m : Float, keys : List(ClKey), nkeys : Int, marks : List(ClMark), refusals : Int, reason : String }
+
+  doc "Interpolation: hold this key's value until the next."
+  fn step() : Int do 0 end
+  doc "Interpolation: straight to the next key (linear; slerp for turns)."
+  fn straight() : Int do 1 end
+  doc "Interpolation: eased into and out of the next key."
+  fn smooth() : Int do 2 end
+
+  pfn key_tuple(k : ClKey) : (Int, Int, Int, Float, Float, Float, Float, Float) do match k do ClKey(p, ch, i, t, x, y, z, w) -> (p, ch, i, t, x, y, z, w) end end
+  pfn mark_tuple(m : ClMark) : (Float, Int) do match m do ClMark(t, g) -> (t, g) end end
+  pfn key_int_list(k : ClKey) : List(Int) do match k do ClKey(p, ch, i, _, _, _, _, _) -> [p, ch, i] end end
+  pfn key_float_list(k : ClKey) : List(Float) do match k do ClKey(_, _, _, t, x, y, z, w) -> [t, x, y, z, w] end end
+
+  pfn finite(x : Float) : Bool do
+    if float_is_nan(x) do false else !float_is_infinite(x) end
+  end
+  pfn refuse(c : Clip, why : String) : Clip do { c with refusals: c.refusals + 1, reason: why } end
+
+  doc "An empty clip of [duration] seconds for rig [rig], looping or not. A negative or non-finite duration is refused and the clip is 0 s long."
+  fn new(rig : Strata.Rig.Rig, duration : Float, loops : Bool) : Clip do
+    let c = { rig: rig, nparts: Strata.Rig.part_count(rig), rests: Strata.Rig.rests(rig), length: 0.0, looping: loops, stride_m: 0.0, keys: Nil, nkeys: 0, marks: Nil, refusals: 0, reason: "" }
+    if finite(duration) && duration >= 0.0 do { c with length: duration } else refuse(c, "a duration must be 0 or more seconds") end
+  end
+
+  fn refused(c : Clip) : Int do c.refusals end
+  fn why(c : Clip) : String do c.reason end
+  fn rig(c : Clip) : Strata.Rig.Rig do c.rig end
+  fn duration(c : Clip) : Float do c.length end
+  fn loops(c : Clip) : Bool do c.looping end
+  doc "The distance one loop carries the figure, in metres (0 when not set)."
+  fn stride_of(c : Clip) : Float do c.stride_m end
+  doc "The keys in order: (part, channel 0 turn or 1 move, interpolation, time, x, y, z, w); a move's w is 0."
+  fn keys(c : Clip) : List((Int, Int, Int, Float, Float, Float, Float, Float)) do
+    List.map(sorted(c), key_tuple)
+  end
+  doc "The marks in the order made: (time, tag)."
+  fn marks(c : Clip) : List((Float, Int)) do List.map(c.marks, mark_tuple) end
+
+  -- does key a come before (or with) key b: by part, channel, time
+  pfn before(a : ClKey, b : ClKey) : Bool do
+    match a do
+      ClKey(pa, ca, _, ta, _, _, _, _) ->
+        match b do
+          ClKey(pb, cb, _, tb, _, _, _, _) ->
+            if pa != pb do pa < pb else if ca != cb do ca < cb else ta <= tb end end
+        end
+    end
+  end
+  -- the keys sorted: they are kept newest first, and a stable sort by part,
+  -- channel and time leaves keys at one time in the order given
+  pfn sorted(c : Clip) : List(ClKey) do List.sort_by(List.reverse(c.keys), before) end
+
+  pfn check(c : Clip, part : Int, time : Float, interp : Int) : String do
+    if part < 0 || part >= c.nparts do "no such part in the clip's rig"
+    else if !finite(time) || time < 0.0 || time > c.length do "a key's time must lie in 0..duration"
+    else if interp < 0 || interp > 2 do "an interpolation is step, straight or smooth"
+    else if c.nkeys >= 65535 do "a clip holds at most 65535 keys"
+    else "" end end end end
+  end
+
+  pfn add(c : Clip, k : ClKey) : Clip do { c with keys: Cons(k, c.keys), nkeys: c.nkeys + 1 } end
+
+  doc "A turn key: part [part]'s whole rotation [q] in its parent's frame at [time]."
+  fn turn(c : Clip, part : Int, time : Float, q : Strata.Math.Quat.Quat, interp : Int) : Clip do
+    let bad = check(c, part, time, interp)
+    let len = Math.sqrt(Qt.x(q) *. Qt.x(q) +. Qt.y(q) *. Qt.y(q) +. Qt.z(q) *. Qt.z(q) +. Qt.w(q) *. Qt.w(q))
+    if bad != "" do refuse(c, bad)
+    else if !finite(len) || len < 0.000001 do refuse(c, "a rotation must be a finite quaternion of some length")
+    else
+      let n = Qt.normalize(q)
+      add(c, ClKey(part, 0, interp, time, Qt.x(n), Qt.y(n), Qt.z(n), Qt.w(n)))
+    end end
+  end
+
+  doc "A move key: part [part]'s whole offset (x, y, z) from its pivot, in metres in its parent's frame, at [time]."
+  fn move(c : Clip, part : Int, time : Float, x : Float, y : Float, z : Float, interp : Int) : Clip do
+    let bad = check(c, part, time, interp)
+    if bad != "" do refuse(c, bad)
+    else if !(finite(x) && finite(y) && finite(z)) do refuse(c, "an offset must be finite")
+    else add(c, ClKey(part, 1, interp, time, x, y, z, 0.0)) end end
+  end
+
+  pfn rest_of(c : Clip, part : Int) : Strata.Math.Quat.Quat do
+    match List.nth_opt(c.rests, part) do
+      Some((x, y, z, w)) -> Strata.Math.Quat.Quat(x, y, z, w)
+      None -> Qt.identity()
+    end
+  end
+
+  -- turn keys at times k * dt, k = 0.. while within the duration, plus one
+  -- at the duration if the last falls short; angle(t) in radians
+  pfn about(c : Clip, part : Int, ax : Float, ay : Float, az : Float, dt : Float, interp : Int, angle : Float -> Float, k : Int) : Clip do
+    let t = int_to_float(k) *. dt
+    if t > c.length +. 0.000000001 do
+      let last = int_to_float(k - 1) *. dt
+      if last < c.length -. 0.000001 do turn(c, part, c.length, Qt.mul(rest_of(c, part), Qt.from_axis_angle(ax, ay, az, angle(c.length))), interp) else c end
+    else if c.nkeys >= 65535 do refuse(c, "a clip holds at most 65535 keys")
+    else
+      let t2 = if t > c.length do c.length else t end
+      about(turn(c, part, t2, Qt.mul(rest_of(c, part), Qt.from_axis_angle(ax, ay, az, angle(t2))), interp), part, ax, ay, az, dt, interp, angle, k + 1)
+    end end
+  end
+
+  pfn axis_ok(ax : Float, ay : Float, az : Float) : Bool do
+    let l = Math.sqrt(ax *. ax +. ay *. ay +. az *. az)
+    finite(l) && l > 0.000001
+  end
+
+  doc "Swing part [part] about the axis (ax, ay, az) in its rest frame: [degrees] times sin(2 pi (t / period + phase)). Writes smooth keys every 1/16 of the period."
+  fn swing(c : Clip, part : Int, ax : Float, ay : Float, az : Float, degrees : Float, period : Float, phase : Float) : Clip do
+    if part < 0 || part >= c.nparts do refuse(c, "no such part in the clip's rig")
+    else if !axis_ok(ax, ay, az) do refuse(c, "an axis must have some length")
+    else if !(finite(degrees) && finite(period) && finite(phase)) || period <= 0.0 do refuse(c, "a swing needs a finite amplitude and phase and a positive period")
+    else
+      let l = Math.sqrt(ax *. ax +. ay *. ay +. az *. az)
+      let amp = degrees *. Math.pi() /. 180.0
+      about(c, part, ax /. l, ay /. l, az /. l, period /. 16.0, smooth(), fn t -> amp *. Math.sin(2.0 *. Math.pi() *. (t /. period +. phase)), 0)
+    end end end
+  end
+
+  doc "Spin part [part] about the axis (ax, ay, az) in its rest frame at [turns_per_second] (negative turns the other way). Writes straight keys every quarter turn."
+  fn spin(c : Clip, part : Int, ax : Float, ay : Float, az : Float, turns_per_second : Float) : Clip do
+    if part < 0 || part >= c.nparts do refuse(c, "no such part in the clip's rig")
+    else if !axis_ok(ax, ay, az) do refuse(c, "an axis must have some length")
+    else if !finite(turns_per_second) || turns_per_second == 0.0 do refuse(c, "a spin needs a finite rate that is not 0")
+    else
+      let l = Math.sqrt(ax *. ax +. ay *. ay +. az *. az)
+      let tps = turns_per_second
+      about(c, part, ax /. l, ay /. l, az /. l, 0.25 /. Math.abs(tps), straight(), fn t -> 2.0 *. Math.pi() *. tps *. t, 0)
+    end end end
+  end
+
+  doc "A mark at [time] (0..duration) with the game's [tag]: reported each time a playing clip crosses it."
+  fn mark(c : Clip, time : Float, tag : Int) : Clip do
+    if !finite(time) || time < 0.0 || time > c.length do refuse(c, "a mark's time must lie in 0..duration")
+    else { c with marks: List.append(c.marks, Cons(ClMark(time, tag), Nil)) } end
+  end
+
+  doc "The distance one loop carries the figure, in metres: a game sets the rate from ground speed with it."
+  fn stride(c : Clip, metres : Float) : Clip do
+    if !finite(metres) do refuse(c, "a stride must be finite") else { c with stride_m: metres } end
+  end
+
+  -- ── Upload ────────────────────────────────────────────────────────────────
+  fn key_count(c : Clip) : Int do c.nkeys end
+  fn mark_count(c : Clip) : Int do List.length(c.marks) end
+  doc "Three ints a key: part, channel, interpolation."
+  fn key_ints(c : Clip) : NativeI32Arr do
+    NativeArray.from_list_i32(List.flat_map(sorted(c), key_int_list))
+  end
+  doc "Five floats a key: time, x, y, z, w."
+  fn key_floats(c : Clip) : NativeF32Arr do
+    NativeArray.from_list_f32(List.flat_map(sorted(c), key_float_list))
+  end
+  fn mark_times(c : Clip) : NativeF32Arr do NativeArray.from_list_f32(List.map(c.marks, fn m -> Tuple.first(mark_tuple(m)))) end
+  fn mark_tags(c : Clip) : NativeI32Arr do NativeArray.from_list_i32(List.map(c.marks, fn m -> Tuple.second(mark_tuple(m)))) end
+end

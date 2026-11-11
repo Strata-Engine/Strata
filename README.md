@@ -136,7 +136,7 @@ thread and never waits for the frame, nor the frame for it. Design:
 ```march
 let opened = Strata.Ffi.Audio.open(false)              -- speakers; false when there is no device
 let (s1, strike) = Strata.Sound.upload(Strata.Sound.new(), Strata.Sound.strike())
-let (s2, v) = Strata.Sound.play_flat(s1, strike, 0.9, 0.0, 1.0)
+let (s2, v) = Strata.Sound.play_flat(s1, strike, 0, 0.9, 0.0, 1.0)   -- group 0
 let s3 = Strata.Sound.control(s2, v, 0, 0.8)           -- hardness
 
 -- once a frame, last
@@ -199,6 +199,25 @@ whose strength follows how open the sky is: it drops in a tunnel.
 In the viewer, footsteps sound every half metre walked, from the block
 underfoot (the viewer's own table of hardness and size), and a landing by
 how hard it was.
+
+### Levels
+
+A game's sound menu sets levels; Strata draws no menu and saves nothing.
+
+```march
+let s1 = Strata.Sound.set_master(s, 0.8)          -- main volume, 0..1 as a slider
+let s2 = Strata.Sound.set_group(s1, 1, 0.5)       -- group 1 (the game's music, say)
+let (s3, v) = Strata.Sound.play_flat(s2, theme, 1, 1.0, 0.0, 1.0)   -- plays in group 1
+```
+
+There are four groups, 0 to 3; the game decides what each is for, and every
+`play` and `play_flat` names one. Strata's own sounds go where the game says:
+`Strata.Sound.with_fluid_group(s, g)` for falling water, and the group
+argument of `with_gust`. A level is a slider value from 0 to 1, cubed into a
+gain, so equal steps of a slider sound like roughly equal steps of loudness
+(0.5 is about -18 dB, 0 is silent). Every change glides, so dragging a
+slider never clicks. In the viewer, 9 and 0 lower and raise the main level;
+`STRATA_AUDIO_LEVEL` sets it at start.
 
 ### Listening
 
@@ -309,6 +328,47 @@ Limits:
 ![Text from 8 to 200 pixels](docs/ui-text-sheet.png)
 ![Wrapping, alignment, outline, shadow, mixed runs](docs/ui-text-styles.png)
 ![Six scripts, mixed direction, kerning and ligatures](docs/ui-text-scripts.png)
+## Animation
+
+Jointed voxel figures (people, creatures, vehicles) built and animated in
+code. Design: `docs/2026-11-11-animation-design.md`; rulings:
+`docs/animation-ledger.md`.
+
+`Strata.Rig` describes a figure once: a voxel size in metres, a palette of
+255 entries (colour, roughness, emission; 0 is empty), up to 64 parts in a
+hierarchy, each with a grid of up to 128 voxels a side, a pivot in its
+parent's voxels, an anchor (the point of its own grid it turns about) and
+a rest rotation; sockets, masks (subtrees) and legs. `Strata.Rig.meshes`
+meshes each part greedily in pieces of 32 voxels a side, in
+`Strata.Quad`'s layout with the palette index in the texture field.
+`Strata.Clip` describes an animation against a rig: turn and move keys
+(step, straight or smooth), marks, a stride, and `swing` and `spin`, which
+write ordinary keys. `Strata.Anim` uploads them and runs the figures: the
+pose arithmetic is C (`native/strata_anim.h`, bound by
+`native/strata_anim.c`), one world per process, posed by `update(dt)`.
+
+```march
+let r0 = Strata.Rig.colour(Strata.Rig.new(0.1), 1, 0.8, 0.2, 0.2, 0.5, 0.0)
+let (r1, body) = Strata.Rig.part(r0, -1, 0.0, 0.0, 0.0, 2, 10, 2)
+let (r2, arm) = Strata.Rig.part(Strata.Rig.box(r1, body, 0, 0, 0, 1, 9, 1, 1), body, 1.0, 10.0, 1.0, 2, 10, 2)
+let rig = Strata.Rig.box(Strata.Rig.anchor(r2, arm, 1.0, 0.0, 1.0), arm, 0, 0, 0, 1, 9, 1, 1)
+let wave = Strata.Clip.mark(Strata.Clip.swing(Strata.Clip.new(rig, 1.0, true), arm, 0.0, 0.0, 1.0, 30.0, 1.0, 0.0), 0.25, 7)
+
+let (a1, rig_id) = Strata.Anim.finish_rig(Strata.Anim.open(256), rig)
+let (a2, wave_id) = Strata.Anim.finish_clip(a1, wave)
+let (a3, fig) = Strata.Anim.spawn_at(a2, rig_id, 0.0, 0.0, 0.0, Strata.Math.Quat.identity())
+let a4 = Strata.Anim.play(a3, fig, 0, wave_id, 0.2, 1.0, 1.0, -1, false)   -- layer 0, every part
+
+-- every frame
+let a5 = Strata.Anim.update(a4, dt)
+let poses = Strata.Anim.matrices(a5, fig)     -- 12 floats a part: a 3x4 in world space
+let steps = Strata.Anim.marks(a5)             -- (figure, layer, tag, weight), in time order
+```
+
+`scripts/anim_check.sh` builds `animcheck/` and runs its scenes; to see the
+chain's matrices at t = 0, 0.25 and 0.5:
+
+    (cd animcheck && forge build --release) && ANIMCHECK_SCENE=table animcheck/.march/build/release/animcheck
 
 ## Using it from a game
 
@@ -319,13 +379,14 @@ A game that draws also lists Strata's C shim itself, because forge does not
 build a dependency's C sources:
 
     [ffi]
-    sources = ["../strata/native/strata_vk.c", "../strata/native/strata_audio.c"]
+    sources = ["../strata/native/strata_vk.c", "../strata/native/strata_audio.c", "../strata/native/strata_anim.c"]
     link = ["-I../strata/native", "-I/opt/homebrew/include", "-L/opt/homebrew/lib",
             "-lglfw", "-lvulkan", "-Wl,-rpath,/opt/homebrew/lib"]
 
 and must run with `MARCH_PIN_MAIN=1`. A game that only uses the core needs
 neither; one that only plays sound lists `strata_audio.c` alone, which needs
-no library beyond the system's.
+no library beyond the system's, and one that animates figures lists
+`strata_anim.c`, which needs none either.
 
 ```march
 -- register blocks
@@ -371,6 +432,8 @@ let s4 = Strata.Stream.apply(s3, Strata.Edit.fill_sphere(Strata.Stream.world(s3)
 | `Strata.Fluid` | finite fluids: fall, run to a drop, stay level, sink, rest |
 | `Strata.Slots`, `Strata.Render` | renderer slot bookkeeping; keeping the renderer in step with a stream |
 | `Strata.Model` | a model block's drawing geometry |
+| `Strata.Rig`, `Strata.Clip` | a jointed figure's description and part meshes; its animations |
+| `Strata.Anim`, `Strata.Ffi.Anim` | figures posed by the C kernel in `native/strata_anim.h` |
 | `Strata.Ffi.Vk` | window, input and the Vulkan renderer |
 | `Strata.Math.*`, `Strata.Noise`, `Strata.Tree` | vectors, matrices, noise, a persistent tree |
 

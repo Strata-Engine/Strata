@@ -586,6 +586,66 @@ static void test_measured_ears(void) {
     CHECK(strcmp(SH_MODEL, "MIT KEMAR") == 0, "the binaural filters come from the MIT KEMAR measurements");
 }
 
+static void test_master(void) {
+    /* half the main level is 6 dB down */
+    SmMixer *m = sm_open();
+    tone_patch(m, 1, SM_SRC_SINE, 300.0f, 0.4f);
+    mu_play_flat(m, 1, 1, 1.0f, 0.0f);
+    render(m, SEC(0.2));
+    double before = mu_db(mu_rms(buf, SEC(0.1), SEC(0.2)));
+    mu_cmd(m, SM_OP_MASTER, 0, 0, 0.5f);
+    render(m, SEC(0.2));
+    double after = mu_db(mu_rms(buf, SEC(0.1), SEC(0.2)));
+    CHECK(fabs((before - after) - 6.02) <= 0.3, "a main level of 0.5 is 6 dB down");
+    sm_close(m);
+    /* turned down block by block, as a device asks: no step */
+    m = sm_open();
+    tone_patch(m, 1, SM_SRC_SINE, 50.0f, 0.8f);
+    mu_play_flat(m, 1, 1, 1.0f, -1.0f);
+    render(m, SEC(0.1));
+    mu_cmd(m, SM_OP_MASTER, 0, 0, 0.2f);
+    float jump = 0.0f, last = buf[2 * (SEC(0.1) - 1)];
+    for (int b = 0; b < 40; b++) {
+        render(m, SM_BLOCK);
+        for (int i = 0; i < SM_BLOCK; i++) { float d = fabsf(buf[2 * i] - last); if (d > jump) jump = d; last = buf[2 * i]; }
+    }
+    CHECK(jump < 0.02f, "the main level glides: no step between blocks");
+    sm_close(m);
+    /* at 0 everything is silent, the echo too; back at 1 a new click is heard and rings */
+    static float tail[2 * SM_RATE];
+    m = sm_open();
+    mu_listener(m, 0, 0, 0, 0, 0, -1);
+    mu_environ(m, 2.0f, 0.0f, 0.6f, 0, NULL);
+    render(m, SEC(0.2));
+    click_patch(m, 1);
+    mu_play_at(m, 1, 1, 1.0f, 1.0f, 0.0f, 0.0f, -10.0f);
+    render(m, SEC(0.3));
+    mu_cmd(m, SM_OP_MASTER, 0, 0, 0.0f);
+    render(m, SEC(0.3));
+    CHECK(mu_db(mu_rms(buf, SEC(0.1), SEC(0.3))) < -90.0, "a main level of 0 silences the voices and the echo");
+    mu_cmd(m, SM_OP_MASTER, 0, 0, 1.0f);
+    render(m, SEC(0.1));
+    mu_play_at(m, 2, 1, 1.0f, 1.0f, 0.0f, 0.0f, -10.0f);
+    sm_mix(m, tail, SEC(0.8));
+    CHECK(mu_db(mu_rms(tail, SEC(0.3), SEC(0.6))) > -70.0, "back at 1, a new click is heard and rings");
+    sm_close(m);
+    /* bad levels: finite, and never louder than full */
+    m = sm_open();
+    tone_patch(m, 1, SM_SRC_SINE, 300.0f, 0.4f);
+    mu_play_flat(m, 1, 1, 1.0f, 0.0f);
+    render(m, SEC(0.2));
+    double full = mu_db(mu_rms(buf, SEC(0.1), SEC(0.2)));
+    float bad[3] = { NAN, -1.0f, 5.0f };
+    int ok = 1;
+    for (int k = 0; k < 3; k++) {
+        mu_cmd(m, SM_OP_MASTER, 0, 0, bad[k]);
+        render(m, SEC(0.2));
+        if (!all_finite(buf, SEC(0.2)) || mu_db(mu_rms(buf, SEC(0.1), SEC(0.2))) > full + 0.1) ok = 0;
+    }
+    CHECK(ok, "a NaN, negative or too-large main level is finite and never louder than full");
+    sm_close(m);
+}
+
 int main(void) {
     test_fp();
     test_ring();
@@ -603,6 +663,7 @@ int main(void) {
     test_reverb();
     test_review();
     test_measured_ears();
+    test_master();
     if (fails == 0) printf("mix_test: ok\n");
     return fails == 0 ? 0 : 1;
 }
