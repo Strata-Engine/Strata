@@ -14,7 +14,7 @@ cd "$(dirname "$0")/.." || exit 1
 QUADS="${1:-0}"
 # Offscreen unless told otherwise: with the display asleep or the window hidden,
 # MoltenVK holds a presented frame for a whole second, which is no fault of the engine.
-out=$(env MARCH_PIN_MAIN=1 STRATA_OFFSCREEN="${STRATA_OFFSCREEN:-1}" STRATA_SOAK=3000 STRATA_BREACH=300 STRATA_QUADS="$QUADS" STRATA_SHOT=/dev/null ./viewer/.march/build/release/strata_viewer 2>&1)
+out=$(env MARCH_PIN_MAIN=1 STRATA_HIDDEN="${STRATA_HIDDEN:-1}" STRATA_OFFSCREEN="${STRATA_OFFSCREEN:-1}" STRATA_SOAK=3000 STRATA_BREACH=300 STRATA_QUADS="$QUADS" STRATA_SHOT=/dev/null ./viewer/.march/build/release/strata_viewer 2>&1)
 line=$(echo "$out" | grep '^soak:')
 lake_start=$(echo "$out" | sed -n 's/^soak-lake: lake_start=\([0-9]*\).*/\1/p')
 [ -n "$line" ] || { echo "FAIL: the viewer printed no soak line"; exit 1; }

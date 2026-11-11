@@ -386,8 +386,8 @@ worked out on a worker and applied six frames later.
 
 | | target | result | |
 |---|---|---|---|
-| main-thread time per fluid step | 2 ms | 0.2 to 0.5 ms | met |
-| worker time per step | (none set) | about 5 microseconds a cell: 4 ms at 800 active cells | |
+| CPU per fluid step at the cap | 2 ms | about 5 microseconds a cell on a worker: 4 ms at 800 active cells, about 20 ms at the cap | missed |
+| what a step costs the frame | (none set) | 0.2 to 0.5 ms | |
 | lake empty | 2 minutes | 5.5 minutes | missed |
 | what is left | under 2%, no cell over an eighth | 3.1%, a film of a few eighths on the bed | missed |
 | at rest after the last change | 5 seconds | no active cells from the step after the last move | met |
@@ -425,7 +425,8 @@ target (50 000 live at 120 fps or better) is met.
 
 | target | result | |
 |---|---|---|
-| main-thread time per fluid step: 2 ms | 0.2 to 0.7 ms presenting; up to 3.5 ms offscreen, where six frames are shorter than the worker's step and the frame waits for it | met presenting |
+| CPU per fluid step at the cap: 2 ms | about 5 microseconds a cell on a worker, so about 20 ms at the cap of 4096 (extrapolated: the test lake never passed 1500 cells) | missed |
+| what a step costs the frame | 0.2 to 0.7 ms presenting; up to 3.5 ms offscreen, where six frames are shorter than the worker's step and the frame waits for it | no target was set for this |
 | active cells a step (cap): 4096 | never reached by the test lake (about 1500 at most) | not exercised |
 | worst frame while a lake drains: 16.7 ms | 15.9 ms (soak, offscreen, 3000 frames, everything lit) | met |
 | lake empty: 2 minutes | 5.5 minutes for 10 280 voxels | missed |
@@ -453,3 +454,16 @@ MoltenVK holds a frame for a whole second.
 Found on the way (GAPS S15): passing the shared block registry into the
 mesher's per-face function made meshing seven times slower. The soak caught
 it; chunk streaming is back to 0.27 s for 1183 chunks.
+
+## After the review
+
+The step target was first reported as met against the wrong measure. The
+design's target is the CPU a step takes; moving the step to a worker made it
+cheap for the frame, not cheap. Near the cap the frame would wait for the
+worker, which is the hitch the design names. The fix is a cheaper step, and
+that is a rewrite of how the step keeps its cells; it is not done.
+
+The review found two faults in the rules, both fixed: a cell whose landing
+place was taken by another fell out of the active set with its water still
+in the air, and an edit made while a worker step ran was forgotten when it
+touched a cell that was already active.

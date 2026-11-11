@@ -896,6 +896,9 @@ int64_t sv_open(int64_t w, int64_t h, int64_t capture_mouse, int64_t quad_capaci
     /* STRATA_PIXELS=1: the size asked for is in pixels, whatever the display's
      * scale, so a scripted run draws the same image on any screen */
     if (getenv("STRATA_PIXELS") && getenv("STRATA_PIXELS")[0] == '1') glfwWindowHint(GLFW_COCOA_RETINA_FRAMEBUFFER, GLFW_FALSE);
+    /* STRATA_HIDDEN=1: the window is never shown. For scripted runs that draw
+     * offscreen (STRATA_OFFSCREEN=1) and must not take over someone's screen. */
+    if (getenv("STRATA_HIDDEN") && getenv("STRATA_HIDDEN")[0] == '1') { glfwWindowHint(GLFW_VISIBLE, GLFW_FALSE); glfwWindowHint(GLFW_FOCUS_ON_SHOW, GLFW_FALSE); }
     g.win = glfwCreateWindow((int)w, (int)h, "Strata", NULL, NULL);
     if (!g.win) { die("glfwCreateWindow", 0); return 0; }
     glfwSetKeyCallback(g.win, on_key);

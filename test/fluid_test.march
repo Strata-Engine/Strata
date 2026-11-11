@@ -101,6 +101,19 @@ mod FluidTest do
     else stamp(w, x + 1, y, z, int_and(acc * 31 + Wf.get_block(w, x, y, z) * (1 + x + 40 * z + 1600 * y), 1152921504606846975)) end end end
   end
 
+  -- over the 9 x 9 floor at y = 0: how many pairs of side neighbours stand two or more eighths apart
+  pfn steps_apart(w : Strata.World.World, i : Int, n : Int) : Int do
+    if i >= 81 do n
+    else
+      let x = i % 9
+      let z = i / 9
+      let l = level(w, x, 0, z)
+      let dx = if x < 8 && (l - level(w, x + 1, 0, z) >= 2 || level(w, x + 1, 0, z) - l >= 2) do 1 else 0 end
+      let dz = if z < 8 && (l - level(w, x, 0, z + 1) >= 2 || level(w, x, 0, z + 1) - l >= 2) do 1 else 0 end
+      steps_apart(w, i + 1, n + dx + dz)
+    end
+  end
+
   -- a 16 x 16 terrain of stone columns, heights from the list, then water cells
   pfn columns(w : Strata.World.World, hs : List(Int), i : Int) : Strata.World.World do
     match hs do
@@ -379,6 +392,60 @@ mod FluidTest do
         (fl, job) ->
           match F.finish_world(job, F.wake_cell(fl, 5, 0, 5), w) do
             (f2, _) -> Test.assert_eq_int(F.active_count(f2), 1, "the one cell")
+          end
+      end
+    end
+  end
+
+  describe "Fluid review findings" do
+    test "a faller whose landing cell was taken by another keeps falling" do
+      -- a full cell at the lip of a one-high platform and a full cell three up over the ground beside it: both land on (0, 0, 0)
+      let w = put(put(box(fresh(), -6, 0, -3, -1, 0, 3, 1), -1, 1, 0, water(8)), 0, 3, 0, water(8))
+      match until_rest(wake_all(fluid()), w, 300, 0) do
+        (rr, taken) ->
+          Test.assert_true(taken >= 0, "it comes to rest")
+          Test.assert_eq_int(F.amount(world_of(rr), reg(), -24, 1, -24, 24, 24, 24), 0, "nothing is left above the ground")
+          Test.assert_eq_int(total(world_of(rr)), 16, "and all sixteen eighths are on it")
+      end
+    end
+    test "at rest, no two neighbours on a floor stand two or more eighths apart" do
+      -- a walled 9 x 9 floor with a full column of three in one corner
+      let w = box(box(box(box(box(fresh(), -1, 0, -1, 9, 4, -1, 1), -1, 0, 9, 9, 4, 9, 1), -1, 0, -1, -1, 4, 9, 1), 9, 0, -1, 9, 4, 9, 1), 0, 0, 0, 0, 2, 0, water(8))
+      match until_rest(wake_all(fluid()), w, 400, 0) do
+        (rr, taken) ->
+          Test.assert_true(taken >= 0, "it comes to rest")
+          Test.assert_eq_int(steps_apart(world_of(rr), 0, 0), 0, "pairs of neighbours two or more apart")
+      end
+    end
+    test "a cell already awake when a worker step begins is still woken by an edit made meanwhile" do
+      -- a single eighth in the middle of a wide slab: awake, and about to be found at rest
+      let w = put(box(fresh(), -20, 3, -20, 22, 3, 22, 1), 1, 4, 1, water(1))
+      match F.begin(F.wake_cell(fluid(), 1, 4, 1), w, Nil) do
+        (fl, job) ->
+          let o = Ef.set_block(w, 1, 3, 1, 0)
+          match F.finish_world(job, F.wake(fl, Ef.world(o), o), Ef.world(o)) do
+            (f2, o2) ->
+              Test.assert_true(F.active_count(f2) > 0, "the water over the new hole is awake")
+              match until_rest(f2, Ef.world(o2), 100, 0) do
+                (rr, _) -> Test.assert_eq_int(F.amount(world_of(rr), reg(), -24, 0, -24, 24, 0, 24), 1, "and falls to the ground")
+              end
+          end
+      end
+    end
+    test "a large sphere carved under water wakes it" do
+      -- water resting on stone at (5, 5, 4) from the centre of a radius 8 sphere: on its surface, well inside its bounds
+      let w = put(box(fresh(), -10, 0, -10, 10, 12, 10, 1), 5, 13, 4, water(8))
+      let o = Ef.fill_sphere(w, 0, 8, 0, 8, 0)
+      Test.assert_eq_int(Wf.get_block(Ef.world(o), 5, 12, 4), 0, "the sphere took the stone under the water")
+      Test.assert_true(F.active_count(F.wake(fluid(), Ef.world(o), o)) > 0, "the water is awake")
+    end
+    test "a worker step that drains into a sink removed meanwhile is dropped" do
+      let w = put(put(fresh(), 1, 0, 0, 10), 0, 0, 0, water(8))
+      match F.begin(F.wake_cell(fluid(), 0, 0, 0), w, Nil) do
+        (fl, job) ->
+          let o = Ef.set_block(w, 1, 0, 0, 0)
+          match F.finish_world(job, F.wake(fl, Ef.world(o), o), Ef.world(o)) do
+            (_, o2) -> Test.assert_eq_int(total(Ef.world(o2)), 8, "the water is still there: its sink was gone before the step landed")
           end
       end
     end

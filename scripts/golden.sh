@@ -3,6 +3,9 @@
 # image in test/golden/. `scripts/golden.sh --update` rewrites the stored
 # images instead; look at them before committing.
 #
+# Scenes draw offscreen in a window that is never shown, so a run does not
+# take over the screen; the image is the one a shown window would get.
+#
 # A scene is a line "name:environment" below. Every scene renders 60 frames
 # at 1280x800 pixels with radius 6 and writes the frame three before the end.
 cd "$(dirname "$0")/.." || exit 1
@@ -80,7 +83,7 @@ for line in $(echo "$SCENES" | tr ' ' ','); do
   draws=$EXPECT_DRAWS
   for kv in $envs; do case "$kv" in GOLDEN_AS=*) stored="${kv#GOLDEN_AS=}";; DRAWS=*) draws="${kv#DRAWS=}";; esac; done
   shot="$OUT/$name.ppm"
-  if ! env MARCH_PIN_MAIN=1 STRATA_RADIUS=6 STRATA_PIXELS=1 STRATA_SIZE=1280x800 STRATA_FRAMES=60 STRATA_LIGHT=0 STRATA_SHOT="$shot" $envs \
+  if ! env MARCH_PIN_MAIN=1 STRATA_RADIUS=6 STRATA_HIDDEN=1 STRATA_OFFSCREEN=1 STRATA_PIXELS=1 STRATA_SIZE=1280x800 STRATA_FRAMES=60 STRATA_LIGHT=0 STRATA_SHOT="$shot" $envs \
        ./viewer/.march/build/release/strata_viewer > "$OUT/$name.log" 2>&1 || [ ! -s "$shot" ]; then
     echo "FAIL: $name did not render"; tail -5 "$OUT/$name.log"; FAILED=1; continue
   fi
@@ -106,7 +109,7 @@ done
 if [ $UPDATE -eq 0 ]; then
   for mode in 2 4; do
     for n in 121 122; do
-      env MARCH_PIN_MAIN=1 STRATA_RADIUS=6 STRATA_PIXELS=1 STRATA_SIZE=1280x800 STRATA_SCENE=3 STRATA_LIGHT=$mode STRATA_FRAMES=$n STRATA_SHOT="$OUT/still$n.ppm" ./viewer/.march/build/release/strata_viewer > /dev/null 2>&1
+      env MARCH_PIN_MAIN=1 STRATA_RADIUS=6 STRATA_HIDDEN=1 STRATA_OFFSCREEN=1 STRATA_PIXELS=1 STRATA_SIZE=1280x800 STRATA_SCENE=3 STRATA_LIGHT=$mode STRATA_FRAMES=$n STRATA_SHOT="$OUT/still$n.ppm" ./viewer/.march/build/release/strata_viewer > /dev/null 2>&1
     done
     if res=$($DIFF "$OUT/still121.ppm" "$OUT/still122.ppm" 4 0.05 2>&1); then echo "ok   stillness, light mode $mode: $res"
     else echo "FAIL stillness, light mode $mode (frames 118 and 119): $res"; FAILED=1; fi
@@ -116,7 +119,7 @@ fi
 # ones are still held, and must land on a later frame. The capacity is the
 # scene's own need plus a little, so the check follows the terrain.
 if [ $UPDATE -eq 0 ]; then
-  RUN="env MARCH_PIN_MAIN=1 STRATA_LIGHT=0 STRATA_RADIUS=6 STRATA_PIXELS=1 STRATA_SIZE=1280x800 STRATA_SCENE=1 STRATA_DIG=1 STRATA_FRAMES=60 STRATA_SHOT=/dev/null ./viewer/.march/build/release/strata_viewer"
+  RUN="env MARCH_PIN_MAIN=1 STRATA_LIGHT=0 STRATA_RADIUS=6 STRATA_HIDDEN=1 STRATA_OFFSCREEN=1 STRATA_PIXELS=1 STRATA_SIZE=1280x800 STRATA_SCENE=1 STRATA_DIG=1 STRATA_FRAMES=60 STRATA_SHOT=/dev/null ./viewer/.march/build/release/strata_viewer"
   need=$($RUN 2>&1 | sed -n 's/.*; \([0-9]*\) quads,.*/\1/p' | head -1)
   line=$(STRATA_QUADS=$((need + 2100)) $RUN 2>&1 | grep 'done after')
   refused=$(echo "$line" | sed -n 's/.*uploads refused \([0-9]*\),.*/\1/p')

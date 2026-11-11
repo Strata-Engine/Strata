@@ -32,9 +32,31 @@ Task 7: Ruling: scripted runs take their size in pixels (STRATA_PIXELS=1) and th
 Task 7: Ruling: the soak runs offscreen by default and allows a fluid step 6 ms of the main thread — presenting to a sleeping display stalls a frame for one second under MoltenVK; offscreen frames are shorter than a worker step — a presentation hitch would not be seen by the soak.
 Task 7: Ruling: soak.sh matched field names by suffix, so worst_ms read fluid_worst_ms and a 30 ms frame passed; fixed to match whole names — none.
 Task 7: complete (soak PASS worst 15.9 ms; lib tests and lint passed in the last full gate run; that run failed its two stillness checks with 'cannot read still121.ppm', unexplained; the same command rerun three times and two full golden runs afterwards all passed; a final full gate run was interrupted by the owner)
-Final review: NOT RUN. The owner asked to finish up before the whole-branch review was dispatched. The branch has had no independent review.
+Final review: run later at the owner's request, by a fresh code-reviewer (fable). Two critical, five important, each critical reproduced by the reviewer in a scratch copy.
 Final: minor (deferred): a fluid step dropped because the world changed under it leaves the previous step's events in place, so the viewer sprays them twice.
 Final: minor (deferred): Strata.Fluid.step (the at-once form) has no test of its own.
 Final: minor (deferred): water cells count as full voxels to light rays, so reflections and shadows of partly full water are those of full blocks.
 Final: minor (deferred): the cap of 4096 active cells was never reached in the viewer, so behaviour under the cap is covered only by unit tests.
 Final: minor (deferred): the timing scripts ask for 2560 x 1600 pixels and get what the display allows (2560 x 1378 on the one attached now).
+Final: fixed "a giver whose offer is wholly refused drops out of the active set with water still due to move" — test "a faller whose landing cell was taken by another keeps falling" RED (8 eighths left in the air) then GREEN; givers refused or cut short stay active — suite 194/194.
+Final: fixed "a wake during a worker step is lost when the cell was already active at begin" — test "a cell already awake when a worker step begins is still woken by an edit made meanwhile" RED then GREEN; every wake is recorded — suite 194/194.
+Final: fixed "wake misses water on the surface of a large sphere fill" — test "a large sphere carved under water wakes it" RED then GREEN; spheres of radius 7 or more wake their skin — suite 194/194.
+Final: fixed "a fluid cell with the same fluid above it leaves a slit in its side" — test "a covered voxel shows its whole side to any lower neighbour of its fluid" RED then GREEN — suite 194/194; the four moving-water goldens re-stored after looking.
+Final: fixed "a step applied after the world changed can destroy water with no sink" — test "a worker step that drains into a sink removed meanwhile is dropped" RED (0 eighths left) then GREEN; a job carries the sinks its drains relied on — suite 194/194.
+Final: fixed "RESULTS marks the 2 ms step target met on a different metric" — RESULTS now reports the target as missed (about 20 ms of worker time at the cap, extrapolated) and the frame's cost separately.
+Final: Ruling: water bound for a drop across dry ground goes straight to where it lands, up to reach cells away, in one step (review finding I4; the design says sideways moves are one cell a step) — moving it a cell at a time left thin streams that crept, and the lip-pours rule depends on it — no stream is drawn on the dry stretch between a cell and the edge it runs to; the dead parameter and comment are removed.
+Final: Ruling: the test "at rest, no two neighbours on a floor stand two or more eighths apart" passes before and after the fix in my scene; the reviewer saw such pairs in hashed basins before the fix — kept as a regression test — it may not cover the case he saw.
+Final: also done because the owner stopped two gate runs that opened windows: scripted runs can hide their window (STRATA_HIDDEN=1), and the goldens and the soak now draw hidden and offscreen by default.
+Final: gate after the fix pass: scripts/verify.sh PASS (194 tests, all goldens), soak PASS (worst frame 18.8 ms, fluid 5.3 ms of the main thread at worst, offscreen).
+Final: minor (deferred): falling water lands on an unloaded chunk below and spreads across it instead of stopping.
+Final: minor (deferred): water taken by a sink makes no event, so a waterfall into the sea has no splash.
+Final: minor (deferred): a sink registered as a fluid family reads as a wall.
+Final: minor (deferred): a waiting cell that rejoins through a neighbour loses its count of steps waited.
+Final: minor (deferred): dormant cells beside chunks that never load are kept for good and looked at every step.
+Final: minor (deferred): the viewer begins a worker step ten times a second with nothing active.
+Final: minor (deferred): a job still running at exit is never awaited.
+Final: minor (deferred): spray positions assume one metre per voxel.
+Final: minor (deferred): spray never expires if the game never sets the time; one long-lived burst widens the drawn span for good; a full ring may tear one particle for a frame.
+Final: minor (deferred): the soak checks the lake at the end only, not that the amount never grows or that no step exceeded the cap.
+Final: minor (deferred): the design's floor-opening scene has no golden image.
+Final: not judged by the reviewer: anything in pixels, all timings, GPU behaviour of the spray buffer.
