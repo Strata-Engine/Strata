@@ -19,8 +19,10 @@
 --             half of what it holds above the neighbour that way (at least
 --             one eighth) to that neighbour. Water runs to a drop instead of
 --             spreading.
---   * Level.  Else it shares with lower side neighbours toward their
---             common level, rounding down, so a single eighth stays put.
+--   * Level.  Else it gives an eighth at a time to its lowest side
+--             neighbour while that one stands two or more below, so a
+--             surface settles to within an eighth and a lone eighth
+--             stays put.
 --
 -- A cell takes offers until it holds eight eighths: from above first, then
 -- from its -x, +x, -z and +z neighbours. What it cannot take stays with the
@@ -50,7 +52,8 @@ mod Strata.Fluid do
   fn ev_landed(e : Event) : Bool do match e do Event(_, _, _, _, _, l) -> l end end
 
   -- registry; flowing family bases; sink bases; cap, reach, fall; the active
-  -- cells (each with how far its water has fallen); cells set aside in or
+  -- cells (each with how far its water has fallen, at most 4095 cells, plus
+  -- 4096 times the steps it has been left waiting under the cap); cells set aside in or
   -- beside chunks that are not loaded; the last step's events; how many
   -- active cells the last step left for later
   type Fluid = Fluid(Strata.Blocks.Registry, List(Int), List(Int), Int, Int, Int, Strata.Store.Store(Int), Strata.Store.Store(Int), List(Event), Int)
@@ -167,12 +170,28 @@ mod Strata.Fluid do
   -- The nearer of two ways down; 0 is none. Ties keep the first.
   pfn nearer(da : Int, db : Int) : Bool do db > 0 && (da == 0 || db < da) end
 
-  -- Share level L with the lower side neighbours: each is brought up to the
-  -- common level, rounded down. n* are the neighbours' looks.
-  pfn lower(l : Int, n : Int) : Int do if n >= 0 && n < l do 1 else 0 end end
-  pfn part(l : Int, n : Int) : Int do if n >= 0 && n < l do n else 0 end end
-  pfn level_to(p : Plan, base : Int, x : Int, y : Int, z : Int, tx : Int, tz : Int, order : Int, n : Int, l : Int, common : Int) : Plan do
-    if n >= 0 && n < l && common > n do bid(p, Offer(tx, y, tz, order, common - n, x, y, z, base, 0, false)) else p end
+  -- Share level l with the side neighbours: one eighth at a time to the
+  -- lowest of them (the first in the order -x, +x, -z, +z among equals)
+  -- while it stands two or more eighths below. a..d are the neighbours'
+  -- looks (below 0: no room there); the answer is the four gifts.
+  pfn open_to(l : Int, n : Int) : Bool do n >= 0 && n < 8 && l - n >= 2 end
+  pfn share(l : Int, a : Int, b : Int, c : Int, d : Int, ga : Int, gb : Int, gc : Int, gd : Int) : (Int, Int, Int, Int) do
+    let na = a + ga
+    let nb = b + gb
+    let nc = c + gc
+    let nd = d + gd
+    let oa = open_to(l, na) && a >= 0
+    let ob = open_to(l, nb) && b >= 0
+    let oc = open_to(l, nc) && c >= 0
+    let od = open_to(l, nd) && d >= 0
+    if oa && (!ob || na <= nb) && (!oc || na <= nc) && (!od || na <= nd) do share(l - 1, a, b, c, d, ga + 1, gb, gc, gd)
+    else if ob && (!oc || nb <= nc) && (!od || nb <= nd) do share(l - 1, a, b, c, d, ga, gb + 1, gc, gd)
+    else if oc && (!od || nc <= nd) do share(l - 1, a, b, c, d, ga, gb, gc + 1, gd)
+    else if od do share(l - 1, a, b, c, d, ga, gb, gc, gd + 1)
+    else (ga, gb, gc, gd) end end end end
+  end
+  pfn gift(p : Plan, base : Int, x : Int, y : Int, z : Int, tx : Int, tz : Int, order : Int, n : Int) : Plan do
+    if n > 0 do bid(p, Offer(tx, y, tz, order, n, x, y, z, base, 0, false)) else p end
   end
 
   -- What the fluid cell at (x, y, z), holding [l] eighths of family [base],
@@ -211,11 +230,8 @@ mod Strata.Fluid do
       else if b3 == 3 do (if nzm <= l && nzm < 8 do bid(p1, Offer(x, y, z - 1, 4, max2(1, (l - nzm) / 2), x, y, z, base, 0, false)) else p1 end)
       else if b3 == 4 do (if nzp <= l && nzp < 8 do bid(p1, Offer(x, y, z + 1, 3, max2(1, (l - nzp) / 2), x, y, z, base, 0, false)) else p1 end)
       else
-        let k = lower(l, nxm) + lower(l, nxp) + lower(l, nzm) + lower(l, nzp)
-        if k == 0 do p1
-        else
-          let common = (l + part(l, nxm) + part(l, nxp) + part(l, nzm) + part(l, nzp)) / (k + 1)
-          level_to(level_to(level_to(level_to(p1, base, x, y, z, x - 1, z, 2, nxm, l, common), base, x, y, z, x + 1, z, 1, nxp, l, common), base, x, y, z, x, z - 1, 4, nzm, l, common), base, x, y, z, x, z + 1, 3, nzp, l, common)
+        match share(l, nxm, nxp, nzm, nzp, 0, 0, 0, 0) do
+          (ga, gb, gc, gd) -> gift(gift(gift(gift(p1, base, x, y, z, x - 1, z, 2, ga), base, x, y, z, x + 1, z, 1, gb), base, x, y, z, x, z - 1, 4, gc), base, x, y, z, x, z + 1, 3, gd)
         end
       end end end end
     end end end
@@ -280,7 +296,7 @@ mod Strata.Fluid do
                   let sk = Kq.key(sx, sy, sz)
                   let d2 = add_delta(add_delta(delta, tk, got), sk, 0 - got)
                   let f2 = Sq.put(Sq.put(fams, tk, base), sk, base)
-                  let arrived = if landed do 0 else fell end
+                  let arrived = if landed do 0 else min2(fell, 4095) end
                   let fe2 = if ord == 0 do Sq.put(fells, tk, max2(Sq.get(fells, tk), arrived)) else fells end
                   let ev2 = if ord == 0 do Cons(Event(tx, ty, tz, got, fell, landed), evs) else evs end
                   take(Settled(d2, f2, fe2, ev2), t, room - got, base)
@@ -321,7 +337,7 @@ mod Strata.Fluid do
       let k = Kq.key(x, y, z)
       if Sq.has(a, k) do a
       else if Sq.has(fells, k) do Sq.put(a, k, Sq.get(fells, k))
-      else Sq.put(a, k, max2(0, Sq.get(old, k))) end end
+      else Sq.put(a, k, max2(0, Sq.get(old, k)) % 4096) end end
     end
   end
 
@@ -352,23 +368,176 @@ mod Strata.Fluid do
     end
   end
 
-  doc "One step over world [w]: every active cell decides its move from the world as it stands, the moves are settled, and the result is one edit. The new fluid holds the cells still active and the step's events. [focus] is where players are, in voxels: when more cells are active than the cap, the nearest go first."
-  fn step_world(f : Fluid, w : Strata.World.World, _focus : List((Float, Float, Float))) : (Fluid, Strata.Edit.Outcome) do
+  -- ── Waiting and dormant cells ────────────────────────────────────────────
+  pfn dist2(fs : List((Float, Float, Float)), x : Int, y : Int, z : Int, best : Float) : Float do
+    match fs do
+      Nil -> best
+      Cons((fx, fy, fz), t) ->
+        let dx = int_to_float(x) -. fx
+        let dy = int_to_float(y) -. fy
+        let dz = int_to_float(z) -. fz
+        let d = dx *. dx +. dy *. dy +. dz *. dz
+        dist2(t, x, y, z, if best < 0.0 || d < best do d else best end)
+    end
+  end
+
+  -- How soon a cell should have its turn, smaller first: its distance from
+  -- the nearest focus, shrunk by every step it has already waited, so the
+  -- near go first and nothing waits for ever.
+  pfn urgency(d2 : Float, waited : Int) : Float do
+    let k = int_to_float(1 + waited)
+    (if d2 < 0.0 do 1.0 else 1.0 +. d2 end) /. (k *. k)
+  end
+
+  -- An active cell with its urgency: (urgency, x, y, z, fell and steps waited).
+  pfn nearer_cell(a : (Float, Int, Int, Int, Int), b : (Float, Int, Int, Int, Int)) : Bool do
+    match a do
+      (da, xa, ya, za, _) ->
+        match b do
+          (db, xb, yb, zb, _) ->
+            if da != db do da < db
+            else if ya != yb do ya < yb
+            else if xa != xb do xa < xb
+            else za <= zb end end end
+        end
+    end
+  end
+
+  pfn split_at(l : List((Float, Int, Int, Int, Int)), n : Int, acc : List((Float, Int, Int, Int, Int))) : (List((Float, Int, Int, Int, Int)), List((Float, Int, Int, Int, Int))) do
+    if n <= 0 do (acc, l)
+    else
+      match l do
+        Nil -> (acc, Nil)
+        Cons(h, t) -> split_at(t, n - 1, Cons(h, acc))
+      end
+    end
+  end
+
+  pfn plan_list(r : Strata.Blocks.Registry, fl : List(Int), sk : List(Int), w : Strata.World.World, reach : Int, fall : Int, p : Plan, l : List((Float, Int, Int, Int, Int))) : Plan do
+    match l do
+      Nil -> p
+      Cons((_, x, y, z, v), t) -> plan_list(r, fl, sk, w, reach, fall, consider(r, fl, sk, w, reach, fall, p, Kq.key(x, y, z), v % 4096), t)
+    end
+  end
+
+  pfn keep_waiting(a : Strata.Store.Store(Int), l : List((Float, Int, Int, Int, Int)), n : Int) : (Strata.Store.Store(Int), Int) do
+    match l do
+      Nil -> (a, n)
+      Cons((_, x, y, z, fell), t) ->
+        let k = Kq.key(x, y, z)
+        -- one more step waited
+        keep_waiting(if Sq.has(a, k) do a else Sq.put(a, k, fell + 4096) end, t, n + 1)
+    end
+  end
+
+  pfn set_aside(d : Strata.Store.Store(Int), es : List((Int, Int, Int, Int))) : Strata.Store.Store(Int) do
+    match es do
+      Nil -> d
+      Cons((x, y, z, fell), t) -> set_aside(Sq.put(d, Kq.key(x, y, z), fell), t)
+    end
+  end
+
+  -- Is everything a cell at (x, y, z) could move into loaded?
+  pfn all_loaded(w : Strata.World.World, x : Int, y : Int, z : Int) : Bool do
+    Wq.is_loaded(w, Kq.key_of_voxel(x, y, z)) && Wq.is_loaded(w, Kq.key_of_voxel(x, y - 1, z)) && Wq.is_loaded(w, Kq.key_of_voxel(x - 1, y, z)) && Wq.is_loaded(w, Kq.key_of_voxel(x + 1, y, z)) && Wq.is_loaded(w, Kq.key_of_voxel(x, y, z - 1)) && Wq.is_loaded(w, Kq.key_of_voxel(x, y, z + 1))
+  end
+
+  -- Dormant cells whose surroundings have loaded come back to the active set.
+  type Revived = Revived(Strata.Store.Store(Int), Strata.Store.Store(Int))
+  pfn revive(w : Strata.World.World, active : Strata.Store.Store(Int), dormant : Strata.Store.Store(Int)) : Revived do
+    if Sq.size(dormant) == 0 do Revived(active, dormant)
+    else
+      Sq.fold(dormant, Revived(active, dormant), fn (rv, k, fell) ->
+        match rv do
+          Revived(a, d) -> if all_loaded(w, Kq.kx(k), Kq.ky(k), Kq.kz(k)) do Revived(if Sq.has(a, k) do a else Sq.put(a, k, fell) end, Sq.remove(d, k)) else rv end
+        end)
+    end
+  end
+
+  -- Does an active cell have anything to do: flowing fluid, or a chunk that is not loaded (it is set aside)?
+  pfn holds(r : Strata.Blocks.Registry, fl : List(Int), w : Strata.World.World, k : Strata.Coord.Key) : Bool do
+    !Wq.is_loaded(w, Kq.key_of_voxel(Kq.kx(k), Kq.ky(k), Kq.kz(k))) || is_flowing(r, fl, w, Kq.kx(k), Kq.ky(k), Kq.kz(k))
+  end
+
+  doc "One step over world [w]: the active cells (the nearest [focus] first, up to the cap) decide their moves from the world as it stands, the moves are settled, and the result is one edit. The new fluid holds the cells still active, those the cap left waiting, those set aside beside chunks that are not loaded, and the step's events. [focus] is where players are, in voxels."
+  fn step_world(f : Fluid, w : Strata.World.World, focus : List((Float, Float, Float))) : (Fluid, Strata.Edit.Outcome) do
     match f do
-      Fluid(r, fl, sk, cap, reach, fall, active, dormant, _, _) ->
-        match Sq.fold(active, Plan(Nil, Nil, Nil), fn (p, k, fell) -> consider(r, fl, sk, w, reach, fall, p, k, fell)) do
-          Plan(os, ds, _) ->
-            let taken = Sq.fold(by_target(os, Sq.empty(Nil)), Settled(Sq.empty(0), Sq.empty(-1), Sq.empty(0), Nil), fn (s, k, offers) -> settle_target(s, r, w, k, offers))
-            match drains(taken, r, w, ds) do
-              Settled(delta, fams, fells, evs) ->
-                let o = Eq.set_many(w, Sq.fold(delta, Nil, fn (acc, k, d) -> cell_after(acc, r, w, fams, k, d)))
-                let w2 = Eq.world(o)
-                let active2 = Sq.fold(delta, Sq.empty(-1), fn (a, k, d) -> if d == 0 do a else join_around(a, active, fells, r, fl, w2, k) end)
-                (Fluid(r, fl, sk, cap, reach, fall, active2, dormant, evs, 0), o)
+      Fluid(r, fl, sk, cap, reach, fall, active0, dormant0, _, _) ->
+        match revive(w, active0, dormant0) do
+          Revived(active, dormant) ->
+            -- a woken cell that holds no flowing fluid has nothing to do and takes no place under the cap
+            let all = Sq.fold(active, Nil, fn (acc, k, v) -> if holds(r, fl, w, k) do Cons((urgency(dist2(focus, Kq.kx(k), Kq.ky(k), Kq.kz(k), -1.0), v / 4096), Kq.kx(k), Kq.ky(k), Kq.kz(k), v), acc) else acc end)
+            let ordered = if List.length(all) > cap do List.sort_by(all, fn (a, b) -> nearer_cell(a, b)) else all end
+            match split_at(ordered, cap, Nil) do
+              (now, later) ->
+                match plan_list(r, fl, sk, w, reach, fall, Plan(Nil, Nil, Nil), now) do
+                  Plan(os, ds, es) ->
+                    let taken = Sq.fold(by_target(os, Sq.empty(Nil)), Settled(Sq.empty(0), Sq.empty(-1), Sq.empty(0), Nil), fn (s, k, offers) -> settle_target(s, r, w, k, offers))
+                    match drains(taken, r, w, ds) do
+                      Settled(delta, fams, fells, evs) ->
+                        let o = Eq.set_many(w, Sq.fold(delta, Nil, fn (acc, k, d) -> cell_after(acc, r, w, fams, k, d)))
+                        let w2 = Eq.world(o)
+                        let moved = Sq.fold(delta, Sq.empty(-1), fn (a, k, d) -> if d == 0 do a else join_around(a, active, fells, r, fl, w2, k) end)
+                        match keep_waiting(moved, later, 0) do
+                          (active2, waiting) -> (Fluid(r, fl, sk, cap, reach, fall, active2, set_aside(dormant, es), evs, waiting), o)
+                        end
+                    end
+                end
             end
         end
     end
   end
+
+  -- ── Waking from an edit ──────────────────────────────────────────────────
+  pfn wake_if(f : Fluid, w : Strata.World.World, x : Int, y : Int, z : Int) : Fluid do
+    match f do
+      Fluid(r, fl, _, _, _, _, _, _, _, _) -> if is_flowing(r, fl, w, x, y, z) do wake_cell(f, x, y, z) else f end
+    end
+  end
+
+  pfn wake_range(f : Fluid, w : Strata.World.World, x0 : Int, y0 : Int, z0 : Int, x1 : Int, y1 : Int, z1 : Int, x : Int, y : Int, z : Int) : Fluid do
+    if y > y1 do f
+    else if z > z1 do wake_range(f, w, x0, y0, z0, x1, y1, z1, x0, y + 1, z0)
+    else if x > x1 do wake_range(f, w, x0, y0, z0, x1, y1, z1, x0, y, z + 1)
+    else wake_range(wake_if(f, w, x, y, z), w, x0, y0, z0, x1, y1, z1, x + 1, y, z) end end end
+  end
+  pfn wake_box(f : Fluid, w : Strata.World.World, x0 : Int, y0 : Int, z0 : Int, x1 : Int, y1 : Int, z1 : Int) : Fluid do
+    if x1 < x0 || y1 < y0 || z1 < z0 do f else wake_range(f, w, x0, y0, z0, x1, y1, z1, x0, y0, z0) end
+  end
+
+  -- Fluid in the bounds of one change, grown by a cell: all of it when that
+  -- is at most 4096 cells, else what lies in the bounds' six faces, two
+  -- cells thick (the changed cells at the face and their neighbours outside).
+  pfn wake_change(f : Fluid, w : Strata.World.World, c : Strata.Edit.Change) : Fluid do
+    match Eq.low(c) do
+      (lx, ly, lz) ->
+        match Eq.high(c) do
+          (hx, hy, hz) ->
+            let x0 = lx - 1
+            let y0 = ly - 1
+            let z0 = lz - 1
+            let x1 = hx + 1
+            let y1 = hy + 1
+            let z1 = hz + 1
+            if (x1 - x0 + 1) * (y1 - y0 + 1) * (z1 - z0 + 1) <= 4096 do wake_box(f, w, x0, y0, z0, x1, y1, z1)
+            else
+              let fa = wake_box(wake_box(f, w, x0, y0, z0, x0 + 1, y1, z1), w, x1 - 1, y0, z0, x1, y1, z1)
+              let fb = wake_box(wake_box(fa, w, x0 + 2, y0, z0, x1 - 2, y0 + 1, z1), w, x0 + 2, y1 - 1, z0, x1 - 2, y1, z1)
+              wake_box(wake_box(fb, w, x0 + 2, y0 + 2, z0, x1 - 2, y1 - 2, z0 + 1), w, x0 + 2, y0 + 2, z1 - 1, x1 - 2, y1 - 2, z1)
+            end
+        end
+    end
+  end
+
+  pfn wake_changes(f : Fluid, w : Strata.World.World, cs : List(Strata.Edit.Change)) : Fluid do
+    match cs do
+      Nil -> f
+      Cons(c, t) -> wake_changes(wake_change(f, w, c), w, t)
+    end
+  end
+
+  doc "Tell the fluid about an edit: fluid in and around what [o] changed becomes active. [w] is the world after the edit. Call it for every edit a game makes; the fluid's own steps need no call."
+  fn wake(f : Fluid, w : Strata.World.World, o : Strata.Edit.Outcome) : Fluid do wake_changes(f, w, Eq.changes(o)) end
 
   pfn amount_go(w : Strata.World.World, r : Strata.Blocks.Registry, x0 : Int, z0 : Int, x1 : Int, y1 : Int, z1 : Int, x : Int, y : Int, z : Int, acc : Int) : Int do
     if y > y1 do acc

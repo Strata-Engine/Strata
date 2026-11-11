@@ -237,6 +237,102 @@ mod FluidTest do
     end
   end
 
+  pfn falling(w : Strata.World.World, i : Int) : Strata.World.World do
+    if i >= 100 do w else falling(put(w, i % 10, 12, i / 10, water(8)), i + 1) end
+  end
+  pfn count_at(w : Strata.World.World, y : Int, i : Int, acc : Int) : Int do
+    if i >= 100 do acc else count_at(w, y, i + 1, if level(w, i % 10, y, i / 10) > 0 do acc + 1 else acc end) end
+  end
+  pfn landing(es : List(Strata.Fluid.Event)) : (Int, Int) do
+    match es do
+      Nil -> (-1, -1)
+      Cons(e, t) -> if F.ev_landed(e) do (F.ev_eighths(e), F.ev_fell(e)) else landing(t) end
+    end
+  end
+  -- only chunk column (0, *, 0): stone below, air above
+  pfn lone() : Strata.World.World do load(load(Wf.new(reg(), flat(), 7, 1.0), 0, -1, 0), 0, 0, 0) end
+
+  describe "Fluid waking and bounds" do
+    test "an edit under still water wakes it" do
+      let w = put(box(fresh(), 0, 3, 0, 2, 3, 2, 1), 1, 4, 1, water(8))
+      Test.assert_eq_int(F.active_count(fluid()), 0, "nothing is active to begin with")
+      let o = Ef.set_block(w, 1, 3, 1, 0)
+      let f = F.wake(fluid(), Ef.world(o), o)
+      Test.assert_true(F.active_count(f) > 0, "the water over the hole is awake")
+      match until_rest(f, Ef.world(o), 200, 0) do
+        (rr, taken) ->
+          Test.assert_true(taken >= 0, "it comes to rest")
+          Test.assert_eq_int(F.amount(world_of(rr), reg(), -24, 0, -24, 24, 0, 24), 8, "on the ground below")
+      end
+    end
+    test "an edit that changes nothing near water wakes nothing" do
+      let w = put(fresh(), 1, 0, 1, water(8))
+      let o = Ef.set_block(w, 20, 5, 20, 1)
+      Test.assert_eq_int(F.active_count(F.wake(fluid(), Ef.world(o), o)), 0, "too far away")
+    end
+    test "a huge edit beside water wakes only what lies on its faces" do
+      -- a 32-cube of stone with a wall of water against its -x face
+      let w = box(box(fresh(), 1, 0, 0, 32, 31, 31, 1), 0, 0, 0, 0, 3, 31, water(8))
+      let o = Ef.fill_box(w, 1, 0, 0, 32, 31, 31, 0)
+      let f = F.wake(fluid(), Ef.world(o), o)
+      Test.assert_true(F.active_count(f) > 0, "the wall is awake")
+      Test.assert_true(F.active_count(f) <= 6 * 34 * 34, "and no more than the faces hold")
+      let r = run(f, Ef.world(o), 2)
+      Test.assert_true(F.amount(world_of(r), reg(), 1, 0, 0, 4, 3, 31) > 0, "water flows into the space")
+    end
+    test "a step handles the cap's worth, nearest first, and loses nothing" do
+      let w = falling(fresh(), 0)
+      let f = F.with_limits(wake_all(fluid()), 10, 8, 4)
+      match F.step_world(f, w, Cons((0.0, 12.0, 0.0), Nil)) do
+        (f2, o) ->
+          Test.assert_eq_int(count_at(Ef.world(o), 12, 0, 0), 90, "ninety have not moved")
+          Test.assert_eq_int(count_at(Ef.world(o), 8, 0, 0), 10, "ten fell four cells")
+          Test.assert_eq_int(level(Ef.world(o), 0, 8, 0), 8, "the nearest the focus among them")
+          Test.assert_eq_int(F.waiting_count(f2), 90, "ninety waiting")
+          Test.assert_eq_int(total(Ef.world(o)), 800, "all the water")
+          let later = run(f2, Ef.world(o), 150)
+          Test.assert_eq_int(count_at(world_of(later), 12, 0, 0), 0, "in time every cell has had its turn")
+          Test.assert_eq_int(total(world_of(later)), 800, "with all the water")
+      end
+    end
+    test "water stops at a chunk that is not loaded, and crosses when it arrives" do
+      let w = box(lone(), 30, 0, 16, 30, 2, 16, water(8))
+      let r = run(wake_box(fluid(), 28, 0, 14, 31, 3, 18, 28, 0, 14), w, 40)
+      Test.assert_eq_int(F.amount(world_of(r), reg(), 0, 0, 0, 31, 4, 31), 24, "all of it still in the loaded chunk")
+      Test.assert_eq_int(F.amount(world_of(r), reg(), 32, 0, 0, 40, 4, 31), 0, "none beyond the border")
+      Test.assert_eq_int(Wf.pending_size(world_of(r)), 0, "and nothing queued for the missing chunk")
+      Test.assert_true(F.dormant_count(fluid_of(r)) > 0, "the cells at the border are set aside")
+      let w2 = load(load(world_of(r), 1, -1, 0), 1, 0, 0)
+      let r2 = run(fluid_of(r), w2, 40)
+      Test.assert_true(F.amount(world_of(r2), reg(), 32, 0, 0, 40, 4, 31) > 0, "it crosses once the chunk is there")
+      Test.assert_eq_int(F.amount(world_of(r2), reg(), 0, 0, 0, 63, 4, 31), 24, "and none was lost")
+    end
+    test "water falling in a chunk that unloads resumes when it returns" do
+      let w = put(fresh(), 5, 20, 5, water(8))
+      let r = run(wake_all(fluid()), w, 1)
+      Test.assert_eq_int(level(world_of(r), 5, 16, 5), 8, "part way down")
+      let gone = Wf.unload(world_of(r), Cf.key(0, 0, 0))
+      let r2 = run(fluid_of(r), gone, 10)
+      Test.assert_eq_int(F.active_count(fluid_of(r2)), 0, "nothing is active while it is away")
+      Test.assert_true(F.dormant_count(fluid_of(r2)) > 0, "but it is remembered")
+      let r3 = run(fluid_of(r2), load(world_of(r2), 0, 0, 0), 6)
+      Test.assert_eq_int(F.amount(world_of(r3), reg(), 0, 0, 0, 10, 0, 10), 8, "it landed")
+      Test.assert_eq_int(F.amount(world_of(r3), reg(), 0, 1, 0, 10, 24, 10), 0, "and nothing hangs in the air")
+    end
+    test "a fall reports how much landed and how far it fell" do
+      let w = put(fresh(), 3, 6, 3, water(8))
+      let r = run(wake_all(fluid()), w, 1)
+      Test.assert_eq_int(List.length(F.events(fluid_of(r))), 1, "one event for the first four cells")
+      match landing(F.events(fluid_of(r))) do (n, _) -> Test.assert_eq_int(n, -1, "it has not landed yet") end
+      let r2 = run(fluid_of(r), world_of(r), 1)
+      match landing(F.events(fluid_of(r2))) do
+        (n, d) ->
+          Test.assert_eq_int(n, 8, "eight eighths landed")
+          Test.assert_eq_int(d, 6, "after six cells")
+      end
+    end
+  end
+
   describe "Fluid properties" do
     test "the amount is conserved, nothing overfills, and everything comes to rest supported" do
       Check.all(Gen.tuple2(Gen.list(Gen.int(0, 6)), Gen.list(Gen.tuple2(Gen.tuple2(Gen.int(0, 15), Gen.int(0, 15)), Gen.tuple2(Gen.int(0, 10), Gen.int(1, 8))))), fn p ->
