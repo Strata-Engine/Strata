@@ -163,6 +163,14 @@ moved a metre aside) and the least obstructed decides how quiet and how dull
 it is; a voice is walked once more the frame it starts, so it never plays
 clear for a moment behind a wall. Unloaded chunks are air.
 
+The space around the listener decides the echo. The same job casts 64 rays
+from the listener to 64 m: how many escape (open sky) and how far and how
+absorbent the rest find set how long the space rings (Eyring's formula) and
+how dull its tail is, and the nearest surfaces send up to eight early
+reflections, each from its own direction. A stone cave rings for seconds; a
+field hardly at all. `Strata.Acoustics.space` answers the same for a game
+that wants it (openness, for instance, for wind).
+
 ## Using it from a game
 
     [deps]

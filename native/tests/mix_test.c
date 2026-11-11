@@ -408,6 +408,87 @@ static void test_occlusion(void) {
     sm_close(m);
 }
 
+static void mu_environ(SmMixer *m, float decay, float damping, float wet, int nrefl, const float *refl) {
+    SmCmd c; memset(&c, 0, sizeof c); c.op = SM_OP_ENVIRON; c.a = 0;
+    c.f[0] = decay; c.f[1] = damping; c.f[2] = wet; c.f[3] = (float)nrefl;
+    sm_command(m, &c);
+    for (int r = 0; r * 2 < nrefl; r++) {
+        memset(&c, 0, sizeof c); c.op = SM_OP_ENVIRON; c.a = r + 1;
+        for (int k = 0; k < 10 && r * 10 + k < nrefl * 5; k++) c.f[k] = refl[r * 10 + k];
+        sm_command(m, &c);
+    }
+}
+/* RT60 from a Schroeder backward integration of the output's energy, between -5 and -25 dB */
+static double rt60(const float *st, int from, int to) {
+    static double e[SM_RATE * 5];
+    double acc = 0.0;
+    for (int i = to - 1; i >= from; i--) { acc += (double)st[2 * i] * st[2 * i] + (double)st[2 * i + 1] * st[2 * i + 1]; e[i - from] = acc; }
+    double top = e[0]; int a = -1, b = -1;
+    for (int i = 0; i < to - from; i++) {
+        double db = 10.0 * log10(e[i] / top + 1e-30);
+        if (a < 0 && db <= -5.0) a = i;
+        if (b < 0 && db <= -25.0) { b = i; break; }
+    }
+    return a < 0 || b < 0 ? -1.0 : 3.0 * (double)(b - a) / SM_RATE;
+}
+static int click_patch(SmMixer *m, int id) {
+    float p[SM_PATCH_FLOATS]; mu_patch_clear(p); mu_source(p, 0, SM_SRC_WHITE, 0.0f, 0.8f);
+    p[SM_P_HOLD] = 0.004f; p[SM_P_ENV(0) + 3] = 0.001f; mu_send_patch(m, id, p); return id;
+}
+static void test_reverb(void) {
+    static float tail[2 * SM_RATE * 4];
+    /* a click into a space that rings for 2 s: the tail decays 60 dB in 2 s, within 10% */
+    SmMixer *m = sm_open();
+    mu_listener(m, 0, 0, 0, 0, 0, -1);
+    mu_environ(m, 2.0f, 0.0f, 0.6f, 0, NULL);
+    render(m, SEC(0.2));                                  /* let the space settle in */
+    click_patch(m, 1);
+    mu_play_at(m, 1, 1, 1.0f, 1.0f, 0.0f, 0.0f, -10.0f);
+    sm_mix(m, tail, SEC(3.5));
+    double t = rt60(tail, SEC(0.05), SEC(3.5));
+    CHECK(t > 1.8 && t < 2.2, "an impulse into a 2.0 s space decays in 2.0 s, within 10%");
+    sm_close(m);
+    /* damping: the highs die sooner than the lows */
+    m = sm_open();
+    mu_listener(m, 0, 0, 0, 0, 0, -1);
+    mu_environ(m, 2.0f, 0.8f, 0.6f, 0, NULL);
+    render(m, SEC(0.2));
+    click_patch(m, 1);
+    mu_play_at(m, 1, 1, 1.0f, 1.0f, 0.0f, 0.0f, -10.0f);
+    sm_mix(m, tail, SEC(2.0));
+    static float fp[SM_FP_VALUES * 24];
+    sm_fingerprint(tail, SEC(2.0), fp);
+    double lo = fp[1 * SM_FP_VALUES + 4] - fp[5 * SM_FP_VALUES + 4], hi = fp[1 * SM_FP_VALUES + 8] - fp[5 * SM_FP_VALUES + 8];
+    CHECK(hi > lo + 3.0, "a damped space's 8 kHz tail falls faster than its 500 Hz tail");
+    sm_close(m);
+    /* a change of space glides: no click */
+    m = sm_open();
+    mu_listener(m, 0, 0, 0, 0, 0, -1);
+    tone_patch(m, 1, SM_SRC_SINE, 200.0f, 0.3f);
+    mu_environ(m, 0.3f, 0.2f, 0.0f, 0, NULL);
+    mu_play_at(m, 1, 1, 1.0f, 1.0f, 0.0f, 0.0f, -3.0f);
+    render(m, SEC(0.3));
+    float refl[5] = { 0.01f, -1.0f, 0.0f, 0.0f, 0.5f };
+    mu_environ(m, 4.0f, 0.2f, 0.6f, 1, refl);
+    render(m, SEC(0.5));
+    float jump = 0.0f; for (int i = 1; i < SEC(0.5); i++) { float d = fabsf(buf[2 * i] - buf[2 * i - 2]); if (d > jump) jump = d; }
+    CHECK(jump < 0.03f, "a new space glides in: no jump");
+    sm_close(m);
+    /* a reflection from the left arrives on the left, after its delay */
+    m = sm_open();
+    mu_listener(m, 0, 0, 0, 0, 0, -1);
+    float left[5] = { 0.0117f, -1.0f, 0.0f, 0.0f, 0.8f };
+    mu_environ(m, 0.1f, 0.0f, 0.6f, 1, left);
+    render(m, SEC(0.2));
+    click_patch(m, 1);
+    mu_play_at(m, 1, 1, 1.0f, 1.0f, 0.0f, 0.0f, -10.0f);
+    sm_mix(m, tail, SEC(0.1));
+    double el = 0, er = 0;
+    for (int i = SEC(0.0117) + 30; i < SEC(0.0117) + 260; i++) { el += tail[2 * i] * tail[2 * i]; er += tail[2 * i + 1] * tail[2 * i + 1]; }
+    CHECK(el > 2.0 * er, "the reflection from the left wall is louder on the left");
+    sm_close(m);
+}
+
 int main(void) {
     test_fp();
     test_ring();
@@ -422,6 +503,7 @@ int main(void) {
     test_recordings();
     test_space();
     test_occlusion();
+    test_reverb();
     if (fails == 0) printf("mix_test: ok\n");
     return fails == 0 ? 0 : 1;
 }

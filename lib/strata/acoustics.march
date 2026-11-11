@@ -183,20 +183,157 @@ mod Strata.Acoustics do
     end
   end
 
-  type Job = Job(Task(List((Int, Float, Float))))
+  -- ── The listener's space ───────────────────────────────────────────────
 
-  doc "Work out the occlusion of every voice in [voices] (voice, x, y, z) from [listener] on a worker. Hand the job to `finish` two frames later, so it is normally done."
-  fn begin(w : Strata.World.World, r : Strata.Blocks.Registry, listener : (Float, Float, Float), voices : List((Int, Float, Float, Float))) : Job do
-    Job(task_spawn(fn _ -> all_voices(w, table(r), listener, voices, Nil)))
-  end
+  -- openness, mean free path (m), mean absorption and damping of what the
+  -- rays hit (0..1), decay (s), and the reflections nearest first:
+  -- (delay s, direction towards the surface x, y, z, gain)
+  type Space = Space(Float, Float, Float, Float, Float, List((Float, Float, Float, Float, Float)))
 
-  doc "The job's answers: (voice, gain, cutoff) for each voice, in order; none if the worker failed. Waits if it is not done."
-  fn finish(j : Job) : List((Int, Float, Float)) do
-    match j do
-      Job(t) -> match task_await(t) do
-        Ok(answers) -> answers
-        Err(_) -> Nil
+  doc "The share of rays from the listener that met nothing within 64 m: 1 in the open sky, 0 shut in."
+  fn openness(sp : Space) : Float do match sp do Space(o, _, _, _, _, _) -> o end end
+  doc "How long the space rings, in seconds: the time for its echo to fall 60 dB."
+  fn decay(sp : Space) : Float do match sp do Space(_, _, _, _, t, _) -> t end end
+  doc "How much the surfaces dull the echo, 0..1."
+  fn damping(sp : Space) : Float do match sp do Space(_, _, _, d, _, _) -> d end end
+  doc "Up to eight early reflections, nearest first: (delay in seconds, the direction to the surface as x, y, z, gain)."
+  fn reflections(sp : Space) : List((Float, Float, Float, Float, Float)) do match sp do Space(_, _, _, _, _, rs) -> rs end end
+  doc "How strong the echo is against the dry sound, 0..1: none in the open."
+  fn wet(sp : Space) : Float do 0.6 *. (1.0 -. openness(sp)) end
+
+  doc "Rays cast from the listener, and how far each looks, in metres."
+  fn rays() : Int do 64 end
+  fn ray_reach() : Float do 64.0 end
+
+  -- a ray's first hit: (metres, packed sound, axis 0..2, step sign, voxel coordinate on that axis), or metres < 0 for none
+  pfn hit_go(w : Strata.World.World, tb : NativeIntArr, sc : Float, tmax : Float, win : Window, vx : Int, vy : Int, vz : Int, ux : Float, uy : Float, uz : Float, t : Float, nx : Float, ny : Float, nz : Float, axis : Int, sign : Int, steps : Int) : (Float, Int, Int, Int, Int) do
+    if t >= tmax || steps <= 0 do (-1.0, 0, 0, 0, 0)
+    else
+      match block_at(w, win, vx, vy, vz) do
+        (win2, id) ->
+          let p = packed(tb, id)
+          if int_and(p / 256, 255) >= 10 && t > 0.0 do (t *. sc, p, axis, sign, if axis == 0 do vx else if axis == 1 do vy else vz end end)
+          else if nx <= ny && nx <= nz do hit_go(w, tb, sc, tmax, win2, vx + dir_of(ux), vy, vz, ux, uy, uz, nx, nx +. step_of(ux), ny, nz, 0, dir_of(ux), steps - 1)
+          else if ny <= nz do hit_go(w, tb, sc, tmax, win2, vx, vy + dir_of(uy), vz, ux, uy, uz, ny, nx, ny +. step_of(uy), nz, 1, dir_of(uy), steps - 1)
+          else hit_go(w, tb, sc, tmax, win2, vx, vy, vz + dir_of(uz), ux, uy, uz, nz, nx, ny, nz +. step_of(uz), 2, dir_of(uz), steps - 1) end end end
       end
     end
   end
+
+  -- a reflecting face: axis, the side the listener sees it from, its plane (voxel units), how far (m), absorption, damping
+  type Face = Face(Int, Int, Int, Float, Float, Float)
+
+  pfn same_face(a : Face, b : Face) : Bool do
+    match (a, b) do (Face(x1, s1, p1, _, _, _), Face(x2, s2, p2, _, _, _)) -> x1 == x2 && s1 == s2 && p1 == p2 end
+  end
+  pfn add_face(fs : List(Face), f : Face) : List(Face) do if List.any(fs, fn g -> same_face(g, f)) do fs else Cons(f, fs) end end
+
+  -- (hits, escaped, total metres, total absorption, total damping, faces)
+  type Rays = Rays(Int, Int, Float, Float, Float, List(Face))
+
+  pfn cast(w : Strata.World.World, tb : NativeIntArr, l : (Float, Float, Float), i : Int, acc : Rays) : Rays do
+    let n = rays()
+    if i >= n do acc
+    else
+      let sc = Strata.World.scale(w)
+      let fz = 1.0 -. 2.0 *. (int_to_float(i) +. 0.5) /. int_to_float(n)
+      let rr = Math.sqrt(1.0 -. fz *. fz)
+      let az = int_to_float(i) *. 2.39996322972865332
+      let ux = rr *. Math.cos(az)
+      let uy = fz
+      let uz = rr *. Math.sin(az)
+      match l do
+        (lx, ly, lz) ->
+          let px = lx /. sc
+          let py = ly /. sc
+          let pz = lz /. sc
+          let vx = float_to_int(Math.floor(px))
+          let vy = float_to_int(Math.floor(py))
+          let vz = float_to_int(Math.floor(pz))
+          let hit = hit_go(w, tb, sc, ray_reach() /. sc, Window(Coac.chunk_of(vx) + 1, 0, 0, Chuac.uniform(0)), vx, vy, vz, ux, uy, uz, 0.0, first_cross(px, ux, vx), first_cross(py, uy, vy), first_cross(pz, uz, vz), 0, 1, 8192)
+          match (hit, acc) do
+            ((d, p, axis, sign, plane_v), Rays(h, e, m, ab, da, fs)) ->
+              if d < 0.0 do cast(w, tb, l, i + 1, Rays(h, e + 1, m, ab, da, fs))
+              else
+                -- the face entered: on the near side of the voxel the ray stepped into
+                let plane = if sign > 0 do plane_v else plane_v + 1 end
+                let lc = if axis == 0 do px else if axis == 1 do py else pz end end
+                let perp = absf(int_to_float(plane) -. lc) *. sc
+                let ab1 = int_to_float(int_and(p, 255)) /. 255.0
+                let da1 = int_to_float(int_and(p / 65536, 255)) /. 255.0
+                cast(w, tb, l, i + 1, Rays(h + 1, e, m +. d, ab +. ab1, da +. da1, add_face(fs, Face(axis, sign, plane, perp, ab1, da1))))
+              end
+          end
+      end
+    end
+  end
+
+  pfn reflection(f : Face) : (Float, Float, Float, Float, Float) do
+    match f do
+      Face(axis, sign, _, perp, ab, _) ->
+        let d = if perp < 0.25 do 0.25 else perp end
+        let s = int_to_float(sign)
+        (2.0 *. d /. 343.0, if axis == 0 do s else 0.0 end, if axis == 1 do s else 0.0 end, if axis == 2 do s else 0.0 end, (1.0 -. ab) /. (1.0 +. d))
+    end
+  end
+  pfn face_d(f : Face) : Float do match f do Face(_, _, _, d, _, _) -> d end end
+  @[no_warn_recursion]
+  pfn take_faces(fs : List(Face), n : Int) : List(Face) do
+    if n <= 0 do Nil
+    else
+      match fs do
+        Nil -> Nil
+        Cons(h, t) -> Cons(h, take_faces(t, n - 1))
+      end
+    end
+  end
+
+  doc "The space with a prebuilt `table`."
+  fn space_with(w : Strata.World.World, tb : NativeIntArr, listener : (Float, Float, Float)) : Space do
+    match cast(w, tb, listener, 0, Rays(0, 0, 0.0, 0.0, 0.0, Nil)) do
+      Rays(h, e, m, ab, da, fs) ->
+        let open = int_to_float(e) /. int_to_float(rays())
+        let mfp = if h > 0 do m /. int_to_float(h) else ray_reach() end
+        let a = if h > 0 do ab /. int_to_float(h) else 1.0 end
+        let damp = if h > 0 do da /. int_to_float(h) else 0.0 end
+        -- Eyring: what escapes counts as absorbed, twice over, since a ray
+        -- that leaves takes the echo's way back with it
+        let keep = (1.0 -. a) *. (1.0 -. open) *. (1.0 -. open)
+        let path = if mfp > 30.0 do 30.0 else mfp end
+        let t0 = if keep <= 0.000001 do 0.1 else 0.04 *. path /. (0.0 -. Math.log(keep)) end
+        let t = if t0 < 0.1 do 0.1 else if t0 > 6.0 do 6.0 else t0 end end
+        let near = take_faces(List.sort_by(fs, fn (x, y) -> face_d(x) < face_d(y)), 8)
+        Space(open, mfp, a, damp, t, List.map(near, fn f -> reflection(f)))
+    end
+  end
+
+  doc "The listener's space: 64 rays to 64 m say how open it is, how long it rings, how dull its echo is, and where its nearest surfaces are. Unloaded chunks are air."
+  fn space(w : Strata.World.World, r : Strata.Blocks.Registry, listener : (Float, Float, Float)) : Space do
+    space_with(w, table(r), listener)
+  end
+
+  doc "Nothing to hear: the open sky."
+  fn open_space() : Space do Space(1.0, ray_reach(), 1.0, 0.0, 0.1, Nil) end
+
+  type Job = Job(Task((List((Int, Float, Float)), Space)))
+
+  doc "Work out, on a worker, the occlusion of every voice in [voices] (voice, x, y, z) from [listener], and the listener's space. Hand the job to `finish_space` two frames later, so it is normally done."
+  fn begin(w : Strata.World.World, r : Strata.Blocks.Registry, listener : (Float, Float, Float), voices : List((Int, Float, Float, Float))) : Job do
+    Job(task_spawn(fn _ ->
+      let tb = table(r)
+      (all_voices(w, tb, listener, voices, Nil), space_with(w, tb, listener))))
+  end
+
+  doc "The job's answers: (voice, gain, cutoff) for each voice, in order, and the listener's space; none and the open sky if the worker failed. Waits if it is not done."
+  fn finish_space(j : Job) : (List((Int, Float, Float)), Space) do
+    match j do
+      Job(t) -> match task_await(t) do
+        Ok(answers) -> answers
+        Err(_) -> (Nil, open_space())
+      end
+    end
+  end
+
+  doc "The job's occlusion answers alone."
+  fn finish(j : Job) : List((Int, Float, Float)) do match finish_space(j) do (vs, _) -> vs end end
 end

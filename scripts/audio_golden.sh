@@ -26,7 +26,7 @@ cat "$OUT/acoustics64.log"
 # a decoded budget refuses a recording past it, and counts it
 SOUNDCHECK_SCENE=budget SOUNDCHECK_OUT="$OUT/budget.wav" $SC > "$OUT/budget.log" 2>&1 || { echo "FAIL: budget"; cat "$OUT/budget.log"; exit 1; }
 
-SCENES='blocks strike tone recording orbit-speakers orbit-headphones distance load64 wall'
+SCENES='blocks strike tone recording orbit-speakers orbit-headphones distance load64 wall cave field'
 fail=0
 [ $UPDATE -eq 1 ] && mkdir -p "$LISTEN"
 for s in $SCENES; do
@@ -46,6 +46,13 @@ done
 # a recording of the tone, loaded back and played, sounds as the tone did
 if [ $UPDATE -eq 0 ] && ! native/tests/bin/fp_diff "$OUT/tone.fp" "$OUT/recording.fp" 2> "$OUT/rec.diff"; then
   echo "FAIL: the tone played back from a file differs from the tone"; head -8 "$OUT/rec.diff"; fail=1
+fi
+# the cave rings: in the half second after each strike its tail is 10 dB above the field's
+tail_db() { awk 'NR > 1 { w = NR - 2; t = w % 10; if (t >= 4 && t <= 8) { for (i = 1; i <= 20; i++) e += 10 ^ ($i / 10); n += 20 } } END { printf "%.1f", 10 * log(e / n) / log(10) }' "$1"; }
+if [ $UPDATE -eq 0 ]; then
+  c=$(tail_db "$OUT/cave.fp"); f=$(tail_db "$OUT/field.fp")
+  if awk -v c="$c" -v f="$f" 'BEGIN { exit !(c - f >= 10) }'; then echo "ok cave rings: tail $c dB against the field's $f"
+  else echo "FAIL: the cave's tail ($c dB) is not 10 dB above the field's ($f dB)"; fail=1; fi
 fi
 [ $fail -eq 0 ] && echo "audio goldens: all match"
 exit $fail

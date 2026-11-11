@@ -25,7 +25,10 @@
 #define SM_REC_FIRST 2048        /* recording ids 2048..4095 */
 #define SM_RECS 2048
 #define SM_GROUPS 4
-#define SM_OCC_GLIDE (SM_RATE / 10)   /* muffling glides to a new value over 100 ms, the acoustics' update interval */
+#define SM_OCC_GLIDE (SM_RATE / 10)
+#define SM_REFL 8                     /* early reflections */
+#define SM_HIST 32768                 /* the sends' history: 0.68 s, past the farthest reflection */
+#define SM_FDN_MAX 4096               /* the longest delay line of the late reverb */   /* muffling glides to a new value over 100 ms, the acoustics' update interval */
 #define SM_LIMIT 0.8912f         /* -1 dBFS */
 #ifndef SM_PI
 #define SM_PI 3.14159265358979323846
@@ -152,6 +155,15 @@ typedef struct {
     float hist[16][SH_TAPS - 1 + SM_BLOCK];
     float mono[SM_BLOCK];
     int order[SM_TRACKED];
+    /* the listener's space: what ENVIRON last asked, and where the glide to it stands */
+    float rv_decay, rv_damp, rv_wet;                  /* now */
+    float rv_decay_to, rv_damp_to, rv_wet_to;          /* asked */
+    float er_to[SM_REFL][5], er_now[SM_REFL][5];      /* reflections: delay s, direction x y z, gain */
+    float send[SM_BLOCK];                              /* the block's sum of voices' sends */
+    float shist[SM_HIST];                             /* the sends, past, for the early reflections */
+    int hist_at;
+    float fdn[8][SM_FDN_MAX]; int fdn_at[8]; float fdn_lp[8];
+    float er_coef[SM_REFL][16], er_pan[SM_REFL][2];
 } SmMixer;
 
 static inline void sm_rec_publish(SmMixer *m, int id, SmRec *r) {
@@ -175,6 +187,7 @@ static inline SmMixer *sm_open(void) {
     for (int g = 0; g < SM_GROUPS; g++) { m->group_gain[g] = 1.0f; m->group_now[g] = 1.0f; }
     m->st.peak_db = -120.0f; m->st.rms_db = -120.0f;
     m->lr[0] = 1.0f; m->lu[1] = 1.0f; m->lf[2] = -1.0f;
+    m->rv_decay = m->rv_decay_to = 0.1f;
     return m;
 }
 static inline void sm_close(SmMixer *m) { free(m); }
@@ -319,6 +332,23 @@ static inline void sm_command(SmMixer *m, const SmCmd *c) {
         }
         break; }
     case SM_OP_LISTENER: sm_listener(m, c->f); break;
+    case SM_OP_ENVIRON:
+        if (c->a == 0) {
+            m->rv_decay_to = sm_clampf(c->f[0], 0.1f, 6.0f); m->rv_damp_to = sm_clampf(c->f[1], 0.0f, 1.0f); m->rv_wet_to = sm_clampf(c->f[2], 0.0f, 1.0f);
+            int n = (int)c->f[3];
+            for (int r = n < 0 ? 0 : n; r < SM_REFL; r++) m->er_to[r][4] = 0.0f;   /* the reflections it does not name fade away */
+        } else if (c->a >= 1 && c->a <= SM_REFL / 2) {
+            for (int k = 0; k < 2; k++) {
+                int r = (c->a - 1) * 2 + k;
+                const float *f = &c->f[k * 5];
+                if (f[0] <= 0.0f) { m->er_to[r][4] = 0.0f; continue; }
+                m->er_to[r][0] = sm_clampf(f[0], 0.0f, (float)(SM_HIST - SM_BLOCK - 2) / SM_RATE);
+                for (int q = 1; q < 4; q++) m->er_to[r][q] = isfinite(f[q]) ? f[q] : 0.0f;
+                m->er_to[r][4] = sm_clampf(f[4], 0.0f, 1.0f);
+                if (m->er_now[r][4] == 0.0f) { m->er_now[r][0] = m->er_to[r][0]; for (int q = 1; q < 4; q++) m->er_now[r][q] = m->er_to[r][q]; }
+            }
+        }
+        break;
     case SM_OP_OUTPUT: m->headphones = c->a == 1; break;
     case SM_OP_GROUP:
         if (c->a >= 0 && c->a < SM_GROUPS) m->group_gain[c->a] = c->f[0] < 0.0f ? 0.0f : c->f[0];
@@ -612,6 +642,10 @@ static inline void sm_place(SmMixer *m, SmVoice *v, float *out, int frames) {
             m->mono[n] = v2;
         }
     }
+    /* the echo hears every placed voice, muffled as it is, but not fading
+     * with distance: far off, a voice is mostly echo */
+    float sg = v->occ_gain * 0.5f;
+    for (int n = 0; n < frames; n++) m->send[n] += m->mono[n] * sg;
     if (m->headphones) {
         float c[16]; sm_sh(X, Y, Z, c);
         for (int k = 0; k < 16; k++) {
@@ -629,6 +663,91 @@ static inline void sm_place(SmMixer *m, SmVoice *v, float *out, int frames) {
         }
         v->pan_l = l1; v->pan_r = r1;
     }
+}
+
+/* The late reverb's delay lines, in ms: spread, none a multiple of another. */
+static const float sm_fdn_ms[8] = { 29.7f, 37.1f, 41.1f, 43.7f, 53.0f, 59.9f, 67.1f, 73.3f };
+
+/* The echo of the listener's space: early reflections, each from its own
+ * direction, then a feedback delay network whose loops lose 60 dB in the
+ * decay asked and lose their highs faster as the damping rises. Everything
+ * the space asks glides over 100 ms. */
+static inline void sm_reverb(SmMixer *m, float *out, int frames) {
+    float k = (float)frames / (float)SM_OCC_GLIDE; if (k > 1.0f) k = 1.0f;
+    float d0 = m->rv_decay, w0 = m->rv_wet;
+    m->rv_decay += (m->rv_decay_to - m->rv_decay) * k;
+    m->rv_damp += (m->rv_damp_to - m->rv_damp) * k;
+    m->rv_wet += (m->rv_wet_to - m->rv_wet) * k;
+    int quiet = m->rv_wet < 1e-5f && w0 < 1e-5f;
+    /* the sends' history */
+    for (int n = 0; n < frames; n++) m->shist[(m->hist_at + n) & (SM_HIST - 1)] = m->send[n];
+    if (quiet) { m->hist_at = (m->hist_at + frames) & (SM_HIST - 1); return; }
+    /* early reflections: a tap into the history each, placed by its direction */
+    for (int r = 0; r < SM_REFL; r++) {
+        float *now = m->er_now[r], *to = m->er_to[r];
+        float g0 = now[4];
+        now[0] += (to[0] - now[0]) * k; now[4] += (to[4] - now[4]) * k;
+        for (int q = 1; q < 4; q++) now[q] += (to[q] - now[q]) * k;
+        if (g0 < 1e-5f && now[4] < 1e-5f) continue;
+        float dx = now[1], dy = now[2], dz = now[3], dn = sqrtf(dx * dx + dy * dy + dz * dz);
+        float X = 1.0f, Y = 0.0f, Z = 0.0f;
+        if (dn > 1e-4f) {
+            X = (dx * m->lf[0] + dy * m->lf[1] + dz * m->lf[2]) / dn;
+            Y = -(dx * m->lr[0] + dy * m->lr[1] + dz * m->lr[2]) / dn;
+            Z = (dx * m->lu[0] + dy * m->lu[1] + dz * m->lu[2]) / dn;
+        }
+        float g1 = now[4] * m->rv_wet, ga = g0 * w0;
+        int dl = (int)(now[0] * SM_RATE);
+        if (dl < 1) dl = 1;
+        if (m->headphones) {
+            float c[16]; sm_sh(X, Y, Z, c);
+            for (int q = 0; q < 16; q++) {
+                float c0 = m->er_coef[r][q], c1 = c[q] * g1, st = (c1 - c0) / (float)frames;
+                for (int n = 0; n < frames; n++) m->bus[q][n] += m->shist[(m->hist_at + n - dl) & (SM_HIST - 1)] * (c0 + st * (float)n);
+                m->er_coef[r][q] = c1;
+            }
+        } else {
+            float lat = sm_clampf(-Y, -1.0f, 1.0f), ang = (lat + 1.0f) * (float)SM_PI / 4.0f;
+            float l1 = cosf(ang) * g1, r1 = sinf(ang) * g1, l0 = m->er_pan[r][0], r0 = m->er_pan[r][1];
+            for (int n = 0; n < frames; n++) {
+                float t = (float)n / (float)frames, x = m->shist[(m->hist_at + n - dl) & (SM_HIST - 1)];
+                out[2 * n] += x * (l0 + (l1 - l0) * t); out[2 * n + 1] += x * (r0 + (r1 - r0) * t);
+            }
+            m->er_pan[r][0] = l1; m->er_pan[r][1] = r1;
+        }
+        (void)ga;
+    }
+    /* the late reverb: 8 lines, mixed by a Hadamard matrix, each losing what the decay asks over its length */
+    float gl[8], lp = 0.6f * m->rv_damp;   /* how much each loop's low-pass holds back the highs */
+    int len[8];
+    for (int i = 0; i < 8; i++) {
+        len[i] = (int)(sm_fdn_ms[i] * SM_RATE / 1000.0f);
+        gl[i] = powf(10.0f, -3.0f * (float)len[i] / (m->rv_decay * SM_RATE));
+    }
+    (void)d0;
+    float wet = m->rv_wet, w_step = (m->rv_wet - w0) / (float)frames;
+    for (int n = 0; n < frames; n++) {
+        float x[8], in = m->shist[(m->hist_at + n - 480) & (SM_HIST - 1)] * 0.35f;   /* 10 ms before the tail starts */
+        for (int i = 0; i < 8; i++) {
+            float y = m->fdn[i][(m->fdn_at[i] - len[i] + SM_FDN_MAX) % SM_FDN_MAX];
+            m->fdn_lp[i] = y + (m->fdn_lp[i] - y) * lp;
+            x[i] = m->fdn_lp[i] * gl[i];
+        }
+        /* a fast Hadamard transform, scaled to keep energy */
+        for (int h = 1; h < 8; h <<= 1)
+            for (int i = 0; i < 8; i += h << 1)
+                for (int j = i; j < i + h; j++) { float a = x[j], b = x[j + h]; x[j] = a + b; x[j + h] = a - b; }
+        float l = 0.0f, r = 0.0f;
+        for (int i = 0; i < 8; i++) {
+            float v = x[i] * 0.35355339f + ((i & 1) ? -in : in);
+            m->fdn[i][m->fdn_at[i]] = v;
+            m->fdn_at[i] = (m->fdn_at[i] + 1) % SM_FDN_MAX;
+            if (i & 1) r += v; else l += v;
+        }
+        float wn = (wet - (m->rv_wet - w0)) + w_step * (float)n;
+        out[2 * n] += l * 0.5f * wn; out[2 * n + 1] += r * 0.5f * wn;
+    }
+    m->hist_at = (m->hist_at + frames) & (SM_HIST - 1);
 }
 
 static SmMixer *sm_sort_m;
@@ -651,6 +770,7 @@ static inline void sm_mix_block(SmMixer *m, float *out, int frames, int *playing
     sm_sort_m = m;
     qsort(m->order, (size_t)n, sizeof(int), sm_by_loud);
     for (int k = 0; k < 16; k++) memset(m->bus[k], 0, sizeof(float) * (size_t)frames);
+    memset(m->send, 0, sizeof(float) * (size_t)frames);
     int mixed = 0;
     for (int j = 0; j < n; j++) {
         SmVoice *v = &m->voices[m->order[j]];
@@ -673,6 +793,7 @@ static inline void sm_mix_block(SmMixer *m, float *out, int frames, int *playing
         else (*playing)++;
     }
     *mixed_n = mixed;
+    sm_reverb(m, out, frames);
     /* decode the bus: binaural for headphones (one ear's filters, mirrored), first-order for speakers */
     if (m->headphones) {
         float S[SM_BLOCK], A[SM_BLOCK];
