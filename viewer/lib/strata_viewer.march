@@ -36,8 +36,9 @@ mod StrataViewer do
   alias Strata.Math.Vec3 as V3
 
   -- ── Blocks ───────────────────────────────────────────────────────────────
-  -- ids: 1 stone, 2 dirt, 3 grass, 4 sand, 5 water, 6 snow, 7 wood, 8 leaves
-  -- texture ids index the palette: the block id, plus 9 for a grass side
+  -- ids: 1 stone, 2 dirt, 3 grass, 4 sand, 5 water, 6 snow, 7 wood, 8 leaves,
+  -- 9 a block whose texture id (999) no layer has: it must draw as 'missing'
+  -- texture ids are StrataViewer.Textures layers: the block id, plus 9 for a grass side
   pfn add(r : Strata.Blocks.Registry, d : Strata.Blocks.Def) : Strata.Blocks.Registry do
     match Bk.register(r, d) do
       Ok((r2, _)) -> r2
@@ -54,19 +55,17 @@ mod StrataViewer do
     let snow = Bk.with_faces(Bk.def(), 6, 6, 6)
     let wood = Bk.with_faces(Bk.def(), 7, 7, 7)
     let leaves = Bk.with_faces(Bk.with_layer(Bk.with_opacity(Bk.def(), Strata.Blocks.SeeThrough), Strata.Blocks.Cutout), 8, 8, 8)
-    add(add(add(add(add(add(add(add(Bk.empty(), stone), dirt), grass), sand), water), snow), wood), leaves)
+    let bad = Bk.with_faces(Bk.def(), 999, 999, 999)
+    add(add(add(add(add(add(add(add(add(Bk.empty(), stone), dirt), grass), sand), water), snow), wood), leaves), bad)
   end
 
-  pfn palette() : Unit do
-    Strata.Ffi.Vk.set_palette(1, 0.52, 0.53, 0.55, 1.0)
-    Strata.Ffi.Vk.set_palette(2, 0.47, 0.34, 0.22, 1.0)
-    Strata.Ffi.Vk.set_palette(3, 0.36, 0.62, 0.24, 1.0)
-    Strata.Ffi.Vk.set_palette(4, 0.76, 0.70, 0.48, 1.0)
-    Strata.Ffi.Vk.set_palette(5, 0.16, 0.42, 0.72, 0.72)
-    Strata.Ffi.Vk.set_palette(6, 0.90, 0.92, 0.95, 1.0)
-    Strata.Ffi.Vk.set_palette(7, 0.40, 0.28, 0.16, 1.0)
-    Strata.Ffi.Vk.set_palette(8, 0.20, 0.47, 0.17, 1.0)
-    Strata.Ffi.Vk.set_palette(9, 0.40, 0.42, 0.22, 1.0)
+  -- Upload the viewer's painted tiles and the registry's block table.
+  pfn tiles_go(i : Int, ok : Bool) : Bool do
+    if i >= StrataViewer.Textures.count() do ok
+    else tiles_go(i + 1, Strata.Ffi.Vk.texture_set(i, StrataViewer.Textures.tile(i)) && ok) end
+  end
+  pfn textures(reg : Strata.Blocks.Registry) : Bool do
+    Strata.Ffi.Vk.textures_create(StrataViewer.Textures.size(), StrataViewer.Textures.count()) && tiles_go(0, true) && Strata.Ffi.Vk.textures_commit() && Strata.Render.upload_blocks(reg)
   end
 
   -- ── Terrain: a pure function of chunk coordinates and seed ───────────────
@@ -253,6 +252,7 @@ mod StrataViewer do
   --   2 shore         low over the water, along the shoreline
   --   3 forest floor  among the trees, looking level
   --   4 dug out       the overview, with one whole chunk of ground removed ahead
+  --   5 bad ids       the forest floor, with a wall of blocks whose texture does not exist and one block id nobody registered
   -- Any other number is the overview.
   -- The first column, walking a fixed grid outward from the origin, whose
   -- ground lies at least four blocks under the water: somewhere to look at
@@ -271,7 +271,7 @@ mod StrataViewer do
       match deep_water(seed, 0) do
         (wx, wz) -> (int_to_float(wx) +. 0.5, int_to_float(sea()) +. 3.5, int_to_float(wz) +. 0.5, 0.9, -0.15)
       end
-    else if scene == 3 do (-40.0, int_to_float(height(-40, 60, seed)) +. 2.6, 60.0, 0.62, -0.05)
+    else if scene == 3 || scene == 5 do (-40.0, int_to_float(height(-40, 60, seed)) +. 2.6, 60.0, 0.62, -0.05)
     else (-70.0, int_to_float(height(0, 0, seed)) +. 46.0, 96.0, 0.62, -0.42) end end
   end
 
@@ -287,7 +287,7 @@ mod StrataViewer do
       Strata.Ffi.Vk.set_offscreen(Env.get_int("STRATA_OFFSCREEN", 0) == 1)
       Strata.Ffi.Vk.pad_commands(Env.get_int("STRATA_PAD_CMDS", 0))
       let reg = registry()
-      palette()
+      if textures(reg) do () else println("strata_viewer: could not upload textures") end
       Strata.Ffi.Vk.set_sun(0.45, 0.80, 0.35, 0.30)
       Strata.Ffi.Vk.set_sky(0.53, 0.72, 0.92)
       -- chunks are meshed out to one short of the radius, so the fog closes there
@@ -311,7 +311,14 @@ mod StrataViewer do
           let cz = Strata.Coord.chunk_of(pz) * 32
           Strata.Stream.run_until_settled(Strata.Stream.apply(s0, Strata.Edit.fill_box(Strata.Stream.world(s0), cx, cy, cz, cx + 31, cy + 31, cz + 31, 0)), 1000000)
         end
-      match Strata.Render.sync(Strata.Render.new(16384), s0b) do
+      -- scene 5 builds a wall of the bad-texture block ahead, topped by an unregistered id
+      let s0c = if Env.get_int("STRATA_SCENE", 1) != 5 do s0b
+        else
+          let gy = height(-35, 53, seed)
+          let w1 = Strata.Edit.world(Strata.Edit.fill_box(Strata.Stream.world(s0b), -38, gy + 1, 53, -32, gy + 2, 53, 9))
+          Strata.Stream.run_until_settled(Strata.Stream.apply(Strata.Stream.apply(s0b, Strata.Edit.fill_box(Strata.Stream.world(s0b), -38, gy + 1, 53, -32, gy + 2, 53, 9)), Strata.Edit.set_block(w1, -35, gy + 3, 53, 60000)), 1000000)
+        end
+      match Strata.Render.sync(Strata.Render.new(16384), s0c) do
         (sl, s1) ->
           println("strata_viewer: " ++ int_to_string(Strata.Stream.loaded_count(s1)) ++ " chunks streamed in " ++ float_to_string(Math.round((t1 -. t0) *. 1000.0)) ++ " ms; " ++ int_to_string(Strata.Ffi.Vk.live_quads()) ++ " quads, " ++ int_to_string(Strata.Ffi.Vk.live_quads() * 8 / 1024) ++ " KB on the GPU")
           let cam = Cam(ex, ey, ez, yaw0, pitch0, Strata.Coord.chunk_of(float_to_int(Math.floor(ex))), Strata.Coord.chunk_of(float_to_int(Math.floor(ey))), Strata.Coord.chunk_of(float_to_int(Math.floor(ez))), false, false)

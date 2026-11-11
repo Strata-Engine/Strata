@@ -95,6 +95,11 @@ static struct {
     VkBuffer cmds;  VkDeviceMemory cmds_mem;                             /* indirect commands, SV_RANGES * SV_CMD_STRIDE */
     VkBuffer dslot; VkDeviceMemory dslot_mem;                            /* the slot each command draws, same shape */
     uint32_t submit[SV_RANGES];    /* commands the next indirect call of each range will submit */
+    VkBuffer blocks; VkDeviceMemory blocks_mem; int32_t *blocks_map;     /* the block table: 8 words a block id */
+    uint32_t nblocks;
+    /* the texture array: one layer per texture id */
+    VkImage tex; VkDeviceMemory tex_mem; VkImageView tex_view; VkSampler sampler;
+    uint32_t tile_px, layers; unsigned char *tex_staging; int aniso;
     uint32_t hi_slot;              /* one past the highest slot ever used: how many the cull pass looks at */
     uint32_t pad_cmds;             /* zero-count commands appended to each indirect call (measurement) */
     VkCommandPool cpool;
@@ -117,8 +122,8 @@ static struct {
 
 /* The uniform block: view-projection, sun, sky, fog, voxel scale, then 256
  * palette colours indexed by a quad's texture id. Must match the shaders. */
-#define UBO_FLOATS (16 + 4 + 4 + 4 + 4 + 4 + 256 * 4)
-#define UBO_PAL 36            /* float offset of the palette */
+#define UBO_FLOATS (16 + 4 + 4 + 4 + 4 + 4)
+#define SV_MAX_BLOCKS 65536    /* rows in the block table: block ids are sixteen bits */
 
 static void die(const char *what, int code) {
     fprintf(stderr, "strata_vk: %s failed (%d)\n", what, code);
@@ -316,6 +321,119 @@ static int make_pipeline(int blend, VkPipeline *out) {
     return 1;
 }
 
+/* ── Textures and the block table ─────────────────────────────────────────── */
+int64_t sv_textures_create(int64_t tile_px, int64_t layers);
+int64_t sv_texture_set(int64_t layer, void *rgba_u8, int64_t nbytes);
+int64_t sv_textures_commit(void);
+
+static void destroy_textures(void) {
+    if (g.sampler) vkDestroySampler(g.dev, g.sampler, NULL);
+    if (g.tex_view) vkDestroyImageView(g.dev, g.tex_view, NULL);
+    if (g.tex) vkDestroyImage(g.dev, g.tex, NULL);
+    if (g.tex_mem) vkFreeMemory(g.dev, g.tex_mem, NULL);
+    g.sampler = VK_NULL_HANDLE; g.tex_view = VK_NULL_HANDLE; g.tex = VK_NULL_HANDLE; g.tex_mem = VK_NULL_HANDLE;
+}
+
+/* Start a texture array: [layers] square tiles of [tile_px] pixels, a power
+ * of two from 1 to 256. Pixels are set with sv_texture_set and the array
+ * goes live at sv_textures_commit; until then the previous one is drawn. */
+int64_t sv_textures_create(int64_t tile_px, int64_t layers) {
+    if (!g.dev || tile_px < 1 || tile_px > 256 || (tile_px & (tile_px - 1)) != 0 || layers < 1 || layers > 2048) return 0;
+    unsigned char *st = calloc((size_t)tile_px * (size_t)tile_px * 4, (size_t)layers);
+    if (!st) return 0;
+    free(g.tex_staging);
+    g.tex_staging = st; g.tile_px = (uint32_t)tile_px; g.layers = (uint32_t)layers;
+    return 1;
+}
+
+/* Set one layer from tile_px * tile_px RGBA bytes (sRGB colour, straight
+ * alpha), rows running downward. 0 if the layer or the length is wrong. */
+int64_t sv_texture_set(int64_t layer, void *rgba_u8, int64_t nbytes) {
+    size_t per = (size_t)g.tile_px * g.tile_px * 4;
+    if (!g.tex_staging || !rgba_u8 || layer < 0 || layer >= (int64_t)g.layers || nbytes != (int64_t)per || narr_len(rgba_u8) < nbytes) return 0;
+    memcpy(g.tex_staging + per * (size_t)layer, narr_data(rgba_u8), per);
+    return 1;
+}
+
+static void tex_barrier(VkCommandBuffer cb, uint32_t level, uint32_t nlevels, VkImageLayout from, VkImageLayout to, VkAccessFlags sa, VkAccessFlags da, VkPipelineStageFlags ss, VkPipelineStageFlags ds) {
+    VkImageMemoryBarrier b = { .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, .srcAccessMask = sa, .dstAccessMask = da, .oldLayout = from, .newLayout = to,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .image = g.tex,
+        .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, level, nlevels, 0, g.layers } };
+    vkCmdPipelineBarrier(cb, ss, ds, 0, 0, NULL, 0, NULL, 1, &b);
+}
+
+/* Build the array from the staged pixels, with a full mip chain, and switch
+ * the renderer to it. Rare and slow: it waits for the GPU to go idle. */
+int64_t sv_textures_commit(void) {
+    if (!g.dev || !g.tex_staging) return 0;
+    vkDeviceWaitIdle(g.dev);
+    destroy_textures();
+    uint32_t levels = 1; for (uint32_t t = g.tile_px; t > 1; t >>= 1) levels++;
+    VkImageCreateInfo ici = { .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D, .format = VK_FORMAT_R8G8B8A8_SRGB,
+        .extent = { g.tile_px, g.tile_px, 1 }, .mipLevels = levels, .arrayLayers = g.layers, .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL,
+        .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT };
+    VKOK(vkCreateImage(g.dev, &ici, NULL, &g.tex), "texture image");
+    VkMemoryRequirements mr; vkGetImageMemoryRequirements(g.dev, g.tex, &mr);
+    VkMemoryAllocateInfo ai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = mr.size,
+        .memoryTypeIndex = mem_type(mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) };
+    VKOK(vkAllocateMemory(g.dev, &ai, NULL, &g.tex_mem), "texture memory");
+    VKOK(vkBindImageMemory(g.dev, g.tex, g.tex_mem, 0), "texture bind");
+
+    VkDeviceSize bytes = (VkDeviceSize)g.tile_px * g.tile_px * 4 * g.layers;
+    VkBuffer sb; VkDeviceMemory sm; void *map = NULL;
+    if (!make_buffer(bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, &sb, &sm, &map)) return 0;
+    memcpy(map, g.tex_staging, (size_t)bytes);
+    VkCommandBufferAllocateInfo cai = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, .commandPool = g.cpool, .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1 };
+    VkCommandBuffer cb; VKOK(vkAllocateCommandBuffers(g.dev, &cai, &cb), "texture command buffer");
+    VkCommandBufferBeginInfo bi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
+    vkBeginCommandBuffer(cb, &bi);
+    tex_barrier(cb, 0, levels, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+    VkBufferImageCopy reg = { .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, g.layers }, .imageExtent = { g.tile_px, g.tile_px, 1 } };
+    vkCmdCopyBufferToImage(cb, sb, g.tex, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &reg);
+    /* each level is a filtered copy of the one above it */
+    for (uint32_t l = 1; l < levels; l++) {
+        tex_barrier(cb, l - 1, 1, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+        int32_t sw = (int32_t)(g.tile_px >> (l - 1)), dw = (int32_t)(g.tile_px >> l);
+        VkImageBlit blit = { .srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, l - 1, 0, g.layers }, .srcOffsets = { { 0, 0, 0 }, { sw, sw, 1 } },
+                             .dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, l, 0, g.layers }, .dstOffsets = { { 0, 0, 0 }, { dw, dw, 1 } } };
+        vkCmdBlitImage(cb, g.tex, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g.tex, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_LINEAR);
+        tex_barrier(cb, l - 1, 1, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+    }
+    tex_barrier(cb, levels - 1, 1, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+    vkEndCommandBuffer(cb);
+    VkSubmitInfo sub = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &cb };
+    vkQueueSubmit(g.queue, 1, &sub, VK_NULL_HANDLE);
+    vkQueueWaitIdle(g.queue);
+    vkFreeCommandBuffers(g.dev, g.cpool, 1, &cb);
+    vkDestroyBuffer(g.dev, sb, NULL); vkFreeMemory(g.dev, sm, NULL);
+
+    VkImageViewCreateInfo vi = { .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = g.tex, .viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY,
+        .format = VK_FORMAT_R8G8B8A8_SRGB, .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, levels, 0, g.layers } };
+    VKOK(vkCreateImageView(g.dev, &vi, NULL, &g.tex_view), "texture view");
+    /* nearest when magnified, so blocks keep their pixels; trilinear with anisotropy when minified */
+    VkSamplerCreateInfo si = { .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO, .magFilter = VK_FILTER_NEAREST, .minFilter = VK_FILTER_LINEAR,
+        .mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR, .addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT, .addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT,
+        .addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT, .anisotropyEnable = g.aniso ? VK_TRUE : VK_FALSE, .maxAnisotropy = g.aniso ? 8.0f : 1.0f,
+        .minLod = 0.0f, .maxLod = (float)(levels - 1) };
+    VKOK(vkCreateSampler(g.dev, &si, NULL, &g.sampler), "sampler");
+    for (int f = 0; f < SV_FRAMES; f++) {
+        if (!g.frames[f].dset) continue;
+        VkDescriptorImageInfo ii = { g.sampler, g.tex_view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+        VkWriteDescriptorSet w = { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = g.frames[f].dset, .dstBinding = 6, .descriptorCount = 1,
+            .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .pImageInfo = &ii };
+        vkUpdateDescriptorSets(g.dev, 1, &w, 0, NULL);
+    }
+    return 1;
+}
+
+/* The block table: 8 words a block id (Strata.Blocks.gpu_table). */
+int64_t sv_blocks_set(void *words_i32, int64_t nblocks) {
+    if (!g.blocks_map || !words_i32 || nblocks < 0 || nblocks > SV_MAX_BLOCKS || narr_len(words_i32) < nblocks * 8) return 0;
+    memcpy(g.blocks_map, narr_data(words_i32), (size_t)nblocks * 32);
+    g.nblocks = (uint32_t)nblocks;
+    return 1;
+}
+
 /* ── Input callbacks ──────────────────────────────────────────────────────── */
 static void on_key(GLFWwindow *w, int key, int sc, int action, int mods) {
     (void)w; (void)sc; (void)mods;
@@ -390,7 +508,8 @@ int64_t sv_open(int64_t w, int64_t h, int64_t capture_mouse, int64_t quad_capaci
     VkPhysicalDeviceFeatures2 have2 = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &have11 };
     vkGetPhysicalDeviceFeatures2(g.phys, &have2);
     if (!have.multiDrawIndirect || !have11.shaderDrawParameters) { die("device lacks multiDrawIndirect or shaderDrawParameters", 0); return 0; }
-    VkPhysicalDeviceFeatures feats = { .multiDrawIndirect = VK_TRUE };
+    g.aniso = have.samplerAnisotropy ? 1 : 0;
+    VkPhysicalDeviceFeatures feats = { .multiDrawIndirect = VK_TRUE, .samplerAnisotropy = have.samplerAnisotropy };
     VkPhysicalDeviceVulkan11Features feats11 = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES, .shaderDrawParameters = VK_TRUE };
     VkDeviceCreateInfo dci = { .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, .pNext = &feats11, .queueCreateInfoCount = 1, .pQueueCreateInfos = &qci,
         .enabledExtensionCount = nd, .ppEnabledExtensionNames = dext, .pEnabledFeatures = &feats };
@@ -404,7 +523,7 @@ int64_t sv_open(int64_t w, int64_t h, int64_t capture_mouse, int64_t quad_capaci
     g.swap_ok = 1;
 
     /* one set layout for every pipeline: 0 uniforms, 1 chunk table, 2 indirect commands, 3 cull statistics, 4 command -> slot */
-    VkDescriptorSetLayoutBinding dslb[5] = {
+    VkDescriptorSetLayoutBinding dslb[7] = {
         { .binding = 0, .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, .descriptorCount = 1,
           .stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT },
         { .binding = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1,
@@ -412,10 +531,14 @@ int64_t sv_open(int64_t w, int64_t h, int64_t capture_mouse, int64_t quad_capaci
         { .binding = 2, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT },
         { .binding = 3, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT },
         { .binding = 4, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1,
-          .stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_COMPUTE_BIT } };
-    VkDescriptorSetLayoutCreateInfo dsli = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 5, .pBindings = dslb };
+          .stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_COMPUTE_BIT },
+        /* 5 the block table, 6 the texture array */
+        { .binding = 5, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_VERTEX_BIT },
+        { .binding = 6, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT } };
+    VkDescriptorSetLayoutCreateInfo dsli = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 7, .pBindings = dslb };
     VKOK(vkCreateDescriptorSetLayout(g.dev, &dsli, NULL, &g.dsl), "descriptor set layout");
-    VkPushConstantRange pcr = { .stageFlags = VK_SHADER_STAGE_VERTEX_BIT, .offset = 0, .size = 4 };   /* where the call's range starts in draw_slot */
+    /* where the call's range starts in draw_slot, and per-call flags (bit 0: cutout) */
+    VkPushConstantRange pcr = { .stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, .offset = 0, .size = 8 };
     VkPipelineLayoutCreateInfo pli = { .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = 1, .pSetLayouts = &g.dsl,
         .pushConstantRangeCount = 1, .pPushConstantRanges = &pcr };
     VKOK(vkCreatePipelineLayout(g.dev, &pli, NULL, &g.layout), "pipeline layout");
@@ -441,8 +564,11 @@ int64_t sv_open(int64_t w, int64_t h, int64_t capture_mouse, int64_t quad_capaci
     memset(map, 0, (size_t)SV_RANGES * SV_CMD_STRIDE * 4);
     vkUnmapMemory(g.dev, g.dslot_mem);
 
-    VkDescriptorPoolSize dps[2] = { { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, SV_FRAMES }, { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4 * SV_FRAMES } };
-    VkDescriptorPoolCreateInfo dpi = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = SV_FRAMES, .poolSizeCount = 2, .pPoolSizes = dps };
+    if (!make_buffer((VkDeviceSize)SV_MAX_BLOCKS * 32, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &g.blocks, &g.blocks_mem, &map)) return 0;
+    g.blocks_map = map;
+    memset(g.blocks_map, 0, (size_t)SV_MAX_BLOCKS * 32);
+    VkDescriptorPoolSize dps[3] = { { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, SV_FRAMES }, { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 5 * SV_FRAMES }, { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, SV_FRAMES } };
+    VkDescriptorPoolCreateInfo dpi = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = SV_FRAMES, .poolSizeCount = 3, .pPoolSizes = dps };
     VKOK(vkCreateDescriptorPool(g.dev, &dpi, NULL, &g.dpool), "descriptor pool");
     for (int f = 0; f < SV_FRAMES; f++) {
         Frame *F = &g.frames[f];
@@ -450,12 +576,12 @@ int64_t sv_open(int64_t w, int64_t h, int64_t capture_mouse, int64_t quad_capaci
         F->stats_map = map; memset(F->stats_map, 0, 32);
         VkDescriptorSetAllocateInfo dai = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, .descriptorPool = g.dpool, .descriptorSetCount = 1, .pSetLayouts = &g.dsl };
         VKOK(vkAllocateDescriptorSets(g.dev, &dai, &F->dset), "descriptor set");
-        VkDescriptorBufferInfo bufs[5] = { { g.ubo, 0, UBO_FLOATS * 4 }, { g.table, 0, VK_WHOLE_SIZE }, { g.cmds, 0, VK_WHOLE_SIZE }, { F->stats, 0, 32 }, { g.dslot, 0, VK_WHOLE_SIZE } };
-        VkWriteDescriptorSet wds[5];
-        for (uint32_t b = 0; b < 5; b++)
+        VkDescriptorBufferInfo bufs[6] = { { g.ubo, 0, UBO_FLOATS * 4 }, { g.table, 0, VK_WHOLE_SIZE }, { g.cmds, 0, VK_WHOLE_SIZE }, { F->stats, 0, 32 }, { g.dslot, 0, VK_WHOLE_SIZE }, { g.blocks, 0, VK_WHOLE_SIZE } };
+        VkWriteDescriptorSet wds[6];
+        for (uint32_t b = 0; b < 6; b++)
             wds[b] = (VkWriteDescriptorSet){ .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = F->dset, .dstBinding = b, .descriptorCount = 1,
                 .descriptorType = b == 0 ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &bufs[b] };
-        vkUpdateDescriptorSets(g.dev, 5, wds, 0, NULL);
+        vkUpdateDescriptorSets(g.dev, 6, wds, 0, NULL);
     }
     {   /* the culling pipeline */
         VkShaderModule cs = shader(strata_cull_comp, sizeof(strata_cull_comp));
@@ -482,6 +608,12 @@ int64_t sv_open(int64_t w, int64_t h, int64_t capture_mouse, int64_t quad_capaci
         if (vkCreateQueryPool(g.dev, &qi, NULL, &g.qpool) != VK_SUCCESS) g.have_ts = 0;
     }
     g.stat[3] = -1.0;
+    {   /* until a game supplies textures: one layer, one magenta texel */
+        static const unsigned char missing[4] = { 255, 0, 255, 255 };
+        if (sv_textures_create(1, 1) != 1) return 0;
+        memcpy(g.tex_staging, missing, 4);
+        if (sv_textures_commit() != 1) return 0;
+    }
     g.ok = 1;
     return 1;
 }
@@ -500,6 +632,10 @@ void sv_close(void) {
         if (g.cmds_mem) vkFreeMemory(g.dev, g.cmds_mem, NULL);
         if (g.dslot) vkDestroyBuffer(g.dev, g.dslot, NULL);
         if (g.dslot_mem) vkFreeMemory(g.dev, g.dslot_mem, NULL);
+        if (g.blocks) vkDestroyBuffer(g.dev, g.blocks, NULL);
+        if (g.blocks_mem) vkFreeMemory(g.dev, g.blocks_mem, NULL);
+        destroy_textures();
+        free(g.tex_staging);
         for (int f = 0; f < SV_FRAMES; f++) {
             if (g.frames[f].stats) vkDestroyBuffer(g.dev, g.frames[f].stats, NULL);
             if (g.frames[f].stats_mem) vkFreeMemory(g.dev, g.frames[f].stats_mem, NULL);
@@ -609,7 +745,8 @@ void sv_set_sun(double x, double y, double z, double ambient) {
 }
 void sv_set_sky(double r, double gr, double b) {
     if (!g.ok) return;
-    g.ubo_map[20] = (float)pow(r, 2.2); g.ubo_map[21] = (float)pow(gr, 2.2); g.ubo_map[22] = (float)pow(b, 2.2); g.ubo_map[23] = 1.0f;
+    /* given as sRGB, stored linear: the swapchain encodes on write */
+    g.ubo_map[20] = (float)pow(r < 0 ? 0 : r, 2.2); g.ubo_map[21] = (float)pow(gr < 0 ? 0 : gr, 2.2); g.ubo_map[22] = (float)pow(b < 0 ? 0 : b, 2.2); g.ubo_map[23] = 1.0f;
 }
 void sv_set_fog(double start, double end, double cam_x, double cam_y) {
     (void)cam_x; (void)cam_y;
@@ -620,15 +757,6 @@ void sv_set_eye(double x, double y, double z, double scale) {
     if (!g.ok) return;
     g.ubo_map[28] = (float)x; g.ubo_map[29] = (float)y; g.ubo_map[30] = (float)z; g.ubo_map[31] = (float)scale;
 }
-/* Colour of texture id [i] (0..255): sRGB rgb as an artist would pick it,
- * plus alpha. Stored linear, since the swapchain encodes on write. */
-static float to_linear(double c) { return (float)pow(c < 0 ? 0 : c, 2.2); }
-void sv_set_palette(int64_t i, double r, double gr, double b, double a) {
-    if (!g.ok || i < 0 || i >= 256) return;
-    float *p = g.ubo_map + UBO_PAL + i * 4;
-    p[0] = to_linear(r); p[1] = to_linear(gr); p[2] = to_linear(b); p[3] = (float)a;
-}
-
 static void write_shot(Frame *F, VkImage image, VkImageLayout layout);
 
 /* ── Draw ─────────────────────────────────────────────────────────────────── */
@@ -702,7 +830,7 @@ int64_t sv_frame(void) {
     if (g.have_ts) { vkCmdResetQueryPool(F->cmd, g.qpool, q0, 2); vkCmdWriteTimestamp(F->cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, g.qpool, q0); }
     /* cull: one compute invocation per slot writes the indirect commands */
     int32_t *misc = (int32_t *)(g.ubo_map + 32);
-    misc[0] = (int32_t)g.hi_slot; misc[1] = SV_CMD_STRIDE;
+    misc[0] = (int32_t)g.hi_slot; misc[1] = SV_CMD_STRIDE; misc[2] = (int32_t)g.layers;
     vkCmdBindDescriptorSets(F->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g.layout, 0, 1, &F->dset, 0, NULL);
     if (g.hi_slot > 0) {
         /* zero the part of each compacted list that will be submitted, so
@@ -744,7 +872,8 @@ int64_t sv_frame(void) {
             if (n == 0) continue;
             if (r == 0) vkCmdBindPipeline(F->cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g.pipe_opaque);
             if (r == 2) vkCmdBindPipeline(F->cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g.pipe_blend);
-            vkCmdPushConstants(F->cmd, g.layout, VK_SHADER_STAGE_VERTEX_BIT, 0, 4, &base);
+            uint32_t pc[2] = { base, r == 1 ? 1u : 0u };          /* the cutout range discards see-through pixels */
+            vkCmdPushConstants(F->cmd, g.layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, 8, pc);
             vkCmdDrawIndirect(F->cmd, g.cmds, (VkDeviceSize)base * 16, n, 16); draws++;
         }
     }

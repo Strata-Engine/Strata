@@ -30,6 +30,7 @@ shore:STRATA_SCENE=2
 forest:STRATA_SCENE=3
 overview-rebuilt:STRATA_SCENE=1 STRATA_REBUILD_AT=30 GOLDEN_AS=overview
 dug-out:STRATA_SCENE=4
+bad-ids:STRATA_SCENE=5
 overview-offscreen:STRATA_SCENE=1 STRATA_OFFSCREEN=1 GOLDEN_AS=overview
 '
 # indirect draw calls a frame must issue, whatever the scene holds

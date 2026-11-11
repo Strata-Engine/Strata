@@ -14,8 +14,7 @@ layout(set = 0, binding = 0) uniform U {
     vec4 sky;
     vec4 fog;       // x start, y end (metres)
     vec4 eye;       // xyz eye (metres), w metres per voxel
-    ivec4 misc;
-    vec4 pal[256];
+    ivec4 misc;     // x slots to cull, y commands per range, z texture layers
 } u;
 
 // The chunk table.
@@ -27,9 +26,10 @@ struct Chunk {
 layout(std430, set = 0, binding = 1) readonly buffer Table { Chunk chunks[]; } table;
 // Which slot each indirect command draws; [base] is where this call's range starts.
 layout(std430, set = 0, binding = 4) readonly buffer DrawSlot { uint slot[]; } draw_slot;
-layout(push_constant) uniform PC { uint base; } pc;
+layout(push_constant) uniform PC { uint base; uint flags; } pc;
 
-layout(location = 0) out vec2 v_uv;           // in unit faces: 0..w, 0..h
+layout(location = 0) out vec2 v_uv;           // in unit faces: 0..w, 0..h (corner shading interpolates in these)
+layout(location = 4) out vec2 v_tex;          // texture coordinate: one tile per world voxel, image rows running downward
 layout(location = 1) out vec3 v_world;        // metres
 layout(location = 2) flat out uint v_w1;
 layout(location = 3) flat out uint v_face;
@@ -52,7 +52,10 @@ void main() {
     else                q = p + vec3(du, dv, face == 4u ? 1.0 : 0.0);
     ivec4 ol = table.chunks[draw_slot.slot[pc.base + uint(gl_DrawID)]].origin_level;
     // a level-L chunk's voxels are 2^L world voxels on a side
-    vec3 world = (vec3(ol.xyz) + q * float(1 << (ol.w & 255))) * u.eye.w;
+    float lod = float(1 << (ol.w & 255));
+    vec3 world = (vec3(ol.xyz) + q * lod) * u.eye.w;
+    // side faces have v running up the world; an image's rows run down
+    v_tex = (face < 2u ? vec2(du, dv) : vec2(du, h - dv)) * lod;
     v_uv = vec2(du, dv);
     v_world = world;
     v_w1 = w1;
