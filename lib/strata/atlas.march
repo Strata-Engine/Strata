@@ -7,11 +7,19 @@
 -- (its mask, a warped fBm laid over a falloff from the centre) and the
 -- regions (cellular noise quantised to region_count), and erodes the height
 -- between the two (Strata.Erosion, uplift scaled by the mask, talus angle
--- from a rock-strength noise); water, receiver, drainage and river width are
--- present but hold their "none" values until rivers fill them.
+-- from a rock-strength noise).
+--
+-- Then the water (Strata.Flood over the eroded heights): a sample whose
+-- spill height is more than lake_margin above it is lake, its water at
+-- spill - lake_margin over an unchanged bed; any other sample is raised to
+-- its spill (by at most lake_margin), so land never holds a pit and the
+-- height never rises down a river. Drainage is step * step a sample summed
+-- down the flood's receivers; land that is not lake with drainage over
+-- river_min_area is river, 2 (area / river_min_area)^0.375 m wide. Sites are
+-- dry, flat samples ranked by Strata.Seed.cell and taken while spaced.
 --
 -- Seeds: Strata.Seed.mix(seed, 101) the island's fBm, 102 the regions, 103
--- the rock strength.
+-- the rock strength; Strata.Seed.cell(seed, 104, i, 0, j) ranks the sites.
 mod Strata.Atlas do
 
   needs IO.Spawn      -- erosion splits rows across worker tasks
@@ -19,40 +27,69 @@ mod Strata.Atlas do
   alias Strata.Noise as Nz
   alias Strata.Seed as Sd3
 
-  -- n, step (m), island radius (m), region size (m), region count, sea level (m), erosion
-  type Def = Def(Int, Float, Float, Float, Int, Float, Strata.Erosion.Params)
+  -- n, step (m), island radius (m), region size (m), region count, sea level (m), erosion,
+  -- river_min_area (m^2), lake_margin (m), site_count, site_spacing (m), site_flat (m)
+  type Def = Def(Int, Float, Float, Float, Int, Float, Strata.Erosion.Params, Float, Float, Int, Float, Float)
 
-  -- A place of interest: kind, x (m), z (m). Filled by a later task.
-  type Site = Site(Int, Float, Float)
+  -- A place for a structure: x (m), z (m), floor height (m), radius (m), region, index in take order
+  type Site = Site(Float, Float, Float, Float, Int, Int)
 
-  -- def, height, region, water, receiver, drainage, river width, sites
-  type Atlas = Atlas(Def, NativeF32Arr, NativeIntArr, NativeF32Arr, NativeIntArr, NativeF32Arr, NativeF32Arr, List(Site))
+  -- def, height, region, water, receiver, drainage, river width, sites, river polylines
+  type Atlas = Atlas(Def, NativeF32Arr, NativeIntArr, NativeF32Arr, NativeIntArr, NativeF32Arr, NativeF32Arr, List(Site), List(List((Float, Float, Float))))
 
-  doc "A grid of n x n samples, step metres apart, centred on the origin: an island of the given radius, regions about region_size metres across (region_count ids), sea at sea metres, eroded with Strata.Erosion.default_params()."
+  doc "A grid of n x n samples, step metres apart, centred on the origin: an island of the given radius, regions about region_size metres across (region_count ids), sea at sea metres, eroded with Strata.Erosion.default_params(); rivers from 2000 m^2 of drainage, lakes 0.3 m below their spill, 8 sites 150 m apart on ground no rougher than 2 m over 3 x 3 samples."
   fn def(n : Int, step : Float, island_radius : Float, region_size : Float, region_count : Int, sea : Float) : Def do
-    Def(n, step, island_radius, region_size, region_count, sea, Strata.Erosion.default_params())
+    Def(n, step, island_radius, region_size, region_count, sea, Strata.Erosion.default_params(), 2000.0, 0.3, 8, 150.0, 2.0)
   end
 
   doc "The same Def eroded with p instead; p with 0 iterations leaves the island's height as the mask made it."
   fn with_erosion(d : Def, p : Strata.Erosion.Params) : Def do
-    match d do Def(n, st, r, rz, rc, sea, _) -> Def(n, st, r, rz, rc, sea, p) end
+    match d do Def(n, st, r, rz, rc, sea, _, ra, lm, sc, sp, sf) -> Def(n, st, r, rz, rc, sea, p, ra, lm, sc, sp, sf) end
   end
 
-  fn d_n(d : Def) : Int do match d do Def(v, _, _, _, _, _, _) -> v end end
-  fn d_step(d : Def) : Float do match d do Def(_, v, _, _, _, _, _) -> v end end
-  fn d_radius(d : Def) : Float do match d do Def(_, _, v, _, _, _, _) -> v end end
-  fn d_region_size(d : Def) : Float do match d do Def(_, _, _, v, _, _, _) -> v end end
-  fn d_region_count(d : Def) : Int do match d do Def(_, _, _, _, v, _, _) -> v end end
-  fn d_sea(d : Def) : Float do match d do Def(_, _, _, _, _, v, _) -> v end end
-  fn d_erosion(d : Def) : Strata.Erosion.Params do match d do Def(_, _, _, _, _, _, v) -> v end end
+  doc "The same Def with rivers from river_min_area square metres of drainage, and lakes lake_margin metres below their spill height (a shallower hollow is filled)."
+  fn with_rivers(d : Def, river_min_area : Float, lake_margin : Float) : Def do
+    match d do Def(n, st, r, rz, rc, sea, p, _, _, sc, sp, sf) -> Def(n, st, r, rz, rc, sea, p, river_min_area, lake_margin, sc, sp, sf) end
+  end
 
-  fn def_of(a : Atlas) : Def do match a do Atlas(d, _, _, _, _, _, _, _) -> d end end
-  pfn heights(a : Atlas) : NativeF32Arr do match a do Atlas(_, v, _, _, _, _, _, _) -> v end end
-  pfn regions(a : Atlas) : NativeIntArr do match a do Atlas(_, _, v, _, _, _, _, _) -> v end end
-  pfn waters(a : Atlas) : NativeF32Arr do match a do Atlas(_, _, _, v, _, _, _, _) -> v end end
-  pfn receivers(a : Atlas) : NativeIntArr do match a do Atlas(_, _, _, _, v, _, _, _) -> v end end
-  pfn drainages(a : Atlas) : NativeF32Arr do match a do Atlas(_, _, _, _, _, v, _, _) -> v end end
-  pfn widths(a : Atlas) : NativeF32Arr do match a do Atlas(_, _, _, _, _, _, v, _) -> v end end
+  doc "The same Def with up to site_count sites, each at least site_spacing metres from the others, on samples whose 3 x 3 neighbourhood spans at most site_flat metres of height."
+  fn with_sites(d : Def, site_count : Int, site_spacing : Float, site_flat : Float) : Def do
+    match d do Def(n, st, r, rz, rc, sea, p, ra, lm, _, _, _) -> Def(n, st, r, rz, rc, sea, p, ra, lm, site_count, site_spacing, site_flat) end
+  end
+
+  fn d_n(d : Def) : Int do match d do Def(v, _, _, _, _, _, _, _, _, _, _, _) -> v end end
+  fn d_step(d : Def) : Float do match d do Def(_, v, _, _, _, _, _, _, _, _, _, _) -> v end end
+  fn d_radius(d : Def) : Float do match d do Def(_, _, v, _, _, _, _, _, _, _, _, _) -> v end end
+  fn d_region_size(d : Def) : Float do match d do Def(_, _, _, v, _, _, _, _, _, _, _, _) -> v end end
+  fn d_region_count(d : Def) : Int do match d do Def(_, _, _, _, v, _, _, _, _, _, _, _) -> v end end
+  fn d_sea(d : Def) : Float do match d do Def(_, _, _, _, _, v, _, _, _, _, _, _) -> v end end
+  fn d_erosion(d : Def) : Strata.Erosion.Params do match d do Def(_, _, _, _, _, _, v, _, _, _, _, _) -> v end end
+  fn d_river_min_area(d : Def) : Float do match d do Def(_, _, _, _, _, _, _, v, _, _, _, _) -> v end end
+  fn d_lake_margin(d : Def) : Float do match d do Def(_, _, _, _, _, _, _, _, v, _, _, _) -> v end end
+  fn d_site_count(d : Def) : Int do match d do Def(_, _, _, _, _, _, _, _, _, v, _, _) -> v end end
+  fn d_site_spacing(d : Def) : Float do match d do Def(_, _, _, _, _, _, _, _, _, _, v, _) -> v end end
+  fn d_site_flat(d : Def) : Float do match d do Def(_, _, _, _, _, _, _, _, _, _, _, v) -> v end end
+
+  fn s_x(s : Site) : Float do match s do Site(v, _, _, _, _, _) -> v end end
+  fn s_z(s : Site) : Float do match s do Site(_, v, _, _, _, _) -> v end end
+  fn s_floor(s : Site) : Float do match s do Site(_, _, v, _, _, _) -> v end end
+  fn s_radius(s : Site) : Float do match s do Site(_, _, _, v, _, _) -> v end end
+  fn s_region(s : Site) : Int do match s do Site(_, _, _, _, v, _) -> v end end
+  fn s_index(s : Site) : Int do match s do Site(_, _, _, _, _, v) -> v end end
+
+  fn def_of(a : Atlas) : Def do match a do Atlas(d, _, _, _, _, _, _, _, _) -> d end end
+  pfn heights(a : Atlas) : NativeF32Arr do match a do Atlas(_, v, _, _, _, _, _, _, _) -> v end end
+  pfn regions(a : Atlas) : NativeIntArr do match a do Atlas(_, _, v, _, _, _, _, _, _) -> v end end
+  pfn waters(a : Atlas) : NativeF32Arr do match a do Atlas(_, _, _, v, _, _, _, _, _) -> v end end
+  pfn receivers(a : Atlas) : NativeIntArr do match a do Atlas(_, _, _, _, v, _, _, _, _) -> v end end
+  pfn drainages(a : Atlas) : NativeF32Arr do match a do Atlas(_, _, _, _, _, v, _, _, _) -> v end end
+  pfn widths(a : Atlas) : NativeF32Arr do match a do Atlas(_, _, _, _, _, _, v, _, _) -> v end end
+
+  doc "The structure sites, in the order they were taken."
+  fn sites(a : Atlas) : List(Site) do match a do Atlas(_, _, _, _, _, _, _, v, _) -> v end end
+
+  doc "The rivers as polylines of (x m, z m, width m), one from each river head down its receivers to the first sample that is not river: the sea, a lake (whose outlet starts its own), or the grid's edge. Downstream of a confluence polylines share their points."
+  fn rivers(a : Atlas) : List(List((Float, Float, Float))) do match a do Atlas(_, _, _, _, _, _, _, _, v) -> v end end
 
   fn n(a : Atlas) : Int do d_n(def_of(a)) end
   fn step(a : Atlas) : Float do d_step(def_of(a)) end
@@ -61,6 +98,7 @@ mod Strata.Atlas do
   pfn salt_mask() : Int do 101 end
   pfn salt_region() : Int do 102 end
   pfn salt_strength() : Int do 103 end
+  pfn salt_site() : Int do 104 end
 
   -- ── Building ─────────────────────────────────────────────────────────────
   pfn clamp(v : Float, lo : Float, hi : Float) : Float do if v < lo do lo else if v > hi do hi else v end end end
@@ -125,7 +163,139 @@ mod Strata.Atlas do
     end
   end
 
-  doc "Build the atlas for a seed: the island mask, erosion, then the regions; rivers and sites come later."
+
+  -- ── Water ────────────────────────────────────────────────────────────────
+  -- lakes and filled hollows: (heights, water levels) from the eroded
+  -- heights h and the flood's spill
+  pfn lake_go(h : NativeF32Arr, sp : NativeF32Arr, margin : Float, i : Int, cnt : Int, hs : NativeF32Arr, ws : NativeF32Arr) : (NativeF32Arr, NativeF32Arr) do
+    if i >= cnt do (hs, ws)
+    else
+      let v = NativeArray.get_f32(h, i)
+      let s = NativeArray.get_f32(sp, i)
+      if s -. v > margin do lake_go(h, sp, margin, i + 1, cnt, NativeArray.set_f32(hs, i, v), NativeArray.set_f32(ws, i, s -. margin))
+      else lake_go(h, sp, margin, i + 1, cnt, NativeArray.set_f32(hs, i, s), ws) end
+    end
+  end
+
+  -- step * step a sample, summed down the receivers, last in order first
+  pfn area_go(rcv : NativeIntArr, ord : NativeIntArr, t : Int, ar : NativeF32Arr) : NativeF32Arr do
+    if t < 0 do ar
+    else
+      let i = NativeArray.get_int(ord, t)
+      let r = NativeArray.get_int(rcv, i)
+      area_go(rcv, ord, t - 1, if r >= 0 do NativeArray.set_f32(ar, r, NativeArray.get_f32(ar, r) +. NativeArray.get_f32(ar, i)) else ar end)
+    end
+  end
+
+  -- river widths: 2 (area / min_area)^0.375 m on land that is not lake, past min_area
+  pfn width_go(d : Def, hs : NativeF32Arr, ws : NativeF32Arr, ar : NativeF32Arr, i : Int, cnt : Int, out : NativeF32Arr) : NativeF32Arr do
+    if i >= cnt do out
+    else
+      let area = NativeArray.get_f32(ar, i)
+      let river = if NativeArray.get_f32(hs, i) <= d_sea(d) do false else if NativeArray.get_f32(ws, i) >= 0.0 do false else area > d_river_min_area(d) end end
+      width_go(d, hs, ws, ar, i + 1, cnt, if river do NativeArray.set_f32(out, i, 2.0 *. Math.pow(area /. d_river_min_area(d), 0.375)) else out end)
+    end
+  end
+
+  -- 1 for every sample a river flows into
+  pfn fed_go(rcv : NativeIntArr, wd : NativeF32Arr, i : Int, cnt : Int, fed : NativeIntArr) : NativeIntArr do
+    if i >= cnt do fed
+    else
+      let r = NativeArray.get_int(rcv, i)
+      let into = if r < 0 do false else NativeArray.get_f32(wd, i) > 0.0 end
+      fed_go(rcv, wd, i + 1, cnt, if into do NativeArray.set_int(fed, r, 1) else fed end)
+    end
+  end
+
+  pfn x_of(d : Def, i : Int) : Float do int_to_float(i % d_n(d) - d_n(d) / 2) *. d_step(d) end
+  pfn z_of(d : Def, i : Int) : Float do int_to_float(i / d_n(d) - d_n(d) / 2) *. d_step(d) end
+
+  -- from river sample i down its receivers while they are river; the first
+  -- that is not (sea or lake) closes the line at the last width
+  pfn trace_go(d : Def, rcv : NativeIntArr, wd : NativeF32Arr, i : Int, left : Int, acc : List((Float, Float, Float))) : List((Float, Float, Float)) do
+    let w = NativeArray.get_f32(wd, i)
+    let here = Cons((x_of(d, i), z_of(d, i), w), acc)
+    let r = NativeArray.get_int(rcv, i)
+    if r < 0 do List.reverse(here)
+    else if left <= 0 do List.reverse(here)
+    else if NativeArray.get_f32(wd, r) > 0.0 do trace_go(d, rcv, wd, r, left - 1, here)
+    else List.reverse(Cons((x_of(d, r), z_of(d, r), w), here)) end end end
+  end
+
+  -- a polyline from every river sample no river flows into, in index order
+  pfn heads_go(d : Def, rcv : NativeIntArr, wd : NativeF32Arr, fed : NativeIntArr, i : Int, acc : List(List((Float, Float, Float)))) : List(List((Float, Float, Float))) do
+    if i < 0 do acc
+    else if NativeArray.get_f32(wd, i) <= 0.0 do heads_go(d, rcv, wd, fed, i - 1, acc)
+    else if NativeArray.get_int(fed, i) == 1 do heads_go(d, rcv, wd, fed, i - 1, acc)
+    else heads_go(d, rcv, wd, fed, i - 1, Cons(trace_go(d, rcv, wd, i, d_n(d) * d_n(d), Nil), acc)) end end end
+  end
+
+  -- ── Sites ────────────────────────────────────────────────────────────────
+  -- the height range over the 3 x 3 samples around interior sample i
+  pfn range_go(hs : NativeF32Arr, n : Int, i : Int, t : Int, lo : Float, hi : Float) : Float do
+    if t >= 9 do hi -. lo
+    else
+      let v = NativeArray.get_f32(hs, i + (t % 3 - 1) + n * (t / 3 - 1))
+      range_go(hs, n, i, t + 1, if v < lo do v else lo end, if v > hi do v else hi end)
+    end
+  end
+
+  pfn candidate(d : Def, hs : NativeF32Arr, ws : NativeF32Arr, wd : NativeF32Arr, i : Int) : Bool do
+    let n = d_n(d)
+    let x = i % n
+    let z = i / n
+    if x < 1 || z < 1 || x > n - 2 || z > n - 2 do false
+    else if NativeArray.get_f32(hs, i) <= d_sea(d) do false
+    else if NativeArray.get_f32(ws, i) >= 0.0 do false
+    else if NativeArray.get_f32(wd, i) > 0.0 do false
+    else range_go(hs, n, i, 0, 1000000.0, 0.0 -. 1000000.0) <= d_site_flat(d) end end end end
+  end
+
+  -- every candidate as (rank, index), last index first
+  pfn candidates_go(d : Def, seed : Int, hs : NativeF32Arr, ws : NativeF32Arr, wd : NativeF32Arr, i : Int, cnt : Int, acc : List((Int, Int))) : List((Int, Int)) do
+    if i >= cnt do acc
+    else if candidate(d, hs, ws, wd, i) do candidates_go(d, seed, hs, ws, wd, i + 1, cnt, Cons((Sd3.cell(seed, salt_site(), i % d_n(d), 0, i / d_n(d)), i), acc))
+    else candidates_go(d, seed, hs, ws, wd, i + 1, cnt, acc) end end
+  end
+
+  pfn ranked_before(a : (Int, Int), b : (Int, Int)) : Bool do
+    match a do
+      (ra, ia) ->
+        match b do
+          (rb, ib) -> if ra != rb do ra < rb else ia < ib end
+        end
+    end
+  end
+
+  pfn dist(ax : Float, az : Float, bx : Float, bz : Float) : Float do
+    let dx = ax -. bx
+    let dz = az -. bz
+    Math.sqrt(dx *. dx +. dz *. dz)
+  end
+
+  pfn clear(ss : List(Site), x : Float, z : Float, spacing : Float) : Bool do
+    match ss do
+      Nil -> true
+      Cons(s, rest) -> if dist(s_x(s), s_z(s), x, z) < spacing do false else clear(rest, x, z, spacing) end
+    end
+  end
+
+  -- candidates in rank order, each taken when spaced from those taken, until site_count
+  pfn take_go(d : Def, hs : NativeF32Arr, rs : NativeIntArr, cs : List((Int, Int)), got : Int, acc : List(Site)) : List(Site) do
+    if got >= d_site_count(d) do List.reverse(acc)
+    else
+      match cs do
+        Nil -> List.reverse(acc)
+        Cons((_, i), rest) ->
+          let x = x_of(d, i)
+          let z = z_of(d, i)
+          if clear(acc, x, z, d_site_spacing(d)) do take_go(d, hs, rs, rest, got + 1, Cons(Site(x, z, NativeArray.get_f32(hs, i), 12.0, NativeArray.get_int(rs, i), got), acc))
+          else take_go(d, hs, rs, rest, got, acc) end
+      end
+    end
+  end
+
+  doc "Build the atlas for a seed: the island mask, erosion, the flood (lakes, filled hollows, receivers), drainage and rivers, the regions, then the sites."
   fn build(d : Def, seed : Int) : Atlas do
     let n = d_n(d)
     let cnt = n * n
@@ -133,12 +303,22 @@ mod Strata.Atlas do
     let r = d_radius(d)
     let hs = NativeArray.make_f32(cnt, 0.0)
     let k = Nz.field2(Nz.settings(0, 4, 2.0, 0.5, 1, 0.3 *. r), Sd3.mix(seed, salt_mask()), 2.0 /. r, x0, x0, d_step(d), n, n, hs)
-    let hs2 = match shape_go(hs, NativeArray.make_f32(cnt, 0.0), d, 0) do (h1, ms) -> erode(d, seed, h1, ms) end
-    let cells = NativeArray.make_f32(cnt, 0.0)
-    let rz = d_region_size(d)
-    let k2 = Nz.field2(Nz.settings(2, 1, 2.0, 0.5, 0, 0.25 *. rz), Sd3.mix(seed, salt_region()), 1.0 /. rz, x0, x0, d_step(d), n, n, cells)
-    let rs = quantise_go(NativeArray.make_int(cnt, 0), cells, hs2, d, 0)
-    Atlas(d, hs2, rs, NativeArray.make_f32(cnt, 0.0 -. 1.0), NativeArray.make_int(cnt, 0 - 1), NativeArray.make_f32(cnt, 0.0), NativeArray.make_f32(cnt, 0.0), Nil)
+    let hs1 = match shape_go(hs, NativeArray.make_f32(cnt, 0.0), d, 0) do (h1, ms) -> erode(d, seed, h1, ms) end
+    match Strata.Flood.fill(n, hs1, d_sea(d)) do
+      (sp, rcv) ->
+        match lake_go(hs1, sp, d_lake_margin(d), 0, cnt, NativeArray.make_f32(cnt, 0.0), NativeArray.make_f32(cnt, 0.0 -. 1.0)) do
+          (hs2, ws) ->
+            let ar = area_go(rcv, Strata.Erosion.order(n, rcv), cnt - 1, NativeArray.make_f32(cnt, d_step(d) *. d_step(d)))
+            let wd = width_go(d, hs2, ws, ar, 0, cnt, NativeArray.make_f32(cnt, 0.0))
+            let lines = heads_go(d, rcv, wd, fed_go(rcv, wd, 0, cnt, NativeArray.make_int(cnt, 0)), cnt - 1, Nil)
+            let cells = NativeArray.make_f32(cnt, 0.0)
+            let rz = d_region_size(d)
+            let k2 = Nz.field2(Nz.settings(2, 1, 2.0, 0.5, 0, 0.25 *. rz), Sd3.mix(seed, salt_region()), 1.0 /. rz, x0, x0, d_step(d), n, n, cells)
+            let rs = quantise_go(NativeArray.make_int(cnt, 0), cells, hs2, d, 0)
+            let ranked = List.sort_by(candidates_go(d, seed, hs2, ws, wd, 0, cnt, Nil), fn (p, q) -> ranked_before(p, q))
+            Atlas(d, hs2, rs, ws, rcv, ar, wd, take_go(d, hs2, rs, ranked, 0, Nil), lines)
+        end
+    end
   end
 
   -- ── Sampling ─────────────────────────────────────────────────────────────
@@ -147,6 +327,9 @@ mod Strata.Atlas do
 
   doc "The region of sample (i, j): 0..region_count-1 on land, -1 in the sea."
   fn region_ij(a : Atlas, i : Int, j : Int) : Int do NativeArray.get_int(regions(a), i + n(a) * j) end
+
+  doc "The sample that sample (i, j) drains into, as an index i + n * j over the filled surface; -1 for an outlet (the sea, or the grid's edge)."
+  fn receiver_ij(a : Atlas, i : Int, j : Int) : Int do NativeArray.get_int(receivers(a), i + n(a) * j) end
 
   -- grid coordinate of a position: sample i is at gx = i
   pfn grid(a : Atlas, m : Float) : Float do m /. step(a) +. int_to_float(n(a) / 2) end
@@ -203,6 +386,20 @@ mod Strata.Atlas do
     if k < 0 do 0.0 else NativeArray.get_f32(drainages(a), k) end
   end
 
+  pfn nearest_go(ss : List(Site), xm : Float, zm : Float, best : Option(Site), bd : Float) : Option(Site) do
+    match ss do
+      Nil -> best
+      Cons(s, rest) ->
+        let e = dist(s_x(s), s_z(s), xm, zm)
+        if e < bd do nearest_go(rest, xm, zm, Some(s), e) else nearest_go(rest, xm, zm, best, bd) end
+    end
+  end
+
+  doc "The site nearest (xm, zm) no more than `reach` metres away, or None; of two at the same distance, the one taken first."
+  fn site_near(a : Atlas, xm : Float, zm : Float, reach : Float) : Option(Site) do
+    nearest_go(sites(a), xm, zm, None, reach +. 0.000001)
+  end
+
   -- ── Hash ─────────────────────────────────────────────────────────────────
   pfn prime() : Int do 1000000007 end
   pfn fold(h : Int, v : Int) : Int do ((h * 1000003 + v) % prime() + prime()) % prime() end
@@ -227,7 +424,16 @@ mod Strata.Atlas do
     let h3 = hash_f(waters(a), 0, cnt, h2)
     let h4 = hash_i(receivers(a), 0, cnt, h3)
     let h5 = hash_f(drainages(a), 0, cnt, h4)
-    hash_f(widths(a), 0, cnt, h5)
+    let h6 = hash_f(widths(a), 0, cnt, h5)
+    let h7 = fold(fold(fold(fold(fold(h6, q(d_river_min_area(d))), q(d_lake_margin(d))), d_site_count(d)), q(d_site_spacing(d))), q(d_site_flat(d)))
+    hash_sites(sites(a), h7)
+  end
+
+  pfn hash_sites(ss : List(Site), h : Int) : Int do
+    match ss do
+      Nil -> h
+      Cons(s, rest) -> hash_sites(rest, fold(fold(fold(fold(fold(fold(h, q(s_x(s))), q(s_z(s))), q(s_floor(s))), q(s_radius(s))), s_region(s)), s_index(s)))
+    end
   end
 
   -- ── Images ───────────────────────────────────────────────────────────────
@@ -262,19 +468,28 @@ mod Strata.Atlas do
 
   pfn region3(r : Int, acc : List(String)) : List(String) do if r < 0 do black3(acc) else hue3(r, acc) end end
 
+  -- drainage on a log scale from one sample's area (base) to hi
+  pfn log3(v : Float, base : Float, hi : Float, acc : List(String)) : List(String) do
+    if v <= 0.0 do black3(acc)
+    else
+      let top = Math.log(hi /. base)
+      grey3(if top < 0.000001 do 1.0 else Math.log(v /. base) /. top end, acc)
+    end
+  end
+
   pfn pixels_go(a : Atlas, layer : Int, hi : Float, i : Int, cnt : Int, acc : List(String)) : List(String) do
     if i >= cnt do List.reverse(acc)
     else
       let next = if layer == 0 do scaled3(NativeArray.get_f32(heights(a), i), 0.0 -. 1000000.0, sea(a) -. 20.0, hi, acc)
         else if layer == 1 do region3(NativeArray.get_int(regions(a), i), acc)
         else if layer == 2 do scaled3(NativeArray.get_f32(waters(a), i), 0.0 -. 1.0, sea(a) -. 20.0, hi, acc)
-        else if layer == 3 do scaled3(NativeArray.get_f32(drainages(a), i), 0.0, 0.0, hi, acc)
+        else if layer == 3 do log3(NativeArray.get_f32(drainages(a), i), step(a) *. step(a), hi, acc)
         else scaled3(NativeArray.get_f32(widths(a), i), 0.0, 0.0, hi, acc) end end end end
       pixels_go(a, layer, hi, i + 1, cnt, next)
     end
   end
 
-  doc "A layer as a P6 image, n x n bytes of RGB: 0 height (sea - 20 m to the highest sample), 1 region (a hue per id), 2 water, 3 drainage, 4 river width (grey, black for none)."
+  doc "A layer as a P6 image, n x n bytes of RGB: 0 height (sea - 20 m to the highest sample), 1 region (a hue per id), 2 lake level (sea - 20 m to the highest), 3 drainage (log scale from one sample's area to the most), 4 river width (0 to the widest); grey, black for none."
   fn layer_ppm(a : Atlas, layer : Int) : String do
     let cnt = n(a) * n(a)
     let arr = if layer == 0 do heights(a) else if layer == 2 do waters(a) else if layer == 3 do drainages(a) else widths(a) end end end

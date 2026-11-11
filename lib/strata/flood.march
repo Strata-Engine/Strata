@@ -1,0 +1,133 @@
+-- Flood — priority-flood (Barnes, Lehman and Mulla 2014) over an n x n grid of
+-- heights, index i + n * j.
+--
+-- The outlets are every edge sample and every sample at or below the sea;
+-- they go into a binary heap at their own height. The lowest is taken; each
+-- neighbour (of 8) not yet reached gets spill = max(its height, the taken
+-- spill) and the taken sample as its receiver, and goes in at its spill. So
+-- a sample's spill is the lowest level water there must reach to leave the
+-- grid or reach the sea, and its receiver was reached before it: following
+-- receivers from anywhere ends at an outlet. The heap orders by (spill,
+-- index), so the result does not depend on how ties fall.
+mod Strata.Flood do
+
+  -- the 8 neighbours: +x, -x, +z, -z, then the diagonals
+  pfn ox(d : Int) : Int do if d == 0 || d == 4 || d == 6 do 1 else if d == 1 || d == 5 || d == 7 do 0 - 1 else 0 end end end
+  pfn oz(d : Int) : Int do if d == 2 || d == 4 || d == 5 do 1 else if d == 3 || d == 6 || d == 7 do 0 - 1 else 0 end end end
+
+  pfn on_edge(n : Int, i : Int) : Bool do
+    let x = i % n
+    let z = i / n
+    x == 0 || z == 0 || x == n - 1 || z == n - 1
+  end
+
+  -- ── The heap: keys and ids side by side, smallest (key, id) at 0 ────────
+  pfn before(ks : NativeF32Arr, vs : NativeIntArr, a : Int, b : Int) : Bool do
+    let ka = NativeArray.get_f32(ks, a)
+    let kb = NativeArray.get_f32(ks, b)
+    if ka < kb do true else if ka > kb do false else NativeArray.get_int(vs, a) < NativeArray.get_int(vs, b) end end
+  end
+
+  pfn swap(ks : NativeF32Arr, vs : NativeIntArr, a : Int, b : Int) : (NativeF32Arr, NativeIntArr) do
+    let ka = NativeArray.get_f32(ks, a)
+    let va = NativeArray.get_int(vs, a)
+    let ks1 = NativeArray.set_f32(NativeArray.set_f32(ks, a, NativeArray.get_f32(ks, b)), b, ka)
+    let vs1 = NativeArray.set_int(NativeArray.set_int(vs, a, NativeArray.get_int(vs, b)), b, va)
+    (ks1, vs1)
+  end
+
+  pfn up(ks : NativeF32Arr, vs : NativeIntArr, i : Int) : (NativeF32Arr, NativeIntArr) do
+    if i == 0 do (ks, vs)
+    else
+      let p = (i - 1) / 2
+      if before(ks, vs, i, p) do (match swap(ks, vs, i, p) do (k1, v1) -> up(k1, v1, p) end) else (ks, vs) end
+    end
+  end
+
+  pfn down(ks : NativeF32Arr, vs : NativeIntArr, i : Int, size : Int) : (NativeF32Arr, NativeIntArr) do
+    let l = 2 * i + 1
+    let r = l + 1
+    let m1 = if l < size do (if before(ks, vs, l, i) do l else i end) else i end
+    let m = if r < size do (if before(ks, vs, r, m1) do r else m1 end) else m1 end
+    if m == i do (ks, vs) else (match swap(ks, vs, i, m) do (k1, v1) -> down(k1, v1, m, size) end) end
+  end
+
+  pfn push(ks : NativeF32Arr, vs : NativeIntArr, size : Int, key : Float, id : Int) : (NativeF32Arr, NativeIntArr) do
+    up(NativeArray.set_f32(ks, size, key), NativeArray.set_int(vs, size, id), size)
+  end
+
+  -- the heap without its top (size is the size before)
+  pfn drop_top(ks : NativeF32Arr, vs : NativeIntArr, size : Int) : (NativeF32Arr, NativeIntArr) do
+    let last = size - 1
+    down(NativeArray.set_f32(ks, 0, NativeArray.get_f32(ks, last)), NativeArray.set_int(vs, 0, NativeArray.get_int(vs, last)), 0, last)
+  end
+
+  -- ── The flood ────────────────────────────────────────────────────────────
+  pfn copy_go(src : NativeF32Arr, i : Int, cnt : Int, dst : NativeF32Arr) : NativeF32Arr do
+    if i >= cnt do dst else copy_go(src, i + 1, cnt, NativeArray.set_f32(dst, i, NativeArray.get_f32(src, i))) end
+  end
+
+  -- every outlet into the heap; returns the heap, its size and the seen marks
+  pfn seed_go(n : Int, h : NativeF32Arr, sea : Float, i : Int, ks : NativeF32Arr, vs : NativeIntArr, size : Int, seen : NativeIntArr) : (NativeF32Arr, NativeIntArr, Int, NativeIntArr) do
+    if i >= n * n do (ks, vs, size, seen)
+    else
+      let v = NativeArray.get_f32(h, i)
+      if on_edge(n, i) || v <= sea do
+        match push(ks, vs, size, v, i) do
+          (k1, v1) -> seed_go(n, h, sea, i + 1, k1, v1, size + 1, NativeArray.set_int(seen, i, 1))
+        end
+      else seed_go(n, h, sea, i + 1, ks, vs, size, seen) end
+    end
+  end
+
+  -- the 8 neighbours of c (spill s) from direction d on
+  pfn reach_go(n : Int, h : NativeF32Arr, c : Int, s : Float, d : Int, ks : NativeF32Arr, vs : NativeIntArr, size : Int, sp : NativeF32Arr, rcv : NativeIntArr, seen : NativeIntArr) : (NativeF32Arr, NativeIntArr, Int, NativeF32Arr, NativeIntArr, NativeIntArr) do
+    if d >= 8 do (ks, vs, size, sp, rcv, seen)
+    else
+      let x = c % n + ox(d)
+      let z = c / n + oz(d)
+      if x < 0 || z < 0 || x >= n || z >= n do reach_go(n, h, c, s, d + 1, ks, vs, size, sp, rcv, seen)
+      else
+        let k = x + n * z
+        if NativeArray.get_int(seen, k) == 1 do reach_go(n, h, c, s, d + 1, ks, vs, size, sp, rcv, seen)
+        else
+          let hk = NativeArray.get_f32(h, k)
+          let v = if hk > s do hk else s end
+          match push(ks, vs, size, v, k) do
+            (k1, v1) -> reach_go(n, h, c, s, d + 1, k1, v1, size + 1, NativeArray.set_f32(sp, k, v), NativeArray.set_int(rcv, k, c), NativeArray.set_int(seen, k, 1))
+          end
+        end
+      end
+    end
+  end
+
+  pfn flood_go(n : Int, h : NativeF32Arr, ks : NativeF32Arr, vs : NativeIntArr, size : Int, sp : NativeF32Arr, rcv : NativeIntArr, seen : NativeIntArr) : (NativeF32Arr, NativeIntArr) do
+    if size <= 0 do (sp, rcv)
+    else
+      let s = NativeArray.get_f32(ks, 0)
+      let c = NativeArray.get_int(vs, 0)
+      match drop_top(ks, vs, size) do
+        (k1, v1) ->
+          match reach_go(n, h, c, s, 0, k1, v1, size - 1, sp, rcv, seen) do
+            (k2, v2, z2, sp2, r2, s2) -> flood_go(n, h, k2, v2, z2, sp2, r2, s2)
+          end
+      end
+    end
+  end
+
+  doc """
+  Priority-flood an n x n grid of heights: (spill, receivers). The spill of a
+  sample is its height raised to the lowest level water there must reach to
+  leave by an outlet (an edge sample, or one at or below `sea`); outlets keep
+  their height. Receivers run over the filled surface, each to the neighbour
+  the flood reached it from (-1 for an outlet), so following them from any
+  sample ends at an outlet, never climbing in spill.
+  """
+  fn fill(n : Int, height : NativeF32Arr, sea : Float) : (NativeF32Arr, NativeIntArr) do
+    let cnt = n * n
+    let sp = copy_go(height, 0, cnt, NativeArray.make_f32(cnt, 0.0))
+    match seed_go(n, height, sea, 0, NativeArray.make_f32(cnt, 0.0), NativeArray.make_int(cnt, 0), 0, NativeArray.make_int(cnt, 0)) do
+      (ks, vs, size, seen) -> flood_go(n, height, ks, vs, size, sp, NativeArray.make_int(cnt, 0 - 1), seen)
+    end
+  end
+end
