@@ -1,0 +1,93 @@
+#version 460
+// Chunk culling. One invocation per chunk slot: test the chunk's box against
+// the view and write one indirect draw command per geometry range, with the
+// range's count when the chunk is in view and zero when it is not.
+//
+// The driver this was built on (MoltenVK) replays a multi-draw as one Metal
+// draw per command and charges CPU for each, drawn or not: about 84 ns a
+// command, measured (RESULTS.md, "The chunk table, compute culling, indirect
+// draws"). So the commands of a range are COMPACTED: a visible chunk takes
+// the next free index from an atomic counter, and `draw_slot` records which
+// slot each command belongs to, since gl_DrawID no longer says. The CPU
+// zero-fills the list up to the length it will submit, and reads the
+// counters two frames later to choose the next length: a GPU-written draw
+// count without drawIndirectCount.
+//
+// The translucent range (2) is not compacted here: its commands must come
+// out in a fixed order, so command i stays slot i.
+layout(local_size_x = 64) in;
+
+struct Chunk {
+    ivec4 origin_level;     // xyz: low corner in voxels; w: bits 0-7 level, bit 8 in use
+    uint first[6];          // per range: 0 opaque, 1 cutout, 2 translucent, 3 cross, 4 loose, 5 spare
+    uint count[6];
+};
+struct Command { uint vertexCount; uint instanceCount; uint firstVertex; uint firstInstance; };
+
+layout(set = 0, binding = 0) uniform U {
+    mat4 vp;
+    vec4 sun;
+    vec4 sky;
+    vec4 fog;
+    vec4 eye;               // w: metres per voxel
+    ivec4 misc;             // x: slots to cull; y: commands per range in the buffer
+    vec4 pal[256];
+} u;
+layout(std430, set = 0, binding = 1) readonly buffer Table { Chunk chunks[]; } table;
+layout(std430, set = 0, binding = 2) writeonly buffer Commands { Command cmds[]; } commands;
+layout(std430, set = 0, binding = 3) buffer Stats { uint counts[6]; uint chunks; uint quads; } stats;
+layout(std430, set = 0, binding = 4) writeonly buffer DrawSlot { uint slot[]; } draw_slot;
+
+// Vertices a range draws per element: quads are 4-vertex strips.
+const uint VERTS[6] = uint[6](4u, 4u, 4u, 4u, 4u, 4u);
+
+bool in_view(vec3 lo, float side) {
+    vec4 c[8];
+    for (int i = 0; i < 8; i++) {
+        vec3 p = lo + side * vec3(float(i & 1), float((i >> 1) & 1), float((i >> 2) & 1));
+        c[i] = u.vp * vec4(p, 1.0);
+    }
+    // OpenGL clip volume: -w <= x, y, z <= w. Outside one plane with all
+    // eight corners means out of view.
+    for (int axis = 0; axis < 3; axis++) {
+        int below = 0, above = 0;
+        for (int i = 0; i < 8; i++) {
+            if (c[i][axis] < -c[i].w) below++;
+            if (c[i][axis] > c[i].w) above++;
+        }
+        if (below == 8 || above == 8) return false;
+    }
+    return true;
+}
+
+void main() {
+    uint slot = gl_GlobalInvocationID.x;
+    if (slot >= uint(u.misc.x)) return;
+    Chunk ch = table.chunks[slot];
+    int level = ch.origin_level.w & 255;
+    bool used = (ch.origin_level.w & 256) != 0;
+    float scale = u.eye.w;
+    bool vis = used && in_view(vec3(ch.origin_level.xyz) * scale, float(32 << level) * scale);
+    uint drawn = 0u;
+    uint stride = uint(u.misc.y);
+    for (uint r = 0u; r < 3u; r++) {
+        uint n = vis ? ch.count[r] : 0u;
+        Command c;
+        c.vertexCount = VERTS[r];
+        c.instanceCount = n;
+        c.firstVertex = 0u;
+        c.firstInstance = ch.first[r];
+        if (r == 2u) {
+            commands.cmds[r * stride + slot] = c;
+            draw_slot.slot[r * stride + slot] = slot;
+        } else if (n > 0u) {
+            uint at = atomicAdd(stats.counts[r], 1u);
+            if (at < stride) {
+                commands.cmds[r * stride + at] = c;
+                draw_slot.slot[r * stride + at] = slot;
+            }
+        }
+        drawn += n;
+    }
+    if (drawn > 0u) { atomicAdd(stats.chunks, 1u); atomicAdd(stats.quads, drawn); }
+}

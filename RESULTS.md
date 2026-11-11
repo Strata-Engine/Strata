@@ -124,3 +124,34 @@ So at this scene size the old path is nowhere near a limit; the GPU-driven
 path that follows is about scaling to many more chunks, not about this
 number. With the quad buffer cut to 20 000 quads the same scene refuses
 232 uploads and carries on without a crash.
+
+## The chunk table, compute culling, indirect draws (Task 3)
+
+Compute shaders and multi-draw indirect both work on MoltenVK. The open
+question was what a command that draws nothing costs. Measured offscreen
+on scene 1 with a FIXED command list (one command per slot per range,
+zero count when culled) and extra empty commands appended to each of the
+three indirect calls:
+
+| extra empty commands per call | frame rate | CPU in the shim | GPU |
+|---|---|---|---|
+| 0 (9 261 commands in all) | 1 480 fps | 0.46 ms | 0.49 ms |
+| 10 000 | 345 fps | 2.87 ms | 1.7 ms |
+| 50 000 | 78 fps | 12.9 ms | 6.9 ms |
+
+That is about 84 ns of CPU and 43 ns of GPU per command, drawn or not:
+MoltenVK replays a multi-draw as one Metal draw per command. The design's
+rule was to compact if 50 000 empty commands cost more than 0.5 ms; they
+cost 12.5 ms. So the list is COMPACTED: the compute pass packs visible
+commands to the front through an atomic counter and records which slot
+each belongs to, the CPU zero-fills the length it is about to submit, and
+it reads the counters back to choose the next length (what was seen, plus
+a quarter, plus 256). With two frames in flight the count it reads is two
+frames old, not one as the design sketched; if a pass overflows its
+allowance the next submit covers every slot, so nothing stays missing
+beyond two frames.
+
+Scene 1 offscreen with the compacted list: 1 950 fps, 0.28 to 0.31 ms of
+CPU in the shim, 3 draw calls. Most of that CPU is the translucent range,
+which is still one command per slot (3 087 of them) until Task 6 gives it
+its own short sorted list.

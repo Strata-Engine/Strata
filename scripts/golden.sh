@@ -29,8 +29,11 @@ overview:STRATA_SCENE=1
 shore:STRATA_SCENE=2
 forest:STRATA_SCENE=3
 overview-rebuilt:STRATA_SCENE=1 STRATA_REBUILD_AT=30 GOLDEN_AS=overview
+dug-out:STRATA_SCENE=4
 overview-offscreen:STRATA_SCENE=1 STRATA_OFFSCREEN=1 GOLDEN_AS=overview
 '
+# indirect draw calls a frame must issue, whatever the scene holds
+EXPECT_DRAWS=3
 FAILED=0
 for line in $(echo "$SCENES" | tr ' ' ','); do
   name="${line%%:*}"; envs="$(echo "${line#*:}" | tr ',' ' ')"
@@ -40,6 +43,9 @@ for line in $(echo "$SCENES" | tr ' ' ','); do
   if ! env MARCH_PIN_MAIN=1 STRATA_RADIUS=6 STRATA_SIZE=640x400 STRATA_FRAMES=60 STRATA_SHOT="$shot" $envs \
        ./viewer/.march/build/release/strata_viewer > "$OUT/$name.log" 2>&1 || [ ! -s "$shot" ]; then
     echo "FAIL: $name did not render"; tail -5 "$OUT/$name.log"; FAILED=1; continue
+  fi
+  if ! grep -q "draw calls $EXPECT_DRAWS\$" "$OUT/$name.log"; then
+    echo "FAIL: $name did not issue $EXPECT_DRAWS draw calls: $(grep 'done after' "$OUT/$name.log")"; FAILED=1; continue
   fi
   if [ $UPDATE -eq 1 ]; then
     [ "$stored" = "$name" ] && gzip -9 -c "$shot" > "test/golden/$name.ppm.gz" && echo "updated $name"

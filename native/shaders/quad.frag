@@ -10,6 +10,7 @@ layout(set = 0, binding = 0) uniform U {
     vec4 sky;
     vec4 fog;
     vec4 eye;
+    ivec4 misc;
     vec4 pal[256];
 } u;
 

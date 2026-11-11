@@ -37,16 +37,30 @@ static inline void   *narr_data(void *a) { return (char *)a + NARR_HDR; }
 #define SV_FRAMES 2            /* frames in flight */
 #define SV_MAX_KEYS 512
 
+#define SV_RANGES 6            /* 0 opaque, 1 cutout, 2 translucent, 3 cross, 4 loose, 5 spare */
+#define SV_PAD_MAX 65536       /* extra zero-count commands sv_pad_commands may append */
+#define SV_CMD_STRIDE (SV_MAX_SLOTS + SV_PAD_MAX)   /* commands per range in the indirect buffer */
+
 typedef SaRange Range;
+
+/* One entry of the chunk table, as the shaders read it (std430, 64 bytes).
+ * The CPU writes entries straight into the mapped buffer. A frame in flight
+ * may read an entry while it changes; either version is drawable, because a
+ * replaced range stays intact for two frames. */
 typedef struct {
-    Range layer[SV_LAYERS];
-    float origin[3];           /* chunk's low corner, in voxels */
-    int   used;
-} Slot;
+    int32_t  origin[3];        /* chunk's low corner, in voxels */
+    int32_t  level_flags;      /* bits 0-7 level, bit 8 in use */
+    uint32_t first[SV_RANGES];
+    uint32_t count[SV_RANGES];
+} ChunkEntry;
+#define SV_IN_USE 256
 
 /* What one frame in flight owns. */
 typedef struct {
     VkCommandBuffer cmd;
+    VkDescriptorSet dset;      /* differs between frames only in the stats buffer */
+    VkBuffer stats; VkDeviceMemory stats_mem; uint32_t *stats_map;   /* written by the cull pass: commands per range [6], chunks, quads */
+    int stats_valid;           /* the cull pass has run for this Frame at least once */
     VkFence fence;             /* signalled when the frame's commands have run */
     VkSemaphore sem_image, sem_done;
     int ts_written;            /* its two timestamp queries hold values */
@@ -74,10 +88,15 @@ static struct {
     int offscreen;
     VkRenderPass pass, pass_off;
     VkPipelineLayout layout;
-    VkPipeline pipe_opaque, pipe_blend;
+    VkPipeline pipe_opaque, pipe_blend, pipe_cull;
     VkDescriptorSetLayout dsl;
     VkDescriptorPool dpool;
-    VkDescriptorSet dset;
+    VkBuffer table; VkDeviceMemory table_mem; ChunkEntry *entries;      /* the chunk table, SV_MAX_SLOTS entries */
+    VkBuffer cmds;  VkDeviceMemory cmds_mem;                             /* indirect commands, SV_RANGES * SV_CMD_STRIDE */
+    VkBuffer dslot; VkDeviceMemory dslot_mem;                            /* the slot each command draws, same shape */
+    uint32_t submit[SV_RANGES];    /* commands the next indirect call of each range will submit */
+    uint32_t hi_slot;              /* one past the highest slot ever used: how many the cull pass looks at */
+    uint32_t pad_cmds;             /* zero-count commands appended to each indirect call (measurement) */
     VkCommandPool cpool;
     Frame frames[SV_FRAMES];
     uint64_t frame_no;         /* frames begun; frame_no % SV_FRAMES picks the Frame */
@@ -87,7 +106,6 @@ static struct {
     int vsync_off;                 /* ask for the immediate present mode */
     double stat[4];                /* last frame: CPU ms, ms waiting, draw calls, GPU ms */
     VkQueryPool qpool; int have_ts; float ts_period;
-    Slot *slots;
     int64_t refused;               /* uploads turned away because the buffer was full */
     /* stats of the last frame */
     int64_t drawn_chunks, drawn_quads;
@@ -99,7 +117,8 @@ static struct {
 
 /* The uniform block: view-projection, sun, sky, fog, voxel scale, then 256
  * palette colours indexed by a quad's texture id. Must match the shaders. */
-#define UBO_FLOATS (16 + 4 + 4 + 4 + 4 + 256 * 4)
+#define UBO_FLOATS (16 + 4 + 4 + 4 + 4 + 4 + 256 * 4)
+#define UBO_PAL 36            /* float offset of the palette */
 
 static void die(const char *what, int code) {
     fprintf(stderr, "strata_vk: %s failed (%d)\n", what, code);
@@ -365,8 +384,16 @@ int64_t sv_open(int64_t w, int64_t h, int64_t capture_mouse, int64_t quad_capaci
         for (uint32_t i = 0; i < nde; i++) if (strcmp(dprops[i].extensionName, "VK_KHR_portability_subset") == 0) dext[nd++] = "VK_KHR_portability_subset";
         free(dprops);
     }
-    VkDeviceCreateInfo dci = { .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, .queueCreateInfoCount = 1, .pQueueCreateInfos = &qci,
-        .enabledExtensionCount = nd, .ppEnabledExtensionNames = dext };
+    /* the GPU-driven path needs these two; both are in the project's baseline */
+    VkPhysicalDeviceFeatures have = { 0 }; vkGetPhysicalDeviceFeatures(g.phys, &have);
+    VkPhysicalDeviceVulkan11Features have11 = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES };
+    VkPhysicalDeviceFeatures2 have2 = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &have11 };
+    vkGetPhysicalDeviceFeatures2(g.phys, &have2);
+    if (!have.multiDrawIndirect || !have11.shaderDrawParameters) { die("device lacks multiDrawIndirect or shaderDrawParameters", 0); return 0; }
+    VkPhysicalDeviceFeatures feats = { .multiDrawIndirect = VK_TRUE };
+    VkPhysicalDeviceVulkan11Features feats11 = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES, .shaderDrawParameters = VK_TRUE };
+    VkDeviceCreateInfo dci = { .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, .pNext = &feats11, .queueCreateInfoCount = 1, .pQueueCreateInfos = &qci,
+        .enabledExtensionCount = nd, .ppEnabledExtensionNames = dext, .pEnabledFeatures = &feats };
     VKOK(vkCreateDevice(g.phys, &dci, NULL, &g.dev), "vkCreateDevice");
     vkGetDeviceQueue(g.dev, g.qfam, 0, &g.queue);
 
@@ -376,11 +403,19 @@ int64_t sv_open(int64_t w, int64_t h, int64_t capture_mouse, int64_t quad_capaci
     if (!make_framebuffers()) return 0;
     g.swap_ok = 1;
 
-    VkDescriptorSetLayoutBinding dslb = { .binding = 0, .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, .descriptorCount = 1,
-        .stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT };
-    VkDescriptorSetLayoutCreateInfo dsli = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 1, .pBindings = &dslb };
+    /* one set layout for every pipeline: 0 uniforms, 1 chunk table, 2 indirect commands, 3 cull statistics, 4 command -> slot */
+    VkDescriptorSetLayoutBinding dslb[5] = {
+        { .binding = 0, .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, .descriptorCount = 1,
+          .stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT },
+        { .binding = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1,
+          .stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_COMPUTE_BIT },
+        { .binding = 2, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT },
+        { .binding = 3, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT },
+        { .binding = 4, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1,
+          .stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_COMPUTE_BIT } };
+    VkDescriptorSetLayoutCreateInfo dsli = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 5, .pBindings = dslb };
     VKOK(vkCreateDescriptorSetLayout(g.dev, &dsli, NULL, &g.dsl), "descriptor set layout");
-    VkPushConstantRange pcr = { .stageFlags = VK_SHADER_STAGE_VERTEX_BIT, .offset = 0, .size = 16 };
+    VkPushConstantRange pcr = { .stageFlags = VK_SHADER_STAGE_VERTEX_BIT, .offset = 0, .size = 4 };   /* where the call's range starts in draw_slot */
     VkPipelineLayoutCreateInfo pli = { .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = 1, .pSetLayouts = &g.dsl,
         .pushConstantRangeCount = 1, .pPushConstantRanges = &pcr };
     VKOK(vkCreatePipelineLayout(g.dev, &pli, NULL, &g.layout), "pipeline layout");
@@ -395,18 +430,41 @@ int64_t sv_open(int64_t w, int64_t h, int64_t capture_mouse, int64_t quad_capaci
     g.ubo_map = map;
     memset(g.ubo_map, 0, UBO_FLOATS * 4);
     sa_init(&g_quads, g.quad_cap);
-    g.slots = calloc(SV_MAX_SLOTS, sizeof(Slot));
-    if (!g.slots) { die("slot table", 0); return 0; }
+    if (!make_buffer((VkDeviceSize)SV_MAX_SLOTS * sizeof(ChunkEntry), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &g.table, &g.table_mem, &map)) return 0;
+    g.entries = map;
+    memset(g.entries, 0, (size_t)SV_MAX_SLOTS * sizeof(ChunkEntry));
+    VkDeviceSize cmd_bytes = (VkDeviceSize)SV_RANGES * SV_CMD_STRIDE * 16;
+    if (!make_buffer(cmd_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, &g.cmds, &g.cmds_mem, &map)) return 0;
+    memset(map, 0, (size_t)cmd_bytes);            /* the padding commands stay zero-count for good */
+    vkUnmapMemory(g.dev, g.cmds_mem);
+    if (!make_buffer((VkDeviceSize)SV_RANGES * SV_CMD_STRIDE * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &g.dslot, &g.dslot_mem, &map)) return 0;
+    memset(map, 0, (size_t)SV_RANGES * SV_CMD_STRIDE * 4);
+    vkUnmapMemory(g.dev, g.dslot_mem);
 
-    VkDescriptorPoolSize dps = { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1 };
-    VkDescriptorPoolCreateInfo dpi = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = 1, .poolSizeCount = 1, .pPoolSizes = &dps };
+    VkDescriptorPoolSize dps[2] = { { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, SV_FRAMES }, { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4 * SV_FRAMES } };
+    VkDescriptorPoolCreateInfo dpi = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = SV_FRAMES, .poolSizeCount = 2, .pPoolSizes = dps };
     VKOK(vkCreateDescriptorPool(g.dev, &dpi, NULL, &g.dpool), "descriptor pool");
-    VkDescriptorSetAllocateInfo dai = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, .descriptorPool = g.dpool, .descriptorSetCount = 1, .pSetLayouts = &g.dsl };
-    VKOK(vkAllocateDescriptorSets(g.dev, &dai, &g.dset), "descriptor set");
-    VkDescriptorBufferInfo dbi = { g.ubo, 0, UBO_FLOATS * 4 };
-    VkWriteDescriptorSet wds = { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = g.dset, .dstBinding = 0, .descriptorCount = 1,
-        .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, .pBufferInfo = &dbi };
-    vkUpdateDescriptorSets(g.dev, 1, &wds, 0, NULL);
+    for (int f = 0; f < SV_FRAMES; f++) {
+        Frame *F = &g.frames[f];
+        if (!make_buffer(32, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &F->stats, &F->stats_mem, &map)) return 0;
+        F->stats_map = map; memset(F->stats_map, 0, 32);
+        VkDescriptorSetAllocateInfo dai = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, .descriptorPool = g.dpool, .descriptorSetCount = 1, .pSetLayouts = &g.dsl };
+        VKOK(vkAllocateDescriptorSets(g.dev, &dai, &F->dset), "descriptor set");
+        VkDescriptorBufferInfo bufs[5] = { { g.ubo, 0, UBO_FLOATS * 4 }, { g.table, 0, VK_WHOLE_SIZE }, { g.cmds, 0, VK_WHOLE_SIZE }, { F->stats, 0, 32 }, { g.dslot, 0, VK_WHOLE_SIZE } };
+        VkWriteDescriptorSet wds[5];
+        for (uint32_t b = 0; b < 5; b++)
+            wds[b] = (VkWriteDescriptorSet){ .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = F->dset, .dstBinding = b, .descriptorCount = 1,
+                .descriptorType = b == 0 ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &bufs[b] };
+        vkUpdateDescriptorSets(g.dev, 5, wds, 0, NULL);
+    }
+    {   /* the culling pipeline */
+        VkShaderModule cs = shader(strata_cull_comp, sizeof(strata_cull_comp));
+        VkComputePipelineCreateInfo ci = { .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO, .layout = g.layout,
+            .stage = { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = cs, .pName = "main" } };
+        VkResult cr = vkCreateComputePipelines(g.dev, VK_NULL_HANDLE, 1, &ci, NULL, &g.pipe_cull);
+        vkDestroyShaderModule(g.dev, cs, NULL);
+        if (cr != VK_SUCCESS) { die("vkCreateComputePipelines", (int)cr); return 0; }
+    }
 
     VkCommandPoolCreateInfo cpi = { .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, .queueFamilyIndex = g.qfam };
     VKOK(vkCreateCommandPool(g.dev, &cpi, NULL, &g.cpool), "command pool");
@@ -435,6 +493,17 @@ void sv_close(void) {
         if (g.swap) vkDestroySwapchainKHR(g.dev, g.swap, NULL);
         if (g.pipe_opaque) vkDestroyPipeline(g.dev, g.pipe_opaque, NULL);
         if (g.pipe_blend) vkDestroyPipeline(g.dev, g.pipe_blend, NULL);
+        if (g.pipe_cull) vkDestroyPipeline(g.dev, g.pipe_cull, NULL);
+        if (g.table) vkDestroyBuffer(g.dev, g.table, NULL);
+        if (g.table_mem) vkFreeMemory(g.dev, g.table_mem, NULL);
+        if (g.cmds) vkDestroyBuffer(g.dev, g.cmds, NULL);
+        if (g.cmds_mem) vkFreeMemory(g.dev, g.cmds_mem, NULL);
+        if (g.dslot) vkDestroyBuffer(g.dev, g.dslot, NULL);
+        if (g.dslot_mem) vkFreeMemory(g.dev, g.dslot_mem, NULL);
+        for (int f = 0; f < SV_FRAMES; f++) {
+            if (g.frames[f].stats) vkDestroyBuffer(g.dev, g.frames[f].stats, NULL);
+            if (g.frames[f].stats_mem) vkFreeMemory(g.dev, g.frames[f].stats_mem, NULL);
+        }
         if (g.layout) vkDestroyPipelineLayout(g.dev, g.layout, NULL);
         if (g.dpool) vkDestroyDescriptorPool(g.dev, g.dpool, NULL);
         if (g.dsl) vkDestroyDescriptorSetLayout(g.dev, g.dsl, NULL);
@@ -457,7 +526,6 @@ void sv_close(void) {
     if (g.inst) vkDestroyInstance(g.inst, NULL);
     if (g.win) glfwDestroyWindow(g.win);
     glfwTerminate();
-    free(g.slots);
     memset(&g, 0, sizeof g);
 }
 
@@ -498,7 +566,7 @@ void sv_set_offscreen(int64_t on) { g.offscreen = on ? 1 : 0; }
 int64_t sv_chunk_upload(int64_t slot, int64_t layer, void *quads, int64_t nquads, double ox, double oy, double oz) {
     if (!g.ok || slot < 0 || slot >= SV_MAX_SLOTS || layer < 0 || layer >= SV_LAYERS || nquads < 0) return 0;
     if (nquads > 0 && (!quads || narr_len(quads) < nquads * 2)) return 0;
-    Slot *s = &g.slots[slot];
+    ChunkEntry *e = &g.entries[slot];
     Range fresh = { 0, (uint32_t)nquads };
     if (nquads > 0) {
         if (!sa_alloc(&g_quads, (uint32_t)nquads, &fresh.first)) { g.refused++; return 0; }
@@ -506,20 +574,26 @@ int64_t sv_chunk_upload(int64_t slot, int64_t layer, void *quads, int64_t nquads
         memcpy(g.giga_map + (size_t)fresh.first * 2, narr_data(quads), (size_t)nquads * 8);
     }
     /* a frame in flight may still read the old range: hold it two frames instead of waiting */
-    sa_release(&g_quads, s->layer[layer], g.frame_no);
-    s->layer[layer] = fresh;
-    s->origin[0] = (float)ox; s->origin[1] = (float)oy; s->origin[2] = (float)oz;
-    s->used = 1;
+    sa_release(&g_quads, (Range){ e->first[layer], e->count[layer] }, g.frame_no);
+    e->origin[0] = (int32_t)ox; e->origin[1] = (int32_t)oy; e->origin[2] = (int32_t)oz;
+    e->first[layer] = fresh.first;
+    e->count[layer] = fresh.count;
+    e->level_flags = SV_IN_USE;
+    if ((uint32_t)slot + 1 > g.hi_slot) g.hi_slot = (uint32_t)slot + 1;
     return 1;
 }
 
 void sv_chunk_free(int64_t slot) {
     if (!g.ok || slot < 0 || slot >= SV_MAX_SLOTS) return;
-    Slot *s = &g.slots[slot];
-    if (!s->used) return;
-    for (int l = 0; l < SV_LAYERS; l++) { sa_release(&g_quads, s->layer[l], g.frame_no); s->layer[l] = (Range){ 0, 0 }; }
-    s->used = 0;
+    ChunkEntry *e = &g.entries[slot];
+    if (!(e->level_flags & SV_IN_USE)) return;
+    e->level_flags = 0;                      /* the cull pass skips it from the next frame on */
+    for (int l = 0; l < SV_LAYERS; l++) { sa_release(&g_quads, (Range){ e->first[l], e->count[l] }, g.frame_no); e->first[l] = 0; e->count[l] = 0; }
 }
+
+/* Append [n] zero-count commands to every indirect call, to measure what
+ * the driver charges for commands that draw nothing. */
+void sv_pad_commands(int64_t n) { g.pad_cmds = n < 0 ? 0 : (n > SV_PAD_MAX ? SV_PAD_MAX : (uint32_t)n); }
 
 /* ── Frame parameters ─────────────────────────────────────────────────────── */
 /* [vp] is a column-major view-projection in OpenGL clip conventions (y up,
@@ -551,30 +625,8 @@ void sv_set_eye(double x, double y, double z, double scale) {
 static float to_linear(double c) { return (float)pow(c < 0 ? 0 : c, 2.2); }
 void sv_set_palette(int64_t i, double r, double gr, double b, double a) {
     if (!g.ok || i < 0 || i >= 256) return;
-    float *p = g.ubo_map + 32 + i * 4;
+    float *p = g.ubo_map + UBO_PAL + i * 4;
     p[0] = to_linear(r); p[1] = to_linear(gr); p[2] = to_linear(b); p[3] = (float)a;
-}
-
-/* ── Culling ──────────────────────────────────────────────────────────────── */
-/* Is the chunk's box (side 32 voxels at [o], scaled) outside the clip volume
- * of the GL-convention view-projection in the uniform block? */
-static int culled(const float *m, const float *o, float scale) {
-    float c[8][4];
-    for (int i = 0; i < 8; i++) {
-        float x = (o[0] + ((i & 1) ? 32.0f : 0.0f)) * scale;
-        float y = (o[1] + ((i & 2) ? 32.0f : 0.0f)) * scale;
-        float z = (o[2] + ((i & 4) ? 32.0f : 0.0f)) * scale;
-        for (int r = 0; r < 4; r++) c[i][r] = m[r] * x + m[4 + r] * y + m[8 + r] * z + m[12 + r];
-    }
-    for (int p = 0; p < 6; p++) {
-        int out = 0;
-        for (int i = 0; i < 8; i++) {
-            float w = c[i][3], v = c[i][p >> 1];
-            if ((p & 1) ? (v > w) : (v < -w)) out++;
-        }
-        if (out == 8) return 1;
-    }
-    return 0;
 }
 
 static void write_shot(Frame *F, VkImage image, VkImageLayout layout);
@@ -613,6 +665,21 @@ int64_t sv_frame(void) {
     vkWaitForFences(g.dev, 1, &F->fence, VK_TRUE, UINT64_MAX);
     double wait_ms = (glfwGetTime() - t_start) * 1000.0;
     sa_collect(&g_quads, g.frame_no);
+    /* what this Frame's cull pass let through, two frames ago */
+    g.drawn_chunks = F->stats_map[6]; g.drawn_quads = F->stats_map[7];
+    /* How many commands to submit for each compacted range: what this Frame's
+     * cull pass counted two frames ago, plus a quarter and 256 for a view
+     * that has turned since. If that pass overflowed its allowance, or has
+     * not run yet, submit every slot once so nothing stays missing. */
+    for (int r = 0; r < SV_RANGES; r++) {
+        uint32_t seen = F->stats_map[r], allowed = g.submit[r];
+        uint32_t next = seen + seen / 4 + 256;
+        if (!F->stats_valid || seen > allowed) next = g.hi_slot;
+        g.submit[r] = next > g.hi_slot ? g.hi_slot : next;
+    }
+    g.submit[2] = g.hi_slot;                     /* the translucent range is not compacted */
+    memset(F->stats_map, 0, 32);
+    F->stats_valid = 1;
     if (g.have_ts && F->ts_written) {
         uint64_t ts[2] = { 0, 0 };
         if (vkGetQueryPoolResults(g.dev, g.qpool, q0, 2, sizeof ts, ts, sizeof ts[0], VK_QUERY_RESULT_64_BIT) == VK_SUCCESS)
@@ -633,6 +700,27 @@ int64_t sv_frame(void) {
     VkCommandBufferBeginInfo bi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
     vkBeginCommandBuffer(F->cmd, &bi);
     if (g.have_ts) { vkCmdResetQueryPool(F->cmd, g.qpool, q0, 2); vkCmdWriteTimestamp(F->cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, g.qpool, q0); }
+    /* cull: one compute invocation per slot writes the indirect commands */
+    int32_t *misc = (int32_t *)(g.ubo_map + 32);
+    misc[0] = (int32_t)g.hi_slot; misc[1] = SV_CMD_STRIDE;
+    vkCmdBindDescriptorSets(F->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g.layout, 0, 1, &F->dset, 0, NULL);
+    if (g.hi_slot > 0) {
+        /* zero the part of each compacted list that will be submitted, so
+         * commands the cull pass does not overwrite draw nothing */
+        int filled = 0;
+        for (int r = 0; r < 2; r++) {
+            uint32_t n = g.submit[r] + g.pad_cmds;
+            if (n) { vkCmdFillBuffer(F->cmd, g.cmds, (VkDeviceSize)r * SV_CMD_STRIDE * 16, (VkDeviceSize)n * 16, 0); filled = 1; }
+        }
+        if (filled) {
+            VkMemoryBarrier fb = { .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT, .dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT };
+            vkCmdPipelineBarrier(F->cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &fb, 0, NULL, 0, NULL);
+        }
+        vkCmdBindPipeline(F->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g.pipe_cull);
+        vkCmdDispatch(F->cmd, (g.hi_slot + 63) / 64, 1, 1);
+        VkMemoryBarrier mb = { .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT, .dstAccessMask = VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_SHADER_READ_BIT };
+        vkCmdPipelineBarrier(F->cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_VERTEX_SHADER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
+    }
     VkClearValue clear[2];
     clear[0].color.float32[0] = g.ubo_map[20]; clear[0].color.float32[1] = g.ubo_map[21];
     clear[0].color.float32[2] = g.ubo_map[22]; clear[0].color.float32[3] = 1.0f;
@@ -646,30 +734,18 @@ int64_t sv_frame(void) {
     vkCmdSetViewport(F->cmd, 0, 1, &vpt); vkCmdSetScissor(F->cmd, 0, 1, &sc);
     VkDeviceSize zero = 0;
     vkCmdBindVertexBuffers(F->cmd, 0, 1, &g.giga, &zero);
-    vkCmdBindDescriptorSets(F->cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g.layout, 0, 1, &g.dset, 0, NULL);
+    vkCmdBindDescriptorSets(F->cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g.layout, 0, 1, &F->dset, 0, NULL);
 
-    float scale = g.ubo_map[31] > 0.0f ? g.ubo_map[31] : 1.0f;
-    g.drawn_chunks = 0; g.drawn_quads = 0;
-    static unsigned char *vis = NULL;
-    if (!vis) vis = malloc(SV_MAX_SLOTS);
-    for (int pass = 0; pass < 2; pass++) {
-        vkCmdBindPipeline(F->cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pass == 0 ? g.pipe_opaque : g.pipe_blend);
-        for (int i = 0; i < SV_MAX_SLOTS; i++) {
-            Slot *s = &g.slots[i];
-            if (!s->used) continue;
-            if (pass == 0 && vis) vis[i] = !culled(g.ubo_map, s->origin, scale);
-            if (vis && !vis[i]) continue;
-            int l0 = pass == 0 ? 0 : 2, l1 = pass == 0 ? 1 : 2, pushed = 0;
-            for (int l = l0; l <= l1; l++) {
-                if (!s->layer[l].count) continue;
-                if (!pushed) {
-                    float pc[4] = { s->origin[0], s->origin[1], s->origin[2], 0.0f };
-                    vkCmdPushConstants(F->cmd, g.layout, VK_SHADER_STAGE_VERTEX_BIT, 0, 16, pc);
-                    pushed = 1; if (pass == 0) g.drawn_chunks++;
-                }
-                vkCmdDraw(F->cmd, 4, s->layer[l].count, 0, s->layer[l].first); draws++;
-                g.drawn_quads += s->layer[l].count;
-            }
+    /* draw: one multi-draw-indirect call per range. The push constant tells
+     * the vertex shader where the call's commands start in draw_slot. */
+    if (g.hi_slot > 0) {
+        for (uint32_t r = 0; r < 3; r++) {
+            uint32_t n = g.submit[r] + g.pad_cmds, base = r * SV_CMD_STRIDE;
+            if (n == 0) continue;
+            if (r == 0) vkCmdBindPipeline(F->cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g.pipe_opaque);
+            if (r == 2) vkCmdBindPipeline(F->cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g.pipe_blend);
+            vkCmdPushConstants(F->cmd, g.layout, VK_SHADER_STAGE_VERTEX_BIT, 0, 4, &base);
+            vkCmdDrawIndirect(F->cmd, g.cmds, (VkDeviceSize)base * 16, n, 16); draws++;
         }
     }
     vkCmdEndRenderPass(F->cmd);

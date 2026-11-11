@@ -1,4 +1,4 @@
-#version 450
+#version 460
 // One packed quad per INSTANCE; the corner comes from gl_VertexIndex (0..3 of
 // a triangle strip). Bit layout matches Strata.Quad:
 //   w0: x 0-4, y 5-9, z 10-14, (w-1) 15-19, (h-1) 20-24, face 25-27
@@ -14,10 +14,20 @@ layout(set = 0, binding = 0) uniform U {
     vec4 sky;
     vec4 fog;       // x start, y end (metres)
     vec4 eye;       // xyz eye (metres), w metres per voxel
+    ivec4 misc;
     vec4 pal[256];
 } u;
 
-layout(push_constant) uniform PC { vec4 origin; } pc;   // chunk low corner, voxels
+// The chunk table.
+struct Chunk {
+    ivec4 origin_level;     // xyz: low corner in voxels; w: bits 0-7 level, bit 8 in use
+    uint first[6];
+    uint count[6];
+};
+layout(std430, set = 0, binding = 1) readonly buffer Table { Chunk chunks[]; } table;
+// Which slot each indirect command draws; [base] is where this call's range starts.
+layout(std430, set = 0, binding = 4) readonly buffer DrawSlot { uint slot[]; } draw_slot;
+layout(push_constant) uniform PC { uint base; } pc;
 
 layout(location = 0) out vec2 v_uv;           // in unit faces: 0..w, 0..h
 layout(location = 1) out vec3 v_world;        // metres
@@ -40,7 +50,9 @@ void main() {
     if (face < 2u)      q = p + vec3(du, face == 0u ? 1.0 : 0.0, dv);
     else if (face < 4u) q = p + vec3(face == 2u ? 1.0 : 0.0, dv, du);
     else                q = p + vec3(du, dv, face == 4u ? 1.0 : 0.0);
-    vec3 world = (pc.origin.xyz + q) * u.eye.w;
+    ivec4 ol = table.chunks[draw_slot.slot[pc.base + uint(gl_DrawID)]].origin_level;
+    // a level-L chunk's voxels are 2^L world voxels on a side
+    vec3 world = (vec3(ol.xyz) + q * float(1 << (ol.w & 255))) * u.eye.w;
     v_uv = vec2(du, dv);
     v_world = world;
     v_w1 = w1;
