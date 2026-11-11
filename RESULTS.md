@@ -340,3 +340,37 @@ limit 0.05%): shadows only 0.0017%; everything on, daylight forest 0.0325%;
 lantern light at dusk 0.68% after two seconds and 0.07% after ten. Light from
 a small lamp is found by few rays, so it takes longer to settle than the
 one-second target.
+
+## Task 7: lighting, measured against its targets
+
+The overview offscreen at 2560 x 1600, stream radius 10, by light mode:
+
+| mode | what it adds | GPU | shim CPU | frame rate |
+|---|---|---|---|---|
+| 0 | the old flat shading | 0.65 ms | 0.25 ms | 1333 fps |
+| 1 | sky and sun, no rays | 0.68 ms | 0.23 ms | 1338 fps |
+| 2 | sun shadows | 1.64 ms | 0.49 ms | 614 fps |
+| 3 | highlight and reflections | 1.77 ms | 0.42 ms | 533 fps |
+| 4 | sky light, emission, one bounce | 4.13 ms | 0.50 ms | 232 fps |
+
+| target | result | |
+|---|---|---|
+| GPU, sun shadows only: 2 ms | 1.4 to 2.0 ms | met |
+| GPU, everything on: 6 ms | 3.4 to 4.6 ms; 9.7 ms with a lake filling the view | met, except the lake |
+| frame rate, everything on: 120 fps | 232 fps; about 100 fps with a lake filling the view | met, except the lake |
+| lighting follows an edit: 2 frames | the frame the edit is drawn | met |
+| light volume memory: 128 MB | 156 MB at radius 10 x 3, 106 MB at 8 x 3 | missed at the default radius |
+| settles within 1 second | daylight yes; lantern light at dusk takes about ten | missed for small lamps |
+
+Causes of the misses: the lake is each water pixel tracing two rays every
+frame with no memory between frames; the volume covers the whole stream box
+at a byte a voxel; a small lamp is found by few of a pixel's rays.
+
+The soak (`scripts/soak.sh`, light mode 4): nothing refused, nothing waiting,
+nothing leaked. Its 20 ms worst-frame limit could not be judged in this run:
+the machine was under a load average of 35 from other work, and the run with
+lighting off (26 ms) was as slow as the run with it on (25 to 33 ms). The
+last quiet run, with the light volume in place, was 16.6 ms.
+
+Screenshots: `docs/light-lake.png`, `docs/light-shore.png`,
+`docs/light-snow.png`, `docs/light-forest.png`, `docs/light-lantern.png`.
