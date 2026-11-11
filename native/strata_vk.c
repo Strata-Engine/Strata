@@ -60,6 +60,9 @@ typedef struct {
 } ChunkEntry;
 #define SV_IN_USE 256
 
+/* An image a pass renders to and a later pass samples. */
+typedef struct { VkImage img; VkDeviceMemory mem; VkImageView view; } Target;
+
 /* What one frame in flight owns. */
 typedef struct {
     VkCommandBuffer cmd;
@@ -97,13 +100,21 @@ static struct {
     uint32_t nimages;
     VkImage *images; VkImageView *views; VkFramebuffer *fbs;     /* nimages of each */
     VkImage depth; VkDeviceMemory depth_mem; VkImageView depth_view;
+    /* what the geometry pass writes and the light pass reads, and the lit image */
+    Target gb_albedo, gb_nm, lit;
+    VkFramebuffer fb_g, fb_l;
+    VkSampler nearest;             /* for reading the frame's own images, texel for texel */
+    int light_mode;                /* 0: the pre-ray-tracing shading, through the deferred passes */
+    float prev_vp[16]; double time_s;
     /* an offscreen target the size of the window, for frames that must not
      * touch the swapchain (timing runs: presentation paces to the display) */
     VkImage off; VkDeviceMemory off_mem; VkImageView off_view; VkFramebuffer off_fb;
     int offscreen;
-    VkRenderPass pass, pass_off;
+    /* geometry, light, and the final pass in its two forms (to a swapchain
+     * image, to the offscreen target); the two final passes are compatible */
+    VkRenderPass pass_g, pass_l, pass, pass_off;
     VkPipelineLayout layout;
-    VkPipeline pipe_opaque, pipe_blend, pipe_cross, pipe_loose, pipe_cull;
+    VkPipeline pipe_opaque, pipe_blend, pipe_cross, pipe_loose, pipe_cull, pipe_light, pipe_composite;
     VkBuffer loose; VkDeviceMemory loose_mem; uint32_t *loose_map;       /* model geometry, expanded per instance: 16 words a quad */
     float *models[SV_MAX_MODELS]; uint32_t model_quads[SV_MAX_MODELS];   /* 21 floats a quad, as Strata.Model lays them out */
     VkDescriptorSetLayout dsl;
@@ -145,7 +156,14 @@ static struct {
 
 /* The uniform block: view-projection, sun, sky, fog, voxel scale, then 256
  * palette colours indexed by a quad's texture id. Must match the shaders. */
-#define UBO_FLOATS (16 + 4 + 4 + 4 + 4 + 4)
+/* The uniform block, in floats (native/shaders/ubo.glsl): vp 0, sun 16,
+ * sky 20, fog 24, eye 28, misc 32 (ints), inv_vp 36, prev_vp 52, light 68,
+ * sun colour 72. */
+#define UBO_FLOATS 76
+#define UBO_INV_VP 36
+#define UBO_PREV_VP 52
+#define UBO_LIGHT 68
+#define UBO_SUN_COLOR 72
 #define SV_MAX_BLOCKS 65536    /* rows in the block table: block ids are sixteen bits */
 
 static void die(const char *what, int code) {
@@ -179,6 +197,13 @@ static VkShaderModule shader(const uint32_t *code, size_t bytes) {
     return m;
 }
 
+static void drop_target(Target *t) {
+    if (t->view) vkDestroyImageView(g.dev, t->view, NULL);
+    if (t->img) vkDestroyImage(g.dev, t->img, NULL);
+    if (t->mem) vkFreeMemory(g.dev, t->mem, NULL);
+    t->view = VK_NULL_HANDLE; t->img = VK_NULL_HANDLE; t->mem = VK_NULL_HANDLE;
+}
+
 static void destroy_swapchain(void) {
     for (uint32_t i = 0; i < g.nimages; i++) {
         if (g.fbs && g.fbs[i]) vkDestroyFramebuffer(g.dev, g.fbs[i], NULL);
@@ -191,6 +216,10 @@ static void destroy_swapchain(void) {
     if (g.off) vkDestroyImage(g.dev, g.off, NULL);
     if (g.off_mem) vkFreeMemory(g.dev, g.off_mem, NULL);
     g.off_fb = VK_NULL_HANDLE; g.off_view = VK_NULL_HANDLE; g.off = VK_NULL_HANDLE; g.off_mem = VK_NULL_HANDLE;
+    if (g.fb_g) vkDestroyFramebuffer(g.dev, g.fb_g, NULL);
+    if (g.fb_l) vkDestroyFramebuffer(g.dev, g.fb_l, NULL);
+    g.fb_g = VK_NULL_HANDLE; g.fb_l = VK_NULL_HANDLE;
+    drop_target(&g.gb_albedo); drop_target(&g.gb_nm); drop_target(&g.lit);
     if (g.depth_view) vkDestroyImageView(g.dev, g.depth_view, NULL);
     if (g.depth) vkDestroyImage(g.dev, g.depth, NULL);
     if (g.depth_mem) vkFreeMemory(g.dev, g.depth_mem, NULL);
@@ -206,6 +235,10 @@ static VkPresentModeKHR pick_present_mode(void) {
     for (uint32_t i = 0; i < n; i++) if (modes[i] == VK_PRESENT_MODE_IMMEDIATE_KHR) return VK_PRESENT_MODE_IMMEDIATE_KHR;
     return VK_PRESENT_MODE_FIFO_KHR;
 }
+
+#define FMT_ALBEDO VK_FORMAT_R8G8B8A8_SRGB
+#define FMT_NM     VK_FORMAT_R8G8B8A8_UNORM
+#define FMT_LIT    VK_FORMAT_R16G16B16A16_SFLOAT
 
 /* A 2D image with its memory and view. */
 static int make_image(VkFormat fmt, VkImageUsageFlags usage, VkImageAspectFlags aspect, VkImage *img, VkDeviceMemory *mem, VkImageView *view) {
@@ -263,9 +296,31 @@ static int make_swapchain(void) {
     if (!g.images || !g.views || !g.fbs || n == 0) return 0;
     VKOK(vkGetSwapchainImagesKHR(g.dev, g.swap, &n, g.images), "swapchain images");
     g.nimages = n;
-    if (!make_image(VK_FORMAT_D32_SFLOAT, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, VK_IMAGE_ASPECT_DEPTH_BIT, &g.depth, &g.depth_mem, &g.depth_view)) return 0;
+    if (!make_image(VK_FORMAT_D32_SFLOAT, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, VK_IMAGE_ASPECT_DEPTH_BIT, &g.depth, &g.depth_mem, &g.depth_view)) return 0;
+    VkImageUsageFlags tu = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    if (!make_image(FMT_ALBEDO, tu, VK_IMAGE_ASPECT_COLOR_BIT, &g.gb_albedo.img, &g.gb_albedo.mem, &g.gb_albedo.view)) return 0;
+    if (!make_image(FMT_NM, tu, VK_IMAGE_ASPECT_COLOR_BIT, &g.gb_nm.img, &g.gb_nm.mem, &g.gb_nm.view)) return 0;
+    if (!make_image(FMT_LIT, tu, VK_IMAGE_ASPECT_COLOR_BIT, &g.lit.img, &g.lit.mem, &g.lit.view)) return 0;
     if (!make_image(g.format, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, VK_IMAGE_ASPECT_COLOR_BIT, &g.off, &g.off_mem, &g.off_view)) return 0;
     return 1;
+}
+
+/* Point every frame's descriptor set at the frame-sized images. Called when
+ * they are first made and whenever the swapchain is rebuilt. */
+static void bind_targets(void) {
+    for (int f = 0; f < SV_FRAMES; f++) {
+        if (!g.frames[f].dset) continue;
+        VkDescriptorImageInfo ii[4] = {
+            { g.nearest, g.gb_albedo.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL },
+            { g.nearest, g.gb_nm.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL },
+            { g.nearest, g.depth_view, VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL },
+            { g.nearest, g.lit.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL } };
+        VkWriteDescriptorSet w[4];
+        for (uint32_t b = 0; b < 4; b++)
+            w[b] = (VkWriteDescriptorSet){ .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = g.frames[f].dset, .dstBinding = 7 + b, .descriptorCount = 1,
+                .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .pImageInfo = &ii[b] };
+        vkUpdateDescriptorSets(g.dev, 4, w, 0, NULL);
+    }
 }
 
 static int make_framebuffers(void) {
@@ -282,38 +337,103 @@ static int make_framebuffers(void) {
     VkFramebufferCreateInfo fi = { .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO, .renderPass = g.pass_off, .attachmentCount = 2,
         .pAttachments = att, .width = g.extent.width, .height = g.extent.height, .layers = 1 };
     VKOK(vkCreateFramebuffer(g.dev, &fi, NULL, &g.off_fb), "offscreen framebuffer");
+    VkImageView ga[3] = { g.gb_albedo.view, g.gb_nm.view, g.depth_view };
+    VkFramebufferCreateInfo gi = { .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO, .renderPass = g.pass_g, .attachmentCount = 3,
+        .pAttachments = ga, .width = g.extent.width, .height = g.extent.height, .layers = 1 };
+    VKOK(vkCreateFramebuffer(g.dev, &gi, NULL, &g.fb_g), "geometry framebuffer");
+    VkFramebufferCreateInfo li = { .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO, .renderPass = g.pass_l, .attachmentCount = 1,
+        .pAttachments = &g.lit.view, .width = g.extent.width, .height = g.extent.height, .layers = 1 };
+    VKOK(vkCreateFramebuffer(g.dev, &li, NULL, &g.fb_l), "light framebuffer");
+    bind_targets();
     return 1;
 }
 
-/* The colour + depth pass. [final] is the layout the colour image is left in:
- * PRESENT_SRC for a swapchain image, TRANSFER_SRC for the offscreen target.
- * The two passes are compatible, so one set of pipelines serves both. */
+static VkAttachmentDescription color_att(VkFormat fmt, VkAttachmentLoadOp load, VkImageLayout final) {
+    return (VkAttachmentDescription){ .format = fmt, .samples = VK_SAMPLE_COUNT_1_BIT, .loadOp = load, .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+        .stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE, .stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
+        .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED, .finalLayout = final };
+}
+
+/* The geometry pass: colour and normal/material targets and the depth
+ * buffer, all left ready to be read by the passes after it. */
+static int make_pass_g(void) {
+    VkAttachmentDescription att[3] = {
+        color_att(FMT_ALBEDO, VK_ATTACHMENT_LOAD_OP_CLEAR, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL),
+        color_att(FMT_NM, VK_ATTACHMENT_LOAD_OP_CLEAR, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL),
+        { .format = VK_FORMAT_D32_SFLOAT, .samples = VK_SAMPLE_COUNT_1_BIT, .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR, .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+          .stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE, .stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
+          .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED, .finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL } };
+    VkAttachmentReference cref[2] = { { 0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL }, { 1, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL } };
+    VkAttachmentReference dref = { 2, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL };
+    VkSubpassDescription sub = { .pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS, .colorAttachmentCount = 2, .pColorAttachments = cref, .pDepthStencilAttachment = &dref };
+    VkSubpassDependency dep[2] = {
+        { .srcSubpass = VK_SUBPASS_EXTERNAL, .dstSubpass = 0,
+          .srcStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+          .dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT,
+          .srcAccessMask = VK_ACCESS_SHADER_READ_BIT,
+          .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT },
+        { .srcSubpass = 0, .dstSubpass = VK_SUBPASS_EXTERNAL,
+          .srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+          .dstStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT,
+          .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+          .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT } };
+    VkRenderPassCreateInfo rpi = { .sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO, .attachmentCount = 3, .pAttachments = att,
+        .subpassCount = 1, .pSubpasses = &sub, .dependencyCount = 2, .pDependencies = dep };
+    VKOK(vkCreateRenderPass(g.dev, &rpi, NULL, &g.pass_g), "geometry pass");
+    return 1;
+}
+
+/* The light pass: one target, the lit image, left ready to be sampled. */
+static int make_pass_l(void) {
+    VkAttachmentDescription att = color_att(FMT_LIT, VK_ATTACHMENT_LOAD_OP_DONT_CARE, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    VkAttachmentReference cref = { 0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL };
+    VkSubpassDescription sub = { .pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS, .colorAttachmentCount = 1, .pColorAttachments = &cref };
+    VkSubpassDependency dep[2] = {
+        { .srcSubpass = VK_SUBPASS_EXTERNAL, .dstSubpass = 0, .srcStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, .dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+          .srcAccessMask = VK_ACCESS_SHADER_READ_BIT, .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT },
+        { .srcSubpass = 0, .dstSubpass = VK_SUBPASS_EXTERNAL, .srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, .dstStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+          .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, .dstAccessMask = VK_ACCESS_SHADER_READ_BIT } };
+    VkRenderPassCreateInfo rpi = { .sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO, .attachmentCount = 1, .pAttachments = &att,
+        .subpassCount = 1, .pSubpasses = &sub, .dependencyCount = 2, .pDependencies = dep };
+    VKOK(vkCreateRenderPass(g.dev, &rpi, NULL, &g.pass_l), "light pass");
+    return 1;
+}
+
+/* The final pass: the lit image goes to the screen and translucent surfaces
+ * draw over it, tested against the geometry pass's depth, which is only
+ * read. [final] is the layout the colour image is left in: PRESENT_SRC for a
+ * swapchain image, TRANSFER_SRC for the offscreen target. The two forms are
+ * compatible, so one set of pipelines serves both. */
 static int make_render_pass(VkImageLayout final, VkRenderPass *out) {
     VkAttachmentDescription att[2] = {
-        { .format = g.format, .samples = VK_SAMPLE_COUNT_1_BIT, .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR, .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+        color_att(g.format, VK_ATTACHMENT_LOAD_OP_DONT_CARE, final),
+        { .format = VK_FORMAT_D32_SFLOAT, .samples = VK_SAMPLE_COUNT_1_BIT, .loadOp = VK_ATTACHMENT_LOAD_OP_LOAD, .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
           .stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE, .stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
-          .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED, .finalLayout = final },
-        { .format = VK_FORMAT_D32_SFLOAT, .samples = VK_SAMPLE_COUNT_1_BIT, .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR, .storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
-          .stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE, .stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
-          .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED, .finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL } };
-    VkAttachmentReference cref = { 0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL }, dref = { 1, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL };
+          .initialLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL, .finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL } };
+    VkAttachmentReference cref = { 0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL }, dref = { 1, VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL };
     VkSubpassDescription sub = { .pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS, .colorAttachmentCount = 1, .pColorAttachments = &cref, .pDepthStencilAttachment = &dref };
     VkSubpassDependency dep = { .srcSubpass = VK_SUBPASS_EXTERNAL, .dstSubpass = 0,
         .srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT,
-        .dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT,
-        .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT };
+        .dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+        .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_SHADER_READ_BIT };
     VkRenderPassCreateInfo rpi = { .sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO, .attachmentCount = 2, .pAttachments = att,
         .subpassCount = 1, .pSubpasses = &sub, .dependencyCount = 1, .pDependencies = &dep };
     VKOK(vkCreateRenderPass(g.dev, &rpi, NULL, out), "vkCreateRenderPass");
     return 1;
 }
 
-/* kind 0: opaque and cutout quads; 1: translucent quads; 2: cross instances; 3: loose quads */
+/* kind 0: opaque and cutout quads; 1: translucent quads; 2: cross instances;
+ * 3: loose quads; 4: the light pass; 5: the lit image to the screen.
+ * Kinds 0, 2 and 3 belong to the geometry pass, 4 to the light pass, 1 and 5
+ * to the final pass. */
 static int make_pipeline(int kind, VkPipeline *out) {
-    int blend = kind == 1, cross = kind == 2, loose = kind == 3;
+    int blend = kind == 1, cross = kind == 2, loose = kind == 3, full = kind >= 4, geom = kind == 0 || cross || loose;
     VkShaderModule vs = cross ? shader(strata_cross_vert, sizeof(strata_cross_vert))
-                      : loose ? shader(strata_loose_vert, sizeof(strata_loose_vert)) : shader(strata_quad_vert, sizeof(strata_quad_vert));
-    VkShaderModule fs = shader(strata_quad_frag, sizeof(strata_quad_frag));
+                      : loose ? shader(strata_loose_vert, sizeof(strata_loose_vert))
+                      : full  ? shader(strata_fullscreen_vert, sizeof(strata_fullscreen_vert)) : shader(strata_quad_vert, sizeof(strata_quad_vert));
+    VkShaderModule fs = kind == 4 ? shader(strata_light_frag, sizeof(strata_light_frag))
+                      : kind == 5 ? shader(strata_composite_frag, sizeof(strata_composite_frag))
+                      : blend     ? shader(strata_water_frag, sizeof(strata_water_frag)) : shader(strata_gbuffer_frag, sizeof(strata_gbuffer_frag));
     VkPipelineShaderStageCreateInfo stages[2] = {
         { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_VERTEX_BIT, .module = vs, .pName = "main" },
         { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_FRAGMENT_BIT, .module = fs, .pName = "main" } };
@@ -330,26 +450,31 @@ static int make_pipeline(int kind, VkPipeline *out) {
         { .location = 2, .binding = 0, .format = VK_FORMAT_R32G32B32A32_UINT, .offset = 32 },
         { .location = 3, .binding = 0, .format = VK_FORMAT_R32G32B32A32_UINT, .offset = 48 } };
     VkPipelineVertexInputStateCreateInfo vin = { .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
-        .vertexBindingDescriptionCount = 1, .pVertexBindingDescriptions = loose ? &lbind : &bind,
-        .vertexAttributeDescriptionCount = loose ? 4 : 2, .pVertexAttributeDescriptions = loose ? lattrs : attrs };
-    VkPipelineInputAssemblyStateCreateInfo ia = { .sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO, .topology = cross ? VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST : VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP };
+        .vertexBindingDescriptionCount = full ? 0 : 1, .pVertexBindingDescriptions = loose ? &lbind : &bind,
+        .vertexAttributeDescriptionCount = full ? 0 : (loose ? 4 : 2), .pVertexAttributeDescriptions = loose ? lattrs : attrs };
+    VkPipelineInputAssemblyStateCreateInfo ia = { .sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
+        .topology = (cross || full) ? VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST : VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP };
     VkPipelineViewportStateCreateInfo vp = { .sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO, .viewportCount = 1, .scissorCount = 1 };
     VkPipelineRasterizationStateCreateInfo rs = { .sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO, .polygonMode = VK_POLYGON_MODE_FILL,
         /* a see-through surface is visible from behind too: water from below */
-        .cullMode = (blend || cross || loose) ? VK_CULL_MODE_NONE : VK_CULL_MODE_BACK_BIT, .frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE, .lineWidth = 1.0f };
+        .cullMode = (kind == 0) ? VK_CULL_MODE_BACK_BIT : VK_CULL_MODE_NONE, .frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE, .lineWidth = 1.0f };
     VkPipelineMultisampleStateCreateInfo ms = { .sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO, .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT };
-    VkPipelineDepthStencilStateCreateInfo ds = { .sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO, .depthTestEnable = VK_TRUE,
-        .depthWriteEnable = blend ? VK_FALSE : VK_TRUE, .depthCompareOp = VK_COMPARE_OP_LESS };
-    VkPipelineColorBlendAttachmentState cba = { .blendEnable = blend ? VK_TRUE : VK_FALSE,
+    /* only the geometry pass writes depth; translucent quads test against it; full-screen passes ignore it */
+    VkPipelineDepthStencilStateCreateInfo ds = { .sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO, .depthTestEnable = full ? VK_FALSE : VK_TRUE,
+        .depthWriteEnable = geom ? VK_TRUE : VK_FALSE, .depthCompareOp = VK_COMPARE_OP_LESS };
+    VkPipelineColorBlendAttachmentState cba[2];
+    cba[0] = (VkPipelineColorBlendAttachmentState){ .blendEnable = blend ? VK_TRUE : VK_FALSE,
         .srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA, .dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA, .colorBlendOp = VK_BLEND_OP_ADD,
         .srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE, .dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA, .alphaBlendOp = VK_BLEND_OP_ADD,
         .colorWriteMask = 0xF };
-    VkPipelineColorBlendStateCreateInfo cb = { .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO, .attachmentCount = 1, .pAttachments = &cba };
+    cba[1] = cba[0];
+    VkPipelineColorBlendStateCreateInfo cb = { .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO, .attachmentCount = geom ? 2 : 1, .pAttachments = cba };
     VkDynamicState dyn[2] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
     VkPipelineDynamicStateCreateInfo dsi = { .sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, .dynamicStateCount = 2, .pDynamicStates = dyn };
     VkGraphicsPipelineCreateInfo pi = { .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, .stageCount = 2, .pStages = stages,
         .pVertexInputState = &vin, .pInputAssemblyState = &ia, .pViewportState = &vp, .pRasterizationState = &rs, .pMultisampleState = &ms,
-        .pDepthStencilState = &ds, .pColorBlendState = &cb, .pDynamicState = &dsi, .layout = g.layout, .renderPass = g.pass };
+        .pDepthStencilState = &ds, .pColorBlendState = &cb, .pDynamicState = &dsi, .layout = g.layout,
+        .renderPass = geom ? g.pass_g : (kind == 4 ? g.pass_l : g.pass) };
     VkResult r = vkCreateGraphicsPipelines(g.dev, VK_NULL_HANDLE, 1, &pi, NULL, out);
     vkDestroyShaderModule(g.dev, vs, NULL); vkDestroyShaderModule(g.dev, fs, NULL);
     if (r != VK_SUCCESS) { die("vkCreateGraphicsPipelines", (int)r); return 0; }
@@ -555,11 +680,16 @@ int64_t sv_open(int64_t w, int64_t h, int64_t capture_mouse, int64_t quad_capaci
     if (!make_swapchain()) return 0;
     if (!make_render_pass(VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, &g.pass)) return 0;
     if (!make_render_pass(VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, &g.pass_off)) return 0;
+    if (!make_pass_g() || !make_pass_l()) return 0;
+    VkSamplerCreateInfo nsi = { .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO, .magFilter = VK_FILTER_NEAREST, .minFilter = VK_FILTER_NEAREST,
+        .mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST, .addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+        .addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, .addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE };
+    VKOK(vkCreateSampler(g.dev, &nsi, NULL, &g.nearest), "nearest sampler");
     if (!make_framebuffers()) return 0;
     g.swap_ok = 1;
 
     /* one set layout for every pipeline: 0 uniforms, 1 chunk table, 2 indirect commands, 3 cull statistics, 4 command -> slot */
-    VkDescriptorSetLayoutBinding dslb[7] = {
+    VkDescriptorSetLayoutBinding dslb[11] = {
         { .binding = 0, .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, .descriptorCount = 1,
           .stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT },
         { .binding = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1,
@@ -570,8 +700,13 @@ int64_t sv_open(int64_t w, int64_t h, int64_t capture_mouse, int64_t quad_capaci
           .stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_COMPUTE_BIT },
         /* 5 the block table, 6 the texture array */
         { .binding = 5, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_VERTEX_BIT },
-        { .binding = 6, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT } };
-    VkDescriptorSetLayoutCreateInfo dsli = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 7, .pBindings = dslb };
+        { .binding = 6, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT },
+        /* the frame's own images: 7 colour, 8 normal and material, 9 depth, 10 the lit image */
+        { .binding = 7, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT },
+        { .binding = 8, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT },
+        { .binding = 9, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT },
+        { .binding = 10, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT } };
+    VkDescriptorSetLayoutCreateInfo dsli = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 11, .pBindings = dslb };
     VKOK(vkCreateDescriptorSetLayout(g.dev, &dsli, NULL, &g.dsl), "descriptor set layout");
     /* where the call's range starts in draw_slot, and per-call flags (bit 0: cutout) */
     VkPushConstantRange pcr = { .stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, .offset = 0, .size = 8 };
@@ -582,6 +717,8 @@ int64_t sv_open(int64_t w, int64_t h, int64_t capture_mouse, int64_t quad_capaci
     if (!make_pipeline(1, &g.pipe_blend)) return 0;
     if (!make_pipeline(2, &g.pipe_cross)) return 0;
     if (!make_pipeline(3, &g.pipe_loose)) return 0;
+    if (!make_pipeline(4, &g.pipe_light)) return 0;
+    if (!make_pipeline(5, &g.pipe_composite)) return 0;
 
     void *map = NULL;
     g.quad_cap = (quad_capacity > 0 && quad_capacity < 0x20000000) ? (uint32_t)quad_capacity : SV_DEFAULT_QUADS;
@@ -611,7 +748,7 @@ int64_t sv_open(int64_t w, int64_t h, int64_t capture_mouse, int64_t quad_capaci
     if (!make_buffer((VkDeviceSize)SV_MAX_BLOCKS * 32, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &g.blocks, &g.blocks_mem, &map)) return 0;
     g.blocks_map = map;
     memset(g.blocks_map, 0, (size_t)SV_MAX_BLOCKS * 32);
-    VkDescriptorPoolSize dps[3] = { { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, SV_FRAMES }, { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 5 * SV_FRAMES }, { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, SV_FRAMES } };
+    VkDescriptorPoolSize dps[3] = { { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, SV_FRAMES }, { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 5 * SV_FRAMES }, { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 5 * SV_FRAMES } };
     VkDescriptorPoolCreateInfo dpi = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = SV_FRAMES, .poolSizeCount = 3, .pPoolSizes = dps };
     VKOK(vkCreateDescriptorPool(g.dev, &dpi, NULL, &g.dpool), "descriptor pool");
     for (int f = 0; f < SV_FRAMES; f++) {
@@ -634,6 +771,7 @@ int64_t sv_open(int64_t w, int64_t h, int64_t capture_mouse, int64_t quad_capaci
                 .descriptorType = b == 0 ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &bufs[b] };
         vkUpdateDescriptorSets(g.dev, 6, wds, 0, NULL);
     }
+    bind_targets();               /* the sets did not exist when the frame's images were made */
     {   /* the culling pipeline */
         VkShaderModule cs = shader(strata_cull_comp, sizeof(strata_cull_comp));
         VkComputePipelineCreateInfo ci = { .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO, .layout = g.layout,
@@ -679,6 +817,11 @@ void sv_close(void) {
         if (g.pipe_cull) vkDestroyPipeline(g.dev, g.pipe_cull, NULL);
         if (g.pipe_cross) vkDestroyPipeline(g.dev, g.pipe_cross, NULL);
         if (g.pipe_loose) vkDestroyPipeline(g.dev, g.pipe_loose, NULL);
+        if (g.pipe_light) vkDestroyPipeline(g.dev, g.pipe_light, NULL);
+        if (g.pipe_composite) vkDestroyPipeline(g.dev, g.pipe_composite, NULL);
+        if (g.pass_g) vkDestroyRenderPass(g.dev, g.pass_g, NULL);
+        if (g.pass_l) vkDestroyRenderPass(g.dev, g.pass_l, NULL);
+        if (g.nearest) vkDestroySampler(g.dev, g.nearest, NULL);
         if (g.loose) vkDestroyBuffer(g.dev, g.loose, NULL);
         if (g.loose_mem) vkFreeMemory(g.dev, g.loose_mem, NULL);
         for (int m = 0; m < SV_MAX_MODELS; m++) free(g.models[m]);
@@ -965,6 +1108,35 @@ int64_t sv_model_set(int64_t index, void *floats, int64_t nquads) {
  * the driver charges for commands that draw nothing. */
 void sv_pad_commands(int64_t n) { g.pad_cmds = n < 0 ? 0 : (n > SV_PAD_MAX ? SV_PAD_MAX : (uint32_t)n); }
 
+/* The inverse of a column-major 4 x 4 matrix; the identity if it has none. */
+static void invert4(const float *m, float *out) {
+    double a[16], inv[16];
+    for (int i = 0; i < 16; i++) a[i] = m[i];
+    inv[0] = a[5]*a[10]*a[15] - a[5]*a[11]*a[14] - a[9]*a[6]*a[15] + a[9]*a[7]*a[14] + a[13]*a[6]*a[11] - a[13]*a[7]*a[10];
+    inv[4] = -a[4]*a[10]*a[15] + a[4]*a[11]*a[14] + a[8]*a[6]*a[15] - a[8]*a[7]*a[14] - a[12]*a[6]*a[11] + a[12]*a[7]*a[10];
+    inv[8] = a[4]*a[9]*a[15] - a[4]*a[11]*a[13] - a[8]*a[5]*a[15] + a[8]*a[7]*a[13] + a[12]*a[5]*a[11] - a[12]*a[7]*a[9];
+    inv[12] = -a[4]*a[9]*a[14] + a[4]*a[10]*a[13] + a[8]*a[5]*a[14] - a[8]*a[6]*a[13] - a[12]*a[5]*a[10] + a[12]*a[6]*a[9];
+    inv[1] = -a[1]*a[10]*a[15] + a[1]*a[11]*a[14] + a[9]*a[2]*a[15] - a[9]*a[3]*a[14] - a[13]*a[2]*a[11] + a[13]*a[3]*a[10];
+    inv[5] = a[0]*a[10]*a[15] - a[0]*a[11]*a[14] - a[8]*a[2]*a[15] + a[8]*a[3]*a[14] + a[12]*a[2]*a[11] - a[12]*a[3]*a[10];
+    inv[9] = -a[0]*a[9]*a[15] + a[0]*a[11]*a[13] + a[8]*a[1]*a[15] - a[8]*a[3]*a[13] - a[12]*a[1]*a[11] + a[12]*a[3]*a[9];
+    inv[13] = a[0]*a[9]*a[14] - a[0]*a[10]*a[13] - a[8]*a[1]*a[14] + a[8]*a[2]*a[13] + a[12]*a[1]*a[10] - a[12]*a[2]*a[9];
+    inv[2] = a[1]*a[6]*a[15] - a[1]*a[7]*a[14] - a[5]*a[2]*a[15] + a[5]*a[3]*a[14] + a[13]*a[2]*a[7] - a[13]*a[3]*a[6];
+    inv[6] = -a[0]*a[6]*a[15] + a[0]*a[7]*a[14] + a[4]*a[2]*a[15] - a[4]*a[3]*a[14] - a[12]*a[2]*a[7] + a[12]*a[3]*a[6];
+    inv[10] = a[0]*a[5]*a[15] - a[0]*a[7]*a[13] - a[4]*a[1]*a[15] + a[4]*a[3]*a[13] + a[12]*a[1]*a[7] - a[12]*a[3]*a[5];
+    inv[14] = -a[0]*a[5]*a[14] + a[0]*a[6]*a[13] + a[4]*a[1]*a[14] - a[4]*a[2]*a[13] - a[12]*a[1]*a[6] + a[12]*a[2]*a[5];
+    inv[3] = -a[1]*a[6]*a[11] + a[1]*a[7]*a[10] + a[5]*a[2]*a[11] - a[5]*a[3]*a[10] - a[9]*a[2]*a[7] + a[9]*a[3]*a[6];
+    inv[7] = a[0]*a[6]*a[11] - a[0]*a[7]*a[10] - a[4]*a[2]*a[11] + a[4]*a[3]*a[10] + a[8]*a[2]*a[7] - a[8]*a[3]*a[6];
+    inv[11] = -a[0]*a[5]*a[11] + a[0]*a[7]*a[9] + a[4]*a[1]*a[11] - a[4]*a[3]*a[9] - a[8]*a[1]*a[7] + a[8]*a[3]*a[5];
+    inv[15] = a[0]*a[5]*a[10] - a[0]*a[6]*a[9] - a[4]*a[1]*a[10] + a[4]*a[2]*a[9] + a[8]*a[1]*a[6] - a[8]*a[2]*a[5];
+    double det = a[0]*inv[0] + a[1]*inv[4] + a[2]*inv[8] + a[3]*inv[12];
+    if (det == 0.0) { for (int i = 0; i < 16; i++) out[i] = (i % 5 == 0) ? 1.0f : 0.0f; return; }
+    for (int i = 0; i < 16; i++) out[i] = (float)(inv[i] / det);
+}
+
+/* How the light pass shades: 0 is the renderer's shading from before ray
+ * tracing, carried through the deferred passes. */
+void sv_set_lighting(int64_t mode) { g.light_mode = (int)mode; }
+
 /* ── Frame parameters ─────────────────────────────────────────────────────── */
 /* [vp] is a column-major view-projection in OpenGL clip conventions (y up,
  * z in -1..1); the vertex shader converts to Vulkan's. */
@@ -1068,6 +1240,11 @@ int64_t sv_frame(void) {
     /* cull: one compute invocation per slot writes the indirect commands */
     int32_t *misc = (int32_t *)(g.ubo_map + 32);
     misc[0] = (int32_t)g.hi_slot; misc[1] = SV_CMD_STRIDE; misc[2] = (int32_t)g.layers; misc[3] = (int32_t)g.nblocks;
+    invert4(g.ubo_map, g.ubo_map + UBO_INV_VP);
+    memcpy(g.ubo_map + UBO_PREV_VP, g.prev_vp, sizeof g.prev_vp);
+    memcpy(g.prev_vp, g.ubo_map, sizeof g.prev_vp);
+    g.ubo_map[UBO_LIGHT + 0] = (float)g.light_mode; g.ubo_map[UBO_LIGHT + 1] = (float)g.time_s;
+    g.ubo_map[UBO_LIGHT + 2] = (float)(g.frame_no & 0xFFFFFF);
     /* this Frame's fence has been waited on, so the GPU is done with its
      * copies: bring them up to date. From here to the next time this Frame
      * comes round, nothing the CPU does can change what it draws. */
@@ -1098,23 +1275,22 @@ int64_t sv_frame(void) {
         VkMemoryBarrier mb = { .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT, .dstAccessMask = VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_SHADER_READ_BIT };
         vkCmdPipelineBarrier(F->cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_VERTEX_SHADER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
     }
-    VkClearValue clear[2];
-    clear[0].color.float32[0] = g.ubo_map[20]; clear[0].color.float32[1] = g.ubo_map[21];
-    clear[0].color.float32[2] = g.ubo_map[22]; clear[0].color.float32[3] = 1.0f;
-    clear[1].depthStencil.depth = 1.0f; clear[1].depthStencil.stencil = 0;
-    VkRenderPassBeginInfo rbi = { .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
-        .renderPass = offscreen ? g.pass_off : g.pass, .framebuffer = offscreen ? g.off_fb : g.fbs[idx],
-        .renderArea = { { 0, 0 }, g.extent }, .clearValueCount = 2, .pClearValues = clear };
-    vkCmdBeginRenderPass(F->cmd, &rbi, VK_SUBPASS_CONTENTS_INLINE);
     VkViewport vpt = { 0, 0, (float)g.extent.width, (float)g.extent.height, 0.0f, 1.0f };
     VkRect2D sc = { { 0, 0 }, g.extent };
-    vkCmdSetViewport(F->cmd, 0, 1, &vpt); vkCmdSetScissor(F->cmd, 0, 1, &sc);
     VkDeviceSize zero = 0;
+
+    /* 1. geometry: the solid ranges write colour, normal, material and depth.
+     * One multi-draw-indirect call per range; the push constant tells the
+     * vertex shader where the call's commands start in draw_slot. */
+    VkClearValue gclear[3];
+    memset(gclear, 0, sizeof gclear);
+    gclear[2].depthStencil.depth = 1.0f;
+    VkRenderPassBeginInfo gbi = { .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO, .renderPass = g.pass_g, .framebuffer = g.fb_g,
+        .renderArea = { { 0, 0 }, g.extent }, .clearValueCount = 3, .pClearValues = gclear };
+    vkCmdBeginRenderPass(F->cmd, &gbi, VK_SUBPASS_CONTENTS_INLINE);
+    vkCmdSetViewport(F->cmd, 0, 1, &vpt); vkCmdSetScissor(F->cmd, 0, 1, &sc);
     vkCmdBindVertexBuffers(F->cmd, 0, 1, &g.giga, &zero);
     vkCmdBindDescriptorSets(F->cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g.layout, 0, 1, &F->dset, 0, NULL);
-
-    /* draw: one multi-draw-indirect call per range. The push constant tells
-     * the vertex shader where the call's commands start in draw_slot. */
     static const uint32_t solid_ranges[4] = { 0, 1, 3, 4 };    /* opaque quads, cutout quads, cross instances, loose quads */
     for (int k = 0; k < 4; k++) {
         uint32_t r = solid_ranges[k];
@@ -1127,7 +1303,26 @@ int64_t sv_frame(void) {
         vkCmdPushConstants(F->cmd, g.layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, 8, pc);
         vkCmdDrawIndirect(F->cmd, g.cmds, (VkDeviceSize)base * 16, n, 16); draws++;
     }
-    /* translucent last, far to near, blended, writing no depth */
+    vkCmdEndRenderPass(F->cmd);
+
+    /* 2. light: one full-screen triangle reads those buffers and writes the lit image */
+    VkRenderPassBeginInfo lbi = { .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO, .renderPass = g.pass_l, .framebuffer = g.fb_l,
+        .renderArea = { { 0, 0 }, g.extent } };
+    vkCmdBeginRenderPass(F->cmd, &lbi, VK_SUBPASS_CONTENTS_INLINE);
+    vkCmdSetViewport(F->cmd, 0, 1, &vpt); vkCmdSetScissor(F->cmd, 0, 1, &sc);
+    vkCmdBindPipeline(F->cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g.pipe_light);
+    vkCmdDraw(F->cmd, 3, 1, 0, 0);
+    vkCmdEndRenderPass(F->cmd);
+
+    /* 3. final: the lit image to the screen, then translucent surfaces over
+     * it, far to near, blended, tested against the geometry pass's depth */
+    VkRenderPassBeginInfo rbi = { .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
+        .renderPass = offscreen ? g.pass_off : g.pass, .framebuffer = offscreen ? g.off_fb : g.fbs[idx],
+        .renderArea = { { 0, 0 }, g.extent } };
+    vkCmdBeginRenderPass(F->cmd, &rbi, VK_SUBPASS_CONTENTS_INLINE);
+    vkCmdSetViewport(F->cmd, 0, 1, &vpt); vkCmdSetScissor(F->cmd, 0, 1, &sc);
+    vkCmdBindPipeline(F->cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g.pipe_composite);
+    vkCmdDraw(F->cmd, 3, 1, 0, 0);
     if (ntrans > 0) {
         vkCmdBindVertexBuffers(F->cmd, 0, 1, &g.giga, &zero);
         uint32_t base = trans_region * SV_CMD_STRIDE;

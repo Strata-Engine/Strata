@@ -1,4 +1,3 @@
-#version 460
 // A loose quad: four arbitrary corners, for model blocks. One 64-byte
 // instance, drawn as a 4-vertex strip; the corner comes from gl_VertexIndex.
 // Each corner is four 32-bit words:
@@ -11,14 +10,6 @@ layout(location = 1) in uvec4 c1;
 layout(location = 2) in uvec4 c2;
 layout(location = 3) in uvec4 c3;
 
-layout(set = 0, binding = 0) uniform U {
-    mat4 vp;
-    vec4 sun;
-    vec4 sky;
-    vec4 fog;
-    vec4 eye;       // xyz eye (metres), w metres per voxel
-    ivec4 misc;
-} u;
 struct Chunk { ivec4 origin_level; uint first[6]; uint count[6]; };
 layout(std430, set = 0, binding = 1) readonly buffer Table { Chunk chunks[]; } table;
 layout(std430, set = 0, binding = 4) readonly buffer DrawSlot { uint slot[]; } draw_slot;
@@ -47,8 +38,5 @@ void main() {
     v_world = world;
     v_w1 = (c.z >> 16) | (255u << 16);
     v_face = face;
-    vec4 clip = u.vp * vec4(world, 1.0);
-    clip.y = -clip.y;
-    clip.z = (clip.z + clip.w) * 0.5;
-    gl_Position = clip;
+    gl_Position = to_clip(u.vp * vec4(world, 1.0));
 }

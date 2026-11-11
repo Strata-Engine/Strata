@@ -1,4 +1,3 @@
-#version 460
 // A cross block: one 8-byte instance (Strata.Quad's instance words) drawn as
 // two quads standing on the cell's diagonals, twelve vertices of a triangle
 // list generated from gl_VertexIndex.
@@ -7,14 +6,6 @@
 layout(location = 0) in uint w0;
 layout(location = 1) in uint w1;
 
-layout(set = 0, binding = 0) uniform U {
-    mat4 vp;
-    vec4 sun;
-    vec4 sky;
-    vec4 fog;
-    vec4 eye;       // xyz eye (metres), w metres per voxel
-    ivec4 misc;     // x slots to cull, y commands per range, z texture layers, w rows in the block table
-} u;
 struct Chunk { ivec4 origin_level; uint first[6]; uint count[6]; };
 layout(std430, set = 0, binding = 1) readonly buffer Table { Chunk chunks[]; } table;
 layout(std430, set = 0, binding = 4) readonly buffer DrawSlot { uint slot[]; } draw_slot;
@@ -50,8 +41,5 @@ void main() {
     v_world = world;
     v_w1 = uint(blocks.rows[id].tex[2]) | (255u << 16);
     v_face = 0u;                            // lit as an upward surface
-    vec4 clip = u.vp * vec4(world, 1.0);
-    clip.y = -clip.y;
-    clip.z = (clip.z + clip.w) * 0.5;
-    gl_Position = clip;
+    gl_Position = to_clip(u.vp * vec4(world, 1.0));
 }

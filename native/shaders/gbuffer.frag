@@ -1,26 +1,20 @@
-#version 460
+// The geometry pass: solid surfaces write what the light pass needs to know
+// about them, not a lit colour.
+//   o_albedo  rgb the texture's colour
+//   o_nm      r face (0..5) / 255, g unused, b light class / 255, a corner shading 0..1
 layout(location = 0) in vec2 v_uv;
 layout(location = 1) in vec3 v_world;
 layout(location = 2) flat in uint v_w1;
 layout(location = 3) flat in uint v_face;
 layout(location = 4) in vec2 v_tex;
 
-layout(set = 0, binding = 0) uniform U {
-    mat4 vp;
-    vec4 sun;
-    vec4 sky;
-    vec4 fog;
-    vec4 eye;
-    ivec4 misc;     // x slots to cull, y commands per range, z texture layers, w rows in the block table
-} u;
 // One layer per texture id; repeat addressing, so a merged quad tiles its
 // texture once per block.
 layout(set = 0, binding = 6) uniform sampler2DArray tiles;
 layout(push_constant) uniform PC { uint base; uint flags; } pc;   // flags bit 0: discard see-through pixels (cutout)
 
-layout(location = 0) out vec4 o_color;
-
-const vec3 NORMALS[6] = vec3[6](vec3(0, 1, 0), vec3(0, -1, 0), vec3(1, 0, 0), vec3(-1, 0, 0), vec3(0, 0, 1), vec3(0, 0, -1));
+layout(location = 0) out vec4 o_albedo;
+layout(location = 1) out vec4 o_nm;
 
 void main() {
     // a texture id past the array's last layer draws layer 0, never out of bounds
@@ -36,15 +30,6 @@ void main() {
     float a0 = float(ao & 3u), a1 = float((ao >> 2) & 3u), a2 = float((ao >> 4) & 3u), a3 = float((ao >> 6) & 3u);
     float occ = mix(mix(a0, a1, f.x), mix(a2, a3, f.x), f.y) / 3.0;
 
-    vec3 n = NORMALS[min(v_face, 5u)];
-    float direct = max(dot(n, u.sun.xyz), 0.0);
-    float skyl = 0.5 + 0.5 * n.y;
-    float light = u.sun.w * (0.55 + 0.45 * skyl) + (1.0 - u.sun.w) * direct;
-    light *= 0.45 + 0.55 * occ;
-
-    vec3 col = base.rgb * light;
-    float d = distance(v_world, u.eye.xyz);
-    float fogk = clamp((d - u.fog.x) / max(u.fog.y - u.fog.x, 0.001), 0.0, 1.0);
-    col = mix(col, u.sky.rgb, fogk * fogk);
-    o_color = vec4(col, base.a);
+    o_albedo = vec4(base.rgb, 1.0);
+    o_nm = vec4(float(min(v_face, 5u)) / 255.0, 0.0, float((v_w1 >> 24) & 255u) / 255.0, occ);
 }

@@ -245,3 +245,16 @@ where they were: scene 1 offscreen about 1 970 fps with 0.17 ms in the
 shim, and the soak at
 
     soak: frames=3000 worst_ms=14.47 mean_ms=8.33 refused=0 waiting=0 slots=2200 live_quads=496835 leaked=0 loaded=3381
+
+# Lighting plan
+
+## The deferred passes, shading unchanged (Task 1)
+
+The renderer now draws in three passes: geometry into screen-sized buffers,
+a full-screen light pass, and a final pass that puts the lit image on
+screen and draws translucent surfaces over it. In light mode 0 the light
+pass computes exactly the old shading, and all 13 golden scenes match the
+stored images to within one level in 255.
+
+Scene 1 offscreen: about 1 500 fps, 0.60 ms of GPU (was 0.44 forward) and
+0.21 ms of CPU in the shim.

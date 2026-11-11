@@ -1,4 +1,3 @@
-#version 460
 // One packed quad per INSTANCE; the corner comes from gl_VertexIndex (0..3 of
 // a triangle strip). Bit layout matches Strata.Quad:
 //   w0: x 0-4, y 5-9, z 10-14, (w-1) 15-19, (h-1) 20-24, face 25-27
@@ -8,14 +7,6 @@
 layout(location = 0) in uint w0;
 layout(location = 1) in uint w1;
 
-layout(set = 0, binding = 0) uniform U {
-    mat4 vp;        // OpenGL clip conventions; converted below
-    vec4 sun;       // xyz direction to the sun, w ambient
-    vec4 sky;
-    vec4 fog;       // x start, y end (metres)
-    vec4 eye;       // xyz eye (metres), w metres per voxel
-    ivec4 misc;     // x slots to cull, y commands per range, z texture layers, w rows in the block table
-} u;
 
 // The chunk table.
 struct Chunk {
@@ -60,8 +51,5 @@ void main() {
     v_world = world;
     v_w1 = w1;
     v_face = face;
-    vec4 clip = u.vp * vec4(world, 1.0);
-    clip.y = -clip.y;                         // Vulkan's y points down
-    clip.z = (clip.z + clip.w) * 0.5;         // and its depth runs 0..1
-    gl_Position = clip;
+    gl_Position = to_clip(u.vp * vec4(world, 1.0));
 }
