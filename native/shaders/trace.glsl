@@ -5,19 +5,22 @@
 // size. `owner` says, per chunk-sized cell, which chunk's voxels are in it,
 // so a ray never mistakes a wrapped-round chunk for the one it is in: where
 // the owner is not the chunk the ray is in, the ray has left the loaded
-// world and sees nothing. `coarse` marks 8-voxel cells that hold anything,
-// so empty space is crossed eight voxels at a time.
+// world and sees nothing. `coarse` says how high each 8-voxel cell's contents
+// reach, so empty space, and the air over the ground, is crossed eight voxels
+// at a time.
 layout(set = 0, binding = 11) uniform usampler3D vol;
 layout(set = 0, binding = 12) uniform usampler3D coarse;
 layout(set = 0, binding = 13) uniform isampler3D owner;
 // Two rows of four ints per class: (kind, top texture, side texture,
-// emission), (roughness, spare...). Kinds: 0 empty, 1 solid, 2 cutout,
+// emission), (roughness, mean colour r, g, b scaled to 65535). Kinds: 0 empty, 1 solid, 2 cutout,
 // 3 see-through, 4 thin.
 layout(std430, set = 0, binding = 14) readonly buffer LightTable { ivec4 rows[]; } light_table;
 
 int class_kind(uint c) { return light_table.rows[2u * c].x; }
 ivec4 class_row(uint c) { return light_table.rows[2u * c]; }
 int class_roughness(uint c) { return light_table.rows[2u * c + 1u].x; }
+// A class's colour: the mean of its top texture, linear.
+vec3 class_color(uint c) { return vec3(light_table.rows[2u * c + 1u].yzw) / 65535.0; }
 
 // What a class emits: rgb scaled by its strength, each 0..1.
 vec3 class_emission(uint c) {
@@ -46,13 +49,19 @@ bool cutout_blocks(uint c, vec3 p, int face) {
     return textureLod(tiles, vec3(uv, float(layer)), 0.0).a >= 0.5;
 }
 
+// A coarse cell holds how high its contents reach above its floor, 1..8, or 0
+// for nothing. A ray [y] above the floor and not descending passes over them.
+bool skip_cell(uint top, float y, float dy) { return top == 0u || (dy >= 0.0 && y >= float(top)); }
+
 // Walk a ray from [ro] along unit [rd], both in voxel units, for at most
 // [tmax] voxels. Solid voxels stop it. A run of cutout voxels of one class
 // stops it where the texture is opaque at the point the ray enters the run:
 // the faces between them are not drawn, so they do not block either. See-through voxels stop it only if [stop_glass]. Thin
 // voxels never stop it; what they emit is added to h.glow. Returns false if
-// nothing stopped it, including when it left the loaded world.
-bool trace(vec3 ro, vec3 rd, float tmax, bool stop_glass, out Hit h) {
+// nothing stopped it, including when it left the loaded world or ran out of
+// [steps]: a ray that skims a surface spends a step per voxel. Past
+// [fine_until] voxels from its start the ray looks at every third voxel only.
+bool trace_steps(vec3 ro, vec3 rd, float tmax, bool stop_glass, int steps, float fine_until, out Hit h) {
     h.glow = vec3(0.0); h.t = tmax; h.cls = 0u; h.face = 0; h.voxel = ivec3(0);
     ivec3 dims = u.vol.xyz;                       // the volume's size in chunks
     vec3 d = rd + (1.0 - step(1.0e-6, abs(rd))) * 1.0e-6;      // no exact zeros to divide by
@@ -61,10 +70,10 @@ bool trace(vec3 ro, vec3 rd, float tmax, bool stop_glass, out Hit h) {
     int face = 0;
     ivec3 last_chunk = ivec3(-1000000);
     ivec3 shift = ivec3(0);                       // from a chunk coordinate to its cell in the volume
-    bool hollow = false;                          // the chunk the ray is in holds nothing
+    float chunk_top = 0.0;                        // how high the contents of the chunk the ray is in reach, in voxels
     ivec3 last_thin = ivec3(-1000000);
     uint before = 0u;                             // the class of the voxel the ray was in last
-    for (int i = 0; i < 160; i++) {
+    for (int i = 0; i < steps; i++) {
         if (t >= tmax) return false;
         vec3 p = ro + d * t;
         ivec3 v = ivec3(floor(p));
@@ -73,14 +82,14 @@ bool trace(vec3 ro, vec3 rd, float tmax, bool stop_glass, out Hit h) {
             ivec3 cell = wrap(ch, dims);
             ivec4 own = texelFetch(owner, cell, 0);
             if (own.w == 0 || own.xyz != ch) return false;         // off the edge of what is loaded
-            last_chunk = ch; shift = cell - ch; hollow = own.w == 2;
+            last_chunk = ch; shift = cell - ch; chunk_top = float(own.w - 1);
         }
         vec3 lo, hi;
-        if (hollow) {
-            lo = vec3(ch * 32); hi = lo + 32.0;                      // an empty chunk: cross it whole
+        if (chunk_top == 0.0 || (d.y >= 0.0 && p.y - float(ch.y * 32) >= chunk_top)) {
+            lo = vec3(ch * 32); hi = lo + 32.0;                      // nothing in this chunk on the ray's way: cross it whole
             before = 0u;
-        } else if (texelFetch(coarse, (v >> 3) + shift * 4, 0).r == 0u) {
-            lo = vec3((v >> 3) * 8); hi = lo + 8.0;                  // nothing in this 8-voxel cell: cross it whole
+        } else if (skip_cell(texelFetch(coarse, (v >> 3) + shift * 4, 0).r, p.y - float((v.y >> 3) * 8), d.y)) {
+            lo = vec3((v >> 3) * 8); hi = lo + 8.0;                  // nothing in this 8-voxel cell on the ray's way: cross it whole
             before = 0u;
         } else {
             uint c = texelFetch(vol, v + shift * 32, 0).r;
@@ -91,6 +100,13 @@ bool trace(vec3 ro, vec3 rd, float tmax, bool stop_glass, out Hit h) {
                 if (kind == 4 && v != last_thin) { h.glow += class_emission(c); last_thin = v; }
             }
             before = c;
+            if (t > fine_until) {
+                // far from where the ray began, look only every third voxel: what is
+                // missed is thin, and the saving is most of a mirror ray's cost
+                face = abs(d.y) > 0.5 ? (d.y > 0.0 ? 1 : 0) : (abs(d.x) > abs(d.z) ? (d.x > 0.0 ? 3 : 2) : (d.z > 0.0 ? 5 : 4));
+                t += 3.0;
+                continue;
+            }
             lo = vec3(v); hi = lo + 1.0;
         }
         // leave the box by whichever face the ray reaches first
@@ -101,3 +117,6 @@ bool trace(vec3 ro, vec3 rd, float tmax, bool stop_glass, out Hit h) {
     }
     return false;
 }
+
+// A ray with the usual step limit: enough for shadows, which leave the loaded world upward.
+bool trace(vec3 ro, vec3 rd, float tmax, bool stop_glass, out Hit h) { return trace_steps(ro, rd, tmax, stop_glass, 160, 1.0e9, h); }

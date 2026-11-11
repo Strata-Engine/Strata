@@ -54,21 +54,27 @@ shadow-slab:STRATA_SCENE=12 STRATA_LIGHT=2
 shadow-placed:STRATA_SCENE=12 STRATA_LIGHT=2 STRATA_SLAB_AT=30 STRATA_FRAMES=37
 shadow-removed:STRATA_SCENE=12 STRATA_LIGHT=2 STRATA_SLAB_OFF=60 STRATA_FRAMES=67
 shadow-small-box:STRATA_SCENE=1 STRATA_LIGHT=2 STRATA_SUN=35 STRATA_LIGHT_BOX=2
+reflect-lake:STRATA_SCENE=2 STRATA_LIGHT=3 STRATA_SUN=12
+reflect-glint:STRATA_SCENE=13 STRATA_LIGHT=3 STRATA_SUN=12
+reflect-down:STRATA_SCENE=14 STRATA_LIGHT=3 STRATA_SUN=35
+reflect-high:STRATA_SCENE=15 STRATA_LIGHT=3 STRATA_SUN=30 DRAWS=4
 '
-# indirect draw calls a frame must issue, whatever the scene holds
+# indirect draw calls a frame must issue, whatever the scene holds; a scene
+# with a kind of geometry nowhere in it says DRAWS=n
 EXPECT_DRAWS=5
 FAILED=0
 for line in $(echo "$SCENES" | tr ' ' ','); do
   name="${line%%:*}"; envs="$(echo "${line#*:}" | tr ',' ' ')"
   stored="$name"
-  for kv in $envs; do case "$kv" in GOLDEN_AS=*) stored="${kv#GOLDEN_AS=}";; esac; done
+  draws=$EXPECT_DRAWS
+  for kv in $envs; do case "$kv" in GOLDEN_AS=*) stored="${kv#GOLDEN_AS=}";; DRAWS=*) draws="${kv#DRAWS=}";; esac; done
   shot="$OUT/$name.ppm"
   if ! env MARCH_PIN_MAIN=1 STRATA_RADIUS=6 STRATA_SIZE=640x400 STRATA_FRAMES=60 STRATA_SHOT="$shot" $envs \
        ./viewer/.march/build/release/strata_viewer > "$OUT/$name.log" 2>&1 || [ ! -s "$shot" ]; then
     echo "FAIL: $name did not render"; tail -5 "$OUT/$name.log"; FAILED=1; continue
   fi
-  if ! grep -q "draw calls $EXPECT_DRAWS\$" "$OUT/$name.log"; then
-    echo "FAIL: $name did not issue $EXPECT_DRAWS draw calls: $(grep 'done after' "$OUT/$name.log")"; FAILED=1; continue
+  if ! grep -q "draw calls $draws\$" "$OUT/$name.log"; then
+    echo "FAIL: $name did not issue $draws draw calls: $(grep 'done after' "$OUT/$name.log")"; FAILED=1; continue
   fi
   # a scene that asks for a swapchain rebuild must have had one
   case "$envs" in *STRATA_REBUILD_AT*)

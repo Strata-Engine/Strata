@@ -2,15 +2,6 @@
 // and writes the lit colour.
 layout(location = 0) in vec2 v_uv;
 
-layout(set = 0, binding = 7) uniform sampler2D gb_albedo;
-layout(set = 0, binding = 8) uniform sampler2D gb_nm;
-layout(set = 0, binding = 9) uniform sampler2D gb_depth;
-
-// What this pass wrote for the frame before: rgb sky light, a sun visibility;
-// and r samples behind them, g view depth, b face.
-layout(set = 0, binding = 15) uniform sampler2D hist_prev;
-layout(set = 0, binding = 16) uniform sampler2D meta_prev;
-
 layout(location = 0) out vec4 o_lit;
 layout(location = 1) out vec4 o_hist;
 layout(location = 2) out vec4 o_meta;
@@ -83,5 +74,16 @@ void main() {
     o_meta = vec4(count, view_depth, float(face), 0.0);
 
     vec3 col = albedo * (u.sun_color.rgb * ndl * sun_vis + sky_flat(n));
+    if (mode >= 3) {
+        // the sun's highlight on anything not fully rough; a mirror ray for what is smooth
+        uint cls = uint(nm.b * 255.0 + 0.5);
+        float rough = float(class_roughness(cls)) / 255.0;
+        vec3 toward_eye = normalize(u.eye.xyz - world);
+        if (rough < 0.25) {
+            float share = mirror_share(n, toward_eye, 0.12) * (1.0 - rough);
+            col = mix(col, reflected(at + n * 0.02, mirror_dir(toward_eye, n, n)), share);
+        }
+        col += sun_highlight(n, toward_eye, rough, sun_vis);
+    }
     o_lit = vec4(fogged(col, world), 1.0);
 }

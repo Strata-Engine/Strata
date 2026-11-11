@@ -27,7 +27,7 @@
 /* Rewritten by build_shaders.sh whenever the shaders change: forge decides
  * whether to recompile this file from its text alone, not from the headers
  * it includes (GAPS S14). */
-#define STRATA_SHADERS_STAMP "abde444811614867"
+#define STRATA_SHADERS_STAMP "fb604ad0569f3c4e"
 #include "strata_shaders.h"
 #include "strata_alloc.h"
 
@@ -118,10 +118,11 @@ static struct {
     VkSampler nearest;             /* for reading the frame's own images, texel for texel */
     int light_mode;                /* 0: the pre-ray-tracing shading, through the deferred passes */
     /* The light volume: a light class per voxel for every chunk held, the
-     * coarse 'anything here' copy, and which chunk each cell holds. */
+     * coarse copy (how high each 8-voxel cell's contents reach), and which chunk each cell holds. */
     Target vol, coarse, owner;
     int vn, vnv;                   /* its size in chunks: vn across (x and z), vnv up */
     VkBuffer ltable; VkDeviceMemory ltable_mem; int32_t *ltable_map;
+    float *tex_mean; uint32_t tex_mean_n;   /* each texture layer's mean colour, linear, three floats a layer */
     struct LightCell { int32_t chunk[3]; int valid; int uniform; } *cells;   /* per cell, as last queued: its chunk, and its class if it is one class throughout, else -1 */
     struct LightWrite { int cell[3]; int32_t chunk[3]; int valid; int uniform; int edit; unsigned char *bytes; } *lq;   /* writes waiting to be copied in, oldest first */
     uint32_t nlq, lq_cap;
@@ -532,6 +533,18 @@ int64_t sv_textures_create(int64_t tile_px, int64_t layers);
 int64_t sv_texture_set(int64_t layer, void *rgba_u8, int64_t nbytes);
 int64_t sv_textures_commit(void);
 
+/* Words 5..7 of each light class: the mean colour of its top texture, linear,
+ * scaled to 0..65535. Refreshed when the classes or the textures change. */
+static void light_colours(void) {
+    if (!g.ltable_map) return;
+    for (int c = 0; c < 256; c++) {
+        int32_t *row = g.ltable_map + c * 8;
+        uint32_t tex = (uint32_t)row[1];
+        for (int k = 0; k < 3; k++)
+            row[5 + k] = (g.tex_mean && tex < g.tex_mean_n) ? (int32_t)(g.tex_mean[tex * 3 + k] * 65535.0f) : 32768;
+    }
+}
+
 static void destroy_textures(void) {
     if (g.sampler) vkDestroySampler(g.dev, g.sampler, NULL);
     if (g.tex_view) vkDestroyImageView(g.dev, g.tex_view, NULL);
@@ -574,6 +587,24 @@ int64_t sv_textures_commit(void) {
     if (!g.dev || !g.tex_staging) return 0;
     vkDeviceWaitIdle(g.dev);
     destroy_textures();
+    {   /* each layer's mean colour over its opaque texels: what a ray sees of a block it hits off screen */
+        float *mean = calloc((size_t)g.layers * 3, sizeof *mean);
+        if (mean) {
+            size_t per = (size_t)g.tile_px * g.tile_px;
+            for (uint32_t l = 0; l < g.layers; l++) {
+                const unsigned char *px = g.tex_staging + per * 4 * l;
+                double sum[3] = { 0, 0, 0 }; size_t n = 0;
+                for (size_t i = 0; i < per; i++) {
+                    if (px[i * 4 + 3] < 128) continue;
+                    for (int c = 0; c < 3; c++) sum[c] += pow(px[i * 4 + c] / 255.0, 2.2);
+                    n++;
+                }
+                for (int c = 0; c < 3; c++) mean[l * 3 + c] = n ? (float)(sum[c] / (double)n) : 0.0f;
+            }
+            free(g.tex_mean); g.tex_mean = mean; g.tex_mean_n = g.layers;
+            light_colours();
+        }
+    }
     uint32_t levels = 1; for (uint32_t t = g.tile_px; t > 1; t >>= 1) levels++;
     VkImageCreateInfo ici = { .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D, .format = VK_FORMAT_R8G8B8A8_SRGB,
         .extent = { g.tile_px, g.tile_px, 1 }, .mipLevels = levels, .arrayLayers = g.layers, .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL,
@@ -727,6 +758,7 @@ int64_t sv_light_table_set(void *words_i32, int64_t nclasses) {
     if (!g.ltable_map || !words_i32 || nclasses < 0 || nclasses > 256 || narr_len(words_i32) < nclasses * 8) return 0;
     memset(g.ltable_map, 0, 256 * 32);
     memcpy(g.ltable_map, narr_data(words_i32), (size_t)nclasses * 32);
+    light_colours();
     return 1;
 }
 
@@ -772,7 +804,7 @@ static void light_flush(Frame *F) {
         unsigned char *dst = F->lstage_map + (size_t)i * SV_LIGHT_WRITE_BYTES;
         unsigned char *coarse = dst + 32768;
         int16_t *own = (int16_t *)(dst + 32768 + 64);
-        int any = 0;
+        int any = 0;                 /* how high the chunk's contents reach, 0..32 */
         if (w->bytes) {
             /* the chunk's flat index is x + 32 * (z + 32 * y); the volume wants x fastest, then y, then z */
             for (int z = 0; z < 32; z++) for (int y = 0; y < 32; y++)
@@ -780,14 +812,19 @@ static void light_flush(Frame *F) {
             memset(coarse, 0, 64);
             for (int z = 0; z < 32; z++) for (int y = 0; y < 32; y++) {
                 const unsigned char *row = dst + 32 * (y + 32 * z);
-                for (int x = 0; x < 32; x++) if (row[x]) { coarse[(x >> 3) + 4 * ((y >> 3) + 4 * (z >> 3))] = 1; any = 1; }
+                /* a coarse cell holds how high its contents reach, 1..8 (0: nothing): a ray above that and rising can cross the cell whole */
+                for (int x = 0; x < 32; x++) if (row[x]) {
+                    unsigned char *cc = &coarse[(x >> 3) + 4 * ((y >> 3) + 4 * (z >> 3))];
+                    if (*cc < (y & 7) + 1) *cc = (unsigned char)((y & 7) + 1);
+                    if (any < y + 1) any = y + 1;
+                }
             }
         } else {
             memset(dst, w->uniform, 32768);
-            memset(coarse, w->uniform ? 1 : 0, 64);
-            any = w->uniform != 0;
+            memset(coarse, w->uniform ? 8 : 0, 64);
+            any = w->uniform != 0 ? 32 : 0;
         }
-        own[0] = (int16_t)w->chunk[0]; own[1] = (int16_t)w->chunk[1]; own[2] = (int16_t)w->chunk[2]; own[3] = (int16_t)(w->valid ? (any ? 1 : 2) : 0);   /* 2: held, and nothing in it */
+        own[0] = (int16_t)w->chunk[0]; own[1] = (int16_t)w->chunk[1]; own[2] = (int16_t)w->chunk[2]; own[3] = (int16_t)(w->valid ? 1 + any : 0);   /* 0: no chunk here; else 1 + how high its contents reach */
         VkDeviceSize base = (VkDeviceSize)i * SV_LIGHT_WRITE_BYTES;
         rv[i] = (VkBufferImageCopy){ .bufferOffset = base, .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
             .imageOffset = { w->cell[0] * 32, w->cell[1] * 32, w->cell[2] * 32 }, .imageExtent = { 32, 32, 32 } };
@@ -1079,7 +1116,7 @@ void sv_close(void) {
         if (g.blocks) vkDestroyBuffer(g.dev, g.blocks, NULL);
         if (g.blocks_mem) vkFreeMemory(g.dev, g.blocks_mem, NULL);
         destroy_textures();
-        free(g.tex_staging);
+        free(g.tex_staging); free(g.tex_mean);
         for (int f = 0; f < SV_FRAMES; f++) {
             if (g.frames[f].stats) vkDestroyBuffer(g.dev, g.frames[f].stats, NULL);
             if (g.frames[f].stats_mem) vkFreeMemory(g.dev, g.frames[f].stats_mem, NULL);
@@ -1410,6 +1447,8 @@ static void invert4(const float *m, float *out) {
 /* How the light pass shades: 0 is the renderer's shading from before ray
  * tracing, carried through the deferred passes. */
 void sv_set_lighting(int64_t mode) { g.light_mode = (int)mode; }
+/* The time, in seconds, that moving surface detail (water's ripples) runs on. */
+void sv_set_time(double seconds) { g.time_s = seconds; }
 
 /* ── Frame parameters ─────────────────────────────────────────────────────── */
 /* [vp] is a column-major view-projection in OpenGL clip conventions (y up,

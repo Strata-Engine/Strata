@@ -23,9 +23,9 @@ build cross.vert
 build loose.vert
 build fullscreen.vert
 build gbuffer.frag tiles.glsl
-build light.frag shade.glsl tiles.glsl trace.glsl sky.glsl
+build light.frag shade.glsl tiles.glsl gbuf.glsl trace.glsl sky.glsl reflect.glsl
 build composite.frag
-build water.frag shade.glsl tiles.glsl trace.glsl sky.glsl
+build water.frag shade.glsl tiles.glsl gbuf.glsl trace.glsl sky.glsl reflect.glsl
 cp "$OUT" strata_shaders.h
 # strata_vk.c carries a stamp of the header, so a shader-only change still
 # changes the C source forge looks at

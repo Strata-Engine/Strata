@@ -299,3 +299,19 @@ An edit: the slab's shadow is at full darkness on the first frame the slab is
 drawn, and gone on the first frame it is not (goldens `shadow-placed`,
 `shadow-removed`, shot four frames after the edit). Stillness: frames 118 and
 119 of the forest differ by more than 4 in 0.0017% of pixels (limit 0.05%).
+
+## Task 5: sun highlight and reflections (light mode 3)
+
+2560 x 1600, offscreen, stream radius 10.
+
+| scene | GPU time |
+|---|---|
+| overview, sun 30 | 2.61 ms |
+| high ground (snow and ice), sun 30 | 1.72 ms |
+| lake filling half the screen, sun 12 | 7.0 ms |
+
+Water is the expensive case: every water pixel traces a sun ray and a mirror
+ray every frame, with no memory between frames. Two changes to the ray walk
+made along the way also brought mode 2 down to 1.43 ms (sun 55) and 1.96 ms
+(sun 15), inside its 2 ms target: a coarse cell and a chunk now record how
+high their contents reach, and a rising ray above that crosses them whole.
