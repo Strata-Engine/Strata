@@ -155,3 +155,22 @@ Scene 1 offscreen with the compacted list: 1 950 fps, 0.28 to 0.31 ms of
 CPU in the shim, 3 draw calls. Most of that CPU is the translucent range,
 which is still one command per slot (3 087 of them) until Task 6 gives it
 its own short sorted list.
+
+## Translucent order (Task 6)
+
+Two see-through walls in different chunks, red glass and water, looked at
+from each side: before, the wall drawn last was whichever had the higher
+slot, so from one side the far wall tinted the near one. Now the shim keeps
+a list of the slots that hold translucent quads, tests and sorts just that
+list far to near each frame, and writes its commands itself, into a region
+of the command buffer each frame in flight owns.
+
+| | |
+|---|---|
+| chunks with translucent quads in view, scene 1 | 18 |
+| time to test, sort and write them | 4 microseconds |
+| CPU in the shim, scene 1 offscreen | 0.10 ms (was 0.28 with one translucent command per slot) |
+| frame rate, scene 1 offscreen | about 2 240 fps |
+
+Translucent quads also draw from both sides now, so a water surface is
+visible from underneath. Quads inside one chunk are still unsorted.

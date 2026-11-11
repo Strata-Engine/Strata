@@ -39,7 +39,12 @@ static inline void   *narr_data(void *a) { return (char *)a + NARR_HDR; }
 
 #define SV_RANGES 6            /* 0 opaque, 1 cutout, 2 translucent, 3 cross, 4 loose, 5 spare */
 #define SV_PAD_MAX 65536       /* extra zero-count commands sv_pad_commands may append */
-#define SV_CMD_STRIDE (SV_MAX_SLOTS + SV_PAD_MAX)   /* commands per range in the indirect buffer */
+#define SV_CMD_STRIDE (SV_MAX_SLOTS + SV_PAD_MAX)   /* commands per region of the indirect buffer */
+/* Regions of the command buffer: one per compute-culled range, then one per
+ * frame in flight for the translucent list, which the CPU writes and so must
+ * not share with a frame the GPU is still drawing. */
+#define SV_REGION_TRANS 6
+#define SV_REGIONS (SV_REGION_TRANS + SV_FRAMES)
 
 typedef SaRange Range;
 
@@ -92,8 +97,11 @@ static struct {
     VkDescriptorSetLayout dsl;
     VkDescriptorPool dpool;
     VkBuffer table; VkDeviceMemory table_mem; ChunkEntry *entries;      /* the chunk table, SV_MAX_SLOTS entries */
-    VkBuffer cmds;  VkDeviceMemory cmds_mem;                             /* indirect commands, SV_RANGES * SV_CMD_STRIDE */
-    VkBuffer dslot; VkDeviceMemory dslot_mem;                            /* the slot each command draws, same shape */
+    VkBuffer cmds;  VkDeviceMemory cmds_mem;  uint32_t *cmds_map;        /* indirect commands, SV_REGIONS * SV_CMD_STRIDE, 4 words each */
+    VkBuffer dslot; VkDeviceMemory dslot_mem; uint32_t *dslot_map;       /* the slot each command draws, same shape */
+    /* slots that hold translucent quads: the list the CPU orders each frame */
+    uint32_t *trans; uint32_t ntrans; int32_t *trans_at;                 /* trans_at[slot] = index in trans, or -1 */
+    struct TransKey { float dist; uint32_t slot; } *trans_keys;
     uint32_t submit[SV_RANGES];    /* commands the next indirect call of each range will submit */
     VkBuffer blocks; VkDeviceMemory blocks_mem; int32_t *blocks_map;     /* the block table: 8 words a block id */
     uint32_t nblocks;
@@ -109,7 +117,7 @@ static struct {
     VkBuffer ubo;  VkDeviceMemory ubo_mem;  float *ubo_map;
     int ok, swap_ok, resized;
     int vsync_off;                 /* ask for the immediate present mode */
-    double stat[4];                /* last frame: CPU ms, ms waiting, draw calls, GPU ms */
+    double stat[6];                /* last frame: CPU ms, ms waiting, draw calls, GPU ms, translucent chunks drawn, microseconds ordering them */
     VkQueryPool qpool; int have_ts; float ts_period;
     int64_t refused;               /* uploads turned away because the buffer was full */
     /* stats of the last frame */
@@ -301,7 +309,8 @@ static int make_pipeline(int blend, VkPipeline *out) {
     VkPipelineInputAssemblyStateCreateInfo ia = { .sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO, .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP };
     VkPipelineViewportStateCreateInfo vp = { .sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO, .viewportCount = 1, .scissorCount = 1 };
     VkPipelineRasterizationStateCreateInfo rs = { .sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO, .polygonMode = VK_POLYGON_MODE_FILL,
-        .cullMode = VK_CULL_MODE_BACK_BIT, .frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE, .lineWidth = 1.0f };
+        /* a see-through surface is visible from behind too: water from below */
+        .cullMode = blend ? VK_CULL_MODE_NONE : VK_CULL_MODE_BACK_BIT, .frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE, .lineWidth = 1.0f };
     VkPipelineMultisampleStateCreateInfo ms = { .sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO, .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT };
     VkPipelineDepthStencilStateCreateInfo ds = { .sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO, .depthTestEnable = VK_TRUE,
         .depthWriteEnable = blend ? VK_FALSE : VK_TRUE, .depthCompareOp = VK_COMPARE_OP_LESS };
@@ -556,13 +565,18 @@ int64_t sv_open(int64_t w, int64_t h, int64_t capture_mouse, int64_t quad_capaci
     if (!make_buffer((VkDeviceSize)SV_MAX_SLOTS * sizeof(ChunkEntry), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &g.table, &g.table_mem, &map)) return 0;
     g.entries = map;
     memset(g.entries, 0, (size_t)SV_MAX_SLOTS * sizeof(ChunkEntry));
-    VkDeviceSize cmd_bytes = (VkDeviceSize)SV_RANGES * SV_CMD_STRIDE * 16;
+    VkDeviceSize cmd_bytes = (VkDeviceSize)SV_REGIONS * SV_CMD_STRIDE * 16;
     if (!make_buffer(cmd_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, &g.cmds, &g.cmds_mem, &map)) return 0;
     memset(map, 0, (size_t)cmd_bytes);            /* the padding commands stay zero-count for good */
-    vkUnmapMemory(g.dev, g.cmds_mem);
-    if (!make_buffer((VkDeviceSize)SV_RANGES * SV_CMD_STRIDE * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &g.dslot, &g.dslot_mem, &map)) return 0;
-    memset(map, 0, (size_t)SV_RANGES * SV_CMD_STRIDE * 4);
-    vkUnmapMemory(g.dev, g.dslot_mem);
+    g.cmds_map = map;
+    if (!make_buffer((VkDeviceSize)SV_REGIONS * SV_CMD_STRIDE * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &g.dslot, &g.dslot_mem, &map)) return 0;
+    memset(map, 0, (size_t)SV_REGIONS * SV_CMD_STRIDE * 4);
+    g.dslot_map = map;
+    g.trans = calloc(SV_MAX_SLOTS, sizeof *g.trans);
+    g.trans_at = malloc(SV_MAX_SLOTS * sizeof *g.trans_at);
+    g.trans_keys = calloc(SV_MAX_SLOTS, sizeof *g.trans_keys);
+    if (!g.trans || !g.trans_at || !g.trans_keys) { die("translucent list", 0); return 0; }
+    for (int i = 0; i < SV_MAX_SLOTS; i++) g.trans_at[i] = -1;
 
     if (!make_buffer((VkDeviceSize)SV_MAX_BLOCKS * 32, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &g.blocks, &g.blocks_mem, &map)) return 0;
     g.blocks_map = map;
@@ -662,6 +676,7 @@ void sv_close(void) {
     if (g.inst) vkDestroyInstance(g.inst, NULL);
     if (g.win) glfwDestroyWindow(g.win);
     glfwTerminate();
+    free(g.trans); free(g.trans_at); free(g.trans_keys);
     memset(&g, 0, sizeof g);
 }
 
@@ -681,8 +696,9 @@ void sv_set_vsync(int64_t on) { int off = on ? 0 : 1; if (g.ok && off != g.vsync
 /* Of the last frame: 0 ms of CPU work inside sv_frame, 1 ms it spent waiting
  * (for the previous frame's fence, the next image, and present), 2 draw
  * calls issued, 3 GPU ms or -1 if the driver
- * gives no timestamps. */
-double sv_stat(int64_t which) { return (which >= 0 && which < 4) ? g.stat[which] : -1.0; }
+ * gives no timestamps, 4 translucent chunks drawn, 5 microseconds spent
+ * ordering them. */
+double sv_stat(int64_t which) { return (which >= 0 && which < 6) ? g.stat[which] : -1.0; }
 int64_t sv_drawn_chunks(void) { return g.drawn_chunks; }
 int64_t sv_drawn_quads(void) { return g.drawn_quads; }
 int64_t sv_live_quads(void) { return (int64_t)sa_live(&g_quads); }
@@ -693,6 +709,74 @@ void sv_force_rebuild(void) { g.resized = 1; }
 /* 1: frames render to an offscreen image and are never presented, so they
  * are not paced by the display. For timing; the window shows nothing new. */
 void sv_set_offscreen(int64_t on) { g.offscreen = on ? 1 : 0; }
+
+/* Keep the list of slots holding translucent quads: add or remove one. */
+static void trans_track(uint32_t slot, int has) {
+    int32_t at = g.trans_at[slot];
+    if (has && at < 0) { g.trans_at[slot] = (int32_t)g.ntrans; g.trans[g.ntrans++] = slot; }
+    else if (!has && at >= 0) {
+        uint32_t last = g.trans[--g.ntrans];
+        g.trans[at] = last; g.trans_at[last] = at; g.trans_at[slot] = -1;
+    }
+}
+
+/* Is the chunk's box outside the clip volume of the view-projection? */
+static int culled(const float *m, const int32_t *o, float side, float scale) {
+    float c[8][4];
+    for (int i = 0; i < 8; i++) {
+        float x = ((float)o[0] + ((i & 1) ? side : 0.0f)) * scale;
+        float y = ((float)o[1] + ((i & 2) ? side : 0.0f)) * scale;
+        float z = ((float)o[2] + ((i & 4) ? side : 0.0f)) * scale;
+        for (int r = 0; r < 4; r++) c[i][r] = m[r] * x + m[4 + r] * y + m[8 + r] * z + m[12 + r];
+    }
+    for (int p = 0; p < 6; p++) {
+        int out = 0;
+        for (int i = 0; i < 8; i++) {
+            float w = c[i][3], v = c[i][p >> 1];
+            if ((p & 1) ? (v > w) : (v < -w)) out++;
+        }
+        if (out == 8) return 1;
+    }
+    return 0;
+}
+
+static int far_first(const void *a, const void *b) {
+    float da = ((const struct TransKey *)a)->dist, db = ((const struct TransKey *)b)->dist;
+    return da < db ? 1 : (da > db ? -1 : 0);
+}
+
+/* Write this frame's translucent commands, far to near, into the Frame's own
+ * region. Returns how many. Work is proportional to the chunks that hold
+ * translucent quads, not to the chunks loaded. */
+static uint32_t order_translucent(uint32_t region) {
+    double t0 = glfwGetTime();
+    float scale = g.ubo_map[31] > 0.0f ? g.ubo_map[31] : 1.0f;
+    const float *eye = g.ubo_map + 28;
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < g.ntrans; i++) {
+        const ChunkEntry *e = &g.entries[g.trans[i]];
+        float side = (float)(32 << (e->level_flags & 255));
+        if (culled(g.ubo_map, e->origin, side, scale)) continue;
+        float cx = ((float)e->origin[0] + side * 0.5f) * scale - eye[0];
+        float cy = ((float)e->origin[1] + side * 0.5f) * scale - eye[1];
+        float cz = ((float)e->origin[2] + side * 0.5f) * scale - eye[2];
+        g.trans_keys[n].dist = cx * cx + cy * cy + cz * cz;
+        g.trans_keys[n].slot = g.trans[i];
+        n++;
+    }
+    qsort(g.trans_keys, n, sizeof *g.trans_keys, far_first);
+    uint32_t *cmd = g.cmds_map + (size_t)region * SV_CMD_STRIDE * 4;
+    uint32_t *ds = g.dslot_map + (size_t)region * SV_CMD_STRIDE;
+    for (uint32_t i = 0; i < n; i++) {
+        const ChunkEntry *e = &g.entries[g.trans_keys[i].slot];
+        cmd[i * 4 + 0] = 4; cmd[i * 4 + 1] = e->count[2]; cmd[i * 4 + 2] = 0; cmd[i * 4 + 3] = e->first[2];
+        ds[i] = g.trans_keys[i].slot;
+        g.drawn_quads += e->count[2];
+    }
+    g.stat[4] = (double)n;
+    g.stat[5] = (glfwGetTime() - t0) * 1.0e6;
+    return n;
+}
 
 /* ── Chunk uploads ────────────────────────────────────────────────────────── */
 /* Replace one layer of a slot with [nquads] quads from a NativeI32Arr (two
@@ -715,6 +799,7 @@ int64_t sv_chunk_upload(int64_t slot, int64_t layer, void *quads, int64_t nquads
     e->first[layer] = fresh.first;
     e->count[layer] = fresh.count;
     e->level_flags = SV_IN_USE;
+    if (layer == 2) trans_track((uint32_t)slot, fresh.count > 0);
     if ((uint32_t)slot + 1 > g.hi_slot) g.hi_slot = (uint32_t)slot + 1;
     return 1;
 }
@@ -724,6 +809,7 @@ void sv_chunk_free(int64_t slot) {
     ChunkEntry *e = &g.entries[slot];
     if (!(e->level_flags & SV_IN_USE)) return;
     e->level_flags = 0;                      /* the cull pass skips it from the next frame on */
+    trans_track((uint32_t)slot, 0);
     for (int l = 0; l < SV_LAYERS; l++) { sa_release(&g_quads, (Range){ e->first[l], e->count[l] }, g.frame_no); e->first[l] = 0; e->count[l] = 0; }
 }
 
@@ -805,7 +891,6 @@ int64_t sv_frame(void) {
         if (!F->stats_valid || seen > allowed) next = g.hi_slot;
         g.submit[r] = next > g.hi_slot ? g.hi_slot : next;
     }
-    g.submit[2] = g.hi_slot;                     /* the translucent range is not compacted */
     memset(F->stats_map, 0, 32);
     F->stats_valid = 1;
     if (g.have_ts && F->ts_written) {
@@ -824,6 +909,9 @@ int64_t sv_frame(void) {
         wait_ms += (glfwGetTime() - t_acq) * 1000.0;
     }
     int draws = 0;
+    /* this Frame's fence has been waited on, so the GPU is done with its region */
+    uint32_t trans_region = SV_REGION_TRANS + (uint32_t)(g.frame_no % SV_FRAMES);
+    uint32_t ntrans = order_translucent(trans_region);
     vkResetCommandBuffer(F->cmd, 0);
     VkCommandBufferBeginInfo bi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
     vkBeginCommandBuffer(F->cmd, &bi);
@@ -866,16 +954,21 @@ int64_t sv_frame(void) {
 
     /* draw: one multi-draw-indirect call per range. The push constant tells
      * the vertex shader where the call's commands start in draw_slot. */
-    if (g.hi_slot > 0) {
-        for (uint32_t r = 0; r < 3; r++) {
-            uint32_t n = g.submit[r] + g.pad_cmds, base = r * SV_CMD_STRIDE;
-            if (n == 0) continue;
-            if (r == 0) vkCmdBindPipeline(F->cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g.pipe_opaque);
-            if (r == 2) vkCmdBindPipeline(F->cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g.pipe_blend);
-            uint32_t pc[2] = { base, r == 1 ? 1u : 0u };          /* the cutout range discards see-through pixels */
-            vkCmdPushConstants(F->cmd, g.layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, 8, pc);
-            vkCmdDrawIndirect(F->cmd, g.cmds, (VkDeviceSize)base * 16, n, 16); draws++;
-        }
+    for (uint32_t r = 0; r < 2; r++) {
+        uint32_t n = g.submit[r] + g.pad_cmds, base = r * SV_CMD_STRIDE;
+        if (n == 0) continue;
+        if (r == 0) vkCmdBindPipeline(F->cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g.pipe_opaque);
+        uint32_t pc[2] = { base, r == 1 ? 1u : 0u };          /* the cutout range discards see-through pixels */
+        vkCmdPushConstants(F->cmd, g.layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, 8, pc);
+        vkCmdDrawIndirect(F->cmd, g.cmds, (VkDeviceSize)base * 16, n, 16); draws++;
+    }
+    /* translucent last, far to near, blended, writing no depth */
+    if (ntrans > 0) {
+        uint32_t base = trans_region * SV_CMD_STRIDE;
+        uint32_t pc[2] = { base, 0u };
+        vkCmdBindPipeline(F->cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g.pipe_blend);
+        vkCmdPushConstants(F->cmd, g.layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, 8, pc);
+        vkCmdDrawIndirect(F->cmd, g.cmds, (VkDeviceSize)base * 16, ntrans, 16); draws++;
     }
     vkCmdEndRenderPass(F->cmd);
     if (g.have_ts) vkCmdWriteTimestamp(F->cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, g.qpool, q0 + 1);
