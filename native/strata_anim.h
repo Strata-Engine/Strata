@@ -11,7 +11,12 @@
  *
  * Refused calls change nothing; they are counted in an_stat(3) and the
  * reason (AN_R_*) is kept in an_stat(5). Marks that cannot be reported are
- * counted in an_stat(6), never dropped silently. */
+ * counted in an_stat(6), never dropped silently.
+ *
+ * The procedural stage (after the layers, in this order): the drop, the
+ * overrides, aim, reach, then springs within the hierarchy pass. Its
+ * settings live in one pool of records shared by every figure (AN_PROC_PER_FIG
+ * a figure of capacity); a full pool refuses with AN_R_FULL. */
 #ifndef STRATA_ANIM_H
 #define STRATA_ANIM_H
 #include <stdint.h>
@@ -32,6 +37,11 @@
 #define AN_FADES 3                 /* sources one layer holds while crossfading */
 #define AN_WRAPS 64                /* loops of one clip walked for marks in one update; more are counted in stat 6 */
 #define AN_IDS (1 << 20)           /* figure ids: the n-th spawn is id n mod 2^20 */
+#define AN_PROC_PER_FIG 8          /* procedural records in the pool, per figure of capacity */
+#define AN_AIMS 4                  /* aim slots a figure */
+#define AN_REACHES 8               /* reach slots a figure */
+#define AN_SPRING_STEP (1.0f / 120)   /* springs are sub-stepped at this */
+#define AN_SPRING_SNAP 0.5f        /* an update longer than this settles every spring at once */
 
 /* why the last refused call was refused: an_stat(5) */
 enum {
@@ -47,7 +57,8 @@ enum {
     AN_R_MASK = 9,      /* no such mask, or a mask of another rig, or a root outside the rig */
     AN_R_KEY = 10,      /* a key's part, channel or interpolation out of range */
     AN_R_BLEND = 11,    /* a blend of 0 or more than AN_BLEND clips, or positions not increasing */
-    AN_R_WHAT = 12      /* an_set: no such setting, or nothing playing on the layer */
+    AN_R_WHAT = 12,     /* an_set: no such setting, or nothing playing on the layer */
+    AN_R_PART = 13      /* the procedural stage: a part outside the rig, a slot outside its range, or a chain not running down the rig */
 };
 
 /* ---- small quaternion and vector arithmetic (xyzw, Hamilton product) ---- */
@@ -93,6 +104,35 @@ static inline int an_finite(const float *v, int n) {
     return 1;
 }
 static const float an_qid[4] = {0, 0, 0, 1};
+static inline float an_dot(const float a[3], const float b[3]) { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]; }
+static inline float an_len(const float a[3]) { return sqrtf(an_dot(a, a)); }
+static inline void an_cross(const float a[3], const float b[3], float o[3]) {
+    float x = a[1] * b[2] - a[2] * b[1], y = a[2] * b[0] - a[0] * b[2], z = a[0] * b[1] - a[1] * b[0];
+    o[0] = x; o[1] = y; o[2] = z;
+}
+static inline float an_clampf(float v, float lo, float hi) { return v < lo ? lo : (v > hi ? hi : v); }
+/* a turn of angle radians about a unit axis */
+static inline void an_qaxis(const float k[3], float angle, float o[4]) {
+    float s = sinf(angle * 0.5f);
+    o[0] = k[0] * s; o[1] = k[1] * s; o[2] = k[2] * s; o[3] = cosf(angle * 0.5f);
+}
+/* a unit vector perpendicular to v (v not zero): across the axis v leans on least */
+static inline void an_perp(const float v[3], float o[3]) {
+    float ax = fabsf(v[0]), ay = fabsf(v[1]), az = fabsf(v[2]);
+    float e[3] = {0, 0, 0};
+    e[ax <= ay && ax <= az ? 0 : (ay <= az ? 1 : 2)] = 1;
+    an_cross(v, e, o);
+    float l = an_len(o);
+    for (int i = 0; i < 3; i++) o[i] /= l;
+}
+/* the shortest turn taking unit a onto unit b; half a turn about a perpendicular when opposite */
+static inline void an_qfromto(const float a[3], const float b[3], float o[4]) {
+    float d = an_dot(a, b);
+    if (d < -0.999999f) { float k[3]; an_perp(a, k); an_qaxis(k, 3.14159265f, o); return; }
+    an_cross(a, b, o);
+    o[3] = 1 + d;
+    an_qnorm(o);
+}
 
 /* ---- the world ---- */
 typedef struct { float from, to, t, len; } AnRamp;   /* a value moving linearly from..to over len seconds */
@@ -141,9 +181,26 @@ typedef struct {
     int32_t id;                  /* -1: free */
     int32_t rig, dirty;
     float pos[3], q[4];
+    int32_t proc;                /* the first of its procedural records, -1 for none */
+    float drop;                  /* metres the root is lowered after the layers */
+    float drop_goal, drop_rate;  /* where the drop is moving and how fast (metres a second; 0 holds) */
     AnLayer layer[AN_LAYERS];
 } AnFig;
 typedef struct { float u; int32_t fig, layer, tag; float weight; } AnEvent;   /* u: how far through the update */
+
+/* one setting of the procedural stage, in a pool shared by every figure.
+ * A figure's records are a list sorted by kind, then slot.
+ *   override: slot = part; v = q xyzw, move xyz, weight; n = 1 if it sets the move
+ *   aim:      slot 0..3; chain[0..n-1]; v = axis xyz (unit, in the last part's frame), target xyz, limit (radians), weight
+ *   reach:    slot 0..7; chain[0..2]; v = target xyz, pole xyz, weight, the weight it fades to, fade speed (weight a second)
+ *   spring:   slot = part; v = stiffness, damping, world rotation xyzw, angular velocity xyz (world); fresh until first posed */
+enum { AN_K_OVERRIDE = 0, AN_K_AIM = 1, AN_K_REACH = 2, AN_K_SPRING = 3 };
+typedef struct {
+    int32_t next;                /* the figure's next record, -1 at the end */
+    uint8_t kind, slot, n, fresh;
+    int8_t chain[4];
+    float v[9];
+} AnProc;
 
 struct AnWorld {
     int capacity;
@@ -160,6 +217,7 @@ struct AnWorld {
     AnEvent *events, *events_tmp; int nevents, fig_events;   /* capacity x AN_FIG_EVENTS */
     int live, posed;
     double refused, negative_dt, dropped; int reason;
+    AnProc *procs; int32_t *proc_free; int nprocs, nproc_free;   /* the procedural pool and its free stack */
 };
 typedef struct AnWorld AnWorld;
 
@@ -170,6 +228,7 @@ static inline void an_close(AnWorld *w) {
     free(w->rigs); free(w->masks); free(w->clips); free(w->keys); free(w->key_interp);
     free(w->mark_t); free(w->mark_tag); free(w->figs); free(w->mats);
     free(w->ids); free(w->free_slots); free(w->events); free(w->events_tmp);
+    free(w->procs); free(w->proc_free);
     free(w);
 }
 
@@ -194,8 +253,13 @@ static inline AnWorld *an_open(int capacity) {
     w->free_slots = (int32_t *)malloc((size_t)capacity * sizeof *w->free_slots);
     w->events = (AnEvent *)calloc((size_t)capacity * AN_FIG_EVENTS, sizeof *w->events);
     w->events_tmp = (AnEvent *)calloc((size_t)capacity * AN_FIG_EVENTS, sizeof *w->events_tmp);
+    w->nprocs = capacity * AN_PROC_PER_FIG;
+    w->procs = (AnProc *)calloc((size_t)w->nprocs, sizeof *w->procs);
+    w->proc_free = (int32_t *)malloc((size_t)w->nprocs * sizeof *w->proc_free);
     if (!w->rigs || !w->masks || !w->clips || !w->keys || !w->key_interp || !w->mark_t || !w->mark_tag || !w->figs ||
-        !w->mats || !w->ids || !w->free_slots || !w->events || !w->events_tmp) { an_close(w); return NULL; }
+        !w->mats || !w->ids || !w->free_slots || !w->events || !w->events_tmp || !w->procs || !w->proc_free) { an_close(w); return NULL; }
+    for (int i = 0; i < w->nprocs; i++) w->proc_free[i] = w->nprocs - 1 - i;   /* record 0 handed out first */
+    w->nproc_free = w->nprocs;
     for (uint32_t i = 0; i < hn; i++) w->ids[i] = -1;
     for (int i = 0; i < capacity; i++) { w->figs[i].id = -1; w->free_slots[i] = capacity - 1 - i; }   /* slot 0 handed out first */
     w->nfree = capacity;
@@ -345,7 +409,7 @@ static inline AnFig *an_fig(AnWorld *w, int fig) {
     return s < 0 ? NULL : &w->figs[s];
 }
 static inline float *an_fig_mats(const AnWorld *w, const AnFig *f) { return w->mats + (size_t)(f - w->figs) * AN_PARTS * 12; }
-static inline void an_pose(AnWorld *w, AnFig *f);
+static inline void an_pose(AnWorld *w, AnFig *f, float dt);
 
 static inline int an_spawn(AnWorld *w, int rig) {
     if (rig < 0 || rig >= w->nrigs) return an_refuse(w, AN_R_RIG);
@@ -356,10 +420,10 @@ static inline int an_spawn(AnWorld *w, int rig) {
     int s = w->free_slots[--w->nfree];
     AnFig *f = &w->figs[s];
     memset(f, 0, sizeof *f);
-    f->id = id; f->rig = rig; f->q[3] = 1;
+    f->id = id; f->rig = rig; f->q[3] = 1; f->proc = -1;
     an_id_insert(w, id, s);
     w->live++;
-    an_pose(w, f);                             /* the rest pose, at the origin */
+    an_pose(w, f, 0);                          /* the rest pose, at the origin */
     return id;
 }
 
@@ -367,6 +431,8 @@ static inline void an_remove(AnWorld *w, int fig) {
     AnFig *f = an_fig(w, fig);
     if (!f) { an_refuse(w, AN_R_FIGURE); return; }
     an_id_erase(w, fig);
+    for (int i = f->proc; i >= 0; i = w->procs[i].next) w->proc_free[w->nproc_free++] = i;
+    f->proc = -1;
     f->id = -1;
     w->free_slots[w->nfree++] = (int32_t)(f - w->figs);
     w->live--;
@@ -605,15 +671,41 @@ static inline void an_advance(AnWorld *w, AnFig *f, float dt) {
             }
         }
     }
+    /* the drop moving toward its goal at its speed */
+    if (f->drop_rate > 0) {
+        float step = f->drop_rate * dt, d = f->drop_goal - f->drop;
+        if (fabsf(d) <= step) f->drop = f->drop_goal;
+        else f->drop += d > 0 ? step : -step;
+    }
+    /* reach weights fading; one that has faded to 0 is let go */
+    for (int32_t *link = &f->proc; *link >= 0;) {
+        AnProc *p = &w->procs[*link];
+        if (p->kind == AN_K_REACH && p->v[8] > 0) {
+            float step = p->v[8] * dt, d = p->v[7] - p->v[6];
+            if (fabsf(d) <= step) { p->v[6] = p->v[7]; p->v[8] = 0; }
+            else p->v[6] += d > 0 ? step : -step;
+            if (p->v[8] == 0 && !(p->v[6] > 0)) {
+                int32_t i = *link;
+                *link = p->next;
+                w->proc_free[w->nproc_free++] = i;
+                continue;
+            }
+        }
+        link = &p->next;
+    }
 }
 
 /* ---- posing ---- */
 typedef struct { int clip; float t, w; int additive; uint64_t mask; } AnTap;
 
-static inline void an_pose(AnWorld *w, AnFig *f) {
+/* one figure's pose in the making: local rotations and moves, and the world
+ * rotations and origins the hierarchy gives them */
+typedef struct { float q[AN_PARTS][4], m[AN_PARTS][3], wq[AN_PARTS][4], wp[AN_PARTS][3], root[3]; } AnBody;
+
+/* the layers: each part's local rotation and move */
+static inline void an_layers(const AnWorld *w, const AnFig *f, AnBody *b) {
     const AnRig *r = &w->rigs[f->rig];
-    float q[AN_PARTS][4], m[AN_PARTS][3];
-    for (int p = 0; p < r->nparts; p++) { memcpy(q[p], r->rest[p], sizeof q[p]); m[p][0] = m[p][1] = m[p][2] = 0; }
+    for (int p = 0; p < r->nparts; p++) { memcpy(b->q[p], r->rest[p], sizeof b->q[p]); b->m[p][0] = b->m[p][1] = b->m[p][2] = 0; }
 
     for (int l = 0; l < AN_LAYERS; l++) {
         const AnLayer *L = &f->layer[l];
@@ -663,36 +755,206 @@ static inline void an_pose(AnWorld *w, AnFig *f) {
             }
             if (ow > 0) {
                 float k = lw * (ow > 1 ? 1 : ow);
-                an_slerp(q[p], oq, k, q[p]);
-                for (int i = 0; i < 3; i++) m[p][i] += (om[i] - m[p][i]) * k;
+                an_slerp(b->q[p], oq, k, b->q[p]);
+                for (int i = 0; i < 3; i++) b->m[p][i] += (om[i] - b->m[p][i]) * k;
             }
             if (aw > 0) {
                 float k = lw * (aw > 1 ? 1 : aw), d[4];
                 an_slerp(an_qid, aq, k, d);
-                an_qmul(d, q[p], q[p]);
-                an_qnorm(q[p]);
-                for (int i = 0; i < 3; i++) m[p][i] += am[i] * k;
+                an_qmul(d, b->q[p], b->q[p]);
+                an_qnorm(b->q[p]);
+                for (int i = 0; i < 3; i++) b->m[p][i] += am[i] * k;
             }
         }
     }
 
-    /* the hierarchy: parents come first, so one forward pass */
-    float wq[AN_PARTS][4], wp[AN_PARTS][3];
+}
+
+/* world rotations and origins of parts from..nparts-1 (parents come first) */
+static inline void an_fk(const AnRig *r, const AnFig *f, AnBody *b, int from) {
+    for (int p = from; p < r->nparts; p++) {
+        const float *pq = p == 0 ? f->q : b->wq[r->parent[p]];
+        const float *pp = p == 0 ? b->root : b->wp[r->parent[p]];
+        float off[3] = {r->pivot[p][0] + b->m[p][0], r->pivot[p][1] + b->m[p][1], r->pivot[p][2] + b->m[p][2]}, ro[3];
+        an_qrot(pq, off, ro);
+        for (int i = 0; i < 3; i++) b->wp[p][i] = pp[i] + ro[i];
+        an_qmul(pq, b->q[p], b->wq[p]);
+        an_qnorm(b->wq[p]);
+    }
+}
+
+/* turn part p by d, a turn in world space, by changing its local rotation */
+static inline void an_turn_world(const AnRig *r, const AnFig *f, AnBody *b, int p, const float d[4]) {
+    const float *pq = p == 0 ? f->q : b->wq[r->parent[p]];
+    float inv[4] = {-pq[0], -pq[1], -pq[2], pq[3]}, t[4];
+    an_qmul(d, b->wq[p], t);
+    an_qmul(inv, t, b->q[p]);
+    an_qnorm(b->q[p]);
+}
+
+/* aim: the turn from the last part's axis to the target, shared equally
+ * along the chain, each share at most the limit, about one world axis */
+static inline void an_do_aim(const AnRig *r, const AnFig *f, AnBody *b, const AnProc *a) {
+    int n = a->n, last = a->chain[n - 1];
+    float ax[3], d[3];
+    an_qrot(b->wq[last], a->v, ax);
+    for (int i = 0; i < 3; i++) d[i] = a->v[3 + i] - b->wp[last][i];
+    float dl = an_len(d), al = an_len(ax);
+    if (!(dl > 1e-6f) || !(al > 1e-6f)) return;   /* the target at the part's origin: no direction */
+    for (int i = 0; i < 3; i++) { d[i] /= dl; ax[i] /= al; }
+    float th = acosf(an_clampf(an_dot(ax, d), -1, 1));
+    if (!(th > 1e-7f)) return;
+    float k[3];
+    an_cross(ax, d, k);
+    float kl = an_len(k);
+    if (kl > 1e-6f) for (int i = 0; i < 3; i++) k[i] /= kl;
+    else an_perp(ax, k);                       /* straight behind: any axis across */
+    float share = th / (float)n;
+    if (share > a->v[6]) share = a->v[6];
+    share *= an_clampf(a->v[7], 0, 1);
+    float dq[4];
+    an_qaxis(k, share, dq);
+    for (int i = 0; i < n; i++) { an_turn_world(r, f, b, a->chain[i], dq); an_fk(r, f, b, a->chain[i]); }
+}
+
+/* reach: two-bone IK in the plane of the root, the target and the pole */
+static inline void an_do_reach(const AnRig *r, const AnFig *f, AnBody *b, const AnProc *a) {
+    float wgt = an_clampf(a->v[6], 0, 1);
+    if (!(wgt > 0)) return;
+    int u = a->chain[0], l = a->chain[1], e = a->chain[2];
+    float A[3], K[3], E[3], ak[3], ke[3], at[3], dir[3], v[3];
+    memcpy(A, b->wp[u], sizeof A); memcpy(K, b->wp[l], sizeof K); memcpy(E, b->wp[e], sizeof E);
+    for (int i = 0; i < 3; i++) { ak[i] = K[i] - A[i]; ke[i] = E[i] - K[i]; at[i] = a->v[i] - A[i]; }
+    float L1 = an_len(ak), L2 = an_len(ke), D = an_len(at), dmax = L1 + L2;
+    if (!(L1 > 1e-6f) || !(L2 > 1e-6f)) return;   /* a bone of no length has nothing to bend */
+    /* the direction to the target; at the root, the way the end lies now, else the upper bone */
+    if (D > 1e-6f * dmax) for (int i = 0; i < 3; i++) dir[i] = at[i] / D;
+    else {
+        float ae[3] = {E[0] - A[0], E[1] - A[1], E[2] - A[2]}, el = an_len(ae);
+        for (int i = 0; i < 3; i++) dir[i] = el > 1e-6f * dmax ? ae[i] / el : ak[i] / L1;
+    }
+    float dmin = fabsf(L1 - L2);
+    if (dmin < 1e-4f * dmax) dmin = 1e-4f * dmax;
+    float Dc = an_clampf(D, dmin, dmax);
+    /* the bend: toward the pole, across the line; a pole on the line falls
+     * back to the side the knee is on now, then to any side */
+    float pa[3] = {a->v[3] - A[0], a->v[4] - A[1], a->v[5] - A[2]}, pd = an_dot(pa, dir);
+    for (int i = 0; i < 3; i++) v[i] = pa[i] - pd * dir[i];
+    if (!(an_len(v) > 1e-5f * dmax)) {
+        float kd = an_dot(ak, dir);
+        for (int i = 0; i < 3; i++) v[i] = ak[i] - kd * dir[i];
+        if (!(an_len(v) > 1e-5f * dmax)) an_perp(dir, v);
+    }
+    float vl = an_len(v);
+    for (int i = 0; i < 3; i++) v[i] /= vl;
+    float ca = an_clampf((L1 * L1 + Dc * Dc - L2 * L2) / (2 * L1 * Dc), -1, 1), sa = sqrtf(1 - ca * ca);
+    float kn[3], en[3], from[3], to[3], dq[4], q0u[4], q0l[4];
+    for (int i = 0; i < 3; i++) { kn[i] = A[i] + L1 * (ca * dir[i] + sa * v[i]); en[i] = A[i] + Dc * dir[i]; }
+    memcpy(q0u, b->q[u], sizeof q0u); memcpy(q0l, b->q[l], sizeof q0l);
+    for (int i = 0; i < 3; i++) { from[i] = ak[i] / L1; to[i] = (kn[i] - A[i]) / L1; }   /* |kn - A| is L1 */
+    an_qfromto(from, to, dq);
+    an_turn_world(r, f, b, u, dq);
+    an_fk(r, f, b, u);
+    {
+        float k2[3], e2[3], t3[3];
+        memcpy(k2, b->wp[l], sizeof k2);
+        for (int i = 0; i < 3; i++) { e2[i] = b->wp[e][i] - k2[i]; t3[i] = en[i] - k2[i]; }
+        float fl = an_len(e2), tl = an_len(t3);
+        if (fl > 1e-6f && tl > 1e-6f) {
+            for (int i = 0; i < 3; i++) { e2[i] /= fl; t3[i] /= tl; }
+            an_qfromto(e2, t3, dq);
+            an_turn_world(r, f, b, l, dq);
+        }
+    }
+    if (wgt < 1) { an_slerp(q0u, b->q[u], wgt, b->q[u]); an_slerp(q0l, b->q[l], wgt, b->q[l]); }
+    an_fk(r, f, b, u);
+}
+
+/* the pose up to the springs. stage 0: the layers and overrides only (the
+ * animated pose, no drop); stage 1: with the drop, aim and reach. */
+static inline void an_build(const AnWorld *w, const AnFig *f, AnBody *b, int stage) {
+    const AnRig *r = &w->rigs[f->rig];
+    an_layers(w, f, b);
+    for (int i = f->proc; i >= 0; i = w->procs[i].next) {
+        const AnProc *o = &w->procs[i];
+        if (o->kind != AN_K_OVERRIDE) continue;
+        float k = an_clampf(o->v[7], 0, 1);
+        an_slerp(b->q[o->slot], o->v, k, b->q[o->slot]);
+        if (o->n) for (int j = 0; j < 3; j++) b->m[o->slot][j] += (o->v[4 + j] - b->m[o->slot][j]) * k;
+    }
+    memcpy(b->root, f->pos, sizeof b->root);
+    if (stage >= 1) b->root[1] -= f->drop;
+    an_fk(r, f, b, 0);
+    if (stage < 1) return;
+    for (int i = f->proc; i >= 0; i = w->procs[i].next) {   /* aims, then reaches, each in slot order */
+        const AnProc *o = &w->procs[i];
+        if (o->kind == AN_K_AIM) an_do_aim(r, f, b, o);
+        else if (o->kind == AN_K_REACH) an_do_reach(r, f, b, o);
+    }
+}
+
+/* a spring: semi-implicit steps of at most AN_SPRING_STEP toward the target world rotation */
+static inline void an_spring_step(AnProc *s, const float target[4], float dt) {
+    float *q = s->v + 2, *om = s->v + 6;
+    if (s->fresh || dt > AN_SPRING_SNAP) {
+        memcpy(q, target, 4 * sizeof(float)); om[0] = om[1] = om[2] = 0; s->fresh = 0;
+        return;
+    }
+    if (!(dt > 0)) return;
+    int n = (int)ceilf(dt / AN_SPRING_STEP - 1e-3f);
+    if (n < 1) n = 1;
+    float h = dt / (float)n, k = s->v[0], c = s->v[1];
+    for (int i = 0; i < n; i++) {
+        float inv[4] = {-q[0], -q[1], -q[2], q[3]}, d[4], e[3];
+        an_qmul(target, inv, d);               /* the turn from where it is to where it is drawn */
+        if (d[3] < 0) for (int j = 0; j < 4; j++) d[j] = -d[j];
+        float sn = sqrtf(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+        float ang = 2 * atan2f(sn, d[3]);
+        for (int j = 0; j < 3; j++) e[j] = sn > 1e-9f ? d[j] * ang / sn : 2 * d[j];
+        for (int j = 0; j < 3; j++) om[j] += h * (k * e[j] - c * om[j]);
+        float rv[3] = {om[0] * h, om[1] * h, om[2] * h}, rl = an_len(rv), dq[4];
+        if (rl > 1e-9f) { float ax[3] = {rv[0] / rl, rv[1] / rl, rv[2] / rl}; an_qaxis(ax, rl, dq); }
+        else { dq[0] = rv[0] / 2; dq[1] = rv[1] / 2; dq[2] = rv[2] / 2; dq[3] = 1; an_qnorm(dq); }
+        float t[4];
+        an_qmul(dq, q, t);
+        memcpy(q, t, sizeof t);
+        an_qnorm(q);
+    }
+}
+
+/* poses figure f: the pose up to the springs, then the hierarchy with the
+ * springs advanced by dt (0 holds them), into its matrices */
+static inline void an_pose(AnWorld *w, AnFig *f, float dt) {
+    const AnRig *r = &w->rigs[f->rig];
+    AnBody b;
+    an_build(w, f, &b, 1);
+    int16_t spring[AN_PARTS];
+    int any = 0;
+    for (int p = 0; p < r->nparts; p++) spring[p] = -1;
+    for (int i = f->proc; i >= 0; i = w->procs[i].next)
+        if (w->procs[i].kind == AN_K_SPRING) { spring[w->procs[i].slot] = (int16_t)i; any = 1; }
     float *out = an_fig_mats(w, f);
     for (int p = 0; p < r->nparts; p++) {
-        const float *pq = p == 0 ? f->q : wq[r->parent[p]];
-        const float *pp = p == 0 ? f->pos : wp[r->parent[p]];
-        float off[3] = {r->pivot[p][0] + m[p][0], r->pivot[p][1] + m[p][1], r->pivot[p][2] + m[p][2]}, ro[3];
-        an_qrot(pq, off, ro);
-        for (int i = 0; i < 3; i++) wp[p][i] = pp[i] + ro[i];
-        an_qmul(pq, q[p], wq[p]);
-        an_qnorm(wq[p]);
-        const float x = wq[p][0], y = wq[p][1], z = wq[p][2], s = wq[p][3];
+        if (any) {   /* parents are final before their children: rebuild in place */
+            const float *pq = p == 0 ? f->q : b.wq[r->parent[p]];
+            const float *pp = p == 0 ? b.root : b.wp[r->parent[p]];
+            float off[3] = {r->pivot[p][0] + b.m[p][0], r->pivot[p][1] + b.m[p][1], r->pivot[p][2] + b.m[p][2]}, ro[3];
+            an_qrot(pq, off, ro);
+            for (int i = 0; i < 3; i++) b.wp[p][i] = pp[i] + ro[i];
+            an_qmul(pq, b.q[p], b.wq[p]);
+            an_qnorm(b.wq[p]);
+            if (spring[p] >= 0) {
+                AnProc *s = &w->procs[spring[p]];
+                an_spring_step(s, b.wq[p], dt);
+                memcpy(b.wq[p], s->v + 2, sizeof b.wq[p]);
+            }
+        }
+        const float x = b.wq[p][0], y = b.wq[p][1], z = b.wq[p][2], sw = b.wq[p][3];
         float *o = out + p * 12;
-        o[0] = 1 - 2 * (y * y + z * z); o[1] = 2 * (x * y + s * z);     o[2] = 2 * (x * z - s * y);
-        o[3] = 2 * (x * y - s * z);     o[4] = 1 - 2 * (x * x + z * z); o[5] = 2 * (y * z + s * x);
-        o[6] = 2 * (x * z + s * y);     o[7] = 2 * (y * z - s * x);     o[8] = 1 - 2 * (x * x + y * y);
-        o[9] = wp[p][0]; o[10] = wp[p][1]; o[11] = wp[p][2];
+        o[0] = 1 - 2 * (y * y + z * z); o[1] = 2 * (x * y + sw * z);     o[2] = 2 * (x * z - sw * y);
+        o[3] = 2 * (x * y - sw * z);     o[4] = 1 - 2 * (x * x + z * z); o[5] = 2 * (y * z + sw * x);
+        o[6] = 2 * (x * z + sw * y);     o[7] = 2 * (y * z - sw * x);     o[8] = 1 - 2 * (x * x + y * y);
+        o[9] = b.wp[p][0]; o[10] = b.wp[p][1]; o[11] = b.wp[p][2];
     }
     f->dirty = 0;
 }
@@ -723,7 +985,7 @@ static inline void an_update(AnWorld *w, float dt) {
         AnFig *f = &w->figs[s];
         if (f->id < 0) continue;
         an_advance(w, f, dt);
-        an_pose(w, f);
+        an_pose(w, f, dt);
         w->posed++;
     }
     an_sort_events(w);
@@ -733,6 +995,194 @@ static inline const float *an_matrices(const AnWorld *w, int fig) {
     int s = an_slot(w, fig);
     return s < 0 ? NULL : w->mats + (size_t)s * AN_PARTS * 12;
 }
+
+/* ---- the procedural stage's calls ---- */
+
+/* a figure's record of kind and slot, made (sorted in) if it has none;
+ * NULL, refused with AN_R_FULL, when the pool is empty */
+static inline AnProc *an_proc_get(AnWorld *w, AnFig *f, int kind, int slot, int *made) {
+    int32_t *link = &f->proc;
+    while (*link >= 0) {
+        AnProc *p = &w->procs[*link];
+        if (p->kind == kind && p->slot == slot) { *made = 0; return p; }
+        if (p->kind > kind || (p->kind == kind && p->slot > slot)) break;
+        link = &p->next;
+    }
+    if (w->nproc_free == 0) { an_refuse(w, AN_R_FULL); return NULL; }
+    int32_t i = w->proc_free[--w->nproc_free];
+    AnProc *p = &w->procs[i];
+    memset(p, 0, sizeof *p);
+    p->kind = (uint8_t)kind; p->slot = (uint8_t)slot; p->next = *link;
+    *link = i; *made = 1;
+    return p;
+}
+static inline AnProc *an_proc_find(const AnWorld *w, const AnFig *f, int kind, int slot) {
+    for (int32_t i = f->proc; i >= 0; i = w->procs[i].next)
+        if (w->procs[i].kind == kind && w->procs[i].slot == slot) return &w->procs[i];
+    return NULL;
+}
+static inline void an_proc_clear(AnWorld *w, AnFig *f, int kind, int slot) {
+    for (int32_t *link = &f->proc; *link >= 0; link = &w->procs[*link].next) {
+        AnProc *p = &w->procs[*link];
+        if (p->kind == kind && p->slot == slot) {
+            int32_t i = *link;
+            *link = p->next;
+            w->proc_free[w->nproc_free++] = i;
+            return;
+        }
+    }
+}
+/* is part p below part a (a strict descendant)? */
+static inline int an_below(const AnRig *r, int a, int p) {
+    if (p <= a) return 0;
+    while (p > a) p = r->parent[p];
+    return p == a;
+}
+/* n parts, each in the rig and below the one before */
+static inline int an_chain_ok(const AnRig *r, int n, const int32_t *chain) {
+    for (int i = 0; i < n; i++) {
+        if (chain[i] < 0 || chain[i] >= r->nparts) return 0;
+        if (i > 0 && !an_below(r, chain[i - 1], chain[i])) return 0;
+    }
+    return 1;
+}
+
+/* part's local rotation (and move, unless move is NULL) pulled toward q by weight; weight 0 clears */
+static inline void an_override(AnWorld *w, int fig, int part, const float q[4], const float move[3], float weight) {
+    AnFig *f = an_fig(w, fig);
+    if (!f) { an_refuse(w, AN_R_FIGURE); return; }
+    if (part < 0 || part >= w->rigs[f->rig].nparts) { an_refuse(w, AN_R_PART); return; }
+    if (!isfinite(weight)) { an_refuse(w, AN_R_VALUE); return; }
+    if (weight <= 0) { an_proc_clear(w, f, AN_K_OVERRIDE, part); f->dirty = 1; return; }
+    float n[4];
+    if (!q || !an_finite(q, 4) || (move && !an_finite(move, 3))) { an_refuse(w, AN_R_VALUE); return; }
+    memcpy(n, q, sizeof n);
+    if (!an_qnorm(n)) { an_refuse(w, AN_R_VALUE); return; }
+    int made;
+    AnProc *p = an_proc_get(w, f, AN_K_OVERRIDE, part, &made);
+    if (!p) return;
+    memcpy(p->v, n, sizeof n);
+    for (int i = 0; i < 3; i++) p->v[4 + i] = move ? move[i] : 0;
+    p->n = move != NULL;
+    p->v[7] = weight > 1 ? 1 : weight;
+    f->dirty = 1;
+}
+
+/* slot 0..3: the chain's last part turns its axis (in its own frame) toward
+ * target (world), the turn shared along the n parts, each at most limit_deg;
+ * weight 0 clears */
+static inline void an_aim(AnWorld *w, int fig, int slot, int n, const int32_t *chain, const float axis[3],
+                          const float target[3], float limit_deg, float weight) {
+    AnFig *f = an_fig(w, fig);
+    if (!f) { an_refuse(w, AN_R_FIGURE); return; }
+    if (slot < 0 || slot >= AN_AIMS) { an_refuse(w, AN_R_PART); return; }
+    if (!isfinite(weight)) { an_refuse(w, AN_R_VALUE); return; }
+    if (weight <= 0) { an_proc_clear(w, f, AN_K_AIM, slot); f->dirty = 1; return; }
+    if (n < 1 || n > 4 || !chain || !an_chain_ok(&w->rigs[f->rig], n, chain)) { an_refuse(w, AN_R_PART); return; }
+    if (!axis || !target || !an_finite(axis, 3) || !an_finite(target, 3) || !isfinite(limit_deg) || limit_deg < 0 ||
+        !(an_len(axis) > 1e-9f)) { an_refuse(w, AN_R_VALUE); return; }
+    int made;
+    AnProc *p = an_proc_get(w, f, AN_K_AIM, slot, &made);
+    if (!p) return;
+    p->n = (uint8_t)n;
+    for (int i = 0; i < 4; i++) p->chain[i] = (int8_t)(i < n ? chain[i] : -1);
+    float al = an_len(axis);
+    for (int i = 0; i < 3; i++) { p->v[i] = axis[i] / al; p->v[3 + i] = target[i]; }
+    p->v[6] = limit_deg * 3.14159265f / 180.0f;
+    p->v[7] = weight > 1 ? 1 : weight;
+    f->dirty = 1;
+}
+
+/* slot 0..7: the chain (upper, lower, end) places the end at target, bending
+ * toward pole; its weight moves to weight over seconds (0: at once). A NULL
+ * chain keeps the slot's chain, target and pole and only moves its weight
+ * (nothing happens if the slot is empty). A weight that reaches 0 clears. */
+static inline void an_reach_to(AnWorld *w, int fig, int slot, const int32_t chain[3], const float target[3],
+                               const float pole[3], float weight, float seconds) {
+    AnFig *f = an_fig(w, fig);
+    if (!f) { an_refuse(w, AN_R_FIGURE); return; }
+    if (slot < 0 || slot >= AN_REACHES) { an_refuse(w, AN_R_PART); return; }
+    if (!isfinite(weight) || !isfinite(seconds)) { an_refuse(w, AN_R_VALUE); return; }
+    float goal = an_clampf(weight, 0, 1);
+    if (chain) {
+        if (!an_chain_ok(&w->rigs[f->rig], 3, chain)) { an_refuse(w, AN_R_PART); return; }
+        if (!target || !pole || !an_finite(target, 3) || !an_finite(pole, 3)) { an_refuse(w, AN_R_VALUE); return; }
+    }
+    AnProc *p = an_proc_find(w, f, AN_K_REACH, slot);
+    if (!chain && !p) return;
+    if (seconds <= 0 && goal <= 0) { an_proc_clear(w, f, AN_K_REACH, slot); f->dirty = 1; return; }
+    if (!p) {
+        int made;
+        p = an_proc_get(w, f, AN_K_REACH, slot, &made);
+        if (!p) return;
+        p->v[6] = 0;                           /* a new reach fades in from 0 */
+    }
+    if (chain) {
+        p->n = 3;
+        for (int i = 0; i < 3; i++) { p->chain[i] = (int8_t)chain[i]; p->v[i] = target[i]; p->v[3 + i] = pole[i]; }
+        p->chain[3] = -1;
+    }
+    p->v[7] = goal;
+    if (seconds > 0) p->v[8] = 1.0f / seconds;
+    else { p->v[6] = goal; p->v[8] = 0; }
+    f->dirty = 1;
+}
+static inline void an_reach(AnWorld *w, int fig, int slot, const int32_t chain[3], const float target[3], const float pole[3], float weight) {
+    if (!chain) { an_refuse(w, AN_R_PART); return; }
+    an_reach_to(w, fig, slot, chain, target, pole, weight, 0);
+}
+
+/* part's world rotation lags its animated one: stiffness and damping per
+ * second; stiffness 0 clears */
+static inline void an_spring(AnWorld *w, int fig, int part, float stiffness, float damping) {
+    AnFig *f = an_fig(w, fig);
+    if (!f) { an_refuse(w, AN_R_FIGURE); return; }
+    if (part < 0 || part >= w->rigs[f->rig].nparts) { an_refuse(w, AN_R_PART); return; }
+    if (!isfinite(stiffness) || !isfinite(damping) || stiffness < 0 || damping < 0) { an_refuse(w, AN_R_VALUE); return; }
+    if (stiffness == 0) { an_proc_clear(w, f, AN_K_SPRING, part); f->dirty = 1; return; }
+    int made;
+    AnProc *p = an_proc_get(w, f, AN_K_SPRING, part, &made);
+    if (!p) return;
+    if (made) { p->fresh = 1; p->v[5] = 1; }
+    p->v[0] = stiffness; p->v[1] = damping;
+    f->dirty = 1;
+}
+
+/* the root lowered by metres (world -y) after the layers, for foot placement */
+static inline void an_drop(AnWorld *w, int fig, float metres) {
+    AnFig *f = an_fig(w, fig);
+    if (!f) { an_refuse(w, AN_R_FIGURE); return; }
+    if (!isfinite(metres)) { an_refuse(w, AN_R_VALUE); return; }
+    f->drop = f->drop_goal = metres;
+    f->drop_rate = 0;
+    f->dirty = 1;
+}
+/* the drop moving toward metres at speed metres a second through the
+ * updates (speed 0 or less: at once) */
+static inline void an_drop_to(AnWorld *w, int fig, float metres, float speed) {
+    AnFig *f = an_fig(w, fig);
+    if (!f) { an_refuse(w, AN_R_FIGURE); return; }
+    if (!isfinite(metres) || !isfinite(speed)) { an_refuse(w, AN_R_VALUE); return; }
+    if (speed <= 0) { an_drop(w, fig, metres); return; }
+    f->drop_goal = metres;
+    f->drop_rate = speed;
+}
+
+/* a part's origin in world space before the springs: stage 1 with the drop,
+ * aim and reach; stage 0 the animated pose (layers and overrides, no drop).
+ * Computed from the figure as it stands: the last update's pose unless it was
+ * changed since. 0 if there is no such figure or part. */
+static inline int an_part_origin_at(const AnWorld *w, int fig, int part, int stage, float out[3]) {
+    int s = an_slot(w, fig);
+    if (s < 0 || !out) return 0;
+    const AnFig *f = &w->figs[s];
+    if (part < 0 || part >= w->rigs[f->rig].nparts) return 0;
+    AnBody b;
+    an_build(w, f, &b, stage);
+    memcpy(out, b.wp[part], 3 * sizeof(float));
+    return 1;
+}
+static inline int an_part_origin(const AnWorld *w, int fig, int part, float out[3]) { return an_part_origin_at(w, fig, part, 1, out); }
 
 static inline int an_marks(const AnWorld *w, int max, int32_t *ints, float *weights) {
     int n = w->nevents < max ? w->nevents : max;
@@ -754,12 +1204,25 @@ static inline uint64_t an_hash(const AnWorld *w) {
         p = (const unsigned char *)an_fig_mats(w, f);
         size_t len = (size_t)w->rigs[f->rig].nparts * 12 * sizeof(float);
         for (size_t i = 0; i < len; i++) { h ^= p[i]; h *= 1099511628211ull; }
-        /* spring state joins the hash when springs exist (Task 3) */
+        /* what the matrices do not show: the drop and its motion, and every
+         * procedural record (spring state, reach fades, settings), in list order */
+        float dr[3] = {f->drop, f->drop_goal, f->drop_rate};
+        p = (const unsigned char *)dr;
+        for (size_t i = 0; i < sizeof dr; i++) { h ^= p[i]; h *= 1099511628211ull; }
+        for (int i = f->proc; i >= 0; i = w->procs[i].next) {
+            const AnProc *q = &w->procs[i];
+            unsigned char tag[8] = {q->kind, q->slot, q->n, q->fresh, (unsigned char)q->chain[0], (unsigned char)q->chain[1],
+                                    (unsigned char)q->chain[2], (unsigned char)q->chain[3]};
+            for (size_t k = 0; k < sizeof tag; k++) { h ^= tag[k]; h *= 1099511628211ull; }
+            p = (const unsigned char *)q->v;
+            for (size_t k = 0; k < sizeof q->v; k++) { h ^= p[k]; h *= 1099511628211ull; }
+        }
     }
     return h;
 }
 
-/* 0 figures, 1 posed, 2 stale, 3 refused calls, 4 negative dt, 5 last refusal reason, 6 marks dropped */
+/* 0 figures, 1 posed, 2 stale, 3 refused calls, 4 negative dt, 5 last refusal reason, 6 marks dropped,
+ * 7 procedural records in use */
 static inline double an_stat(const AnWorld *w, int which) {
     switch (which) {
     case 0: return w->live;
@@ -773,6 +1236,7 @@ static inline double an_stat(const AnWorld *w, int which) {
     case 4: return w->negative_dt;
     case 5: return w->reason;
     case 6: return w->dropped;
+    case 7: return w->nprocs - w->nproc_free;
     default: return 0;
     }
 }
