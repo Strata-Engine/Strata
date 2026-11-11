@@ -378,14 +378,14 @@ mod StrataViewer do
   end
 
   -- Left click carves, right click builds, each once per press.
-  pfn act(m : Sim, reg : Strata.Blocks.Registry, x : Float, y : Float, z : Float, fx : Float, fy : Float, fz : Float, dig : Bool, build : Bool) : Sim do
+  pfn act(m : Sim, reg : Strata.Blocks.Registry, x : Float, y : Float, z : Float, fx : Float, fy : Float, fz : Float, dig : Bool, build : Bool, block : Int) : Sim do
     if !dig && !build do m
     else
       let w = Strata.Stream.world(sim_stream(m))
       let h = Strata.Query.raycast(w, x, y, z, fx, fy, fz, 250.0, Strata.Query.targetable(reg))
       if !Strata.Query.is_hit(h) do m
       else if dig do edit(m, Strata.Edit.fill_sphere(w, Strata.Query.hit_x(h), Strata.Query.hit_y(h), Strata.Query.hit_z(h), 6, 0))
-      else edit(m, Strata.Edit.fill_sphere(w, Strata.Query.hit_x(h), Strata.Query.hit_y(h) + 2, Strata.Query.hit_z(h), 2, 1)) end end
+      else edit(m, Strata.Edit.fill_sphere(w, Strata.Query.hit_x(h), Strata.Query.hit_y(h) + 2, Strata.Query.hit_z(h), 2, block)) end end
     end
   end
 
@@ -393,8 +393,18 @@ mod StrataViewer do
 
   -- eye position, yaw, pitch, the chunk the camera was last in, mouse buttons
   -- last frame, flying or walking, vertical speed, on the ground, F last frame
-  -- ..., then the sun's height in degrees, the light mode, and whether L was down
-  type Cam = Cam(Float, Float, Float, Float, Float, Int, Int, Int, Bool, Bool, Bool, Float, Bool, Bool, Float, Int, Bool)
+  -- ..., then the sun's height in degrees, the light mode, whether L was down,
+  -- and the hotbar slot chosen
+  type Cam = Cam(Float, Float, Float, Float, Float, Int, Int, Int, Bool, Bool, Bool, Float, Bool, Bool, Float, Int, Bool, Int)
+
+  -- the hotbar slot a number key held this frame asks for, else the one already chosen
+  pfn slot_key(i : Int, chosen : Int) : Int do
+    if i >= 9 do chosen else if Strata.Ffi.Vk.key(49 + i) do i else slot_key(i + 1, chosen) end end
+  end
+  -- is the display on? STRATA_UI says; otherwise it is on when a person is at the keys
+  pfn ui_on(scripted : Bool) : Bool do Env.get_int("STRATA_UI", if scripted do 0 else 1 end) != 0 end
+  -- the display's scale: STRATA_UI_SCALE in hundredths, 100 by default
+  pfn ui_scale() : Float do int_to_float(Env.get_int("STRATA_UI_SCALE", 100)) /. 100.0 end
 
   -- Put the sun [deg] degrees above the horizon, to the south-east, warmer and dimmer the lower it is.
   fn sun_at(deg : Float) : Unit do
@@ -430,13 +440,14 @@ mod StrataViewer do
     Strata.Ffi.Vk.poll()
     if Strata.Ffi.Vk.should_close() || Strata.Ffi.Vk.key(256) || (frames > 0 && frame >= frames) do
       println("strata_viewer: done after " ++ int_to_string(frame) ++ " frames; uploads refused " ++ int_to_string(Strata.Ffi.Vk.refused()) ++ ", still waiting " ++ int_to_string(Strata.Render.waiting(sl)) ++ "; rebuilds " ++ int_to_string(float_to_int(Strata.Ffi.Vk.stat(6))) ++ "; draw calls " ++ int_to_string(float_to_int(Strata.Ffi.Vk.stat(2))))
+      if Strata.Render.ui_dropped() > 0 do println("ui: dropped " ++ int_to_string(Strata.Render.ui_dropped()) ++ " quads") else () end
       if script == 2 do
         println("soak: frames=" ++ int_to_string(frame) ++ " worst_ms=" ++ ms2(worst *. 1000.0) ++ " mean_ms=" ++ ms2(total *. 1000.0 /. int_to_float(if frame > 10 do frame - 10 else 1 end)) ++ " refused=" ++ int_to_string(Strata.Ffi.Vk.refused()) ++ " waiting=" ++ int_to_string(Strata.Render.waiting(sl)) ++ " slots=" ++ int_to_string(Strata.Render.used(sl)) ++ " live_quads=" ++ int_to_string(Strata.Ffi.Vk.live_quads()) ++ " leaked=" ++ int_to_string(float_to_int(Strata.Ffi.Vk.stat(7))) ++ " loaded=" ++ int_to_string(Strata.Stream.loaded_count(s)) ++ " fluid_worst_ms=" ++ ms2(fworst) ++ " fluid_active=" ++ int_to_string(Strata.Fluid.active_count(fl)) ++ " fluid_waiting=" ++ int_to_string(Strata.Fluid.waiting_count(fl)) ++ (if soak_lake() do " lake_end=" ++ int_to_string(lake_voxels(Strata.Stream.world(s), reg)) else "" end))
       else () end
       Strata.Stream.stop(s)
     else
       match cam do
-        Cam(x, y, z, yaw, pitch, kx0, ky0, kz0, lb0, rb0, fly0, vy0, ground0, f0, sun0, mode0, l0) ->
+        Cam(x, y, z, yaw, pitch, kx0, ky0, kz0, lb0, rb0, fly0, vy0, ground0, f0, sun0, mode0, l0, slot0) ->
           let now = Strata.Ffi.Vk.time()
           let scripted = frames > 0
           let dt = if scripted do 0.016667 else clampf(now -. t_prev, 0.0, 0.1) end
@@ -497,9 +508,10 @@ mod StrataViewer do
               edit(m2a, Strata.Edit.set_block(Strata.Stream.world(sim_stream(m2a)), -32, height(-35, 53, seed) + 8, 53, lake_base() + 7))
             else m2 end
           let m3 = if scripted && frame == Env.get_int("STRATA_BREACH", -1) do breach(m2s, seed) else if scripted && frame == Env.get_int("STRATA_DRAIN", -1) do drain_floor(m2s, seed) else m2s end end
+          let slot = if scripted do slot0 else slot_key(0, slot0) end
           let lb = !scripted && Strata.Ffi.Vk.mouse_button(0)
           let rb = !scripted && Strata.Ffi.Vk.mouse_button(1)
-          let m4 = act(m3, reg, x2, y2, z2, fx, fy, fz, (lb && !lb0) || (frame == 10 && Env.get_int("STRATA_DIG", 0) == 1) || (script == 2 && frame % 100 == 50), rb && !rb0)
+          let m4 = act(m3, reg, x2, y2, z2, fx, fy, fz, (lb && !lb0) || (frame == 10 && Env.get_int("STRATA_DIG", 0) == 1) || (script == 2 && frame % 100 == 50), rb && !rb0, StrataViewer.Hud.slot_block(slot))
           -- the fluid: ten steps a second (a scripted run: every sixth frame)
           let t_fluid = Strata.Ffi.Vk.time()
           let due = Env.get_int("STRATA_FLUID", 1) != 0 && (if scripted do frame % 6 == 0 else Math.floor(now *. 10.0) != Math.floor(t_prev *. 10.0) end)
@@ -538,6 +550,13 @@ mod StrataViewer do
               -- under water the world is seen through it
               let top = Strata.Fluid.surface(fl, Strata.Stream.world(s3), float_to_int(Math.floor(x2)), float_to_int(Math.floor(y2)), float_to_int(Math.floor(z2)))
               if top > y2 do Strata.Render.set_underwater(top, 0.035, 0.17, 0.30, 0.055) else Strata.Render.clear_underwater() end
+              -- the display, built afresh each frame
+              if ui_on(scripted) do
+                let shown = Env.get_int("STRATA_UI_SHOW", 0)
+                let u0 = Strata.Render.ui_begin(ui_scale())
+                let u1 = if shown == 1 do StrataViewer.Hud.flood(u0, 0, 20000) else if shown == 2 do StrataViewer.Hud.frames(u0) else StrataViewer.Hud.build(u0, slot) end end
+                if Strata.Render.draw_ui(u1) do () else () end
+              else () end
               Strata.Render.set_time(if scripted do int_to_float(frame) /. 60.0 else now end)
               if sun != sun0 do sun_at(sun) else () end
               if mode != mode0 do Strata.Ffi.Vk.set_lighting(mode) else () end
@@ -552,7 +571,7 @@ mod StrataViewer do
               let worst2 = if frame >= 10 && spent > worst do spent else worst end
               let fworst2 = if fluid_ms > fworst do fluid_ms else fworst end
               let total2 = if frame >= 10 do total +. spent else total end
-              let cam2 = Cam(x2, y2, z2, yaw2, pitch2, kx, ky, kz, lb, rb, fly, StrataViewer.Walker.speed_y(moved), StrataViewer.Walker.grounded(moved), fkey, sun, mode, lkey)
+              let cam2 = Cam(x2, y2, z2, yaw2, pitch2, kx, ky, kz, lb, rb, fly, StrataViewer.Walker.speed_y(moved), StrataViewer.Walker.grounded(moved), fkey, sun, mode, lkey, slot)
               if next != frame && frame % 240 == 239 do
                 println("  " ++ float_to_string(Math.round(240.0 /. (now -. t_mark))) ++ " fps; march " ++ ms2(march_ms) ++ " ms, shim " ++ ms2(Strata.Ffi.Vk.stat(0)) ++ " ms, waiting " ++ ms2(Strata.Ffi.Vk.stat(1)) ++ " ms, gpu " ++ ms2(Strata.Ffi.Vk.stat(3)) ++ " ms; " ++ int_to_string(float_to_int(Strata.Ffi.Vk.stat(2))) ++ " draw calls, " ++ int_to_string(float_to_int(Strata.Ffi.Vk.stat(4))) ++ " see-through chunks ordered in " ++ int_to_string(float_to_int(Strata.Ffi.Vk.stat(5))) ++ " us, " ++ int_to_string(Strata.Ffi.Vk.drawn_chunks()) ++ " chunks, " ++ int_to_string(Strata.Ffi.Vk.drawn_quads()) ++ " quads; " ++ int_to_string(Strata.Stream.loaded_count(s3)) ++ " chunks loaded")
                 if scripted && script != 2 && (Env.get_int("STRATA_BREACH", -1) >= 0 || Env.get_int("STRATA_DRAIN", -1) >= 0) do
@@ -714,6 +733,7 @@ mod StrataViewer do
       let reg = registry()
       if Strata.Render.set_light_box(Env.get_int("STRATA_LIGHT_BOX", r), 3) do () else println("strata_viewer: could not build the light volume") end
       if textures(reg) do () else println("strata_viewer: could not upload textures") end
+      if Strata.Render.ui_atlas(StrataViewer.Hud.atlas_w(), StrataViewer.Hud.atlas_h(), StrataViewer.Hud.atlas()) do () else println("strata_viewer: could not upload the interface atlas") end
       if Strata.Render.light_overflow(reg) > 0 do println("strata_viewer: " ++ int_to_string(Strata.Render.light_overflow(reg)) ++ " blocks share another block's light class") else () end
       sun_at(int_to_float(Env.get_int("STRATA_SUN", 55)))
       -- chunks are meshed out to one short of the radius, so the fog closes there
@@ -781,7 +801,7 @@ mod StrataViewer do
         (sl, s1) ->
           println("strata_viewer: " ++ int_to_string(Strata.Stream.loaded_count(s1)) ++ " chunks streamed in " ++ float_to_string(Math.round((t1 -. t0) *. 1000.0)) ++ " ms; " ++ int_to_string(Strata.Ffi.Vk.live_quads()) ++ " quads, " ++ int_to_string(Strata.Ffi.Vk.live_quads() * 8 / 1024) ++ " KB on the GPU")
           -- the fixed scenes fly, holding their pose; the default and the walk scene stand on the ground
-          let cam = Cam(ex, ey, ez, yaw0, pitch0, Strata.Coord.chunk_of(float_to_int(Math.floor(ex))), Strata.Coord.chunk_of(float_to_int(Math.floor(ey))), Strata.Coord.chunk_of(float_to_int(Math.floor(ez))), false, false, soak > 0 || (scene != 0 && scene != 11), 0.0, false, false, int_to_float(Env.get_int("STRATA_SUN", 55)), Env.get_int("STRATA_LIGHT", 4), false)
+          let cam = Cam(ex, ey, ez, yaw0, pitch0, Strata.Coord.chunk_of(float_to_int(Math.floor(ex))), Strata.Coord.chunk_of(float_to_int(Math.floor(ey))), Strata.Coord.chunk_of(float_to_int(Math.floor(ez))), false, false, soak > 0 || (scene != 0 && scene != 11), 0.0, false, false, int_to_float(Env.get_int("STRATA_SUN", 55)), Env.get_int("STRATA_LIGHT", 4), false, 0)
           frame_loop(s1, Strata.Fluid.with_limits(Strata.Fluid.new(reg, Cons((lake_base(), Strata.Fluid.flowing()), Cons((5, Strata.Fluid.sink()), Nil))), Env.get_int("STRATA_FLUID_CAP", 4096), Env.get_int("STRATA_FLUID_REACH", 16), 4), None, sl, reg, cam, 0, frames, if soak > 0 do 2 else if scene == 11 && frames > 0 do 1 else if scene == 4 && frames > 0 do 3 else 0 end end end, hole, 0.0, 0.0, 0.0, Strata.Ffi.Vk.time(), Strata.Ffi.Vk.time(), NativeArray.make_f32(16, 0.0))
       end
       Strata.Ffi.Vk.close()

@@ -27,7 +27,7 @@
 /* Rewritten by build_shaders.sh whenever the shaders change: forge decides
  * whether to recompile this file from its text alone, not from the headers
  * it includes (GAPS S14). */
-#define STRATA_SHADERS_STAMP "f49b15817fd8e3c9"
+#define STRATA_SHADERS_STAMP "2844f727de11e2aa"
 #include "strata_shaders.h"
 #include "strata_spray.h"
 #include "strata_alloc.h"
@@ -42,6 +42,8 @@ static inline void   *narr_data(void *a) { return (char *)a + NARR_HDR; }
 #define SV_FRAMES 2            /* frames in flight */
 #define SV_SPRAY_CAP 65536     /* particles the spray ring holds */
 #define SV_SPRAY_FLOATS 10     /* floats a particle */
+#define SV_UI_QUADS 16384      /* quads the 2D layer holds a frame */
+#define SV_UI_FLOATS 16        /* floats a quad (Strata.Ui) */
 #define SV_LIGHT_PER_FRAME 128 /* chunks whose light bytes one frame may copy into the volume */
 #define SV_LIGHT_WRITE_BYTES (32768 + 64 + 8)   /* per write: the voxels, the coarse cells, the owner texel */
 #define SV_MAX_KEYS 512
@@ -85,6 +87,7 @@ typedef struct {
     uint32_t *pending; uint32_t npending; unsigned char *is_pending;   /* slots changed since this Frame's table was last brought up to date */
     VkBuffer lstage; VkDeviceMemory lstage_mem; unsigned char *lstage_map;   /* this frame's light-volume writes, before they are copied in */
     VkBuffer stats; VkDeviceMemory stats_mem; uint32_t *stats_map;   /* written by the cull pass: commands per range [6], chunks, quads */
+    VkBuffer ui; VkDeviceMemory ui_mem; float *ui_map;   /* this frame's 2D layer */
     int stats_valid;           /* the cull pass has run for this Frame at least once */
     VkFence fence;             /* signalled when the frame's commands have run */
     VkSemaphore sem_image, sem_done;
@@ -149,6 +152,11 @@ static struct {
      * xyz, birth, velocity xyz, life, texture layer, size). */
     VkBuffer spray; VkDeviceMemory spray_mem; float *spray_map;
     SprayRing ring; float *spray_births;
+    /* The 2D layer: the quads the game last handed over, drawn last. Each
+     * Frame copies them when it is recorded. */
+    VkPipeline pipe_ui;
+    float *ui_cpu; uint32_t ui_n; uint64_t ui_dropped;
+    Target ui_art; VkSampler ui_sampler;   /* the interface atlas: one image of a game's own interface art */
     VkBuffer loose; VkDeviceMemory loose_mem; uint32_t *loose_map;       /* model geometry, expanded per instance: 16 words a quad */
     float *models[SV_MAX_MODELS]; uint32_t model_quads[SV_MAX_MODELS];   /* 21 floats a quad, as Strata.Model lays them out */
     VkDescriptorSetLayout dsl;
@@ -484,17 +492,20 @@ static int make_render_pass(VkImageLayout final, VkRenderPass *out) {
 
 /* kind 0: opaque and cutout quads; 1: translucent quads; 2: cross instances;
  * 3: loose quads; 4: the light pass; 5: the lit image to the screen;
- * 6: spray (final pass, blended, after the translucent quads).
+ * 6: spray (final pass, blended, after the translucent quads);
+ * 7: the 2D layer (final pass, blended, no depth, last of all).
  * Kinds 0, 2 and 3 belong to the geometry pass, 4 to the light pass, 1 and 5
  * to the final pass. */
 static int make_pipeline(int kind, VkPipeline *out) {
-    int spray = kind == 6;
-    int blend = kind == 1 || spray, cross = kind == 2, loose = kind == 3, full = kind == 4 || kind == 5, geom = kind == 0 || cross || loose;
-    VkShaderModule vs = spray ? shader(strata_spray_vert, sizeof(strata_spray_vert))
+    int spray = kind == 6, ui = kind == 7;
+    int blend = kind == 1 || spray || ui, cross = kind == 2, loose = kind == 3, full = kind == 4 || kind == 5, geom = kind == 0 || cross || loose;
+    VkShaderModule vs = ui ? shader(strata_ui_vert, sizeof(strata_ui_vert))
+                      : spray ? shader(strata_spray_vert, sizeof(strata_spray_vert))
                       : cross ? shader(strata_cross_vert, sizeof(strata_cross_vert))
                       : loose ? shader(strata_loose_vert, sizeof(strata_loose_vert))
                       : full  ? shader(strata_fullscreen_vert, sizeof(strata_fullscreen_vert)) : shader(strata_quad_vert, sizeof(strata_quad_vert));
-    VkShaderModule fs = spray ? shader(strata_spray_frag, sizeof(strata_spray_frag))
+    VkShaderModule fs = ui ? shader(strata_ui_frag, sizeof(strata_ui_frag))
+                      : spray ? shader(strata_spray_frag, sizeof(strata_spray_frag))
                       : kind == 4 ? shader(strata_light_frag, sizeof(strata_light_frag))
                       : kind == 5 ? shader(strata_composite_frag, sizeof(strata_composite_frag))
                       : blend     ? shader(strata_water_frag, sizeof(strata_water_frag)) : shader(strata_gbuffer_frag, sizeof(strata_gbuffer_frag));
@@ -519,9 +530,16 @@ static int make_pipeline(int kind, VkPipeline *out) {
         { .location = 0, .binding = 0, .format = VK_FORMAT_R32G32B32A32_SFLOAT, .offset = 0 },
         { .location = 1, .binding = 0, .format = VK_FORMAT_R32G32B32A32_SFLOAT, .offset = 16 },
         { .location = 2, .binding = 0, .format = VK_FORMAT_R32G32_SFLOAT, .offset = 32 } };
+    /* a 2D quad is sixteen floats */
+    VkVertexInputBindingDescription ubind = { .binding = 0, .stride = SV_UI_FLOATS * 4, .inputRate = VK_VERTEX_INPUT_RATE_INSTANCE };
+    VkVertexInputAttributeDescription uattrs[4] = {
+        { .location = 0, .binding = 0, .format = VK_FORMAT_R32G32B32A32_SFLOAT, .offset = 0 },
+        { .location = 1, .binding = 0, .format = VK_FORMAT_R32G32B32A32_SFLOAT, .offset = 16 },
+        { .location = 2, .binding = 0, .format = VK_FORMAT_R32G32B32A32_SFLOAT, .offset = 32 },
+        { .location = 3, .binding = 0, .format = VK_FORMAT_R32G32B32A32_SFLOAT, .offset = 48 } };
     VkPipelineVertexInputStateCreateInfo vin = { .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
-        .vertexBindingDescriptionCount = full ? 0 : 1, .pVertexBindingDescriptions = spray ? &sbind : (loose ? &lbind : &bind),
-        .vertexAttributeDescriptionCount = full ? 0 : (spray ? 3 : (loose ? 4 : 2)), .pVertexAttributeDescriptions = spray ? sattrs : (loose ? lattrs : attrs) };
+        .vertexBindingDescriptionCount = full ? 0 : 1, .pVertexBindingDescriptions = ui ? &ubind : spray ? &sbind : (loose ? &lbind : &bind),
+        .vertexAttributeDescriptionCount = full ? 0 : (ui ? 4 : spray ? 3 : (loose ? 4 : 2)), .pVertexAttributeDescriptions = ui ? uattrs : spray ? sattrs : (loose ? lattrs : attrs) };
     VkPipelineInputAssemblyStateCreateInfo ia = { .sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
         .topology = (cross || full) ? VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST : VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP };
     VkPipelineViewportStateCreateInfo vp = { .sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO, .viewportCount = 1, .scissorCount = 1 };
@@ -530,7 +548,7 @@ static int make_pipeline(int kind, VkPipeline *out) {
         .cullMode = (kind == 0) ? VK_CULL_MODE_BACK_BIT : VK_CULL_MODE_NONE, .frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE, .lineWidth = 1.0f };
     VkPipelineMultisampleStateCreateInfo ms = { .sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO, .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT };
     /* only the geometry pass writes depth; translucent quads test against it; full-screen passes ignore it */
-    VkPipelineDepthStencilStateCreateInfo ds = { .sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO, .depthTestEnable = full ? VK_FALSE : VK_TRUE,
+    VkPipelineDepthStencilStateCreateInfo ds = { .sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO, .depthTestEnable = (full || ui) ? VK_FALSE : VK_TRUE,
         .depthWriteEnable = geom ? VK_TRUE : VK_FALSE, .depthCompareOp = VK_COMPARE_OP_LESS };
     VkPipelineColorBlendAttachmentState cba[3];
     cba[0] = (VkPipelineColorBlendAttachmentState){ .blendEnable = blend ? VK_TRUE : VK_FALSE,
@@ -550,6 +568,105 @@ static int make_pipeline(int kind, VkPipeline *out) {
     if (r != VK_SUCCESS) { die("vkCreateGraphicsPipelines", (int)r); return 0; }
     return 1;
 }
+
+/* ── The 2D layer ─────────────────────────────────────────────────────────── */
+
+/* A sampled 2D image (or array of [layers]) filled from [pixels], which
+ * holds every layer one after another. Waits for the GPU: rare. */
+static int make_sampled(VkFormat fmt, uint32_t w, uint32_t h, uint32_t layers, uint32_t bpp, const unsigned char *pixels, int array, Target *out) {
+    VkImageCreateInfo ici = { .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D, .format = fmt,
+        .extent = { w, h, 1 }, .mipLevels = 1, .arrayLayers = layers, .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL,
+        .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT };
+    VKOK(vkCreateImage(g.dev, &ici, NULL, &out->img), "2D image");
+    VkMemoryRequirements mr; vkGetImageMemoryRequirements(g.dev, out->img, &mr);
+    VkMemoryAllocateInfo ai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = mr.size,
+        .memoryTypeIndex = mem_type(mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) };
+    VKOK(vkAllocateMemory(g.dev, &ai, NULL, &out->mem), "2D image memory");
+    VKOK(vkBindImageMemory(g.dev, out->img, out->mem, 0), "2D image bind");
+    VkDeviceSize bytes = (VkDeviceSize)w * h * bpp * layers;
+    VkBuffer sb; VkDeviceMemory sm; void *map = NULL;
+    if (!make_buffer(bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, &sb, &sm, &map)) return 0;
+    if (pixels) memcpy(map, pixels, (size_t)bytes); else memset(map, 0, (size_t)bytes);
+    VkCommandBufferAllocateInfo cai = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, .commandPool = g.cpool, .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1 };
+    VkCommandBuffer cb; VKOK(vkAllocateCommandBuffers(g.dev, &cai, &cb), "2D image command buffer");
+    VkCommandBufferBeginInfo bi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
+    vkBeginCommandBuffer(cb, &bi);
+    VkImageMemoryBarrier b = { .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, .srcAccessMask = 0, .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+        .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED, .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .image = out->img,
+        .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, layers } };
+    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &b);
+    VkBufferImageCopy reg = { .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, layers }, .imageExtent = { w, h, 1 } };
+    vkCmdCopyBufferToImage(cb, sb, out->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &reg);
+    b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT; b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL; b.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, NULL, 0, NULL, 1, &b);
+    vkEndCommandBuffer(cb);
+    VkSubmitInfo sub = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &cb };
+    vkQueueSubmit(g.queue, 1, &sub, VK_NULL_HANDLE);
+    vkQueueWaitIdle(g.queue);
+    vkFreeCommandBuffers(g.dev, g.cpool, 1, &cb);
+    vkDestroyBuffer(g.dev, sb, NULL); vkFreeMemory(g.dev, sm, NULL);
+    VkImageViewCreateInfo vi = { .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = out->img, .viewType = array ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D,
+        .format = fmt, .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, layers } };
+    VKOK(vkCreateImageView(g.dev, &vi, NULL, &out->view), "2D image view");
+    return 1;
+}
+
+static void bind_image(uint32_t binding, VkSampler s, VkImageView v) {
+    for (int f = 0; f < SV_FRAMES; f++) {
+        if (!g.frames[f].dset) continue;
+        VkDescriptorImageInfo ii = { s, v, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+        VkWriteDescriptorSet w = { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = g.frames[f].dset, .dstBinding = binding, .descriptorCount = 1,
+            .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .pImageInfo = &ii };
+        vkUpdateDescriptorSets(g.dev, 1, &w, 0, NULL);
+    }
+}
+
+static int ui_art_make(uint32_t w, uint32_t h, const unsigned char *rgba) {
+    Target fresh = { 0 };
+    if (!make_sampled(VK_FORMAT_R8G8B8A8_SRGB, w, h, 1, 4, rgba, 0, &fresh)) { drop_target(&fresh); return 0; }
+    if (!g.ui_sampler) {
+        /* nearest when magnified, like the block textures: interface art keeps its pixels */
+        VkSamplerCreateInfo si = { .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO, .magFilter = VK_FILTER_NEAREST, .minFilter = VK_FILTER_LINEAR,
+            .mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST, .addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, .addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+            .addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, .maxAnisotropy = 1.0f };
+        VKOK(vkCreateSampler(g.dev, &si, NULL, &g.ui_sampler), "interface sampler");
+    }
+    drop_target(&g.ui_art);
+    g.ui_art = fresh;
+    bind_image(17, g.ui_sampler, g.ui_art.view);
+    return 1;
+}
+
+/* The interface atlas: one image, [w] x [h] RGBA bytes (sRGB colour,
+ * straight alpha, rows running downward), holding all of a game's own
+ * interface art. Replaces the last one. Rare and slow: it waits for the GPU. */
+int64_t sv_ui_atlas(int64_t w, int64_t h, void *rgba_u8) {
+    if (!g.ok || !rgba_u8 || w < 1 || h < 1 || w > 8192 || h > 8192 || narr_len(rgba_u8) < w * h * 4) return 0;
+    vkDeviceWaitIdle(g.dev);
+    return ui_art_make((uint32_t)w, (uint32_t)h, narr_data(rgba_u8));
+}
+
+/* The 2D layer for the frames from now on: [nquads] quads of 16 floats
+ * (Strata.Ui), drawn in order over the finished frame. They stay until the
+ * next call; none clears the layer. Returns how many were taken: quads past
+ * the layer's capacity are dropped from the end; sv_stat(9) is how many the
+ * last call dropped. */
+int64_t sv_ui_set(void *floats, int64_t nquads) {
+    g.ui_dropped = 0;
+    if (!g.ok || !g.ui_cpu || nquads <= 0 || !floats) { g.ui_n = 0; return 0; }
+    int64_t have = narr_len(floats) / SV_UI_FLOATS;
+    int64_t n = nquads < have ? nquads : have;
+    if (n > SV_UI_QUADS) { g.ui_dropped = (uint64_t)(n - SV_UI_QUADS); n = SV_UI_QUADS; }
+    memcpy(g.ui_cpu, narr_data(floats), (size_t)n * SV_UI_FLOATS * sizeof(float));
+    g.ui_n = (uint32_t)n;
+    return n;
+}
+
+/* The window's size in points: what an interface is laid out on. */
+int64_t sv_win_w(void) { int w = 0, h = 0; if (g.win) glfwGetWindowSize(g.win, &w, &h); return w; }
+int64_t sv_win_h(void) { int w = 0, h = 0; if (g.win) glfwGetWindowSize(g.win, &w, &h); return h; }
 
 /* ── Textures and the block table ─────────────────────────────────────────── */
 int64_t sv_textures_create(int64_t tile_px, int64_t layers);
@@ -988,7 +1105,7 @@ int64_t sv_open(int64_t w, int64_t h, int64_t capture_mouse, int64_t quad_capaci
     g.swap_ok = 1;
 
     /* one set layout for every pipeline: 0 uniforms, 1 chunk table, 2 indirect commands, 3 cull statistics, 4 command -> slot */
-    VkDescriptorSetLayoutBinding dslb[17] = {
+    VkDescriptorSetLayoutBinding dslb[18] = {
         { .binding = 0, .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, .descriptorCount = 1,
           .stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT },
         { .binding = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1,
@@ -1012,8 +1129,10 @@ int64_t sv_open(int64_t w, int64_t h, int64_t capture_mouse, int64_t quad_capaci
         { .binding = 14, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT },
         /* the light pass's memory of the frame before */
         { .binding = 15, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT },
-        { .binding = 16, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT } };
-    VkDescriptorSetLayoutCreateInfo dsli = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 17, .pBindings = dslb };
+        { .binding = 16, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT },
+        /* the 2D layer's interface atlas */
+        { .binding = 17, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT } };
+    VkDescriptorSetLayoutCreateInfo dsli = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 18, .pBindings = dslb };
     VKOK(vkCreateDescriptorSetLayout(g.dev, &dsli, NULL, &g.dsl), "descriptor set layout");
     /* where the call's range starts in draw_slot, and per-call flags (bit 0: cutout) */
     VkPushConstantRange pcr = { .stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, .offset = 0, .size = 8 };
@@ -1027,6 +1146,10 @@ int64_t sv_open(int64_t w, int64_t h, int64_t capture_mouse, int64_t quad_capaci
     if (!make_pipeline(4, &g.pipe_light)) return 0;
     if (!make_pipeline(5, &g.pipe_composite)) return 0;
     if (!make_pipeline(6, &g.pipe_spray)) return 0;
+    if (!make_pipeline(7, &g.pipe_ui)) return 0;
+    g.ui_cpu = calloc((size_t)SV_UI_QUADS * SV_UI_FLOATS, sizeof(float));
+    if (!g.ui_cpu) return 0;
+    g.ui_n = 0; g.ui_dropped = 0;
     {   void *smap = NULL;
         if (!make_buffer((VkDeviceSize)SV_SPRAY_CAP * SV_SPRAY_FLOATS * 4, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, &g.spray, &g.spray_mem, &smap)) return 0;
         g.spray_map = smap; memset(g.spray_map, 0, (size_t)SV_SPRAY_CAP * SV_SPRAY_FLOATS * 4);
@@ -1071,13 +1194,15 @@ int64_t sv_open(int64_t w, int64_t h, int64_t capture_mouse, int64_t quad_capaci
     if (!make_buffer((VkDeviceSize)SV_MAX_BLOCKS * 32, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &g.blocks, &g.blocks_mem, &map)) return 0;
     g.blocks_map = map;
     memset(g.blocks_map, 0, (size_t)SV_MAX_BLOCKS * 32);
-    VkDescriptorPoolSize dps[3] = { { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, SV_FRAMES }, { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 6 * SV_FRAMES }, { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 10 * SV_FRAMES } };
+    VkDescriptorPoolSize dps[3] = { { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, SV_FRAMES }, { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 6 * SV_FRAMES }, { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 12 * SV_FRAMES } };
     VkDescriptorPoolCreateInfo dpi = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = SV_FRAMES, .poolSizeCount = 3, .pPoolSizes = dps };
     VKOK(vkCreateDescriptorPool(g.dev, &dpi, NULL, &g.dpool), "descriptor pool");
     for (int f = 0; f < SV_FRAMES; f++) {
         Frame *F = &g.frames[f];
         if (!make_buffer(32, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &F->stats, &F->stats_mem, &map)) return 0;
         F->stats_map = map; memset(F->stats_map, 0, 32);
+        if (!make_buffer((VkDeviceSize)SV_UI_QUADS * SV_UI_FLOATS * 4, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, &F->ui, &F->ui_mem, &map)) return 0;
+        F->ui_map = map;
         VkDescriptorSetAllocateInfo dai = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, .descriptorPool = g.dpool, .descriptorSetCount = 1, .pSetLayouts = &g.dsl };
         VKOK(vkAllocateDescriptorSets(g.dev, &dai, &F->dset), "descriptor set");
         if (!make_buffer(UBO_FLOATS * 4, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, &F->ubo, &F->ubo_mem, &map)) return 0;
@@ -1116,6 +1241,9 @@ int64_t sv_open(int64_t w, int64_t h, int64_t capture_mouse, int64_t quad_capaci
 
     VkCommandPoolCreateInfo cpi = { .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, .queueFamilyIndex = g.qfam };
     VKOK(vkCreateCommandPool(g.dev, &cpi, NULL, &g.cpool), "command pool");
+    {   static const unsigned char white[4] = { 255, 255, 255, 255 };   /* until a game supplies interface art */
+        if (!ui_art_make(1, 1, white)) return 0;
+    }
     for (int f = 0; f < SV_FRAMES; f++) {
         VkCommandBufferAllocateInfo cai = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, .commandPool = g.cpool, .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1 };
         VKOK(vkAllocateCommandBuffers(g.dev, &cai, &g.frames[f].cmd), "command buffer");
@@ -1160,6 +1288,13 @@ void sv_close(void) {
         }
         if (g.pipe_light) vkDestroyPipeline(g.dev, g.pipe_light, NULL);
         if (g.pipe_composite) vkDestroyPipeline(g.dev, g.pipe_composite, NULL);
+        if (g.pipe_ui) vkDestroyPipeline(g.dev, g.pipe_ui, NULL);
+        for (int f = 0; f < SV_FRAMES; f++) {
+            if (g.frames[f].ui) vkDestroyBuffer(g.dev, g.frames[f].ui, NULL);
+            if (g.frames[f].ui_mem) vkFreeMemory(g.dev, g.frames[f].ui_mem, NULL);
+        }
+        drop_target(&g.ui_art);
+        if (g.ui_sampler) vkDestroySampler(g.dev, g.ui_sampler, NULL);
         if (g.pipe_spray) vkDestroyPipeline(g.dev, g.pipe_spray, NULL);
         if (g.spray) vkDestroyBuffer(g.dev, g.spray, NULL);
         if (g.spray_mem) vkFreeMemory(g.dev, g.spray_mem, NULL);
@@ -1210,6 +1345,7 @@ void sv_close(void) {
     glfwTerminate();
     free(g.trans); free(g.trans_at); free(g.trans_keys);
     free(g.spray_births); g.spray_births = NULL;
+    free(g.ui_cpu); g.ui_cpu = NULL; g.ui_n = 0;
     free(g.ubo_map); free(g.entries); free(g.cells); free(g.stage_light);
     for (uint32_t i = 0; i < g.nlq; i++) free(g.lq[i].bytes);
     free(g.lq);
@@ -1240,6 +1376,7 @@ double sv_stat(int64_t which) {
     if (which == 6) return (double)g.rebuilds;
     if (which == 7) return (double)g_quads.leaked + (double)g_loose.leaked;
     if (which == 8) return g.spray_births ? (double)sp_count(&g.ring) : 0.0;
+    if (which == 9) return (double)g.ui_dropped;
     return (which >= 0 && which < 6) ? g.stat[which] : -1.0;
 }
 int64_t sv_drawn_chunks(void) { return g.drawn_chunks; }
@@ -1782,6 +1919,15 @@ int64_t sv_frame(void) {
         vkCmdBindPipeline(F->cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g.pipe_spray);
         vkCmdDraw(F->cmd, 4, run, 0, first); draws++;
         if (run < n) { vkCmdDraw(F->cmd, 4, n - run, 0, 0); draws++; }
+    }
+    /* the 2D layer over everything: this Frame's own copy of the quads, one draw */
+    if (g.ui_n > 0 && F->ui_map) {
+        memcpy(F->ui_map, g.ui_cpu, (size_t)g.ui_n * SV_UI_FLOATS * 4);
+        float scr[2] = { (float)g.extent.width, (float)g.extent.height };
+        vkCmdBindVertexBuffers(F->cmd, 0, 1, &F->ui, &zero);
+        vkCmdBindPipeline(F->cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g.pipe_ui);
+        vkCmdPushConstants(F->cmd, g.layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, 8, scr);
+        vkCmdDraw(F->cmd, 4, g.ui_n, 0, 0); draws++;
     }
     vkCmdEndRenderPass(F->cmd);
     if (g.have_ts) vkCmdWriteTimestamp(F->cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, g.qpool, q0 + 1);
