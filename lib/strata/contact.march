@@ -270,6 +270,105 @@ mod Strata.Contact do
     Win3(0, 0, 0, sx, sy, sz, grid_go(Strata.Body.ids(g), t, NativeArray.make_u8(sx * sy * sz, 0), 0, sx * sy * sz))
   end
 
+
+  -- ── Driven boxes ─────────────────────────────────────────────────────────
+  -- A driven body is an axis-aligned box (half extents hx, hy, hz about its
+  -- centre). A body's corner against it: inside, pushed out through the
+  -- nearest face; outside but within reach, a speculative contact.
+  pfn corner_box(cs : NativeFloatArr, nc : Int, st : NativeFloatArr, a : Int, b : Int, scale : Float, dt : Float, lx : Float, ly : Float, lz : Float, hx : Float, hy : Float, hz : Float) : (NativeFloatArr, Int) do
+    let o = a * 32
+    let rx = cget(st, o + 23) *. lx +. cget(st, o + 24) *. ly +. cget(st, o + 25) *. lz
+    let ry = cget(st, o + 26) *. lx +. cget(st, o + 27) *. ly +. cget(st, o + 28) *. lz
+    let rz = cget(st, o + 29) *. lx +. cget(st, o + 30) *. ly +. cget(st, o + 31) *. lz
+    let ob = b * 32
+    let bx = cget(st, ob)
+    let yb = cget(st, ob + 1)
+    let bz = cget(st, ob + 2)
+    let dx = cget(st, o) +. rx -. bx
+    let dy = cget(st, o + 1) +. ry -. yb
+    let dz = cget(st, o + 2) +. rz -. bz
+    let (vax, vay, vaz) = point_vel(st, a, rx, ry, rz)
+    let (vbx, vby, vbz) = point_vel(st, b, dx, dy, dz)
+    let sp = Math.sqrt((vax -. vbx) *. (vax -. vbx) +. (vay -. vby) *. (vay -. vby) +. (vaz -. vbz) *. (vaz -. vbz))
+    let margin = minf(0.5, sp *. dt /. scale +. 0.02) *. scale
+    let put = fn (qx, qy, qz, nx, ny, nz, gap) ->
+      (put_contact(cs, nc, a, b, bx +. qx -. cget(st, o), yb +. qy -. cget(st, o + 1), bz +. qz -. cget(st, o + 2), qx, qy, qz, nx, ny, nz, gap), nc + 1)
+    let ex = hx -. absf(dx)
+    let ey = hy -. absf(dy)
+    let ez = hz -. absf(dz)
+    if ex > 0.0 && ey > 0.0 && ez > 0.0 do
+      let sx = if dx < 0.0 do -1.0 else 1.0 end
+      let sy = if dy < 0.0 do -1.0 else 1.0 end
+      let sz = if dz < 0.0 do -1.0 else 1.0 end
+      if ex <= ey && ex <= ez do put(sx *. hx, dy, dz, sx, 0.0, 0.0, 0.0 -. ex)
+      else if ey <= ez do put(dx, sy *. hy, dz, 0.0, sy, 0.0, 0.0 -. ey)
+      else put(dx, dy, sz *. hz, 0.0, 0.0, sz, 0.0 -. ez) end end
+    else
+      let qx = clampf(dx, 0.0 -. hx, hx)
+      let qy = clampf(dy, 0.0 -. hy, hy)
+      let qz = clampf(dz, 0.0 -. hz, hz)
+      let d = Math.sqrt((dx -. qx) *. (dx -. qx) +. (dy -. qy) *. (dy -. qy) +. (dz -. qz) *. (dz -. qz))
+      if d >= margin || d <= 0.0 do (cs, nc)
+      else put(qx, qy, qz, (dx -. qx) /. d, (dy -. qy) /. d, (dz -. qz) /. d, d) end
+    end
+  end
+  pfn corners_box(cs : NativeFloatArr, nc : Int, st : NativeFloatArr, a : Int, b : Int, scale : Float, dt : Float, sx : Int, sy : Int, surf : NativeIntArr, cx : Float, cy : Float, cz : Float, hx : Float, hy : Float, hz : Float, i : Int, n : Int) : (NativeFloatArr, Int) do
+    if i >= n do (cs, nc)
+    else
+      let v = NativeArray.get_int(surf, i)
+      let lx = int_to_float(v % (sx + 1)) *. scale -. cx
+      let ly = int_to_float((v / (sx + 1)) % (sy + 1)) *. scale -. cy
+      let lz = int_to_float(v / ((sx + 1) * (sy + 1))) *. scale -. cz
+      match corner_box(cs, nc, st, a, b, scale, dt, lx, ly, lz, hx, hy, hz) do
+        (cs2, nc2) -> corners_box(cs2, nc2, st, a, b, scale, dt, sx, sy, surf, cx, cy, cz, hx, hy, hz, i + 1, n)
+      end
+    end
+  end
+  doc "Contacts of body [a]'s corners (as for `gen_world`) against driven body [b], an axis-aligned box of half extents (hx, hy, hz) metres about its centre. Normals point out of the box toward a."
+  fn gen_box(cs : NativeFloatArr, nc : Int, st : NativeFloatArr, a : Int, b : Int, scale : Float, dt : Float, sx : Int, sy : Int, surf : NativeIntArr, cx : Float, cy : Float, cz : Float, hx : Float, hy : Float, hz : Float) : (NativeFloatArr, Int) do
+    corners_box(cs, nc, st, a, b, scale, dt, sx, sy, surf, cx, cy, cz, hx, hy, hz, 0, NativeArray.length_int(surf))
+  end
+
+  pfn pts_go(cs : NativeFloatArr, nc : Int, st : NativeFloatArr, a : Int, b : Int, win : Win3, scale : Float, dt : Float, pts : NativeFloatArr, lbx : Float, lby : Float, lbz : Float, i : Int, n : Int) : (NativeFloatArr, Int) do
+    if i >= n do (cs, nc)
+    else
+      match point_vs(cs, nc, st, a, b, win, scale, dt, cget(pts, i * 3), cget(pts, i * 3 + 1), cget(pts, i * 3 + 2), lbx, lby, lbz) do
+        (cs2, nc2) -> pts_go(cs2, nc2, st, a, b, win, scale, dt, pts, lbx, lby, lbz, i + 1, n)
+      end
+    end
+  end
+  doc "Contacts of the points [pts] (three floats each, metres from body a's centre in its own frame) against body [b]'s grid window, as `gen_body` does for corners."
+  fn gen_points(cs : NativeFloatArr, nc : Int, st : NativeFloatArr, a : Int, b : Int, winb : Win3, scale : Float, dt : Float, pts : NativeFloatArr, lbx : Float, lby : Float, lbz : Float) : (NativeFloatArr, Int) do
+    pts_go(cs, nc, st, a, b, winb, scale, dt, pts, lbx, lby, lbz, 0, NativeArray.length_float(pts) / 3)
+  end
+
+  doc "Points on the surface of a box of half extents (hx, hy, hz), no more than [spacing] apart, about its centre: three floats each."
+  fn box_points(hx : Float, hy : Float, hz : Float, spacing : Float) : NativeFloatArr do
+    let nx = float_to_int(Math.ceil(2.0 *. hx /. spacing)) + 1
+    let ny = float_to_int(Math.ceil(2.0 *. hy /. spacing)) + 1
+    let nz = float_to_int(Math.ceil(2.0 *. hz /. spacing)) + 1
+    let n = box_count(nx, ny, nz, 0, 0)
+    box_fill(NativeArray.make_float(n * 3 + 1, 0.0), nx, ny, nz, hx, hy, hz, 0, 0)
+  end
+  pfn on_shell(nx : Int, ny : Int, nz : Int, i : Int) : Bool do
+    let x = i % nx
+    let y = (i / nx) % ny
+    let z = i / (nx * ny)
+    x == 0 || y == 0 || z == 0 || x == nx - 1 || y == ny - 1 || z == nz - 1
+  end
+  pfn box_count(nx : Int, ny : Int, nz : Int, i : Int, acc : Int) : Int do
+    if i >= nx * ny * nz do acc else box_count(nx, ny, nz, i + 1, if on_shell(nx, ny, nz, i) do acc + 1 else acc end) end
+  end
+  pfn frac(k : Int, n : Int, h : Float) : Float do if n <= 1 do 0.0 else 0.0 -. h +. 2.0 *. h *. int_to_float(k) /. int_to_float(n - 1) end end
+  pfn box_fill(a : NativeFloatArr, nx : Int, ny : Int, nz : Int, hx : Float, hy : Float, hz : Float, i : Int, k : Int) : NativeFloatArr do
+    if i >= nx * ny * nz do a
+    else if !on_shell(nx, ny, nz, i) do box_fill(a, nx, ny, nz, hx, hy, hz, i + 1, k)
+    else
+      let a2 = cset(cset(cset(a, k * 3, frac(i % nx, nx, hx)), k * 3 + 1, frac((i / nx) % ny, ny, hy)), k * 3 + 2, frac(i / (nx * ny), nz, hz))
+      box_fill(a2, nx, ny, nz, hx, hy, hz, i + 1, k + 1)
+    end end
+  end
+
   -- ── Solving ──────────────────────────────────────────────────────────────
   -- velocity of body k's point at arm r
   pfn point_vel(st : NativeFloatArr, k : Int, rx : Float, ry : Float, rz : Float) : (Float, Float, Float) do
