@@ -5,6 +5,7 @@ mod Strata.Test.Physics do
 
   needs IO.Clock      -- charged to every test module once any uses Check.all (GAPS S3)
   needs IO.Process
+  needs IO.Spawn      -- steps worked out on a worker
   import Test
   alias Strata.Physics as Ph
   alias Strata.Body as Bg
@@ -447,6 +448,208 @@ mod Strata.Test.Physics do
               let cs = Ed.changes(o)
               Test.assert_eq_int(List.length(cs), 3, "three blocks written")
               Test.assert_true(List.all(cs, fn c -> same_column(c, cs)), "standing along y in one column")
+          end
+      end
+    end
+  end
+
+
+  -- ── Off the main thread, the clock, driven bodies ────────────────────────
+  pfn run_job(s : Sim, n : Int) : Sim do
+    if n <= 0 do s
+    else
+      match s do
+        Sim(p, w) ->
+          match Ph.begin(p, w, Nil) do
+            (p1, j) ->
+              match Ph.finish_world(j, p1, w) do
+                (p2, o) -> run_job(Sim(p2, Ed.world(o)), n - 1)
+              end
+          end
+      end
+    end
+  end
+  pfn pile() : Sim do Sim(List.fold_left(List.range(0, 6), phys(), fn (p0, i) -> heap_one(p0, i)), world()) end
+
+  -- drive a driven body [n] times at (vx, vy, vz), stepping physics after each
+  pfn drive_n(s : Sim, id : Int, vx : Float, vy : Float, vz : Float, n : Int) : Sim do
+    if n <= 0 do s
+    else
+      match s do
+        Sim(p, w) ->
+          match Ph.drive(p, w, id, vx, vy, vz, 1.0 /. 60.0) do
+            (p2, _) -> drive_n(run(Sim(p2, w), 1), id, vx, vy, vz, n - 1)
+          end
+      end
+    end
+  end
+  pfn walker(p : Strata.Physics.Physics, x : Float, y : Float, z : Float) : (Strata.Physics.Physics, Int) do Ph.add_driven(p, x, y, z, 0.3, 0.9, 0.3) end
+  pfn names(p : Strata.Physics.Physics, id : Int, other : Int) : Bool do List.any(Ph.contacts(p, id), fn c -> Ph.ct_other(c) == other) end
+
+  describe "Physics off the main thread" do
+    test "the job equals the step" do
+      let a = run(pile(), 60)
+      let b = run_job(pile(), 60)
+      Test.assert_true(Ph.hash(sp(a)) == Ph.hash(sp(b)), "equal hashes after 60 steps")
+    end
+
+    test "edits belong to the next step" do
+      match crate_at(phys(), 0.0, 0.0, 0.0) do
+        (p, id) ->
+          let s = run(Sim(p, world()), 120)
+          let o = Ed.fill_box(sw(s), -1, -4, -1, 2, -1, 2, 0)
+          let w2 = Ed.world(o)
+          -- A: the edit is handed while step N is in flight
+          match Ph.begin(sp(s), sw(s), Nil) do
+            (pa, ja) ->
+              match Ph.finish_world(ja, Ph.wake(pa, o), w2) do
+                (pa2, _) ->
+                  -- B: the edit is handed after step N finished
+                  match Ph.begin(sp(s), sw(s), Nil) do
+                    (pb, jb) ->
+                      match Ph.finish_world(jb, pb, w2) do
+                        (pb2, _) ->
+                          Test.assert_true(Ph.is_asleep(pa2, id) && Ph.is_asleep(pb2, id), "step N did not see the edit")
+                          let pb3 = Ph.wake(pb2, o)
+                          let a3 = run(Sim(pa2, w2), 30)
+                          let b3 = run(Sim(pb3, w2), 30)
+                          Test.assert_true(Ph.hash(sp(a3)) == Ph.hash(sp(b3)), "the same afterwards either way")
+                          Test.assert_true(py(a3, id) < 0.9, "and step N + 1 did see it")
+                      end
+                  end
+              end
+          end
+      end
+    end
+
+    test "the clock" do
+      let s = run(Sim(phys(), world()), 10)
+      let last = 10.0 /. 60.0
+      Test.assert_eq_int(Ph.due(sp(s), last +. 0.05), 2, "three steps owed, at most two")
+      let s2 = run(s, 2)
+      Test.assert_true(near(Ph.behind(sp(s2), last +. 0.05), 1.0 /. 60.0, 0.000001), "one step behind after two")
+    end
+
+    test "pose interpolates between the last two steps" do
+      match add(phys(), block(2, 2, 2), 0.0, 20.0, 0.0, Qt.from_axis_angle(0.0, 0.0, 1.0, deg(20.0))) do
+        (p, id) ->
+          let s0 = run(Sim(Ph.push(p, id, 0.0, 21.0, 1.0, 0.0, 0.0, 30000.0), world()), 1)
+          let s1 = run(s0, 1)
+          let t = (int_to_float(Ph.steps(sp(s1))) -. 0.5) /. 60.0
+          match (Ph.pose(sp(s1), id, t), Ph.pose(sp(s0), id, 10.0), Ph.pose(sp(s1), id, 10.0)) do
+            ((x, y, z, q), (x0, y0, z0, q0), (x1, y1, z1, q1)) ->
+              -- the centre of mass is the corner plus the turned (1, 1, 1)
+              let c = fn (ax, ay, az, aq) -> match Qt.rotate(aq, Strata.Math.Vec3.new(1.0, 1.0, 1.0)) do v -> (ax +. Strata.Math.Vec3.x(v), ay +. Strata.Math.Vec3.y(v), az +. Strata.Math.Vec3.z(v)) end
+              match (c(x, y, z, q), c(x0, y0, z0, q0), c(x1, y1, z1, q1)) do
+                ((mx, my, mz), (ax, ay, az), (bx, yb, bz)) ->
+                  Test.assert_true(near(mx, (ax +. bx) /. 2.0, 0.000000001) && near(my, (ay +. yb) /. 2.0, 0.000000001) && near(mz, (az +. bz) /. 2.0, 0.000000001), "the centre's midpoint")
+              end
+              let m = Qt.normalize(Strata.Math.Quat.Quat(Qt.x(q0) +. Qt.x(q1), Qt.y(q0) +. Qt.y(q1), Qt.z(q0) +. Qt.z(q1), Qt.w(q0) +. Qt.w(q1)))
+              Test.assert_true(near(Qt.x(q), Qt.x(m), 0.000001) && near(Qt.y(q), Qt.y(m), 0.000001) && near(Qt.z(q), Qt.z(m), 0.000001) && near(Qt.w(q), Qt.w(m), 0.000001), "the slerp midpoint")
+          end
+      end
+    end
+  end
+
+  describe "Physics driven bodies" do
+    test "drive stands on a body" do
+      match crate_at(phys(), 0.0, 0.0, 0.0) do
+        (p0, crate) ->
+          let s = run(Sim(p0, world()), 120)
+          match walker(sp(s), 1.0, 4.0, 1.0) do
+            (p1, me) ->
+              let s2 = drive_n(Sim(p1, sw(s)), me, 0.0, -5.0, 0.0, 60)
+              match Ph.position(sp(s2), me) do
+                (_, y, _) -> Test.assert_true(near(y -. 0.9, 2.0, 0.01), "standing on the crate's top")
+              end
+              let s3 = drive_n(s2, me, 1.0, -5.0, 0.0, 20)
+              Test.assert_true(px(s3, me) > 1.3, "not blocked sideways on top")
+              Test.assert_true(Ph.exists(sp(s3), crate), "the crate is still there")
+          end
+      end
+    end
+
+    test "drive pushes a light body and is stopped by a heavy one" do
+      let light = Bg.grid_set(Bg.grid(1, 1, 1), 0, 0, 0, 1)
+      let p0 = Ph.new(reg(), Ph.with_scale(Ph.config(), 0.1))
+      let w = world_at(0.1)
+      match Ph.add(p0, Bg.grid_set(Bg.grid(2, 2, 2), 0, 0, 0, 1), 1.0, 0.0, 0.0, Qt.identity(), Ph.dynamic()) do
+        (p1, crate) ->
+          match Ph.add_driven(p1, 0.0, 0.9, 0.1, 0.3, 0.9, 0.3) do
+            (p2, me) ->
+              let p3 = Ph.with_driven_mass(p2, me, 80.0)
+              let x0 = px(Sim(p3, w), crate)
+              let s = drive_n(run(Sim(p3, w), 30), me, 2.0, -1.0, 0.0, 60)
+              Test.assert_true(px(s, crate) -. x0 >= 0.5, "a 10 kg crate is pushed")
+              Test.assert_true(names(sp(s), me, crate), "and named in the driven body's contacts")
+          end
+      end
+      let _ = light
+      match crate_at(phys(), 1.0, 0.0, -1.0) do
+        (p1, crate) ->
+          match walker(p1, -0.5, 0.9, 0.0) do
+            (p2, me) ->
+              let s0 = run(Sim(p2, world()), 30)
+              let x0 = px(s0, crate)
+              let s = drive_n(s0, me, 2.0, -1.0, 0.0, 60)
+              Test.assert_true(absf(px(s, crate) -. x0) < 0.01, "a 16000 kg crate does not move")
+              Test.assert_true(px(s, me) <= 1.0 -. 0.3 +. 0.01, "and blocks the walker")
+              Test.assert_true(names(sp(s), me, crate), "named in the contacts")
+          end
+      end
+    end
+
+    test "a driven body rides a moving body" do
+      let p0 = Ph.new(reg(), Ph.config())
+      match crate_at(p0, 0.0, 0.0, 0.0) do
+        (p1, crate) ->
+          let s = run(Sim(p1, world()), 60)
+          match walker(sp(s), 1.0, 2.95, 1.0) do
+            (p2, me) ->
+              let s1 = drive_n(Sim(p2, sw(s)), me, 0.0, -2.0, 0.0, 10)
+              let x0 = px(s1, me)
+              match Ph.position(sp(s1), crate) do
+                (cx, cy, cz) ->
+                  let s2 = drive_n(Sim(Ph.push(sp(s1), crate, cx, cy, cz, 2.0 *. 16000.0, 0.0, 0.0), sw(s1)), me, 0.0, -2.0, 0.0, 30)
+                  -- friction stops the crate after about a third of a metre; the walker goes with it
+                  match (Ph.position(sp(s2), me), Ph.position(sp(s2), crate)) do
+                    ((mx, my, _), (kx, ky, _)) ->
+                      Test.assert_true(near(my -. 0.9, ky +. 1.0, 0.05), "still on top")
+                      Test.assert_true(kx -. cx > 0.2, "the crate slid")
+                      Test.assert_true(mx -. x0 >= 0.8 *. (kx -. cx), "carried along x with it")
+                  end
+              end
+          end
+      end
+      match crate_at(phys(), 0.0, 4.0, 0.0) do
+        (p1, crate) ->
+          let w = Ed.world(Ed.fill_box(world(), -2, 0, -2, 3, 3, 3, 1))
+          let s = run(Sim(p1, w), 60)
+          match walker(sp(s), 1.0, 6.95, 1.0) do
+            (p2, me) ->
+              let s1 = drive_n(Sim(p2, sw(s)), me, 0.0, -5.0, 0.0, 10)
+              let o = Ed.fill_box(sw(s1), -2, 0, -2, 3, 3, 3, 0)
+              let s2 = drive_n(Sim(Ph.wake(sp(s1), o), Ed.world(o)), me, 0.0, -5.0, 0.0, 40)
+              Test.assert_true(py(s2, crate) < 3.0 && py(s2, me) -. 0.9 >= py(s2, crate) +. 0.9, "falls with the crate, above it")
+          end
+      end
+    end
+
+    test "raycast sees a rotated body" do
+      match add(Ph.new(reg(), Ph.with_gravity(Ph.config(), 0.0)), block(4, 1, 1), 0.0, 10.0, 0.0, Qt.from_axis_angle(0.0, 1.0, 0.0, deg(45.0))) do
+        (p, id) ->
+          let stop = fn i -> i != 0
+          -- unrotated, the bar would cover x 0..4, y 10..11, z 0..1; turned 45 degrees about its low corner its far end is near (2.8, -2.8)
+          match Ph.raycast(p, world(), 3.5, 12.0, 0.5, 0.0, -1.0, 0.0, 1.5, stop) do
+            (_, hit_id) -> Test.assert_eq_int(hit_id, -1, "where the unrotated far end would be: a miss")
+          end
+          match Ph.position(p, id) do
+            (cx, cy, cz) ->
+              match Ph.raycast(p, world(), cx -. 5.0, cy, cz, 1.0, 0.0, 0.0, 20.0, stop) do
+                (h, hit_id) ->
+                  Test.assert_eq_int(hit_id, id, "through its middle: the body")
+                  Test.assert_true(Strata.Query.is_hit(h), "a hit")
+              end
           end
       end
     end
