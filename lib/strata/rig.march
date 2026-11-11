@@ -1,0 +1,455 @@
+-- Rig — a jointed voxel figure's description: a palette, parts in a
+-- hierarchy, each with its own voxel grid, sockets, masks and legs. A value
+-- until `Strata.Anim.finish_rig` uploads it; built once and shared by every
+-- figure made from it.
+--
+-- Space. Each part has a frame of its own. Its grid sits in that frame with
+-- voxel (x, y, z) spanning [x, x + 1] x [y, y + 1] x [z, z + 1] voxels, less
+-- the part's anchor: the point of its own grid, in its own voxels, it turns
+-- about (default (0, 0, 0), the grid's low corner). A part's pivot is where
+-- that point sits in its parent's grid, in the parent's voxels; the root's
+-- pivot is in the figure's space, in voxels. Voxels are `voxel_size` metres.
+--
+-- Parts are numbered 0, 1, ... in the order made; the first is the root
+-- (parent -1) and every other part's parent was made before it. Up to 64
+-- parts, each 0 to 128 voxels a side; a part with no voxels is a pure joint.
+-- The palette has entries 1..255 (colour, roughness, emission); 0 is empty.
+--
+-- A call the rig cannot take changes nothing but the count `refused` and
+-- the reason `why`.
+--
+-- Meshing (`meshes`) cuts each part into pieces of 32 voxels a side and
+-- meshes each greedily, per face direction, merging equal palette indices
+-- and equal corner shades, the way Strata.Mesh meshes a chunk: a face is
+-- drawn toward an empty voxel or the outside of the part, never between two
+-- filled voxels (of any colours), and its corners are shaded from the
+-- voxels around them in the layer it faces. A piece sees the part's other
+-- pieces as its neighbours and air beyond the part.
+mod Strata.Rig do
+
+  alias Strata.Quad as Q
+  alias Strata.Math.Quat as Qt
+
+  -- a box of voxels set to a colour, corners inclusive
+  type RgEdit = RgEdit(Int, Int, Int, Int, Int, Int, Int)
+  -- parent, pivot (parent's voxels), grid size, anchor (own voxels), rest rotation, edits newest first
+  type RgPart = RgPart(Int, Float, Float, Float, Int, Int, Int, Float, Float, Float, (Float, Float, Float, Float), List(RgEdit))
+  -- part, position (part's voxels), rotation
+  type RgSocket = RgSocket(Int, Float, Float, Float, (Float, Float, Float, Float))
+  -- upper, lower, foot, sole (metres below the foot's pivot)
+  type RgLeg = RgLeg(Int, Int, Int, Float)
+  -- index, red, green, blue, roughness, emission
+  type RgColour = RgColour(Int, Float, Float, Float, Float, Float)
+
+  type Rig = { voxel : Float, palette : List(RgColour), parts : List(RgPart), sockets : List(RgSocket), masks : List(List(Int)), legs : List(RgLeg), refusals : Int, reason : String }
+
+  pfn finite(x : Float) : Bool do
+    if float_is_nan(x) do false else !float_is_infinite(x) end
+  end
+
+  -- rotations are kept as four floats: a Quat inside a generic container miscompiles (GAPS S23)
+  pfn q4(q : Strata.Math.Quat.Quat) : (Float, Float, Float, Float) do (Qt.x(q), Qt.y(q), Qt.z(q), Qt.w(q)) end
+  pfn socket_tuple(s : RgSocket) : (Int, Float, Float, Float, (Float, Float, Float, Float)) do match s do RgSocket(p, x, y, z, q) -> (p, x, y, z, q) end end
+  pfn leg_tuple(l : RgLeg) : (Int, Int, Int, Float) do match l do RgLeg(a, b, c, s) -> (a, b, c, s) end end
+  pfn colour_tuple(c : RgColour) : (Int, Float, Float, Float, Float, Float) do match c do RgColour(i, cr, cg, cb, ro, em) -> (i, cr, cg, cb, ro, em) end end
+  pfn colour_index(c : RgColour) : Int do match c do RgColour(i, _, _, _, _, _) -> i end end
+  pfn rest_of_part(p : RgPart) : (Float, Float, Float, Float) do match p do RgPart(_, _, _, _, _, _, _, _, _, _, q, _) -> q end end
+  pfn parent_of_part(p : RgPart) : Int do match p do RgPart(par, _, _, _, _, _, _, _, _, _, _, _) -> par end end
+  pfn replace_at(e : (Int, RgPart), p : Int, np : RgPart) : RgPart do match e do (i, old) -> if i == p do np else old end end end
+
+  pfn refuse(r : Rig, why : String) : Rig do { r with refusals: r.refusals + 1, reason: why } end
+
+  doc "An empty rig whose voxels are [voxel_size] metres. A size that is not a positive number is refused and the rig keeps 0.1."
+  fn new(voxel_size : Float) : Rig do
+    let r = { voxel: 0.1, palette: Nil, parts: Nil, sockets: Nil, masks: Nil, legs: Nil, refusals: 0, reason: "" }
+    if finite(voxel_size) && voxel_size > 0.0 do { r with voxel: voxel_size } else refuse(r, "the voxel size must be a positive number") end
+  end
+
+  doc "How many calls this rig refused."
+  fn refused(r : Rig) : Int do r.refusals end
+  doc "Why the last refused call was refused; empty when none was."
+  fn why(r : Rig) : String do r.reason end
+  doc "The voxel size in metres."
+  fn voxel_size(r : Rig) : Float do r.voxel end
+  doc "How many parts the rig has."
+  fn part_count(r : Rig) : Int do List.length(r.parts) end
+  doc "How many masks the rig has; they are numbered 0, 1, ... in the order made."
+  fn mask_count(r : Rig) : Int do List.length(r.masks) end
+  doc "The masks' roots, in mask order."
+  fn masks(r : Rig) : List(List(Int)) do r.masks end
+  doc "The sockets, in socket order: (part, x, y, z in the part's voxels, rotation as (x, y, z, w))."
+  fn sockets(r : Rig) : List((Int, Float, Float, Float, (Float, Float, Float, Float))) do
+    List.map(r.sockets, socket_tuple)
+  end
+  doc "The legs, in leg order: (upper, lower, foot, sole in metres)."
+  fn legs(r : Rig) : List((Int, Int, Int, Float)) do
+    List.map(r.legs, leg_tuple)
+  end
+  doc "The palette entries set: (index, red, green, blue, roughness, emission)."
+  fn palette(r : Rig) : List((Int, Float, Float, Float, Float, Float)) do
+    List.map(r.palette, colour_tuple)
+  end
+
+  doc "Each part's rest rotation as (x, y, z, w), in part order."
+  fn rests(r : Rig) : List((Float, Float, Float, Float)) do
+    List.map(r.parts, rest_of_part)
+  end
+
+  pfn has_part(r : Rig, p : Int) : Bool do p >= 0 && p < List.length(r.parts) end
+  pfn part_at(r : Rig, p : Int) : RgPart do List.nth(r.parts, p) end
+  pfn with_part(r : Rig, p : Int, np : RgPart) : Rig do
+    { r with parts: List.map(List.enumerate(r.parts), fn e -> replace_at(e, p, np)) }
+  end
+
+  doc "Set palette entry [index] (1..255): colour (linear, 0..1), roughness and emission as blocks mean them."
+  fn colour(r : Rig, index : Int, red : Float, green : Float, blue : Float, roughness : Float, emission : Float) : Rig do
+    if index < 1 || index > 255 do refuse(r, "a colour index is 1 to 255 (0 is empty)")
+    else if !(finite(red) && finite(green) && finite(blue) && finite(roughness) && finite(emission)) do refuse(r, "a colour's values must be finite")
+    else { r with palette: Cons(RgColour(index, red, green, blue, roughness, emission), List.filter(r.palette, fn c -> colour_index(c) != index)) } end end
+  end
+
+  doc "Add a part with a grid of (sx, sy, sz) voxels (each 0..128), turning about (px, py, pz) in its parent's voxels. The first part is the root (parent -1). Answers its number, or -1 if refused."
+  fn part(r : Rig, parent : Int, px : Float, py : Float, pz : Float, sx : Int, sy : Int, sz : Int) : (Rig, Int) do
+    let n = List.length(r.parts)
+    if n >= 64 do (refuse(r, "a rig holds at most 64 parts"), -1)
+    else if sx < 0 || sy < 0 || sz < 0 || sx > 128 || sy > 128 || sz > 128 do (refuse(r, "a part's grid is 0 to 128 voxels a side"), -1)
+    else if n == 0 && parent != -1 do (refuse(r, "the first part is the root: its parent is -1"), -1)
+    else if n > 0 && (parent < 0 || parent >= n) do (refuse(r, "a part's parent must be a part already made (one root only)"), -1)
+    else if !(finite(px) && finite(py) && finite(pz)) do (refuse(r, "a pivot must be finite"), -1)
+    else ({ r with parts: List.append(r.parts, Cons(RgPart(parent, px, py, pz, sx, sy, sz, 0.0, 0.0, 0.0, (0.0, 0.0, 0.0, 1.0), Nil), Nil)) }, n) end end end end end
+  end
+
+  doc "The point of part [p]'s own grid, in its own voxels, that it turns about and that its pivot places (default (0, 0, 0), the grid's low corner)."
+  fn anchor(r : Rig, p : Int, ax : Float, ay : Float, az : Float) : Rig do
+    if !has_part(r, p) do refuse(r, "no such part")
+    else if !(finite(ax) && finite(ay) && finite(az)) do refuse(r, "an anchor must be finite")
+    else
+      match part_at(r, p) do
+        RgPart(par, px, py, pz, sx, sy, sz, _, _, _, q, ed) -> with_part(r, p, RgPart(par, px, py, pz, sx, sy, sz, ax, ay, az, q, ed))
+      end
+    end end
+  end
+
+  doc "Part [p]'s rest rotation, in its parent's frame. A clip's turn key replaces it while the clip plays."
+  fn rest(r : Rig, p : Int, q : Strata.Math.Quat.Quat) : Rig do
+    let len = Math.sqrt(Qt.x(q) *. Qt.x(q) +. Qt.y(q) *. Qt.y(q) +. Qt.z(q) *. Qt.z(q) +. Qt.w(q) *. Qt.w(q))
+    if !has_part(r, p) do refuse(r, "no such part")
+    else if !finite(len) || len < 0.000001 do refuse(r, "a rotation must be a finite quaternion of some length")
+    else
+      match part_at(r, p) do
+        RgPart(par, px, py, pz, sx, sy, sz, ax, ay, az, _, ed) -> with_part(r, p, RgPart(par, px, py, pz, sx, sy, sz, ax, ay, az, q4(Qt.normalize(q)), ed))
+      end
+    end end
+  end
+
+  doc "Fill the box of voxels from (x0, y0, z0) to (x1, y1, z1), corners included, in part [p] with palette index [colour] (0 empties it)."
+  fn box(r : Rig, p : Int, x0 : Int, y0 : Int, z0 : Int, x1 : Int, y1 : Int, z1 : Int, colour : Int) : Rig do
+    if !has_part(r, p) do refuse(r, "no such part")
+    else if colour < 0 || colour > 255 do refuse(r, "a voxel's colour is a palette index 0 to 255")
+    else
+      match part_at(r, p) do
+        RgPart(par, px, py, pz, sx, sy, sz, ax, ay, az, q, ed) ->
+          if x0 < 0 || y0 < 0 || z0 < 0 || x1 >= sx || y1 >= sy || z1 >= sz || x0 > x1 || y0 > y1 || z0 > z1 do refuse(r, "a voxel or box must lie inside the part's grid")
+          else with_part(r, p, RgPart(par, px, py, pz, sx, sy, sz, ax, ay, az, q, Cons(RgEdit(x0, y0, z0, x1, y1, z1, colour), ed))) end
+      end
+    end end
+  end
+
+  doc "Set the voxel (x, y, z) of part [p] to palette index [colour] (0 empties it)."
+  fn voxel(r : Rig, p : Int, x : Int, y : Int, z : Int, colour : Int) : Rig do box(r, p, x, y, z, x, y, z, colour) end
+
+  doc "A socket on part [p] at (x, y, z) in its voxels, turned by [q]: a hand, a muzzle, a saddle. Answers its number, or -1."
+  fn socket(r : Rig, p : Int, x : Float, y : Float, z : Float, q : Strata.Math.Quat.Quat) : (Rig, Int) do
+    if !has_part(r, p) do (refuse(r, "no such part"), -1)
+    else if !(finite(x) && finite(y) && finite(z)) do (refuse(r, "a socket's position must be finite"), -1)
+    else ({ r with sockets: List.append(r.sockets, Cons(RgSocket(p, x, y, z, q4(Qt.normalize(q))), Nil)) }, List.length(r.sockets)) end end
+  end
+
+  doc "A mask: the parts [roots] and every part below them. Answers its number (0, 1, ...), or -1."
+  fn mask(r : Rig, roots : List(Int)) : (Rig, Int) do
+    if !List.all(roots, fn p -> has_part(r, p)) do (refuse(r, "a mask's roots must be parts"), -1)
+    else if List.length(r.masks) >= 4096 do (refuse(r, "too many masks"), -1)
+    else ({ r with masks: List.append(r.masks, Cons(roots, Nil)) }, List.length(r.masks)) end end
+  end
+
+  doc "A leg for foot placement: three parts (upper, lower, foot) and the sole's height below the foot's pivot, in metres."
+  fn leg(r : Rig, upper : Int, lower : Int, foot : Int, sole : Float) : Rig do
+    if !(has_part(r, upper) && has_part(r, lower) && has_part(r, foot)) do refuse(r, "a leg's parts must be parts")
+    else if !finite(sole) do refuse(r, "a sole must be finite")
+    else { r with legs: List.append(r.legs, Cons(RgLeg(upper, lower, foot, sole), Nil)) } end end
+  end
+
+  -- ── Sameness ──────────────────────────────────────────────────────────────
+  -- Rig has no Eq (its record holds lists of constructors), so it is compared here, field by field.
+
+  pfn q_same(a : (Float, Float, Float, Float), b : (Float, Float, Float, Float)) : Bool do
+    match a do (ax, ay, az, aw) -> match b do (bx, b_y, bz, bw) -> ax == bx && ay == b_y && az == bz && aw == bw end end
+  end
+  pfn edit_same(a : RgEdit, b : RgEdit) : Bool do
+    match a do
+      RgEdit(a0, a1, a2, a3, a4, a5, a6) ->
+        match b do RgEdit(b0, b1, b2, b3, b4, b5, b6) -> a0 == b0 && a1 == b1 && a2 == b2 && a3 == b3 && a4 == b4 && a5 == b5 && a6 == b6 end
+    end
+  end
+  pfn part_same(a : RgPart, b : RgPart) : Bool do
+    match a do
+      RgPart(a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, aq, ae) ->
+        match b do
+          RgPart(b0, b1, b2, b3, b4, b5, b6, b7, b8, b9, bq, be) ->
+            if a0 == b0 && a1 == b1 && a2 == b2 && a3 == b3 && a4 == b4 && a5 == b5 && a6 == b6 && a7 == b7 && a8 == b8 && a9 == b9 do
+              if q_same(aq, bq) do lists_same(ae, be, edit_same) else false end
+            else false end
+        end
+    end
+  end
+  pfn socket_same(a : RgSocket, b : RgSocket) : Bool do
+    match a do
+      RgSocket(ap, ax, ay, az, aq) -> match b do RgSocket(bp, bx, b_y, bz, bq) -> if ap == bp && ax == bx && ay == b_y && az == bz do q_same(aq, bq) else false end end
+    end
+  end
+  pfn leg_same(a : RgLeg, b : RgLeg) : Bool do
+    match a do RgLeg(a0, a1, a2, a3) -> match b do RgLeg(b0, b1, b2, b3) -> a0 == b0 && a1 == b1 && a2 == b2 && a3 == b3 end end
+  end
+  pfn colour_same(a : RgColour, b : RgColour) : Bool do
+    match a do
+      RgColour(a0, a1, a2, a3, a4, a5) -> match b do RgColour(b0, b1, b2, b3, b4, b5) -> a0 == b0 && a1 == b1 && a2 == b2 && a3 == b3 && a4 == b4 && a5 == b5 end
+    end
+  end
+  pfn ints_same(a : List(Int), b : List(Int)) : Bool do lists_same(a, b, fn (x, y) -> x == y) end
+  pfn lists_same(a : List(t), b : List(t), eq : t -> t -> Bool) : Bool do
+    match a do
+      Nil -> is_nil(b)
+      Cons(x, xs) ->
+        match b do
+          Nil -> false
+          Cons(y, ys) -> if eq(x, y) do lists_same(xs, ys, eq) else false end
+        end
+    end
+  end
+
+  doc "Are two rigs the same description: voxel size, palette, parts and their voxels, sockets, masks and legs? (Refusals are not compared.)"
+  fn same(a : Rig, b : Rig) : Bool do
+    if a.voxel != b.voxel do false
+    else if !lists_same(a.parts, b.parts, part_same) do false
+    else if !lists_same(a.masks, b.masks, ints_same) do false
+    else if !lists_same(a.sockets, b.sockets, socket_same) do false
+    else if !lists_same(a.legs, b.legs, leg_same) do false
+    else lists_same(a.palette, b.palette, colour_same) end end end end end
+  end
+
+  -- ── Upload ────────────────────────────────────────────────────────────────
+
+  doc "Each part's parent, for the pose kernel."
+  fn parents(r : Rig) : NativeI32Arr do
+    NativeArray.from_list_i32(List.map(r.parts, parent_of_part))
+  end
+
+  pfn anchor_of(r : Rig, p : Int) : (Float, Float, Float) do
+    if !has_part(r, p) do (0.0, 0.0, 0.0)
+    else match part_at(r, p) do RgPart(_, _, _, _, _, _, _, ax, ay, az, _, _) -> (ax, ay, az) end end
+  end
+
+  pfn part_floats(r : Rig, p : RgPart) : List(Float) do
+    let v = r.voxel
+    match p do
+      RgPart(par, px, py, pz, sx, sy, sz, ax, ay, az, (qx, qy, qz, qw), _) ->
+        match anchor_of(r, par) do
+          (bx, b_y, bz) ->
+            [(px -. bx) *. v, (py -. b_y) *. v, (pz -. bz) *. v,
+             qx, qy, qz, qw,
+             (0.0 -. ax) *. v, (0.0 -. ay) *. v, (0.0 -. az) *. v,
+             (int_to_float(sx) -. ax) *. v, (int_to_float(sy) -. ay) *. v, (int_to_float(sz) -. az) *. v]
+        end
+    end
+  end
+
+  doc "13 floats a part, for the pose kernel: pivot in metres in the parent's frame, rest rotation (xyzw), and the grid's box (min, max) in metres in the part's frame."
+  fn floats(r : Rig) : NativeF32Arr do
+    NativeArray.from_list_f32(List.flat_map(r.parts, fn p -> part_floats(r, p)))
+  end
+
+  doc "How many roots each mask has, in mask order."
+  fn mask_counts(r : Rig) : NativeI32Arr do NativeArray.from_list_i32(List.map(r.masks, fn m -> List.length(m))) end
+  doc "Every mask's roots, one mask after another."
+  fn mask_roots(r : Rig) : NativeI32Arr do NativeArray.from_list_i32(List.flat_map(r.masks, fn m -> m)) end
+
+  -- ── Meshing ───────────────────────────────────────────────────────────────
+
+  -- a part's voxels: palette indices at x + sx * (y + sy * z)
+  type RgGrid = RgGrid(NativeU8Arr, Int, Int, Int)
+
+  pfn paint_row(g : NativeU8Arr, sx : Int, sy : Int, x : Int, x1 : Int, y : Int, z : Int, c : Int) : NativeU8Arr do
+    if x > x1 do g else paint_row(NativeArray.set_u8(g, x + sx * (y + sy * z), c), sx, sy, x + 1, x1, y, z, c) end
+  end
+  pfn paint_plane(g : NativeU8Arr, sx : Int, sy : Int, e : RgEdit, y : Int, z : Int) : NativeU8Arr do
+    match e do
+      RgEdit(x0, _, _, x1, y1, _, c) -> if y > y1 do g else paint_plane(paint_row(g, sx, sy, x0, x1, y, z, c), sx, sy, e, y + 1, z) end
+    end
+  end
+  pfn paint(g : NativeU8Arr, sx : Int, sy : Int, e : RgEdit, z : Int) : NativeU8Arr do
+    match e do
+      RgEdit(_, y0, _, _, _, z1, _) -> if z > z1 do g else paint(paint_plane(g, sx, sy, e, y0, z), sx, sy, e, z + 1) end
+    end
+  end
+  pfn paint_all(g : NativeU8Arr, sx : Int, sy : Int, edits : List(RgEdit)) : NativeU8Arr do
+    match edits do
+      Nil -> g
+      Cons(e, rest) -> match e do RgEdit(_, _, z0, _, _, _, _) -> paint_all(paint(g, sx, sy, e, z0), sx, sy, rest) end
+    end
+  end
+
+  pfn grid_of(p : RgPart) : RgGrid do
+    match p do
+      RgPart(_, _, _, _, sx, sy, sz, _, _, _, _, ed) -> RgGrid(paint_all(NativeArray.make_u8(sx * sy * sz, 0), sx, sy, List.reverse(ed)), sx, sy, sz)
+    end
+  end
+
+  doc "The palette index at voxel (x, y, z) of part [p]: 0 when empty, outside the grid, or no such part."
+  fn get(r : Rig, p : Int, x : Int, y : Int, z : Int) : Int do
+    if !has_part(r, p) do 0 else cell(grid_of(part_at(r, p)), x, y, z) end
+  end
+
+  pfn cell(g : RgGrid, x : Int, y : Int, z : Int) : Int do
+    match g do
+      RgGrid(a, sx, sy, sz) ->
+        if x < 0 || y < 0 || z < 0 do 0
+        else if x >= sx || y >= sy || z >= sz do 0
+        else NativeArray.get_u8(a, x + sx * (y + sy * z)) end end
+    end
+  end
+  pfn solid(g : RgGrid, x : Int, y : Int, z : Int) : Bool do cell(g, x, y, z) != 0 end
+
+  -- the normal and in-plane axes of face f as (x, y, z) steps: faces 0/1 +-y (u x, v z), 2/3 +-x (u z, v y), 4/5 +-z (u x, v y)
+  pfn nx(f : Int) : Int do if f == 2 do 1 else if f == 3 do -1 else 0 end end end
+  pfn ny(f : Int) : Int do if f == 0 do 1 else if f == 1 do -1 else 0 end end end
+  pfn nz(f : Int) : Int do if f == 4 do 1 else if f == 5 do -1 else 0 end end end
+  pfn ux(f : Int) : Int do if f == 2 || f == 3 do 0 else 1 end end
+  pfn uz(f : Int) : Int do if f == 2 || f == 3 do 1 else 0 end end
+  pfn vy(f : Int) : Int do if f < 2 do 0 else 1 end end
+  pfn vz(f : Int) : Int do if f < 2 do 1 else 0 end end
+
+  -- piece-local (n, a, b) of face f to piece-local (x, y, z)
+  pfn lx(f : Int, n : Int, a : Int) : Int do if f == 2 || f == 3 do n else a end end
+  pfn ly(f : Int, n : Int, b : Int) : Int do if f < 2 do n else b end end
+  pfn lz(f : Int, n : Int, a : Int, b : Int) : Int do if f < 2 do b else if f < 4 do a else n end end end
+
+  pfn shade(g : RgGrid, x : Int, y : Int, z : Int, f : Int, su : Int, sv : Int) : Int do
+    let dux = su * ux(f)
+    let duz = su * uz(f)
+    let dvy = sv * vy(f)
+    let dvz = sv * vz(f)
+    Strata.Mesh.corner_ao(solid(g, x + dux, y, z + duz), solid(g, x, y + dvy, z + dvz), solid(g, x + dux, y + dvy, z + duz + dvz))
+  end
+
+  -- the merge key of the face of voxel (x, y, z) looking along f: 0 for none, else 1 + colour + 256 * shading
+  pfn face_key(g : RgGrid, f : Int, x : Int, y : Int, z : Int) : Int do
+    let c = cell(g, x, y, z)
+    if c == 0 do 0
+    else
+      let fx = x + nx(f)
+      let fy = y + ny(f)
+      let fz = z + nz(f)
+      if solid(g, fx, fy, fz) do 0
+      else 1 + c + 256 * Q.ao4(shade(g, fx, fy, fz, f, -1, -1), shade(g, fx, fy, fz, f, 1, -1), shade(g, fx, fy, fz, f, -1, 1), shade(g, fx, fy, fz, f, 1, 1)) end
+    end
+  end
+
+  -- a piece: its low corner in the part's grid and its extent
+  type RgPiece = RgPiece(Int, Int, Int, Int, Int, Int)
+
+  pfn extent_n(pc : RgPiece, f : Int) : Int do match pc do RgPiece(_, _, _, ex, ey, ez) -> if f < 2 do ey else if f < 4 do ex else ez end end end end
+  pfn extent_u(pc : RgPiece, f : Int) : Int do match pc do RgPiece(_, _, _, ex, _, ez) -> if f == 2 || f == 3 do ez else ex end end end
+  pfn extent_v(pc : RgPiece, f : Int) : Int do match pc do RgPiece(_, _, _, _, ey, ez) -> if f < 2 do ez else ey end end end
+
+  pfn mask_fill(mask : NativeIntArr, g : RgGrid, pc : RgPiece, f : Int, n : Int, a : Int, b : Int, eu : Int, ev : Int, found : Int) : (NativeIntArr, Int) do
+    if b >= ev do (mask, found)
+    else if a >= eu do mask_fill(mask, g, pc, f, n, 0, b + 1, eu, ev, found)
+    else
+      match pc do
+        RgPiece(ox, oy, oz, _, _, _) ->
+          let key = face_key(g, f, ox + lx(f, n, a), oy + ly(f, n, b), oz + lz(f, n, a, b))
+          mask_fill(NativeArray.set_int(mask, a + 32 * b, key), g, pc, f, n, a + 1, b, eu, ev, if key == 0 do found else found + 1 end)
+      end
+    end end
+  end
+
+  pfn run_w(mask : NativeIntArr, key : Int, a : Int, b : Int, eu : Int) : Int do
+    if a >= eu do a else if NativeArray.get_int(mask, a + 32 * b) != key do a else run_w(mask, key, a + 1, b, eu) end end
+  end
+  pfn row_is(mask : NativeIntArr, key : Int, a : Int, a1 : Int, b : Int) : Bool do
+    if a >= a1 do true else if NativeArray.get_int(mask, a + 32 * b) != key do false else row_is(mask, key, a + 1, a1, b) end end
+  end
+  pfn run_h(mask : NativeIntArr, key : Int, a : Int, a1 : Int, b : Int, ev : Int) : Int do
+    if b >= ev do b else if row_is(mask, key, a, a1, b) do run_h(mask, key, a, a1, b + 1, ev) else b end end
+  end
+  pfn clear_box(mask : NativeIntArr, a : Int, a0 : Int, a1 : Int, b : Int, b1 : Int) : NativeIntArr do
+    if b >= b1 do mask
+    else if a >= a1 do clear_box(mask, a0, a0, a1, b + 1, b1)
+    else clear_box(NativeArray.set_int(mask, a + 32 * b, 0), a + 1, a0, a1, b, b1) end end
+  end
+
+  -- greedy merge of one slice; quads pushed two words at a time onto [acc], newest first
+  pfn greedy(mask : NativeIntArr, f : Int, n : Int, a : Int, b : Int, eu : Int, ev : Int, acc : List(Int)) : (NativeIntArr, List(Int)) do
+    if b >= ev do (mask, acc)
+    else if a >= eu do greedy(mask, f, n, 0, b + 1, eu, ev, acc)
+    else
+      let key = NativeArray.get_int(mask, a + 32 * b)
+      if key == 0 do greedy(mask, f, n, a + 1, b, eu, ev, acc)
+      else
+        let a1 = run_w(mask, key, a + 1, b, eu)
+        let b1 = run_h(mask, key, a, a1, b + 1, ev)
+        let w0 = Q.pack0(lx(f, n, a), ly(f, n, b), lz(f, n, a, b), a1 - a, b1 - b, f)
+        let w1 = Q.pack1(int_and(key - 1, 255), (key - 1) / 256, 0)
+        greedy(clear_box(mask, a, a, a1, b, b1), f, n, a1, b, eu, ev, Cons(w1, Cons(w0, acc)))
+      end
+    end end
+  end
+
+  pfn slices(mask : NativeIntArr, g : RgGrid, pc : RgPiece, f : Int, n : Int, acc : List(Int)) : (NativeIntArr, List(Int)) do
+    if n >= extent_n(pc, f) do (mask, acc)
+    else
+      let eu = extent_u(pc, f)
+      let ev = extent_v(pc, f)
+      match mask_fill(mask, g, pc, f, n, 0, 0, eu, ev, 0) do
+        (m2, found) ->
+          if found == 0 do slices(m2, g, pc, f, n + 1, acc)
+          else match greedy(m2, f, n, 0, 0, eu, ev, acc) do (m3, acc2) -> slices(m3, g, pc, f, n + 1, acc2) end end
+      end
+    end
+  end
+
+  pfn piece_faces(mask : NativeIntArr, g : RgGrid, pc : RgPiece, f : Int, acc : List(Int)) : (NativeIntArr, List(Int)) do
+    if f >= 6 do (mask, acc)
+    else match slices(mask, g, pc, f, 0, acc) do (m2, acc2) -> piece_faces(m2, g, pc, f + 1, acc2) end end
+  end
+
+  pfn least(a : Int, b : Int) : Int do if a < b do a else b end end
+
+  -- the part's pieces in order x, then z, then y; those with no quads left out
+  @[no_warn_recursion]
+  pfn pieces(p : Int, g : RgGrid, mask : NativeIntArr, ox : Int, oy : Int, oz : Int) : List((Int, Int, Int, Int, NativeI32Arr)) do
+    match g do
+      RgGrid(_, sx, sy, sz) ->
+        if oy >= sy do Nil
+        else if oz >= sz do pieces(p, g, mask, 0, oy + 32, 0)
+        else if ox >= sx do pieces(p, g, mask, 0, oy, oz + 32)
+        else
+          let pc = RgPiece(ox, oy, oz, least(32, sx - ox), least(32, sy - oy), least(32, sz - oz))
+          match piece_faces(mask, g, pc, 0, Nil) do
+            (m2, words) ->
+              let rest = pieces(p, g, m2, ox + 32, oy, oz)
+              if is_nil(words) do rest else Cons((p, ox, oy, oz, NativeArray.from_list_i32(List.reverse(words))), rest) end
+          end
+        end end end
+    end
+  end
+
+  pfn part_pieces(e : (Int, RgPart)) : List((Int, Int, Int, Int, NativeI32Arr)) do
+    match e do (i, p) -> pieces(i, grid_of(p), NativeArray.make_int(1024, 0), 0, 0, 0) end
+  end
+
+  doc "Every part's mesh, cut into pieces of 32 voxels a side: (part, ox, oy, oz, quads), where (ox, oy, oz) is the piece's low corner in the part's grid and the quads are two words each in Strata.Quad's layout, local to the piece, with the palette index in the texture field. Pieces with nothing to draw are left out."
+  fn meshes(r : Rig) : List((Int, Int, Int, Int, NativeI32Arr)) do
+    List.flat_map(List.enumerate(r.parts), part_pieces)
+  end
+end

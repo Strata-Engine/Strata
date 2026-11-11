@@ -163,3 +163,23 @@ renamed `View` to `Sight` (Strata.Fluid has a `View`).
 `fn site_near(a : Atlas, xm : Float, zm : Float, within : Float)` is a bare
 "parse error" at the `fn` line; `within` is reserved. Workaround: another
 name (`reach` in `Strata.Atlas.site_near`).
+
+## S22: `spawn` cannot be a function name, and `linear` cannot be one either
+
+`fn spawn(rig : Int, ...)` in `Strata.Ffi.Anim` is "I got stuck here" at
+the name: `spawn` is the actor keyword. `Cl.linear()` as a call is a parse
+error too: `linear` is the linear-types keyword. Workaround: other names.
+`Strata.Anim.spawn_at` makes a figure (the design calls it `spawn`), and
+`Strata.Clip.straight()` names linear interpolation.
+
+## S23: a single-constructor type of Floats through a generic container fails to compile
+
+`type Qq = Qq(Float, Float, Float, Float)` returned by the function passed
+to `List.map` (a `List(Qq)`), or read back through `List.nth_opt`, stops
+clang: "'%r' defined with type '%ub.Qq = type { double, double, double,
+double }' but expected 'i64'". The four-Float type is unboxed into a
+struct and the generic code tags it as an Int. `Strata.Math.Quat.Quat` is
+such a type. Reproduced in a 15-line app (a `List(Holder(Int, Qq))` mapped
+to its `Qq`s). Workaround: `Strata.Rig` and `Strata.Clip` keep rotations as
+`(Float, Float, Float, Float)` tuples inside lists and constructors, and
+build a `Quat` only at the edges.

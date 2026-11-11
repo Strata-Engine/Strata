@@ -1,0 +1,161 @@
+-- Anim — what a game animates, as a value: rigs and clips uploaded once,
+-- figures spawned from them, played, blended and placed, and every figure
+-- posed by `update`. The pose arithmetic runs in C (native/strata_anim.h,
+-- through Strata.Ffi.Anim); this module keeps what March needs beside it:
+-- each finished rig, with its sockets and legs, by id.
+--
+-- One world per process: `open` makes it (closing any open one), `close`
+-- frees it. Time is the dt passed to `update`, never the clock: the same
+-- calls with the same dt give the same `hash`.
+--
+-- A call C refuses (no such figure, a layer outside 0..7, a clip of another
+-- rig, ...) changes nothing and is counted in `stats`.
+--
+-- A consumer lists native/strata_anim.c in its own [ffi] sources (GAPS S11).
+-- `spawn` is a March keyword, so a figure is made with `spawn_at` (GAPS S22).
+mod Strata.Anim do
+
+  needs IO.Foreign
+  needs Anim
+
+  alias Strata.Math.Quat as Qt
+
+  type Anim = { rigs : List((Int, Strata.Rig.Rig)), capacity : Int }
+
+  doc "Open the figure world for up to [capacity] figures (1..4096), closing any open one."
+  fn open(capacity : Int) : Anim do
+    let ok = Strata.Ffi.Anim.open(capacity)
+    { rigs: Nil, capacity: if ok do capacity else 0 end }
+  end
+
+  doc "Free the figure world. Rigs, clips and figures are gone; open again to start over."
+  fn close(a : Anim) : Anim do
+    Strata.Ffi.Anim.close()
+    { a with rigs: Nil, capacity: 0 }
+  end
+
+  doc "How many figures the world was opened for; 0 when it could not be opened or is closed."
+  fn capacity(a : Anim) : Int do a.capacity end
+
+  doc "Upload rig [r] (its hierarchy, rest pose and masks); its meshes are `Strata.Rig.meshes`. Answers its id, or -1 if refused. The rig's sockets and legs stay here, read with `rig`."
+  fn finish_rig(a : Anim, r : Strata.Rig.Rig) : (Anim, Int) do
+    let id = Strata.Ffi.Anim.rig(Strata.Rig.part_count(r), Strata.Rig.parents(r), Strata.Rig.floats(r))
+    if id < 0 do (a, id)
+    else
+      let made = Strata.Ffi.Anim.masks(id, Strata.Rig.mask_count(r), Strata.Rig.mask_counts(r), Strata.Rig.mask_roots(r))
+      if made < Strata.Rig.mask_count(r) do (a, -1) else ({ a with rigs: Cons((id, r), a.rigs) }, id) end
+    end
+  end
+
+  pfn rig_go(rs : List((Int, Strata.Rig.Rig)), id : Int) : Option(Strata.Rig.Rig) do
+    match rs do
+      Nil -> None
+      Cons((i, r), rest) -> if i == id do Some(r) else rig_go(rest, id) end
+    end
+  end
+  doc "The rig finished as [id], with its sockets and legs."
+  fn rig(a : Anim, id : Int) : Option(Strata.Rig.Rig) do rig_go(a.rigs, id) end
+
+  -- the id of a finished rig equal to r, newest first; -1 if none
+  pfn id_of(rs : List((Int, Strata.Rig.Rig)), r : Strata.Rig.Rig) : Int do
+    match rs do
+      Nil -> -1
+      Cons((i, x), rest) -> if Strata.Rig.same(x, r) do i else id_of(rest, r) end
+    end
+  end
+
+  doc "Upload clip [c]. Its rig must have been finished in this world first. Answers its id, or -1 if refused."
+  fn finish_clip(a : Anim, c : Strata.Clip.Clip) : (Anim, Int) do
+    let rid = id_of(a.rigs, Strata.Clip.rig(c))
+    let id = Strata.Ffi.Anim.clip(rid, Strata.Clip.duration(c), Strata.Clip.loops(c), Strata.Clip.stride_of(c), Strata.Clip.key_count(c), Strata.Clip.key_ints(c), Strata.Clip.key_floats(c), Strata.Clip.mark_count(c), Strata.Clip.mark_times(c), Strata.Clip.mark_tags(c))
+    (a, id)
+  end
+
+  doc "A new figure of rig [rig] at (x, y, z) metres turned by [q], in its rest pose. Answers its id, or -1 if refused (no such rig, or the world full)."
+  fn spawn_at(a : Anim, rig : Int, x : Float, y : Float, z : Float, q : Strata.Math.Quat.Quat) : (Anim, Int) do
+    (a, Strata.Ffi.Anim.spawn_at(rig, x, y, z, Qt.x(q), Qt.y(q), Qt.z(q), Qt.w(q)))
+  end
+
+  doc "Remove figure [f]."
+  fn remove(a : Anim, f : Int) : Anim do
+    Strata.Ffi.Anim.remove(f)
+    a
+  end
+
+  doc "Put figure [f] at (x, y, z) metres turned by [q]. It is posed there at the next update."
+  fn place(a : Anim, f : Int, x : Float, y : Float, z : Float, q : Strata.Math.Quat.Quat) : Anim do
+    Strata.Ffi.Anim.place(f, x, y, z, Qt.x(q), Qt.y(q), Qt.z(q), Qt.w(q))
+    a
+  end
+
+  doc "Play clip [clip] on [layer] (0..7) of figure [f]: crossfading from what plays there over [fade] seconds, at [rate] (1 is as made), the layer's weight ramping to [weight]; [mask] is a mask number of the figure's rig (-1 for every part); additive layers add their turn on top of the layers below."
+  fn play(a : Anim, f : Int, layer : Int, clip : Int, fade : Float, rate : Float, weight : Float, mask : Int, additive : Bool) : Anim do
+    Strata.Ffi.Anim.play(f, layer, clip, fade, rate, weight, mask, additive)
+    a
+  end
+
+  doc "Play a blend of up to four [clips] placed at increasing [positions] on [layer]: the two neighbours of [value] blend, kept in step by phase. Rate 1; set it with `set_rate`."
+  fn blend(a : Anim, f : Int, layer : Int, clips : List(Int), positions : List(Float), value : Float, fade : Float, weight : Float, mask : Int) : Anim do
+    let n = if List.length(clips) == List.length(positions) do List.length(clips) else 0 end
+    Strata.Ffi.Anim.blend(f, layer, n, NativeArray.from_list_i32(clips), NativeArray.from_list_f32(positions), value, fade, weight, mask)
+    a
+  end
+
+  doc "The rate of what plays newest on [layer] (1 is as made, negative plays backward). [fade] is not used."
+  fn set_rate(a : Anim, f : Int, layer : Int, v : Float, fade : Float) : Anim do
+    Strata.Ffi.Anim.set(f, layer, 0, v, fade)
+    a
+  end
+  doc "The weight of [layer], 0..1, ramping there over [fade] seconds."
+  fn set_weight(a : Anim, f : Int, layer : Int, v : Float, fade : Float) : Anim do
+    Strata.Ffi.Anim.set(f, layer, 1, v, fade)
+    a
+  end
+  doc "Jump what plays newest on [layer] to [v]: seconds into a clip, or a blend's phase 0..1. [fade] is not used."
+  fn set_time(a : Anim, f : Int, layer : Int, v : Float, fade : Float) : Anim do
+    Strata.Ffi.Anim.set(f, layer, 2, v, fade)
+    a
+  end
+  doc "Move the blend on [layer] to [v], over [fade] seconds."
+  fn set_value(a : Anim, f : Int, layer : Int, v : Float, fade : Float) : Anim do
+    Strata.Ffi.Anim.set(f, layer, 3, v, fade)
+    a
+  end
+  doc "Pause or resume what plays newest on [layer]."
+  fn pause(a : Anim, f : Int, layer : Int, paused : Bool) : Anim do
+    Strata.Ffi.Anim.set(f, layer, 4, if paused do 1.0 else 0.0 end, 0.0)
+    a
+  end
+
+  doc "Advance every figure by [dt] seconds and pose it. A negative dt changes nothing and is counted."
+  fn update(a : Anim, dt : Float) : Anim do
+    Strata.Ffi.Anim.update(dt)
+    a
+  end
+
+  pfn marks_go(i : Int, acc : List((Int, Int, Int, Float))) : List((Int, Int, Int, Float)) do
+    if i < 0 do acc
+    else marks_go(i - 1, Cons((Strata.Ffi.Anim.mark_int(i, 0), Strata.Ffi.Anim.mark_int(i, 1), Strata.Ffi.Anim.mark_int(i, 2), Strata.Ffi.Anim.mark_weight(i)), acc)) end
+  end
+  doc "The marks the last update crossed, in time order: (figure, layer, tag, weight). A mark on a layer at weight 0 is reported with weight 0."
+  fn marks(_a : Anim) : List((Int, Int, Int, Float)) do marks_go(Strata.Ffi.Anim.mark_count() - 1, Nil) end
+
+  pfn copy_go(out : NativeF32Arr, f : Int, k : Int, n : Int) : NativeF32Arr do
+    if k >= n do out else copy_go(NativeArray.set_f32(out, k, Strata.Ffi.Anim.matrix(f, k)), f, k + 1, n) end
+  end
+  doc "Figure [f]'s pose: 12 floats a part, a column-major 3x4 matrix in world space (rotation columns, then the part's origin). Empty if there is no such figure."
+  fn matrices(_a : Anim, f : Int) : NativeF32Arr do
+    let n = 12 * Strata.Ffi.Anim.parts(f)
+    copy_go(NativeArray.make_f32(n, 0.0), f, 0, n)
+  end
+
+  doc "A hash of every live figure's pose: equal runs give equal hashes."
+  fn hash(_a : Anim) : Int do Strata.Ffi.Anim.hash() end
+
+  doc "(figures, posed by the last update, stale since it, refused calls)."
+  fn stats(_a : Anim) : (Int, Int, Int, Int) do
+    (float_to_int(Strata.Ffi.Anim.stat(0)), float_to_int(Strata.Ffi.Anim.stat(1)), float_to_int(Strata.Ffi.Anim.stat(2)), float_to_int(Strata.Ffi.Anim.stat(3)))
+  end
+  doc "A figure of the kernel's: 0 figures, 1 posed, 2 stale, 3 refused calls, 4 negative dt, 5 the last refusal's reason (AN_R_* in strata_anim.h), 6 marks dropped."
+  fn stat(_a : Anim, which : Int) : Float do Strata.Ffi.Anim.stat(which) end
+end
