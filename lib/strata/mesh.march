@@ -7,9 +7,12 @@
 --     is not solid-opaque, unless A and B are the same id (a body of glass
 --     has no inner faces). The face goes to A's layer.
 --   * A fluid stands as high as its fill level, or full height when the
---     same fluid is above it. Between two voxels of one fluid only the one
---     standing higher draws a side face; inside a column there is no top or
---     bottom face. Each fluid quad carries its drop below the voxel's top.
+--     same fluid is above it. A top face's corners dip up to three eighths
+--     to meet lower neighbours, so a surface that is not level is drawn as
+--     a slope, not as steps; a side face between two voxels of one fluid is
+--     drawn only across a bigger difference than that. Inside a column
+--     there is no top or bottom face. Each fluid quad carries its drop
+--     below the voxel's top.
 --   * Each face corner is shaded 0..3 from the three cells around it in the
 --     layer the face looks into; only solid-opaque blocks shade, including
 --     those in neighbouring chunks.
@@ -237,8 +240,31 @@ mod Strata.Mesh do
     else B.fill(r, NativeArray.get_int(ids, cell)) end
   end
 
-  -- The face of a fluid cell: none toward its own fluid above or below, and
-  -- none toward a neighbour of its own fluid that stands as high or higher.
+  -- How high the fluid surface at a neighbour stands, for the corner it
+  -- shares with a cell of family [base] standing at [h]: its own level if
+  -- it is the same fluid, else [h] (banks and air do not pull a corner down).
+  pfn beside(ids : NativeIntArr, kind : NativeU8Arr, r : Strata.Blocks.Registry, cell : Int, base : Int, h : Int) : Int do
+    if NativeArray.get_u8(kind, cell) >= 32 && B.fluid_base(r, NativeArray.get_int(ids, cell)) == base do stands(ids, kind, r, cell, base) else h end
+  end
+
+  -- How far a top face's corner dips, 0..3 eighths: down to the lowest of
+  -- the three other cells that share the corner, so that neighbouring
+  -- surfaces meet instead of stepping.
+  pfn dip(ids : NativeIntArr, kind : NativeU8Arr, r : Strata.Blocks.Registry, cell : Int, base : Int, h : Int, du : Int, dv : Int) : Int do
+    let a = beside(ids, kind, r, cell + du, base, h)
+    let b = beside(ids, kind, r, cell + dv, base, h)
+    let c = beside(ids, kind, r, cell + du + dv, base, h)
+    let low = if a < b do (if a < c do a else c end) else (if b < c do b else c end) end
+    if h - low > 3 do 3 else if h - low < 0 do 0 else h - low end end
+  end
+
+  -- The face of a fluid cell. None toward its own fluid above or below. Its
+  -- top face's corners dip to meet lower neighbours of the same fluid (the
+  -- shading byte carries the dips; a face with any dip is kept from merging
+  -- by a bit that alternates from cell to cell). Toward a neighbour of its
+  -- own fluid a side is drawn only when it stands more than three eighths
+  -- higher, more than the corners can take up. Every key carries the fluid
+  -- bit (134217728) and the drop.
   pfn fluid_key(ids : NativeIntArr, kind : NativeU8Arr, r : Strata.Blocks.Registry, f : Int, cell : Int) : Int do
     let front = cell + toward(f)
     let id = NativeArray.get_int(ids, cell)
@@ -248,17 +274,16 @@ mod Strata.Mesh do
     else if same && f < 2 do 0
     else
       let h = stands(ids, kind, r, cell, base)
-      if same && stands(ids, kind, r, front, base) >= h do 0
-      else
-        let u = su(f)
-        let v = sv(f)
-        1 + id + 65536 * Q.ao4(corner_at(kind, front, 0 - u, 0 - v), corner_at(kind, front, u, 0 - v), corner_at(kind, front, 0 - u, v), corner_at(kind, front, u, v)) + 16777216 * (8 - h)
-      end
+      if f == 0 do
+        let code = Q.ao4(dip(ids, kind, r, cell, base, h, -1, -34), dip(ids, kind, r, cell, base, h, 1, -34), dip(ids, kind, r, cell, base, h, -1, 34), dip(ids, kind, r, cell, base, h, 1, 34))
+        1 + id + 65536 * code + 16777216 * (8 - h) + 134217728 + (if code != 0 && (cell % 34 + cell / 34) % 2 == 1 do 268435456 else 0 end)
+      else if same && stands(ids, kind, r, front, base) + 3 >= h do 0
+      else 1 + id + 65536 * (if same do 3 else 0 end) + 16777216 * (8 - h) + 134217728 end end
     end end
   end
 
   -- The merge key of the face of [cell] looking along face f, or 0 for no
-  -- face: 1 + id + 65536 * shading + 16777216 * drop.
+  -- face: 1 + id + 65536 * shading + 16777216 * drop, + 134217728 for a fluid.
   pfn face_key(ids : NativeIntArr, kind : NativeU8Arr, r : Strata.Blocks.Registry, f : Int, cell : Int) : Int do
     let k = NativeArray.get_u8(kind, cell)
     if int_and(k / 2, 3) != 0 do 0
@@ -313,7 +338,8 @@ mod Strata.Mesh do
     let x = if f == 2 || f == 3 do n else a end
     let y = if f < 2 do n else b end
     let z = if f < 2 do b else if f < 4 do a else n end end
-    let w0 = Q.with_drop(Q.pack0(x, y, z, w, h, f), int_and((key - 1) / 16777216, 7))
+    let w0d = Q.with_drop(Q.pack0(x, y, z, w, h, f), int_and((key - 1) / 16777216, 7))
+    let w0 = if int_and((key - 1) / 134217728, 1) == 1 do Q.with_fluid(w0d) else w0d end
     -- the flags byte carries the block's light class: what the surface is to the lighting
     let w1 = Q.pack1(B.face_tex(r, id, f), ao, B.light_class(r, id))
     let l = B.layer_index(r, id)

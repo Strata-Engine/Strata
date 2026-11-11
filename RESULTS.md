@@ -374,3 +374,35 @@ last quiet run, with the light volume in place, was 16.6 ms.
 
 Screenshots: `docs/light-lake.png`, `docs/light-shore.png`,
 `docs/light-snow.png`, `docs/light-forest.png`, `docs/light-lantern.png`.
+
+# Fluid plan
+
+## Tasks 4 and 5: a lake drains in the viewer
+
+The test lake (seed 7): radius 22, 7 deep, 10 280 voxels, its bed 12 voxels
+above the ground outside its rim. Breached at frame 30 by a channel of carve
+spheres through the rim down to its bed. Ten fluid steps a second, each
+worked out on a worker and applied six frames later.
+
+| | target | result | |
+|---|---|---|---|
+| main-thread time per fluid step | 2 ms | 0.2 to 0.5 ms | met |
+| worker time per step | (none set) | about 5 microseconds a cell: 4 ms at 800 active cells | |
+| lake empty | 2 minutes | 5.5 minutes | missed |
+| what is left | under 2%, no cell over an eighth | 3.1%, a film of a few eighths on the bed | missed |
+| at rest after the last change | 5 seconds | no active cells from the step after the last move | met |
+| water conserved | exactly | exactly (property tests) | met |
+
+Why the drain is slow: water leaves only over the lip of the outlet, a few
+cells wide, at up to eight eighths a cell a step. The rest of the lake stays
+level and feeds the lip by evening out. An earlier rule let every surface
+cell within reach send its water straight to the outlet; it drained no
+faster (the lip was still the limit) and tore holes in the surface.
+
+Why a film is left: a cell evens out only with cells two or more eighths
+lower, so a wet bed keeps up to an eighth or two a cell, and a single eighth
+never moves on flat ground.
+
+The lake used is 10 000 voxels, not the planned 20 000: of the lakes near the
+origin for seed 7 it is the largest whose bed is above the ground outside,
+so that a breach can drain it at all.

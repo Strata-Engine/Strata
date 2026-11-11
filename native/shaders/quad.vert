@@ -37,19 +37,29 @@ void main() {
     uint cu = flip ? (i >> 1) : (i & 1u);
     uint cv = flip ? (i & 1u) : (i >> 1);
     float du = float(cu) * w, dv = float(cv) * h;
+    // A partly full fluid stands [drop] eighths below its voxel's top: its
+    // top face is lowered, and the upper edge of its sides with it.
+    float drop = float((w0 >> 28) & 7u) / 8.0;
+    // A fluid's quad carries no corner shading in that byte. On a top face
+    // it holds how far each corner dips (0..3 eighths) to meet a lower
+    // neighbour; on a side, how far its top edge is lowered to match.
+    bool fluid = (w0 >> 31) != 0u;
+    uint bits = (w1 >> 16) & 255u;
+    float dip = fluid ? float((face == 0u ? (bits >> (2u * (cu + 2u * cv))) : bits) & 3u) / 8.0 : 0.0;
+    float up = cv == 1u ? dv - drop - dip : 0.0;          // a side's height along v, as drawn
     vec3 q;
-    if (face < 2u)      q = p + vec3(du, face == 0u ? 1.0 : 0.0, dv);
-    else if (face < 4u) q = p + vec3(face == 2u ? 1.0 : 0.0, dv, du);
-    else                q = p + vec3(du, dv, face == 4u ? 1.0 : 0.0);
+    if (face < 2u)      q = p + vec3(du, face == 0u ? 1.0 - drop - dip : 0.0, dv);
+    else if (face < 4u) q = p + vec3(face == 2u ? 1.0 : 0.0, up, du);
+    else                q = p + vec3(du, up, face == 4u ? 1.0 : 0.0);
     ivec4 ol = table.chunks[draw_slot.slot[pc.base + uint(gl_DrawID)]].origin_level;
     // a level-L chunk's voxels are 2^L world voxels on a side
     float lod = float(1 << (ol.w & 255));
     vec3 world = (vec3(ol.xyz) + q * lod) * u.eye.w;
     // side faces have v running up the world; an image's rows run down
-    v_tex = (face < 2u ? vec2(du, dv) : vec2(du, h - dv)) * lod;
+    v_tex = (face < 2u ? vec2(du, dv) : vec2(du, h - up)) * lod;
     v_uv = vec2(du, dv);
     v_world = world;
-    v_w1 = w1;
+    v_w1 = fluid ? (w1 | (255u << 16)) : w1;           // a fluid is not corner-shaded
     v_face = face;
     gl_Position = to_clip(u.vp * vec4(world, 1.0));
 }

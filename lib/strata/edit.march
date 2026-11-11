@@ -182,8 +182,57 @@ mod Strata.Edit do
     end
   end
 
-  doc "Set a list of (x, y, z, id) cells in order, as one outcome with one Cell change per block that changed or was queued."
+  -- ── Many cells at once ───────────────────────────────────────────────────
+  -- Cells are gathered by chunk and each chunk is rewritten once, so a
+  -- thousand cells in one chunk copy it once, not a thousand times.
+  pfn gather(cells : List((Int, Int, Int, Int)), m : Strata.Store.Store(List((Int, Int, Int, Int)))) : Strata.Store.Store(List((Int, Int, Int, Int))) do
+    match cells do
+      Nil -> m
+      Cons((x, y, z, id), t) ->
+        let k = Kc.key_of_voxel(x, y, z)
+        gather(t, Strata.Store.put(m, k, Cons((x, y, z, id), Strata.Store.get(m, k))))
+    end
+  end
+
+  -- What writing a chunk's cells builds: the chunk, the changes (newest
+  -- first), whether anything changed, and the dirty chunks.
+  type Wrote = Wrote(Strata.Chunk.Chunk, List(Change), Bool, List(Strata.Coord.Key))
+
+  pfn on_border(v : Int) : Bool do Kc.local_of(v) == 0 || Kc.local_of(v) == 31 end
+
+  pfn write_cells(w : Strata.World.World, wr : Wrote, cells : List((Int, Int, Int, Int))) : Wrote do
+    match cells do
+      Nil -> wr
+      Cons((x, y, z, id0), t) ->
+        match wr do
+          Wrote(c, cs, _, d) ->
+            let id = if id0 < 0 || id0 > 65535 do 0 else id0 end
+            let old = Strata.Chunk.get(c, Kc.local_of(x), Kc.local_of(y), Kc.local_of(z))
+            if old == id do write_cells(w, wr, t)
+            else
+              -- a cell on the chunk's border changes its neighbours' faces too
+              let d2 = if on_border(x) || on_border(y) || on_border(z) do dirty_for(w, d, x, y, z, x, y, z) else d end
+              write_cells(w, Wrote(Strata.Chunk.set(c, Kc.local_of(x), Kc.local_of(y), Kc.local_of(z), id), Cons(Cell(x, y, z, old, id), cs), true, d2), t)
+            end
+        end
+    end
+  end
+
+  pfn chunk_cells(o : Outcome, k : Strata.Coord.Key, newest_first : List((Int, Int, Int, Int))) : Outcome do
+    let cells = List.reverse(newest_first)
+    match o do
+      Outcome(w, d, cs, q) ->
+        if !Wl.is_loaded(w, k) do many_go(o, cells)
+        else
+          match write_cells(w, Wrote(Strata.Store.get(Wl.chunks(w), k), cs, false, d), cells) do
+            Wrote(c2, cs2, any, d2) -> if any do Outcome(Wl.replace_chunk(w, k, c2), add_key(d2, k), cs2, q) else o end
+          end
+        end
+    end
+  end
+
+  doc "Set a list of (x, y, z, id) cells, as one outcome with one Cell change per block that changed or was queued. Cells of one chunk are applied in the order given, so a cell listed twice ends as the later; the order of changes between chunks is not kept."
   fn set_many(w : Strata.World.World, cells : List((Int, Int, Int, Int))) : Outcome do
-    many_go(Outcome(w, Nil, Nil, Nil), cells)
+    Strata.Store.fold(gather(cells, Strata.Store.empty(Nil)), Outcome(w, Nil, Nil, Nil), fn (o, k, l) -> chunk_cells(o, k, l))
   end
 end

@@ -5,6 +5,7 @@
 mod FluidTest do
   needs IO.Clock      -- charged to every test module once any uses Check.all (GAPS S3)
   needs IO.Process
+  needs IO.Spawn      -- steps worked out on a worker
 
   alias Strata.World as Wf
   alias Strata.Edit as Ef
@@ -296,16 +297,18 @@ mod FluidTest do
       end
     end
     test "water stops at a chunk that is not loaded, and crosses when it arrives" do
-      let w = box(lone(), 30, 0, 16, 30, 2, 16, water(8))
-      let r = run(wake_box(fluid(), 28, 0, 14, 31, 3, 18, 28, 0, 14), w, 40)
-      Test.assert_eq_int(F.amount(world_of(r), reg(), 0, 0, 0, 31, 4, 31), 24, "all of it still in the loaded chunk")
-      Test.assert_eq_int(F.amount(world_of(r), reg(), 32, 0, 0, 40, 4, 31), 0, "none beyond the border")
+      -- a walled channel along x, open only toward the chunk that is missing, with water two deep in it
+      let walls = box(box(box(lone(), 27, 0, 15, 31, 3, 15, 1), 27, 0, 17, 31, 3, 17, 1), 27, 0, 16, 27, 3, 16, 1)
+      let w = box(walls, 28, 0, 16, 31, 1, 16, water(8))
+      let r = run(wake_box(fluid(), 27, 0, 15, 31, 3, 17, 27, 0, 15), w, 20)
+      Test.assert_eq_int(F.amount(world_of(r), reg(), 0, 0, 0, 31, 4, 31), 64, "all of it still in the loaded chunk")
       Test.assert_eq_int(Wf.pending_size(world_of(r)), 0, "and nothing queued for the missing chunk")
       Test.assert_true(F.dormant_count(fluid_of(r)) > 0, "the cells at the border are set aside")
+      Test.assert_eq_int(F.active_count(fluid_of(r)), 0, "and nothing is left active")
       let w2 = load(load(world_of(r), 1, -1, 0), 1, 0, 0)
       let r2 = run(fluid_of(r), w2, 40)
-      Test.assert_true(F.amount(world_of(r2), reg(), 32, 0, 0, 40, 4, 31) > 0, "it crosses once the chunk is there")
-      Test.assert_eq_int(F.amount(world_of(r2), reg(), 0, 0, 0, 63, 4, 31), 24, "and none was lost")
+      Test.assert_true(F.amount(world_of(r2), reg(), 32, 0, 0, 63, 4, 31) > 0, "it crosses once the chunk is there")
+      Test.assert_eq_int(F.amount(world_of(r2), reg(), 0, 0, 0, 63, 4, 31), 64, "and none was lost")
     end
     test "water falling in a chunk that unloads resumes when it returns" do
       let w = put(fresh(), 5, 20, 5, water(8))
@@ -329,6 +332,54 @@ mod FluidTest do
         (n, d) ->
           Test.assert_eq_int(n, 8, "eight eighths landed")
           Test.assert_eq_int(d, 6, "after six cells")
+      end
+    end
+  end
+
+  describe "Fluid steps on a worker" do
+    test "a step worked out on a worker is the step worked out at once" do
+      let w = put(put(fresh(), 3, 6, 3, water(8)), 0, 0, 0, water(8))
+      let f = wake_all(fluid())
+      match F.step_world(f, w, Nil) do
+        (fa, oa) ->
+          match F.begin(f, w, Nil) do
+            (fl, job) ->
+              match F.finish_world(job, fl, w) do
+                (fb, ob) ->
+                  Test.assert_eq_int(stamp(Ef.world(ob), -2, 0, -2, 7), stamp(Ef.world(oa), -2, 0, -2, 7), "the same world")
+                  Test.assert_eq_int(F.active_count(fb), F.active_count(fa), "the same cells active")
+                  Test.assert_eq_int(List.length(F.events(fb)), List.length(F.events(fa)), "the same events")
+              end
+          end
+      end
+    end
+    test "an edit made where a running step moves water discards the step and loses nothing" do
+      let w = put(fresh(), 3, 6, 3, water(8))
+      match F.begin(wake_all(fluid()), w, Nil) do
+        (fl, job) ->
+          -- the step drops the water to (3, 2, 3); a block lands there first
+          let o = Ef.set_block(w, 3, 2, 3, 1)
+          match F.finish_world(job, F.wake(fl, Ef.world(o), o), Ef.world(o)) do
+            (f2, o2) ->
+              Test.assert_eq_int(List.length(Ef.changes(o2)), 0, "the step changes nothing")
+              Test.assert_eq_int(level(Ef.world(o2), 3, 6, 3), 8, "the water is where it was")
+              Test.assert_eq_int(Wf.get_block(Ef.world(o2), 3, 2, 3), 1, "the block is where it was put")
+              Test.assert_true(F.active_count(f2) > 0, "and the water is still awake")
+              match until_rest(f2, Ef.world(o2), 100, 0) do
+                (rr, taken) ->
+                  Test.assert_true(taken >= 0, "it comes to rest")
+                  Test.assert_eq_int(total(world_of(rr)), 8, "with all its water")
+              end
+          end
+      end
+    end
+    test "a cell woken while a step runs is awake when it ends" do
+      let w = put(fresh(), 5, 0, 5, water(8))
+      match F.begin(fluid(), w, Nil) do
+        (fl, job) ->
+          match F.finish_world(job, F.wake_cell(fl, 5, 0, 5), w) do
+            (f2, _) -> Test.assert_eq_int(F.active_count(f2), 1, "the one cell")
+          end
       end
     end
   end
