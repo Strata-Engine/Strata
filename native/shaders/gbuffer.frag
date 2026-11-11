@@ -1,12 +1,14 @@
 // The geometry pass: solid surfaces write what the light pass needs to know
 // about them, not a lit colour.
 //   o_albedo  rgb the texture's colour
-//   o_nm      r face (0..5) / 255, g unused, b light class / 255, a corner shading 0..1
+//   o_nm      r face (0..5) / 255, g unused, b light class / 255, a corner shading 0..1;
+//             a turned surface (a body) has r 16..255 and g: its true normal, octahedral (light.frag decodes)
 layout(location = 0) in vec2 v_uv;
 layout(location = 1) in vec3 v_world;
 layout(location = 2) flat in uint v_w1;
 layout(location = 3) flat in uint v_face;
 layout(location = 4) in vec2 v_tex;
+layout(location = 5) flat in vec4 v_rot;
 
 layout(push_constant) uniform PC { uint base; uint flags; } pc;   // flags bit 0: discard see-through pixels (cutout)
 
@@ -28,5 +30,8 @@ void main() {
     float occ = mix(mix(a0, a1, f.x), mix(a2, a3, f.x), f.y) / 3.0;
 
     o_albedo = vec4(base.rgb, 1.0);
-    o_nm = vec4(float(min(v_face, 5u)) / 255.0, 0.0, float((v_w1 >> 24) & 255u) / 255.0, occ);
+    if (turned(v_rot)) {
+        vec2 e = oct_enc(qrot(v_rot, NORMALS[min(v_face, 5u)]));
+        o_nm = vec4((16.0 + floor(e.x * 239.0 + 0.5)) / 255.0, e.y, float((v_w1 >> 24) & 255u) / 255.0, occ);
+    } else o_nm = vec4(float(min(v_face, 5u)) / 255.0, 0.0, float((v_w1 >> 24) & 255u) / 255.0, occ);
 }

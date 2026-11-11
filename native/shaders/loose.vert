@@ -10,7 +10,7 @@ layout(location = 1) in uvec4 c1;
 layout(location = 2) in uvec4 c2;
 layout(location = 3) in uvec4 c3;
 
-struct Chunk { ivec4 origin_level; uint first[6]; uint count[6]; };
+struct Chunk { ivec4 origin_level; uint first[6]; uint count[6]; vec4 pos; vec4 rot; };   // a body slot (w bit 9) is drawn at pos (metres), turned by rot
 layout(std430, set = 0, binding = 1) readonly buffer Table { Chunk chunks[]; } table;
 layout(std430, set = 0, binding = 4) readonly buffer DrawSlot { uint slot[]; } draw_slot;
 layout(push_constant) uniform PC { uint base; uint flags; } pc;
@@ -19,6 +19,7 @@ layout(location = 0) out vec2 v_uv;
 layout(location = 1) out vec3 v_world;
 layout(location = 2) flat out uint v_w1;
 layout(location = 3) flat out uint v_face;
+layout(location = 5) flat out vec4 v_rot;
 layout(location = 4) out vec2 v_tex;
 
 vec3 pos_of(uvec4 c) { return vec3(float(c.x & 65535u), float(c.x >> 16), float(c.y & 65535u)) / 256.0 - 1.0; }
@@ -31,8 +32,11 @@ void main() {
     vec3 n = cross(pos_of(c1) - pos_of(c0), pos_of(c2) - pos_of(c0));
     vec3 a = abs(n);
     uint face = a.y >= a.x && a.y >= a.z ? (n.y >= 0.0 ? 0u : 1u) : (a.x >= a.z ? (n.x >= 0.0 ? 2u : 3u) : (n.z >= 0.0 ? 4u : 5u));
-    ivec4 ol = table.chunks[draw_slot.slot[pc.base + uint(gl_DrawID)]].origin_level;
-    vec3 world = (vec3(ol.xyz) + p) * u.eye.w;
+    Chunk ch = table.chunks[draw_slot.slot[pc.base + uint(gl_DrawID)]];
+    ivec4 ol = ch.origin_level;
+    bool body = (ol.w & 512) != 0;
+    vec3 world = body ? ch.pos.xyz + qrot(ch.rot, p * u.eye.w) : (vec3(ol.xyz) + p) * u.eye.w;
+    v_rot = body ? ch.rot : vec4(0.0, 0.0, 0.0, 1.0);
     v_uv = vec2(0.5);                       // no corner shading on a model
     v_tex = vec2(float(c.y >> 16), float(c.z & 65535u)) / 256.0 - 64.0;
     v_world = world;

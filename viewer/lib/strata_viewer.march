@@ -10,10 +10,13 @@
 --   L   step through the light modes        [ and ]   lower and raise the sun
 --   N   play a recording from viewer/sounds/ (WAV, FLAC, MP3) 5 m ahead
 --   H   switch sound between headphones (3D) and speakers      9 and 0   main sound level down and up
+--   C   drop a crate ahead
 --
 -- The world streams in around the camera and has no edge: a 2 km island,
 -- read from Strata.Atlas, in a sea that goes on.
 --
+-- STRATA_SCALE=0.1  the 10 cm world (StrataViewer.Fine): a tower, a wall, a cliff and a stream to knock down; stream radius 8 (STRATA_RADIUS is ignored)
+-- STRATA_CRATE=f     drop a crate ahead of the camera at frame f (C does it by hand)
 -- STRATA_LIGHT_BOX=n the light volume's horizontal radius in chunks (default: the stream's)
 -- STRATA_SLAB_AT=f, STRATA_SLAB_OFF=f   scene 12: the frame its slab appears at, and the frame it goes
 -- STRATA_LIGHT=n     light mode: 0 the old flat shading, 1 sky and sun, 2 + shadows, 3 + reflections, 4 + sky light (default), 9 the light volume
@@ -709,15 +712,38 @@ mod StrataViewer do
   end
 
   -- A stream and the fluid that moves in its world.
-  type Sim = Sim(Strata.Stream.Stream, Strata.Fluid.Fluid)
-  pfn sim_stream(m : Sim) : Strata.Stream.Stream do match m do Sim(s, _) -> s end end
-  pfn sim_fluid(m : Sim) : Strata.Fluid.Fluid do match m do Sim(_, f) -> f end end
+  type Sim = Sim(Strata.Stream.Stream, Strata.Fluid.Fluid, Strata.Physics.Physics)
+  pfn sim_stream(m : Sim) : Strata.Stream.Stream do match m do Sim(s, _, _) -> s end end
+  pfn sim_fluid(m : Sim) : Strata.Fluid.Fluid do match m do Sim(_, f, _) -> f end end
+  pfn sim_phys(m : Sim) : Strata.Physics.Physics do match m do Sim(_, _, p) -> p end end
 
-  -- Apply an edit and tell the fluid about it.
+  -- Apply an edit and tell the fluid and physics about it.
   pfn edit(m : Sim, o : Strata.Edit.Outcome) : Sim do
     match m do
-      Sim(s, f) -> Sim(Strata.Stream.apply(s, o), Strata.Fluid.wake(f, Strata.Edit.world(o), o))
+      Sim(s, f, p) -> Sim(Strata.Stream.apply(s, o), Strata.Fluid.wake(f, Strata.Edit.world(o), o), Strata.Physics.wake(p, o))
     end
+  end
+
+  -- ── Physics ──────────────────────────────────────────────────────────────
+  -- physics, the step in flight, the walker's driven body, C last frame, metres per voxel, the clock's start
+  type PhysRig = PhysRig(Strata.Physics.Physics, Option(Strata.Physics.Stepping), Int, Bool, Float, Float)
+
+  pfn block_of(n : Int, id : Int, i : Int, g : Strata.Body.Grid) : Strata.Body.Grid do
+    if i >= n * n * n do g else block_of(n, id, i + 1, Strata.Body.grid_set(g, i % n, (i / n) % n, i / (n * n), id)) end
+  end
+  -- a wooden crate 2 m across at 1 m voxels, 1 m across at 10 cm
+  pfn crate(scale : Float) : Strata.Body.Grid do
+    let n = if scale < 0.5 do 10 else 2 end
+    block_of(n, 7, 0, Strata.Body.grid(n, n, n))
+  end
+  pfn add_crate(p : Strata.Physics.Physics, x : Float, y : Float, z : Float, scale : Float) : Strata.Physics.Physics do
+    match Strata.Physics.add(p, crate(scale), x, y, z, Strata.Math.Quat.identity(), Strata.Physics.dynamic()) do
+      (p2, _) -> p2
+    end
+  end
+  -- a stone slab 6 x 1 x 2 voxels
+  pfn slab_body(i : Int, g : Strata.Body.Grid) : Strata.Body.Grid do
+    if i >= 12 do g else slab_body(i + 1, Strata.Body.grid_set(g, i % 6, 0, i / 6, 1)) end
   end
 
   -- Breach the test lake on its lowest side: a channel of carve spheres of
@@ -942,7 +968,7 @@ mod StrataViewer do
     end
   end
 
-  pfn frame_loop(s : Strata.Stream.Stream, fl : Strata.Fluid.Fluid, job : Option(Strata.Fluid.Job), sl : Strata.Render.Render, reg : Strata.Blocks.Registry, cam : Cam, frame : Int, frames : Int, script : Int, hole : (Int, Int, Int), tl : (Int, Int, Int, Int, Int, Int, Int), worst : Float, total : Float, fworst : Float, t_prev : Float, t_mark : Float, vp : NativeF32Arr, snd : Strata.Sound.Sound, aworst : Float) : Unit do
+  pfn frame_loop(s : Strata.Stream.Stream, fl : Strata.Fluid.Fluid, job : Option(Strata.Fluid.Job), sl : Strata.Render.Render, reg : Strata.Blocks.Registry, cam : Cam, rig : PhysRig, frame : Int, frames : Int, script : Int, hole : (Int, Int, Int), tl : (Int, Int, Int, Int, Int, Int, Int), worst : Float, total : Float, fworst : Float, t_prev : Float, t_mark : Float, vp : NativeF32Arr, snd : Strata.Sound.Sound, aworst : Float) : Unit do
     Strata.Ffi.Vk.poll()
     if Strata.Ffi.Vk.should_close() || Strata.Ffi.Vk.key(256) || (frames > 0 && frame >= frames) do
       println("strata_viewer: done after " ++ int_to_string(frame) ++ " frames; uploads refused " ++ int_to_string(Strata.Ffi.Vk.refused()) ++ ", still waiting " ++ int_to_string(Strata.Render.waiting(sl)) ++ "; rebuilds " ++ int_to_string(float_to_int(Strata.Ffi.Vk.stat(6))) ++ "; draw calls " ++ int_to_string(float_to_int(Strata.Ffi.Vk.stat(2))))
@@ -978,14 +1004,16 @@ mod StrataViewer do
           let strafe = live *. axis(Strata.Ffi.Vk.key(68), Strata.Ffi.Vk.key(65))
           let space = !scripted && Strata.Ffi.Vk.key(32)
           let w0 = Strata.Stream.world(s)
-          -- flying moves along the view at 40 m/s; walking moves on the ground at 5 m/s under gravity
-          let moved = if fly do
+          let (ph, pjob, me, ck0, sc, tz) = match rig do PhysRig(a, b, c, d, e, f) -> (a, b, c, d, e, f) end
+          -- flying moves along the view at 40 m/s; walking moves on the ground at 5 m/s under gravity, as physics' driven body
+          let (ph1, moved) = if fly do
               let rise = live *. axis(space, Strata.Ffi.Vk.key(340))
-              StrataViewer.Walker.body_with(x +. (fx *. go +. Math.cos(yaw2) *. strafe) *. 40.0 *. dt, y +. (fy *. go +. rise) *. 40.0 *. dt, z +. (fz *. go +. Math.sin(yaw2) *. strafe) *. 40.0 *. dt, 0.0, false)
+              let b = StrataViewer.Walker.body_with(x +. (fx *. go +. Math.cos(yaw2) *. strafe) *. 40.0 *. dt, y +. (fy *. go +. rise) *. 40.0 *. dt, z +. (fz *. go +. Math.sin(yaw2) *. strafe) *. 40.0 *. dt, 0.0, false)
+              (Strata.Physics.place_driven(ph, me, StrataViewer.Walker.eye_x(b), StrataViewer.Walker.eye_y(b) -. 0.7, StrataViewer.Walker.eye_z(b)), b)
             else
               let mx = (Math.sin(yaw2) *. go +. Math.cos(yaw2) *. strafe) *. 5.0
               let mz = (Math.sin(yaw2) *. strafe -. Math.cos(yaw2) *. go) *. 5.0
-              StrataViewer.Walker.step(w0, StrataViewer.Walker.body_with(x, y, z, vy0, ground0), mx, mz, space, dt)
+              StrataViewer.Walker.drive(ph, w0, me, StrataViewer.Walker.body_with(x, y, z, vy0, ground0), mx, mz, space, dt)
             end
           -- the soak circuit: a 150 m circle at about 36 m/s, looking along it and down
           let turn = int_to_float(frame) *. 0.004
@@ -994,13 +1022,13 @@ mod StrataViewer do
           let z2 = if script == 2 do soak_z(turn, hole) else StrataViewer.Walker.eye_z(moved) end
           -- the stream: refocus when the camera enters another chunk, then one tick
           let t_march = Strata.Ffi.Vk.time()
-          let kx = Strata.Coord.chunk_of(float_to_int(Math.floor(x2)))
-          let ky = Strata.Coord.chunk_of(float_to_int(Math.floor(y2)))
-          let kz = Strata.Coord.chunk_of(float_to_int(Math.floor(z2)))
+          let kx = Strata.Coord.chunk_of(float_to_int(Math.floor(x2 /. sc)))
+          let ky = Strata.Coord.chunk_of(float_to_int(Math.floor(y2 /. sc)))
+          let kz = Strata.Coord.chunk_of(float_to_int(Math.floor(z2 /. sc)))
           let s1a = if kx != kx0 || ky != ky0 || kz != kz0 do Strata.Stream.set_focus(s, Cons((x2, y2, z2), Nil)) else s end
           let seed = Env.get_int("STRATA_SEED", 7)
           if script == 2 && soak_lake() && frame == Env.get_int("STRATA_BREACH", -1) - 1 do println("soak-lake: lake_start=" ++ int_to_string(lake_voxels(Strata.Stream.world(s1a), reg, tl))) else () end
-          let m0 = Sim(s1a, fl)
+          let m0 = Sim(s1a, fl, ph1)
           let m1 = if script == 3 && frame == 10 do
               match hole do
                 (hx, hy, hz) -> edit(m0, Strata.Edit.fill_box(Strata.Stream.world(s1a), hx, hy, hz, hx + 31, hy + 31, hz + 31, 0))
@@ -1018,7 +1046,7 @@ mod StrataViewer do
           let rb = !scripted && Strata.Ffi.Vk.mouse_button(1)
           let dig_now = (lb && !lb0) || (frame == 10 && Env.get_int("STRATA_DIG", 0) == 1) || (script == 2 && frame % 100 == 50)
           let build_now = rb && !rb0
-          let m4 = act(m3, reg, x2, y2, z2, fx, fy, fz, dig_now, build_now)
+          let m4a = act(m3, reg, x2, y2, z2, fx, fy, fz, dig_now, build_now)
           -- sound: the camera is the listener; a carve or a build strikes where it lands
           let sndl = Strata.Sound.listener(snd, x2, y2, z2, fx, fy, fz, 0.0, 1.0, 0.0)
           let snd0 = if dig_now do strike_at(sndl, w0, reg, x2, y2, z2, fx, fy, fz, 0.55, 0.85) else if build_now do strike_at(sndl, w0, reg, x2, y2, z2, fx, fy, fz, 0.95, 0.3) else sndl end end
@@ -1056,16 +1084,34 @@ mod StrataViewer do
               println("strata_viewer: sound on " ++ (if hp do "headphones" else "speakers" end))
               Strata.Sound.set_output(snd_lv, hp)
             else snd_lv end
+          -- C drops a crate 6 m ahead and a little up, once per press
+          let ckey = !scripted && Strata.Ffi.Vk.key(67)
+          let drop = (ckey && !ck0) || (scripted && frame == Env.get_int("STRATA_CRATE", -1))
+          let m4c = if !drop do m4a
+            else match m4a do Sim(ms, mf, mp) -> Sim(ms, mf, add_crate(mp, x2 +. Math.sin(yaw2) *. 6.0, y2 +. 2.0, z2 -. Math.cos(yaw2) *. 6.0, sc)) end end
+          -- physics on the clock: the step begun last frame is finished, and the next begun; at most two steps a frame
+          let tphys = if scripted do int_to_float(frame) /. 60.0 else now -. tz end
+          let focus = Cons((x2, y2, z2), Nil)
+          let (pa, sa) = match pjob do
+              Some(j) -> Strata.Physics.finish(j, sim_phys(m4c), sim_stream(m4c))
+              None -> (sim_phys(m4c), sim_stream(m4c))
+            end
+          let owed = Strata.Physics.due(pa, tphys)
+          let (pb, sb) = if owed >= 2 do Strata.Physics.step(pa, sa, focus) else (pa, sa) end
+          let (pc, pjob2) = if owed >= 1 do
+              match Strata.Physics.begin(pb, Strata.Stream.world(sb), focus) do (p4, j4) -> (p4, Some(j4)) end
+            else (pb, None) end
+          let m4 = Sim(sb, sim_fluid(m4c), pc)
           -- the fluid: ten steps a second (a scripted run: every sixth frame)
           let t_fluid = Strata.Ffi.Vk.time()
           let due = Env.get_int("STRATA_FLUID", 1) != 0 && (if scripted do frame % 6 == 0 else Math.floor(now *. 10.0) != Math.floor(t_prev *. 10.0) end)
           -- a step is worked out on a worker: the one begun last time is finished here, then the next begins
           let m5 = if !due do m4
             else if Env.get_int("STRATA_FLUID_SYNC", 0) == 1 do
-              match Strata.Fluid.step(sim_fluid(m4), sim_stream(m4), Cons((x2, y2, z2), Nil)) do (f2, sf) -> Sim(sf, f2) end
+              match Strata.Fluid.step(sim_fluid(m4), sim_stream(m4), Cons((x2, y2, z2), Nil)) do (f2, sf) -> Sim(sf, f2, sim_phys(m4)) end
             else
               match job do
-                Some(j) -> match Strata.Fluid.finish(j, sim_fluid(m4), sim_stream(m4)) do (f2, sf) -> Sim(sf, f2) end
+                Some(j) -> match Strata.Fluid.finish(j, sim_fluid(m4), sim_stream(m4)) do (f2, sf) -> Sim(sf, f2, sim_phys(m4)) end
                 None -> m4
               end
             end end
@@ -1085,12 +1131,14 @@ mod StrataViewer do
           let s2 = Strata.Stream.tick(sim_stream(m5))
           match Strata.Render.sync(sl, s2) do
             (sl2, s3) ->
+              let (sl3, pd) = Strata.Render.bodies(sl2, sim_phys(m5), tphys -. 1.0 /. 60.0)
+              let rig2 = PhysRig(pd, pjob2, me, ckey, sc, tz)
               let march_ms = (Strata.Ffi.Vk.time() -. t_march) *. 1000.0
               let aspect = int_to_float(Strata.Ffi.Vk.fb_w()) /. int_to_float(if Strata.Ffi.Vk.fb_h() < 1 do 1 else Strata.Ffi.Vk.fb_h() end)
               let view = M4.look_at(V3.new(x2, y2, z2), V3.new(x2 +. fx, y2 +. fy, z2 +. fz), V3.new(0.0, 1.0, 0.0))
               let vp2 = M4.mul_into_f32(M4.perspective(1.15, aspect, 0.1, 1200.0), view, vp)
               Strata.Ffi.Vk.set_camera(vp2)
-              Strata.Ffi.Vk.set_eye(x2, y2, z2, 1.0)
+              Strata.Ffi.Vk.set_eye(x2, y2, z2, sc)
               Strata.Render.set_time(if scripted do int_to_float(frame) /. 60.0 else now end)
               if sun != sun0 do sun_at(sun) else () end
               if mode != mode0 do Strata.Ffi.Vk.set_lighting(mode) else () end
@@ -1122,8 +1170,8 @@ mod StrataViewer do
                   end
                 else () end
                 if Strata.Fluid.active_count(fl2) + Strata.Fluid.dormant_count(fl2) > 0 do println("  fluid: active " ++ int_to_string(Strata.Fluid.active_count(fl2)) ++ ", waiting " ++ int_to_string(Strata.Fluid.waiting_count(fl2)) ++ ", dormant " ++ int_to_string(Strata.Fluid.dormant_count(fl2)) ++ "; last step " ++ ms2(fluid_ms) ++ " ms") else () end
-                frame_loop(s3, fl2, job2, sl2, reg, cam2, next, frames, script, hole, tl, worst2, total2, fworst2, now, now, vp2, snd2, aworst2)
-              else frame_loop(s3, fl2, job2, sl2, reg, cam2, next, frames, script, hole, tl, worst2, total2, fworst2, now, t_mark, vp2, snd2, aworst2) end
+                frame_loop(s3, fl2, job2, sl3, reg, cam2, rig2, next, frames, script, hole, tl, worst2, total2, fworst2, now, now, vp2, snd2, aworst2)
+              else frame_loop(s3, fl2, job2, sl3, reg, cam2, rig2, next, frames, script, hole, tl, worst2, total2, fworst2, now, t_mark, vp2, snd2, aworst2) end
           end
       end
     end
@@ -1279,6 +1327,7 @@ mod StrataViewer do
           else (int_to_float(at_x(cx, d, rad + 44)), int_to_float(land_height(land, at_x(cx, d, rad + 44), at_z(cz, d, rad + 44), seed)) +. 14.0, int_to_float(at_z(cz, d, rad + 44)), int_to_float(d) *. 0.39269908 +. 3.14159265, -0.25) end
       end
     else if scene == 21 do (-45.0, int_to_float(land_height(land, -35, 53, seed)) +. 10.0, 40.0, 2.5, -0.4)
+    else if scene == 25 || scene == 26 do (-40.0, int_to_float(land_height(land, -40, 60, seed)) +. 3.5, 60.0, 0.0, -0.3)
     else if scene == 20 do (-35.5, int_to_float(land_height(land, -35, 53, seed)) +. 12.0, 60.5, 0.0, -0.95)
     else if scene == 16 do (-34.5, int_to_float(land_height(land, -35, 53, seed)) -. 1.3, 58.2, 0.0, -0.03)
     else if scene == 10 || scene == 17 do
@@ -1298,7 +1347,7 @@ mod StrataViewer do
           let ey = int_to_float(land_height(land, bx, bz, seed)) +. 5.0
           (int_to_float(bx) +. 0.5, ey, int_to_float(bz) +. 0.5, int_to_float(d) *. 0.39269908, 0.0 -. Math.atan2(ey -. int_to_float(line), int_to_float(2 * rad + 8)))
       end
-    else (-70.0, int_to_float(land_height(land, 0, 0, seed)) +. 46.0, 96.0, 0.62, -0.42) end end end end end end end end end end end end end end end end end
+    else (-70.0, int_to_float(land_height(land, 0, 0, seed)) +. 46.0, 96.0, 0.62, -0.42) end end end end end end end end end end end end end end end end end end
   end end
 
   -- The land for STRATA_ISLAND: the island's atlas from the cache in
@@ -1344,8 +1393,15 @@ mod StrataViewer do
       end) ++ " chunks: median " ++ hundredths(List.nth(ts, 100)) ++ " ms, worst " ++ hundredths(List.nth(ts, 199)) ++ " ms over 200 surface chunks, 10 runs each on one task")
   end
 
+  -- the 10 cm world's poses: 27 the overview (tower, wall and cliff); anything else stands near the middle
+  pfn fine_pose(scene : Int) : (Float, Float, Float, Float, Float) do
+    if scene == 27 do (2.0, 6.0, 12.0, 0.0, -0.12) else (2.0, 1.7, 8.0, 0.0, 0.0) end
+  end
+
   fn main(_cap : Cap(IO)) : Unit do
-    let r = Env.get_int("STRATA_RADIUS", 10)
+    let sc = if Env.get("STRATA_SCALE", "1") == "0.1" do 0.1 else 1.0 end
+    let fine = sc < 0.5
+    let r = if fine do 8 else Env.get_int("STRATA_RADIUS", 10) end
     let soak = Env.get_int("STRATA_SOAK", 0)
     let frames = if soak > 0 do soak else Env.get_int("STRATA_FRAMES", 0) end
     let seed = Env.get_int("STRATA_SEED", 7)
@@ -1356,7 +1412,7 @@ mod StrataViewer do
     let tl = scene_lake(land, seed)
     -- the soak starts on its circuit, 60 m over the origin's ground, looking down a little
     let mid = soak_mid(tl)
-    let start = if soak > 0 do (soak_x(0.0, mid), int_to_float(land_height(land, match mid do (cx, _, _) -> cx end, match mid do (_, _, cz) -> cz end, seed)) +. (if soak_lake() do 45.0 else 60.0 end), soak_z(0.0, mid), 3.14159265, -0.35) else pose(scene, seed, land, tl) end
+    let start = if soak > 0 do (soak_x(0.0, mid), int_to_float(land_height(land, match mid do (cx, _, _) -> cx end, match mid do (_, _, cz) -> cz end, seed)) +. (if soak_lake() do 45.0 else 60.0 end), soak_z(0.0, mid), 3.14159265, -0.35) else if fine do fine_pose(scene) else pose(scene, seed, land, tl) end end
     if !Strata.Ffi.Vk.open(match size do (w, _) -> w end, match size do (_, h) -> h end, frames == 0, Env.get_int("STRATA_QUADS", 0)) do println("strata_viewer: could not open a Vulkan window")
     else
       Strata.Ffi.Vk.set_vsync(Env.get_int("STRATA_VSYNC", 1) != 0)
@@ -1369,13 +1425,15 @@ mod StrataViewer do
       if Strata.Render.light_overflow(reg) > 0 do println("strata_viewer: " ++ int_to_string(Strata.Render.light_overflow(reg)) ++ " blocks share another block's light class") else () end
       sun_at(int_to_float(Env.get_int("STRATA_SUN", 55)))
       -- chunks are meshed out to one short of the radius, so the fog closes there
-      Strata.Ffi.Vk.set_fog(int_to_float(r - 1) *. 32.0 *. 0.55, int_to_float(r - 1) *. 32.0)
+      Strata.Ffi.Vk.set_fog(int_to_float(r - 1) *. 32.0 *. sc *. 0.55, int_to_float(r - 1) *. 32.0 *. sc)
       let ex = match start do (x, _, _, _, _) -> x end
       let ey = match start do (_, y, _, _, _) -> y end
       let ez = match start do (_, _, z, _, _) -> z end
       let yaw0 = match start do (_, _, _, a, _) -> a end
       let pitch0 = match start do (_, _, _, _, a) -> a end
-      let world = Strata.World.new(reg, Strata.Terrain.gen(fn (k, sd) -> land_chunk(land, k, sd)), seed, 1.0)
+      let gen = if fine do Strata.Terrain.gen(fn (k, sd) -> StrataViewer.Fine.terrain(Strata.Coord.kx(k), Strata.Coord.ky(k), Strata.Coord.kz(k), sd))
+        else Strata.Terrain.gen(fn (k, sd) -> land_chunk(land, k, sd)) end
+      let world = Strata.World.new(reg, gen, seed, sc)
       let t0 = Strata.Ffi.Vk.time()
       let s0 = Strata.Stream.run_until_settled(Strata.Stream.set_focus(Strata.Stream.start(world, Strata.Stream.config(r, 3, 32, 8)), Cons((ex, ey, ez), Nil)), 1000000)
       let t1 = Strata.Ffi.Vk.time()
@@ -1426,13 +1484,41 @@ mod StrataViewer do
           Strata.Stream.run_until_settled(Strata.Stream.apply(hollow, Strata.Edit.set_many(Strata.Stream.world(hollow), stairs(gy + 1, 0, Nil))), 1000000)
         end end
       -- scene 12 starts with its slab in place unless a run asks for it to appear later
-      let s0e = if scene == 12 && Env.get_int("STRATA_SLAB_AT", -1) < 0 do Strata.Stream.run_until_settled(slab(s0h, seed, 1), 1000000) else s0h end
+      let s0i = if scene == 12 && Env.get_int("STRATA_SLAB_AT", -1) < 0 do Strata.Stream.run_until_settled(slab(s0h, seed, 1), 1000000) else s0h end
+      -- scenes 25 and 26 level a pad 14 x 10 m ahead for their crates and slab: clear above the ground there, fill below
+      let pad = (float_to_int(Math.floor(ex)) - 5, land_height(land, float_to_int(Math.floor(ex)) - 3, float_to_int(Math.floor(ez)) - 8, seed) + 1, float_to_int(Math.floor(ez)) - 12)
+      let s0e = if (scene != 25 && scene != 26) || fine do s0i
+        else
+          match pad do
+            (px, py, pz) ->
+              let cleared = Strata.Stream.apply(s0i, Strata.Edit.fill_box(Strata.Stream.world(s0i), px, py, pz, px + 14, py + 8, pz + 10, 0))
+              Strata.Stream.run_until_settled(Strata.Stream.apply(cleared, Strata.Edit.fill_box(Strata.Stream.world(cleared), px, py - 4, pz, px + 14, py - 1, pz + 10, 3)), 1000000)
+          end
+        end
       match Strata.Render.sync(Strata.Render.new(16384), s0e) do
         (sl, s1) ->
           println("strata_viewer: " ++ int_to_string(Strata.Stream.loaded_count(s1)) ++ " chunks streamed in " ++ float_to_string(Math.round((t1 -. t0) *. 1000.0)) ++ " ms; " ++ int_to_string(Strata.Ffi.Vk.live_quads()) ++ " quads, " ++ int_to_string(Strata.Ffi.Vk.live_quads() * 8 / 1024) ++ " KB on the GPU")
           -- the fixed scenes fly, holding their pose; the default and the walk scene stand on the ground
-          let cam = Cam(ex, ey, ez, yaw0, pitch0, Strata.Coord.chunk_of(float_to_int(Math.floor(ex))), Strata.Coord.chunk_of(float_to_int(Math.floor(ey))), Strata.Coord.chunk_of(float_to_int(Math.floor(ez))), false, false, soak > 0 || (scene != 0 && scene != 11), 0.0, false, false, int_to_float(Env.get_int("STRATA_SUN", 55)), Env.get_int("STRATA_LIGHT", 4), false, level_bits(start_level()), 0.0)
-          frame_loop(s1, Strata.Fluid.with_limits(Strata.Fluid.new(reg, Cons((lake_base(), Strata.Fluid.flowing()), Cons((5, Strata.Fluid.sink()), Nil))), Env.get_int("STRATA_FLUID_CAP", 4096), Env.get_int("STRATA_FLUID_REACH", 16), 4), None, sl, reg, cam, 0, frames, if soak > 0 do 2 else if scene == 11 && frames > 0 do 1 else if scene == 4 && frames > 0 do 3 else 0 end end end, hole, tl, 0.0, 0.0, 0.0, Strata.Ffi.Vk.time(), Strata.Ffi.Vk.time(), NativeArray.make_f32(16, 0.0), audio_start(frames), 0.0)
+          let cam = Cam(ex, ey, ez, yaw0, pitch0, Strata.Coord.chunk_of(float_to_int(Math.floor(ex /. sc))), Strata.Coord.chunk_of(float_to_int(Math.floor(ey /. sc))), Strata.Coord.chunk_of(float_to_int(Math.floor(ez /. sc))), false, false, soak > 0 || (scene != 0 && scene != 11), 0.0, false, false, int_to_float(Env.get_int("STRATA_SUN", 55)), Env.get_int("STRATA_LIGHT", 4), false, level_bits(start_level()), 0.0)
+          -- physics: the walker is a driven body; scene 26 leans a slab on a crate
+          let ph0 = Strata.Physics.new(reg, Strata.Physics.with_scale(Strata.Physics.config(), sc))
+          let ph1 = if scene != 26 || fine do ph0
+            else
+              -- the crate 8 m ahead and a little left; the slab runs to its right, across the view
+              let ax = ex -. 3.0
+              let az = ez -. 8.0
+              let gy = match pad do (_, py, _) -> int_to_float(py) end
+              let pc = add_crate(ph0, ax, gy, az, sc)
+              -- its high end on the crate, its low end on the ground toward +x: tilted toward the sun
+              -- 6 m long so it leans at 19.5 degrees: friction (0.6) holds it; at 30 degrees it slid off
+              match Strata.Physics.add(pc, slab_body(0, Strata.Body.grid(6, 1, 2)), ax +. 1.9, gy +. 2.05, az, Strata.Math.Quat.from_axis_angle(0.0, 0.0, 1.0, -0.34), Strata.Physics.dynamic()) do
+                (p2, _) -> p2
+              end
+            end
+          let rig = match StrataViewer.Walker.add_to(ph1, StrataViewer.Walker.body(ex, ey, ez)) do
+              (p3, me) -> PhysRig(p3, None, me, false, sc, Strata.Ffi.Vk.time())
+            end
+          frame_loop(s1, Strata.Fluid.with_limits(Strata.Fluid.new(reg, Cons((lake_base(), Strata.Fluid.flowing()), Cons((5, Strata.Fluid.sink()), Nil))), Env.get_int("STRATA_FLUID_CAP", 4096), Env.get_int("STRATA_FLUID_REACH", 16), 4), None, sl, reg, cam, rig, 0, frames, if soak > 0 do 2 else if scene == 11 && frames > 0 do 1 else if scene == 4 && frames > 0 do 3 else 0 end end end, hole, tl, 0.0, 0.0, 0.0, Strata.Ffi.Vk.time(), Strata.Ffi.Vk.time(), NativeArray.make_f32(16, 0.0), audio_start(frames), 0.0)
       end
       Strata.Ffi.Vk.close()
     end

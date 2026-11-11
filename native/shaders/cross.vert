@@ -6,7 +6,7 @@
 layout(location = 0) in uint w0;
 layout(location = 1) in uint w1;
 
-struct Chunk { ivec4 origin_level; uint first[6]; uint count[6]; };
+struct Chunk { ivec4 origin_level; uint first[6]; uint count[6]; vec4 pos; vec4 rot; };   // a body slot (w bit 9) is drawn at pos (metres), turned by rot
 layout(std430, set = 0, binding = 1) readonly buffer Table { Chunk chunks[]; } table;
 layout(std430, set = 0, binding = 4) readonly buffer DrawSlot { uint slot[]; } draw_slot;
 struct Block { int tex[6]; int flags; int emission; };
@@ -17,6 +17,7 @@ layout(location = 0) out vec2 v_uv;
 layout(location = 1) out vec3 v_world;
 layout(location = 2) flat out uint v_w1;
 layout(location = 3) flat out uint v_face;
+layout(location = 5) flat out vec4 v_rot;
 layout(location = 4) out vec2 v_tex;
 
 const int CORNER[6] = int[6](0, 1, 2, 2, 1, 3);
@@ -25,7 +26,7 @@ void main() {
     uint id = w1 & 65535u;
     if (id >= uint(u.misc.w)) {             // a block the table does not have: draw nothing
         gl_Position = vec4(0.0, 0.0, 2.0, 1.0);
-        v_uv = vec2(0.0); v_world = vec3(0.0); v_w1 = 0u; v_face = 0u; v_tex = vec2(0.0);
+        v_uv = vec2(0.0); v_world = vec3(0.0); v_w1 = 0u; v_face = 0u; v_tex = vec2(0.0); v_rot = vec4(0.0, 0.0, 0.0, 1.0);
         return;
     }
     vec3 p = vec3(float(w0 & 31u), float((w0 >> 5) & 31u), float((w0 >> 10) & 31u));
@@ -34,8 +35,11 @@ void main() {
     float cu = float(c & 1), cv = float(c >> 1);
     // the first quad runs corner to corner one way, the second the other
     vec3 q = (i < 6) ? p + vec3(cu, cv, cu) : p + vec3(cu, cv, 1.0 - cu);
-    ivec4 ol = table.chunks[draw_slot.slot[pc.base + uint(gl_DrawID)]].origin_level;
-    vec3 world = (vec3(ol.xyz) + q) * u.eye.w;
+    Chunk ch = table.chunks[draw_slot.slot[pc.base + uint(gl_DrawID)]];
+    ivec4 ol = ch.origin_level;
+    bool body = (ol.w & 512) != 0;
+    vec3 world = body ? ch.pos.xyz + qrot(ch.rot, q * u.eye.w) : (vec3(ol.xyz) + q) * u.eye.w;
+    v_rot = body ? ch.rot : vec4(0.0, 0.0, 0.0, 1.0);
     v_uv = vec2(0.5);                       // no corner shading on a plant
     v_tex = vec2(cu, 1.0 - cv);
     v_world = world;
