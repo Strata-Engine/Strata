@@ -10,13 +10,14 @@
 -- task carries everything it needs (the generator, or the registry and a
 -- snapshot of the 27 chunks), so it shares no state with the caller.
 --
--- `tick` collects the tasks started on the PREVIOUS tick, applies up to
+-- `tick` collects the tasks started TWO ticks ago, applies up to
 -- `apply_budget` generated chunks, and starts the next batch: up to
 -- `workers` generation tasks (nearest to a focus first) and up to `workers`
 -- mesh tasks, for loaded chunks that need a mesh and have all 26 neighbours
--- loaded. Work therefore has a whole frame to finish before it is asked
--- for; `tick` waits only for a task that is still running a frame after it
--- was started. (March has no non-blocking await, and an actor cannot be
+-- loaded. Work therefore has two whole frames to finish before it is asked
+-- for; `tick` waits only for a task still running two frames after it was
+-- started. (One frame was not enough: a hard chunk takes 14 ms or more to
+-- mesh, and the wait showed as dropped frames.) (March has no non-blocking await, and an actor cannot be
 -- called from a test; see GAPS S12.)
 --
 -- A mesh is requested with a stamp; a result whose stamp is no longer the
@@ -43,8 +44,10 @@ mod Strata.Stream do
   pfn nworkers(c : Config) : Int do match c do Config(_, _, _, n) -> n end end
 
   -- ── Work in flight ───────────────────────────────────────────────────────
-  type GenRes = GenRes(Strata.Coord.Key, Strata.Chunk.Chunk)
-  type GenTask = GenTask(Strata.Coord.Key, Task(Strata.Chunk.Chunk))
+  -- a generated chunk and its content hash, which the worker computes
+  type Made = Made(Strata.Chunk.Chunk, Int)
+  type GenRes = GenRes(Strata.Coord.Key, Made)
+  type GenTask = GenTask(Strata.Coord.Key, Task(Made))
   type MeshTask = MeshTask(Strata.Coord.Key, Int, Task(Strata.Mesh.Meshed))
 
   -- ── The stream ───────────────────────────────────────────────────────────
@@ -57,9 +60,11 @@ mod Strata.Stream do
   type Meshing = Meshing(Strata.Store.Store(Int), Strata.Store.Store(Int), Strata.Store.Store(Strata.Mesh.Meshed), List(Strata.Coord.Key), Int)
 
   -- world, config, focus chunks, wanted-and-missing queue (nearest first),
-  -- generated chunks waiting for budget, generation tasks, mesh tasks,
-  -- meshing, unloads not yet taken
-  type Stream = Stream(Strata.World.World, Config, List(Strata.Coord.Key), List(Strata.Coord.Key), List(GenRes), List(GenTask), List(MeshTask), Meshing, List(Strata.Coord.Key))
+  -- generated chunks waiting for budget, the generation and mesh tasks to
+  -- collect on the next tick, meshing, unloads not yet taken, and the
+  -- generation and mesh tasks started on the last tick (collected the tick
+  -- after next)
+  type Stream = Stream(Strata.World.World, Config, List(Strata.Coord.Key), List(Strata.Coord.Key), List(GenRes), List(GenTask), List(MeshTask), Meshing, List(Strata.Coord.Key), List(GenTask), List(MeshTask))
 
   pfn no_mesh(w : Strata.World.World) : Strata.Mesh.Meshed do
     Strata.Mesh.build(Strata.World.registry(w), Strata.Mesh.around_from(fn (dx, dy, dz) -> Strata.Chunk.uniform(0)))
@@ -67,7 +72,7 @@ mod Strata.Stream do
 
   doc "Start streaming [w]. Nothing loads until a focus is set and `tick` is called."
   fn start(w : Strata.World.World, c : Config) : Stream do
-    Stream(w, c, Nil, Nil, Nil, Nil, Nil, Meshing(So.empty(0), So.empty(0), So.empty(no_mesh(w)), Nil, 0), Nil)
+    Stream(w, c, Nil, Nil, Nil, Nil, Nil, Meshing(So.empty(0), So.empty(0), So.empty(no_mesh(w)), Nil, 0), Nil, Nil, Nil)
   end
 
   -- ── Collecting tasks ─────────────────────────────────────────────────────
@@ -109,17 +114,17 @@ mod Strata.Stream do
   doc "Wait for the work in flight and fold it in, so nothing is left running. Call before dropping a stream."
   fn stop(s : Stream) : Unit do
     match s do
-      Stream(_, _, _, _, _, gts, mts, m, _) ->
-        match await_gens(gts, Got(Nil, Nil)) do
+      Stream(_, _, _, _, _, gts, mts, m, _, gts2, mts2) ->
+        match await_gens(gts2, await_gens(gts, Got(Nil, Nil))) do
           Got(_, _) ->
-            match await_meshes(mts, m) do
+            match await_meshes(mts2, await_meshes(mts, m)) do
               Meshing(_, _, _, _, _) -> ()
             end
         end
     end
   end
 
-  fn world(s : Stream) : Strata.World.World do match s do Stream(w, _, _, _, _, _, _, _, _) -> w end end
+  fn world(s : Stream) : Strata.World.World do match s do Stream(w, _, _, _, _, _, _, _, _, _, _) -> w end end
   fn loaded_count(s : Stream) : Int do Wo.loaded_count(world(s)) end
 
   -- ── The wanted set ───────────────────────────────────────────────────────
@@ -149,47 +154,62 @@ mod Strata.Stream do
     if a >= b && a >= c do a else if b >= c do b else c end end
   end
 
-  -- The box's keys at Chebyshev distance d from focus f that are not loaded
-  -- and not already queued, appended (reversed) to acc. i walks the box.
-  pfn shell(w : Strata.World.World, seen : Strata.Store.Store(Bool), acc : List(Strata.Coord.Key), f : Strata.Coord.Key, h : Int, v : Int, d : Int, i : Int) : (Strata.Store.Store(Bool), List(Strata.Coord.Key)) do
+  -- Sort one focus's box into buckets by Chebyshev distance: bucket d gains
+  -- the box's keys at distance d that are not loaded and not already seen.
+  -- One pass over the box; i walks it.
+  pfn bucket(w : Strata.World.World, seen : Strata.Store.Store(Bool), bs : Strata.Tree.Tree(List(Strata.Coord.Key)), f : Strata.Coord.Key, h : Int, v : Int, multi : Bool, i : Int) : (Strata.Store.Store(Bool), Strata.Tree.Tree(List(Strata.Coord.Key))) do
     let nh = 2 * h + 1
     let nv = 2 * v + 1
-    if i >= nh * nh * nv do (seen, acc)
+    if i >= nh * nh * nv do (seen, bs)
     else
       let dx = i % nh - h
       let dz = (i / nh) % nh - h
       let dy = i / (nh * nh) - v
-      if cheb(dx, dy, dz) != d do shell(w, seen, acc, f, h, v, d, i + 1)
+      let k = Ko.key(Ko.kx(f) + dx, Ko.ky(f) + dy, Ko.kz(f) + dz)
+      -- with one focus no key can come up twice, so the seen set is left alone
+      if Wo.is_loaded(w, k) || (multi && So.has(seen, k)) do bucket(w, seen, bs, f, h, v, multi, i + 1)
       else
-        let k = Ko.key(Ko.kx(f) + dx, Ko.ky(f) + dy, Ko.kz(f) + dz)
-        if Wo.is_loaded(w, k) || So.has(seen, k) do shell(w, seen, acc, f, h, v, d, i + 1)
-        else shell(w, So.put(seen, k, true), Cons(k, acc), f, h, v, d, i + 1) end
+        let d = cheb(dx, dy, dz)
+        bucket(w, if multi do So.put(seen, k, true) else seen end, Strata.Tree.set(bs, d, Cons(k, Strata.Tree.get(bs, d))), f, h, v, multi, i + 1)
       end
     end
   end
 
-  pfn shells_for(w : Strata.World.World, seen : Strata.Store.Store(Bool), acc : List(Strata.Coord.Key), fs : List(Strata.Coord.Key), h : Int, v : Int, d : Int) : (Strata.Store.Store(Bool), List(Strata.Coord.Key)) do
+  pfn buckets_for(w : Strata.World.World, seen : Strata.Store.Store(Bool), bs : Strata.Tree.Tree(List(Strata.Coord.Key)), fs : List(Strata.Coord.Key), h : Int, v : Int, multi : Bool) : Strata.Tree.Tree(List(Strata.Coord.Key)) do
     match fs do
-      Nil -> (seen, acc)
+      Nil -> bs
       Cons(f, t) ->
-        match shell(w, seen, acc, f, h, v, d, 0) do
-          (seen2, acc2) -> shells_for(w, seen2, acc2, t, h, v, d)
+        match bucket(w, seen, bs, f, h, v, multi, 0) do
+          (seen2, bs2) -> buckets_for(w, seen2, bs2, t, h, v, multi)
         end
     end
   end
 
-  pfn queue_go(w : Strata.World.World, seen : Strata.Store.Store(Bool), acc : List(Strata.Coord.Key), fs : List(Strata.Coord.Key), h : Int, v : Int, d : Int) : List(Strata.Coord.Key) do
-    if d > (if h > v do h else v end) do List.reverse(acc)
-    else
-      match shells_for(w, seen, acc, fs, h, v, d) do
-        (seen2, acc2) -> queue_go(w, seen2, acc2, fs, h, v, d + 1)
-      end
+  pfn push_all(ks : List(Strata.Coord.Key), acc : List(Strata.Coord.Key)) : List(Strata.Coord.Key) do
+    match ks do
+      Nil -> acc
+      Cons(k, t) -> push_all(t, Cons(k, acc))
     end
+  end
+
+  -- The buckets end to end, farthest first onto the front, so the result
+  -- runs nearest first.
+  pfn drain(bs : Strata.Tree.Tree(List(Strata.Coord.Key)), d : Int, acc : List(Strata.Coord.Key)) : List(Strata.Coord.Key) do
+    if d < 0 do acc else drain(bs, d - 1, push_all(Strata.Tree.get(bs, d), acc)) end
+  end
+
+  pfn nils(n : Int, acc : List(List(Strata.Coord.Key))) : List(List(Strata.Coord.Key)) do
+    if n <= 0 do acc else nils(n - 1, Cons(Nil, acc)) end
   end
 
   -- Wanted chunks that are not loaded, nearest to a focus first.
   pfn missing(w : Strata.World.World, c : Config, fs : List(Strata.Coord.Key)) : List(Strata.Coord.Key) do
-    queue_go(w, So.empty(false), Nil, fs, rh(c), rv(c), 0)
+    let far = if rh(c) > rv(c) do rh(c) else rv(c) end
+    let multi = match fs do
+      Cons(_, Cons(_, _)) -> true
+      _ -> false
+    end
+    drain(buckets_for(w, So.empty(false), Strata.Tree.from_list(nils(far + 1, Nil), Nil), fs, rh(c), rv(c), multi), far, Nil)
   end
 
   -- ── Unloading ────────────────────────────────────────────────────────────
@@ -227,10 +247,10 @@ mod Strata.Stream do
   doc "Set the focus points, in metres. Chunks now out of range are unloaded at once; loading happens over the following ticks."
   fn set_focus(s : Stream, points : List((Float, Float, Float))) : Stream do
     match s do
-      Stream(w, c, _, _, got, gts, mts, m, gone) ->
+      Stream(w, c, _, _, got, gts, mts, m, gone, gts2, mts2) ->
         let fs = focus_keys(w, points, Nil)
         match drop_far(Dropped(w, m, gone), So.keys(Wo.chunks(w)), c, fs) do
-          Dropped(w2, m2, gone2) -> Stream(w2, c, fs, missing(w2, c, fs), got, gts, mts, m2, gone2)
+          Dropped(w2, m2, gone2) -> Stream(w2, c, fs, missing(w2, c, fs), got, gts, mts, m2, gone2, gts2, mts2)
         end
     end
   end
@@ -267,9 +287,9 @@ mod Strata.Stream do
   doc "Adopt the world an edit produced and schedule its dirty chunks for remeshing."
   fn apply(s : Stream, o : Strata.Edit.Outcome) : Stream do
     match s do
-      Stream(_, c, fs, q, got, gts, mts, m, gone) ->
+      Stream(_, c, fs, q, got, gts, mts, m, gone, gts2, mts2) ->
         let w2 = Strata.Edit.world(o)
-        Stream(w2, c, fs, q, got, gts, mts, stale(m, w2, Strata.Edit.dirty(o)), gone)
+        Stream(w2, c, fs, q, got, gts, mts, stale(m, w2, Strata.Edit.dirty(o)), gone, gts2, mts2)
     end
   end
 
@@ -294,7 +314,7 @@ mod Strata.Stream do
             if !near(fs, k, rh(c), rv(c)) || Wo.is_loaded(w, k) do apply_gens(a, t, n, c, fs)
             else if n <= 0 do apply_gens(Applied(w, m, Cons(GenRes(k, ch), rest)), t, n, c, fs)
             else
-              let w2 = Wo.insert(w, k, ch)
+              let w2 = match ch do Made(c, h) -> Wo.insert_hashed(w, k, c, h) end
               apply_gens(Applied(w2, arrived(m, w2, k), rest), t, n - 1, c, fs)
             end end
         end
@@ -310,8 +330,13 @@ mod Strata.Stream do
 
   type Sent = Sent(List(Strata.Coord.Key), List(GenTask))
 
-  pfn gen_task(g : Strata.Terrain.Gen, k : Strata.Coord.Key, seed : Int) : Task(Strata.Chunk.Chunk) do
-    task_spawn(fn _ -> Strata.Terrain.run(g, k, seed))
+  pfn make(g : Strata.Terrain.Gen, k : Strata.Coord.Key, seed : Int) : Made do
+    let c = Strata.Terrain.run(g, k, seed)
+    Made(c, Strata.Chunk.hash(c))
+  end
+
+  pfn gen_task(g : Strata.Terrain.Gen, k : Strata.Coord.Key, seed : Int) : Task(Made) do
+    task_spawn(fn _ -> make(g, k, seed))
   end
 
   -- Start up to [room] generation tasks from the head of the queue.
@@ -333,19 +358,25 @@ mod Strata.Stream do
 
   -- Start a mesh task for each todo chunk that needs one and has its 27,
   -- up to [room]; what does not fit stays on the todo list in [left].
-  pfn send_meshes(todo : List(Strata.Coord.Key), m : Meshing, out : List(MeshTask), left : List(Strata.Coord.Key), w : Strata.World.World, room : Int) : Asked do
+  pfn send_meshes(todo : List(Strata.Coord.Key), seen : Strata.Store.Store(Bool), m : Meshing, out : List(MeshTask), left : List(Strata.Coord.Key), w : Strata.World.World, room : Int) : Asked do
     match todo do
       Nil -> Asked(m, out, left)
       Cons(k, t) ->
-        match m do
-          Meshing(need, asked, ready, td, clock) ->
-            let want = So.get(need, k)
-            if want == 0 || want == So.get(asked, k) || !Strata.Mesh.has_all(Wo.chunks(w), k) do send_meshes(t, m, out, left, w, room)
-            else if room <= 0 do send_meshes(t, m, out, Cons(k, left), w, room)
-            else
-              let task = mesh_task(Wo.registry(w), Strata.Mesh.around_of(Wo.chunks(w), k))
-              send_meshes(t, Meshing(need, So.put(asked, k, want), ready, td, clock), Cons(MeshTask(k, want, task), out), left, w, room - 1)
-            end end
+        -- an arriving chunk puts itself and its 26 neighbours on the list, so
+        -- most keys are there many times over: look at each once
+        if So.has(seen, k) do send_meshes(t, seen, m, out, left, w, room)
+        else
+          let seen2 = So.put(seen, k, true)
+          match m do
+            Meshing(need, asked, ready, td, clock) ->
+              let want = So.get(need, k)
+              if want == 0 || want == So.get(asked, k) || !Strata.Mesh.has_all(Wo.chunks(w), k) do send_meshes(t, seen2, m, out, left, w, room)
+              else if room <= 0 do send_meshes(t, seen2, m, out, Cons(k, left), w, room)
+              else
+                let task = mesh_task(Wo.registry(w), Strata.Mesh.around_of(Wo.chunks(w), k))
+                send_meshes(t, seen2, Meshing(need, So.put(asked, k, want), ready, td, clock), Cons(MeshTask(k, want, task), out), left, w, room - 1)
+              end end
+          end
         end
     end
   end
@@ -376,21 +407,41 @@ mod Strata.Stream do
     end
   end
 
-  doc "One step: collect the work started on the previous tick, apply generated chunks within the budget, start the next batch of generation and meshing."
+  -- Drop from the queue's head-ward part any key a running task is already
+  -- generating, so it is not started twice.
+  pfn running(ts : List(GenTask), k : Strata.Coord.Key) : Bool do
+    match ts do
+      Nil -> false
+      Cons(GenTask(k2, _), t) -> if Ko.key_eq(k2, k) do true else running(t, k) end
+    end
+  end
+  pfn skip_running(q : List(Strata.Coord.Key), ts : List(GenTask)) : List(Strata.Coord.Key) do
+    match ts do
+      Nil -> q
+      _ ->
+        match q do
+          Nil -> Nil
+          Cons(k, t) -> if running(ts, k) do skip_running(t, ts) else Cons(k, skip_running(t, ts)) end
+        end
+    end
+  end
+
+  doc "One step: collect the work started two ticks ago, apply generated chunks within the budget, start the next batch of generation and meshing."
   fn tick(s : Stream) : Stream do
     match s do
-      Stream(w, c, fs, q, got, gts, mts, m, gone) ->
+      Stream(w, c, fs, q, got, gts, mts, m, gone, gts_new, mts_new) ->
         match await_gens(gts, Got(Nil, Nil)) do
           Got(gens, failed) ->
             let m1 = await_meshes(mts, m)
             match apply_gens(Applied(w, m1, Nil), append(got, gens), budget(c), c, fs) do
               Applied(w2, m2, waiting) ->
-                match send_gens(prepend(failed, q), Nil, w2, c, fs, waiting, nworkers(c)) do
+                match send_gens(skip_running(prepend(failed, q), gts_new), Nil, w2, c, fs, waiting, nworkers(c)) do
                   Sent(q2, gts2) ->
                     match take_todo(m2) do
                       (m3, todo) ->
-                        match send_meshes(todo, m3, Nil, Nil, w2, nworkers(c)) do
-                          Asked(m4, mts2, left) -> Stream(w2, c, fs, q2, waiting, gts2, mts2, with_todo(m4, left), gone)
+                        match send_meshes(todo, So.empty(false), m3, Nil, Nil, w2, nworkers(c)) do
+                          -- what was started last tick is collected next tick; what starts now, the tick after
+                          Asked(m4, mts2, left) -> Stream(w2, c, fs, q2, waiting, gts_new, mts_new, with_todo(m4, left), gone, gts2, mts2)
                         end
                     end
                 end
@@ -402,15 +453,15 @@ mod Strata.Stream do
   doc "Is there nothing left to do: no chunk wanted and missing, no task running, nothing waiting to be applied or looked at?"
   fn settled(s : Stream) : Bool do
     match s do
-      Stream(_, _, _, q, got, gts, mts, Meshing(_, _, _, todo, _), _) ->
-        count(q, 0) == 0 && count(got, 0) == 0 && count(gts, 0) == 0 && count(mts, 0) == 0 && count(todo, 0) == 0
+      Stream(_, _, _, q, got, gts, mts, Meshing(_, _, _, todo, _), _, gts2, mts2) ->
+        count(q, 0) == 0 && count(got, 0) == 0 && count(gts, 0) == 0 && count(mts, 0) == 0 && count(todo, 0) == 0 && count(gts2, 0) == 0 && count(mts2, 0) == 0
     end
   end
 
   doc "What is outstanding, as (wanted chunks not yet requested, chunks being generated, meshes being built, generated chunks waiting for budget)."
   fn pending(s : Stream) : (Int, Int, Int, Int) do
     match s do
-      Stream(_, _, _, q, got, gts, mts, _, _) -> (count(q, 0), count(gts, 0), count(mts, 0), count(got, 0))
+      Stream(_, _, _, q, got, gts, mts, _, _, gts2, mts2) -> (count(q, 0), count(gts, 0) + count(gts2, 0), count(mts, 0) + count(mts2, 0), count(got, 0))
     end
   end
 
@@ -426,16 +477,16 @@ mod Strata.Stream do
   doc "Meshes finished since the last take, at most one (the newest) per chunk. The renderer uploads them."
   fn take_meshes(s : Stream) : (Stream, List((Strata.Coord.Key, Strata.Mesh.Meshed))) do
     match s do
-      Stream(w, c, fs, q, got, gts, mts, Meshing(need, asked, ready, todo, clock), gone) ->
+      Stream(w, c, fs, q, got, gts, mts, Meshing(need, asked, ready, todo, clock), gone, gts2, mts2) ->
         let out = So.fold(ready, Nil, fn (acc, k, mesh) -> Cons((k, mesh), acc))
-        (Stream(w, c, fs, q, got, gts, mts, Meshing(need, asked, So.empty(no_mesh(w)), todo, clock), gone), out)
+        (Stream(w, c, fs, q, got, gts, mts, Meshing(need, asked, So.empty(no_mesh(w)), todo, clock), gone, gts2, mts2), out)
     end
   end
 
   doc "Chunks unloaded since the last take. The renderer frees their meshes."
   fn take_unloads(s : Stream) : (Stream, List(Strata.Coord.Key)) do
     match s do
-      Stream(w, c, fs, q, got, gts, mts, m, gone) -> (Stream(w, c, fs, q, got, gts, mts, m, Nil), gone)
+      Stream(w, c, fs, q, got, gts, mts, m, gone, gts2, mts2) -> (Stream(w, c, fs, q, got, gts, mts, m, Nil, gts2, mts2), gone)
     end
   end
 

@@ -174,3 +174,65 @@ of the command buffer each frame in flight owns.
 
 Translucent quads also draw from both sides now, so a water surface is
 visible from underneath. Quads inside one chunk are still unsorted.
+
+## The renderer plan, measured (Task 10)
+
+Scene 1 (overview), radius 10 x 3, 2560 x 1600, release build, M3 Max.
+
+| | |
+|---|---|
+| chunks streamed at startup | 3087 in 0.89 s |
+| quads on the GPU | 397 265 in 3.1 MB (plus cross instances and loose quads) |
+| draw calls a frame | 5: opaque, cutout, crosses, models, translucent |
+| drawn after culling | 117 chunks, 112 291 quads |
+| frame rate, offscreen | about 2 000 fps |
+| CPU in the shim | 0.17 ms |
+| CPU in March (tick and sync, nothing arriving) | 0.01 ms |
+| GPU time, by timestamp query | 0.43 ms |
+| translucent chunks ordered | 18 in 5 microseconds |
+
+The driver gives timestamp queries, so GPU time is measured, not inferred.
+"Vsync off" could not be measured as planned: MoltenVK paces presentation
+to the display even in the immediate mode, so uncapped figures are taken
+offscreen, where a frame is rendered and never presented.
+
+### The soak run
+
+`scripts/soak.sh`: 3000 frames round a 150 m circuit at 36 m/s with vsync
+on, a sphere carved every 100 frames.
+
+    soak: frames=3000 worst_ms=14.41 mean_ms=8.34 refused=0 waiting=0 slots=2200 live_quads=496835 loaded=3381
+
+No frame over 16.7 ms across four runs (worst 14.4 to 16.3 ms). It did not
+start there. The first run's worst frame was 25.8 ms, 21 ms of it in March,
+and three changes to `Strata.Stream` followed:
+
+- the wanted-and-missing queue is built in one pass over the box instead
+  of one pass per distance ring, and the mesh to-do list is looked at once
+  per chunk instead of once per mention (an arriving chunk mentions 27);
+- a generated chunk's hash is computed by the worker that generated it,
+  not on the caller's thread when it is inserted;
+- tasks are collected two ticks after they start, not one. A hard chunk
+  takes 14 ms or more to mesh, and waiting for it after one frame was the
+  dropped frame.
+
+What remains: the frame in which the camera crosses into a new chunk
+spends 5 to 7 ms in March rebuilding the queue and unloading the far slab.
+It fits in a frame at 120 Hz with little to spare, it is work proportional
+to the loaded chunks, and it will grow with the far field. The far-field
+plan has to make it incremental.
+
+With a quad buffer smaller than the scene (`scripts/soak.sh 200000`) the
+run finishes cleanly with 359 meshes still waiting, as it must; each
+waiting mesh is retried every frame, which is wasteful and is noted for
+later.
+
+### Against the design's targets
+
+| target | result |
+|---|---|
+| draw calls per frame constant | met: 5 |
+| flying at 40 m/s, vsync on, no frame over 16.7 ms | met at radius 10: worst 14.4 to 16.3 ms |
+| CPU in the shim under 0.5 ms | met at 3087 chunks: 0.17 ms. The 8400-chunk scene is the far-field plan's |
+| 240 fps standing still at the 5 km view | not yet measurable: no 5 km view. About 2 000 fps offscreen at radius 10 |
+| GPU memory for quads under 64 MB at the 5 km view | not yet measurable. 4 MB at radius 10 |

@@ -99,18 +99,27 @@ let s4 = Strata.Stream.apply(s3, Strata.Edit.fill_sphere(Strata.Stream.world(s3)
 | `Strata.Edit` | single, list, box and sphere edits |
 | `Strata.Stream` | loading around focus points; task-built chunks and meshes |
 | `Strata.Query` | raycast and swept box collision |
-| `Strata.Ffi.Vk` | window, input and the Vulkan quad renderer |
+| `Strata.Slots`, `Strata.Render` | renderer slot bookkeeping; keeping the renderer in step with a stream |
+| `Strata.Model` | a model block's drawing geometry |
+| `Strata.Ffi.Vk` | window, input and the Vulkan renderer |
 | `Strata.Math.*`, `Strata.Noise`, `Strata.Tree` | vectors, matrices, noise, a persistent tree |
 
 ## Known limits
 
 - No save format: edited chunks stay in memory.
-- No light field and no ray-traced lighting yet; the viewer shades with a
-  sun direction and corner shading only.
-- The renderer culls on the CPU and issues one draw per chunk layer;
-  compute culling and indirect draws are the next rendering project.
-- `Strata.Stream.tick` waits for work started a tick earlier if it is
-  still running. See `GAPS.md` S12.
+- Lighting is a sun direction, corner shading and fog. No shadows, no
+  emitted or ray-traced light yet.
+- The view reaches the stream's radius, about 300 m by default. The far
+  field is the next plan.
+- Translucent quads are ordered by chunk, not within one, and draw from
+  both sides, so a one-block pane blends twice.
+- Model faces light as the nearest of the six axis directions.
+- On MoltenVK presentation paces to the display even with vsync off;
+  uncapped timing uses `STRATA_OFFSCREEN=1`.
+- There is no separate upload path for devices without unified memory:
+  the mapped buffer is correct everywhere and slower on a discrete GPU.
+- The frame in which the camera enters a new chunk spends 5 to 7 ms in
+  `Strata.Stream.set_focus`. See `RESULTS.md`.
 - March and forge gaps met on the way are in `GAPS.md`.
 
 ## The gate

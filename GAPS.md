@@ -73,8 +73,8 @@ its own `[ffi]` block; see `viewer/forge.toml`.
 early. The alternative, worker actors with a collector actor polled by
 `Actor.call`, returns `Err("actor_call: not in scheduler context")` under
 `forge test` (cube_forge G49), so it cannot be tested. Workaround in
-`Strata.Stream`: work started on one tick is awaited on the next, so it has
-a whole frame to finish and the wait is normally zero. A real
+`Strata.Stream`: work started on one tick is awaited two ticks later, so it
+has two whole frames to finish and the wait is normally zero. A real
 `task_poll(t) : Option(a)` would let `tick` never wait at all.
 
 ## S13 — float literals have no exponent form
