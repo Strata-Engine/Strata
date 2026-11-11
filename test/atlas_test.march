@@ -5,6 +5,7 @@ mod Strata.Test.Atlas do
   needs IO.Clock
   needs IO.Process
   needs IO.Console    -- charged here once any test module prints (the erosion timing; GAPS S3)
+  needs IO.FileSystem -- the cache test reads and writes .march/atlas-test
 
   import Test
   alias Strata.Atlas as At
@@ -232,6 +233,20 @@ mod Strata.Test.Atlas do
     end
   end
 
+  -- the first [len] bytes of [b]
+  pfn cut(b : NativeU8Arr, len : Int) : NativeU8Arr do cut_go(b, NativeArray.make_u8(len, 0), 0, len) end
+  pfn cut_go(b : NativeU8Arr, out : NativeU8Arr, i : Int, len : Int) : NativeU8Arr do
+    if i >= len do out else cut_go(b, NativeArray.set_u8(out, i, NativeArray.get_u8(b, i)), i + 1, len) end
+  end
+
+  -- read back, the same hash, the same rivers and lakes
+  pfn round_trips(a : Strata.Atlas.Atlas) : Bool do
+    match At.from_bytes(At.to_bytes(a)) do
+      Some(b) -> At.hash(b) == At.hash(a) && eq(At.rivers(b), At.rivers(a)) && eq(At.lakes(b), At.lakes(a))
+      None -> false
+    end
+  end
+
   pfn lit(img : String, header : Int) : Bool do
     List.any(string_chars(string_slice(img, header, string_byte_length(img) - header)), fn c -> char_to_int(c) != 0)
   end
@@ -319,6 +334,42 @@ mod Strata.Test.Atlas do
       Test.assert_true(At.hash(At.build(small(), 7)) != At.hash(At.build(At.def(64, 4.0, 100.0, 40.0, 5, 1.0), 7)), "the Def counts")
       Test.assert_true(At.hash(At.build(small(), 7)) != At.hash(At.build(At.with_rivers(small(), 1000.0, 0.3), 7)), "the river threshold counts")
       Test.assert_true(At.hash(At.build(small(), 7)) != At.hash(At.build(At.with_sites(small(), 4, 150.0, 2.0), 7)), "the site count counts")
+    end
+    test "an atlas read back from its bytes is the same atlas" do
+      Test.assert_true(round_trips(At.build(small(), 7)), "the 64 x 64 island")
+      Test.assert_true(round_trips(At.build(demo(), 7)), "the demo island, with lakes, rivers and sites")
+    end
+    test "bytes cut short, or of another version, read as None" do
+      let b = At.to_bytes(At.build(small(), 7))
+      let len = NativeArray.length_u8(b)
+      Test.assert_true(Option.is_none(At.from_bytes(cut(b, len - 1))), "one byte short")
+      Test.assert_true(Option.is_none(At.from_bytes(cut(b, len / 2))), "half")
+      Test.assert_true(Option.is_none(At.from_bytes(cut(b, 0))), "empty")
+      Test.assert_true(Option.is_none(At.from_bytes(NativeArray.set_u8(cut(b, len), 0, 255))), "another version")
+    end
+    test "load_or_build writes the atlas once, reads it back, and rebuilds over a bad file" do
+      let dir = ".march/atlas-test"
+      let path = dir ++ "/" ++ At.cache_name(small(), 7)
+      let want = At.hash(At.build(small(), 7))
+      let _gone = File.delete(path)
+      Test.assert_true(At.hash(At.load_or_build(dir, small(), 7)) == want, "built")
+      Test.assert_true(File.exists(path), "and written")
+      Test.assert_true(At.hash(At.load_or_build(dir, small(), 7)) == want, "read back")
+      let _bad = File.write(path, "not an atlas")
+      Test.assert_true(At.hash(At.load_or_build(dir, small(), 7)) == want, "a bad file is rebuilt")
+      Test.assert_true(Option.is_some(match File.read(path) do
+          Ok(text) -> At.from_bytes(Bytes.to_u8_arr(Bytes.from_string(text)))
+          Err(_) -> None
+        end), "and rewritten")
+    end
+    test "the cache name follows the seed and the Def" do
+      Test.assert_true(string_starts_with(At.cache_name(small(), 7), "atlas-7-"), "names the seed")
+      Test.assert_true(string_ends_with(At.cache_name(small(), 7), ".bin"), "a .bin file")
+      Test.assert_true(At.cache_name(small(), 7) == At.cache_name(small(), 7), "the same twice")
+      Test.assert_true(At.cache_name(small(), 7) != At.cache_name(small(), 8), "another seed")
+      Test.assert_true(At.cache_name(small(), 7) != At.cache_name(At.def(64, 4.0, 100.0, 40.0, 5, 1.0), 7), "another sea")
+      Test.assert_true(At.cache_name(small(), 7) != At.cache_name(raw(), 7), "other erosion")
+      Test.assert_true(At.cache_name(small(), 7) != At.cache_name(At.with_lakes(small(), 3, 30.0, 5.0), 7), "other lakes")
     end
     test "a layer image is a P6 header and three bytes a sample" do
       let a = At.build(small(), 7)

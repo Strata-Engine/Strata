@@ -33,6 +33,11 @@ click carves a sphere, right click builds one, escape quits. Carve the
 rim of a lake in the hills and it drains. `L` steps
 through the light modes and `[` and `]` lower and raise the sun.
 
+The world is an island 2 km across, read from `Strata.Atlas`: rivers run
+to the sea in their channels and lakes stand at their spill level. Its atlas
+takes about 4 s to build and is cached in `.march/atlas` (read in about
+30 ms after that); `STRATA_ISLAND=0` brings back the older noise terrain.
+
 Environment switches for scripted runs are listed at the top of
 `viewer/lib/strata_viewer.march`: a fixed scene (`STRATA_SCENE`), a frame
 count and screenshot (`STRATA_FRAMES`, `STRATA_SHOT`), offscreen timing
