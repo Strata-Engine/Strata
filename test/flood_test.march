@@ -1,0 +1,95 @@
+-- Priority-flood: spill heights fill every basin to its lowest way out, and
+-- receivers over the filled surface always lead to an outlet.
+mod Strata.Test.Flood do
+
+  needs IO.Clock
+  needs IO.Process
+
+  import Test
+  alias Strata.Flood as Fl
+
+  pfn plain(n : Int, v : Float) : NativeF32Arr do NativeArray.make_f32(n * n, v) end
+
+  pfn edge(n : Int, i : Int) : Bool do
+    let x = i % n
+    let z = i / n
+    x == 0 || z == 0 || x == n - 1 || z == n - 1
+  end
+
+  -- a 16 x 16 bowl: the edge at 20 m but for a notch of 12 m at (0, 8); inside,
+  -- 2 m at the centre rising 0.5 m a sample (at most 6.6 m), all above sea 0
+  pfn bowl_go(hs : NativeF32Arr, i : Int) : NativeF32Arr do
+    if i >= 256 do hs
+    else
+      let x = int_to_float(i % 16 - 8)
+      let z = int_to_float(i / 16 - 8)
+      let v = if i == 16 * 8 do 12.0 else if edge(16, i) do 20.0 else 2.0 +. 0.5 *. Math.sqrt(x *. x +. z *. z) end end
+      bowl_go(NativeArray.set_f32(hs, i, v), i + 1)
+    end
+  end
+
+  -- a plate 10 m high with a channel along row 8 from the centre to the edge,
+  -- 5 m at x = 0 rising 0.1 m a sample to x = 8
+  pfn channel_go(hs : NativeF32Arr, x : Int) : NativeF32Arr do
+    if x > 8 do hs else channel_go(NativeArray.set_f32(hs, x + 16 * 8, 5.0 +. 0.1 *. int_to_float(x)), x + 1) end
+  end
+
+  -- following receivers from i reaches an edge cell (receiver -1) within [left] steps
+  pfn to_edge(rs : NativeIntArr, i : Int, left : Int) : Bool do
+    let r = NativeArray.get_int(rs, i)
+    if r < 0 do edge(16, i) else if left <= 0 do false else to_edge(rs, r, left - 1) end end
+  end
+
+  pfn interior_spill_go(sp : NativeF32Arr, i : Int, want : Float) : Bool do
+    if i >= 256 do true
+    else if edge(16, i) do interior_spill_go(sp, i + 1, want)
+    else if NativeArray.get_f32(sp, i) == want do interior_spill_go(sp, i + 1, want)
+    else false end end end
+  end
+
+  pfn edges_keep_go(sp : NativeF32Arr, hs : NativeF32Arr, i : Int) : Bool do
+    if i >= 256 do true
+    else if edge(16, i) do (if NativeArray.get_f32(sp, i) == NativeArray.get_f32(hs, i) do edges_keep_go(sp, hs, i + 1) else false end)
+    else edges_keep_go(sp, hs, i + 1) end end
+  end
+
+  pfn all_reach_go(rs : NativeIntArr, i : Int) : Bool do
+    if i >= 256 do true else if to_edge(rs, i, 256) do all_reach_go(rs, i + 1) else false end end
+  end
+
+  pfn same_go(a : NativeF32Arr, b : NativeF32Arr, i : Int) : Bool do
+    if i >= 256 do true else if NativeArray.get_f32(a, i) == NativeArray.get_f32(b, i) do same_go(a, b, i + 1) else false end end
+  end
+
+  describe "Flood" do
+    test "a bowl fills to its rim's lowest point and drains over it to the edge" do
+      let hs = bowl_go(plain(16, 0.0), 0)
+      match Fl.fill(16, hs, 0.0) do
+        (sp, rs) ->
+          Test.assert_true(interior_spill_go(sp, 0, 12.0), "every inner cell spills at the notch, 12 m")
+          Test.assert_true(edges_keep_go(sp, hs, 0), "the edge cells are outlets at their own height")
+          Test.assert_true(all_reach_go(rs, 0), "receivers from every cell reach the edge")
+          Test.assert_true(NativeArray.get_int(rs, 1 + 16 * 8) == 16 * 8, "the cell inside the notch drains through it")
+      end
+    end
+    test "a plate with a channel to the edge has nothing to fill" do
+      let hs = channel_go(plain(16, 10.0), 0)
+      match Fl.fill(16, hs, 0.0) do
+        (sp, rs) ->
+          Test.assert_true(same_go(sp, hs, 0), "spill equals height everywhere")
+          Test.assert_true(all_reach_go(rs, 0), "and every cell reaches the edge")
+          Test.assert_true(NativeArray.get_int(rs, 8 + 16 * 8) == 7 + 16 * 8, "the channel runs down to the edge")
+      end
+    end
+    test "a sample at or below sea is an outlet" do
+      let hs = NativeArray.set_f32(plain(16, 10.0), 8 + 16 * 8, 0.0 -. 3.0)
+      match Fl.fill(16, hs, 0.0) do
+        (sp, rs) ->
+          Test.assert_true(NativeArray.get_int(rs, 8 + 16 * 8) == 0 - 1, "the sea sample has no receiver")
+          Test.assert_true(NativeArray.get_f32(sp, 8 + 16 * 8) == 0.0 -. 3.0, "nor is it raised")
+          Test.assert_true(NativeArray.get_int(rs, 7 + 16 * 8) == 8 + 16 * 8, "its neighbour drains into it")
+          Test.assert_true(same_go(sp, hs, 0), "nothing is filled")
+      end
+    end
+  end
+end
