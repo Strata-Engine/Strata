@@ -8,7 +8,8 @@
 --   left click   carve a sphere out of what you are looking at
 --   right click  build a sphere of stone onto it
 --   L   step through the light modes        [ and ]   lower and raise the sun
---   N   play a recording from viewer/sounds/ (WAV, FLAC, MP3)
+--   N   play a recording from viewer/sounds/ (WAV, FLAC, MP3) 5 m ahead
+--   H   switch sound between headphones (3D) and speakers
 --
 -- The world streams in around the camera and has no edge.
 --
@@ -421,7 +422,7 @@ mod StrataViewer do
       Cons(h, t) -> load_all(t, if Strata.Ffi.Audio.load("sounds/" ++ h) > 0 do n + 1 else n end)
     end
   end
-  pfn place_recording(snd : Strata.Sound.Sound, frame : Int) : Strata.Sound.Sound do
+  pfn place_recording(snd : Strata.Sound.Sound, frame : Int, x : Float, y : Float, z : Float) : Strata.Sound.Sound do
     let n = List.length(sound_files())
     if n == 0 do
       println("strata_viewer: no recordings in viewer/sounds/")
@@ -431,14 +432,17 @@ mod StrataViewer do
       if !Strata.Ffi.Audio.ready(id) do
         println("strata_viewer: recording " ++ int_to_string(id - 2048) ++ " is not ready")
         snd
-      else match Strata.Sound.play_flat(snd, id, 0.9, 0.0, 1.0) do (s, _) -> s end end
+      else match Strata.Sound.play(snd, id, x, y, z, 0.9, 1.0, 1.0) do (s, v) -> Strata.Sound.with_range(s, v, 3.0, 150.0) end end
     end
   end
   -- the strike patch is the first uploaded
   pfn strike_patch() : Int do 1 end
-  pfn strike(snd : Strata.Sound.Sound, hardness : Float, size : Float) : Strata.Sound.Sound do
-    match Strata.Sound.play_flat(snd, strike_patch(), 0.9, 0.0, 1.0) do
-      (s1, v) -> Strata.Sound.control(Strata.Sound.control(Strata.Sound.control(s1, v, 0, hardness), v, 1, size), v, 2, 0.8)
+  -- a strike where the view's ray meets the world, or 3 m ahead when it meets nothing
+  pfn strike_at(snd : Strata.Sound.Sound, w : Strata.World.World, reg : Strata.Blocks.Registry, x : Float, y : Float, z : Float, fx : Float, fy : Float, fz : Float, hardness : Float, size : Float) : Strata.Sound.Sound do
+    let h = Strata.Query.raycast(w, x, y, z, fx, fy, fz, 250.0, Strata.Query.targetable(reg))
+    let d = if Strata.Query.is_hit(h) do Strata.Query.hit_dist(h) else 3.0 end
+    match Strata.Sound.play(snd, strike_patch(), x +. fx *. d, y +. fy *. d, z +. fz *. d, 0.9, 1.0, 1.0) do
+      (s1, v) -> Strata.Sound.control(Strata.Sound.control(Strata.Sound.control(Strata.Sound.with_range(s1, v, 4.0, 250.0), v, 0, hardness), v, 1, size), v, 2, 0.8)
     end
   end
   -- once a frame, last: hand over the frame's sound, mix it in game time if rendering, and with STRATA_AUDIO_METER=1 report once a second
@@ -460,7 +464,7 @@ mod StrataViewer do
   -- eye position, yaw, pitch, the chunk the camera was last in, mouse buttons
   -- last frame, flying or walking, vertical speed, on the ground, F last frame
   -- ..., then the sun's height in degrees, the light mode, and whether L was down,
-  -- then the sound keys down last frame (bit 0 N, bit 1 H)
+  -- then the sound keys down last frame (bit 0 N, bit 1 H) and bit 2: headphones
   type Cam = Cam(Float, Float, Float, Float, Float, Int, Int, Int, Bool, Bool, Bool, Float, Bool, Bool, Float, Int, Bool, Int)
 
   -- Put the sun [deg] degrees above the horizon, to the south-east, warmer and dimmer the lower it is.
@@ -570,11 +574,21 @@ mod StrataViewer do
           let dig_now = (lb && !lb0) || (frame == 10 && Env.get_int("STRATA_DIG", 0) == 1) || (script == 2 && frame % 100 == 50)
           let build_now = rb && !rb0
           let m4 = act(m3, reg, x2, y2, z2, fx, fy, fz, dig_now, build_now)
-          let snd0 = if dig_now do strike(snd, 0.55, 0.85) else if build_now do strike(snd, 0.95, 0.3) else snd end end
-          -- N plays the next recording from viewer/sounds/
+          -- sound: the camera is the listener; a carve or a build strikes where it lands
+          let sndl = Strata.Sound.listener(snd, x2, y2, z2, fx, fy, fz, 0.0, 1.0, 0.0)
+          let snd0 = if dig_now do strike_at(sndl, w0, reg, x2, y2, z2, fx, fy, fz, 0.55, 0.85) else if build_now do strike_at(sndl, w0, reg, x2, y2, z2, fx, fy, fz, 0.95, 0.3) else sndl end end
+          -- N plays the next recording from viewer/sounds/ 5 m ahead; H switches headphones and speakers
           let nkey = !scripted && Strata.Ffi.Vk.key(78)
-          let keys = if nkey do 1 else 0 end
-          let snd1 = if nkey && int_and(keys0, 1) == 0 do place_recording(snd0, frame) else snd0 end
+          let hkey = !scripted && Strata.Ffi.Vk.key(72)
+          let hp_was = int_and(keys0, 4) != 0
+          let hp_now = if hkey && int_and(keys0, 2) == 0 do !hp_was else hp_was end
+          let keys = (if nkey do 1 else 0 end) + (if hkey do 2 else 0 end) + (if hp_now do 4 else 0 end)
+          let snd_n = if nkey && int_and(keys0, 1) == 0 do place_recording(snd0, frame, x2 +. fx *. 5.0, y2 +. fy *. 5.0, z2 +. fz *. 5.0) else snd0 end
+          let snd1 = if hkey && int_and(keys0, 2) == 0 do
+              let hp = int_and(keys, 4) != 0
+              println("strata_viewer: sound on " ++ (if hp do "headphones" else "speakers" end))
+              Strata.Sound.set_output(snd_n, hp)
+            else snd_n end
           -- the fluid: ten steps a second (a scripted run: every sixth frame)
           let t_fluid = Strata.Ffi.Vk.time()
           let due = Env.get_int("STRATA_FLUID", 1) != 0 && (if scripted do frame % 6 == 0 else Math.floor(now *. 10.0) != Math.floor(t_prev *. 10.0) end)

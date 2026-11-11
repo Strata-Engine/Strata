@@ -15,6 +15,7 @@
 #include <string.h>
 #include <math.h>
 #include <stdatomic.h>
+#include "strata_hrir.h"
 
 #define SM_RATE 48000
 #define SM_BLOCK 256
@@ -41,7 +42,8 @@ enum {
     SM_OP_OCCLUDE = 7,
     SM_OP_ENVIRON = 8,
     SM_OP_GROUP = 9,     /* a = group, f0 = gain */
-    SM_OP_OUTPUT = 10    /* a = 0 speakers, 1 headphones */
+    SM_OP_OUTPUT = 10,   /* a = 0 speakers, 1 headphones */
+    SM_OP_RANGE = 11     /* f0 = reference distance, f1 = maximum distance (m) */
 };
 
 /* ---- the patch: SM_PATCH_FLOATS floats, sent as PATCH records of 12 ---- */
@@ -119,6 +121,17 @@ typedef struct {
     float env2;
     int64_t age, hold;
     int fading; int64_t fade_left, fade_len;
+    /* in the world */
+    int flat; float pos[3], ref, maxd, prio;
+    float occ_gain, occ_cut;       /* set by OCCLUDE (muffling through blocks) */
+    float loud;                    /* this block's rank: how loud it would be at the listener */
+    int mixed;                     /* mixed last block: entering or leaving the mix fades */
+    float coef[16];                /* last block's bus gains, to glide from */
+    float pan_l, pan_r;            /* last block's speaker gains */
+    SmSvf air; float air_a1, air_a2, air_a3, air_k;
+    float detune[4];               /* each source's detune as a ratio */
+    int krate;                     /* samples to the next control-rate update */
+    float k_pitch, k_gain, k_cut1, k_cut2, k_level1, k_oct;   /* what that update decided */
 } SmVoice;
 
 typedef struct {
@@ -130,6 +143,13 @@ typedef struct {
     SmStats st;
     _Atomic(SmRec *) recs[SM_RECS];
     _Atomic uint64_t blocks;
+    /* the listener: position, and right, up and front unit vectors */
+    float lis[3], lr[3], lu[3], lf[3];
+    int headphones;
+    float bus[16][SM_BLOCK];
+    float hist[16][SH_TAPS - 1 + SM_BLOCK];
+    float mono[SM_BLOCK];
+    int order[SM_TRACKED];
 } SmMixer;
 
 static inline void sm_rec_publish(SmMixer *m, int id, SmRec *r) {
@@ -152,6 +172,7 @@ static inline SmMixer *sm_open(void) {
     if (!m) return NULL;
     for (int g = 0; g < SM_GROUPS; g++) { m->group_gain[g] = 1.0f; m->group_now[g] = 1.0f; }
     m->st.peak_db = -120.0f; m->st.rms_db = -120.0f;
+    m->lr[0] = 1.0f; m->lu[1] = 1.0f; m->lf[2] = -1.0f;
     return m;
 }
 static inline void sm_close(SmMixer *m) { free(m); }
@@ -174,6 +195,37 @@ static inline void sm_env_stage(SmVoice *v, int stage) {
     v->stage_len = sm_samples(secs); v->stage_left = v->stage_len;
 }
 
+static inline float sm_dist(const SmMixer *m, const float *p) {
+    float d0 = p[0] - m->lis[0], d1 = p[1] - m->lis[1], d2 = p[2] - m->lis[2];
+    return sqrtf(d0 * d0 + d1 * d1 + d2 * d2);
+}
+/* how loud a voice would be at the listener, times its priority: the rank */
+static inline float sm_loudness(const SmMixer *m, float gain, float prio, int flat, const float *pos, float ref, float maxd, float occ, int group) {
+    float g = fabsf(gain) * (prio > 0.0f ? prio : 1.0f) * occ * m->group_gain[group >= 0 && group < SM_GROUPS ? group : 0];
+    if (flat) return g;
+    float d = sm_dist(m, pos);
+    if (d > maxd) return 0.0f;
+    return g * ref / (d > ref ? d : ref);
+}
+static inline void sm_norm3(float *v, float dx, float dy, float dz) {
+    float l = sqrtf(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+    if (l < 1e-6f) { v[0] = dx; v[1] = dy; v[2] = dz; return; }
+    v[0] /= l; v[1] /= l; v[2] /= l;
+}
+static inline void sm_cross(float *o, const float *a, const float *b) {
+    o[0] = a[1] * b[2] - a[2] * b[1]; o[1] = a[2] * b[0] - a[0] * b[2]; o[2] = a[0] * b[1] - a[1] * b[0];
+}
+static inline void sm_listener(SmMixer *m, const float *f) {
+    for (int i = 0; i < 3; i++) m->lis[i] = isfinite(f[i]) ? f[i] : 0.0f;
+    float fw[3] = { f[3], f[4], f[5] }, up[3] = { f[6], f[7], f[8] };
+    sm_norm3(fw, 0.0f, 0.0f, -1.0f); sm_norm3(up, 0.0f, 1.0f, 0.0f);
+    float r[3]; sm_cross(r, fw, up);
+    if (sqrtf(r[0] * r[0] + r[1] * r[1] + r[2] * r[2]) < 1e-4f) { float alt[3] = { 0.0f, 0.0f, 1.0f }; if (fabsf(fw[2]) > 0.9f) alt[2] = 0.0f, alt[1] = 1.0f; sm_cross(r, fw, alt); }
+    sm_norm3(r, 1.0f, 0.0f, 0.0f);
+    float u[3]; sm_cross(u, r, fw); sm_norm3(u, 0.0f, 1.0f, 0.0f);
+    memcpy(m->lr, r, sizeof r); memcpy(m->lu, u, sizeof u); memcpy(m->lf, fw, sizeof fw);
+}
+
 static inline void sm_play(SmMixer *m, const SmCmd *c) {
     int src = c->a;
     int direct = src >= SM_REC_FIRST;
@@ -191,8 +243,24 @@ static inline void sm_play(SmMixer *m, const SmCmd *c) {
     }
     SmVoice *v = NULL;
     for (int i = 0; i < SM_TRACKED; i++) if (m->voices[i].number == 0) { v = &m->voices[i]; break; }
-    if (!v) { m->st.refused++; return; }
+    if (!v) {   /* every slot taken: the newcomer replaces the quietest only if it would be louder */
+        float newl = sm_loudness(m, c->f[0], c->f[2], c->f[6] != 0.0f, &c->f[3], 1.0f, 100.0f, 1.0f, c->b);
+        SmVoice *low = NULL;
+        for (int i = 0; i < SM_TRACKED; i++) {
+            SmVoice *u = &m->voices[i];
+            u->loud = sm_loudness(m, u->gain * u->p[SM_P_GAIN], u->prio, u->flat, u->pos, u->ref, u->maxd, u->occ_gain, u->group);
+            if (!low || u->loud < low->loud) low = u;
+        }
+        m->st.refused++;
+        if (!low || newl <= low->loud) return;
+        sm_voice_release(low);
+        v = low;
+    }
     memset(v, 0, sizeof *v);
+    v->flat = c->f[6] != 0.0f; v->pos[0] = c->f[3]; v->pos[1] = c->f[4]; v->pos[2] = c->f[5];
+    v->ref = 1.0f; v->maxd = 100.0f; v->prio = c->f[2] > 0.0f ? c->f[2] : 1.0f;
+    v->occ_gain = 1.0f; v->occ_cut = 20000.0f;
+    v->mixed = 1;                  /* a new voice starts in the mix, its own attack intact; one ranked out fades from its first block */
     v->number = c->voice; v->src = src; v->group = c->b >= 0 && c->b < SM_GROUPS ? c->b : 0;
     if (direct) {
         memset(v->p, 0, sizeof v->p);
@@ -205,6 +273,8 @@ static inline void sm_play(SmMixer *m, const SmCmd *c) {
     v->gain = c->f[0]; v->pitch = c->f[1] > 0.0f ? c->f[1] : 1.0f; v->pan = sm_clampf(c->f[7], -1.0f, 1.0f);
     for (int i = 0; i < 4; i++) { v->ctl[i] = v->ctl_to[i] = sm_clampf(v->p[SM_P_CTL(i) + 4], 0.0f, 1.0f); }
     v->hold = sm_samples(v->p[SM_P_HOLD]);
+    for (int i = 0; i < 4; i++) v->detune[i] = (float)pow(2.0, v->p[SM_P_SRC(i) + 3] / 1200.0);
+    v->krate = 0;
     v->coef_age = 1 << 30;
     v->gain_now = -1.0f;           /* set on the first sample, unsmoothed */
     v->env = 0.0f; sm_env_stage(v, 0);
@@ -229,10 +299,24 @@ static inline void sm_command(SmMixer *m, const SmCmd *c) {
         if (c->f[0] < 0.0f) { if (v->stage < 3) sm_env_stage(v, 3); }
         else if (!v->fading) { v->fading = 1; v->fade_len = v->fade_left = sm_samples(c->f[0] > 0.005f ? c->f[0] : 0.005f); }
         break; }
+    case SM_OP_MOVE: {
+        SmVoice *v = sm_find(m, c->voice);
+        if (v) for (int i = 0; i < 3; i++) if (isfinite(c->f[i])) v->pos[i] = c->f[i];
+        break; }
+    case SM_OP_RANGE: {
+        SmVoice *v = sm_find(m, c->voice);
+        if (v) { v->ref = c->f[0] > 0.01f ? c->f[0] : 0.01f; v->maxd = c->f[1] > v->ref ? c->f[1] : v->ref; }
+        break; }
+    case SM_OP_OCCLUDE: {
+        SmVoice *v = sm_find(m, c->voice);
+        if (v) { v->occ_gain = sm_clampf(c->f[0], 0.0f, 1.0f); v->occ_cut = sm_clampf(c->f[1], 200.0f, 20000.0f); }
+        break; }
+    case SM_OP_LISTENER: sm_listener(m, c->f); break;
+    case SM_OP_OUTPUT: m->headphones = c->a == 1; break;
     case SM_OP_GROUP:
         if (c->a >= 0 && c->a < SM_GROUPS) m->group_gain[c->a] = c->f[0] < 0.0f ? 0.0f : c->f[0];
         break;
-    default: break;   /* MOVE, LISTENER, OCCLUDE, ENVIRON, OUTPUT: given meaning by later work */
+    default: break;   /* ENVIRON: given meaning by later work */
     }
 }
 
@@ -253,7 +337,7 @@ static inline float sm_source(SmVoice *v, int i, float pitch_mul) {
     float level = s[2];
     float out = 0.0f;
     if (kind >= SM_SRC_SINE && kind <= SM_SRC_SQUARE) {
-        double hz = s[1] * pitch_mul * pow(2.0, s[3] / 1200.0);
+        double hz = s[1] * pitch_mul * v->detune[i];
         double dt = hz / SM_RATE; if (dt > 0.49) dt = 0.49; if (dt < 0.0) dt = 0.0;
         double t = v->phase[i];
         switch (kind) {
@@ -343,49 +427,59 @@ static inline int sm_env_step(SmVoice *v) {
 }
 
 static const float sm_smooth = 0.0041580f;   /* 1 - exp(-1 / (5 ms * 48 kHz)) */
+#define SM_KRATE 16                           /* control rate: every 16 samples, 3 kHz */
+static const float sm_smooth_k = 0.0644f;     /* the same 5 ms glide, taken in steps of SM_KRATE */
 
-/* add one voice's [frames] into stereo [out]; answers 1 when it has ended */
-static inline int sm_voice_mix(SmMixer *m, SmVoice *v, float *out, int frames) {
-    (void)m;
-    float ga = cosf((float)((v->pan + 1.0f) * SM_PI / 4.0)), gb = sinf((float)((v->pan + 1.0f) * SM_PI / 4.0));
+/* Render one voice's [frames]: into [mono] (added), or, for a stereo
+ * recording played flat, into stereo [out] with the gain ramp x0..x1.
+ * Answers 1 when the voice has ended. */
+static inline int sm_voice_render(SmMixer *m, SmVoice *v, float *mono, float *out, int frames, float x0, float x1) {
     for (int n = 0; n < frames; n++) {
         if (v->hold > 0 && v->age == v->hold && v->stage < 3) sm_env_stage(v, 3);
         v->age++;
         if (sm_env_step(v)) return 1;
-        /* controls glide toward what they were last set to */
-        float pitch_mul = v->pitch, gain_mul = v->gain * v->p[SM_P_GAIN];
-        float cut1 = v->p[SM_P_FLT(0) + 1], cut2 = v->p[SM_P_FLT(1) + 1], level1 = -1.0f;
-        for (int c = 0; c < 4; c++) {
-            int tgt = (int)v->p[SM_P_CTL(c)];
-            if (v->p[SM_P_CTL(c) + 1] == 0.0f && v->p[SM_P_CTL(c) + 2] == 0.0f) continue;   /* unused */
-            v->ctl[c] += (v->ctl_to[c] - v->ctl[c]) * sm_smooth;
-            float val = sm_ctl_map(v, c);
-            if (tgt == SM_TGT_PITCH) pitch_mul *= val;
-            else if (tgt == SM_TGT_GAIN) gain_mul *= val;
-            else if (tgt == SM_TGT_CUTOFF) cut1 = val;
-            else if (tgt == SM_TGT_CUTOFF2) cut2 = val;
-            else if (tgt == SM_TGT_LEVEL1) level1 = val;
-        }
-        float cut_oct = v->p[SM_P_ENV(1) + 4] * v->env;   /* env 1 rides on the gain envelope's shape */
-        for (int i = 0; i < 2; i++) {
-            const float *d = &v->p[SM_P_MOD(i)];
-            int kind = (int)d[0];
-            if (kind == SM_MOD_OFF) continue;
-            float val;
-            if (kind == SM_MOD_LFO) {
-                val = (float)sin(2.0 * SM_PI * v->mphase[i]);
-                v->mphase[i] += d[1] / SM_RATE; if (v->mphase[i] >= 1.0) v->mphase[i] -= 1.0;
-            } else {
-                if (v->walk_left[i] <= 0) { v->walk_to[i] = sm_white(v); v->walk_left[i] = (int)(SM_RATE / (d[1] > 0.05f ? d[1] : 0.05f)); }
-                v->walk_left[i]--;
-                v->walk[i] += (v->walk_to[i] - v->walk[i]) * (d[1] * 2.0f / SM_RATE);
-                val = v->walk[i];
+        /* controls and modulators run at a control rate: every SM_KRATE samples */
+        if (v->krate <= 0) {
+            v->krate = SM_KRATE;
+            float pitch_mul = v->pitch, gain_mul = v->gain * v->p[SM_P_GAIN];
+            float cut1 = v->p[SM_P_FLT(0) + 1], cut2 = v->p[SM_P_FLT(1) + 1], level1 = -1.0f;
+            for (int c = 0; c < 4; c++) {
+                int tgt = (int)v->p[SM_P_CTL(c)];
+                if (v->p[SM_P_CTL(c) + 1] == 0.0f && v->p[SM_P_CTL(c) + 2] == 0.0f) continue;   /* unused */
+                v->ctl[c] += (v->ctl_to[c] - v->ctl[c]) * sm_smooth_k;
+                float val = sm_ctl_map(v, c);
+                if (tgt == SM_TGT_PITCH) pitch_mul *= val;
+                else if (tgt == SM_TGT_GAIN) gain_mul *= val;
+                else if (tgt == SM_TGT_CUTOFF) cut1 = val;
+                else if (tgt == SM_TGT_CUTOFF2) cut2 = val;
+                else if (tgt == SM_TGT_LEVEL1) level1 = val;
             }
-            int tgt = (int)d[2];
-            if (tgt == SM_TGT_PITCH) pitch_mul *= powf(2.0f, d[3] * val / 12.0f);
-            else if (tgt == SM_TGT_CUTOFF) cut_oct += d[3] * val;
-            else if (tgt == SM_TGT_GAIN) { float g = 1.0f + d[3] * val; gain_mul *= g < 0.0f ? 0.0f : g; }
+            float oct = 0.0f;
+            for (int i = 0; i < 2; i++) {
+                const float *d = &v->p[SM_P_MOD(i)];
+                int kind = (int)d[0];
+                if (kind == SM_MOD_OFF) continue;
+                float val;
+                if (kind == SM_MOD_LFO) {
+                    val = sinf((float)(2.0 * SM_PI * v->mphase[i]));
+                    v->mphase[i] += d[1] * SM_KRATE / SM_RATE; if (v->mphase[i] >= 1.0) v->mphase[i] -= floor(v->mphase[i]);
+                } else {
+                    if (v->walk_left[i] <= 0) { v->walk_to[i] = sm_white(v); v->walk_left[i] = (int)(SM_RATE / (d[1] > 0.05f ? d[1] : 0.05f)); }
+                    v->walk_left[i] -= SM_KRATE;
+                    v->walk[i] += (v->walk_to[i] - v->walk[i]) * (d[1] * 2.0f * SM_KRATE / SM_RATE);
+                    val = v->walk[i];
+                }
+                int tgt = (int)d[2];
+                if (tgt == SM_TGT_PITCH) pitch_mul *= powf(2.0f, d[3] * val / 12.0f);
+                else if (tgt == SM_TGT_CUTOFF) oct += d[3] * val;
+                else if (tgt == SM_TGT_GAIN) { float g = 1.0f + d[3] * val; gain_mul *= g < 0.0f ? 0.0f : g; }
+            }
+            v->k_pitch = pitch_mul; v->k_gain = gain_mul; v->k_cut1 = cut1; v->k_cut2 = cut2; v->k_level1 = level1; v->k_oct = oct;
+            v->coef_age = 1 << 30;   /* filters follow at once */
         }
+        v->krate--;
+        float pitch_mul = v->k_pitch, gain_mul = v->k_gain, cut1 = v->k_cut1, cut2 = v->k_cut2, level1 = v->k_level1;
+        float cut_oct = v->p[SM_P_ENV(1) + 4] * v->env + v->k_oct;   /* env 1 rides on the gain envelope's shape */
         if (v->gain_now < 0.0f) v->gain_now = gain_mul;
         v->gain_now += (gain_mul - v->gain_now) * sm_smooth;
         int recs = 0, done = 0, others = 0;
@@ -394,10 +488,11 @@ static inline int sm_voice_mix(SmMixer *m, SmVoice *v, float *out, int frames) {
             if (kd == SM_SRC_RECORDING) { recs++; if (v->rec_done[i]) done++; } else if (kd != SM_SRC_OFF) others++;
         }
         if (recs > 0 && done == recs && others == 0) return 1;
+        float xf = x0 + (x1 - x0) * (float)n / (float)frames;
         if (v->stereo) {   /* a stereo recording played flat: both channels, balanced by pan, no filters */
             SmRec *r = v->rec[0];
             int at = (int)v->rpos[0];
-            float amp = v->env * v->gain_now * m->group_now[v->group];
+            float amp = v->env * v->gain_now * m->group_now[v->group] * xf;
             if (v->fading) { if (v->fade_left <= 0) return 1; amp *= (float)v->fade_left / (float)v->fade_len; v->fade_left--; }
             float gl = v->pan > 0.0f ? 1.0f - v->pan : 1.0f, gr = v->pan < 0.0f ? 1.0f + v->pan : 1.0f;
             out[2 * n] += r->data[2 * at] * amp * gl; out[2 * n + 1] += r->data[2 * at + 1] * amp * gr;
@@ -407,11 +502,11 @@ static inline int sm_voice_mix(SmMixer *m, SmVoice *v, float *out, int frames) {
         }
         float x = 0.0f;
         for (int i = 0; i < 4; i++) {
-            float s = sm_source(v, i, pitch_mul);
-            if (i == 0 && level1 >= 0.0f && v->p[SM_P_SRC(0) + 2] != 0.0f) s *= level1 / v->p[SM_P_SRC(0) + 2];
-            x += s;
+            float sv = sm_source(v, i, pitch_mul);
+            if (i == 0 && level1 >= 0.0f && v->p[SM_P_SRC(0) + 2] != 0.0f) sv *= level1 / v->p[SM_P_SRC(0) + 2];
+            x += sv;
         }
-        if (++v->coef_age >= 32) {
+        if (++v->coef_age >= SM_KRATE) {
             v->coef_age = 0;
             sm_svf_coef(v, 0, cut1 * powf(2.0f, cut_oct), v->p[SM_P_FLT(0) + 2]);
             sm_svf_coef(v, 1, cut2, v->p[SM_P_FLT(1) + 2]);
@@ -419,15 +514,169 @@ static inline int sm_voice_mix(SmMixer *m, SmVoice *v, float *out, int frames) {
         int k0 = (int)v->p[SM_P_FLT(0)], k1 = (int)v->p[SM_P_FLT(1)];
         if (k0) x = sm_svf(v, 0, k0, x);
         if (k1) x = sm_svf(v, 1, k1, x);
-        float amp = x * v->env * v->gain_now * m->group_now[v->group];
+        float amp = x * v->env * v->gain_now * m->group_now[v->group] * xf;
         if (v->fading) {
             if (v->fade_left <= 0) return 1;
             amp *= (float)v->fade_left / (float)v->fade_len;
             v->fade_left--;
         }
-        out[2 * n] += amp * ga; out[2 * n + 1] += amp * gb;
+        mono[n] += amp;
     }
     return 0;
+}
+
+/* A virtual voice: time passes, nothing is computed. Answers 1 when it ends. */
+static inline int sm_voice_skip(SmVoice *v, int frames) {
+    if (v->fading) { v->fade_left -= frames; if (v->fade_left <= 0) return 1; }
+    int left = frames;
+    while (left > 0) {
+        if (v->hold > 0 && v->age < v->hold && v->age + left >= v->hold && v->stage < 3) {
+            int k = (int)(v->hold - v->age); v->age += k; left -= k;
+            if (v->stage == 0 || v->stage == 1 || v->stage == 3) v->stage_left = v->stage_left > k ? v->stage_left - k : 0;
+            sm_env_stage(v, 3);
+            continue;
+        }
+        if (v->stage == 0 || v->stage == 1 || v->stage == 3) {
+            int64_t k = v->stage_left < left ? v->stage_left : left;
+            v->stage_left -= k; v->age += k; left -= (int)k;
+            float to = v->stage == 0 ? 1.0f : v->stage == 1 ? sm_clampf(v->p[SM_P_ENV(0) + 2], 0.0f, 1.0f) : 0.0f;
+            v->env = v->stage_len > 0 ? to + (v->stage_from - to) * (float)v->stage_left / (float)v->stage_len : to;
+            if (v->stage_left <= 0) { if (v->stage == 3) return 1; sm_env_stage(v, v->stage + 1); }
+        } else if (v->stage == 2) { v->age += left; left = 0; }
+        else return 1;
+    }
+    int recs = 0, done = 0, others = 0;
+    for (int i = 0; i < 4; i++) {
+        int kd = (int)v->p[SM_P_SRC(i)];
+        if (kd == SM_SRC_RECORDING && v->rec[i]) {
+            recs++;
+            double rate = (v->p[SM_P_SRC(i) + 1] > 0.0f ? v->p[SM_P_SRC(i) + 1] : 1.0f) * v->pitch;
+            v->rpos[i] += rate * frames;
+            if (v->rpos[i] >= v->rec[i]->frames) {
+                if (v->p[SM_P_LOOP] != 0.0f && !v->stereo) v->rpos[i] = fmod(v->rpos[i], (double)v->rec[i]->frames);
+                else v->rec_done[i] = 1;
+            }
+            if (v->rec_done[i]) done++;
+        } else if (kd != SM_SRC_OFF) others++;
+    }
+    return recs > 0 && done == recs && others == 0;
+}
+
+/* SN3D real spherical harmonics to order 3, ACN order; X front, Y left, Z up */
+static inline void sm_sh(float X, float Y, float Z, float *o) {
+    const float s3 = 1.7320508f, s15 = 3.8729833f, s58 = 0.7905694f, s38 = 0.6123724f;
+    o[0] = 1.0f; o[1] = Y; o[2] = Z; o[3] = X;
+    o[4] = s3 * X * Y; o[5] = s3 * Y * Z; o[6] = 0.5f * (3 * Z * Z - 1); o[7] = s3 * X * Z; o[8] = 0.5f * s3 * (X * X - Y * Y);
+    o[9] = s58 * Y * (3 * X * X - Y * Y); o[10] = s15 * X * Y * Z; o[11] = s38 * Y * (5 * Z * Z - 1); o[12] = 0.5f * Z * (5 * Z * Z - 3);
+    o[13] = s38 * X * (5 * Z * Z - 1); o[14] = 0.5f * s15 * Z * (X * X - Y * Y); o[15] = s58 * X * (X * X - 3 * Y * Y);
+}
+/* a channel's symmetry left to right: channels with m < 0 change sign in the other ear */
+static inline int sm_sh_odd(int k) { int n = k < 1 ? 0 : k < 4 ? 1 : k < 9 ? 2 : 3; return k - n * (n + 1) < 0; }
+
+/* place a positional voice's mono block: air absorption, distance, then the bus (headphones) or a pan (speakers) */
+static inline void sm_place(SmMixer *m, SmVoice *v, float *out, int frames) {
+    float d[3] = { v->pos[0] - m->lis[0], v->pos[1] - m->lis[1], v->pos[2] - m->lis[2] };
+    float dist = sqrtf(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+    float X = 1.0f, Y = 0.0f, Z = 0.0f;
+    if (dist > 1e-4f) {
+        X = (d[0] * m->lf[0] + d[1] * m->lf[1] + d[2] * m->lf[2]) / dist;
+        Y = -(d[0] * m->lr[0] + d[1] * m->lr[1] + d[2] * m->lr[2]) / dist;
+        Z = (d[0] * m->lu[0] + d[1] * m->lu[1] + d[2] * m->lu[2]) / dist;
+    }
+    float g = v->occ_gain * v->ref / (dist > v->ref ? dist : v->ref);
+    /* air absorption: 20 kHz at the listener down to 4 kHz at 200 m; muffling may close it further */
+    float air = 20000.0f * powf(0.2f, (dist < 200.0f ? dist : 200.0f) / 200.0f);
+    float cut = air < v->occ_cut ? air : v->occ_cut;
+    if (cut < 19000.0f) {
+        float fc = sm_clampf(cut, 20.0f, 0.45f * SM_RATE), gg = (float)tan(SM_PI * fc / SM_RATE), k = 1.41421f;
+        v->air_a1 = 1.0f / (1.0f + gg * (gg + k)); v->air_a2 = gg * v->air_a1; v->air_a3 = gg * v->air_a2; v->air_k = k;
+        for (int n = 0; n < frames; n++) {
+            SmSvf *f = &v->air; float x = m->mono[n];
+            float v3 = x - f->ic2, v1 = v->air_a1 * f->ic1 + v->air_a2 * v3, v2 = f->ic2 + v->air_a2 * f->ic1 + v->air_a3 * v3;
+            f->ic1 = 2.0f * v1 - f->ic1; f->ic2 = 2.0f * v2 - f->ic2;
+            m->mono[n] = v2;
+        }
+    }
+    if (m->headphones) {
+        float c[16]; sm_sh(X, Y, Z, c);
+        for (int k = 0; k < 16; k++) {
+            float c0 = v->coef[k], c1 = c[k] * g, step = (c1 - c0) / (float)frames;
+            float *b = m->bus[k];
+            for (int n = 0; n < frames; n++) b[n] += m->mono[n] * (c0 + step * (float)n);
+            v->coef[k] = c1;
+        }
+    } else {
+        float lat = sm_clampf(-Y, -1.0f, 1.0f), ang = (lat + 1.0f) * (float)SM_PI / 4.0f;
+        float l1 = cosf(ang) * g, r1 = sinf(ang) * g, l0 = v->pan_l, r0 = v->pan_r;
+        for (int n = 0; n < frames; n++) {
+            float t = (float)n / (float)frames;
+            out[2 * n] += m->mono[n] * (l0 + (l1 - l0) * t); out[2 * n + 1] += m->mono[n] * (r0 + (r1 - r0) * t);
+        }
+        v->pan_l = l1; v->pan_r = r1;
+    }
+}
+
+static SmMixer *sm_sort_m;
+static int sm_by_loud(const void *a, const void *b) {
+    float x = sm_sort_m->voices[*(const int *)a].loud, y = sm_sort_m->voices[*(const int *)b].loud;
+    if (x != y) return x < y ? 1 : -1;
+    return *(const int *)a - *(const int *)b;
+}
+
+/* one block of at most SM_BLOCK frames */
+static inline void sm_mix_block(SmMixer *m, float *out, int frames, int *playing, int *mixed_n) {
+    /* rank: the loudest at the listener, times priority, are mixed */
+    int n = 0;
+    for (int i = 0; i < SM_TRACKED; i++) {
+        SmVoice *v = &m->voices[i];
+        if (v->number == 0) continue;
+        v->loud = sm_loudness(m, v->gain * v->p[SM_P_GAIN], v->prio, v->flat, v->pos, v->ref, v->maxd, v->occ_gain, v->group);
+        m->order[n++] = i;
+    }
+    sm_sort_m = m;
+    qsort(m->order, (size_t)n, sizeof(int), sm_by_loud);
+    for (int k = 0; k < 16; k++) memset(m->bus[k], 0, sizeof(float) * (size_t)frames);
+    int mixed = 0;
+    for (int j = 0; j < n; j++) {
+        SmVoice *v = &m->voices[m->order[j]];
+        int want = j < SM_MIXED && v->loud > 0.0f;
+        int ended;
+        if (want || v->mixed) {   /* mixed, or leaving the mix: render, fading in or out over this block */
+            float x0 = v->mixed ? 1.0f : 0.0f, x1 = want ? 1.0f : 0.0f;
+            memset(m->mono, 0, sizeof(float) * (size_t)frames);
+            ended = sm_voice_render(m, v, m->mono, out, frames, x0, x1);
+            if (!v->stereo) {
+                if (v->flat) {
+                    float ga = cosf((v->pan + 1.0f) * (float)SM_PI / 4.0f), gb = sinf((v->pan + 1.0f) * (float)SM_PI / 4.0f);
+                    for (int t = 0; t < frames; t++) { out[2 * t] += m->mono[t] * ga; out[2 * t + 1] += m->mono[t] * gb; }
+                } else sm_place(m, v, out, frames);
+            }
+            v->mixed = want;
+            if (want) mixed++;
+        } else ended = sm_voice_skip(v, frames);
+        if (ended) sm_voice_release(v);
+        else (*playing)++;
+    }
+    *mixed_n = mixed;
+    /* decode the bus: binaural for headphones (one ear's filters, mirrored), first-order for speakers */
+    if (m->headphones) {
+        float S[SM_BLOCK], A[SM_BLOCK];
+        memset(S, 0, sizeof(float) * (size_t)frames); memset(A, 0, sizeof(float) * (size_t)frames);
+        for (int k = 0; k < 16; k++) {
+            float *h = m->hist[k];
+            memcpy(h + SH_TAPS - 1, m->bus[k], sizeof(float) * (size_t)frames);
+            float *acc = sm_sh_odd(k) ? A : S;
+            const float *f = strata_hrir[k];
+            for (int q = 0; q < SH_TAPS; q++) {   /* tap by tap, so the inner loop runs along the block */
+                const float fq = f[q], *x = h + SH_TAPS - 1 - q;
+                for (int t = 0; t < frames; t++) acc[t] += fq * x[t];
+            }
+            memmove(h, h + frames, sizeof(float) * (SH_TAPS - 1));
+        }
+        for (int t = 0; t < frames; t++) { out[2 * t] += S[t] + A[t]; out[2 * t + 1] += S[t] - A[t]; }
+    } else {
+        for (int t = 0; t < frames; t++) { float w = m->bus[0][t], y = m->bus[1][t]; out[2 * t] += 0.5f * (w + y); out[2 * t + 1] += 0.5f * (w - y); }
+    }
 }
 
 /* Mix [frames] (any count) into interleaved stereo [out], replacing it. */
@@ -435,14 +684,10 @@ static inline void sm_mix(SmMixer *m, float *out, int frames) {
     memset(out, 0, sizeof(float) * 2 * (size_t)frames);
     for (int g = 0; g < SM_GROUPS; g++) m->group_now[g] += (m->group_gain[g] - m->group_now[g]) * 0.5f;
     int playing = 0, mixed = 0;
-    for (int i = 0; i < SM_TRACKED; i++) {
-        SmVoice *v = &m->voices[i];
-        if (v->number == 0) continue;
-        if (mixed < SM_MIXED) {
-            mixed++;
-            if (sm_voice_mix(m, v, out, frames)) { sm_voice_release(v); continue; }
-        }
-        playing++;
+    for (int at = 0; at < frames; at += SM_BLOCK) {
+        int k = frames - at < SM_BLOCK ? frames - at : SM_BLOCK;
+        playing = 0;
+        sm_mix_block(m, out + 2 * at, k, &playing, &mixed);
     }
     /* the limiter: instant attack, 100 ms release, so the output never passes SM_LIMIT */
     double sum = 0.0; float peak = 0.0f;
@@ -458,12 +703,16 @@ static inline void sm_mix(SmMixer *m, float *out, int frames) {
         if (q > peak) peak = q;
         sum += (double)out[2 * n] * out[2 * n] + (double)out[2 * n + 1] * out[2 * n + 1];
     }
-    m->st.playing = playing; m->st.virtual_ = 0;
+    m->st.playing = playing; m->st.virtual_ = playing - mixed;
     atomic_fetch_add(&m->blocks, 1);
     m->st.peak_db = (float)(20.0 * log10(peak > 1e-6f ? peak : 1e-6f));
     double rms = frames > 0 ? sqrt(sum / (2.0 * frames)) : 0.0;
     m->st.rms_db = (float)(20.0 * log10(rms > 1e-6 ? rms : 1e-6));
 }
+
+/* For tests and tools: is voice [number] mixed (not virtual)? Where is its source [i] in its recording, in frames? */
+static inline int sm_is_mixed(SmMixer *m, int32_t number) { SmVoice *v = sm_find(m, number); return v && v->mixed; }
+static inline double sm_voice_position(SmMixer *m, int32_t number, int i) { SmVoice *v = sm_find(m, number); return v && i >= 0 && i < 4 ? v->rpos[i] : -1.0; }
 
 /* ---- files ---- */
 static inline void sm_put32(unsigned char *p, uint32_t v) { p[0] = v; p[1] = v >> 8; p[2] = v >> 16; p[3] = v >> 24; }
@@ -544,6 +793,7 @@ static inline int sm_fp_read(const char *path, float *fp, int max) {
     return windows;
 }
 #define SM_FP_MAX_WINDOWS 6000   /* ten minutes */
+#define SM_FP_FLOOR -80.0f       /* bands quieter than this on both sides are not compared */
 /* 0 when every band of every window is within [band_db] and every window's
  * total loudness within [total_db]; 1 when not; 2 when the shapes differ
  * or a file cannot be read. Differences go to stderr. */
@@ -557,6 +807,7 @@ static inline int sm_fp_compare(const char *stored, const char *fresh, float ban
         for (int i = 0; i < SM_FP_VALUES; i++) {
             float x = a[w * SM_FP_VALUES + i], y = b[w * SM_FP_VALUES + i];
             ea += pow(10.0, x / 10.0); eb += pow(10.0, y / 10.0);
+            if (x < SM_FP_FLOOR && y < SM_FP_FLOOR) continue;   /* both near silence: noise, not a difference */
             if (fabsf(x - y) > band_db) { if (bad < 8) fprintf(stderr, "fp: window %d value %d: %.2f against %.2f\n", w, i, x, y); bad++; }
         }
         double d = 10.0 * log10(ea) - 10.0 * log10(eb);

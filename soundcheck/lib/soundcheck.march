@@ -55,12 +55,68 @@ mod Soundcheck do
   end
   pfn flat_src(src : Int) : Strata.Sound.Sound -> Strata.Sound.Sound do fn s -> match Sn.play_flat(s, src, 1.0, 0.0, 1.0) do (s2, _) -> s2 end end
 
+  -- placed sound: the listener at the origin facing -z
+  pfn face() : Strata.Sound.Sound -> Strata.Sound.Sound do fn s -> Sn.listener(s, 0.0, 0.0, 0.0, 0.0, 0.0, -1.0, 0.0, 1.0, 0.0) end
+  pfn output(hp : Bool) : Strata.Sound.Sound -> Strata.Sound.Sound do fn s -> Sn.set_output(s, hp) end
+  pfn at(src : Int, x : Float, y : Float, z : Float, gain : Float) : Strata.Sound.Sound -> Strata.Sound.Sound do fn s -> match Sn.play(s, src, x, y, z, gain, 1.0, 1.0) do (s2, _) -> s2 end end
+  pfn mv(v : Int, x : Float, y : Float, z : Float) : Strata.Sound.Sound -> Strata.Sound.Sound do fn s -> Sn.move(s, v, x, y, z) end
+  pfn noise_patch() : Strata.Sound.Patch do Sn.with_source(Sn.patch(), 0, Sn.source_pink(), 0.0, 0.4, 0.0) end
+
+  -- orbit: pink noise circling the listener at 5 m once in 8 s, starting ahead
+  pfn orbit_go(i : Int, n : Int, acc : List(Ev)) : List(Ev) do
+    if i > n do acc
+    else
+      let t = int_to_float(i) *. frame()
+      let a = t /. 8.0 *. 6.28318531
+      orbit_go(i + 1, n, Cons(Ev(t, mv(1, 5.0 *. Math.sin(a), 0.0, -5.0 *. Math.cos(a))), acc))
+    end
+  end
+  pfn orbit(hp : Bool) : List(Ev) do
+    Cons(Ev(0.0, output(hp)), Cons(Ev(0.0, face()), Cons(Ev(0.0, up(noise_patch())), Cons(Ev(0.0, at(1, 0.0, 0.0, -5.0, 1.0)), List.reverse(orbit_go(1, 480, Nil))))))
+  end
+  -- distance: a 300 Hz tone walking away from 1 m to 120 m over 8 s
+  pfn away_go(i : Int, n : Int, acc : List(Ev)) : List(Ev) do
+    if i > n do acc
+    else
+      let t = int_to_float(i) *. frame()
+      away_go(i + 1, n, Cons(Ev(t, mv(1, 0.0, 0.0, 0.0 -. (1.0 +. 119.0 *. t /. 8.0))), acc))
+    end
+  end
+  pfn distance() : List(Ev) do
+    let tone300 = Sn.with_source(Sn.patch(), 0, Sn.source_saw(), 300.0, 0.3, 0.0)
+    Cons(Ev(0.0, face()), Cons(Ev(0.0, up(tone300)), Cons(Ev(0.0, at(1, 0.0, 0.0, -1.0, 1.0)), Cons(Ev(0.0, fn s -> Sn.with_range(s, 1, 1.0, 200.0)), List.reverse(away_go(1, 480, Nil))))))
+  end
+  -- load64: 64 rich voices all round, on headphones: what the mixer costs
+  pfn rich() : Strata.Sound.Patch do
+    Sn.with_source(Sn.patch(), 0, Sn.source_saw(), 110.0, 0.1, 0.0)
+    |> Sn.with_source(1, Sn.source_pink(), 0.0, 0.05, 0.0)
+    |> Sn.with_source(2, Sn.source_square(), 165.0, 0.05, 7.0)
+    |> Sn.with_filter(0, Sn.filter_low(), 1200.0, 1.2)
+    |> Sn.with_filter(1, Sn.filter_peak(), 600.0, 2.0)
+    |> Sn.with_mod(0, Sn.mod_lfo(), 0.3, Sn.target_cutoff(), 1.0)
+    |> Sn.with_mod(1, Sn.mod_walk(), 0.5, Sn.target_gain(), 0.3)
+  end
+  pfn ring_go(i : Int, acc : List(Ev)) : List(Ev) do
+    if i >= 64 do acc
+    else
+      let a = int_to_float(i) *. 2.39996323
+      let y = 1.0 -. 2.0 *. (int_to_float(i) +. 0.5) /. 64.0
+      let r = 4.0 *. Math.sqrt(1.0 -. y *. y)
+      ring_go(i + 1, Cons(Ev(0.0, at(1, r *. Math.cos(a), 4.0 *. y, r *. Math.sin(a), 0.5)), acc))
+    end
+  end
+  pfn load64() : List(Ev) do Cons(Ev(0.0, output(true)), Cons(Ev(0.0, face()), Cons(Ev(0.0, up(rich())), ring_go(0, Nil)))) end
+
   -- a scene: its events and its length in seconds
   pfn scene(name : String) : (List(Ev), Float) do
     if name == "blocks" do (blocks_go(1), 4.5)
     else if name == "strike" do (Cons(Ev(0.0, up(Sn.strike())), strikes_go(0)), 3.5)
     else if name == "tone" do (tone_scene(), 1.5)
-    else (Nil, 0.0) end end end
+    else if name == "orbit-speakers" do (orbit(false), 8.0)
+    else if name == "orbit-headphones" do (orbit(true), 8.0)
+    else if name == "distance" do (distance(), 8.0)
+    else if name == "load64" do (load64(), 3.0)
+    else (Nil, 0.0) end end end end end end end
   end
 
   @[no_warn_recursion]
@@ -181,7 +237,7 @@ mod Soundcheck do
             let frames = float_to_int(secs /. frame())
             let s = run(evs, Sn.new(), world(), Strata.Fluid.new(Strata.Blocks.empty(), Nil), 0, frames)
             Strata.Ffi.Audio.close()
-            println("soundcheck: " ++ name ++ " -> " ++ out ++ " (" ++ int_to_string(frames) ++ " frames, " ++ int_to_string(Sn.refused(s)) ++ " refused)")
+            println("soundcheck: " ++ name ++ " -> " ++ out ++ " (" ++ int_to_string(frames) ++ " frames, " ++ int_to_string(Sn.refused(s)) ++ " refused, mixing " ++ float_to_string(Math.round(Strata.Ffi.Audio.stat(5) *. 1000.0) /. 10.0) ++ "% of real time)")
           end end
       end
     end end end

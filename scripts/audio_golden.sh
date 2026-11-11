@@ -5,6 +5,7 @@
 # keeps the WAVs in $TMPDIR/strata-audio-listen: listen before committing.
 cd "$(dirname "$0")/.." || exit 1
 . scripts/env.sh
+native/stamp_audio.sh --check || exit 1
 UPDATE=0; [ "$1" = "--update" ] && UPDATE=1
 OUT="${TMPDIR:-/tmp}/strata-audio.$$"; mkdir -p "$OUT" test/golden-audio native/tests/bin
 trap 'rm -rf "$OUT"' EXIT
@@ -21,7 +22,7 @@ STRATA_AUDIO_FAIL=1 SOUNDCHECK_SCENE=nodevice $SC > "$OUT/nodevice.log" 2>&1 || 
 # a decoded budget refuses a recording past it, and counts it
 SOUNDCHECK_SCENE=budget SOUNDCHECK_OUT="$OUT/budget.wav" $SC > "$OUT/budget.log" 2>&1 || { echo "FAIL: budget"; cat "$OUT/budget.log"; exit 1; }
 
-SCENES='blocks strike tone recording'
+SCENES='blocks strike tone recording orbit-speakers orbit-headphones distance load64'
 fail=0
 [ $UPDATE -eq 1 ] && mkdir -p "$LISTEN"
 for s in $SCENES; do
