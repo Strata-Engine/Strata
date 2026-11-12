@@ -298,7 +298,7 @@ mod Strata.Nav do
           (x0, nx) ->
             match span(sz, gz, 12 + r, 96) do
               (z0, nz) ->
-                match span(sy, gy, 8 + h, 40) do
+                match span(sy, gy, 8 + h, 40 + 2 * h) do
                   (y0, ny) ->
                     let c = { nc_w: w, nc_reg: Wn.registry(w), nc_x0: x0, nc_y0: y0, nc_z0: z0, nc_nx: nx, nc_ny: ny, nc_nz: nz, nc_r: r, nc_h: h, nc_step: stp, nc_drop: drp, nc_swim: sw }
                     let n = nx * ny * nz
@@ -307,7 +307,8 @@ mod Strata.Nav do
                     if si < 0 || budget <= 0 do NvPath(Nil, false, 0)
                     else if stand(st, c, sx, sy, sz) == 0 do NvPath(Nil, false, 0)
                     else
-                      let cap = 12 * budget + 16
+                      -- an expansion pushes at most one cell a level for each straight way and one for each diagonal
+                      let cap = (4 * (stp + drp + 1) + 4) * budget + 16
                       let gi = if goal do idx(c, gx, gy, gz) else -2 end
                       let g0 = NativeArray.set_i32(NativeArray.make_i32(n, 1000000000), si, 0)
                       let h0 = if goal do octile(sx, sz, gx, gz) else 0 end
@@ -322,7 +323,7 @@ mod Strata.Nav do
     end
   end
 
-  doc "The way for the walker from the cell (sx, sy, sz) to (gx, gy, gz), both cells that hold it (see `foot`), through the world as loaded now: an A* search that expands at most [budget] cells, inside a window of at most 96 by 40 by 96 cells about the two. The path is arrived when it ends at the goal; else it ends at the cell reached that is nearest the goal over the ground (which may be the start), and a game walks it and asks again. Empty when the start does not hold the walker. A straight step costs 10, a diagonal 14, a cell climbed 5 more, a cell dropped 1 more, and a move into water three times as much."
+  doc "The way for the walker from the cell (sx, sy, sz) to (gx, gy, gz), both cells that hold it (see `foot`), through the world as loaded now: an A* search that expands at most [budget] cells, inside a window of at most 96 cells across and 40 and twice its height up and down, about the two. The path is arrived when it ends at the goal; else it ends at the cell reached that is nearest the goal over the ground (which may be the start), and a game walks it and asks again. Empty when the start does not hold the walker. A straight step costs 10, a diagonal 14, a cell climbed 5 more, a cell dropped 1 more, and a move into water three times as much."
   fn find(w : Strata.World.World, k : Walker, sx : Int, sy : Int, sz : Int, gx : Int, gy : Int, gz : Int, budget : Int) : Path do
     run(w, k, sx, sy, sz, gx, gy, gz, true, fn (_x, _y, _z) -> false, budget)
   end
@@ -333,42 +334,60 @@ mod Strata.Nav do
   end
 
   -- ── Straight lines ───────────────────────────────────────────────────────
-  -- the height the walker stands at after one straight step from (x, y, z): the same level first, then up, then down; -1000000 when it cannot take it
-  pfn step_w(w : Strata.World.World, k : Walker, x : Int, y : Int, z : Int, dx : Int, dz : Int, i : Int) : Int do
+  -- the height the walker is at after one straight step from (x, y, z), keeping the footing [kind] (1 standing, 2 afloat): the same level
+  -- first, then up, then down; -1000000 when it cannot take it
+  pfn step_w(w : Strata.World.World, k : Walker, kind : Int, x : Int, y : Int, z : Int, dx : Int, dz : Int, i : Int) : Int do
     match k do
       NvWalker(r, h, stp, drp, _) ->
         -- i: 0 level, 1..stp up, then 1..drp down
         if i > stp + drp do -1000000
         else
           let y2 = if i == 0 do y else if i <= stp do y + i else y - (i - stp) end end
-          let ok = if standing(w, k, x + dx, y2, z + dz) == 0 do false
+          let ok = if standing(w, k, x + dx, y2, z + dz) != kind do false
             else if y2 > y do clear_w(w, r, x, z, y + h, y2 + h - 1, 0)
             else if y2 < y do clear_w(w, r, x + dx, z + dz, y2 + h, y + h - 1, 0)
             else true end end end
-          if ok do y2 else step_w(w, k, x, y, z, dx, dz, i + 1) end
+          if ok do y2 else step_w(w, k, kind, x, y, z, dx, dz, i + 1) end
         end
     end
   end
 
-  -- Walk the cells the line from (ax, az) to (bx, bz) passes through, one straight step at a time. [e] is the line's error term in
-  -- units of the two spans: each step is along the axis the line is further behind on.
-  pfn line(w : Strata.World.World, k : Walker, x : Int, y : Int, z : Int, bx : Int, by0 : Int, bz : Int, sx : Int, sz : Int, nx : Int, nz : Int, ix : Int, iz : Int) : Bool do
+  -- two straight steps, (dx, 0) then (0, dz) or the other way about: the height after, or -1000000
+  pfn two_steps(w : Strata.World.World, k : Walker, kind : Int, x : Int, y : Int, z : Int, dx : Int, dz : Int, x_first : Bool) : Int do
+    let y1 = if x_first do step_w(w, k, kind, x, y, z, dx, 0, 0) else step_w(w, k, kind, x, y, z, 0, dz, 0) end
+    if y1 < -999999 do y1
+    else if x_first do step_w(w, k, kind, x + dx, y1, z, 0, dz, 0)
+    else step_w(w, k, kind, x, y1, z + dz, dx, 0, 0) end end
+  end
+
+  -- Walk the cells the line from (ax, az) to (bx, bz) passes through, one straight step at a time: each step is along the axis whose
+  -- next cell edge the line meets first ([ix] of [nx] steps taken along x, [iz] of [nz] along z). Where the line passes exactly through a
+  -- corner, both ways round it must be open and end at one height: a walker has width, and one way alone would clip the block on the other.
+  pfn line(w : Strata.World.World, k : Walker, kind : Int, x : Int, y : Int, z : Int, by0 : Int, sx : Int, sz : Int, nx : Int, nz : Int, ix : Int, iz : Int) : Bool do
     if ix >= nx && iz >= nz do y == by0
     else
-      -- the next crossing: x when (1 + 2 ix) * nz < (1 + 2 iz) * nx
-      let along_x = if ix >= nx do false else if iz >= nz do true else (1 + 2 * ix) * nz < (1 + 2 * iz) * nx end end
-      let dx = if along_x do sx else 0 end
-      let dz = if along_x do 0 else sz end
-      let y2 = step_w(w, k, x, y, z, dx, dz, 0)
-      if y2 < -999999 do false
-      else line(w, k, x + dx, y2, z + dz, bx, by0, bz, sx, sz, nx, nz, if along_x do ix + 1 else ix end, if along_x do iz else iz + 1 end) end
+      let a = (1 + 2 * ix) * nz
+      let b = (1 + 2 * iz) * nx
+      if ix < nx && iz < nz && a == b do
+        let ya = two_steps(w, k, kind, x, y, z, sx, sz, true)
+        let yb = two_steps(w, k, kind, x, y, z, sx, sz, false)
+        if ya < -999999 || ya != yb do false else line(w, k, kind, x + sx, ya, z + sz, by0, sx, sz, nx, nz, ix + 1, iz + 1) end
+      else
+        let along_x = if ix >= nx do false else if iz >= nz do true else a < b end end
+        let dx = if along_x do sx else 0 end
+        let dz = if along_x do 0 else sz end
+        let y2 = step_w(w, k, kind, x, y, z, dx, dz, 0)
+        if y2 < -999999 do false
+        else line(w, k, kind, x + dx, y2, z + dz, by0, sx, sz, nx, nz, if along_x do ix + 1 else ix end, if along_x do iz else iz + 1 end) end
+      end
     end
   end
 
-  doc "Can the walker go straight from cell (ax, ay, az), where it stands, to (bx, by, bz)? True when every cell the line between their columns passes through holds it, each reached from the last by a step it can take (level, up within its step, down within its drop), and the walk ends at height by. The line is walked a straight step at a time, so it squeezes between no two blocks that touch at a corner."
+  doc "Can the walker go straight from cell (ax, ay, az), where it stands, to (bx, by, bz)? True when every cell the line between their columns passes through holds it on the footing it starts with (standing all the way, or afloat all the way: a line that goes into or out of water is not straight, so `smooth` never cuts a path through a pond it was routed round), each reached from the last by a step it can take (level, up within its step, down within its drop), and the walk ends at height by. The line is walked a straight step at a time, and through the exact corner of a cell only when both cells beside it are open, so it squeezes between no two blocks and clips none. `straight(a, b)` and `straight(b, a)` walk the same cells."
   fn straight(w : Strata.World.World, k : Walker, ax : Int, ay : Int, az : Int, bx : Int, by0 : Int, bz : Int) : Bool do
-    if standing(w, k, ax, ay, az) == 0 do false
-    else line(w, k, ax, ay, az, bx, by0, bz, if bx >= ax do 1 else -1 end, if bz >= az do 1 else -1 end, absi(bx - ax), absi(bz - az), 0, 0) end
+    let kind = standing(w, k, ax, ay, az)
+    if kind == 0 do false
+    else line(w, k, kind, ax, ay, az, by0, if bx >= ax do 1 else -1 end, if bz >= az do 1 else -1 end, absi(bx - ax), absi(bz - az), 0, 0) end
   end
 
   -- from anchor [a], the last of the next [look] cells it can walk straight to, and what follows it; the first is always taken
