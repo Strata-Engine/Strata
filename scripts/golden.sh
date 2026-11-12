@@ -96,9 +96,14 @@ ui-frames:STRATA_SCENE=1 STRATA_UI=1 STRATA_UI_SHOW=2 DRAWS=6 STRICT=1
 text-sheet:STRATA_SCENE=1 STRATA_UI=1 STRATA_UI_SHOW=3 DRAWS=6 STRICT=1
 text-styles:STRATA_SCENE=1 STRATA_LIGHT=4 STRATA_UI=1 STRATA_UI_SHOW=4 DRAWS=6 STRICT=1
 text-scripts:STRATA_SCENE=1 STRATA_UI=1 STRATA_UI_SHOW=7 DRAWS=6 STRICT=1
+humanoid-poses:STRATA_SCENE=31 STRATA_LIGHT=4 STRATA_SUN=12 DRAWS=20
+figure-walk-lit-2s:STRATA_SCENE=32 STRATA_LIGHT=4 STRATA_FRAMES=123 DRAWS=20
+figure-walk-lit-3s:STRATA_SCENE=32 STRATA_LIGHT=4 STRATA_FRAMES=183 DRAWS=20
+figure-walk-lit-4s:STRATA_SCENE=32 STRATA_LIGHT=4 STRATA_FRAMES=243 DRAWS=20
 '
 # indirect draw calls a frame must issue, whatever the scene holds; a scene
-# with a kind of geometry nowhere in it says DRAWS=n. STRICT=1 holds a scene
+# with a kind of geometry nowhere in it says DRAWS=n (a figure scene adds one
+# draw per figure piece shown: the humanoid's 15 parts are one piece each). STRICT=1 holds a scene
 # to a difference of 4 in 0.05% of pixels: small text is few pixels. Line 9's note stands:
 # a new scene's first picture is left as test/golden/name.actual.ppm to be
 # looked at and stored by hand (gzip -9 -c it to test/golden/name.ppm.gz)
