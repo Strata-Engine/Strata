@@ -15,9 +15,11 @@
 --     back to its generated state is recognised and dropped again.
 --
 -- Chunks of every level (Strata.Coord) share the one store. Only level 0 is
--- edited. A coarser chunk, when it loads, has the edited level-0 chunks
--- under it (loaded and edited, or cached) coarsened and laid over what it
--- generated to (`coarsen`), so a crater is still a crater from afar; an
+-- edited. A coarser chunk shows the edited level-0 chunks under it (loaded
+-- and edited, or cached) coarsened and laid over what it generated to
+-- (`coarsen`). The laying over is a pure function (`coarsen_over`) of the
+-- generated chunk and the fine chunks `edits_under` captures, so Strata.Stream
+-- runs it on a worker and `insert` puts a coarse chunk as it is given. An
 -- edit to a level-0 chunk marks its ancestors, up to the generator's level,
 -- stale (`stale`), and Strata.Stream builds them again. A coarse chunk is
 -- never cached: it is made again from its generator and the edits.
@@ -156,14 +158,38 @@ mod Strata.World do
     else fdiv(Kd.kz(f), n) == Kd.kz(k) end end end
   end
 
-  -- the edited level-0 chunks under k: loaded and differing from their generation, or cached
-  pfn edited_under(w : World, k : Strata.Coord.Key) : List((Strata.Coord.Key, Strata.Chunk.Chunk)) do
-    let n = pow2(Kd.level(k))
-    match w do
-      World(_, _, _, _, cs, gh, tc, ca, _, _) ->
-        let loaded = Sr.fold(tc, Nil, fn (acc, f, _t) -> if !under(k, n, f) do acc else if differs(cs, gh, tc, f) do Cons((f, Sr.get(cs, f)), acc) else acc end end)
-        Sr.fold(ca, loaded, fn (acc, f, c) -> if under(k, n, f) do Cons((f, c), acc) else acc end)
+  -- A level-0 chunk that may be edited, as captured for coarsening: its key,
+  -- its content, and the hash it generated to (-1 for a cached chunk, which
+  -- is edited by definition). Whether a loaded one still differs from its
+  -- generation is decided where it is coarsened, not where it is captured.
+  type Fine = Fine(Strata.Coord.Key, Strata.Chunk.Chunk, Int)
+
+  doc "The level-0 chunks under key [k] that may be edited: every loaded chunk touched since it loaded, and every cached chunk. A walk of the touched and cached keys, no voxel read or hash: cheap enough for the caller's thread. `coarsen_over` decides which differ."
+  fn edits_under(w : World, k : Strata.Coord.Key) : List(Fine) do
+    let l = Kd.level(k)
+    if l <= 0 || l > 5 do Nil
+    else
+      let n = pow2(l)
+      match w do
+        World(_, _, _, _, cs, gh, tc, ca, _, _) ->
+          let loaded = Sr.fold(tc, Nil, fn (acc, f, _t) -> if under(k, n, f) do Cons(Fine(f, Sr.get(cs, f), Sr.get(gh, f)), acc) else acc end)
+          Sr.fold(ca, loaded, fn (acc, f, c) -> if under(k, n, f) do Cons(Fine(f, c, -1), acc) else acc end)
+      end
     end
+  end
+
+  -- A voxel's rank in coarsening: 2 a solid opaque cube, 1 a fluid or another
+  -- cube (glass, leaves, water that is not a fluid), 0 air, a cross, a model
+  -- or nothing drawn; and the id it stands as (a fluid as its family's full voxel).
+  pfn rank(r : Strata.Blocks.Registry, id : Int) : Int do
+    if id <= 0 do 0
+    else if Strata.Blocks.is_fluid(r, id) do 1
+    else if Strata.Blocks.style_index(r, id) != 0 do 0
+    else if Strata.Blocks.is_solid_opaque(r, id) do 2
+    else 1 end end end end
+  end
+  pfn stands_as(r : Strata.Blocks.Registry, id : Int) : Int do
+    if Strata.Blocks.is_fluid(r, id) do Strata.Blocks.with_state(r, id, 7) else id end
   end
 
   -- one more of id in the tally
@@ -173,68 +199,82 @@ mod Strata.World do
       Cons((i, n), t) -> if i == id do Cons((i, n + 1), t) else Cons((i, n), tally(t, id)) end
     end
   end
-  -- the most common id that is not air; air only when nothing else is; a tie to the lower id
-  pfn best(l : List((Int, Int)), bid : Int, bn : Int) : Int do
+  -- the winner of a tally of ids stood as (stands_as): the highest rank, then the most common, a tie to the lower id; air when nothing ranks
+  pfn best(r : Strata.Blocks.Registry, l : List((Int, Int)), bid : Int, brank : Int, bn : Int) : Int do
     match l do
       Nil -> bid
       Cons((i, n), t) ->
-        if i == 0 do best(t, bid, bn)
-        else if n > bn do best(t, i, n)
-        else if n == bn && i < bid do best(t, i, n)
-        else best(t, bid, bn) end end end
+        let k = rank(r, i)
+        if k == 0 do best(r, t, bid, brank, bn)
+        else if k > brank do best(r, t, i, k, n)
+        else if k < brank do best(r, t, bid, brank, bn)
+        else if n > bn do best(r, t, i, k, n)
+        else if n == bn && i < bid do best(r, t, i, k, n)
+        else best(r, t, bid, brank, bn) end end end end end
     end
   end
-  pfn cube_go(c : Strata.Chunk.Chunk, x0 : Int, y0 : Int, z0 : Int, s : Int, t : Int, acc : List((Int, Int))) : List((Int, Int)) do
+  pfn cube_go(r : Strata.Blocks.Registry, c : Strata.Chunk.Chunk, x0 : Int, y0 : Int, z0 : Int, s : Int, t : Int, acc : List((Int, Int))) : List((Int, Int)) do
     if t >= s * s * s do acc
-    else cube_go(c, x0, y0, z0, s, t + 1, tally(acc, Ck.get_or(c, x0 + t % s, y0 + t / (s * s), z0 + (t / s) % s, 0)))
+    else cube_go(r, c, x0, y0, z0, s, t + 1, tally(acc, stands_as(r, Ck.get_or(c, x0 + t % s, y0 + t / (s * s), z0 + (t / s) % s, 0))))
     end
   end
-  -- the max-occupancy id of the s-cube from (x0, y0, z0) of c
-  pfn cube_id(c : Strata.Chunk.Chunk, x0 : Int, y0 : Int, z0 : Int, s : Int) : Int do
+  -- the coarse id of the s-cube from (x0, y0, z0) of c
+  pfn cube_id(r : Strata.Blocks.Registry, c : Strata.Chunk.Chunk, x0 : Int, y0 : Int, z0 : Int, s : Int) : Int do
     let u = Ck.uniform_id(c)
-    if u >= 0 do u else best(cube_go(c, x0, y0, z0, s, 0, Nil), 0, 0) end
+    if u >= 0 do (if rank(r, u) == 0 do 0 else stands_as(r, u) end)
+    else best(r, cube_go(r, c, x0, y0, z0, s, 0, Nil), 0, 0, 0) end
   end
 
   -- lay the coarsening of level-0 chunk f (content c) into a, the flat voxels of level-l key k
-  pfn lay_go(a : NativeI32Arr, c : Strata.Chunk.Chunk, s : Int, n : Int, ox : Int, oy : Int, oz : Int, t : Int) : NativeI32Arr do
+  pfn lay_go(r : Strata.Blocks.Registry, a : NativeI32Arr, c : Strata.Chunk.Chunk, s : Int, n : Int, ox : Int, oy : Int, oz : Int, t : Int) : NativeI32Arr do
     if t >= n * n * n do a
     else
       let i = t % n
       let m = (t / n) % n
       let j = t / (n * n)
-      lay_go(NativeArray.set_i32(a, (ox + i) + 32 * ((oz + m) + 32 * (oy + j)), cube_id(c, i * s, j * s, m * s, s)), c, s, n, ox, oy, oz, t + 1)
+      lay_go(r, NativeArray.set_i32(a, (ox + i) + 32 * ((oz + m) + 32 * (oy + j)), cube_id(r, c, i * s, j * s, m * s, s)), c, s, n, ox, oy, oz, t + 1)
     end
   end
-  pfn lay(a : NativeI32Arr, k : Strata.Coord.Key, f : Strata.Coord.Key, c : Strata.Chunk.Chunk) : NativeI32Arr do
+  pfn lay(r : Strata.Blocks.Registry, a : NativeI32Arr, k : Strata.Coord.Key, f : Strata.Coord.Key, c : Strata.Chunk.Chunk) : NativeI32Arr do
     let s = pow2(Kd.level(k))
     let n = 32 / s
-    lay_go(a, c, s, n, (Kd.kx(f) - s * Kd.kx(k)) * n, (Kd.ky(f) - s * Kd.ky(k)) * n, (Kd.kz(f) - s * Kd.kz(k)) * n, 0)
+    lay_go(r, a, c, s, n, (Kd.kx(f) - s * Kd.kx(k)) * n, (Kd.ky(f) - s * Kd.ky(k)) * n, (Kd.kz(f) - s * Kd.kz(k)) * n, 0)
   end
 
-  -- the generated chunk of key k with the edited level-0 chunks under it coarsened over it
-  pfn overlay(w : World, k : Strata.Coord.Key, generated : Strata.Chunk.Chunk) : Strata.Chunk.Chunk do
+  -- the captured fine chunks that are edited: cached, or differing from their generation
+  pfn edited(fs : List(Fine)) : List(Fine) do
+    List.fold_left(fs, Nil, fn (acc, p) -> match p do Fine(f, c, h) -> if h < 0 do Cons(p, acc) else if Ck.hash(c) != h do Cons(p, acc) else acc end end end)
+  end
+
+  doc "The coarse chunk of key [k] (level L, 1..5): [generated] with each edited chunk of [fines] (from `edits_under`; a loaded one is edited if it differs from its generation hash) coarsened over it. Each coarse voxel such a chunk covers takes its 2^L cube's: the most common solid opaque cube block if there is one; else the most common fluid (as its family's full voxel) or other cube block; else air (crosses and models count as air). A tie goes to the lower id. Pure, for a worker task (registry [r])."
+  fn coarsen_over(r : Strata.Blocks.Registry, k : Strata.Coord.Key, generated : Strata.Chunk.Chunk, fines : List(Fine)) : Strata.Chunk.Chunk do
     let l = Kd.level(k)
     if l <= 0 || l > 5 do generated
     else
-      match edited_under(w, k) do
+      let n = pow2(l)
+      let mine = List.fold_left(fines, Nil, fn (acc, p) -> match p do Fine(f, _, _) -> if under(k, n, f) do Cons(p, acc) else acc end end)
+      match edited(mine) do
         Nil -> generated
-        fs -> Ck.from_flat(List.fold_left(fs, Ck.to_flat(generated), fn (a, p) -> match p do (f, c) -> lay(a, k, f, c) end))
+        fs -> Ck.from_flat(List.fold_left(fs, Ck.to_flat(generated), fn (a, p) -> match p do Fine(f, c, _) -> lay(r, a, k, f, c) end))
       end
     end
   end
 
-  doc "The chunk of key [k] (level L) as the world shows it: what the generator makes for it, with each level-0 chunk under it that is edited (loaded and different from its generation, or cached) coarsened over it: each of the chunk's voxels it covers is the max-occupancy voxel of its 2^L cube (any id but air wins over air; among those the most common, a tie to the lower id). Edits queued for a chunk not yet loaded are not in it. A level-0 key, or one above level 5 (a level-0 chunk smaller than a voxel), is the generated chunk alone."
-  fn coarsen(w : World, k : Strata.Coord.Key) : Strata.Chunk.Chunk do overlay(w, k, Strata.Terrain.run(terrain(w), k, seed(w))) end
+  doc "The chunk of key [k] as the world shows it: what the generator makes for it with the edited level-0 chunks under it coarsened over it (`coarsen_over`). Edits queued for a chunk not yet loaded are not in it. A level-0 key, or one above level 5 (a level-0 chunk smaller than a voxel), is the generated chunk alone."
+  fn coarsen(w : World, k : Strata.Coord.Key) : Strata.Chunk.Chunk do coarsen_over(registry(w), k, Strata.Terrain.run(terrain(w), k, seed(w)), edits_under(w, k)) end
+
+  doc "The hash the loaded chunk at [k] generated to, as `insert_hashed` was given it (for a coarse chunk, the hash of what was put); -1 when it is not loaded."
+  fn gen_hash(w : World, k : Strata.Coord.Key) : Int do match w do World(_, _, _, _, _, gh, _, _, _, _) -> Sr.get(gh, k) end end
 
   -- ── Loading and unloading ────────────────────────────────────────────────
-  doc "Load the chunk at [k], given what the generator produced for it. A cached edited chunk takes the generated one's place, and edits queued for the key are applied (its ancestors are then stale). A coarser chunk has the edited level-0 chunks under it coarsened over it (`coarsen`)."
+  doc "Load the chunk at [k], given what the generator produced for it. A cached edited chunk takes the generated one's place, and edits queued for the key are applied (its ancestors are then stale). A coarser chunk is put as it is given, with no coarsening here: give it `coarsen`'s or `coarsen_over`'s chunk to show the edits under it."
   fn insert(w : World, k : Strata.Coord.Key, generated : Strata.Chunk.Chunk) : World do insert_hashed(w, k, generated, Ck.hash(generated)) end
 
   doc "As `insert`, for a caller that has already hashed the generated chunk (`Strata.Chunk.hash`): the stream's workers do, so the hash is not paid for on the caller's thread."
   fn insert_hashed(w : World, k : Strata.Coord.Key, generated : Strata.Chunk.Chunk, hash : Int) : World do
     if Kd.level(k) > 0 do
       match w do
-        World(r, g, sd, sc, cs, gh, tc, ca, pe, st) -> World(r, g, sd, sc, Sr.put(cs, k, overlay(w, k, generated)), Sr.put(gh, k, hash), Sr.remove(tc, k), ca, pe, st)
+        World(r, g, sd, sc, cs, gh, tc, ca, pe, st) -> World(r, g, sd, sc, Sr.put(cs, k, generated), Sr.put(gh, k, hash), Sr.remove(tc, k), ca, pe, st)
       end
     else
       match w do

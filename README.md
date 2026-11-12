@@ -222,8 +222,9 @@ any fine voxel under it would be. `Strata.Stream.config_levels(6, 3, 8, 4,
 chunks out and 1 up and down about the focus; `take_meshes` returns meshes
 of every level (`Strata.Mesh.level`). Edits stay at level 0: a coarse
 chunk has the edited level-0 chunks under it coarsened over it
-(`Strata.World.coarsen`), and an edit makes its ancestors stale
-(`Strata.World.stale`), which the stream builds again on its next tick.
+(`Strata.World.coarsen`; the stream does it on the worker that generates
+the chunk), and an edit makes its ancestors stale (`Strata.World.stale`),
+which the stream puts through its generation queue again without waiting.
 Nothing draws the coarse levels yet.
 
 ## Modules
