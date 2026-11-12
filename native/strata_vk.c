@@ -27,7 +27,7 @@
 /* Rewritten by build_shaders.sh whenever the shaders change: forge decides
  * whether to recompile this file from its text alone, not from the headers
  * it includes (GAPS S14). */
-#define STRATA_SHADERS_STAMP "c0527566b99d8a91"
+#define STRATA_SHADERS_STAMP "dbd687867761280d"
 #include "strata_shaders.h"
 #include "strata_spray.h"
 #include "strata_alloc.h"
@@ -277,6 +277,7 @@ static struct {
 #define UBO_LIGHT 68
 #define UBO_SUN_COLOR 72
 #define SV_MAX_BLOCKS 65536    /* rows in the block table: block ids are sixteen bits */
+#define SV_TOP_OF (SV_MAX_BLOCKS * 8)   /* after the rows, in words: each texture's top texture, for a far chunk's side faces */
 
 static void die(const char *what, int code) {
     fprintf(stderr, "strata_vk: %s failed (%d)\n", what, code);
@@ -931,6 +932,23 @@ int64_t sv_blocks_set(void *words_i32, int64_t nblocks) {
     if (!g.blocks_map || !words_i32 || nblocks < 0 || nblocks > SV_MAX_BLOCKS || narr_len(words_i32) < nblocks * 8) return 0;
     memcpy(g.blocks_map, narr_data(words_i32), (size_t)nblocks * 32);
     g.nblocks = (uint32_t)nblocks;
+    /* each texture's top texture: a block's side texture that differs from its top (a grass side) maps to the
+     * top, so a chunk above level 0, whose risers are many voxels tall, keeps the ground's colour; the first
+     * block to name a side texture decides it; every other texture maps to itself */
+    uint32_t *top = (uint32_t *)g.blocks_map + SV_TOP_OF;
+    for (uint32_t t = 0; t < 65536; t++) top[t] = t;
+    const int32_t *rows = narr_data(words_i32);
+    static uint8_t named[65536];
+    memset(named, 0, sizeof named);
+    for (int64_t b = 0; b < nblocks; b++) {
+        int32_t t0 = rows[b * 8];
+        for (int f = 2; f < 6; f++) {
+            int32_t tf = rows[b * 8 + f];
+            if (tf < 0 || tf > 65535 || t0 < 0 || t0 > 65535 || named[tf]) continue;
+            named[tf] = 1;
+            if (tf != t0) top[tf] = (uint32_t)t0;
+        }
+    }
     return 1;
 }
 
@@ -2076,9 +2094,10 @@ int64_t sv_open(int64_t w, int64_t h, int64_t capture_mouse, int64_t quad_capaci
     if (!g.trans || !g.trans_at || !g.trans_keys) { die("translucent list", 0); return 0; }
     for (int i = 0; i < SV_MAX_SLOTS; i++) g.trans_at[i] = -1;
 
-    if (!make_buffer((VkDeviceSize)SV_MAX_BLOCKS * 32, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &g.blocks, &g.blocks_mem, &map)) return 0;
+    if (!make_buffer((VkDeviceSize)SV_MAX_BLOCKS * 32 + 65536 * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &g.blocks, &g.blocks_mem, &map)) return 0;
     g.blocks_map = map;
     memset(g.blocks_map, 0, (size_t)SV_MAX_BLOCKS * 32);
+    for (uint32_t t = 0; t < 65536; t++) ((uint32_t *)g.blocks_map)[SV_TOP_OF + t] = t;
     VkDescriptorPoolSize dps[4] = { { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, SV_FRAMES }, { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 16 * SV_FRAMES }, { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 13 * SV_FRAMES },
                                     { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 4 * SV_FRAMES } };
     VkDescriptorPoolCreateInfo dpi = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = SV_FRAMES, .poolSizeCount = 4, .pPoolSizes = dps };

@@ -337,14 +337,132 @@ mod StrataViewer do
   -- turned by the site's hash (Strata.Seed.cell(seed, 28, s_index, 0, 0)),
   -- centred on the site, its bottom row on the ground at the site floor.
 
-  -- the tree templates (species s at 3 s .. 3 s + 2), the ruins (wall, tower, arch), the trees' reach in metres, the settings
-  type Decor = Decor(List(Strata.Template.Template), List(Strata.Template.Template), Float, Gp)
+  -- the tree templates (species s at 3 s .. 3 s + 2), the ruins (wall, tower, arch), the trees' reach in metres, the settings,
+  -- and each tree template coarsened for levels 1 and 2 (coarse_windows)
+  type Decor = Decor(List(Strata.Template.Template), List(Strata.Template.Template), Float, Gp, List((NativeU8Arr, NativeU8Arr)))
 
   doc "No trees and no ruins: the land alone, at the default settings."
-  fn bare_decor() : Decor do Decor(Nil, Nil, 4.0, gp_default()) end
+  fn bare_decor() : Decor do Decor(Nil, Nil, 4.0, gp_default(), Nil) end
 
   doc "No trees and no ruins, at settings g."
-  fn bare_decor_of(g : Gp) : Decor do Decor(Nil, Nil, 4.0, g) end
+  fn bare_decor_of(g : Gp) : Decor do Decor(Nil, Nil, 4.0, g, Nil) end
+
+  -- ── Coarse trees ─────────────────────────────────────────────────────────
+  -- A tree at level 1 or 2 is its template coarsened: a coarse voxel is wood
+  -- if any voxel of the fine template in its 2^L cube is wood, else leaves if
+  -- any is leaves. The cubes are the WORLD's (a coarse voxel of the chunk),
+  -- not the template's, so the coarse tree is exactly the fine tree's
+  -- coarsening wherever the tree stands: for each template and level a
+  -- window table holds, for every cube start in template coordinates
+  -- (-(2^L - 1) .. size - 1 on each axis), 2 for wood, 1 for leaves, 0 for
+  -- none; it is built once, beside the template.
+
+  -- the code of a template id: 2 wood (any id but leaves and holes), 1 leaves (8), 0 a hole
+  pfn tree_code(id : Int) : Int do if id == 0 do 0 else if id == 8 do 1 else 2 end end end
+  pfn codes_go(ids : NativeI32Arr, out : NativeU8Arr, i : Int, n : Int) : NativeU8Arr do
+    if i >= n do out else codes_go(ids, NativeArray.set_u8(out, i, tree_code(NativeArray.get_i32(ids, i))), i + 1, n) end
+  end
+  -- the largest code over a window of [w] along one axis: src is nx x ny x nz (x fastest, then y, then z),
+  -- the result one axis (0 x, 1 y, 2 z) w - 1 longer, its entry c the window starting at c - (w - 1)
+  pfn win_max(src : NativeU8Arr, nx : Int, ny : Int, nz : Int, axis : Int, w : Int, q : Int, x : Int, y : Int, z : Int, best : Int) : Int do
+    if q >= w do best
+    else
+      let xx = if axis == 0 do x - (w - 1) + q else x end
+      let yy = if axis == 1 do y - (w - 1) + q else y end
+      let zz = if axis == 2 do z - (w - 1) + q else z end
+      let inside = if xx < 0 do false else if xx >= nx do false else if yy < 0 do false else if yy >= ny do false else if zz < 0 do false else zz < nz end end end end end
+      let v = if inside do NativeArray.get_u8(src, xx + nx * (yy + ny * zz)) else 0 end
+      win_max(src, nx, ny, nz, axis, w, q + 1, x, y, z, if v > best do v else best end)
+    end
+  end
+  pfn win_go(src : NativeU8Arr, nx : Int, ny : Int, nz : Int, axis : Int, w : Int, out : NativeU8Arr, mx : Int, my : Int, t : Int, n : Int) : NativeU8Arr do
+    if t >= n do out
+    else
+      let x = t % mx
+      let y = (t / mx) % my
+      let z = t / (mx * my)
+      win_go(src, nx, ny, nz, axis, w, NativeArray.set_u8(out, t, win_max(src, nx, ny, nz, axis, w, 0, x, y, z, 0)), mx, my, t + 1, n)
+    end
+  end
+  pfn win_axis(src : NativeU8Arr, nx : Int, ny : Int, nz : Int, axis : Int, w : Int) : NativeU8Arr do
+    let mx = if axis == 0 do nx + w - 1 else nx end
+    let my = if axis == 1 do ny + w - 1 else ny end
+    let mz = if axis == 2 do nz + w - 1 else nz end
+    win_go(src, nx, ny, nz, axis, w, NativeArray.make_u8(mx * my * mz, 0), mx, my, 0, mx * my * mz)
+  end
+  doc "A tree template's window table for level [l] (cubes of 2^l): (sx + m) x (sy + m) x (sz + m), m = 2^l - 1, x fastest; the entry at (i + m, j + m, k + m) is the code of the cube starting at template voxel (i, j, k): 2 if it holds wood, else 1 if leaves, else 0."
+  fn coarse_window(t : Strata.Template.Template, l : Int) : NativeU8Arr do
+    let w = float_to_int(pow2f(l))
+    let sx = Strata.Template.t_sx(t)
+    let sy = Strata.Template.t_sy(t)
+    let sz = Strata.Template.t_sz(t)
+    let c0 = codes_go(Strata.Template.t_ids(t), NativeArray.make_u8(sx * sy * sz, 0), 0, sx * sy * sz)
+    let c1 = win_axis(c0, sx, sy, sz, 0, w)
+    let c2 = win_axis(c1, sx + w - 1, sy, sz, 1, w)
+    win_axis(c2, sx + w - 1, sy + w - 1, sz, 2, w)
+  end
+
+  -- the window code at cube start (i, j, k) of template t, 0 off the table
+  pfn window_at(t : Strata.Template.Template, win : NativeU8Arr, m : Int, i : Int, j : Int, k : Int) : Int do
+    let ax = Strata.Template.t_sx(t) + m
+    let ay = Strata.Template.t_sy(t) + m
+    let az = Strata.Template.t_sz(t) + m
+    let ii = i + m
+    let jj = j + m
+    let kk = k + m
+    if ii < 0 do 0 else if ii >= ax do 0 else if jj < 0 do 0 else if jj >= ay do 0 else if kk < 0 do 0 else if kk >= az do 0
+    else NativeArray.get_u8(win, ii + ax * (jj + ay * kk)) end end end end end end
+  end
+
+  doc "The code (2 wood, 1 leaves, 0 none) of coarse voxel (cx, cy, cz) of level [l] (cubes of w = 2^l level-0 voxels) for template t blitted at level-0 voxel (ox, oy, oz), turned rot, with its window table win."
+  fn coarse_code(t : Strata.Template.Template, win : NativeU8Arr, w : Int, ox : Int, oy : Int, oz : Int, rot : Int, cx : Int, cy : Int, cz : Int) : Int do
+    let m = w - 1
+    let a = cx * w - ox
+    let b = cz * w - oz
+    let j = cy * w - oy
+    let sx = Strata.Template.t_sx(t)
+    let sz = Strata.Template.t_sz(t)
+    let r = ((rot % 4) + 4) % 4
+    -- the footprint window [a, a + w) x [b, b + w) in the template's own coordinates (Strata.Template's turns)
+    if r == 0 do window_at(t, win, m, a, j, b)
+    else if r == 1 do window_at(t, win, m, b, j, sz - a - w)
+    else if r == 2 do window_at(t, win, m, sx - a - w, j, sz - b - w)
+    else window_at(t, win, m, sx - b - w, j, a) end end end
+  end
+
+  -- floor(v / d), d > 0, any sign
+  pfn fdivv(v : Int, d : Int) : Int do if v >= 0 do v / d else 0 - ((d - 1 - v) / d) end end
+
+  -- one coarse tree into chunk c (level-l voxels from (x0, y0, z0)): every coarse voxel of it inside the chunk that is air
+  pfn coarse_tree_into(c : Strata.Chunk.Chunk, t : Strata.Template.Template, win : NativeU8Arr, w : Int, ox : Int, oy : Int, oz : Int, rot : Int, x0 : Int, y0 : Int, z0 : Int) : Strata.Chunk.Chunk do
+    let fw = if rot % 2 == 0 do Strata.Template.t_sx(t) else Strata.Template.t_sz(t) end
+    let fd = if rot % 2 == 0 do Strata.Template.t_sz(t) else Strata.Template.t_sx(t) end
+    let gx0 = imax(fdivv(ox, w), x0)
+    let gx1 = imin(fdivv(ox + fw - 1, w), x0 + 31)
+    let gy0 = imax(fdivv(oy, w), y0)
+    let gy1 = imin(fdivv(oy + Strata.Template.t_sy(t) - 1, w), y0 + 31)
+    let gz0 = imax(fdivv(oz, w), z0)
+    let gz1 = imin(fdivv(oz + fd - 1, w), z0 + 31)
+    if gx0 > gx1 || gy0 > gy1 || gz0 > gz1 do c
+    else
+      let nx = gx1 - gx0 + 1
+      let nz = gz1 - gz0 + 1
+      coarse_cells(c, t, win, w, ox, oy, oz, rot, x0, y0, z0, gx0, gy0, gz0, nx, nz, 0, nx * nz * (gy1 - gy0 + 1))
+    end
+  end
+  pfn coarse_cells(c : Strata.Chunk.Chunk, t : Strata.Template.Template, win : NativeU8Arr, w : Int, ox : Int, oy : Int, oz : Int, rot : Int, x0 : Int, y0 : Int, z0 : Int, gx0 : Int, gy0 : Int, gz0 : Int, nx : Int, nz : Int, i : Int, n : Int) : Strata.Chunk.Chunk do
+    if i >= n do c
+    else
+      let gx = gx0 + i % nx
+      let gz = gz0 + (i / nx) % nz
+      let gy = gy0 + i / (nx * nz)
+      let code = coarse_code(t, win, w, ox, oy, oz, rot, gx, gy, gz)
+      let c2 = if code == 0 do c else if Ch.get_or(c, gx - x0, gy - y0, gz - z0, 1) != 0 do c else Ch.set(c, gx - x0, gy - y0, gz - z0, if code == 2 do 7 else 8 end) end end
+      coarse_cells(c2, t, win, w, ox, oy, oz, rot, x0, y0, z0, gx0, gy0, gz0, nx, nz, i + 1, n)
+    end
+  end
+  pfn imax(a : Int, b : Int) : Int do if a > b do a else b end end
+  pfn imin(a : Int, b : Int) : Int do if a < b do a else b end end
 
   pfn trees_go(scale : Float, seed : Int, i : Int, acc : List(Strata.Template.Template)) : List(Strata.Template.Template) do
     if i < 0 do acc else trees_go(scale, seed, i - 1, Cons(StrataViewer.Trees.build(i / 3, Strata.Seed.mix(seed, 600 + i), scale), acc)) end
@@ -412,16 +530,17 @@ mod StrataViewer do
     let rs = ruin("wall.vox", scale, ruin("tower.vox", scale, ruin("arch.vox", scale, Nil)))
     -- said once a run: the flag is an environment variable of this process
     let _said = if List.length(rs) == 3 do () else if Env.get("STRATA_RUINS_SAID", "") == "1" do () else say_once("strata_viewer: the ruins (wall, tower, arch .vox) were not all found under " ++ String.join(ruin_dirs(), ", ") ++ "; no ruins") end end
-    Decor(ts, if List.length(rs) == 3 do rs else Nil end, fmax(4.0, reach_go(ts, scale, 0.0)), g)
+    Decor(ts, if List.length(rs) == 3 do rs else Nil end, fmax(4.0, reach_go(ts, scale, 0.0)), g, List.map(ts, fn t -> (coarse_window(t, 1), coarse_window(t, 2))))
   end
 
   doc "The tree templates of a Decor (species s at 3 s .. 3 s + 2)."
-  fn decor_trees(d : Decor) : List(Strata.Template.Template) do match d do Decor(v, _, _, _) -> v end end
+  fn decor_trees(d : Decor) : List(Strata.Template.Template) do match d do Decor(v, _, _, _, _) -> v end end
   doc "The ruin templates of a Decor: wall, tower, arch, or none."
-  fn decor_ruins(d : Decor) : List(Strata.Template.Template) do match d do Decor(_, v, _, _) -> v end end
-  pfn decor_reach(d : Decor) : Float do match d do Decor(_, _, v, _) -> v end end
+  fn decor_ruins(d : Decor) : List(Strata.Template.Template) do match d do Decor(_, v, _, _, _) -> v end end
+  pfn decor_reach(d : Decor) : Float do match d do Decor(_, _, v, _, _) -> v end end
+  pfn decor_coarse(d : Decor) : List((NativeU8Arr, NativeU8Arr)) do match d do Decor(_, _, _, _, v) -> v end end
   doc "The generator settings a Decor carries."
-  fn decor_gp(d : Decor) : Gp do match d do Decor(_, _, _, g) -> g end end
+  fn decor_gp(d : Decor) : Gp do match d do Decor(_, _, _, g, _) -> g end end
 
   doc "The tree kind of a Decor: cells tree_cell (6 m), its radius the trees' reach, jitter tree_jitter (0.6), salt 21, chance tree_chance (0.35)."
   fn tree_kind(d : Decor) : Strata.Feature.FeatureKind do
@@ -449,12 +568,13 @@ mod StrataViewer do
   doc "The tree template a placement's index picks in a region: the species by the region's mix, then one of its three; None with no trees."
   fn pick_tree(d : Decor, region : Int, index : Int) : Option(Strata.Template.Template) do
     let ts = decor_trees(d)
-    if List.length(ts) < 12 do None
-    else
-      let sp = tree_species(decor_gp(d), region, index)
-      let v = float_to_int(Strata.Seed.unit(Strata.Seed.next(index)) *. 3.0)
-      List.nth_opt(ts, 3 * sp + (if v > 2 do 2 else v end))
-    end
+    if List.length(ts) < 12 do None else List.nth_opt(ts, pick_at(d, region, index)) end
+  end
+  -- which of the 12 templates a placement's index picks in a region
+  pfn pick_at(d : Decor, region : Int, index : Int) : Int do
+    let sp = tree_species(decor_gp(d), region, index)
+    let v = float_to_int(Strata.Seed.unit(Strata.Seed.next(index)) *. 3.0)
+    3 * sp + (if v > 2 do 2 else v end)
   end
 
   -- whether a placement stands in the box x0..x1, z0..z1 (metres) grown by r: the only ones whose template can reach it
@@ -656,16 +776,22 @@ mod StrataViewer do
   -- not; then the ground in metres before it is cut into voxels, and how
   -- calm the column must stay: 0 on a lake or river column and within the
   -- lake rim's reach, else the river damp (1 far from rivers).
-  pfn island_cell(g : Gp, wn : Win, xm : Float, zm : Float, seed : Int, scale : Float) : (Int, Int, Int, Float, Float) do
+  -- [fine] is level 0's metres a voxel (the same as [scale] at level 0): above level 0 a water line
+  -- stands no higher than level 0's (water_line), and a lake keeps a voxel of water over its bed
+  pfn island_cell(g : Gp, wn : Win, xm : Float, zm : Float, seed : Int, scale : Float, fine : Float) : (Int, Int, Int, Float, Float) do
     match wn do
       Win(_, _, _, _, _, hs, _, ws, rs, _) ->
         let h = win_bilinear(wn, hs, xm, zm)
         let lake = win_lake(wn, xm, zm)
         let w = win_bilinear(wn, ws, xm, zm)
-        if lake >= 0.0 do (vox(h, scale), vox(lake, scale), 0, int_to_float(vox(h, scale)) *. scale, 0.0)
+        if lake >= 0.0 do
+          let line = water_line(lake, scale, fine)
+          let gr0 = vox(h, scale)
+          let gr = if fine < scale do (if gr0 >= line do line - 1 else gr0 end) else gr0 end
+          (gr, line, 0, int_to_float(gr) *. scale, 0.0)
         else if w >= 1.0 do
           let top = river_surface(rs, xm, zm, 1000000.0, h)
-          let line = vox(top, scale)
+          let line = water_line(top, scale, fine)
           let bed = vox(top -. fmin(1.5, w /. 6.0), scale)
           let g = if bed < line do bed else line - 1 end
           (g, 0, line, int_to_float(g) *. scale, 0.0)
@@ -681,9 +807,15 @@ mod StrataViewer do
     end
   end
 
+  doc "The highest voxel of [scale] metres that water standing at [m] metres fills, in a world whose level 0 is [fine] metres a voxel: at level 0 the voxel holding m; above it, the last whose top is at or under level 0's water top, so a coarse level's water never stands above a finer level's."
+  fn water_line(m : Float, scale : Float, fine : Float) : Int do
+    if fine >= scale do vox(m, scale)
+    else float_to_int(Math.floor(int_to_float(vox(m, fine) + 1) *. fine /. scale +. 0.000001)) - 1 end
+  end
+
   -- the column's (ground, lake line, river line) in voxels
   pfn island_col(g : Gp, wn : Win, xm : Float, zm : Float, seed : Int, scale : Float) : (Int, Int, Int) do
-    match island_cell(g, wn, xm, zm, seed, scale) do (gr, l, r, _, _) -> (gr, l, r) end
+    match island_cell(g, wn, xm, zm, seed, scale, scale) do (gr, l, r, _, _) -> (gr, l, r) end
   end
 
   doc "The island column at whole-voxel column (wx, wz) of a world of [scale] metres a voxel, at the default settings: (ground, lake water line, river water line) in voxels, a line 0 where there is no such water."
@@ -938,20 +1070,20 @@ mod StrataViewer do
   -- The columns of an area n x n from (x0, z0) and its halo, side = n + 2 halo:
   -- H in metres and calm; and for the area's own n x n, ground, lake and river lines.
   type Cols3 = Cols3(NativeF32Arr, NativeF32Arr, NativeIntArr, NativeIntArr, NativeIntArr)
-  pfn cols3_go(g : Gp, hl : Int, wn : Win, x0 : Int, z0 : Int, n : Int, seed : Int, scale : Float, t : Int, hm : NativeF32Arr, cm : NativeF32Arr, gs : NativeIntArr, ls : NativeIntArr, rs : NativeIntArr) : Cols3 do
+  pfn cols3_go(g : Gp, hl : Int, wn : Win, x0 : Int, z0 : Int, n : Int, seed : Int, scale : Float, fine : Float, t : Int, hm : NativeF32Arr, cm : NativeF32Arr, gs : NativeIntArr, ls : NativeIntArr, rs : NativeIntArr) : Cols3 do
     let side = n + 2 * hl
     if t >= side * side do Cols3(hm, cm, gs, ls, rs)
     else
       let x = t % side - hl
       let z = t / side - hl
-      match island_cell(g, wn, int_to_float(x0 + x) *. scale, int_to_float(z0 + z) *. scale, seed, scale) do
+      match island_cell(g, wn, int_to_float(x0 + x) *. scale, int_to_float(z0 + z) *. scale, seed, scale, fine) do
         (gr, l, r, h, c) ->
           let hm2 = NativeArray.set_f32(hm, t, h)
           let cm2 = NativeArray.set_f32(cm, t, c)
           if x >= 0 && x < n && z >= 0 && z < n do
             let k = x + n * z
-            cols3_go(g, hl, wn, x0, z0, n, seed, scale, t + 1, hm2, cm2, NativeArray.set_int(gs, k, gr), NativeArray.set_int(ls, k, l), NativeArray.set_int(rs, k, r))
-          else cols3_go(g, hl, wn, x0, z0, n, seed, scale, t + 1, hm2, cm2, gs, ls, rs) end
+            cols3_go(g, hl, wn, x0, z0, n, seed, scale, fine, t + 1, hm2, cm2, NativeArray.set_int(gs, k, gr), NativeArray.set_int(ls, k, l), NativeArray.set_int(rs, k, r))
+          else cols3_go(g, hl, wn, x0, z0, n, seed, scale, fine, t + 1, hm2, cm2, gs, ls, rs) end
       end
     end
   end
@@ -1029,7 +1161,9 @@ mod StrataViewer do
   -- The area n x n from whole-voxel column (x0, z0): its relaxed H (pulled
   -- to a site's floor in its beard) and calm, and its ground, lake and river lines (voxels).
   type Area = Area(NativeF32Arr, NativeF32Arr, NativeIntArr, NativeIntArr, NativeIntArr)
-  pfn area_n(g : Gp, a : Strata.Atlas.Atlas, scale : Float, x0 : Int, z0 : Int, n : Int, seed : Int) : Area do
+  pfn area_n(g : Gp, a : Strata.Atlas.Atlas, scale : Float, x0 : Int, z0 : Int, n : Int, seed : Int) : Area do area_lv(g, a, scale, scale, x0, z0, n, seed) end
+  -- as area_n, in a world whose level 0 is [fine] metres a voxel (its water lines: water_line)
+  pfn area_lv(g : Gp, a : Strata.Atlas.Atlas, scale : Float, fine : Float, x0 : Int, z0 : Int, n : Int, seed : Int) : Area do
     let hl = halo(g)
     let side = n + 2 * hl
     let cnt = side * side
@@ -1038,7 +1172,7 @@ mod StrataViewer do
     let hw = int_to_float(hl) *. scale
     let far = int_to_float(n - 1) *. scale
     let wn = island_window(a, x0m -. hw, z0m -. hw, x0m +. far +. hw, z0m +. far +. hw)
-    match cols3_go(g, hl, wn, x0, z0, n, seed, scale, 0, NativeArray.make_f32(cnt, 0.0), NativeArray.make_f32(cnt, 0.0), NativeArray.make_int(n * n, 0), NativeArray.make_int(n * n, 0), NativeArray.make_int(n * n, 0)) do
+    match cols3_go(g, hl, wn, x0, z0, n, seed, scale, fine, 0, NativeArray.make_f32(cnt, 0.0), NativeArray.make_f32(cnt, 0.0), NativeArray.make_int(n * n, 0), NativeArray.make_int(n * n, 0), NativeArray.make_int(n * n, 0)) do
       Cols3(hm, cm, gs, ls, rs) ->
         let tal = NativeArray.make_f32(cnt, 0.0)
         let tal2 = if Ns.field2(rock_s(), Strata.Seed.mix(seed, 10), p_rock_freq(g), x0m -. hw, z0m -. hw, scale, side, side, tal) == cnt do talus_go(tal, p_talus_mid(g), p_talus_spread(g), 0, cnt) else tal end
@@ -1295,14 +1429,16 @@ mod StrataViewer do
     let x0 = cx * 32
     let y0 = cy * 32
     let z0 = cz * 32
-    let sv = sea_v(g, scale)
+    -- level 0's metres a voxel; above level 0 the water stands no higher than there
+    let s0 = scale /. pow2f(lvl)
+    let sv = water_line(p_sea(g), scale, s0)
     let x0m = int_to_float(x0) *. scale
     let y0m = int_to_float(y0) *. scale
     let z0m = int_to_float(z0) *. scale
-    -- level 1's canopy voxels need the slope at their base column alone
-    let pad = if fine do tree_pad(d, scale) else if lvl == 1 && List.length(decor_trees(d)) >= 12 do 1 else 0 end end
+    -- level 0 reads its trees from its own area; a coarse chunk asks level 0 about each tree (coarse_trees)
+    let pad = if fine do tree_pad(d, scale) else 0 end
     let n = 32 + 2 * pad
-    match area_n(g, a, scale, x0 - pad, z0 - pad, n, seed) do
+    match area_lv(g, a, scale, s0, x0 - pad, z0 - pad, n, seed) do
       Area(hp0, cp, gp, lp, rp) ->
         -- above level 0 the land stands a little higher, so a coarse voxel is solid where a fine one under it would be
         let hp = if fine do hp0 else lift_go(hp0, level_lift(scale), 0, n * n) end
@@ -1333,24 +1469,48 @@ mod StrataViewer do
         let land = Ch.from_flat(finish_go(g, fine, mats, gs, ls, rs, x0, y0, z0, sv, scale, seed, 0))
         -- a tree stands at least H - A, so a chunk wholly under that holds none
         let (low, _) = span_go(hp, 0, n * n, 1000000.0, 0.0 -. 1000000.0)
-        let ts = if lvl > 1 do Nil else if (int_to_float(y0 + 32) *. scale) < low -. p_amp(g) do Nil else island_trees(a, d, hp, cp, lp, rp, cx, cz, pad, seed, scale) end end
+        let ts = if lvl > 2 do Nil else if (int_to_float(y0 + 32) *. scale) < low -. p_amp(g) do Nil
+          else if fine do island_trees(a, d, hp, cp, lp, rp, cx, cz, pad, seed, scale) else coarse_trees(a, d, cx, cz, scale, s0, seed) end end end
         if fine do ruins_into(a, d, trees_into(land, Strata.Coord.key(cx, cy, cz), ts), cx, cy, cz, scale, seed)
-        else canopy_into(land, ts, x0, y0, z0) end
+        else coarse_into(land, a, d, ts, lvl, x0, y0, z0) end
     end
   end
 
-  -- level 1's trees: one canopy-colour (leaves) voxel over each one's base, where it is air
-  pfn canopy_into(c : Strata.Chunk.Chunk, ts : List((Strata.Template.Template, Strata.Feature.Placed, Int, Int, Int)), x0 : Int, y0 : Int, z0 : Int) : Strata.Chunk.Chunk do
+  doc "The trees level 0 stands that can reach the coarse chunk column (cx, cz) of [sc] metres a voxel, in a world of [s0] metres a voxel at level 0: (template, placement, base column x, ground top y, base column z) in level-0 voxels, each decided as level 0 decides it, from a 3 x 3 area of level-0 columns about its base."
+  fn coarse_trees(a : Strata.Atlas.Atlas, d : Decor, cx : Int, cz : Int, sc : Float, s0 : Float, seed : Int) : List((Strata.Template.Template, Strata.Feature.Placed, Int, Int, Int)) do
+    if List.length(decor_trees(d)) < 12 do Nil
+    else
+      let k = tree_kind(d)
+      let x0 = int_to_float(cx * 32) *. sc
+      let z0 = int_to_float(cz * 32) *. sc
+      let x1 = int_to_float(cx * 32 + 32) *. sc
+      let z1 = int_to_float(cz * 32 + 32) *. sc
+      let g = decor_gp(d)
+      let ps = Strata.Feature.candidates(k, seed, x0, z0, x1, z1, fn (x, z) -> region_density(g, Strata.Atlas.region_at(a, x, z)))
+      List.reverse(List.fold_left(ps, Nil, fn (acc, p) -> if reaches(p, x0, z0, x1, z1, Strata.Feature.k_radius(k)) do level0_tree(a, d, p, s0, seed, acc) else acc end))
+    end
+  end
+  pfn level0_tree(a : Strata.Atlas.Atlas, d : Decor, p : Strata.Feature.Placed, s0 : Float, seed : Int, acc : List((Strata.Template.Template, Strata.Feature.Placed, Int, Int, Int))) : List((Strata.Template.Template, Strata.Feature.Placed, Int, Int, Int)) do
+    let wx = float_to_int(Math.floor(Strata.Feature.p_xm(p) /. s0))
+    let wz = float_to_int(Math.floor(Strata.Feature.p_zm(p) /. s0))
+    match area_n(decor_gp(d), a, s0, wx - 1, wz - 1, 3, seed) do
+      Area(hs, cms, _, ls, rs) -> island_tree(a, d, p, hs, cms, ls, rs, wx - 1, wz - 1, 3, seed, s0, acc)
+    end
+  end
+
+  -- levels 1 and 2: each tree as its template coarsened (coarse_window), into chunk c whose first voxel is (x0, y0, z0) of level lvl
+  pfn coarse_into(c : Strata.Chunk.Chunk, a : Strata.Atlas.Atlas, d : Decor, ts : List((Strata.Template.Template, Strata.Feature.Placed, Int, Int, Int)), lvl : Int, x0 : Int, y0 : Int, z0 : Int) : Strata.Chunk.Chunk do
     match ts do
       Nil -> c
-      Cons((_, _, wx, top, wz), rest) ->
-        let x = wx - x0
-        let y = top + 1 - y0
-        let z = wz - z0
-        let inside = x >= 0 && x < 32 && y >= 0 && y < 32 && z >= 0 && z < 32
-        if !inside do canopy_into(c, rest, x0, y0, z0)
-        else if Ch.get_or(c, x, y, z, 0) != 0 do canopy_into(c, rest, x0, y0, z0)
-        else canopy_into(Ch.fill_box(c, x, y, z, x, y, z, 8), rest, x0, y0, z0) end end
+      Cons((t, p, wx, top, wz), rest) ->
+        let i = pick_at(d, Strata.Atlas.region_at(a, Strata.Feature.p_xm(p), Strata.Feature.p_zm(p)), Strata.Feature.p_index(p))
+        match List.nth_opt(decor_coarse(d), i) do
+          None -> coarse_into(c, a, d, rest, lvl, x0, y0, z0)
+          Some((w1, w2)) ->
+            match tree_origin(t, wx, top, wz) do
+              (ox, oy, oz) -> coarse_into(coarse_tree_into(c, t, if lvl == 1 do w1 else w2 end, if lvl == 1 do 2 else 4 end, ox, oy, oz, Strata.Feature.p_rot(p), x0, y0, z0), a, d, rest, lvl, x0, y0, z0)
+            end
+        end
     end
   end
 
@@ -1390,10 +1550,10 @@ mod StrataViewer do
   -- ── Levels: the far field ────────────────────────────────────────────────
   -- A level-L chunk is the same chain at scale * 2^L metres a voxel: the
   -- atlas read at that step, the detail and density noise at the same
-  -- frequencies in metres, the water at the same levels, the early-outs as
-  -- before. Above level 0 no cave is cut and no tall grass or post stands;
-  -- level 1 keeps each tree as one leaves voxel over its base, coarser levels
-  -- none; a ruin is level 0's alone, but its site's beard (the ground pulled
+  -- frequencies in metres, the early-outs as before; water lines stand no
+  -- higher than level 0's (water_line). Above level 0 no cave is cut and no
+  -- tall grass or post stands; levels 1 and 2 keep each tree level 0 stands
+  -- as its template coarsened (coarse_window), coarser levels none; a ruin is level 0's alone, but its site's beard (the ground pulled
   -- to its floor) is at every level. The thermal halo and the density's
   -- lattice are counted in voxels, so at coarser levels they reach over more
   -- metres. A chunk wholly beyond the atlas (and the reach of its rivers and
@@ -1435,9 +1595,11 @@ mod StrataViewer do
   end
 
   -- open sea at chunk row cy of [sc] metres a voxel
-  pfn sea_chunk(g : Gp, sc : Float, cy : Int) : Strata.Chunk.Chunk do
-    let sv = sea_v(g, sc)
-    let bed = vox(p_sea(g) -. 20.0, sc)
+  pfn sea_chunk(g : Gp, sc : Float, s0 : Float, cy : Int) : Strata.Chunk.Chunk do
+    let sv = water_line(p_sea(g), sc, s0)
+    -- the bed stays under the water line, so the coarsest level still has a voxel of sea
+    let bed0 = vox(p_sea(g) -. 20.0, sc)
+    let bed = if bed0 >= sv do sv - 1 else bed0 end
     let y0 = cy * 32
     if y0 > sv do Ch.uniform(0)
     else if y0 + 31 <= bed - 4 do Ch.uniform(1)
@@ -1452,7 +1614,7 @@ mod StrataViewer do
     let cz = Strata.Coord.kz(k)
     let g = decor_gp(d)
     let sc = scale *. pow2f(l)
-    if beyond(g, a, sc, cx, cz) do sea_chunk(g, sc, cy)
+    if beyond(g, a, sc, cx, cz) do sea_chunk(g, sc, scale, cy)
     else if l == 0 do island_decorated(a, d, scale, cx, cy, cz, seed)
     else
       let e = island_early_lift(g, a, sc, level_lift(sc), cx, cy, cz)

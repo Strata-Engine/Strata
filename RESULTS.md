@@ -818,7 +818,7 @@ above a load average of 8 are not judged.
 | GPU quads, scene 135, radius 10 | 1.88 million (14.7 MB) | | under Part F's 64 MB |
 | level-1 surface chunk at 1 m: under 1 ms | median 8.5 ms, worst 12.4 ms (level 0 in the same minute: 10.4 / 25.5 ms) | 33 | not judged (load 33) |
 | far shore visible from the highest hill (scene 135) | yes: the land runs to the shore and the sea to the horizon | | met |
-| ring boundary (scene 136): no holes, no double drawing | none seen; the near trees end and the hillside's terraces coarsen past them | | met |
+| ring boundary (scene 136): no holes, no double drawing | none seen: past the level-0 edge, about 100 m out at radius 4, the trees go on coarsened (2 m voxels, then 4 m) on their trunks, the hills keep their green and their terraces coarsen | | met |
 | the soak at 0.25 m with four levels: chunks at the start | 12 939 (3872 / 2904 / 2904 / 1936 / 1323), settled after 3239 ticks in 34.7 s | 21 | not judged (load 21) |
 | the soak: worst frame against 16.7 ms (the soak allows 20) | 165.6 ms, mean 21.3 ms over 6010 frames; the near field alone in the next minutes: 205.1 ms, mean 18.7 ms | 21 to 41 | not judged (load 21 to 41) |
 | the soak: refused, waiting, leaked, retained at the end | 0, 0, 0, 0; 6287 slots in use, 12 413 chunks loaded | | met |
@@ -839,10 +839,17 @@ ones with room.
 Lighting: a coarse chunk is lit as light mode 1 lights everything (sun
 times n.l and the flat sky term). From the hill (scene 135) the near land
 and the far land are of a brightness; no shadow falls past the near
-chunks. Out at sea a straight line of sand shows near the horizon: the
-generator's beyond-the-atlas sea (Task 11) meets the atlas's own sea floor
-there with an underwater step of up to about 18 m, and with coarse voxels
-of 8 and 16 m that step reaches the water line.
+chunks. A first version showed a line of sand across the sea and brown
+far hills. The line was water: each level filled the sea to the voxel
+holding 40 m, so its top stood at 41, 42, 44, 48 and 48 m at levels 0 to
+4, and where an outer level's water stood over an inner one's, its side
+toward the camera was open (the face against the finer level's hidden
+chunk, which holds water, is culled) and showed the outer level's sand
+floor through it. Above level 0 water now stands no higher than level
+0's (40, 40, 40 and 32 m at levels 1 to 4) and the line is gone. The
+brown was the grass side's dirt on risers many metres tall; a far
+chunk's sides now take the top texture. Levels 1 and 2 carry the trees,
+coarsened; levels 3 and 4 none.
 
 The soak's other misses (sound underruns: 2 with the far field, 4
 without; an acoustics update over 2 ms; the fluid step over 6 ms without

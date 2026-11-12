@@ -82,8 +82,10 @@ mod Strata.Slots do
   -- drawn), held keys whose meshes the renderer has been told to hide, held
   -- keys under each key (itself included; only keys with some), complete
   -- keys (held, or hidden over eight complete children), the keys whose last
-  -- given reach was true, and retained keys with the key each waits for.
-  type DrawRule = DrawRule(Int, Strata.Store.Store(Bool), Strata.Store.Store(Int), Strata.Store.Store(Bool), Strata.Store.Store(Bool), Strata.Store.Store(Strata.Coord.Key))
+  -- given reach was true, retained keys with the key each waits for, and
+  -- keys placed in a new slot whose upload is not yet confirmed (`settle`),
+  -- with whether it was refused.
+  type DrawRule = DrawRule(Int, Strata.Store.Store(Bool), Strata.Store.Store(Int), Strata.Store.Store(Bool), Strata.Store.Store(Bool), Strata.Store.Store(Strata.Coord.Key), List((Strata.Coord.Key, Bool)))
 
   -- capacity, key -> slot (-1 for none), freed slots, the next never-used
   -- slot, how many are in use, meshes waiting (oldest first), the draw rule
@@ -132,9 +134,9 @@ mod Strata.Slots do
 
   -- ── The draw rule ────────────────────────────────────────────────────────
   pfn no_rule(top : Int) : DrawRule do
-    DrawRule(top, Strata.Store.empty(false), Strata.Store.empty(0), Strata.Store.empty(false), Strata.Store.empty(false), Strata.Store.empty(Ks.key(0, 0, 0)))
+    DrawRule(top, Strata.Store.empty(false), Strata.Store.empty(0), Strata.Store.empty(false), Strata.Store.empty(false), Strata.Store.empty(Ks.key(0, 0, 0)), Nil)
   end
-  pfn rule_top(r : DrawRule) : Int do match r do DrawRule(t, _, _, _, _, _) -> t end end
+  pfn rule_top(r : DrawRule) : Int do match r do DrawRule(t, _, _, _, _, _, _) -> t end end
 
   -- does [k] take part in the rule: levels 0..top, with a top above 0
   pfn in_rule(top : Int, k : Strata.Coord.Key) : Bool do
@@ -206,14 +208,14 @@ mod Strata.Slots do
   -- and plan what this changes in what is drawn, onto [acts]
   pfn changed(rule : DrawRule, owned : Strata.Store.Store(Int), k : Strata.Coord.Key, delta : Int, acts : List(Action)) : (DrawRule, List(Action)) do
     match rule do
-      DrawRule(top, hid, sub, dn, rch, ret) ->
+      DrawRule(top, hid, sub, dn, rch, ret, pend) ->
         if !in_rule(top, k) do (rule, acts)
         else
           let hid1 = if delta < 0 do Strata.Store.remove(hid, k) else hid end
           match climb(top, owned, sub, dn, k, delta) do
             (sub2, dn2) ->
               match visit(owned, sub2, dn2, k, up_to(k, top), true, Walked(hid1, rch, acts)) do
-                Walked(hid2, rch2, acts2) -> (DrawRule(top, hid2, sub2, dn2, rch2, ret), acts2)
+                Walked(hid2, rch2, acts2) -> (DrawRule(top, hid2, sub2, dn2, rch2, ret, pend), acts2)
               end
           end
         end
@@ -223,14 +225,14 @@ mod Strata.Slots do
   -- keys retained waiting for [k], which now holds no mesh: they wait for its parent (past the top, for nothing)
   pfn orphan(rule : DrawRule, k : Strata.Coord.Key) : DrawRule do
     match rule do
-      DrawRule(top, hid, sub, dn, rch, ret) ->
+      DrawRule(top, hid, sub, dn, rch, ret, pend) ->
         if Strata.Store.size(ret) == 0 do rule
-        else DrawRule(top, hid, sub, dn, rch, Strata.Store.fold(ret, ret, fn (acc, rk, t) -> if Ks.key_eq(t, k) do Strata.Store.put(acc, rk, Ks.parent(k)) else acc end)) end
+        else DrawRule(top, hid, sub, dn, rch, Strata.Store.fold(ret, ret, fn (acc, rk, t) -> if Ks.key_eq(t, k) do Strata.Store.put(acc, rk, Ks.parent(k)) else acc end), pend) end
     end
   end
   pfn unretain(rule : DrawRule, k : Strata.Coord.Key) : DrawRule do
     match rule do
-      DrawRule(top, hid, sub, dn, rch, ret) -> if Strata.Store.has(ret, k) do DrawRule(top, hid, sub, dn, rch, Strata.Store.remove(ret, k)) else rule end
+      DrawRule(top, hid, sub, dn, rch, ret, pend) -> if Strata.Store.has(ret, k) do DrawRule(top, hid, sub, dn, rch, Strata.Store.remove(ret, k), pend) else rule end
     end
   end
 
@@ -241,7 +243,7 @@ mod Strata.Slots do
   fn with_levels(s : Slots, top : Int) : (Slots, List(Action)) do
     let t = if top < 0 do 0 else top end
     match s do
-      Slots(cap, owned, free, next, n, w, DrawRule(t0, hid, _, _, _, ret)) ->
+      Slots(cap, owned, free, next, n, w, DrawRule(t0, hid, _, _, _, ret, _)) ->
         if t0 == t do (s, Nil)
         else
           -- retained keys are freed: the rule they waited under is gone
@@ -251,7 +253,7 @@ mod Strata.Slots do
           let frees = List.map(gone, fn k -> Free(Strata.Store.get(owned, k)))
           let hid1 = List.fold_left(gone, hid, fn (h, k) -> Strata.Store.remove(h, k))
           -- what the renderer hides now stays hidden until the rule says otherwise
-          let r0 = DrawRule(t, hid1, Strata.Store.empty(0), Strata.Store.empty(false), Strata.Store.empty(false), Strata.Store.empty(Ks.key(0, 0, 0)))
+          let r0 = DrawRule(t, hid1, Strata.Store.empty(0), Strata.Store.empty(false), Strata.Store.empty(false), Strata.Store.empty(Ks.key(0, 0, 0)), Nil)
           let (r1, acts) = List.fold_left(Strata.Store.keys(owned1), (r0, Nil), fn (acc, k) -> match acc do (r, a) -> changed(r, owned1, k, 1, a) end)
           -- without a rule every held mesh is drawn
           let shows = if t > 0 do Nil else List.map(Strata.Store.keys(hid1), fn k -> Visible(Strata.Store.get(owned1, k), true)) end
@@ -263,11 +265,11 @@ mod Strata.Slots do
 
   doc "Is [k]'s mesh drawn: held, and not hidden by the which-chunk-draws rule?"
   fn drawn(s : Slots, k : Strata.Coord.Key) : Bool do
-    match s do Slots(_, owned, _, _, _, _, DrawRule(_, hid, _, _, _, _)) -> held(owned, k) && !Strata.Store.get(hid, k) end
+    match s do Slots(_, owned, _, _, _, _, DrawRule(_, hid, _, _, _, _, _)) -> held(owned, k) && !Strata.Store.get(hid, k) end
   end
 
   doc "How many keys have gone from the stream but keep their slots until the key above them holds a mesh."
-  fn retained(s : Slots) : Int do match s do Slots(_, _, _, _, _, _, DrawRule(_, _, _, _, _, ret)) -> Strata.Store.size(ret) end end
+  fn retained(s : Slots) : Int do match s do Slots(_, _, _, _, _, _, DrawRule(_, _, _, _, _, ret, _)) -> Strata.Store.size(ret) end end
 
   -- Give back the slots of the chunks that went, and forget anything of
   -- theirs that was waiting. With levels, a held key below the top is
@@ -283,9 +285,9 @@ mod Strata.Slots do
             if have < 0 do release(Slots(cap, owned, free, next, n, without(w, k), orphan(rule, k)), t, acts)
             else if in_rule(top, k) && Ks.level(k) < top do
               match rule do
-                DrawRule(tp, hid, sub, dn, rch, ret) ->
+                DrawRule(tp, hid, sub, dn, rch, ret, pend) ->
                   let ret2 = if Strata.Store.has(ret, k) do ret else Strata.Store.put(ret, k, Ks.parent(k)) end
-                  release(Slots(cap, owned, free, next, n, without(w, k), DrawRule(tp, hid, sub, dn, rch, ret2)), t, acts)
+                  release(Slots(cap, owned, free, next, n, without(w, k), DrawRule(tp, hid, sub, dn, rch, ret2, pend)), t, acts)
               end
             else
               let owned2 = Strata.Store.remove(owned, k)
@@ -304,7 +306,7 @@ mod Strata.Slots do
     match s do
       Slots(cap, owned, free, next, n, w, rule) ->
         match rule do
-          DrawRule(top, _, _, _, _, ret) ->
+          DrawRule(top, _, _, _, _, ret, _) ->
             if Strata.Store.size(ret) == 0 do (s, acts)
             else
               let ready = Strata.Store.fold(ret, Nil, fn (acc, rk, t) -> if Ks.level(t) > top do Cons(rk, acc) else if held(owned, t) do Cons(rk, acc) else acc end end)
@@ -342,10 +344,18 @@ mod Strata.Slots do
     end
   end
 
+  -- a key new to a slot enters the draw rule only once its upload lands (`settle`)
+  pfn pending(rule : DrawRule, k : Strata.Coord.Key) : DrawRule do
+    match rule do
+      DrawRule(top, hid, sub, dn, rch, ret, pend) -> if in_rule(top, k) do DrawRule(top, hid, sub, dn, rch, ret, Cons((k, false), pend)) else rule end
+    end
+  end
+
   -- Place every waiting mesh that can get a slot; the rest keep waiting, in
   -- order. A retained key meshed again is live again; a key new to a slot
-  -- enters the draw rule. Actions accumulate newest first; [kept] is reversed.
-  pfn place(s : Slots, todo : List(Waiting), kept : List(Waiting), acts : List(Action)) : (Slots, List(Action)) do
+  -- waits to enter the draw rule until `settle`. Actions accumulate newest
+  -- first; [kept] is reversed.
+  pfn place_go(s : Slots, todo : List(Waiting), kept : List(Waiting), acts : List(Action)) : (Slots, List(Action)) do
     match todo do
       Nil ->
         match s do
@@ -355,39 +365,68 @@ mod Strata.Slots do
         match s do
           Slots(cap, owned, free, next, n, w, rule) ->
             let have = Strata.Store.get(owned, k)
-            if have >= 0 do place(Slots(cap, owned, free, next, n, w, unretain(rule, k)), t, kept, Cons(Upload(have, k, m), acts))
+            if have >= 0 do place_go(Slots(cap, owned, free, next, n, w, unretain(rule, k)), t, kept, Cons(Upload(have, k, m), acts))
             else
               match free do
-                Cons(f, rest) ->
-                  let owned2 = Strata.Store.put(owned, k, f)
-                  match changed(rule, owned2, k, 1, Cons(Upload(f, k, m), acts)) do
-                    (rule2, acts2) -> place(Slots(cap, owned2, rest, next, n + 1, w, rule2), t, kept, acts2)
-                  end
+                Cons(f, rest) -> place_go(Slots(cap, Strata.Store.put(owned, k, f), rest, next, n + 1, w, pending(rule, k)), t, kept, Cons(Upload(f, k, m), acts))
                 Nil ->
-                  if next < cap do
-                    let owned2 = Strata.Store.put(owned, k, next)
-                    match changed(rule, owned2, k, 1, Cons(Upload(next, k, m), acts)) do
-                      (rule2, acts2) -> place(Slots(cap, owned2, Nil, next + 1, n + 1, w, rule2), t, kept, acts2)
-                    end
-                  else place(s, t, Cons(Waiting(k, m), kept), acts) end
+                  if next < cap do place_go(Slots(cap, Strata.Store.put(owned, k, next), Nil, next + 1, n + 1, w, pending(rule, k)), t, kept, Cons(Upload(next, k, m), acts))
+                  else place_go(s, t, Cons(Waiting(k, m), kept), acts) end
               end
             end
         end
     end
   end
 
-  doc "Plan what the renderer must do for these finished meshes and unloaded chunks: frees first, then uploads, then the frees of retained chunks whose wait is over, with the shows and hides the draw rule asks for after the action that caused them. A mesh takes its chunk's slot, else a freed one, else a new one; with none left it waits and is planned again next time."
+  doc "Plan what the renderer must do for these finished meshes and unloaded chunks: `place`, then `settle`, their actions end to end, as if every upload lands. A renderer that may refuse uploads performs `place`'s, reports each refusal (`refused`), and then performs `settle`'s."
   fn plan(s : Slots, meshes : List((Strata.Coord.Key, Strata.Mesh.Meshed)), gone : List(Strata.Coord.Key)) : (Slots, List(Action)) do
-    match release(s, gone, Nil) do
+    match place(s, meshes, gone) do
+      (s1, a1) ->
+        match settle(s1) do
+          (s2, a2) -> (s2, append_acts(a1, a2))
+        end
+    end
+  end
+
+  doc "The first half of a plan: frees first (keys that left, in order of level, finest first; with levels a held key below the top is retained instead), then uploads. A mesh takes its chunk's slot, else a freed one, else a new one; with none left it waits and is planned again next time. With levels a key new to a slot does not enter the draw rule until `settle`, so a refused upload shows, hides and frees nothing."
+  fn place(s : Slots, meshes : List((Strata.Coord.Key, Strata.Mesh.Meshed)), gone : List(Strata.Coord.Key)) : (Slots, List(Action)) do
+    match release(s, List.sort_by(gone, fn (a, b) -> Ks.level(a) < Ks.level(b)), Nil) do
       (s1, frees) ->
         match s1 do
           Slots(cap, owned, free, next, n, w, rule) ->
-            match place(Slots(cap, owned, free, next, n, Nil, rule), enqueue(w, meshes), Nil, Nil) do
-              (s2, ups) ->
-                match release_kept(s2, Nil) do
-                  (s3, kept) -> (s3, append_acts(List.reverse(frees), append_acts(List.reverse(ups), List.reverse(kept))))
-                end
+            match place_go(Slots(cap, owned, free, next, n, Nil, rule), enqueue(w, meshes), Nil, Nil) do
+              (s2, ups) -> (s2, append_acts(List.reverse(frees), List.reverse(ups)))
             end
+        end
+    end
+  end
+
+  doc "The second half of a plan, once `place`'s uploads are performed and any refusal reported: the keys whose new slot's upload landed enter the draw rule, a refused one gives its slot back (its mesh waits), and retained keys whose wait is over are freed; with the shows and hides that brings."
+  fn settle(s : Slots) : (Slots, List(Action)) do
+    match s do
+      Slots(cap, owned, free, next, n, w, DrawRule(top, hid, sub, dn, rch, ret, pend)) ->
+        let r0 = DrawRule(top, hid, sub, dn, rch, ret, Nil)
+        match List.fold_left(List.reverse(pend), (Slots(cap, owned, free, next, n, w, r0), Nil), fn (acc, e) -> match acc do (sa, aa) -> enter(sa, e, aa) end) do
+          (s1, a1) ->
+            match release_kept(s1, a1) do
+              (s2, a2) -> (s2, List.reverse(a2))
+            end
+        end
+    end
+  end
+  pfn enter(s : Slots, e : (Strata.Coord.Key, Bool), acts : List(Action)) : (Slots, List(Action)) do
+    match s do
+      Slots(cap, owned, free, next, n, w, rule) ->
+        match e do
+          (k, refusal) ->
+            let have = Strata.Store.get(owned, k)
+            if have < 0 do (s, acts)
+            else if refusal do (Slots(cap, Strata.Store.remove(owned, k), Cons(have, free), next, n - 1, w, rule), acts)
+            else
+              match changed(rule, owned, k, 1, acts) do
+                (rule2, acts2) -> (Slots(cap, owned, free, next, n, w, rule2), acts2)
+              end
+            end end
         end
     end
   end
@@ -399,12 +438,15 @@ mod Strata.Slots do
     end
   end
 
-  doc "The renderer could not take this upload (its buffer is full): keep the mesh waiting, in its slot, to be planned again. A free or a visibility action is never refused; passing one changes nothing."
+  doc "The renderer could not take this upload (its buffer is full): keep the mesh waiting to be planned again, in its slot; under levels, a key new to its slot gives the slot back at `settle` and never entered the draw rule. A free or a visibility action is never refused; passing one changes nothing."
   fn refused(s : Slots, a : Action) : Slots do
     match a do
       Upload(_, k, m) ->
         match s do
-          Slots(cap, owned, free, next, n, w, rule) -> Slots(cap, owned, free, next, n, append(without(w, k), Cons(Waiting(k, m), Nil)), rule)
+          Slots(cap, owned, free, next, n, w, DrawRule(top, hid, sub, dn, rch, ret, pend)) ->
+            -- a key new to its slot under levels gives the slot back at `settle`
+            let pend2 = List.map(pend, fn e -> match e do (pk, r) -> if Ks.key_eq(pk, k) do (pk, true) else (pk, r) end end)
+            Slots(cap, owned, free, next, n, append(without(w, k), Cons(Waiting(k, m), Nil)), DrawRule(top, hid, sub, dn, rch, ret, pend2))
         end
       _ -> s
     end
