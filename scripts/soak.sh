@@ -16,6 +16,11 @@
 # sound run must match within 0.5 ms (judged only on a quiet machine), and
 # one that holds the main thread 100 ms every 600 frames, which the mixer
 # must not notice. Nothing is played aloud. STRATA_SOAK_AUDIO=0 skips sound.
+#
+# The flight runs with the viewer's far field (four levels unless
+# STRATA_LEVELS says otherwise) and records it: the chunks loaded at the
+# start, level by level, the ticks and time they took to settle, and at the
+# end the chunks loaded, slots in use and meshes still retained.
 #   scripts/soak.sh            the default quad buffer
 #   scripts/soak.sh 200000     a quad buffer of that many quads, smaller than the
 #                              scene needs: uploads are refused and wait, and the
@@ -36,6 +41,8 @@ line=$(echo "$out" | grep '^soak:')
 echo "$line"
 # a field of the summary line by its whole name: the space keeps worst_ms from matching fluid_worst_ms
 get() { echo "$line" | sed -n "s/.* $1=\\([0-9.]*\\).*/\\1/p"; }
+echo "$out" | grep '^strata_viewer: far field' | sed 's/^strata_viewer: /at the start, /'
+echo "far field at the end: levels $(get levels), $(get loaded) chunks loaded, $(get slots) slots in use, $(get retained) retained, worst frame $(get worst_ms) ms (load average $(uptime | sed 's/.*load averages*: *\([0-9.]*\).*/\1/'))"
 fail=0
 # with the default buffer everything must fit; with a given one the run only has to survive
 if [ "$QUADS" = "0" ]; then
@@ -47,8 +54,10 @@ fi
 [ "$(get text_waiting)" = "0" ] || { echo "FAIL: glyphs were still waiting at the end"; fail=1; }
 [ "$(get atlas_bytes)" -le 16777216 ] || { echo "FAIL: the glyph atlas is over 16 MB"; fail=1; }
 [ "$(get leaked)" = "0" ] || { echo "FAIL: an allocator lost buffer space"; fail=1; }
-# the circuit keeps a steady view, so what the GPU holds must stay near what it started with
-[ "$(get live_quads)" -le 3000000 ] || { echo "FAIL: the quad buffer grew without bound"; fail=1; }
+# the circuit keeps a steady view, so what the GPU holds must stay near what it started with: 3 million
+# quads for the near field alone, Part F's 64 MB (8 388 608 quads) with the far field
+qmax=3000000; [ "$(get levels)" != "0" ] && qmax=8388608
+[ "$(get live_quads)" -le $qmax ] || { echo "FAIL: the quad buffer grew without bound"; fail=1; }
 awk "BEGIN { exit !($(get worst_ms) <= 20.0) }" || { echo "FAIL: a frame took over 20 ms"; fail=1; }
 [ "$(get fluid_waiting)" = "0" ] || { echo "FAIL: fluid cells were left waiting at the end: the cap was exceeded"; fail=1; }
 # offscreen a frame is about 3 ms, so six frames can be less than the worker needs and the main thread waits for it

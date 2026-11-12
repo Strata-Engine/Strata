@@ -19,13 +19,14 @@ done
 # C tests, the audio goldens, then the golden images; all need a compiler, the last a GPU
 mkdir -p native/tests/bin
 # (*_test.cpp: tests of native/strata_vox.cpp, C++ because ogt_vox.h is;
-# -fno-exceptions keeps them free of the C++ runtime, as in the forge builds)
+# -fno-exceptions keeps them free of the C++ runtime, and -ffp-contract=off keeps
+# floating point unfused, as in the forge builds, so the noise test runs the kernel forge builds)
 for t in native/tests/*_test.c native/tests/*_test.cpp; do
   [ -f "$t" ] || continue
   b="native/tests/bin/$(basename "${t%.*}")"
   # the text test links the text module and what it stands on
   extra=""; [ "$(basename "$t")" = "text_test.c" ] && extra="native/strata_text.c -Inative/sheenbidi/Headers -I/opt/homebrew/include/freetype2 -I/opt/homebrew/include/harfbuzz -L/opt/homebrew/lib -lfreetype -lharfbuzz"
-  if ! cc -O1 -Wall -Wextra -fno-exceptions -Inative -o "$b" "$t" $extra > .verify.log 2>&1 || ! "$b" >> .verify.log 2>&1; then
+  if ! cc -O1 -Wall -Wextra -ffp-contract=off -fno-exceptions -Inative -o "$b" "$t" $extra > .verify.log 2>&1 || ! "$b" >> .verify.log 2>&1; then
     echo "FAIL: $t"; tail -20 .verify.log; exit 1
   fi
 done
@@ -33,6 +34,10 @@ done
 if ! scripts/anim_check.sh > .verify.log 2>&1; then echo "FAIL: scripts/anim_check.sh"; tail -20 .verify.log; exit 1; fi
 # the entity scenes: entities added, read and written by the C kernel through Strata.Entities, headless
 if ! scripts/ent_check.sh > .verify.log 2>&1; then echo "FAIL: scripts/ent_check.sh"; tail -20 .verify.log; exit 1; fi
+# the match: hidden scripted runs of the viewer with STRATA_COMBAT=1 (needs a GPU)
+if [ "${STRATA_NO_GPU:-0}" != "1" ]; then
+  if ! scripts/combat_check.sh > .verify.log 2>&1; then echo "FAIL: scripts/combat_check.sh"; tail -20 .verify.log; exit 1; fi
+fi
 # the audio goldens: rendered in game time, no device opened, nothing played aloud
 if ! scripts/audio_golden.sh > .verify.log 2>&1; then echo "FAIL: scripts/audio_golden.sh"; tail -20 .verify.log; exit 1; fi
 if [ "${STRATA_NO_GPU:-0}" != "1" ]; then

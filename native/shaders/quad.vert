@@ -13,13 +13,16 @@ struct Chunk { ivec4 origin_level; uint first[6]; uint count[6]; vec4 pos; vec4 
 layout(std430, set = 0, binding = 1) readonly buffer Table { Chunk chunks[]; } table;
 // Which slot each indirect command draws; [base] is where this call's range starts.
 layout(std430, set = 0, binding = 4) readonly buffer DrawSlot { uint slot[]; } draw_slot;
+// The block table, then each texture's top texture (strata_vk.c, sv_blocks_set): a far chunk's riser takes its block's top
+struct Block { int tex[6]; int flags; int emission; };
+layout(std430, set = 0, binding = 5) readonly buffer Blocks { Block rows[65536]; uint top_of[]; } blocks;
 layout(push_constant) uniform PC { uint base; uint flags; } pc;
 
 layout(location = 0) out vec2 v_uv;           // in unit faces: 0..w, 0..h (corner shading interpolates in these)
 layout(location = 4) out vec2 v_tex;          // texture coordinate: one tile per world voxel, image rows running downward
 layout(location = 1) out vec3 v_world;        // metres
 layout(location = 2) flat out uint v_w1;
-layout(location = 3) flat out uint v_face;
+layout(location = 3) flat out uint v_face;        // 0..5; plus 8 for a chunk above level 0, lit without rays
 layout(location = 5) flat out vec4 v_rot;        // the rotation of the body drawn; identity for the world
 
 void main() {
@@ -59,7 +62,10 @@ void main() {
     v_tex = (face < 2u ? vec2(du, dv) : vec2(du, h - up)) * lod;
     v_uv = vec2(du, dv);
     v_world = world;
-    v_w1 = fluid ? (w1 | (255u << 16)) : w1;           // a fluid is not corner-shaded
-    v_face = face;
+    // a side face of a chunk above level 0 takes its block's top texture: a riser there is many voxels tall,
+    // and a grass side's dirt would brown the far hills
+    uint w1t = ((ol.w & 255) > 0 && face >= 2u) ? ((w1 & 0xFFFF0000u) | blocks.top_of[w1 & 65535u]) : w1;
+    v_w1 = fluid ? (w1t | (255u << 16)) : w1t;           // a fluid is not corner-shaded
+    v_face = face | ((ol.w & 255) > 0 ? 8u : 0u);
     gl_Position = to_clip(u.vp * vec4(world, 1.0));
 }

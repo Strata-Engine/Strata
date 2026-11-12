@@ -1,7 +1,7 @@
 // The geometry pass: solid surfaces write what the light pass needs to know
 // about them, not a lit colour.
 //   o_albedo  rgb the texture's colour
-//   o_nm      r face (0..5) / 255, g unused, b light class / 255, a corner shading 0..1;
+//   o_nm      r face (0..5) / 255, g 1 for a chunk above level 0 (lit without rays) else 0, b light class / 255, a corner shading 0..1;
 //             a turned surface (a body) has r 16..255 and g: its true normal, octahedral (light.frag decodes)
 // A figure (push constant flags bit 1) takes its colour, roughness and
 // emission from its rig's palette, not a texture or a light class:
@@ -33,7 +33,7 @@ void main() {
         float em = float(pe.y >> 16) / 65535.0;
         uint code = (((v_w1 >> 24) & 1u) << 6) | uint(floor(em * 63.0 + 0.5));
         o_albedo = vec4(col, float(code) / 255.0);
-        vec2 fe = oct_enc(qrot(v_rot, NORMALS[min(v_face, 5u)]));
+        vec2 fe = oct_enc(qrot(v_rot, NORMALS[min(v_face & 7u, 5u)]));
         o_nm = vec4((16.0 + floor(fe.x * 239.0 + 0.5)) / 255.0, fe.y, float(pe.y & 65535u) / 65535.0, focc);
         return;
     }
@@ -52,7 +52,7 @@ void main() {
 
     o_albedo = vec4(base.rgb, 1.0);
     if (turned(v_rot)) {
-        vec2 e = oct_enc(qrot(v_rot, NORMALS[min(v_face, 5u)]));
+        vec2 e = oct_enc(qrot(v_rot, NORMALS[min(v_face & 7u, 5u)]));
         o_nm = vec4((16.0 + floor(e.x * 239.0 + 0.5)) / 255.0, e.y, float((v_w1 >> 24) & 255u) / 255.0, occ);
-    } else o_nm = vec4(float(min(v_face, 5u)) / 255.0, 0.0, float((v_w1 >> 24) & 255u) / 255.0, occ);
+    } else o_nm = vec4(float(min(v_face & 7u, 5u)) / 255.0, v_face >= 8u ? 1.0 : 0.0, float((v_w1 >> 24) & 255u) / 255.0, occ);
 }

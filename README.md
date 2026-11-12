@@ -10,10 +10,17 @@ Design: `docs/2026-11-10-strata-design.md`. Build plan:
 
 ## Toolchain
 
-Strata compiles against March `origin/main`. Last verified against commit
-`1a4251bc8` (march 0.7.0). `scripts/env.sh` expects that build at
-`~/code/march-main` (a git worktree of the March repository, built with
-`dune build`); set `STRATA_MARCH_HOME` to point elsewhere.
+Strata compiles against March `origin/main` (as of `f6481bbe6`, march
+0.7.0). `scripts/env.sh` puts a build of it first on the path (at
+`~/code/march-main`, a git worktree of the March repository built with
+`dune build`; set `STRATA_MARCH_HOME` to point elsewhere) and sets
+`MARCH_HOME` to an empty directory there, because forge otherwise takes the
+toolchain `~/.march/current` names (0.5.0 on the development machine) ahead
+of the one on the path. March 0.5.0 no longer builds Strata: file, settings
+and print calls answer a capability result (`Authority.must`), and hashes
+use `int_wrapping_mul`, neither of which 0.5.0 has. The numbers in
+`RESULTS.md` up to the island's are from 0.5.0; those of path finding are
+from main.
 
 The renderer needs Vulkan and GLFW. On macOS:
 
@@ -77,17 +84,32 @@ a ruin), and a stamped voxel that is now air was removed by an edit.
 **The scale rule.** Everything the generator knows is in metres: lengths,
 heights, noise periods. The world's scale (metres a voxel, given to
 `Strata.World.new`) only decides how finely that shape is cut into voxels,
-so the same seed makes the same island at 1 m, 0.5 m or 0.25 m a voxel, its
-features as many metres across. Voxel counts (a blast's radius, a chunk's 32)
-stay voxels. The stream's focus and `Strata.Query.raycast` take metres;
+so the same seed makes the same island at any scale that divides a metre
+(1 m, 0.5 m, 0.25 m a voxel): the ground, the water, the trees (the same
+tree in the same cell, its slope measured over a metre each side), the
+ruins (authored at 1 m a voxel and fitted with `Strata.Template.fit`, so a
+ruin is as many metres across) and the lantern posts (rolled per square
+metre) stand where they stand, in metres, to within a voxel of the coarser
+scale; `viewer/test/island_test.march` checks it at 1 m and 0.5 m. Two
+parts are still tuned at 1 m: the thermal scree (its reach is counted in
+voxels, so a steep slope relaxes less at a finer scale) and the cave and
+density sampling lattice (its spacing is in voxels). Voxel counts (a blast's
+radius, a chunk's 32) stay voxels. The stream's focus and `Strata.Query.raycast` take metres;
 the renderer, the camera, edits and `Strata.Fluid` work in voxels. The
 viewer's fixed scenes are posed at 1 m; `STRATA_SCALE=0.25` runs it finer.
 
-**The parameter file.** Every number the viewer's generator uses (the atlas
+**The parameter file.** The viewer's generator settings (the atlas
 definition, the detail and density noise, the cave thresholds, the surface
 lines, the tree kind, each region's tree density, species mix and cave
-factor) is a line of `viewer/assets/island.gen`, `name = value`, read at
-start and again on `R` (or `STRATA_REGEN=1` in a scripted run). A name the
+factor) are lines of `viewer/assets/island.gen`, `name = value`, read at
+start and again on `R` (or `STRATA_REGEN=1` in a scripted run). Some
+numbers stay in the code: a site's radius (12 m) and the island mask's
+relief (up to 60 m over the sea before erosion) in `Strata.Atlas`; and in the
+viewer the reach of a lake's rim clamp (4 m), the room left over the ground
+for trees and ruins (`feature_top`, 18 m), how far a tree may reach
+(`max_reach`, 10 m), how far past an area rivers are looked for
+(`reach_m`, 64 m), a river channel's depth (up to 1.5 m) and the tree
+species' shapes (`StrataViewer.Trees`). A name the
 file leaves out takes the code's default and is said once a load; a name it
 does not know, or a line it cannot read, is said and ignored. Regenerating
 first finishes the fluid's step in flight and starts the fluid afresh, then
@@ -459,6 +481,75 @@ let e3 = Strata.Entities.set_column(e2, 0, Strata.Entities.col_velocity(), vel)
 
     (cd entcheck && forge build --release) && ENTCHECK_SCENE=basics entcheck/.march/build/release/entcheck
 
+## The match
+
+A small complete game in the viewer, to show the parts working together: a
+free-for-all between the player and eleven computer fighters, first to 30
+kills (`docs/2026-11-12-combat-design.md`).
+
+```sh
+MARCH_PIN_MAIN=1 STRATA_SHORE=1 STRATA_COMBAT=1 STRATA_LIGHT=4 ./viewer/.march/build/release/strata_viewer
+```
+
+- **You**: slot 1 is a bow (accurate, 35 a hit, an arrow every 0.6 s), slot 2
+  fire (60 where it lands, less out to 2 m, yourself included; a fireball
+  every 1.5 s). Hold the left button to shoot. Slots 3 to 9 are blocks: the
+  left button digs one block within 6 m, the right places one. Fire burns
+  wood, leaves, tall grass and ice within 2 m and turns grass to dirt.
+- **They**: seven rushers (100 health, a swing for 25) and four shooters (60
+  health, arrows). Each goes for the nearest fighter it can see, whoever that
+  is. They find their way (`Strata.Nav`): round a wall, a pit or a cliff when
+  the straight way is shut, through water if that is the way, and a rusher
+  goes on for 6 s after a target that steps out of sight. They swim, climb
+  out at a low bank, and cannot attack from the water. They do not dig,
+  place or burn. `STRATA_COMBAT_NAV=0` plays the match without path finding.
+- **Keys**: Tab the table, Enter another match once one is won. Flight is off.
+  More than 150 m from the field the match is paused.
+- A fighter is an entity (`Strata.Entities`) drawn as a figure (`Strata.Anim`)
+  the match places each frame; shots are flying entities; the rules are pure
+  March in `viewer/lib/combat.march`, the rest in `viewer/lib/match.march` and
+  `match_hud.march`. `scripts/combat_check.sh` plays eleven scripted scenes
+  hidden, each twice, and the gate runs it.
+
+Not in it: melee for the player, fighters that keep clear of each other (one
+blocked by another sidesteps; one stuck 20 s is put back at a spawn point),
+enemies that dig or burn, fire
+that spreads, drowning, new sounds, a flash on a hit (waiting on a per-figure
+tint in the animation work).
+
+## Finding the way
+
+`Strata.Nav` answers where a walker can stand and how it gets from one
+place to another; `Strata.Steer` which way a mover should head
+(`docs/2026-11-12-nav-design.md`). Neither knows what a walker is in a game.
+
+```march
+-- a walker from its box in metres: 0.6 m wide, 1.8 m tall, climbs 1.05 m, drops 4 m
+let k = Strata.Nav.with_swim(Strata.Nav.walker_of(Strata.World.scale(w), 0.3, 1.8, 1.05, 4.0), true)
+
+-- the cell under a place, then the way from one to another: at most 1200 cells expanded
+match Strata.Nav.foot(w, k, x, y, z, 2) do
+  Some((ax, ay, az)) ->
+    let p = Strata.Nav.find(w, k, ax, ay, az, gx, gy, gz, 1200)
+    -- its corners, in metres; drop those reached as the mover goes
+    let corners = Strata.Nav.points(Strata.Nav.smooth(w, k, Strata.Nav.cells(p), 10), Strata.World.scale(w))
+    Strata.Nav.advance(corners, px, pz, 0.5)
+  None -> Nil
+end
+
+-- no path needed when the walker can go straight
+Strata.Nav.straight(w, k, ax, ay, az, gx, gy, gz)
+
+-- the cheapest way to any cell a game's own test accepts: here, one out of a threat's sight
+Strata.Nav.nearest(w, k, ax, ay, az, fn (x, y, z) -> hidden_from(threat, x, y, z), 600)
+```
+
+A path that is not `arrived` ends at the cell nearest the goal that the
+search reached: walk it and ask again. A search reads the world as it is, so
+an edit is seen by the next one; there is nothing to rebuild. It works in a
+window of at most 96 cells across (and 40 and twice the walker's height up
+and down) and on loaded chunks only.
+
 ## Using it from a game
 
     [deps]
@@ -516,7 +607,43 @@ chunk has the edited level-0 chunks under it coarsened over it
 (`Strata.World.coarsen`; the stream does it on the worker that generates
 the chunk), and an edit makes its ancestors stale (`Strata.World.stale`),
 which the stream puts through its generation queue again without waiting.
-Nothing draws the coarse levels yet.
+
+## The far field
+
+Past the near chunks the world goes on in rings of coarser chunks (Part F
+of `docs/2026-11-10-renderer-design.md`): level L is 32 voxels a side,
+each `scale * 2^L` metres, and each level reaches twice as far as the one
+before. A game asks for it with `config_levels` and a generator made with
+`gen_levels`, and draws it with the same two calls as before:
+
+```march
+-- level 0 out 10 chunks (3 up and down), levels 1..4 each 10 of their own chunks out and 1 up and down
+let s0 = Strata.Stream.start(world, Strata.Stream.config_levels(10, 3, 8, 4, 10, 1, 4))
+-- each frame, as always: the renderer takes meshes of every level
+let (r2, s2) = Strata.Render.sync(r, Strata.Stream.tick(s1))
+```
+
+- **One level draws each region.** `Strata.Render.sync` applies the rule
+  in `Strata.Slots`: a coarse chunk is kept undrawn, its mesh held, while
+  its eight children all have meshes; a fine chunk is drawn only when its
+  seven siblings have theirs. While fine chunks arrive the coarse one
+  stands in for them, and when they leave their meshes stay on screen
+  until the coarse one's mesh is uploaded (`Strata.Render.retained`).
+- **Each level loads its whole box**, under the finer levels too, but a
+  coarse chunk over chunks that will be drawn is not meshed. Each level's
+  meshed inside is snapped out to whole chunks of the level above, so the
+  levels meet on whole coarse chunks.
+- **Lit without rays.** A coarse chunk is lit by the sun and the sky alone,
+  as light mode 1 lights everything; it is not in the light volume, casts
+  no shadow and is reflected only as sky.
+- **Seams.** Where two levels meet the ground can step by one coarse voxel,
+  and a ring passing over terrain changes its shape once. The fog closes
+  at the outer ring.
+
+In the viewer the far field is on: four levels, to 5.1 km at 1 m a voxel
+(1.3 km at 0.25 m). `STRATA_LEVELS=n` sets the number of levels, 0 the near
+field alone. Scene 135 is the island from its highest hill, 136 a ring
+boundary over the ground; their numbers are in `RESULTS.md`.
 
 ## Modules
 
@@ -534,6 +661,8 @@ Nothing draws the coarse levels yet.
 | `Strata.Edit` | single, list, box and sphere edits; blasts |
 | `Strata.Stream` | loading around focus points; task-built chunks and meshes |
 | `Strata.Query` | raycast and swept box collision |
+| `Strata.Nav` | where a walker stands; A* paths over the voxels, nearest-by-test, straight lines, corners |
+| `Strata.Steer` | directions over the ground for a mover: seek, flee, arrive, keep apart, blend, turn |
 | `Strata.Fluid` | finite fluids: fall, run to a drop, stay level, sink, rest |
 | `Strata.Slots`, `Strata.Render` | renderer slot bookkeeping; keeping the renderer in step with a stream |
 | `Strata.Model` | a model block's drawing geometry |
@@ -566,8 +695,9 @@ Nothing draws the coarse levels yet.
 - Light from a small lamp takes several seconds to stop shimmering.
 - A reflection shows surfaces lit by the sun and a flat sky term, without
   their own highlights or sky light, and misses thin things far away.
-- The view reaches the stream's radius, about 300 m by default. The far
-  field is the next plan.
+- The far field is lit without rays: no shadows, sky light or reflections
+  past the near chunks. Where two levels meet the ground can step by one
+  coarse voxel; the levels meet on whole coarse chunks.
 - Translucent quads are ordered by chunk, not within one, and draw from
   both sides, so a one-block pane blends twice.
 - Model faces light as the nearest of the six axis directions.
@@ -577,6 +707,14 @@ Nothing draws the coarse levels yet.
   the mapped buffer is correct everywhere and slower on a discrete GPU.
 - The frame in which the camera enters a new chunk spends 5 to 7 ms in
   `Strata.Stream.set_focus`. See `RESULTS.md`.
+- Generating an island chunk costs about 12 ms of CPU for a surface chunk
+  at level 0 and about 11 ms for a coarse one, against a 1 ms target; the
+  far field takes about 30 s to fill from cold (measured at a load average
+  of 34). See `RESULTS.md`.
+- The island's thermal scree and its cave and density sampling are tuned
+  at 1 m a voxel: their reach and spacing are counted in voxels, so at a
+  finer scale steep slopes relax less and the lattice is finer. The rest of
+  the island is the same in metres at any scale that divides a metre.
 - March and forge gaps met on the way are in `GAPS.md`.
 
 ## The gate

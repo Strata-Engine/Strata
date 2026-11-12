@@ -1,0 +1,63 @@
+-- Steer: directions over the ground for a mover.
+mod Strata.Test.Steer do
+
+  needs IO.Clock      -- charged to every test module once any uses Check.all (GAPS S3)
+  needs IO.Process
+  import Test
+  alias Strata.Steer as Stq
+
+  pfn near(a : Float, b : Float) : Bool do Math.abs(a -. b) < 0.0001 end
+  pfn is2(p : (Float, Float), x : Float, z : Float) : Bool do match p do (px, pz) -> near(px, x) && near(pz, z) end end
+  pfn len2(p : (Float, Float)) : Float do match p do (px, pz) -> Math.sqrt(px *. px +. pz *. pz) end end
+
+  describe "Steer.seek, flee and arrive" do
+    test "seek is the unit direction to the point, flee its opposite, and both are zero on the spot" do
+      Test.assert_true(is2(Stq.seek(1.0, 1.0, 4.0, 5.0), 0.6, 0.8), "3, 4 away is (0.6, 0.8)")
+      Test.assert_true(is2(Stq.flee(1.0, 1.0, 4.0, 5.0), -0.6, -0.8), "and away from it the opposite")
+      Test.assert_true(is2(Stq.seek(2.0, 2.0, 2.0, 2.0), 0.0, 0.0), "zero on the spot")
+      Test.assert_true(is2(Stq.flee(2.0, 2.0, 2.0, 2.0), 0.0, 0.0), "for flee too")
+    end
+
+    test "arrive goes at full speed far off, slows evenly, and stops short" do
+      Test.assert_true(match Stq.arrive(0.0, 0.0, 10.0, 0.0, 1.0, 5.0) do (ux, _, s) -> near(ux, 1.0) && near(s, 1.0) end, "full speed at 10 m")
+      Test.assert_true(match Stq.arrive(0.0, 0.0, 3.0, 0.0, 1.0, 5.0) do (_, _, s) -> near(s, 0.5) end, "half at 3 m, midway from 1 to 5")
+      Test.assert_true(match Stq.arrive(0.0, 0.0, 0.5, 0.0, 1.0, 5.0) do (ux, _, s) -> near(ux, 1.0) && near(s, 0.0) end, "stopped inside 1 m, still facing it")
+      Test.assert_true(match Stq.arrive(0.0, 0.0, 3.0, 0.0, 1.0, 1.0) do (_, _, s) -> near(s, 1.0) end, "no slowing when slow is not past stop")
+    end
+
+    test "range says toward, away or hold" do
+      Test.assert_eq_int(Stq.range(0.0, 0.0, 30.0, 0.0, 12.0, 25.0), 1, "30 m: toward")
+      Test.assert_eq_int(Stq.range(0.0, 0.0, 20.0, 0.0, 12.0, 25.0), 0, "20 m: hold")
+      Test.assert_eq_int(Stq.range(0.0, 0.0, 5.0, 0.0, 12.0, 25.0), -1, "5 m: away")
+    end
+  end
+
+  describe "Steer.apart, blend and turn" do
+    test "a neighbour pushes straight away, harder the nearer, and not at all at the radius" do
+      Test.assert_true(is2(Stq.apart(0.0, 0.0, Cons((1.0, 0.0), Nil), 2.0), -0.5, 0.0), "half the radius off: half a push, away")
+      Test.assert_true(is2(Stq.apart(0.0, 0.0, Cons((2.0, 0.0), Nil), 2.0), 0.0, 0.0), "at the radius: none")
+      Test.assert_true(is2(Stq.apart(0.0, 0.0, Cons((0.0, 0.0), Nil), 2.0), 0.0, 0.0), "itself among the others: none")
+      Test.assert_true(is2(Stq.apart(0.0, 0.0, Nil, 2.0), 0.0, 0.0), "no one: none")
+    end
+
+    test "pushes add, and the sum is no longer than one" do
+      Test.assert_true(is2(Stq.apart(0.0, 0.0, Cons((1.0, 0.0), Cons((-1.0, 0.0), Nil)), 2.0), 0.0, 0.0), "two opposite neighbours cancel")
+      Test.assert_true(is2(Stq.apart(0.0, 0.0, Cons((1.0, 0.0), Cons((0.0, 1.0), Nil)), 2.0), -0.5, -0.5), "two at right angles push diagonally")
+      let crowd = Cons((0.2, 0.0), Cons((0.3, 0.1), Cons((0.25, -0.1), Nil)))
+      Test.assert_true(near(len2(Stq.apart(0.0, 0.0, crowd, 2.0)), 1.0), "three close on one side: cut to one")
+    end
+
+    test "blend weighs two directions and answers a unit one, or zero" do
+      Test.assert_true(is2(Stq.blend(1.0, 0.0, 1.0, 0.0, 1.0, 1.0), 0.70710678, 0.70710678), "equal weights: between them")
+      Test.assert_true(is2(Stq.blend(1.0, 0.0, 1.0, 0.0, 1.0, 0.0), 1.0, 0.0), "weight zero: the other alone")
+      Test.assert_true(is2(Stq.blend(1.0, 0.0, 1.0, -1.0, 0.0, 1.0), 0.0, 0.0), "opposites cancel")
+    end
+
+    test "turn goes the shorter way, no more than a step, and lands exactly" do
+      Test.assert_true(near(Stq.turn(0.0, 1.0, 0.25), 0.25), "a step toward")
+      Test.assert_true(near(Stq.turn(0.0, 0.1, 0.25), 0.1), "less than a step: there")
+      Test.assert_true(near(Stq.turn(3.0, -3.0, 0.1), 3.1), "across the back: on past pi, the shorter way")
+      Test.assert_true(near(Stq.turn(3.1, -3.1, 0.1), -3.1), "and landing over the seam")
+    end
+  end
+end

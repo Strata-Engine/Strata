@@ -1,0 +1,93 @@
+# Combat ledger — plan: docs/2026-11-12-combat-plan.md
+
+Spec: docs/2026-11-12-combat-design.md. Executed inline (native), one reviewer at the end.
+
+Pre-flight: Task 3 consumes Task 1's roster, ring, spawn_at, target, intent and Task 2's clips, bow: names agree. Task 4 consumes Task 1's hit, tick, idle, winner: agree. Task 7 consumes Task 1's tool and Task 5's throw_fire: agree. Task 8's tint is produced and consumed inside Task 8. No conflicts found.
+
+Task 1: Ruling: `hit`'s third parameter is `who`, not `by` — `by` is a reserved word in March (parse error) — nothing if wrong.
+Task 1: Ruling: another module cannot match on Combat's constructors (no qualified constructor patterns; the codebase reads foreign types through accessors), so Combat also exports `credit`, `killed`, `intent_code`, `intent_target`, `kind_code`, `player`/`rusher`/`shooter`, `at`, `kills`, `deaths`, `health`, `alive`, `name`, `kind` — the plan's Produces block named the types only — later tasks read outcomes and intents as numbers.
+Task 1: Ruling: test modules also need `needs IO.Clock` — charged to every test module once any uses the clock (GAPS S3).
+Task 1: complete (commit a224ef0, tests: forge test test/combat_test.march -> 72/72 pass, 14 of them combat's)
+Task 2: Ruling: a fallen fighter comes apart into 15 pieces, one a humanoid part; the plan's "10" (Task 8's check) miscounted the humanoid's parts — nothing if wrong.
+Task 2: Ruling: `piece(part)` is a box of the part's size in its main colour (the head keeps its hair and eyes), not a copy of the part's voxels — the rig API does not expose a part's voxels; at 1/16 m the difference is the belt and a forearm's sleeve.
+Task 2: complete (commit 1787009, tests: forge test test/combat_test.march -> 75/75 pass; scripts/golden.sh PASS, figure scenes unchanged)
+Task 3: Ruling: `Match.frame` answers (match, stream, block changes) and the viewer applies the changes with its own `edit` (stream, fluid wake, physics wake); the plan had it answer the fluid — an edit must go through the viewer's Sim so support and fluids hear of it — nothing if wrong.
+Task 3: Ruling: `Match.start` takes the start's height and whether there is a player; the middle is searched in eight directions (40 to 160 m) rather than "inland", since the shore's direction is not known to the match — same result: the first circle four fifths dry.
+Task 3: Ruling: the match keeps the figure world itself (`Match.anim`, `Match.rigs`), not a Crowd; `Figures.body_id` and `clip_ids` expose what it needs.
+Task 3: Finding: the viewer's sea (block 5) is a plain non-colliding block, not a fluid state, so `Figures.dry_ground_at` called the sea bed dry. It now treats block 5 as water. The STRATA_FIGURES crowd used the same function: it could have stood walkers on the sea bed.
+Task 3: Finding (for Task 7): the viewer's dig is a sphere of radius 6 and its build a sphere of radius 2 (`act`). The user asked for single-block edits; a match must dig and place one block.
+Task 4: Ruling: an arrow's thrower is kept in the match's own shot record, not in an entity slot — the match already holds a record a shot for its figure — nothing if wrong.
+Task 4: Ruling: an arrow that meets a block has its entity removed and its figure left stuck for 5 s; a flying entity left in place would keep reporting the block under gravity.
+Task 4: Ruling: `Combat.lead` also answers the seconds in flight (the test flies the shot for that long).
+Task 4: Ruling: a fighter with no target jogs (2.8 m/s) to within 14 m of the middle and then between the inner spawn points; at a walk (1.4 m/s) round fixed points the bots-only match stood at 9 kills for its leader after 5 minutes.
+Task 4: Ruling: loosing an arrow or beginning a swing counts as activity for the idle rule (design: "given or taken a hit"): a shooter holding its ground and missing for 20 s is not stuck.
+Task 4: Ruling: the bots-only match's budget in combat_check.sh is 90,000 frames, not the plan's 54,000 — measured: a winner at frame 52,356 (14.5 minutes of play), 249 kills in all, the top four within 3 kills; the plan's number left 3% of margin — cost if wrong: a match that slows down further still passes until it takes 25 minutes.
+Task 4: Finding: 68 idle respawns in that match (4.7 a minute): fighters stuck where they cannot get out. The field is 53/64 dry; walkers that enter the sea walk its bed. Expect Task 6 (swimming) to lower it; measure again there.
+Task 4: Ruling: scenes are numbers to the match (1 duel, 2 trap); the viewer maps STRATA_COMBAT_SCENE's name. The trap's check line is `combat: trap inside I, respawns R` (I == 0, R >= 1) over 1,800 frames, not the plan's `freed F` at 1,500: the idle rule needs 20 s after the block is set at frame 300.
+Task 3: complete (commit 026d244, shared with Task 4; tests: scripts/combat_check.sh -> field ok; scripts/golden.sh PASS)
+Task 4: complete (commit 026d244, tests: forge test -> 78/78 pass; scripts/combat_check.sh -> field, duel, trap, match ok, each equal across two runs)
+Task 5: Ruling: the fire scene's check asks for wood >= 1 and grass >= 1; leaves are not required — the mark is a metre up a trunk and the canopy of a generated tree starts well above 3 m.
+Task 5: Ruling: scripted scenes set the camera (`Match.staged`, `Match.eye`); the viewer takes its eye and view from them. Needed for any picture of a scene: the scripted camera otherwise stays at the shore start.
+Task 5: Ruling: `ground` in the match searches 160 m down from above the start (Figures.ground_at searches 6 m and answered 58 m in the air; Task 4's duel and trap fighters were being dropped from there). The trap scene's fighters now stand still, so the pit and the block act on them; its idle respawns are 2.
+Task 5: Finding (not resolved): with support on, a tree whose trunk burns through is gone from the terrain 6 frames later and nothing is seen falling or lying there in the scripted pictures. Strata.Physics makes loose pieces into bodies (physics.march:866); whether they are made and not drawn, or dropped, was not established. Raise with the physics session.
+Task 5: Not measured yet: the fireball's light cost with four in the air (plan: under 1 ms). Left to Task 10's measurements.
+Task 5: complete (commit 4b2a7ad, tests: forge test test/combat_test.march -> 79/79; combat_check.sh -> field, duel, trap, fire, match ok; golden combat-fire stored after looking)
+Task 6: Note: `water_point` and its test were written together; the test was not watched failing first.
+Task 6: Ruling: swimmers swim at 2.5 m/s, not the design's 1.5 (a designer's number): at 1.5 the bots-only match slowed from 14.5 to 23.7 minutes.
+Task 6: Ruling: a swimming fighter makes for the nearest spawn point (dry land by construction), whatever its target. Design said "toward where it was going"; two swimmers chasing each other met in the water, could not attack, and stood there until the idle rule took them.
+Task 6: Ruling: fighters with nothing to do gather at a rally point, the open ground nearest the middle, not the middle itself: this field's middle is in a river.
+Task 6: Ruling: spawn points are on open ground: dry, not leaves or wood, with two cells of headroom.
+Task 6: Ruling: the sidestep of a blocked fighter grows (0.5, 1, 2, 4 s) and alternates left and right until it has moved 2 m; the design's fixed half second to the left left fighters stuck behind two-block terraces at two spawn points for the whole match.
+Task 6: Measured: bots-only match, winner at frame 41,945 (11.6 minutes), 133 kills, 5 idle respawns (Task 4: 52,356 frames, 249 kills, 68 idle respawns).
+Task 6: complete (commit c42c678, tests: forge test test/combat_test.march -> 80/80; combat_check.sh -> field, duel, trap, fire, channel, match ok)
+Task 7: Ruling: in a match the viewer's dig and build are one block within 6 m (`Match.single_edit`); the viewer's own are spheres of radius 6 and 2. The user's words: "single block terrain edits".
+Task 7: Ruling: the trigger is the left button held, not its press: an archer holds and looses every 0.6 s. On a block's slot the left button's press digs, as before.
+Task 7: Ruling: a dead player's view tips to the sky and movement stops for the 3 s; the design's "the view drops to the ground" would move the body, since the viewer keeps one position for the eye and the body.
+Task 7: Ruling: scripted players run on their own grounds (scene 5 `range`, 6 `victim`): the player at a spawn point, the rusher 20 or 10 m off along the first lane of walkable ground in plain sight. On the rally-to-spawn line first tried, the arrows met a terrace and the rusher could not reach the player.
+Task 7: Ruling: the viewer also moves the walker's physics body when the match sets the player down (`Physics.place_driven`); setting the eye alone left the player 16 m from its spawn point.
+Task 7: Ruling: `Match.start` takes the script as well as the scene; `Match.view` gives a scripted player's view to the camera; the plan's `script_input` is inside `frame`.
+Task 7: Note: the single_edit test was written after the function and passed at once.
+Task 8: Ruling: the hit flash (the per-figure tint, the task's one engine change) is not built yet. The animation session has unmerged work in the anim kernel, its bindings, render.march and the figure shaders, and asked that the tint be built on main once its branch lands (expected within hours). Its four requirements: carry the tint in the traced figure records too; keep it render-only or fold it into an_hash; reset it on spawn and id reuse; leave the shadow map alone. Until then a hit shows by the flinch and the push only.
+Task 8: Ruling: the flinch plays as an additive layer (layer 1): a plain layer at full weight would put the legs in their rest pose.
+Task 8: Ruling: a killed fighter's entity is removed at once and its figure plays the fall alone; the plan held the entity for the 0.6 s. A corpse that still had a box would stop arrows.
+Task 8: Ruling: shirt-coloured loose parts are rigs per fighter (15 a fighter, 180 in all, of AN_RIGS 256 with the twelve humanoids and four props: 196). Simpler than sharing the unshirted shapes; room is the cost.
+Task 8: Ruling: knockback from a swing is 1 m (the design gives arrows 1.5 m and fire up to 3 m; it names none for a swing).
+Task 8: Measured: bots-only match, winner at frame 56,993 (15.8 minutes): pushed fighters take longer to finish.
+Task 7: complete (commit 8e3b1b4, tests: forge test -> 81/81; combat_check.sh archer, victim, far ok)
+Task 8: complete but for the flash (commit 37eb2e4, tests: combat_check.sh all nine ok; scripts/verify.sh -> PASS on this commit)
+Task 9: Ruling: the bow and the flame on the hotbar are drawn from rectangles; the plan added two pictures to the interface atlas. The atlas's free pixels are the white the display's plain rectangles sample, so it is left alone.
+Task 9: Ruling: `Hud.build_bar` takes the nine icons; the match's display is `StrataViewer.MatchHud` (a file of its own).
+Task 9: Ruling: STRATA_COMBAT_HOLD=1 keeps a scripted run going to its last frame after a win, for the end screen's picture (a scripted run otherwise ends at the win, before the shot is taken).
+Task 9: Ruling: `again` takes no world; the ten-match check allows 28 live entities and 60 figures after the tenth (measured: 10 and 17).
+Task 9: Mistake: three runs of the viewer went out without STRATA_HIDDEN (the settings were in one shell variable, which zsh passes as a single word): a window was open on the user's screen for about ten minutes, then twice briefly. Scripted runs are launched through a shell function now.
+Task 9: complete (commit 8f04db6, tests: forge test test/combat_test.march -> 82/82; combat_check.sh all ten ok; goldens combat-fight and combat-end stored after looking)
+
+## Final review (one fresh reviewer, whole branch 5267b6d..90012f3)
+
+No Critical findings. Fix pass:
+
+Final: fixed arrow knockback always zero (the removed arrow's velocity was read) — combat_check archer `pushes 2` RED (0) -> GREEN.
+Final: fixed a touch lost when the same arrow's block hit is reported first — touches are handled before block hits. Not reproduced: the new `waller` scene (a wall a metre behind the target) passed before the fix too; kept as a guard.
+Final: fixed stuck arrows drawn upright (the kernel zeroes a shot's velocity before reporting the block) — a shot keeps its own direction; combat_check duel `arrows stuck 1, upright 1` RED -> `upright 0` GREEN.
+Final: fixed the first-step test being a fixed metre and absent for fireballs — `Combat.muzzle_reach(speed, dt)`, test muzzle_reach RED (no function) -> GREEN; a fireball with a block in its first step bursts there. The glue's use of it has no scene of its own.
+Final: fixed shooters not leading the player (its velocity was taken as zero) — the eye's travel since the last frame. No test: scripted players do not move; wiring only.
+Final: fixed the trap check that could not fail — it asserts the rusher fell 250 cm or more (300 measured) and reports who is inside a block 2 s after it is set (0: the mover put the shooter out).
+Final: fixed the ten-match check's loose bounds — every rematch must begin with exactly 11 entities and 15 figures (it does, nine times).
+Final: fixed (regraded from Minor: a second burn and blast at the world's origin) a fireball bursting twice when it lands on the frame it is 4 s old. No test: needs that coincidence.
+Final: fixed (regraded from Minor: seen on every idle fighter) the wander goal flipping each frame at 14 m from the rally point — a fighter patrols once it has reached the rally point, until 60 m from it. No test: a matter of looks; the field check's travel is 419 m (415 before).
+Final: Ruling: finding 8, the tree that vanishes when its trunk burns, is not fixed here — the physics session confirmed it as its bug (`finish_world` drops the bodies a step makes but applies the step's edit) with a fix on its branch (0ae7a68), not yet on main — until then a burned-through tree disappears.
+Final: Ruling: the reviewer is right that the plan called a bots-only match over 54,000 frames a finding, not a budget to raise; it takes 58,160 (16.2 minutes) after the fixes. Left as it is and reported to the user: the design gave no length, and the numbers that set the pace (health, damage, knockback) are the design's.
+Final: minor (deferred): the respawn point is chosen counting the returning fighter as living at its death place.
+Final: minor (deferred): swings land every 1.0 or 1.25 s (the 0.25 s decision tick).
+Final: minor (deferred): the viewer's dig and build sounds play on a weapon's slot; a dead player can still dig and place.
+Final: minor (deferred): the player can place a block inside a fighter or on a spawn point.
+Final: minor (deferred): a swimmer's bank exit does not check headroom; in water 1.0 to 1.4 m deep a swimmer's feet are eased into the bed.
+Final: minor (deferred): a retreating shooter faces the way it walks, not its target.
+Final: minor (deferred): a swimmer making for the nearest spawn point can turn back to its own bank; a shooter firing at a submerged player never retargets.
+Final: minor (deferred): no strike sound on a hit and no knockback for the player (both in the design); 196 of 256 rigs used.
+Final: Ruling (declined to judge, now measured): the walking mover puts a fighter out of a block set in its place (trap: 0 inside at frame 420).
+Final: the gate on 06bf059 passed all but the two combat pictures, which the knockback fix moved (the target is pushed up the slope, so the archer's view tips up); looked at and re-stored.
+
+## After the plan (asked for by the user while playing)
+
+Key P saves a picture (PPM by the renderer, turned into a PNG by `sips`). Tall grass left with nothing under it by any edit is removed (the viewer's `edit`). Spray where a river's surface steps down (`StrataViewer.Falls`): found on a worker every 5 s, on when playing only.

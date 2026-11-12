@@ -99,6 +99,14 @@ mod Strata.Test.Stream do
     List.fold_left(l, 0, fn (n, p) -> match p do (k, _) -> if Cd.level(k) == lv do n + 1 else n end end)
   end
 
+  -- level-1 meshes with x below [x]
+  pfn level1_short_of(l : List((Strata.Coord.Key, Strata.Mesh.Meshed)), x : Int) : Int do
+    match l do
+      Nil -> 0
+      Cons((k, _), t) -> (if Cd.level(k) == 1 do (if Cd.kx(k) < x do 1 else 0 end) else 0 end) + level1_short_of(t, x)
+    end
+  end
+
   describe "Stream" do
     test "loads the box around the focus and meshes every chunk with all its neighbours" do
       let s = at(begin(8, 2), 0.5, 0.5, 0.5)
@@ -311,14 +319,15 @@ mod Strata.Test.Stream do
     end
     test "with levels, a settled stream holds each level's box, meshes carry their level, and the world is the same by two paths" do
       let s = at(begin_levels(), 0.5, 0.5, 0.5)
-      Test.assert_eq_int(at_level(s, 0), 75, "level 0: 5 x 3 x 5")
-      Test.assert_eq_int(at_level(s, 1), 75, "level 1: 5 x 3 x 5 of its own chunks")
-      Test.assert_eq_int(at_level(s, 2), 75, "level 2 likewise")
-      Test.assert_eq_int(Sm.loaded_count(s), 225, "nothing else")
+      Test.assert_eq_int(at_level(s, 0), 144, "level 0: an inner 3 x 1 x 3 snapped out to whole level-1 chunks, 4 x 2 x 4, and a ring: 6 x 4 x 6")
+      Test.assert_eq_int(at_level(s, 1), 144, "level 1 likewise, of its own chunks")
+      Test.assert_eq_int(at_level(s, 2), 75, "level 2, the top, is not snapped: 5 x 3 x 5")
+      Test.assert_eq_int(Sm.loaded_count(s), 363, "nothing else")
       match Sm.take_meshes(s) do
         (s1, ms) ->
-          Test.assert_eq_int(mesh_at(ms, 1), 9, "level 1 meshes its inner 3 x 1 x 3")
-          Test.assert_eq_int(mesh_at(ms, 2), 9, "and level 2")
+          Test.assert_eq_int(mesh_at(ms, 0), 32, "level 0 meshes its inner 4 x 2 x 4")
+          Test.assert_eq_int(mesh_at(ms, 1), 28, "level 1 its inner 4 x 2 x 4 less the 2 x 1 x 2 over level 0's")
+          Test.assert_eq_int(mesh_at(ms, 2), 5, "and level 2 its inner 3 x 1 x 3 less the 2 x 1 x 2 over level 1's")
           Test.assert_true(mesh_levels(ms), "each mesh carries its key's level")
           let a = at(at(s1, 3200.5, 0.5, 0.5), 300.5, 40.5, -200.5)
           let b = at(at(begin_levels(), -1600.5, 0.5, 1600.5), 300.5, 40.5, -200.5)
@@ -380,7 +389,7 @@ mod Strata.Test.Stream do
       let s1 = Sm.tick(Sm.apply(s, Ed.fill_box(Sm.world(s), 4, -6, 4, 5, -5, 5, 0)))
       let far = at(s1, 3200.5, 0.5, 0.5)
       Test.assert_false(Wd.is_loaded(Sm.world(far), k1), "nothing is loaded for it far away")
-      Test.assert_eq_int(Sm.loaded_count(far), 225, "only the far boxes")
+      Test.assert_eq_int(Sm.loaded_count(far), 363, "only the far boxes")
       let back = at(far, 0.5, 0.5, 0.5)
       Test.assert_eq_int(C.get(Strata.Store.get(Wd.chunks(Sm.world(back)), k1), 2, 29, 2), 0, "back again, it shows the edit")
       Sm.stop(back)
@@ -396,6 +405,42 @@ mod Strata.Test.Stream do
       Test.assert_false(Wd.is_loaded(Sm.world(away), Cd.key(0, -1, 0)), "its edited level-0 chunk has gone to the cache")
       Test.assert_eq_int(C.get(Strata.Store.get(Wd.chunks(Sm.world(away)), k1), 2, 29, 2), 0, "and it was refreshed with the edit")
       Sm.stop(away)
+    end
+  
+    test "each level's meshed inside is whole chunks of the level above, and holds its parents in the next level's" do
+      let s = at(begin_levels(), 0.5, 0.5, 0.5)
+      let w = Sm.world(s)
+      let inner = List.filter(Strata.Store.keys(Wd.chunks(w)), fn k -> Strata.Mesh.has_all(Wd.chunks(w), k))
+      let below_top = List.filter(inner, fn k -> Cd.level(k) < 2)
+      Test.assert_true(List.all(below_top, fn k -> List.all(Cd.children(Cd.parent(k)), fn c -> Strata.Mesh.has_all(Wd.chunks(w), c))), "every meshable chunk below the top has seven meshable siblings")
+      Test.assert_true(List.all(below_top, fn k -> Strata.Mesh.has_all(Wd.chunks(w), Cd.parent(k))), "and a meshable parent")
+      -- level 0's inside is -1..1 in x and 0 in y about the focus, snapped out to whole level-1 chunks (-2..1, 0..1), and the box is one more
+      Test.assert_true(Wd.is_loaded(w, Cd.key(-3, 0, 0)), "x -1 is snapped out to -2, and the box runs one further")
+      Test.assert_false(Wd.is_loaded(w, Cd.key(3, 0, 0)), "x 1 already ends a level-1 chunk: the box ends at 2")
+      Test.assert_true(Wd.is_loaded(w, Cd.key(0, 2, 0)), "y 0 is snapped out to 1, and the box runs to 2")
+      Test.assert_false(Wd.is_loaded(w, Cd.key(0, -2, 0)), "and down to -1")
+      Sm.stop(s)
+    end
+    test "a coarse chunk over loaded, meshable children is not meshed; once they leave it is" do
+      let s = at(Sm.start(Wd.new(reg(), layered(), 7, 1.0), Sm.config_levels(4, 4, 8, 4, 4, 2, 1)), 0.5, 0.5, 0.5)
+      Test.assert_eq_int(at_level(s, 0), 1000, "level 0: inside 7 x 7 x 7 snapped to 8 x 8 x 8, and a ring")
+      Test.assert_eq_int(at_level(s, 1), 486, "level 1, the top: inside 7 x 3 x 7 grown in y to hold level 0's parents, 7 x 4 x 7, and a ring")
+      match Sm.take_meshes(s) do
+        (s1, ms) ->
+          Test.assert_eq_int(mesh_at(ms, 0), 512, "level 0 meshes its inside, 8 x 8 x 8")
+          Test.assert_eq_int(mesh_at(ms, 1), 132, "level 1 its inside, less the 4 x 4 x 4 over level 0's")
+          Test.assert_false(has_key(mesh_keys(ms), Cd.key_at(0, 0, 0, 1)), "the level-1 chunk at the focus is not meshed")
+          Test.assert_true(has_key(mesh_keys(ms), Cd.key_at(2, 0, 0, 1)), "one over the level-0 edge is")
+          -- four chunks on in x: level-0 chunks -5 to -2 go; -1 stays in the band, but without its neighbour it cannot be meshed
+          let s2 = at(s1, 128.5, 0.5, 0.5)
+          match Sm.take_meshes(s2) do
+            (s3, ms2) ->
+              Test.assert_true(has_key(mesh_keys(ms2), Cd.key_at(-1, 0, 0, 1)), "the level-1 chunk the fine box left is meshed now")
+              Test.assert_false(has_key(mesh_keys(ms2), Cd.key_at(1, 0, 0, 1)), "one still over meshable children is not")
+              Test.assert_eq_int(level1_short_of(ms2, 4), 32, "the 2 x 4 x 4 of them that the fine box left, and no other level-1 chunk short of the new edge")
+              Sm.stop(s3)
+          end
+      end
     end
   end
 end
