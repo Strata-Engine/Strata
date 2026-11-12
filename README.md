@@ -10,10 +10,15 @@ Design: `docs/2026-11-10-strata-design.md`. Build plan:
 
 ## Toolchain
 
-Strata compiles against March `origin/main`. Last verified against commit
-`1a4251bc8` (march 0.7.0). `scripts/env.sh` expects that build at
-`~/code/march-main` (a git worktree of the March repository, built with
-`dune build`); set `STRATA_MARCH_HOME` to point elsewhere.
+Strata is meant to compile against March `origin/main`, and
+`scripts/env.sh` puts a build of it first on the path (at
+`~/code/march-main`, a git worktree of the March repository built with
+`dune build`; set `STRATA_MARCH_HOME` to point elsewhere). In practice the
+builds on the development machine have used March 0.5.0: forge takes the
+toolchain `~/.march/current` names (0.5.0 there) ahead of the one
+`scripts/env.sh` puts on the path, so the gate and every number in
+`RESULTS.md` come from 0.5.0. A switch to March main is planned; it was
+last tried at commit `1a4251bc8` (march 0.7.0).
 
 The renderer needs Vulkan and GLFW. On macOS:
 
@@ -77,17 +82,32 @@ a ruin), and a stamped voxel that is now air was removed by an edit.
 **The scale rule.** Everything the generator knows is in metres: lengths,
 heights, noise periods. The world's scale (metres a voxel, given to
 `Strata.World.new`) only decides how finely that shape is cut into voxels,
-so the same seed makes the same island at 1 m, 0.5 m or 0.25 m a voxel, its
-features as many metres across. Voxel counts (a blast's radius, a chunk's 32)
-stay voxels. The stream's focus and `Strata.Query.raycast` take metres;
+so the same seed makes the same island at any scale that divides a metre
+(1 m, 0.5 m, 0.25 m a voxel): the ground, the water, the trees (the same
+tree in the same cell, its slope measured over a metre each side), the
+ruins (authored at 1 m a voxel and fitted with `Strata.Template.fit`, so a
+ruin is as many metres across) and the lantern posts (rolled per square
+metre) stand where they stand, in metres, to within a voxel of the coarser
+scale; `viewer/test/island_test.march` checks it at 1 m and 0.5 m. Two
+parts are still tuned at 1 m: the thermal scree (its reach is counted in
+voxels, so a steep slope relaxes less at a finer scale) and the cave and
+density sampling lattice (its spacing is in voxels). Voxel counts (a blast's
+radius, a chunk's 32) stay voxels. The stream's focus and `Strata.Query.raycast` take metres;
 the renderer, the camera, edits and `Strata.Fluid` work in voxels. The
 viewer's fixed scenes are posed at 1 m; `STRATA_SCALE=0.25` runs it finer.
 
-**The parameter file.** Every number the viewer's generator uses (the atlas
+**The parameter file.** The viewer's generator settings (the atlas
 definition, the detail and density noise, the cave thresholds, the surface
 lines, the tree kind, each region's tree density, species mix and cave
-factor) is a line of `viewer/assets/island.gen`, `name = value`, read at
-start and again on `R` (or `STRATA_REGEN=1` in a scripted run). A name the
+factor) are lines of `viewer/assets/island.gen`, `name = value`, read at
+start and again on `R` (or `STRATA_REGEN=1` in a scripted run). Some
+numbers stay in the code: a site's radius (12 m) and the island mask's
+relief (up to 60 m over the sea before erosion) in `Strata.Atlas`; and in the
+viewer the reach of a lake's rim clamp (4 m), the room left over the ground
+for trees and ruins (`feature_top`, 18 m), how far a tree may reach
+(`max_reach`, 10 m), how far past an area rivers are looked for
+(`reach_m`, 64 m), a river channel's depth (up to 1.5 m) and the tree
+species' shapes (`StrataViewer.Trees`). A name the
 file leaves out takes the code's default and is said once a load; a name it
 does not know, or a line it cannot read, is said and ignored. Regenerating
 first finishes the fluid's step in flight and starts the fluid afresh, then
@@ -648,6 +668,14 @@ boundary over the ground; their numbers are in `RESULTS.md`.
   the mapped buffer is correct everywhere and slower on a discrete GPU.
 - The frame in which the camera enters a new chunk spends 5 to 7 ms in
   `Strata.Stream.set_focus`. See `RESULTS.md`.
+- Generating an island chunk costs about 12 ms of CPU for a surface chunk
+  at level 0 and about 11 ms for a coarse one, against a 1 ms target; the
+  far field takes about 30 s to fill from cold (measured at a load average
+  of 34). See `RESULTS.md`.
+- The island's thermal scree and its cave and density sampling are tuned
+  at 1 m a voxel: their reach and spacing are counted in voxels, so at a
+  finer scale steep slopes relax less and the lattice is finer. The rest of
+  the island is the same in metres at any scale that divides a metre.
 - March and forge gaps met on the way are in `GAPS.md`.
 
 ## The gate

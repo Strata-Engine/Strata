@@ -276,14 +276,14 @@ linear congruential generator in the test) asserted with `Test.assert_*`;
 existing properties (chunk, slots under random traffic, and others) are
 left as they are, and are worth rewriting the same way.
 
-## S34: `by` cannot be a parameter name; `1.0e12` is not a number
+## S32: `by` cannot be a parameter name; `1.0e12` is not a number
 
 `pfn hits(fs, victim : Int, by : Int, ...)` is "I got stuck here" at `by`:
 it is reserved. A float written with an exponent (`1.0e12`) is a bare
 "parse error" on its line. Workaround: another name (`who` in
 `StrataViewer.Combat.hit`); the number written out (`1000000000000.0`).
 
-## S34: another module's constructors cannot be matched by their qualified names
+## S33: another module's constructors cannot be matched by their qualified names
 
 `match o do StrataViewer.Combat.CbKilled(c) -> ...` in a test is "I got
 stuck here" at the dot, and through an alias (`Cb.CbKilled`) "I don't know
@@ -298,7 +298,16 @@ assignment `A="1 B=2"`. Three scripted viewer runs lost STRATA_HIDDEN that
 way and opened a window. Workaround: a shell function that lists the
 settings and takes the rest as "$@" (`scripts/combat_check.sh`'s `run`).
 
-## S35: a module alias is not private to its module in a test build
+## S35: a match with two arms on one line does not parse
+
+`fn slot(o : Option(Int)) : Int do match o do Some(s) -> s _ -> -1 end end`
+is "parse error: I was expecting `end` to close the match here" at the
+second arm (met writing `Strata.Population`'s readers). The same match
+with each arm on its own line parses. A one-line match with one arm
+(`match a do (x, _) -> x end`) is fine. Workaround: put each arm on its own
+line.
+
+## S36: a module alias is not private to its module in a test build
 
 `alias StrataViewer.Combat as Cb` in `viewer/lib/match.march` and
 `alias Strata.Coord as Cb` in `viewer/test/blast_test.march`: the test build
@@ -307,7 +316,7 @@ clang then could not find ("use of undefined value"). The same family as
 S27. Workaround: aliases unique across the app (`Rules` in the match, `Cmb`
 in its test).
 
-## S36: `needs` cannot be a parameter name, nor `linear` (again)
+## S37: `needs` cannot be a parameter name, nor `linear` (again)
 
 `fn unsupported(..., needs : Int -> Bool, ...)` reads as the capability
 keyword: "This `mod` has no matching `end`", reported at the module's

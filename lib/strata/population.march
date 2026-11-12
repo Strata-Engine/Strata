@@ -1,0 +1,927 @@
+-- Population — what a world holds, declared by the game and placed by the
+-- engine. A game builds a `Pop` at start-up from four kinds of declaration,
+-- each kind its own namespace of names:
+--
+--   fields  a number per ground column: a built-in the game supplies in one
+--           of ten slots, a noise, another field through a curve, or the
+--           cover of a layer (how much of it stands near the column);
+--   zones   yes or no for a column: region ids, a band of a field, a ring
+--           around sites, and all, any and not of other zones;
+--   shapes  the things placed: block ids, or templates, a variant each;
+--   layers  what is placed, by which placer (cover, scatter, site), under
+--           which rule.
+--
+-- A rule is data: a base density per square metre times a curve of each of
+-- some fields, passing only inside some zones and outside others.
+--
+-- `freeze` checks the declarations and compiles them into a `Frozen`: every
+-- name resolved to a small index into lists held in declaration order, so
+-- nothing is looked up by name per column. Layers run in declaration order,
+-- except that a layer is moved after every layer whose cover its rule reads
+-- (through curve fields and zones too); a layer is placed at the first
+-- point where all it reads has run. The first mistake found is returned as
+-- an `Err` naming the offender. Nothing here places anything.
+mod Strata.Population do
+
+  -- points (x, factor), sorted by x; piecewise linear, flat beyond the ends
+  type PopCurve = PopCurve(List((Float, Float)))
+  -- metres: centre x and z, the floor height, the radius; the site's index
+  type PopSite = PopSite(Float, Float, Float, Float, Int)
+  -- base density per square metre; (field, curve) factors; zones to be inside; zones to be outside
+  type PopRule = PopRule(Float, List((String, PopCurve)), List(String), List(String))
+
+  -- declarations as given, by name
+  type PopFieldDecl = PdGround(String, Int) | PdNoise(String, Int, Int, Float, Int) | PdCurve(String, String, PopCurve) | PdCover(String, String, Float)
+  type PopZoneDecl = PdRegions(String, List(Int)) | PdBand(String, String, Float, Float) | PdRing(String, List(PopSite), Float, Float) | PdAll(String, List(String)) | PdAny(String, List(String)) | PdNot(String, String)
+  type PopShapesDecl = PdBlocks(String, List(Int)) | PdTemplates(String, List(Strata.Template.Template))
+  -- shape set, zone, a weight per variant
+  type PopWeightsDecl = PdWeights(String, String, List(Float))
+  type PopLayerDecl = PdLayerCover(String, String, PopRule, Int) | PdLayerScatter(String, String, PopRule, Float, Float, Int) | PdLayerSite(String, String, List(PopSite), Float, Int)
+
+  -- each list newest first; freeze reverses them
+  type Pop = { pp_fields : List(PopFieldDecl), pp_zones : List(PopZoneDecl), pp_shapes : List(PopShapesDecl), pp_weights : List(PopWeightsDecl), pp_layers : List(PopLayerDecl) }
+
+  -- compiled: a field index is into fz_fields, a zone index into fz_zones,
+  -- a shape set index into fz_shapes, a layer index into fz_layers (run order)
+  -- PfGround slot; PfNoise kind, octaves, period (m), salt; PfCurve source field; PfCover layer, radius (m)
+  type PopField = PfGround(Int) | PfNoise(Int, Int, Float, Int) | PfCurve(Int, PopCurve) | PfCover(Int, Float)
+  type PopZone = PfRegions(List(Int)) | PfBand(Int, Float, Float) | PfRing(List(PopSite), Float, Float) | PfAll(List(Int)) | PfAny(List(Int)) | PfNot(Int)
+  -- the variants, and (zone, a weight per variant) in declaration order
+  type PopShapes = PfBlocks(List(Int), List((Int, List(Float)))) | PfTemplates(List(Strata.Template.Template), List((Int, List(Float))))
+  type PopFrozenRule = PfRule(Float, List((Int, PopCurve)), List(Int), List(Int))
+  -- shape set first; cover: rule, salt; scatter: rule, cell (m), jitter, salt; site: sites, margin (m), salt
+  type PopLayer = PfLayerCover(Int, PopFrozenRule, Int) | PfLayerScatter(Int, PopFrozenRule, Float, Float, Int) | PfLayerSite(Int, List(PopSite), Float, Int)
+
+  type Frozen = { fz_field_names : List(String), fz_fields : List(PopField), fz_zone_names : List(String), fz_zones : List(PopZone), fz_shape_names : List(String), fz_shapes : List(PopShapes), fz_layer_names : List(String), fz_layers : List(PopLayer), fz_ground : List(Int) }
+
+  -- Building
+
+  doc "A population with nothing declared."
+  fn new() : Pop do { pp_fields: Nil, pp_zones: Nil, pp_shapes: Nil, pp_weights: Nil, pp_layers: Nil } end
+
+  pfn add_field(p : Pop, d : PopFieldDecl) : Pop do { p with pp_fields: Cons(d, p.pp_fields) } end
+  pfn add_zone(p : Pop, d : PopZoneDecl) : Pop do { p with pp_zones: Cons(d, p.pp_zones) } end
+  pfn add_shapes(p : Pop, d : PopShapesDecl) : Pop do { p with pp_shapes: Cons(d, p.pp_shapes) } end
+  pfn add_layer(p : Pop, d : PopLayerDecl) : Pop do { p with pp_layers: Cons(d, p.pp_layers) } end
+
+  doc "A field the game supplies in its Ground, in slot 0..9: 0 altitude (m), 1 slope (rise over run), 2 water depth (m), 3 river distance (m), 4 lake distance (m), 5 coast distance (m), 6 wetness (unit), 7 region (id), 8 depth below the top surface (m), 9 open sky (0 or 1). freeze refuses another slot."
+  fn field_ground(p : Pop, name : String, slot : Int) : Pop do add_field(p, PdGround(name, slot)) end
+
+  doc "A noise field: noise kind, octaves, period in metres and a seed salt."
+  fn field_noise(p : Pop, name : String, kind : Int, octaves : Int, period : Float, salt : Int) : Pop do add_field(p, PdNoise(name, kind, octaves, period, salt)) end
+
+  doc "The field named `of` through curve c."
+  fn field_curve(p : Pop, name : String, of : String, c : PopCurve) : Pop do add_field(p, PdCurve(name, of, c)) end
+
+  doc "How many of the layer's instances stand within radius metres of a column, over the layer's densest packing, clamped to 0..1. A layer whose rule reads it runs after that layer."
+  fn field_cover(p : Pop, name : String, layer : String, radius : Float) : Pop do add_field(p, PdCover(name, layer, radius)) end
+
+  doc "A curve through points (x, factor), taken in order of x by a stable sort: piecewise linear between them, flat beyond the first and the last. Points at one x keep the order given and make a step: below it the curve approaches the first, at and above it reads the last. freeze refuses a curve with no points."
+  fn curve(points : List((Float, Float))) : PopCurve do PopCurve(List.sort_by(points, x_before)) end
+
+  pfn x_before(a : (Float, Float), b : (Float, Float)) : Bool do
+    match a do (ax, _) -> match b do (bx, _) -> ax <= bx end end
+  end
+
+  pfn curve_walk(pts : List((Float, Float)), x : Float) : Float do
+    match pts do
+      Nil -> 0.0
+      Cons((x0, y0), rest) ->
+        if x < x0 do y0
+        else
+          match rest do
+            Nil -> y0
+            Cons((x1, y1), _) -> if x < x1 do y0 +. (y1 -. y0) *. (x -. x0) /. (x1 -. x0) else curve_walk(rest, x) end
+          end
+        end
+    end
+  end
+
+  doc "The curve's value at x; 0 for a curve with no points."
+  fn curve_at(c : PopCurve, x : Float) : Float do match c do PopCurve(pts) -> curve_walk(pts, x) end end
+
+  pfn curve_empty(c : PopCurve) : Bool do match c do PopCurve(pts) -> List.is_empty(pts) end end
+
+  doc "A zone: the columns whose region id (built-in slot 7) is one of ids."
+  fn zone_regions(p : Pop, name : String, ids : List(Int)) : Pop do add_zone(p, PdRegions(name, ids)) end
+
+  doc "A zone: the columns where lo <= field < hi."
+  fn zone_band(p : Pop, name : String, field : String, lo : Float, hi : Float) : Pop do add_zone(p, PdBand(name, field, lo, hi)) end
+
+  doc "A zone: the columns within inner..outer metres of some site's centre."
+  fn zone_ring(p : Pop, name : String, sites : List(PopSite), inner : Float, outer : Float) : Pop do add_zone(p, PdRing(name, sites, inner, outer)) end
+
+  doc "A zone: the columns inside every zone of `of`."
+  fn zone_all(p : Pop, name : String, of : List(String)) : Pop do add_zone(p, PdAll(name, of)) end
+
+  doc "A zone: the columns inside some zone of `of`."
+  fn zone_any(p : Pop, name : String, of : List(String)) : Pop do add_zone(p, PdAny(name, of)) end
+
+  doc "A zone: the columns outside the zone `of`."
+  fn zone_not(p : Pop, name : String, of : String) : Pop do add_zone(p, PdNot(name, of)) end
+
+  doc "A rule: density per square metre is base times curve(field) for each (field, curve) of curves; it passes only inside every zone of inside and outside every zone of outside."
+  fn rule(base : Float, curves : List((String, PopCurve)), inside : List(String), outside : List(String)) : PopRule do PopRule(base, curves, inside, outside) end
+
+  doc "A site: centre (xm, zm) and floor height in metres, radius in metres, and the game's index for it."
+  fn site(xm : Float, zm : Float, floor : Float, radius : Float, index : Int) : PopSite do PopSite(xm, zm, floor, radius, index) end
+
+  doc "A shape set of one-voxel things: a variant per block id."
+  fn shapes_blocks(p : Pop, name : String, ids : List(Int)) : Pop do add_shapes(p, PdBlocks(name, ids)) end
+
+  doc "A shape set of templates: a variant per template."
+  fn shapes_templates(p : Pop, name : String, ts : List(Strata.Template.Template)) : Pop do add_shapes(p, PdTemplates(name, ts)) end
+
+  doc "Inside zone, the shape set's variants are weighted by w, one weight per variant; where no weights apply its variants are equally likely."
+  fn weights(p : Pop, shapes : String, zone : String, w : List(Float)) : Pop do { p with pp_weights: Cons(PdWeights(shapes, zone, w), p.pp_weights) } end
+
+  doc "A cover layer: per surface, the rule's density picks whether it holds one of the shape set's blocks; hashed with salt."
+  fn layer_cover(p : Pop, name : String, shapes : String, r : PopRule, salt : Int) : Pop do add_layer(p, PdLayerCover(name, shapes, r, salt)) end
+
+  doc "A scatter layer: hashed cells `cell` metres on a side, at most one instance a cell, offset by up to jitter / 2 of a cell (jitter 0..0.6); hashed with salt."
+  fn layer_scatter(p : Pop, name : String, shapes : String, r : PopRule, cell : Float, jitter : Float, salt : Int) : Pop do add_layer(p, PdLayerScatter(name, shapes, r, cell, jitter, salt)) end
+
+  doc "A site layer: one instance at each site, the ground drawn up to it for margin metres around; hashed with salt."
+  fn layer_site(p : Pop, name : String, shapes : String, sites : List(PopSite), margin : Float, salt : Int) : Pop do add_layer(p, PdLayerSite(name, shapes, sites, margin, salt)) end
+
+  -- Names and lookups
+
+  pfn field_name(d : PopFieldDecl) : String do
+    match d do
+      PdGround(n, _) -> n
+      PdNoise(n, _, _, _, _) -> n
+      PdCurve(n, _, _) -> n
+      PdCover(n, _, _) -> n
+    end
+  end
+  pfn zone_name(d : PopZoneDecl) : String do
+    match d do
+      PdRegions(n, _) -> n
+      PdBand(n, _, _, _) -> n
+      PdRing(n, _, _, _) -> n
+      PdAll(n, _) -> n
+      PdAny(n, _) -> n
+      PdNot(n, _) -> n
+    end
+  end
+  pfn shapes_name(d : PopShapesDecl) : String do
+    match d do
+      PdBlocks(n, _) -> n
+      PdTemplates(n, _) -> n
+    end
+  end
+  pfn variant_count(d : PopShapesDecl) : Int do
+    match d do
+      PdBlocks(_, ids) -> List.length(ids)
+      PdTemplates(_, ts) -> List.length(ts)
+    end
+  end
+  pfn layer_name(d : PopLayerDecl) : String do
+    match d do
+      PdLayerCover(n, _, _, _) -> n
+      PdLayerScatter(n, _, _, _, _, _) -> n
+      PdLayerSite(n, _, _, _, _) -> n
+    end
+  end
+  pfn layer_shapes(d : PopLayerDecl) : String do
+    match d do
+      PdLayerCover(_, s, _, _) -> s
+      PdLayerScatter(_, s, _, _, _, _) -> s
+      PdLayerSite(_, s, _, _, _) -> s
+    end
+  end
+  pfn layer_rule(d : PopLayerDecl) : Option(PopRule) do
+    match d do
+      PdLayerCover(_, _, r, _) -> Some(r)
+      PdLayerScatter(_, _, r, _, _, _) -> Some(r)
+      PdLayerSite(_, _, _, _, _) -> None
+    end
+  end
+  pfn rule_fields(r : PopRule) : List(String) do match r do PopRule(_, cs, _, _) -> List.map(cs, curve_field) end end
+  pfn rule_zones(r : PopRule) : List(String) do match r do PopRule(_, _, ins, outs) -> List.append(ins, outs) end end
+  pfn curve_field(fc : (String, PopCurve)) : String do match fc do (n, _) -> n end end
+
+  pfn has_name(xs : List(String), n : String) : Bool do List.any(xs, fn x -> x == n) end
+
+  pfn index_go(xs : List(String), n : String, i : Int) : Int do
+    match xs do
+      Nil -> -1
+      Cons(x, rest) -> if x == n do i else index_go(rest, n, i + 1) end
+    end
+  end
+  -- the position of n in xs, or -1
+  pfn index_of(xs : List(String), n : String) : Int do index_go(xs, n, 0) end
+
+  pfn find_field(fs : List(PopFieldDecl), n : String) : Option(PopFieldDecl) do List.find(fs, fn d -> field_name(d) == n) end
+  pfn find_zone(zs : List(PopZoneDecl), n : String) : Option(PopZoneDecl) do List.find(zs, fn d -> zone_name(d) == n) end
+  pfn find_layer(ls : List(PopLayerDecl), n : String) : Option(PopLayerDecl) do List.find(ls, fn d -> layer_name(d) == n) end
+
+  -- the zones a zone is made of
+  pfn zone_children(d : PopZoneDecl) : List(String) do
+    match d do
+      PdAll(_, of) -> of
+      PdAny(_, of) -> of
+      PdNot(_, of) -> Cons(of, Nil)
+      _ -> Nil
+    end
+  end
+
+  -- Checks: each the first mistake it finds, or None
+
+  pfn first_some(xs : List(a), f : a -> Option(String)) : Option(String) do
+    match xs do
+      Nil -> None
+      Cons(x, rest) ->
+        match f(x) do
+          Some(e) -> Some(e)
+          None -> first_some(rest, f)
+        end
+    end
+  end
+  pfn first_of(checks : List(Option(String))) : Option(String) do first_some(checks, fn c -> c) end
+
+  pfn q(n : String) : String do "'" ++ n ++ "'" end
+  pfn fail(msg : String) : Option(String) do Some("population: " ++ msg) end
+  pfn fail_if(bad : Bool, msg : String) : Option(String) do if bad do fail(msg) else None end end
+  -- not a number, or a number not above 0 (NaN compares false with everything)
+  pfn not_positive(v : Float) : Bool do if v > 0.0 do false else true end end
+  -- the first of names not in known, as a mistake of `who`
+  pfn undeclared(who : String, kind : String, names : List(String), known : List(String)) : Option(String) do
+    first_some(names, fn n -> fail_if(!has_name(known, n), who ++ " names undeclared " ++ kind ++ " " ++ q(n)))
+  end
+
+  pfn dup_go(kind : String, names : List(String), seen : List(String)) : Option(String) do
+    match names do
+      Nil -> None
+      Cons(n, rest) -> if has_name(seen, n) do fail("two " ++ kind ++ "s named " ++ q(n)) else dup_go(kind, rest, Cons(n, seen)) end
+    end
+  end
+  pfn duplicate(kind : String, names : List(String)) : Option(String) do dup_go(kind, names, Nil) end
+
+  pfn check_field(fnames : List(String), lnames : List(String), d : PopFieldDecl) : Option(String) do
+    match d do
+      PdGround(n, s) -> fail_if(if s < 0 do true else s > 9 end, "field " ++ q(n) ++ " reads ground slot " ++ int_to_string(s) ++ ", outside 0..9")
+      PdNoise(n, _, _, per, _) -> fail_if(not_positive(per), "field " ++ q(n) ++ " has a noise period of " ++ float_to_string(per) ++ " m; it must be above 0")
+      PdCurve(n, of, c) -> first_of([undeclared("field " ++ q(n), "field", Cons(of, Nil), fnames), fail_if(curve_empty(c), "field " ++ q(n) ++ " has a curve with no points")])
+      PdCover(n, l, r) -> first_of([undeclared("field " ++ q(n), "layer", Cons(l, Nil), lnames), fail_if(r < 0.0, "field " ++ q(n) ++ " has a negative radius")])
+    end
+  end
+
+  pfn check_sites(who : String, sites : List(PopSite)) : Option(String) do
+    first_some(sites, fn s -> fail_if(site_radius(s) < 0.0, who ++ " has a site with a negative radius"))
+  end
+
+  pfn check_zone(fnames : List(String), znames : List(String), d : PopZoneDecl) : Option(String) do
+    let who = "zone " ++ q(zone_name(d))
+    match d do
+      PdRegions(_, _) -> None
+      PdBand(_, f, _, _) -> undeclared(who, "field", Cons(f, Nil), fnames)
+      PdRing(_, sites, inner, outer) -> first_of([fail_if(if inner < 0.0 do true else outer < 0.0 end, who ++ " has a negative radius"), check_sites(who, sites)])
+      _ -> undeclared(who, "zone", zone_children(d), znames)
+    end
+  end
+
+  pfn check_shapes(d : PopShapesDecl) : Option(String) do
+    fail_if(variant_count(d) == 0, "shape set " ++ q(shapes_name(d)) ++ " has no variants")
+  end
+
+  pfn check_weights(shapes : List(PopShapesDecl), znames : List(String), w : PopWeightsDecl) : Option(String) do
+    match w do
+      PdWeights(s, z, ws) ->
+        let who = "weights of " ++ q(s) ++ " in " ++ q(z)
+        match List.find(shapes, fn d -> shapes_name(d) == s) do
+          None -> fail(who ++ " name undeclared shape set " ++ q(s))
+          Some(d) ->
+            first_of([
+              undeclared(who, "zone", Cons(z, Nil), znames),
+              fail_if(List.length(ws) != variant_count(d), who ++ " give " ++ int_to_string(List.length(ws)) ++ " weights for " ++ int_to_string(variant_count(d)) ++ " variants"),
+              fail_if(List.any(ws, fn v -> if v >= 0.0 do false else true end), who ++ " hold a weight that is negative or not a number"),
+              fail_if(not_positive(List.fold_left(ws, 0.0, fn (a, v) -> a +. v)), who ++ " sum to 0")])
+        end
+    end
+  end
+
+  pfn weights_key(w : PopWeightsDecl) : String do match w do PdWeights(s, z, _) -> q(s) ++ " in " ++ q(z) end end
+  -- a shape set weighted twice in one zone
+  pfn duplicate_weights(ws : List(PopWeightsDecl)) : Option(String) do
+    first_some(dup_keys(List.map(ws, weights_key), Nil), fn k -> fail("two weights of " ++ k))
+  end
+  pfn dup_keys(ks : List(String), seen : List(String)) : List(String) do
+    match ks do
+      Nil -> Nil
+      Cons(k, rest) -> if has_name(seen, k) do Cons(k, Nil) else dup_keys(rest, Cons(k, seen)) end
+    end
+  end
+
+  pfn check_rule(who : String, fnames : List(String), znames : List(String), r : PopRule) : Option(String) do
+    match r do
+      PopRule(base, cs, _, _) ->
+        first_of([fail_if(if base >= 0.0 do false else true end, who ++ " has a rule base of " ++ float_to_string(base) ++ "; it must be 0 or more"), undeclared(who, "field", rule_fields(r), fnames), undeclared(who, "zone", rule_zones(r), znames), first_some(cs, fn fc -> empty_curve_of(who, fc))])
+    end
+  end
+  pfn empty_curve_of(who : String, fc : (String, PopCurve)) : Option(String) do
+    match fc do (f, c) -> fail_if(curve_empty(c), who ++ " has a curve with no points for field " ++ q(f)) end
+  end
+
+  pfn check_layer(fnames : List(String), znames : List(String), snames : List(String), d : PopLayerDecl) : Option(String) do
+    let who = "layer " ++ q(layer_name(d))
+    let shapes = undeclared(who, "shape set", Cons(layer_shapes(d), Nil), snames)
+    match d do
+      PdLayerCover(_, _, r, _) -> first_of([shapes, check_rule(who, fnames, znames, r)])
+      PdLayerScatter(_, _, r, cell, jitter, _) ->
+        first_of([shapes, check_rule(who, fnames, znames, r), fail_if(cell <= 0.0, who ++ " has a cell of " ++ float_to_string(cell) ++ " m; it must be above 0"), fail_if(if jitter < 0.0 do true else jitter > 0.6 end, who ++ " has a jitter of " ++ float_to_string(jitter) ++ ", outside 0..0.6")])
+      PdLayerSite(_, _, sites, margin, _) -> first_of([shapes, fail_if(margin < 0.0, who ++ " has a negative margin"), check_sites(who, sites)])
+    end
+  end
+
+  -- Cycles among curve fields and among zones
+
+  -- xs from the first n on
+  pfn from_name(xs : List(String), n : String) : List(String) do
+    match xs do
+      Nil -> Nil
+      Cons(x, rest) -> if x == n do xs else from_name(rest, n) end
+    end
+  end
+  -- path (newest first) has reached n again: the loop from n back to n
+  pfn loop_text(path : List(String), n : String) : String do
+    string_join(List.append(from_name(List.reverse(path), n), Cons(n, Nil)), " -> ")
+  end
+
+  pfn field_loop(fs : List(PopFieldDecl), n : String, path : List(String)) : Option(String) do
+    if has_name(path, n) do fail("fields read each other in a cycle: " ++ loop_text(path, n))
+    else
+      match find_field(fs, n) do
+        Some(PdCurve(_, of, _)) -> field_loop(fs, of, Cons(n, path))
+        _ -> None
+      end
+    end
+  end
+
+  pfn zone_loop(zs : List(PopZoneDecl), n : String, path : List(String)) : Option(String) do
+    if has_name(path, n) do fail("zones are made of each other in a cycle: " ++ loop_text(path, n))
+    else
+      match find_zone(zs, n) do
+        Some(d) -> first_some(zone_children(d), fn c -> zone_loop(zs, c, Cons(n, path)))
+        None -> None
+      end
+    end
+  end
+
+  -- What a rule reaches (declarations checked and free of cycles)
+
+  -- the fields a zone reads, through the zones it is made of
+  pfn zone_fields(zs : List(PopZoneDecl), n : String) : List(String) do
+    match find_zone(zs, n) do
+      Some(PdBand(_, f, _, _)) -> Cons(f, Nil)
+      Some(d) -> List.flat_map(zone_children(d), fn c -> zone_fields(zs, c))
+      None -> Nil
+    end
+  end
+  -- the layers whose cover a field reads, through curve fields
+  pfn field_layers(fs : List(PopFieldDecl), n : String) : List(String) do
+    match find_field(fs, n) do
+      Some(PdCurve(_, of, _)) -> field_layers(fs, of)
+      Some(PdCover(_, l, _)) -> Cons(l, Nil)
+      _ -> Nil
+    end
+  end
+  -- the built-in slots a field reads, through curve fields
+  pfn field_slots(fs : List(PopFieldDecl), n : String) : List(Int) do
+    match find_field(fs, n) do
+      Some(PdCurve(_, of, _)) -> field_slots(fs, of)
+      Some(PdGround(_, s)) -> Cons(s, Nil)
+      _ -> Nil
+    end
+  end
+  -- every field a rule reads directly or through its zones
+  pfn rule_reads(zs : List(PopZoneDecl), r : PopRule) : List(String) do
+    List.append(rule_fields(r), List.flat_map(rule_zones(r), fn z -> zone_fields(zs, z)))
+  end
+  -- the zones the weights of shape set s are keyed to
+  pfn weights_zones(ws : List(PopWeightsDecl), s : String) : List(String) do
+    List.filter_map(ws, fn w -> weights_zone_of(s, w))
+  end
+  pfn weights_zone_of(s : String, w : PopWeightsDecl) : Option(String) do
+    match w do PdWeights(s2, z, _) -> if s2 == s do Some(z) else None end end
+  end
+  -- the layers whose cover the layer reads: through its rule, and through the zones its shape set's weights are keyed to
+  pfn layer_reads(fs : List(PopFieldDecl), zs : List(PopZoneDecl), ws : List(PopWeightsDecl), d : PopLayerDecl) : List(String) do
+    let from_rule = match layer_rule(d) do
+      Some(r) -> rule_reads(zs, r)
+      None -> Nil
+    end
+    let from_weights = List.flat_map(weights_zones(ws, layer_shapes(d)), fn z -> zone_fields(zs, z))
+    List.flat_map(List.append(from_rule, from_weights), fn f -> field_layers(fs, f))
+  end
+
+  -- Layer order
+
+  pfn reads_of(deps : List((String, List(String))), n : String) : List(String) do
+    match List.find(deps, fn e -> entry_name(e) == n) do
+      Some((_, ds)) -> ds
+      None -> Nil
+    end
+  end
+  pfn entry_name(e : (String, List(String))) : String do match e do (n, _) -> n end end
+  pfn ready(done_rev : List(String), e : (String, List(String))) : Bool do
+    match e do (_, ds) -> List.all(ds, fn d -> has_name(done_rev, d)) end
+  end
+
+  -- every pending layer waits on another pending one: follow the waits from n until one repeats
+  pfn chase(pending : List((String, List(String))), n : String, path : List(String)) : String do
+    if has_name(path, n) do loop_text(path, n)
+    else
+      let names = List.map(pending, entry_name)
+      match List.find(reads_of(pending, n), fn d -> has_name(names, d)) do
+        Some(d) -> chase(pending, d, Cons(n, path))
+        None -> string_join(names, ", ")
+      end
+    end
+  end
+
+  -- the layers in run order: repeatedly the earliest declared whose reads have all run
+  pfn run_order(pending : List((String, List(String))), done_rev : List(String)) : Result(List(String), String) do
+    match pending do
+      Nil -> Ok(List.reverse(done_rev))
+      Cons(first, _) ->
+        match List.find(pending, fn e -> ready(done_rev, e)) do
+          Some(e) ->
+            let n = entry_name(e)
+            run_order(List.filter(pending, fn x -> entry_name(x) != n), Cons(n, done_rev))
+          None -> Err("population: layers read each other's cover in a cycle: " ++ chase(pending, entry_name(first), Nil))
+        end
+    end
+  end
+
+  -- Compiling (declarations checked)
+
+  pfn compile_field(fnames : List(String), lorder : List(String), d : PopFieldDecl) : PopField do
+    match d do
+      PdGround(_, s) -> PfGround(s)
+      PdNoise(_, k, o, per, salt) -> PfNoise(k, o, per, salt)
+      PdCurve(_, of, c) -> PfCurve(index_of(fnames, of), c)
+      PdCover(_, l, r) -> PfCover(index_of(lorder, l), r)
+    end
+  end
+
+  pfn compile_zone(fnames : List(String), znames : List(String), d : PopZoneDecl) : PopZone do
+    match d do
+      PdRegions(_, ids) -> PfRegions(ids)
+      PdBand(_, f, lo, hi) -> PfBand(index_of(fnames, f), lo, hi)
+      PdRing(_, sites, inner, outer) -> PfRing(sites, inner, outer)
+      PdAll(_, of) -> PfAll(List.map(of, fn z -> index_of(znames, z)))
+      PdAny(_, of) -> PfAny(List.map(of, fn z -> index_of(znames, z)))
+      PdNot(_, of) -> PfNot(index_of(znames, of))
+    end
+  end
+
+  pfn weights_of(znames : List(String), ws : List(PopWeightsDecl), s : String) : List((Int, List(Float))) do
+    List.filter_map(ws, fn w -> weight_entry(znames, s, w))
+  end
+  pfn weight_entry(znames : List(String), s : String, w : PopWeightsDecl) : Option((Int, List(Float))) do
+    match w do PdWeights(s2, z, v) -> if s2 == s do Some((index_of(znames, z), v)) else None end end
+  end
+
+  pfn compile_shapes(znames : List(String), ws : List(PopWeightsDecl), d : PopShapesDecl) : PopShapes do
+    match d do
+      PdBlocks(n, ids) -> PfBlocks(ids, weights_of(znames, ws, n))
+      PdTemplates(n, ts) -> PfTemplates(ts, weights_of(znames, ws, n))
+    end
+  end
+
+  pfn compile_curve(fnames : List(String), fc : (String, PopCurve)) : (Int, PopCurve) do
+    match fc do (f, c) -> (index_of(fnames, f), c) end
+  end
+  pfn compile_rule(fnames : List(String), znames : List(String), r : PopRule) : PopFrozenRule do
+    match r do
+      PopRule(base, cs, ins, outs) ->
+        PfRule(base, List.map(cs, fn fc -> compile_curve(fnames, fc)), List.map(ins, fn z -> index_of(znames, z)), List.map(outs, fn z -> index_of(znames, z)))
+    end
+  end
+
+  pfn compile_layer(fnames : List(String), znames : List(String), snames : List(String), d : PopLayerDecl) : PopLayer do
+    let s = index_of(snames, layer_shapes(d))
+    match d do
+      PdLayerCover(_, _, r, salt) -> PfLayerCover(s, compile_rule(fnames, znames, r), salt)
+      PdLayerScatter(_, _, r, cell, jitter, salt) -> PfLayerScatter(s, compile_rule(fnames, znames, r), cell, jitter, salt)
+      PdLayerSite(_, _, sites, margin, salt) -> PfLayerSite(s, sites, margin, salt)
+    end
+  end
+
+  pfn band_field(d : PopZoneDecl) : List(String) do
+    match d do
+      PdBand(_, f, _, _) -> Cons(f, Nil)
+      _ -> Nil
+    end
+  end
+
+  pfn dedup_sorted(xs : List(Int), acc : List(Int)) : List(Int) do
+    match xs do
+      Nil -> List.reverse(acc)
+      Cons(x, rest) ->
+        match acc do
+          Cons(a, _) -> if a == x do dedup_sorted(rest, acc) else dedup_sorted(rest, Cons(x, acc)) end
+          Nil -> dedup_sorted(rest, Cons(x, acc))
+        end
+    end
+  end
+
+  -- a regions zone reads the region slot
+  pfn regions_slot(d : PopZoneDecl) : List(Int) do
+    match d do
+      PdRegions(_, _) -> Cons(7, Nil)
+      _ -> Nil
+    end
+  end
+
+  -- the built-in slots some layer's rule or some zone reads, ascending
+  pfn ground_used(fs : List(PopFieldDecl), zs : List(PopZoneDecl), ls : List(PopLayerDecl)) : List(Int) do
+    let from_rules = List.flat_map(ls, fn d -> rule_fields_of(d))
+    let roots = List.append(from_rules, List.flat_map(zs, band_field))
+    let slots = List.append(List.flat_map(roots, fn f -> field_slots(fs, f)), List.flat_map(zs, regions_slot))
+    dedup_sorted(List.sort_by(slots, fn (a, b) -> a <= b), Nil)
+  end
+  pfn rule_fields_of(d : PopLayerDecl) : List(String) do
+    match layer_rule(d) do
+      Some(r) -> rule_fields(r)
+      None -> Nil
+    end
+  end
+
+  pfn compile(fs : List(PopFieldDecl), zs : List(PopZoneDecl), ss : List(PopShapesDecl), ws : List(PopWeightsDecl), ls : List(PopLayerDecl), lorder : List(String)) : Frozen do
+    let fnames = List.map(fs, field_name)
+    let znames = List.map(zs, zone_name)
+    let snames = List.map(ss, shapes_name)
+    let layers = List.filter_map(lorder, fn n -> find_layer(ls, n))
+    { fz_field_names: fnames, fz_fields: List.map(fs, fn d -> compile_field(fnames, lorder, d)), fz_zone_names: znames, fz_zones: List.map(zs, fn d -> compile_zone(fnames, znames, d)), fz_shape_names: snames, fz_shapes: List.map(ss, fn d -> compile_shapes(znames, ws, d)), fz_layer_names: lorder, fz_layers: List.map(layers, fn d -> compile_layer(fnames, znames, snames, d)), fz_ground: ground_used(fs, zs, ls) }
+  end
+
+  doc "Checks the declarations and compiles them, or the first mistake found, naming the offender: a duplicate name within a kind; a field, zone, rule, weights or layer naming something undeclared; a ground slot outside 0..9; a noise period not above 0; a shape set with no variants; weights whose count is not the variant count, with a negative weight, or summing to 0; a second weights for one shape set and zone; a rule base below 0 or not a number; a curve with no points; a negative radius or margin; a cell not above 0; a jitter outside 0..0.6; curve fields or zones that refer to each other in a cycle; layers that read each other's cover in a cycle, through their rules or their shape sets' weights zones."
+  fn freeze(p : Pop) : Result(Frozen, String) do
+    let fs = List.reverse(p.pp_fields)
+    let zs = List.reverse(p.pp_zones)
+    let ss = List.reverse(p.pp_shapes)
+    let ws = List.reverse(p.pp_weights)
+    let ls = List.reverse(p.pp_layers)
+    let fnames = List.map(fs, field_name)
+    let znames = List.map(zs, zone_name)
+    let snames = List.map(ss, shapes_name)
+    let lnames = List.map(ls, layer_name)
+    let mistake = first_of([
+      duplicate("field", fnames), duplicate("zone", znames), duplicate("shape set", snames), duplicate("layer", lnames),
+      first_some(fs, fn d -> check_field(fnames, lnames, d)),
+      first_some(zs, fn d -> check_zone(fnames, znames, d)),
+      first_some(ss, check_shapes),
+      first_some(ws, fn w -> check_weights(ss, znames, w)),
+      duplicate_weights(ws),
+      first_some(ls, fn d -> check_layer(fnames, znames, snames, d)),
+      first_some(fnames, fn n -> field_loop(fs, n, Nil)),
+      first_some(znames, fn n -> zone_loop(zs, n, Nil))])
+    match mistake do
+      Some(e) -> Err(e)
+      None ->
+        match run_order(List.map(ls, fn d -> (layer_name(d), layer_reads(fs, zs, ws, d))), Nil) do
+          Err(e) -> Err(e)
+          Ok(lorder) -> Ok(compile(fs, zs, ss, ws, ls, lorder))
+        end
+    end
+  end
+
+  doc "The layers' names in the order they run."
+  fn layer_names(f : Frozen) : List(String) do f.fz_layer_names end
+
+  doc "The built-in slots (0..9) that some rule or zone reads, through curve fields (a regions zone reads slot 7), ascending: the game checks its Ground supplies them."
+  fn missing_ground(f : Frozen) : List(Int) do f.fz_ground end
+
+  -- Reading a Frozen, for the module that evaluates it (Strata.Populate).
+  -- Indices are positions in declaration order (layers: run order). A
+  -- reader asked for an index out of range, or for a number its kind does
+  -- not have, answers -1, 0.0, Nil or a curve with no points.
+
+  doc "A curve's points (x, factor), sorted by x."
+  fn curve_points(c : PopCurve) : List((Float, Float)) do match c do PopCurve(pts) -> pts end end
+
+  doc "A site's centre x in metres."
+  fn site_xm(s : PopSite) : Float do match s do PopSite(v, _, _, _, _) -> v end end
+  doc "A site's centre z in metres."
+  fn site_zm(s : PopSite) : Float do match s do PopSite(_, v, _, _, _) -> v end end
+  doc "A site's floor height in metres."
+  fn site_floor(s : PopSite) : Float do match s do PopSite(_, _, v, _, _) -> v end end
+  doc "A site's radius in metres."
+  fn site_radius(s : PopSite) : Float do match s do PopSite(_, _, _, v, _) -> v end end
+  doc "The game's index for a site."
+  fn site_index(s : PopSite) : Int do match s do PopSite(_, _, _, _, v) -> v end end
+
+  pfn nth_of(xs : List(a), i : Int) : Option(a) do if i < 0 do None else List.nth_opt(xs, i) end end
+  pfn no_curve() : PopCurve do PopCurve(Nil) end
+
+  -- fields
+
+  pfn fz_field(f : Frozen, i : Int) : Option(PopField) do nth_of(f.fz_fields, i) end
+  doc "How many fields there are."
+  fn field_count(f : Frozen) : Int do List.length(f.fz_fields) end
+  doc "The fields' names, by index."
+  fn field_names(f : Frozen) : List(String) do f.fz_field_names end
+  doc "The index of the field named n, or -1."
+  fn field_index(f : Frozen, n : String) : Int do index_of(f.fz_field_names, n) end
+  doc "Field i's kind: 0 ground, 1 noise, 2 curve, 3 cover; -1 for no such field."
+  fn field_kind(f : Frozen, i : Int) : Int do
+    match fz_field(f, i) do
+      Some(PfGround(_)) -> 0
+      Some(PfNoise(_, _, _, _)) -> 1
+      Some(PfCurve(_, _)) -> 2
+      Some(PfCover(_, _)) -> 3
+      None -> -1
+    end
+  end
+  doc "A ground field's slot 0..9."
+  fn field_slot(f : Frozen, i : Int) : Int do
+    match fz_field(f, i) do
+      Some(PfGround(s)) -> s
+      _ -> -1
+    end
+  end
+  doc "A noise field's noise kind."
+  fn field_noise_kind(f : Frozen, i : Int) : Int do
+    match fz_field(f, i) do
+      Some(PfNoise(k, _, _, _)) -> k
+      _ -> -1
+    end
+  end
+  doc "A noise field's octaves."
+  fn field_octaves(f : Frozen, i : Int) : Int do
+    match fz_field(f, i) do
+      Some(PfNoise(_, o, _, _)) -> o
+      _ -> -1
+    end
+  end
+  doc "A noise field's period in metres."
+  fn field_period(f : Frozen, i : Int) : Float do
+    match fz_field(f, i) do
+      Some(PfNoise(_, _, v, _)) -> v
+      _ -> 0.0
+    end
+  end
+  doc "A noise field's seed salt."
+  fn field_salt(f : Frozen, i : Int) : Int do
+    match fz_field(f, i) do
+      Some(PfNoise(_, _, _, s)) -> s
+      _ -> -1
+    end
+  end
+  doc "A curve field's source field index."
+  fn field_source(f : Frozen, i : Int) : Int do
+    match fz_field(f, i) do
+      Some(PfCurve(s, _)) -> s
+      _ -> -1
+    end
+  end
+  doc "A curve field's curve."
+  fn field_source_curve(f : Frozen, i : Int) : PopCurve do
+    match fz_field(f, i) do
+      Some(PfCurve(_, c)) -> c
+      _ -> no_curve()
+    end
+  end
+  doc "A cover field's layer index (run order)."
+  fn field_layer(f : Frozen, i : Int) : Int do
+    match fz_field(f, i) do
+      Some(PfCover(l, _)) -> l
+      _ -> -1
+    end
+  end
+  doc "A cover field's radius in metres."
+  fn field_radius(f : Frozen, i : Int) : Float do
+    match fz_field(f, i) do
+      Some(PfCover(_, r)) -> r
+      _ -> 0.0
+    end
+  end
+
+  -- zones
+
+  pfn fz_zone(f : Frozen, i : Int) : Option(PopZone) do nth_of(f.fz_zones, i) end
+  doc "How many zones there are."
+  fn zone_count(f : Frozen) : Int do List.length(f.fz_zones) end
+  doc "The zones' names, by index."
+  fn zone_names(f : Frozen) : List(String) do f.fz_zone_names end
+  doc "The index of the zone named n, or -1."
+  fn zone_index(f : Frozen, n : String) : Int do index_of(f.fz_zone_names, n) end
+  doc "Zone i's kind: 0 regions, 1 band, 2 ring, 3 all, 4 any, 5 not; -1 for no such zone."
+  fn zone_kind(f : Frozen, i : Int) : Int do
+    match fz_zone(f, i) do
+      Some(PfRegions(_)) -> 0
+      Some(PfBand(_, _, _)) -> 1
+      Some(PfRing(_, _, _)) -> 2
+      Some(PfAll(_)) -> 3
+      Some(PfAny(_)) -> 4
+      Some(PfNot(_)) -> 5
+      None -> -1
+    end
+  end
+  doc "A regions zone's region ids."
+  fn zone_ids(f : Frozen, i : Int) : List(Int) do
+    match fz_zone(f, i) do
+      Some(PfRegions(ids)) -> ids
+      _ -> Nil
+    end
+  end
+  doc "A band zone's field index."
+  fn zone_field(f : Frozen, i : Int) : Int do
+    match fz_zone(f, i) do
+      Some(PfBand(fi, _, _)) -> fi
+      _ -> -1
+    end
+  end
+  doc "A band zone's lower bound (inclusive)."
+  fn zone_lo(f : Frozen, i : Int) : Float do
+    match fz_zone(f, i) do
+      Some(PfBand(_, v, _)) -> v
+      _ -> 0.0
+    end
+  end
+  doc "A band zone's upper bound (exclusive)."
+  fn zone_hi(f : Frozen, i : Int) : Float do
+    match fz_zone(f, i) do
+      Some(PfBand(_, _, v)) -> v
+      _ -> 0.0
+    end
+  end
+  doc "A ring zone's sites."
+  fn zone_sites(f : Frozen, i : Int) : List(PopSite) do
+    match fz_zone(f, i) do
+      Some(PfRing(ss, _, _)) -> ss
+      _ -> Nil
+    end
+  end
+  doc "A ring zone's inner radius in metres."
+  fn zone_inner(f : Frozen, i : Int) : Float do
+    match fz_zone(f, i) do
+      Some(PfRing(_, v, _)) -> v
+      _ -> 0.0
+    end
+  end
+  doc "A ring zone's outer radius in metres."
+  fn zone_outer(f : Frozen, i : Int) : Float do
+    match fz_zone(f, i) do
+      Some(PfRing(_, _, v)) -> v
+      _ -> 0.0
+    end
+  end
+  doc "The zone indices an all, any or not zone is made of (a not zone: the one it negates)."
+  fn zone_members(f : Frozen, i : Int) : List(Int) do
+    match fz_zone(f, i) do
+      Some(PfAll(zs)) -> zs
+      Some(PfAny(zs)) -> zs
+      Some(PfNot(z)) -> Cons(z, Nil)
+      _ -> Nil
+    end
+  end
+
+  -- shape sets
+
+  pfn fz_shapes_at(f : Frozen, i : Int) : Option(PopShapes) do nth_of(f.fz_shapes, i) end
+  doc "How many shape sets there are."
+  fn shape_set_count(f : Frozen) : Int do List.length(f.fz_shapes) end
+  doc "The shape sets' names, by index."
+  fn shape_set_names(f : Frozen) : List(String) do f.fz_shape_names end
+  doc "The index of the shape set named n, or -1."
+  fn shape_set_index(f : Frozen, n : String) : Int do index_of(f.fz_shape_names, n) end
+  doc "Shape set i's kind: 0 blocks, 1 templates; -1 for no such set."
+  fn shape_set_kind(f : Frozen, i : Int) : Int do
+    match fz_shapes_at(f, i) do
+      Some(PfBlocks(_, _)) -> 0
+      Some(PfTemplates(_, _)) -> 1
+      None -> -1
+    end
+  end
+  doc "A block shape set's block ids, a variant each."
+  fn shape_set_blocks(f : Frozen, i : Int) : List(Int) do
+    match fz_shapes_at(f, i) do
+      Some(PfBlocks(ids, _)) -> ids
+      _ -> Nil
+    end
+  end
+  doc "A template shape set's templates, a variant each."
+  fn shape_set_templates(f : Frozen, i : Int) : List(Strata.Template.Template) do
+    match fz_shapes_at(f, i) do
+      Some(PfTemplates(ts, _)) -> ts
+      _ -> Nil
+    end
+  end
+  doc "How many variants shape set i has."
+  fn shape_set_variants(f : Frozen, i : Int) : Int do
+    match fz_shapes_at(f, i) do
+      Some(PfBlocks(ids, _)) -> List.length(ids)
+      Some(PfTemplates(ts, _)) -> List.length(ts)
+      None -> 0
+    end
+  end
+  doc "Shape set i's weights: (zone index, a weight per variant), in declaration order, at most one per zone."
+  fn shape_set_weights(f : Frozen, i : Int) : List((Int, List(Float))) do
+    match fz_shapes_at(f, i) do
+      Some(PfBlocks(_, ws)) -> ws
+      Some(PfTemplates(_, ws)) -> ws
+      None -> Nil
+    end
+  end
+
+  -- layers, in run order
+
+  pfn fz_layer(f : Frozen, i : Int) : Option(PopLayer) do nth_of(f.fz_layers, i) end
+  pfn fz_rule(f : Frozen, i : Int) : Option(PopFrozenRule) do
+    match fz_layer(f, i) do
+      Some(PfLayerCover(_, r, _)) -> Some(r)
+      Some(PfLayerScatter(_, r, _, _, _)) -> Some(r)
+      _ -> None
+    end
+  end
+  doc "How many layers there are."
+  fn layer_count(f : Frozen) : Int do List.length(f.fz_layers) end
+  doc "The index (run order) of the layer named n, or -1."
+  fn layer_index(f : Frozen, n : String) : Int do index_of(f.fz_layer_names, n) end
+  doc "Layer i's kind: 0 cover, 1 scatter, 2 site; -1 for no such layer."
+  fn layer_kind(f : Frozen, i : Int) : Int do
+    match fz_layer(f, i) do
+      Some(PfLayerCover(_, _, _)) -> 0
+      Some(PfLayerScatter(_, _, _, _, _)) -> 1
+      Some(PfLayerSite(_, _, _, _)) -> 2
+      None -> -1
+    end
+  end
+  doc "Layer i's shape set index."
+  fn layer_shape_set(f : Frozen, i : Int) : Int do
+    match fz_layer(f, i) do
+      Some(PfLayerCover(s, _, _)) -> s
+      Some(PfLayerScatter(s, _, _, _, _)) -> s
+      Some(PfLayerSite(s, _, _, _)) -> s
+      None -> -1
+    end
+  end
+  doc "Layer i's hash salt."
+  fn layer_salt(f : Frozen, i : Int) : Int do
+    match fz_layer(f, i) do
+      Some(PfLayerCover(_, _, v)) -> v
+      Some(PfLayerScatter(_, _, _, _, v)) -> v
+      Some(PfLayerSite(_, _, _, v)) -> v
+      None -> -1
+    end
+  end
+  doc "Layer i's rule base density per square metre (cover and scatter)."
+  fn layer_base(f : Frozen, i : Int) : Float do
+    match fz_rule(f, i) do
+      Some(PfRule(b, _, _, _)) -> b
+      None -> 0.0
+    end
+  end
+  doc "Layer i's rule factors: (field index, curve) (cover and scatter)."
+  fn layer_curves(f : Frozen, i : Int) : List((Int, PopCurve)) do
+    match fz_rule(f, i) do
+      Some(PfRule(_, cs, _, _)) -> cs
+      None -> Nil
+    end
+  end
+  doc "The zone indices layer i's rule must be inside (cover and scatter)."
+  fn layer_inside(f : Frozen, i : Int) : List(Int) do
+    match fz_rule(f, i) do
+      Some(PfRule(_, _, ins, _)) -> ins
+      None -> Nil
+    end
+  end
+  doc "The zone indices layer i's rule must be outside (cover and scatter)."
+  fn layer_outside(f : Frozen, i : Int) : List(Int) do
+    match fz_rule(f, i) do
+      Some(PfRule(_, _, _, outs)) -> outs
+      None -> Nil
+    end
+  end
+  doc "A scatter layer's cell side in metres."
+  fn layer_cell(f : Frozen, i : Int) : Float do
+    match fz_layer(f, i) do
+      Some(PfLayerScatter(_, _, v, _, _)) -> v
+      _ -> 0.0
+    end
+  end
+  doc "A scatter layer's jitter 0..0.6."
+  fn layer_jitter(f : Frozen, i : Int) : Float do
+    match fz_layer(f, i) do
+      Some(PfLayerScatter(_, _, _, v, _)) -> v
+      _ -> 0.0
+    end
+  end
+  doc "A site layer's sites."
+  fn layer_sites(f : Frozen, i : Int) : List(PopSite) do
+    match fz_layer(f, i) do
+      Some(PfLayerSite(_, ss, _, _)) -> ss
+      _ -> Nil
+    end
+  end
+  doc "A site layer's margin in metres."
+  fn layer_margin(f : Frozen, i : Int) : Float do
+    match fz_layer(f, i) do
+      Some(PfLayerSite(_, _, v, _)) -> v
+      _ -> 0.0
+    end
+  end
+end
