@@ -60,3 +60,4 @@ Task 9: Ruling: `Hud.build_bar` takes the nine icons; the match's display is `St
 Task 9: Ruling: STRATA_COMBAT_HOLD=1 keeps a scripted run going to its last frame after a win, for the end screen's picture (a scripted run otherwise ends at the win, before the shot is taken).
 Task 9: Ruling: `again` takes no world; the ten-match check allows 28 live entities and 60 figures after the tenth (measured: 10 and 17).
 Task 9: Mistake: three runs of the viewer went out without STRATA_HIDDEN (the settings were in one shell variable, which zsh passes as a single word): a window was open on the user's screen for about ten minutes, then twice briefly. Scripted runs are launched through a shell function now.
+Task 9: complete (commit 8f04db6, tests: forge test test/combat_test.march -> 82/82; combat_check.sh all ten ok; goldens combat-fight and combat-end stored after looking)
