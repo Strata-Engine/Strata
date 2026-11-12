@@ -754,6 +754,37 @@ static void test_fast_and_undeclared(void) {
     en_close(w);
 }
 
+/* Two flyers of one kind (half 0.2, pair (0, 0) declared), A at a going va and B at b going vb, one step of 1/60 s;
+ * how many touches, and in *pair the (a, b) of the first. Worked by hand, not by the brute force. */
+static int two_flyers(const double a[3], const double va[3], const double b[3], const double vb[3], int64_t ids[2], int64_t pair[2]) {
+    EnWorld *w = world(16);
+    box_kind(w, 1, 0.2f, 0);
+    ids[0] = en_add(w, 0, a[0], a[1], a[2], 0);
+    ids[1] = en_add(w, 0, b[0], b[1], b[2], 0);
+    en_set(w, ids[0], 1, va); en_set(w, ids[1], 1, vb);
+    en_touching(w, 0, 0);
+    en_tick(w, 0, NULL, 1.0 / 60);
+    int64_t pairs[16];
+    int n = touch_pairs(w, pairs);
+    if (n > 0) { pair[0] = pairs[0]; pair[1] = pairs[1]; }
+    en_close(w);
+    return n;
+}
+
+static void test_flyer_against_flyer(void) {
+    int64_t ids[2], pair[2] = {-1, -1};
+    /* A from (-5, 0, 0) to (5, 0, 0) and B from (0, 0, -5) to (0, 0, 5) in one step: they cross at the origin */
+    double a0[3] = {-5, 0, 0}, east[3] = {600, 0, 0}, b0[3] = {0, 0, -5}, north[3] = {0, 0, 600};
+    CHECK(two_flyers(a0, east, b0, north, ids, pair) == 1 && pair[0] == ids[0] && pair[1] == ids[1],
+          "two flyers crossing in one 10 m step report one touch, a the lower id");
+    /* parallel paths 0.3 m apart, both stepping 2 m east, B 1.5 m ahead: never nearer than 1.5 m, but each swept box
+     * (A x -0.2..2.2, B x 1.3..3.7; z -0.2..0.2 and 0.1..0.5) overlaps the other: the near miss the reading costs */
+    double p0[3] = {0, 0, 0}, slow[3] = {120, 0, 0}, q0[3] = {1.5, 0, 0.3};
+    CHECK(two_flyers(p0, slow, q0, slow, ids, pair) == 1, "parallel flyers 0.3 m apart, one 1.5 m ahead, report a near miss");
+    double r0[3] = {1.5, 0, 0.5};
+    CHECK(two_flyers(p0, slow, r0, slow, ids, pair) == 0, "the same pair 0.5 m apart reports none");
+}
+
 static void test_event_overflow(void) {
     EnWorld *w = en_open(1 << 17, 4096, 128, 160.0, 3.2, 0.1);
     box_kind(w, 0, 0.01f, 0); box_kind(w, 0, 100.0f, 0);
@@ -838,6 +869,7 @@ int main(void) {
     test_ray_entities();
     test_touches();
     test_fast_and_undeclared();
+    test_flyer_against_flyer();
     test_event_overflow();
     test_removal_in_loop();
     if (fails == 0) printf("ent_test: ok\n");

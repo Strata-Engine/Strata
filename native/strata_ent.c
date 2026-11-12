@@ -14,7 +14,7 @@
  * With no world open every call does nothing and answers its default
  * (0, -1 for a kind or an id, 0.0). */
 /* Rewritten by stamp_ent.sh whenever strata_ent.h or strata_ent_grid.h changes (GAPS S14). */
-#define STRATA_ENT_STAMP "b92b3eecb5ce6eeb"
+#define STRATA_ENT_STAMP "171342a3b810f7ab"
 #include <stdint.h>
 #include <time.h>
 #include "strata_ent.h"

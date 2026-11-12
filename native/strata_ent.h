@@ -37,6 +37,11 @@
 #include <math.h>
 #include <float.h>
 
+/* No product is fused into an add anywhere in the entity headers (strata_ent.h, strata_ent_grid.h): the ray must
+ * break ties as Strata.Query does in March, and equal calls must give equal hashes whatever the compiler's default.
+ * Never switched back on here; it stays off for the rest of a file that includes this one. */
+#pragma STDC FP_CONTRACT OFF
+
 #define EN_KINDS 62
 #define EN_SLOTS 8                 /* float slots, and int slots, a kind at most */
 #define EN_VOICES 2
@@ -623,8 +628,7 @@ static inline int en_solid(const EnWorld *w, int vx, int vy, int vz) {
 /* ---- the ray ---- */
 /* Strata.Query.raycast's walk, step for step, in doubles: voxels in voxel units (metres / voxel_metres), the
  * face entered by (0 +y, 1 -y, 2 +x, 3 -x, 4 +z, 5 -z), the face facing back along the strongest axis for a
- * ray starting inside a solid voxel. Products are not fused (FP_CONTRACT off) so ties break as in March. */
-#pragma STDC FP_CONTRACT OFF
+ * ray starting inside a solid voxel. Products are not fused (FP_CONTRACT is off for the whole header) so ties break as in March. */
 static inline int en_ray_face(int axis, double u) {
     return axis == 0 ? (u > 0 ? 3 : 2) : axis == 1 ? (u > 0 ? 1 : 0) : (u > 0 ? 5 : 4);
 }
@@ -672,7 +676,6 @@ static inline int en_ray(const EnWorld *w, const double o[3], const double d[3],
         steps--;
     }
 }
-#pragma STDC FP_CONTRACT DEFAULT
 
 /* ---- events ---- */
 /* The events of the last en_tick, in the order written: first the removals made since the tick before, then

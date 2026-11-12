@@ -26,14 +26,18 @@
  * its box (position +- the kind's half extents) where the step began and
  * where it ended. An entity that did not move has its plain box. Two boxes
  * touch when they overlap strictly on every axis; faces that only meet do
- * not touch. */
+ * not touch. Every moving entity is swept, so two movers are swept box against
+ * swept box: two fast flyers crossing are never missed, and two whose paths
+ * pass near each other at different moments of the step can report a near
+ * miss.
+ *
+ * Contraction is off here as in the rest of strata_ent.h (set there, never
+ * switched back), so a test's brute force computes the same distances. */
 #ifndef STRATA_ENT_GRID_H
 #define STRATA_ENT_GRID_H
 #ifndef STRATA_ENT_H
 #error "strata_ent_grid.h is part of strata_ent.h; include that"
 #endif
-
-#pragma STDC FP_CONTRACT OFF   /* distances and box tests unfused, so a test's brute force computes the same */
 
 static inline int32_t en_gcell(double v) {
     double c = floor(v * (1.0 / EN_CELL));
@@ -243,7 +247,9 @@ static inline int64_t en_ray_entities(const EnWorld *w, const double o[3], const
 }
 
 /* Ask for touch events between kind_a and kind_b, in either order, from the next tick on. Declaring a pair again
- * changes nothing. Refused (EN_R_KIND) for no such kind. */
+ * changes nothing. Refused (EN_R_KIND) for no such kind. A moving entity is tested along its whole step (the box
+ * it swept), so a fast flyer does not pass through a thin target; two moving entities are both swept, so they can
+ * report a near miss: paths that pass within their boxes' reach at different moments of the step. */
 static inline void en_touching(EnWorld *w, int kind_a, int kind_b) {
     if (kind_a < 0 || kind_a >= w->nkinds || kind_b < 0 || kind_b >= w->nkinds) { en_refuse(w, EN_R_KIND); return; }
     int lo = kind_a < kind_b ? kind_a : kind_b, hi = kind_a < kind_b ? kind_b : kind_a;
@@ -284,5 +290,4 @@ static inline void en_touches(EnWorld *w) {
     }
 }
 
-#pragma STDC FP_CONTRACT DEFAULT
 #endif
