@@ -1,0 +1,80 @@
+-- Fracture: cutting a body's grid into pieces round where it was struck.
+-- Block 1 is stone breaking into 0.5 m pieces.
+mod Strata.Test.Fracture do
+
+  needs IO.Clock      -- charged to every test module once any uses Check.all (GAPS S3)
+  needs IO.Process
+  import Test
+  alias Strata.Fracture as Fr
+  alias Strata.Body as Bg
+  alias Strata.Blocks as B
+
+  pfn reg() : Strata.Blocks.Registry do
+    match B.register(B.empty(), B.def()) do
+      Ok((r, _)) -> r
+      Err(_) -> B.empty()
+    end
+  end
+  pfn fill(g : Strata.Body.Grid, sx : Int, sy : Int, sz : Int, i : Int) : Strata.Body.Grid do
+    if i >= sx * sy * sz do g else fill(Bg.grid_set(g, i % sx, (i / sx) % sy, i / (sx * sy), 1), sx, sy, sz, i + 1) end
+  end
+  pfn slab() : Strata.Body.Grid do fill(Bg.grid(40, 4, 40), 40, 4, 40, 0) end
+
+  pfn total(ps : List((Strata.Body.Grid, Int, Int, Int))) : Int do List.fold_left(ps, 0, fn (n, p) -> n + piece_count(p)) end
+  pfn piece_count(p : (Strata.Body.Grid, Int, Int, Int)) : Int do match p do (g, _, _, _) -> Bg.solid_count(reg(), g) end end
+  pfn largest(ps : List((Strata.Body.Grid, Int, Int, Int))) : Int do List.fold_left(ps, 0, fn (m, p) -> if piece_count(p) > m do piece_count(p) else m end) end
+
+  -- every voxel of every piece, put back in the parent's coordinates, is a stone voxel of the parent, and each appears once
+  pfn covered(ps : List((Strata.Body.Grid, Int, Int, Int)), seen : Strata.Body.Grid) : (Strata.Body.Grid, Bool) do
+    match ps do
+      Nil -> (seen, true)
+      Cons((g, ox, oy, oz), t) ->
+        match mark(g, ox, oy, oz, seen, 0) do
+          (s2, ok) -> if !ok do (s2, false) else covered(t, s2) end
+        end
+    end
+  end
+  pfn mark(g : Strata.Body.Grid, ox : Int, oy : Int, oz : Int, seen : Strata.Body.Grid, i : Int) : (Strata.Body.Grid, Bool) do
+    let sx = Bg.size_x(g)
+    let sy = Bg.size_y(g)
+    if i >= sx * sy * Bg.size_z(g) do (seen, true)
+    else
+      let x = i % sx
+      let y = (i / sx) % sy
+      let z = i / (sx * sy)
+      if Bg.grid_get(g, x, y, z) == 0 do mark(g, ox, oy, oz, seen, i + 1)
+      else if Bg.grid_get(seen, ox + x, oy + y, oz + z) != 0 do (seen, false)
+      else mark(g, ox, oy, oz, Bg.grid_set(seen, ox + x, oy + y, oz + z, 1), i + 1) end end
+    end
+  end
+
+  describe "Fracture" do
+    test "every voxel lands in exactly one piece" do
+      let ps = Fr.pieces(reg(), slab(), 20, 3, 20, 3.0, 0.1, 7)
+      Test.assert_eq_int(total(ps), 6400, "all 6400 voxels")
+      match covered(ps, Bg.grid(40, 4, 40)) do
+        (_, ok) -> Test.assert_true(ok, "each once, where it was")
+      end
+    end
+
+    test "the same inputs give the same pieces" do
+      let a = Fr.pieces(reg(), slab(), 5, 3, 30, 2.0, 0.1, 11)
+      let b = Fr.pieces(reg(), slab(), 5, 3, 30, 2.0, 0.1, 11)
+      Test.assert_eq_int(List.length(a), List.length(b), "as many pieces")
+      Test.assert_true(List.map(a, fn p -> piece_count(p)) == List.map(b, fn p -> piece_count(p)), "of the same sizes, in the same order")
+    end
+
+    test "broken through, a 10 cm slab breaks into pieces about half a metre across" do
+      let ps = Fr.pieces(reg(), slab(), 20, 3, 20, 100.0, 0.1, 3)
+      let avg = 6400 / List.length(ps)
+      Test.assert_true(avg >= 60 && avg <= 250, "an average piece of 60 to 250 voxels")
+    end
+
+    test "a larger excess breaks more of the slab" do
+      let weak = Fr.pieces(reg(), slab(), 20, 3, 20, 1.5, 0.1, 5)
+      let hard = Fr.pieces(reg(), slab(), 20, 3, 20, 4.0, 0.1, 5)
+      Test.assert_true(largest(hard) < largest(weak), "the largest piece left is smaller")
+      Test.assert_true(List.length(hard) > List.length(weak), "and there are more pieces")
+    end
+  end
+end
