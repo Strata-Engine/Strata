@@ -27,7 +27,7 @@
 /* Rewritten by build_shaders.sh whenever the shaders change: forge decides
  * whether to recompile this file from its text alone, not from the headers
  * it includes (GAPS S14). */
-#define STRATA_SHADERS_STAMP "af6f47f045d76f77"
+#define STRATA_SHADERS_STAMP "69ff6a01136adf56"
 #include "strata_shaders.h"
 #include "strata_particles.h"
 #include "strata_alloc.h"
@@ -630,11 +630,11 @@ static int make_pipeline(int kind, VkPipeline *out) {
         .vertexBindingDescriptionCount = (full || fig) ? 0 : 1, .pVertexBindingDescriptions = ui ? &ubind : spray ? &sbind : (loose ? &lbind : &bind),
         .vertexAttributeDescriptionCount = (full || fig) ? 0 : (ui ? 4 : spray ? 4 : (loose ? 4 : 2)), .pVertexAttributeDescriptions = ui ? uattrs : spray ? sattrs : (loose ? lattrs : attrs) };
     VkPipelineInputAssemblyStateCreateInfo ia = { .sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
-        .topology = (cross || full) ? VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST : VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP };
+        .topology = (cross || full || spray) ? VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST : VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP };
     VkPipelineViewportStateCreateInfo vp = { .sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO, .viewportCount = 1, .scissorCount = 1 };
     VkPipelineRasterizationStateCreateInfo rs = { .sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO, .polygonMode = VK_POLYGON_MODE_FILL,
         /* a see-through surface is visible from behind too: water from below */
-        .cullMode = (kind == 0 || fig) ? VK_CULL_MODE_BACK_BIT : VK_CULL_MODE_NONE, .frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE, .lineWidth = 1.0f };
+        .cullMode = (kind == 0 || fig || spray) ? VK_CULL_MODE_BACK_BIT : VK_CULL_MODE_NONE, .frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE, .lineWidth = 1.0f };
     VkPipelineMultisampleStateCreateInfo ms = { .sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO, .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT };
     /* only the geometry pass writes depth; translucent quads test against it; full-screen passes ignore it */
     VkPipelineDepthStencilStateCreateInfo ds = { .sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO, .depthTestEnable = (full || ui) ? VK_FALSE : VK_TRUE,
@@ -2917,7 +2917,7 @@ int64_t sv_spray(double x, double y, double z, double vx, double vy, double vz, 
         p[4] = (float)(vx + spread * spray_hash(id, 4)); p[5] = (float)(vy + spread * 0.5 * (spray_hash(id, 5) + 1.0f)); p[6] = (float)(vz + spread * spray_hash(id, 6));
         p[7] = (float)(life * (0.7 + 0.15 * (spray_hash(id, 7) + 1.0f)));
         p[8] = 0.0f; p[9] = 0.16f + 0.07f * spray_hash(id, 8);
-        p[10] = 0.5f * (spray_hash(id, 9) + 1.0f); p[11] = 0.0f; p[12] = (float)tex; p[13] = 0.0f; p[14] = 0.0f; p[15] = 0.0f;
+        p[10] = 0.5f * (spray_hash(id, 9) + 1.0f); p[11] = 3.14159265f * spray_hash(id, 10); p[12] = (float)tex; p[13] = 0.0f; p[14] = 0.0f; p[15] = 0.0f;
     }
     return n;
 }
@@ -3238,8 +3238,8 @@ int64_t sv_frame(void) {
             uint32_t ppc[2] = { (uint32_t)pass, 0u };
             vkCmdBindPipeline(F->cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pass == 0 ? g.pipe_spray : g.pipe_glow);
             vkCmdPushConstants(F->cmd, g.layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, 8, ppc);
-            vkCmdDraw(F->cmd, 4, run, 0, first); draws++;
-            if (run < n) { vkCmdDraw(F->cmd, 4, n - run, 0, 0); draws++; }
+            vkCmdDraw(F->cmd, 36, run, 0, first); draws++;      /* a cube's 36 vertices, or a square's 12 (strata_particles.h) */
+            if (run < n) { vkCmdDraw(F->cmd, 36, n - run, 0, 0); draws++; }
         }
     }
     /* the 2D layer over everything: this Frame's own copy of the quads, one draw */

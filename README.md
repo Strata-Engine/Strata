@@ -580,7 +580,7 @@ nothing after it is born. Particles meet nothing.
 alias Strata.Particles as Pt
 
 -- an effect: glowing (added, not lit) or shaded (blended, lit by sun and sky)
-let flame = Pt.effect() |> Pt.glowing() |> Pt.layer(14)
+let flame = Pt.effect() |> Pt.glowing() |> Pt.layer(13) |> Pt.spin(2.0)
   |> Pt.colour([(0.0, 1.0, 0.9, 0.5, 0.0), (0.15, 1.0, 0.6, 0.15, 0.9), (1.0, 0.6, 0.1, 0.0, 0.0)])
   |> Pt.size([(0.0, 0.25), (1.0, 0.05)])          -- (age, metres)
   |> Pt.accel(0.0, 3.0, 0.0) |> Pt.drag(2.0) |> Pt.wobble(0.08, 1.5)
@@ -594,15 +594,18 @@ let (fx3, e) = Pt.emitter(fx2, flame_id, Pt.point(x, y, z), (0.0, 0.3, 0.0), 0.4
 let fx4 = Strata.Render.particles(Pt.step(Pt.move(fx3, e, Pt.point(x2, y2, z2)), dt))
 ```
 
-Colour and size follow up to four keys over a particle's life; it moves
+A particle is drawn as a tiny cube, tumbling at the effect's `spin`, each
+face lit by its own direction and textured with the effect's layer
+(`Pt.sprite()` draws a square facing the eye instead). Colour and size
+follow up to four keys over a particle's life; it moves
 under a constant acceleration with linear drag and a sideways sway. A
 moving emitter spreads a frame's particles along its path, so a fast one
 leaves an unbroken trail (past 4 m a frame it has jumped, and leaves none).
 A burst holds at most 512, an emitter spawns at most 4096 a frame, and the
 ring holds 65 536 live particles, overwriting its oldest when full. A
 shaded effect is lit once a particle unless `Pt.lit_per_pixel` asks for
-spray's per-pixel lighting. `Strata.Render.spray` is the built-in effect 0,
-as it was.
+spray's per-pixel lighting. `Strata.Render.spray` is the built-in effect 0:
+tumbling cubes in the texture of the block they were thrown from.
 
 ## The far field
 

@@ -50,6 +50,26 @@ int main(void) {
         CHECK(fabsf(p[0] - 1.0f) < 1e-5f && fabsf(p[1] - (2.0f + 3.5f - 1.225f)) < 1e-5f && fabsf(p[2] - 3.0f) < 1e-5f, "effect 0 flies as spray: start + v t - 4.9 t^2");
         CHECK(fx[0] == 0.0f && fx[2] == 0.0f, "effect 0 is shaded and lit per pixel");
     }
+    /* the cube a particle is drawn as: 36 corners, twelve triangles, each wound to face out of its face */
+    {
+        float fx[PT_EFFECT_FLOATS];
+        pt_effect_spray(fx);
+        CHECK(PT_EFFECT_FLOATS == 44 && fx[40] == 1.0f, "an effect is 44 floats; spray is drawn as a cube");
+        int out = 1, faces[6] = {0};
+        for (int t = 0; t < 12; t++) {
+            float a[3], b[3], c[3], n[3];
+            pt_cube_vertex(3 * t, a, n); pt_cube_vertex(3 * t + 1, b, n); pt_cube_vertex(3 * t + 2, c, n);
+            float e1[3] = { b[0] - a[0], b[1] - a[1], b[2] - a[2] }, e2[3] = { c[0] - a[0], c[1] - a[1], c[2] - a[2] };
+            float x[3] = { e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2], e1[0] * e2[1] - e1[1] * e2[0] };
+            float mid[3] = { (a[0] + b[0] + c[0]) / 3.0f, (a[1] + b[1] + c[1]) / 3.0f, (a[2] + b[2] + c[2]) / 3.0f };
+            if (x[0] * n[0] + x[1] * n[1] + x[2] * n[2] <= 0.0f) out = 0;           /* counter-clockwise seen from outside */
+            if (mid[0] * n[0] + mid[1] * n[1] + mid[2] * n[2] <= 0.0f) out = 0;     /* on the side its normal names */
+            if (fabsf(a[0]) != 0.5f || fabsf(a[1]) != 0.5f || fabsf(a[2]) != 0.5f) out = 0;
+            faces[(int)(fabsf(n[0]) * 0 + (n[1] > 0.5f ? 0 : n[1] < -0.5f ? 1 : n[0] > 0.5f ? 2 : n[0] < -0.5f ? 3 : n[2] > 0.5f ? 4 : 5))]++;
+        }
+        CHECK(out, "every triangle of the cube winds counter-clockwise seen from outside, on its own face, corners at +-0.5");
+        CHECK(faces[0] == 2 && faces[1] == 2 && faces[2] == 2 && faces[3] == 2 && faces[4] == 2 && faces[5] == 2, "two triangles a face, six faces");
+    }
     /* drag: the speed tends to a / k */
     {
         float fx[PT_EFFECT_FLOATS] = {0}, rec[PT_FLOATS] = {0}, p0[3], p1[3];

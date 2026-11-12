@@ -58,19 +58,39 @@ static inline uint32_t sp_first(const SprayRing *r) { return (uint32_t)(r->tail 
  * [4..19]  four colour keys (r, g, b, opacity)    [20..23] their ages (0..1)
  * [24..27] four sizes (m)                         [28..31] their ages (0..1)
  * [32..35] size keys used (1..4), drag k, wobble metres, wobble Hz
- * [36..39] ax, ay, az (m/s2), spin (rad/s) */
-#define PT_EFFECT_FLOATS 40
+ * [36..39] ax, ay, az (m/s2), spin (rad/s)
+ * [40..43] shape (0 a square facing the eye, 1 a cube), three unused */
+#define PT_EFFECT_FLOATS 44
 #define PT_EFFECTS 64
 
-/* Effect 0, spray: shaded, the record's layer, white, size 1 (the record's
- * size scale is spray's size), ballistic under gravity, lit per pixel. Its
- * fade over the last third is spray's own (the shader keeps it for effect 0). */
+/* Effect 0, spray: a shaded cube in the record's layer (the block it was
+ * thrown from), white, size 1 (the record's size scale is spray's size),
+ * ballistic under gravity, tumbling 4 radians a second, lit per pixel. Its fade over the last third is
+ * spray's own (the shader keeps it for effect 0). */
 static inline void pt_effect_spray(float *e) {
     for (int i = 0; i < PT_EFFECT_FLOATS; i++) e[i] = 0.0f;
     e[1] = 13.0f; e[3] = 1.0f;
     e[4] = 1.0f; e[5] = 1.0f; e[6] = 1.0f; e[7] = 1.0f;
     e[24] = 1.0f; e[32] = 1.0f;
-    e[37] = -9.8f;
+    e[37] = -9.8f; e[39] = 4.0f;                       /* falling, tumbling */
+    e[40] = 1.0f;
+}
+
+/* Corner [v] (0..35) of the unit cube a particle is drawn as, about its
+ * middle, and its face's outward normal: face v / 6 (+y, -y, +x, -x, +z,
+ * -z), two triangles a face, each counter-clockwise seen from outside (the
+ * winding the quad pipeline keeps as front). particle.vert holds the same
+ * table. */
+static inline void pt_cube_vertex(int v, float pos[3], float nrm[3]) {
+    static const float N[6][3] = { {0,1,0}, {0,-1,0}, {1,0,0}, {-1,0,0}, {0,0,1}, {0,0,-1} };
+    static const float T1[6][3] = { {0,0,1}, {1,0,0}, {0,1,0}, {0,0,1}, {1,0,0}, {0,1,0} };
+    static const float T2[6][3] = { {1,0,0}, {0,0,1}, {0,0,1}, {0,1,0}, {0,1,0}, {1,0,0} };
+    static const float S[6] = { 0, 1, 1, 0, 1, 0 }, T[6] = { 0, 0, 1, 0, 1, 1 };
+    int f = (v / 6) % 6, c = v % 6;
+    for (int k = 0; k < 3; k++) {
+        nrm[k] = N[f][k];
+        pos[k] = 0.5f * N[f][k] + (S[c] - 0.5f) * T1[f][k] + (T[c] - 0.5f) * T2[f][k];
+    }
 }
 
 /* Where a particle is at age [t]: with drag k > 0,
