@@ -44,6 +44,8 @@ mod Strata.Physics do
   pfn c_iters(c : PhysConfig) : Int do match c do PhConfig(_, _, i, _, _, _, _, _) -> i end end
   pfn c_awake(c : PhysConfig) : Int do match c do PhConfig(_, _, _, a, _, _, _, _) -> a end end
   pfn c_total(c : PhysConfig) : Int do match c do PhConfig(_, _, _, _, t, _, _, _) -> t end end
+  pfn c_support(c : PhysConfig) : Bool do match c do PhConfig(_, _, _, _, _, s, _, _) -> s end end
+  pfn c_anchor(c : PhysConfig) : Int do match c do PhConfig(_, _, _, _, _, _, y, _) -> y end end
   pfn c_scale(c : PhysConfig) : Float do match c do PhConfig(_, _, _, _, _, _, _, sc) -> sc end end
 
   doc "A body physics moves."
@@ -90,12 +92,13 @@ mod Strata.Physics do
   -- the game's camera: whether one is set, the eye, the direction looked in (unit), the cosine of half the view's angle
   type Sight = NoView | Seen(Float, Float, Float, Float, Float, Float, Float)
 
-  type Physics = { reg : Strata.Blocks.Registry, cfg : PhysConfig, bodies : List(Rigid), next : Int, steps : Int, view : Sight, waiting : Int, over : Int, touches : List(Touch), driving : List(Touch), unmeshed : List(Int), meshes : List((Int, Int, Strata.Mesh.Meshed)),
+  type Physics = { reg : Strata.Blocks.Registry, cfg : PhysConfig, bodies : List(Rigid), next : Int, steps : Int, view : Sight, waiting : Int, over : Int, touches : List(Touch), driving : List(Touch), unmeshed : List(Int), meshes : List((Int, Int, Strata.Mesh.Meshed)), fills : Int,
+                   loosed : List((Int, (Int, Int, Int, Int, Int, Int), List((Int, Int, Int, Int)), List(Strata.Edit.Change))),
                    pushes : List(PhPush), wakes : List(Strata.Edit.Change), events : List(PhysEvent) }
 
   doc "No bodies yet."
   fn new(r : Strata.Blocks.Registry, c : PhysConfig) : Physics do
-    { reg: r, cfg: c, bodies: Nil, next: 1, steps: 0, view: NoView, waiting: 0, over: 0, touches: Nil, driving: Nil, unmeshed: Nil, meshes: Nil, pushes: Nil, wakes: Nil, events: Nil }
+    { reg: r, cfg: c, bodies: Nil, next: 1, steps: 0, view: NoView, waiting: 0, over: 0, touches: Nil, driving: Nil, unmeshed: Nil, meshes: Nil, fills: 0, loosed: Nil, pushes: Nil, wakes: Nil, events: Nil }
   end
 
   -- ── Small maths ──────────────────────────────────────────────────────────
@@ -786,19 +789,115 @@ mod Strata.Physics do
     if da != db do da > db else a.id < b.id end
   end
 
-  pfn finish_step(p0 : Physics, w : Strata.World.World, focus : List((Float, Float, Float))) : (Physics, Strata.Edit.Outcome) do
+  pfn finish_step(p0 : Physics, w : Strata.World.World, focus : List((Float, Float, Float)), w0 : Strata.World.World, removals : List((Int, Int, Int, Int))) : (Physics, Strata.Edit.Outcome) do
     let made = List.fold_left(p0.unmeshed, Nil, fn (acc, id) -> match find(p0, id) do
         Some(b) -> List.append(acc, body_meshes(p0.reg, b))
         None -> acc
       end)
     let p = { p0 with unmeshed: Nil, meshes: List.append(p0.meshes, made) }
     match capped(p, w, focus) do
-      (p2, cells) -> (p2, Strata.Edit.set_many(w, cells))
+      (p2, cells) -> (p2, Strata.Edit.set_many(w0, List.append(removals, cells)))
+    end
+  end
+
+  -- ── Support ──────────────────────────────────────────────────────────────
+  doc "Every body's id, in order."
+  fn ids(p : Physics) : List(Int) do List.map(p.bodies, fn b -> b.id) end
+  doc "Loose pieces larger than the support pass's fill cap, counted as held instead, since physics began."
+  fn capped_fills(p : Physics) : Int do p.fills end
+
+  -- a piece's cells split along 128-voxel lines from its low corner, each part in a fixed order
+  pfn mins(cs : List((Int, Int, Int)), x0 : Int, y0 : Int, z0 : Int) : (Int, Int, Int) do
+    match cs do
+      Nil -> (x0, y0, z0)
+      Cons((x, y, z), t) -> mins(t, if x < x0 do x else x0 end, if y < y0 do y else y0 end, if z < z0 do z else z0 end)
+    end
+  end
+  pfn split128(cs : List((Int, Int, Int))) : List(List((Int, Int, Int))) do
+    match cs do
+      Nil -> Nil
+      Cons((ax, ay, az), _) ->
+        match mins(cs, ax, ay, az) do
+          (x0, y0, z0) ->
+            let tag = fn c -> match c do (x, y, z) -> ((x - x0) / 128) + 1000 * (((y - y0) / 128) + 1000 * ((z - z0) / 128)) end
+            let tagged = List.sort_by(List.map(cs, fn c -> (tag(c), c)), fn (a, b) -> match (a, b) do ((ta, _), (tb, _)) -> ta <= tb end)
+            group(tagged, -1, Nil, Nil)
+        end
+    end
+  end
+  pfn group(ts : List((Int, (Int, Int, Int))), cur : Int, run : List((Int, Int, Int)), acc : List(List((Int, Int, Int)))) : List(List((Int, Int, Int))) do
+    match ts do
+      Nil -> reverse(if List.is_empty(run) do acc else Cons(reverse(run), acc) end)
+      Cons((t, c), rest) ->
+        if t == cur do group(rest, cur, Cons(c, run), acc)
+        else group(rest, t, Cons(c, Nil), if List.is_empty(run) do acc else Cons(reverse(run), acc) end) end
+    end
+  end
+  pfn cell_box(cs : List((Int, Int, Int))) : (Int, Int, Int, Int, Int, Int) do
+    match cs do
+      Nil -> (0, 0, 0, 0, 0, 0)
+      Cons((x, y, z), _) -> List.fold_left(cs, (x, y, z, x, y, z), fn (b, c) -> grow_box(b, c))
+    end
+  end
+  pfn grow_box(b : (Int, Int, Int, Int, Int, Int), c : (Int, Int, Int)) : (Int, Int, Int, Int, Int, Int) do
+    match (b, c) do
+      ((x0, y0, z0, x1, y1, z1), (x, y, z)) -> (if x < x0 do x else x0 end, if y < y0 do y else y0 end, if z < z0 do z else z0 end, if x > x1 do x else x1 end, if y > y1 do y else y1 end, if z > z1 do z else z1 end)
+    end
+  end
+  -- the cells a loose part leaves as air: its own, and a plant standing on any of them
+  pfn leaving(r : Strata.Blocks.Registry, w : Strata.World.World, cs : List((Int, Int, Int))) : List((Int, Int, Int, Int)) do
+    List.fold_left(cs, Nil, fn (acc, c) -> leave_one(r, w, acc, c))
+  end
+  pfn leave_one(r : Strata.Blocks.Registry, w : Strata.World.World, acc : List((Int, Int, Int, Int)), c : (Int, Int, Int)) : List((Int, Int, Int, Int)) do
+    match c do
+      (x, y, z) ->
+        let above = Strata.World.get_block(w, x, y + 1, z)
+        let acc2 = Cons((x, y, z, 0), acc)
+        if above != 0 && !Strata.Blocks.collides(r, above) && !Strata.Blocks.is_fluid(r, above) do Cons((x, y + 1, z, 0), acc2) else acc2 end
+    end
+  end
+
+  -- the step's first part: what the edits handed to it left without support becomes bodies, at rest where it was
+  pfn support_stage(p : Physics, w : Strata.World.World) : (Physics, Strata.World.World, List((Int, Int, Int, Int))) do
+    let p0 = { p with events: Nil, loosed: Nil }
+    if !c_support(p.cfg) || List.is_empty(p.wakes) do (p0, w, Nil)
+    else
+      let scale = c_scale(p.cfg)
+      let l = Strata.Support.loose(p.reg, w, p.wakes, c_anchor(p.cfg), scale)
+      let parts = List.fold_left(Strata.Support.pieces(l), Nil, fn (acc, pc) -> List.append(acc, split128(pc)))
+      let p1 = List.fold_left(parts, { p0 with fills: p.fills + Strata.Support.capped(l) }, fn (q, cells) -> loose_body(q, w, cells, scale))
+      let removals = List.fold_left(p1.loosed, Nil, fn (acc, e) -> match e do (_, _, rs, _) -> List.append(acc, rs) end)
+      if List.is_empty(removals) do (p1, w, Nil)
+      else
+        let o = Strata.Edit.set_many(w, removals)
+        -- bodies resting on what left wake, as they would for any edit
+        ({ p1 with wakes: List.append(p1.wakes, Strata.Edit.changes(o)) }, Strata.Edit.world(o), removals)
+      end
+    end
+  end
+  pfn loose_body(p : Physics, w : Strata.World.World, cells : List((Int, Int, Int)), scale : Float) : Physics do
+    match Bg.from_world(w, cells) do
+      (g, x0, y0, z0) ->
+        match add(p, g, int_to_float(x0) *. scale, int_to_float(y0) *. scale, int_to_float(z0) *. scale, Qt.identity(), dynamic()) do
+          (p2, id) ->
+            match cell_box(cells) do
+              (bx0, by0, bz0, bx1, by1, bz1) ->
+                let entry = (id, (bx0 - 1, by0 - 1, bz0 - 1, bx1 + 1, by1 + 1, bz1 + 1), leaving(p.reg, w, cells), p.wakes)
+                let ev = PhEvent(2, id, -1, (int_to_float(bx0 + bx1) /. 2.0 +. 0.5) *. scale, (int_to_float(by0 + by1) /. 2.0 +. 0.5) *. scale, (int_to_float(bz0 + bz1) /. 2.0 +. 0.5) *. scale, int_to_float(List.length(cells)))
+                { p2 with loosed: List.append(p2.loosed, Cons(entry, Nil)), events: List.append(p2.events, Cons(ev, Nil)) }
+            end
+        end
     end
   end
 
   doc "One step of 1/60 s (the config's rate) against world [w], as it stands. [focus] orders the work when it is capped: bodies nearest it move first, and past the total cap the bodies farthest from it become blocks. Returns the bodies after the step and the edit physics made to the world."
   fn step_world(p : Physics, w : Strata.World.World, focus : List((Float, Float, Float))) : (Physics, Strata.Edit.Outcome) do
+    match support_stage(p, w) do
+      (ps, ws, removals) -> dyn_step(ps, ws, focus, w, removals)
+    end
+  end
+
+  pfn dyn_step(p : Physics, w : Strata.World.World, focus : List((Float, Float, Float)), w0 : Strata.World.World, removals : List((Int, Int, Int, Int))) : (Physics, Strata.Edit.Outcome) do
     let scale = c_scale(p.cfg)
     let dt0 = c_dt(p.cfg)
     let g = c_gravity(p.cfg)
@@ -811,8 +910,8 @@ mod Strata.Physics do
     let waiting = List.drop(cand, c_awake(p.cfg))
     let bs1 = merge(bs0, List.map(by_id(waiting), fn b -> { b with waited: b.waited + 1 }), Nil)
     let n = List.length(mv)
-    let p1 = { p with steps: p.steps + 1, pushes: Nil, wakes: Nil, events: Nil, waiting: List.length(waiting), touches: Nil }
-    if n == 0 do finish_step({ p1 with bodies: driven_seen(bs1) }, w, focus)
+    let p1 = { p with steps: p.steps + 1, pushes: Nil, wakes: Nil, waiting: List.length(waiting), touches: Nil }
+    if n == 0 do finish_step({ p1 with bodies: driven_seen(bs1) }, w, focus, w0, removals)
     else
       let nsub = substeps(mv, dt0, g, scale, 1)
       let dt = dt0 /. int_to_float(nsub)
@@ -841,7 +940,7 @@ mod Strata.Physics do
           -- a wall that took more than half a metre a second's worth of its own momentum wakes
           let woke = woken_statics(statics, push, n, Nil)
           let changed = by_id(List.append(moved, woke))
-          finish_step({ p1 with bodies: driven_seen(merge(bs1, changed, Nil)), events: evs, touches: tch }, w, focus)
+          finish_step({ p1 with bodies: driven_seen(merge(bs1, changed, Nil)), events: List.append(p1.events, evs), touches: tch }, w, focus, w0, removals)
       end
     end
   end
@@ -1278,14 +1377,32 @@ mod Strata.Physics do
     end
   end
 
+  pfn undone(undo : List((Int, Int, Int, Int)), c : (Int, Int, Int, Int)) : Bool do
+    match c do (x, y, z, _) -> List.any(undo, fn u -> match u do (a, b, d, _) -> a == x && b == y && d == z end) end
+  end
+  pfn deferred_event(e : (Int, (Int, Int, Int, Int, Int, Int), List((Int, Int, Int, Int)), List(Strata.Edit.Change)), scale : Float) : PhysEvent do
+    match e do
+      (id, (x0, y0, z0, x1, y1, z1), rs, _) -> PhEvent(4, id, -1, (int_to_float(x0 + x1) /. 2.0 +. 0.5) *. scale, (int_to_float(y0 + y1) /. 2.0 +. 0.5) *. scale, (int_to_float(z0 + z1) /. 2.0 +. 0.5) *. scale, int_to_float(List.length(rs)))
+    end
+  end
+
   doc "Wait for the step [j] and take its result. What the step did to the world is applied to [w], the world as it stands now. A step is never dropped."
   fn finish_world(j : Stepping, p : Physics, w : Strata.World.World) : (Physics, Strata.Edit.Outcome) do
     match j do
       PhJob(t) ->
         match task_await(t) do
           Ok((r, o)) ->
-            let p2 = { p with bodies: reconcile(r.bodies, p.bodies, Nil), steps: r.steps, events: r.events, waiting: r.waiting, over: r.over, touches: r.touches, meshes: List.append(p.meshes, r.meshes) }
-            with_outcome(p2, Strata.Edit.set_many(w, as_cells(Strata.Edit.changes(o), Nil)))
+            -- a loose piece whose cells, or their neighbours, an edit handed since begin changed is not applied: worked out again next step
+            let stale = List.filter(r.loosed, fn e -> match e do (_, bx, _, _) -> List.any(p.wakes, fn c -> touches(bx, c, 0)) end)
+            let gone = List.map(stale, fn e -> match e do (id, _, _, _) -> id end)
+            let undo = List.fold_left(stale, Nil, fn (acc, e) -> match e do (_, _, rs, _) -> List.append(acc, rs) end)
+            let again = List.fold_left(stale, Nil, fn (acc, e) -> match e do (_, _, _, cs) -> List.append(acc, cs) end)
+            let evs = List.map(stale, fn e -> deferred_event(e, c_scale(p.cfg)))
+            let kept = List.filter(reconcile(r.bodies, p.bodies, Nil), fn b -> !List.member(gone, b.id))
+            let cells = List.filter(as_cells(Strata.Edit.changes(o), Nil), fn c -> !undone(undo, c))
+            let p2 = { p with bodies: kept, steps: r.steps, events: List.append(r.events, evs), waiting: r.waiting, over: r.over, touches: r.touches, fills: r.fills,
+                              meshes: List.append(p.meshes, List.filter(r.meshes, fn m -> match m do (id, _, _) -> !List.member(gone, id) end)), wakes: List.append(p.wakes, again) }
+            with_outcome(p2, Strata.Edit.set_many(w, cells))
           Err(_) -> (p, Strata.Edit.set_many(w, Nil))
         end
     end
