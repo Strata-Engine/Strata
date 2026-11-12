@@ -499,6 +499,7 @@ static inline int an_spawn(AnWorld *w, int rig) {
 
 static inline void an_recount(AnWorld *w);
 static inline void an_attach_place(AnWorld *w, AnFig *f);
+static inline void an_place_chain(AnWorld *w, AnFig *f);
 static inline void an_unhang(AnFig *f) {   /* no longer attached; it keeps its placement */
     f->att = -1; f->att_socket = 0;
     memset(f->att_pos, 0, sizeof f->att_pos);
@@ -506,7 +507,8 @@ static inline void an_unhang(AnFig *f) {   /* no longer attached; it keeps its p
 }
 
 /* a removed figure's children are detached at its socket as it stands now
- * (whether or not a query posed them since the last update) */
+ * (the chain above re-placed from the top: whether or not a query posed any
+ * of them since the last update) */
 static inline void an_remove(AnWorld *w, int fig) {
     AnFig *f = an_fig(w, fig);
     if (!f) { an_refuse(w, AN_R_FIGURE); return; }
@@ -515,8 +517,7 @@ static inline void an_remove(AnWorld *w, int fig) {
         for (int s = 0; s < w->capacity; s++) {
             AnFig *c = &w->figs[s];
             if (c->id < 0 || c->att != slot) continue;
-            an_attach_place(w, c);
-            an_mark(w, c);
+            an_place_chain(w, c);
             an_unhang(c);
         }
         an_unhang(f);
@@ -1112,6 +1113,17 @@ static inline void an_attach_place(AnWorld *w, AnFig *f) {
     an_qmul(sq, f->att_q, f->q);
     an_qnorm(f->q);
 }
+/* f and every figure above it that hangs placed at its parent's socket from
+ * the top down, so f's placement is a function of the chain's state alone
+ * (not of which of them a query placed since the last update); each placed
+ * one is marked stale. An update re-places them all the same way. */
+static inline void an_place_chain(AnWorld *w, AnFig *f) {
+    AnFig *chain[AN_DEPTH + 2];
+    int n = 0;
+    for (AnFig *g = f; n < AN_DEPTH + 2; g = &w->figs[g->att]) { chain[n++] = g; if (g->att < 0) break; }
+    for (int i = n - 1; i >= 0; i--)
+        if (chain[i]->att >= 0) { an_attach_place(w, chain[i]); an_mark(w, chain[i]); }
+}
 /* every figure's depth (links above it), the deepest, and how many hang */
 static inline void an_recount(AnWorld *w) {
     w->nattached = 0; w->max_depth = 0;
@@ -1541,14 +1553,14 @@ static inline int an_attach(AnWorld *w, int child, int parent, int socket, const
     an_recount(w);
     return 1;
 }
-/* child no longer hangs; it is left at its parent's socket as the parent
- * stands now (whether or not a query posed it since the last update) */
+/* child no longer hangs; it is left at its parent's socket as the chain
+ * above it stands now, re-placed from the top (whether or not a query posed
+ * any of them since the last update) */
 static inline void an_detach(AnWorld *w, int child) {
     AnFig *c = an_fig(w, child);
     if (!c) { an_refuse(w, AN_R_FIGURE); return; }
     if (c->att < 0) return;
-    an_attach_place(w, c);
-    an_mark(w, c);
+    an_place_chain(w, c);
     an_unhang(c);
     an_recount(w);
 }

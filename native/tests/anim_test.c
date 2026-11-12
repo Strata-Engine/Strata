@@ -1253,7 +1253,8 @@ static void test_query_no_trace(void) {
     CHECK(query_script(0) == query_script(1), "posing stale figures for a query changes nothing the next update carries");
 }
 
-/* a parent moved after an update, then (or not) a query, then its child let go (mode 0 detach, 1 remove the parent) */
+/* f -> c -> g; f moved after an update, then (or not) a query, then a child let go:
+ * mode 0 detach c, 1 remove f, 2 detach g, 3 remove c (2 and 3: the parent itself hangs from a moved root) */
 static uint64_t letgo_script(int query, int mode) {
     AnWorld *w = an_open(4);
     int rig = chain(w, 0);
@@ -1269,7 +1270,10 @@ static uint64_t letgo_script(int query, int mode) {
     an_place(w, f, at, q90);
     if (query == 1) { AnHit h; float o[3] = {4, 1.5f, 5}, d[3] = {0, 0, -1}; an_hit_ray(w, o, d, 100, -1, &h); }
     if (query == 2) an_socket(w, c, s, pos, q);
-    if (mode == 0) an_detach(w, c); else an_remove(w, f);
+    if (mode == 0) an_detach(w, c);
+    else if (mode == 1) an_remove(w, f);
+    else if (mode == 2) an_detach(w, g);
+    else an_remove(w, c);
     an_update(w, 1.0f / 60);
     uint64_t hash = an_hash(w);
     an_close(w);
@@ -1279,6 +1283,9 @@ static void test_letgo_no_trace(void) {
     uint64_t d = letgo_script(0, 0), r = letgo_script(0, 1);
     CHECK(d == letgo_script(1, 0) && d == letgo_script(2, 0), "a hit or socket query before a detach leaves the next update's hash unchanged");
     CHECK(r == letgo_script(1, 1) && r == letgo_script(2, 1), "and before removing the parent");
+    uint64_t d2 = letgo_script(0, 2), r2 = letgo_script(0, 3);
+    CHECK(d2 == letgo_script(1, 2) && d2 == letgo_script(2, 2), "detaching a grandchild whose chain's root moved: no trace of a query");
+    CHECK(r2 == letgo_script(1, 3) && r2 == letgo_script(2, 3), "removing a parent that itself hangs from a moved root: no trace of a query");
     AnWorld *w = an_open(4);
     int rig = chain(w, 0);
     float sp[3] = {0, 0.5f, 0};

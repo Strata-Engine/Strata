@@ -16,7 +16,7 @@
  * box's pairs (an_x_hit_box answers how many there are, so a caller whose
  * array was short can ask again with a longer one). */
 /* Rewritten by stamp_anim.sh whenever strata_anim.h changes (GAPS S14). */
-#define STRATA_ANIM_STAMP "7d8e5b878f9e2bbf"
+#define STRATA_ANIM_STAMP "a6ae6b6ecf7c2942"
 #include <stdint.h>
 #include "strata_anim.h"
 
