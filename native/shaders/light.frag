@@ -5,7 +5,8 @@ layout(location = 0) in vec2 v_uv;
 layout(location = 0) out vec4 o_lit;
 layout(location = 1) out vec4 o_hist;
 layout(location = 2) out vec4 o_meta;
-// boxes (voxels, low and high corners) round bodies that moved this frame, then round traced figures that moved lately (strata_vk.c, fig_trace_prepare)
+// boxes (voxels, low and high corners) round bodies that moved this frame, then round traced figures that moved lately (strata_vk.c, fig_trace_prepare):
+// the low corner's w 1 for a figure's shadow box (the sun term alone), 0 for the rest (every term)
 layout(std430, set = 0, binding = 21) readonly buffer Movers { vec4 boxes[]; } movers;
 
 // A colour for a light class, for looking at the volume.
@@ -74,9 +75,13 @@ void main() {
     // An edit unsettles the pixels it can reach: those within 32 voxels of the chunks it changed.
     // So does a sun that has just moved, everywhere.
     bool settling = u.vol.w <= 2 || u.edit_lo.w > 0.5 && all(greaterThan(at, u.edit_lo.xyz - 32.0)) && all(lessThan(at, u.edit_hi.xyz + 32.0));
-    // so does a body or a traced figure moving near it: its own surface, its shadow, the sky light it blocks and the light it gives
-    for (int m = 0; m < u.bodies.x && m < 80; m++)
-        if (all(greaterThan(at, movers.boxes[2 * m].xyz)) && all(lessThan(at, movers.boxes[2 * m + 1].xyz))) settling = true;
+    // so does a body moving near it (its own surface, its shadow), or a glowing traced figure (the light it gives);
+    // a moving traced figure's shadow box (w 1) samples the sun alone every frame, the sky keeping its schedule and memory
+    bool shade_moves = false;
+    for (int m = 0; m < u.bodies.x && m < 144; m++)
+        if (all(greaterThan(at, movers.boxes[2 * m].xyz)) && all(lessThan(at, movers.boxes[2 * m + 1].xyz))) {
+            if (movers.boxes[2 * m].w > 0.5) shade_moves = true; else settling = true;
+        }
     // and a figure that moved since the last frame, on its own surface
     if (figure && (fcode & 64) != 0) settling = true;
     if (settling) kept = min(kept, 2.0);
@@ -85,14 +90,19 @@ void main() {
     int rays = mode >= 4 ? int(u.light.w) : 0;
     vec3 sky = rays > 0 ? old.rgb : sky_flat(n);
     float count = kept;
-    if (sample_now) {
+    if (sample_now || shade_moves) {
         float sun_now = sun_visible(at, n, sun_toward(rand2(px, frame, 0)));
         // while an edit settles, a pixel whose new sample contradicts its memory starts again
         if (settling && abs(old.a - sun_now) > 0.6) kept = 0.0;
+        // in a moving figure's shadow box the sun leans on 2 past samples, and none when the new one contradicts them
+        float ks = shade_moves ? min(kept, 2.0) : kept;
+        if (shade_moves && abs(old.a - sun_now) > 0.6) ks = 0.0;
         // shadows lean on 64 past samples at most, so they follow a moving sun; sky light on all of them, since a small bright thing is found by few rays
-        sun_vis = mix(old.a, sun_now, 1.0 / (min(kept, 64.0) + 1.0));
-        if (rays > 0) sky = mix(old.rgb, sky_light(at, n, px, frame, rays), 1.0 / (kept + 1.0));
-        count = kept + 1.0;
+        sun_vis = mix(old.a, sun_now, 1.0 / (min(ks, 64.0) + 1.0));
+        if (sample_now) {
+            if (rays > 0) sky = mix(old.rgb, sky_light(at, n, px, frame, rays), 1.0 / (kept + 1.0));
+            count = kept + 1.0;
+        }
     }
     o_hist = vec4(sky, sun_vis);
     o_meta = vec4(count, view_depth, float(face), 0.0);

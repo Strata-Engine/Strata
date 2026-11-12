@@ -94,7 +94,7 @@ void body_ray(uint bi, vec3 ro, vec3 rd, float tmax, bool stop_glass, uint pal, 
     if (dot(oc, oc) - tca * tca > sp.w * sp.w || tca + sp.w < 0.0 || tca - sp.w > lim) return;
     BodyRow b = body_table.rows[bi];
     float sc = b.pos.w > 0.0 ? b.pos.w : u.eye.w;     // metres a voxel of its grid
-    float k = b.pos.w > 0.0 ? sc / u.eye.w : 1.0;      // its voxel in world voxels: exactly 1 for a body (a GPU's x / x need not be)
+    float kv = b.pos.w > 0.0 ? sc / u.eye.w : 1.0;      // its voxel in world voxels: exactly 1 for a body (a GPU's x / x need not be)
     vec4 qi = vec4(-b.rot.xyz, b.rot.w);
     vec3 o = qrot(qi, ro * u.eye.w - b.pos.xyz) / sc;
     vec3 d = qrot(qi, rd);
@@ -105,7 +105,7 @@ void body_ray(uint bi, vec3 ro, vec3 rd, float tmax, bool stop_glass, uint pal, 
     vec3 tlo = min(ta, tb), thi = max(ta, tb);
     float tin = max(max(tlo.x, tlo.y), max(tlo.z, 0.0));
     float lim2 = min(tmax, best);
-    if (pal != 0u) lim2 /= k;
+    if (pal != 0u) lim2 /= kv;
     float tout = min(min(thi.x, thi.y), min(thi.z, lim2));
     if (tin >= tout) return;
     // a ray that starts on the body's own surface does not stop on it at once
@@ -123,7 +123,7 @@ void body_ray(uint bi, vec3 ro, vec3 rd, float tmax, bool stop_glass, uint pal, 
         if (c != 0u && t > 0.05) {
             if (pal != 0u || class_kind(c) == 1 || class_kind(c) == 2 || (class_kind(c) == 3 && stop_glass)) {
                 vec3 nl = vec3(0.0); nl[axis] = -float(stp[axis]);
-                best = pal != 0u ? t * k : t; bcls = pal != 0u ? pal | c : c; bface = nearest_face(qrot(b.rot, nl));
+                best = pal != 0u ? t * kv : t; bcls = pal != 0u ? pal | c : c; bface = nearest_face(qrot(b.rot, nl));
                 return;
             }
         }

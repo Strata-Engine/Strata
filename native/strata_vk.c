@@ -27,7 +27,7 @@
 /* Rewritten by build_shaders.sh whenever the shaders change: forge decides
  * whether to recompile this file from its text alone, not from the headers
  * it includes (GAPS S14). */
-#define STRATA_SHADERS_STAMP "411c82a171748379"
+#define STRATA_SHADERS_STAMP "b93a168dbfcadf55"
 #include "strata_shaders.h"
 #include "strata_spray.h"
 #include "strata_alloc.h"
@@ -1134,6 +1134,8 @@ __attribute__((weak)) void an_x_draw_sun(double x, double y, double z) { (void)x
 #define SV_TRACE_ROWS (SV_FIG_TRACED * (1 + SV_FIG_PARTS))   /* body table rows for them: a group row and its parts' */
 #define SV_FIG_SETTLE 8                   /* frames a traced figure's surroundings keep settling after it stops */
 #define SV_FIG_REACH 24.0f                /* metres along the ground a moving traced figure's shadow is followed for history */
+#define SV_FIG_BOXES (2 * SV_FIG_TRACED)  /* history boxes for traced figures: a shadow box and a glow box each */
+#define SV_GLOW_FLOOR 0.01f               /* light (linear, of a sun of about 1) below which a figure's glow is not followed for history */
 #define SV_TABLE_ROWS (SV_MAX_BODIES + SV_TRACE_ROWS)
 typedef struct { int32_t rp, next; uint32_t first, count; int32_t o[3]; float lo[3], hi[3]; } FigPiece;   /* lo, hi: what its quads cover, voxels of the piece */
 static struct {
@@ -1153,7 +1155,8 @@ static struct {
      * per part with a shape, appended to the body table by bodies_to_frame */
     struct FigShape { uint32_t first, nwords; int32_t dims[3]; int shaped; } *shape;   /* SV_FIG_RP */
     BodyRow *trows; int32_t tgroups, tparts;   /* SV_TRACE_ROWS: groups first, then parts (a group's dims.x counts from the first part row) */
-    float (*tmov)[8]; int32_t ntmov;      /* SV_FIG_TRACED: boxes (voxels) round traced figures that moved lately, their shadows and light included */
+    float (*tmov)[8]; int32_t ntmov;      /* SV_FIG_BOXES: boxes (voxels) round traced figures that moved lately: their shadows (w 1), their glow (w 0) */
+    float *glow;                          /* SV_FIG_RP: how far (metres) a part's glowing voxels light what is round them, past SV_GLOW_FLOOR; < 0 until worked out */
     int boxes_off;                        /* STRATA_FIG_BOXES=0: traced figures unsettle no history round them (to show what they prevent) */
     int64_t traced_figs, traced_parts, traced_over;
     struct FigGroup { int32_t rp, base, n; } *groups; int32_t ngroups;
@@ -1196,8 +1199,10 @@ static int fig_init(void) {
     fg.placed = calloc(SV_FIG_INST, 1);
     fg.shape = calloc(SV_FIG_RP, sizeof *fg.shape);
     fg.trows = calloc(SV_TRACE_ROWS, sizeof *fg.trows);
-    fg.tmov = calloc(SV_FIG_TRACED, sizeof *fg.tmov);
-    if (!fg.quiet || !fg.placed || !fg.shape || !fg.trows || !fg.tmov) return 0;
+    fg.tmov = calloc(SV_FIG_BOXES, sizeof *fg.tmov);
+    fg.glow = malloc(SV_FIG_RP * sizeof *fg.glow);
+    if (!fg.quiet || !fg.placed || !fg.shape || !fg.trows || !fg.tmov || !fg.glow) return 0;
+    for (int i = 0; i < SV_FIG_RP; i++) fg.glow[i] = -1.0f;
     if (!fg.pieces || !fg.head || !fg.anchor || !fg.sphere || !fg.count || !fg.base || !fg.touched || !fg.order || !fg.moving || !fg.groups || !fg.seen[0] || !fg.seen[1] || !fg.sgroups) return 0;
     for (int i = 0; i < SV_FIG_RP; i++) { fg.head[i] = -1; fg.anchor[i][3] = 1.0f; fg.sphere[i][3] = -1.0f; }
     fg.npieces = 0; fg.free_head = -1; fg.blend = 1.0f;
@@ -1214,7 +1219,7 @@ static void fig_free(void) {
     if (g.dev) { if (fg.pal) vkDestroyBuffer(g.dev, fg.pal, NULL); if (fg.pal_mem) vkFreeMemory(g.dev, fg.pal_mem, NULL); fig_shadow_free(); }
     free(fg.pieces); free(fg.head); free(fg.anchor); free(fg.sphere); free(fg.count); free(fg.base); free(fg.touched);
     free(fg.order); free(fg.moving); free(fg.groups); free(fg.seen[0]); free(fg.seen[1]); free(fg.sgroups);
-    free(fg.quiet); free(fg.placed); free(fg.shape); free(fg.trows); free(fg.tmov);
+    free(fg.quiet); free(fg.placed); free(fg.shape); free(fg.trows); free(fg.tmov); free(fg.glow);
     memset(&fg, 0, sizeof fg);
 }
 
@@ -1295,6 +1300,7 @@ int64_t sv_rig_palette(int64_t rig, void *floats) {
         e[i * 2] = unorm(c[0], 2047.0) | (unorm(c[1], 2047.0) << 11) | (unorm(c[2], 1023.0) << 22);
         e[i * 2 + 1] = unorm(c[3], 65535.0) | (unorm(c[4], 65535.0) << 16);
     }
+    if (fg.glow) for (int p = 0; p < SV_FIG_PARTS; p++) fg.glow[rig * SV_FIG_PARTS + p] = -1.0f;
     return 1;
 }
 /* Rig [rig]'s part [part] as the rays see it: one palette index a voxel (0
@@ -1314,7 +1320,28 @@ int64_t sv_rig_shape(int64_t rig, int64_t part, void *bytes, int64_t n, int64_t 
     memcpy(g.bbytes_map + first, bytes, (size_t)(sx * sy * sz));
     sh->first = first; sh->nwords = words; sh->dims[0] = (int32_t)sx; sh->dims[1] = (int32_t)sy; sh->dims[2] = (int32_t)sz;
     sh->shaped = 1;
+    fg.glow[rig * SV_FIG_PARTS + part] = -1.0f;
     return 1;
+}
+/* how far (metres) rig part rp's glowing voxels light their surroundings above
+ * SV_GLOW_FLOOR: n emitting voxels of the brightest emission e seen as a blob
+ * of n^(2/3) voxel faces, lighting a surface r away by about
+ * e x GLOW x area / (pi r^2); 0 when nothing in it glows */
+static float fig_glow(int32_t rp) {
+    if (fg.glow[rp] >= 0.0f) return fg.glow[rp];
+    const struct FigShape *sh = &fg.shape[rp];
+    const uint32_t *pal = fg.pal_map + (size_t)(rp / SV_FIG_PARTS) * 256 * 2;
+    const unsigned char *b = (const unsigned char *)(g.bbytes_map + sh->first);
+    uint32_t nv = (uint32_t)(sh->dims[0] * sh->dims[1] * sh->dims[2]), lit = 0;
+    float emax = 0.0f;
+    for (uint32_t i = 0; i < nv; i++) {
+        if (!b[i]) continue;
+        float e = (float)(pal[b[i] * 2 + 1] >> 16) / 65535.0f;
+        if (e > 0.0f) { lit++; if (e > emax) emax = e; }
+    }
+    float v = fg.anchor[rp][3], area = cbrtf((float)lit * (float)lit) * v * v;
+    fg.glow[rp] = lit ? sqrtf(emax * 5.0f * area / (3.14159265f * SV_GLOW_FLOOR)) : 0.0f;
+    return fg.glow[rp];
 }
 /* How far between its last two poses each figure is drawn (0..1), passed to
  * the draw list each frame. 1 until a game sets it: the last pose. */
@@ -1437,10 +1464,13 @@ static void fig_prepare(Frame *F) {
  * rotation, its size and first word, its voxel size in pos.w (a group row
  * has -1 there). Those parts are marked placed and left out of the shadow
  * map; a traced figure past the cap, or a part with no shape, stays plain.
- * A traced figure that moved in the last SV_FIG_SETTLE frames adds a box in
- * which the light pass's history settles: round the figure by 4 m, swept
- * away from the sun until its shadow's top has come down 2 m below its feet
- * (at most SV_FIG_REACH m along the ground). bodies_to_frame appends them. */
+ * A traced figure that moved in the last SV_FIG_SETTLE frames adds up to two
+ * boxes to the light pass's history: its shadow's footprint (its bounds and
+ * 0.5 m, swept away from the sun until its top has come down 2 m below its
+ * feet, at most SV_FIG_REACH m along the ground), where only the sun term
+ * samples every frame and lean on 2 past samples (w 1); and, if any of its
+ * parts glows, what that glow lights above SV_GLOW_FLOOR (fig_glow), where
+ * every term settles (w 0). bodies_to_frame appends them. */
 static void fig_trace_prepare(int n, const int32_t *rp, const float *xf, const int32_t *fl) {
     memset(fg.placed, 0, (size_t)n);
     if (!fig_rays_on()) return;
@@ -1456,6 +1486,7 @@ static void fig_trace_prepare(int n, const int32_t *rp, const float *xf, const i
         BodyRow *gr = &fg.trows[fg.tgroups];
         int32_t first = fg.tparts, rig = -1;
         float lo[3] = { 1e30f, 1e30f, 1e30f }, hi[3] = { -1e30f, -1e30f, -1e30f };
+        float glo[3] = { 1e30f, 1e30f, 1e30f }, ghi[3] = { -1e30f, -1e30f, -1e30f };   /* round its glowing parts, out to their glow's reach */
         for (int k = i; k < j; k++) {
             int32_t r = rp[k];
             if (r < 0 || r >= SV_FIG_RP || !fg.shape[r].shaped) continue;
@@ -1477,6 +1508,11 @@ static void fig_trace_prepare(int n, const int32_t *rp, const float *xf, const i
                 if (m + rad > hi[c]) hi[c] = m + rad;
             }
             pr->sphere[3] = rad / scale + 0.01f;
+            float gr2 = fig_glow(r);
+            if (gr2 > 0.0f) {
+                gr2 = fminf(gr2, 48.0f * scale) + rad;              /* a sky ray reaches 48 voxels */
+                for (int c = 0; c < 3; c++) { float m = pr->sphere[c] * scale; glo[c] = fminf(glo[c], m - gr2); ghi[c] = fmaxf(ghi[c], m + gr2); }
+            }
             rig = r / SV_FIG_PARTS;
             fg.placed[k] = 1;
             fg.tparts++;
@@ -1493,18 +1529,23 @@ static void fig_trace_prepare(int n, const int32_t *rp, const float *xf, const i
             fg.tgroups++;
             fg.traced_figs++;
             if (!fg.boxes_off && fg.quiet[i] < SV_FIG_SETTLE) {
-                float *m = fg.tmov[fg.ntmov++], sweep[3] = { 0.0f, 0.0f, 0.0f };
-                if (shadows) {
+                if (shadows) {   /* its shadow's footprint: its bounds and 0.5 m, swept away from the sun to 2 m under its feet: the sun term alone */
+                    float *m = fg.tmov[fg.ntmov++], sweep[3];
                     float s[3] = { sun[0] / sl, sun[1] / sl, sun[2] / sl }, flat = sqrtf(s[0] * s[0] + s[2] * s[2]);
                     float t = (hi[1] - lo[1] + 2.0f) / s[1];
                     if (flat * t > SV_FIG_REACH) t = SV_FIG_REACH / flat;
                     for (int k = 0; k < 3; k++) sweep[k] = -s[k] * t;
+                    for (int k = 0; k < 3; k++) {
+                        m[k] = (fminf(lo[k], lo[k] + sweep[k]) - 0.5f) / scale;
+                        m[4 + k] = (fmaxf(hi[k], hi[k] + sweep[k]) + 0.5f) / scale;
+                    }
+                    m[3] = 1.0f; m[7] = 0.0f;
                 }
-                for (int k = 0; k < 3; k++) {
-                    m[k] = (fminf(lo[k], lo[k] + sweep[k]) - 4.0f) / scale;
-                    m[4 + k] = (fmaxf(hi[k], hi[k] + sweep[k]) + 4.0f) / scale;
+                if (glo[0] <= ghi[0]) {   /* what its glow reaches: every term */
+                    float *m = fg.tmov[fg.ntmov++];
+                    for (int k = 0; k < 3; k++) { m[k] = glo[k] / scale; m[4 + k] = ghi[k] / scale; }
+                    m[3] = m[7] = 0.0f;
                 }
-                m[3] = m[7] = 0.0f;
             }
         }
         i = j;
@@ -1943,8 +1984,8 @@ int64_t sv_open(int64_t w, int64_t h, int64_t capture_mouse, int64_t quad_capaci
         F->bcells_map = map; memset(F->bcells_map, 0, (size_t)SV_MAX_CELLS * 8 + 16);
         if (!make_buffer((VkDeviceSize)SV_BODY_LIST * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &F->blist, &F->blist_mem, &map)) return 0;
         F->blist_map = map;
-        if (!make_buffer((VkDeviceSize)(SV_MOVERS + SV_FIG_TRACED) * 32, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &F->bmovers, &F->bmovers_mem, &map)) return 0;
-        F->bmovers_map = map; memset(F->bmovers_map, 0, (SV_MOVERS + SV_FIG_TRACED) * 32);
+        if (!make_buffer((VkDeviceSize)(SV_MOVERS + SV_FIG_BOXES) * 32, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &F->bmovers, &F->bmovers_mem, &map)) return 0;
+        F->bmovers_map = map; memset(F->bmovers_map, 0, (SV_MOVERS + SV_FIG_BOXES) * 32);
         F->pending = calloc(SV_MAX_SLOTS, sizeof *F->pending);
         F->is_pending = calloc(SV_MAX_SLOTS, 1);
         if (!F->pending || !F->is_pending) return 0;
