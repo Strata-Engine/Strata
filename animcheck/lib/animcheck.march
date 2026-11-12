@@ -4,11 +4,16 @@
 --   ANIMCHECK_SCENE=name ./animcheck
 --
 -- prints "scene name: ok", or the failure and exits 1. scripts/anim_check.sh
--- builds it and runs every scene. `table` prints the chain's matrices.
+-- builds it and runs every scene. `table` prints the chain's matrices;
+-- `stairs` is foot placement on a flight of steps; `hits` sockets,
+-- attachments and hit tests on a humanoid, then the hit ray timed in the
+-- arena; `arena` times the update over 512 figures with half the crowd out of
+-- view; `ground128` times foot placement for 128 figures over hills.
 mod Animcheck do
 
   needs IO
   needs IO.Process
+  needs IO.Clock
   needs IO.Foreign
   needs Anim
 
@@ -142,9 +147,9 @@ mod Animcheck do
     else
       match An.spawn_at(a, rig, int_to_float(i % 20) *. 2.0, 0.0, int_to_float(i / 20) *. 2.0, turn_y(int_to_float(i) *. 17.0)) do
         (a1, f) ->
-          let a2 = An.play(a1, f, 0, List.nth(cs, i % 3), 0.0, 0.5 +. int_to_float(i % 7) *. 0.1, 1.0, -1, false)
-          let a3 = if i % 5 == 0 do An.play(a2, f, 1, List.nth(cs, 3), 0.3, 1.0, 0.6, -1, true) else a2 end
-          let a4 = if i % 9 == 0 do An.blend(a3, f, 2, [List.nth(cs, 0), List.nth(cs, 2)], [0.0, 1.0], 0.3, 0.2, 0.8, 0) else a3 end
+          let a2 = An.play(a1, f, 0, unwrap_or(List.nth_opt(cs, i % 3), 0), 0.0, 0.5 +. int_to_float(i % 7) *. 0.1, 1.0, -1, false)
+          let a3 = if i % 5 == 0 do An.play(a2, f, 1, unwrap_or(List.nth_opt(cs, 3), 0), 0.3, 1.0, 0.6, -1, true) else a2 end
+          let a4 = if i % 9 == 0 do An.blend(a3, f, 2, [unwrap_or(List.nth_opt(cs, 0), 0), unwrap_or(List.nth_opt(cs, 2), 0)], [0.0, 1.0], 0.3, 0.2, 0.8, 0) else a3 end
           spawn_go(a4, rig, cs, i + 1, n)
       end
     end
@@ -153,7 +158,7 @@ mod Animcheck do
   pfn shake_go(a : Strata.Anim.Anim, cs : List(Int), i : Int, n : Int) : Strata.Anim.Anim do
     if i >= n do a
     else
-      let a1 = if i % 3 == 0 do An.play(a, i, 0, List.nth(cs, (i + 1) % 3), 0.25, 1.0, 1.0, -1, false) else a end
+      let a1 = if i % 3 == 0 do An.play(a, i, 0, unwrap_or(List.nth_opt(cs, (i + 1) % 3), 0), 0.25, 1.0, 1.0, -1, false) else a end
       let a2 = if i % 7 == 0 do An.place(a1, i, 1.0, 0.5, int_to_float(i) *. 0.1, turn_y(int_to_float(i))) else a1 end
       let a3 = if i % 9 == 0 do An.set_value(a2, i, 2, 0.9, 0.5) else a2 end
       shake_go(a3, cs, i + 1, n)
@@ -264,6 +269,547 @@ mod Animcheck do
     end
   end
 
+  -- ── stairs: foot placement ────────────────────────────────────────────────
+  -- A two-legged rig at voxel 0.1: a pelvis 1 m up, hips 0.15 m either side
+  -- along x, thigh and shin 0.5 m each, soles 0.05 m below the feet.
+  pfn biped() : Strata.Rig.Rig do
+    let r0 = Rg.colour(Rg.new(0.1), 1, 0.3, 0.3, 0.8, 0.5, 0.0)
+    match Rg.part(r0, -1, 0.0, 10.0, 0.0, 4, 2, 2) do
+      (r1, root) ->
+        match leg_parts(Rg.anchor(r1, root, 2.0, 0.0, 1.0), root, 0.5) do
+          (r2, lu, ll, lf) ->
+            match leg_parts(r2, root, 3.5) do
+              (r3, ru, rl, rf) -> Rg.leg(Rg.leg(r3, lu, ll, lf, 0.05), ru, rl, rf, 0.05)
+            end
+        end
+    end
+  end
+  -- a thigh at x (pelvis grid voxels), a shin and a foot under it
+  pfn leg_parts(r : Strata.Rig.Rig, root : Int, x : Float) : (Strata.Rig.Rig, Int, Int, Int) do
+    match Rg.part(r, root, x, 0.0, 1.0, 1, 5, 1) do
+      (r1, upper) ->
+        match Rg.part(Rg.anchor(r1, upper, 0.5, 5.0, 0.5), upper, 0.5, 0.0, 0.5, 1, 5, 1) do
+          (r2, lower) ->
+            match Rg.part(Rg.anchor(r2, lower, 0.5, 5.0, 0.5), lower, 0.5, 0.0, 0.5, 1, 1, 2) do
+              (r3, foot) -> (Rg.anchor(r3, foot, 0.5, 0.5, 0.5), upper, lower, foot)
+            end
+        end
+    end
+  end
+
+  pfn stairs_reg() : Strata.Blocks.Registry do
+    match Strata.Blocks.register(Strata.Blocks.empty(), Strata.Blocks.def()) do
+      Ok((r, _)) -> r
+      Err(_) -> Strata.Blocks.empty()
+    end
+  end
+  pfn load_go(w : Strata.World.World, i : Int) : Strata.World.World do
+    if i >= 8 do w
+    else load_go(Strata.World.insert(w, Strata.Coord.key(i % 2 - 1, (i / 2) % 2 - 1, i / 4 - 1), Strata.Chunk.uniform(0)), i + 1) end
+  end
+  pfn fill(w : Strata.World.World, x0 : Int, y0 : Int, z0 : Int, x1 : Int, y1 : Int, z1 : Int) : Strata.World.World do
+    Strata.Edit.world(Strata.Edit.fill_box(w, x0, y0, z0, x1, y1, z1, 1))
+  end
+  -- voxels of 0.05 m: the floor's top at 0, then steps 0.25 m high and 0.3 m deep rising along +x from x = 0
+  pfn stairs_world() : Strata.World.World do
+    let w0 = load_go(Strata.World.new(stairs_reg(), Strata.Terrain.gen(fn (k, seed) -> Strata.Chunk.uniform(0)), 1, 0.05), 0)
+    fill(fill(fill(w0, -32, -32, -32, 31, -1, 31), 0, 0, -32, 31, 4, 31), 6, 5, -32, 31, 9, 31)
+  end
+
+  -- the top of the stairs under x (metres): the floor, then a step 0.25 m high at x >= 0 and 0.5 m at x >= 0.3
+  pfn step_at(x : Float) : Float do if x < 0.0 do 0.0 else if x < 0.3 do 0.25 else 0.5 end end end
+  -- how far a foot's sole is below the step under it (negative: above)
+  pfn sunk(m : NativeF32Arr, foot : Int) : Float do step_at(NativeArray.get_f32(m, 12 * foot + 9)) -. (NativeArray.get_f32(m, 12 * foot + 10) -. 0.05) end
+  pfn most(a : Float, b : Float) : Float do if a > b do a else b end end
+
+  -- n updates of ground then update, the figure placed at x0 + dx k; the worst sinking of a sole and the largest move of the root in one update
+  pfn ground_go(a : Strata.Anim.Anim, f : Int, w : Strata.World.World, k : Int, n : Int, x0 : Float, dx : Float, worst : Float, jump : Float, root : Float) : (Strata.Anim.Anim, Float, Float, Float) do
+    if k >= n do (a, worst, jump, root)
+    else
+      let a1 = An.update(An.ground(An.place(a, f, x0 +. dx *. int_to_float(k), 0.32, 0.0, Qt.identity()), f, w, 1.0), 1.0 /. 60.0)
+      let m = An.matrices(a1, f)
+      let r = NativeArray.get_f32(m, 10)
+      ground_go(a1, f, w, k + 1, n, x0, dx, most(worst, most(sunk(m, 3), sunk(m, 6))), most(jump, Math.abs(r -. root)), r)
+    end
+  end
+
+  -- stairs: walking in place with the left foot on the floor and the right on the first step, then carried 0.3 m up the stairs so each foot climbs a step; after 30 updates each sole is within 0.02 m of its step, no sole is ever more than 0.02 m below its step, and the root never moves more than 0.04 m in an update
+  pfn stairs_scene() : Int do
+    let r = biped()
+    let walk = Cl.swing(Cl.swing(Cl.swing(Cl.swing(Cl.new(r, 1.0, true), 1, 1.0, 0.0, 0.0, 20.0, 1.0, 0.0), 4, 1.0, 0.0, 0.0, 20.0, 1.0, 0.5), 2, 1.0, 0.0, 0.0, 10.0, 1.0, 0.25), 5, 1.0, 0.0, 0.0, 10.0, 1.0, 0.75)
+    let w = stairs_world()
+    match An.finish_rig(An.open(4), r) do
+      (a1, rig) ->
+        match An.finish_clip(a1, walk) do
+          (a2, clip) ->
+            match An.spawn_at(a2, rig, 0.0, 0.32, 0.0, Qt.identity()) do
+              (a3, f) ->
+                match ground_go(An.play(a3, f, 0, clip, 0.0, 1.0, 1.0, -1, false), f, w, 0, 30, 0.0, 0.0, -1.0, 0.0, 1.32) do
+                  (a4, worst1, jump1, root1) ->
+                    let m = An.matrices(a4, f)
+                    let left = NativeArray.get_f32(m, 12 * 3 + 10) -. 0.05
+                    let right = NativeArray.get_f32(m, 12 * 6 + 10) -. 0.05
+                    println("  left sole " ++ float_to_string(left) ++ ", right sole " ++ float_to_string(right) ++ ", pelvis " ++ float_to_string(root1))
+                    match ground_go(a4, f, w, 0, 30, 0.005, 0.01, worst1, jump1, root1) do
+                      (a5, worst, jump, _) ->
+                        let m5 = An.matrices(a5, f)
+                        println("  climbed: left sole " ++ float_to_string(NativeArray.get_f32(m5, 12 * 3 + 10) -. 0.05) ++ ", right sole " ++ float_to_string(NativeArray.get_f32(m5, 12 * 6 + 10) -. 0.05) ++ "; worst sinking " ++ float_to_string(worst) ++ ", largest root move " ++ float_to_string(jump))
+                        let bad = check(rig >= 0 && clip >= 0, "the rig and the walk are accepted")
+                          + check(near(left, 0.0, 0.02), "the left sole on the floor (0 m)")
+                          + check(near(right, 0.25, 0.02), "the right sole on the first step (0.25 m)")
+                          + check(root1 < 1.32 -. 0.1, "the root lowered for the longer leg")
+                          + check(worst <= 0.02, "no sole more than 0.02 m below its step at any update")
+                          + check(jump <= 0.04, "the root never moves more than 0.04 m in one update")
+                          + check(near(sunk(m5, 3), 0.0, 0.02) && near(sunk(m5, 6), 0.0, 0.02), "after the climb each sole is on its new step")
+                          + check(finite_go(m5, 0), "finite")
+                          + check(An.stat(a5, 3) == 0.0, "nothing refused")
+                        report("stairs", bad + check(An.capacity(An.close(a5)) == 0, "closed"))
+                    end
+                end
+            end
+        end
+    end
+  end
+
+
+  -- ── hits: sockets, attachments and hit tests ──────────────────────────────
+  -- A humanoid at voxel 0.1: a pelvis 0.9 m up, a torso, a head (colour 3,
+  -- its front middle voxel 4), arms with a hand socket on the right, legs.
+  pfn humanoid() : (Strata.Rig.Rig, Int, Int, Int) do
+    let r0 = Rg.colour(Rg.colour(Rg.colour(Rg.colour(Rg.new(0.1), 1, 0.3, 0.3, 0.8, 0.5, 0.0), 2, 0.8, 0.6, 0.4, 0.5, 0.0), 3, 0.9, 0.7, 0.6, 0.5, 0.0), 4, 0.1, 0.1, 0.1, 0.5, 0.0)
+    match Rg.part(r0, -1, 0.0, 9.0, 0.0, 4, 2, 2) do
+      (r1, pelvis) ->
+        match Rg.part(Rg.box(Rg.anchor(r1, pelvis, 2.0, 0.0, 1.0), pelvis, 0, 0, 0, 3, 1, 1, 1), pelvis, 2.0, 2.0, 1.0, 4, 5, 2) do
+          (r2, torso) ->
+            match Rg.part(Rg.box(Rg.anchor(r2, torso, 2.0, 0.0, 1.0), torso, 0, 0, 0, 3, 4, 1, 1), torso, 2.0, 5.0, 1.0, 3, 3, 3) do
+              (r3, head) ->
+                let r4 = Rg.voxel(Rg.box(Rg.anchor(r3, head, 1.5, 0.0, 1.5), head, 0, 0, 0, 2, 2, 2, 3), head, 1, 1, 2, 4)
+                match limb(r4, torso, -0.5, 5.0, 1.0, 5) do
+                  (r5, _) ->
+                    match limb(r5, torso, 4.5, 5.0, 1.0, 5) do
+                      (r6, right_arm) ->
+                        match Rg.socket(r6, right_arm, 0.5, 0.0, 0.5, Qt.identity()) do
+                          (r7, hand) ->
+                            match limb(r7, pelvis, 1.0, 0.0, 1.0, 9) do
+                              (r8, _) -> match limb(r8, pelvis, 3.0, 0.0, 1.0, 9) do (r9, _) -> (r9, torso, head, hand) end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+  end
+  -- a limb of [len] voxels hanging from (x, y, z) in its parent's grid, colour 2
+  pfn limb(r : Strata.Rig.Rig, parent : Int, x : Float, y : Float, z : Float, len : Int) : (Strata.Rig.Rig, Int) do
+    match Rg.part(r, parent, x, y, z, 1, len, 1) do
+      (r1, p) -> (Rg.box(Rg.anchor(r1, p, 0.5, int_to_float(len), 0.5), p, 0, 0, 0, 0, len - 1, 0, 2), p)
+    end
+  end
+  -- a sword: one blade 0.8 m long, colour 5, its grip at the bottom
+  pfn sword() : Strata.Rig.Rig do
+    match Rg.part(Rg.colour(Rg.new(0.1), 5, 0.7, 0.7, 0.75, 0.2, 0.0), -1, 0.0, 0.0, 0.0, 1, 8, 1) do
+      (r, blade) -> Rg.box(Rg.anchor(r, blade, 0.5, 0.0, 0.5), blade, 0, 0, 0, 0, 7, 0, 5)
+    end
+  end
+
+  pfn hit_is(h : Option(Strata.Anim.FigureHit), f : Int, part : Int, colour : Int) : Bool do
+    match h do
+      Some(x) -> x.fig == f && x.part == part && x.colour == colour
+      None -> false
+    end
+  end
+  pfn hit_dist(h : Option(Strata.Anim.FigureHit)) : Float do
+    match h do
+      Some(x) -> x.dist
+      None -> -1.0
+    end
+  end
+  pfn hit_voxel(h : Option(Strata.Anim.FigureHit)) : (Int, Int, Int) do
+    match h do
+      Some(x) -> (x.x, x.y, x.z)
+      None -> (-1, -1, -1)
+    end
+  end
+  pfn hit_normal(h : Option(Strata.Anim.FigureHit)) : (Float, Float, Float) do
+    match h do
+      Some(x) -> x.normal
+      None -> (0.0, 0.0, 0.0)
+    end
+  end
+  pfn normal_near(n : (Float, Float, Float), x : Float, y : Float, z : Float) : Bool do
+    match n do (a, b, c) -> near(a, x, 0.0001) && near(b, y, 0.0001) && near(c, z, 0.0001) end
+  end
+  pfn socket_at(s : Option((Float, Float, Float, Strata.Math.Quat.Quat)), x : Float, y : Float, z : Float) : Bool do
+    match s do
+      Some((sx, sy, sz, _)) -> near(sx, x, 0.0001) && near(sy, y, 0.0001) && near(sz, z, 0.0001)
+      None -> false
+    end
+  end
+  pfn has_pair(ps : List((Int, Int)), f : Int, part : Int) : Bool do List.any(ps, fn p -> p == (f, part)) end
+
+  -- hits: a ray through the head reports the head part and the struck voxel's colour; a ray at the chest the torso;
+  -- the hand socket is where the rig puts it; a sword hangs from it; ignoring the man skips him and the sword he carries;
+  -- a box at the head finds the head
+  pfn hits_scene() : Int do
+    match humanoid() do
+      (r, torso, head, hand) ->
+        match An.finish_rig(An.open(8), r) do
+          (a1, rig) ->
+            match An.finish_rig(a1, sword()) do
+              (a2, srig) ->
+                match An.spawn_at(a2, rig, 0.0, 0.0, 0.0, Qt.identity()) do
+                  (a3, man) ->
+                    match An.spawn_at(a3, srig, 5.0, 0.0, 0.0, Qt.identity()) do
+                      (a4, blade) ->
+                        let a5 = An.update(a4, 1.0 /. 60.0)
+                        let face = An.hit_ray(a5, 0.0, 1.75, 3.0, 0.0, 0.0, -1.0, 10.0, -1)
+                        let chest = An.hit_ray(a5, 0.0, 1.3, 3.0, 0.0, 0.0, -2.0, 10.0, -1)
+                        let none = An.hit_ray(a5, 0.0, 1.75, 3.0, 0.0, 0.0, -1.0, 10.0, man)
+                        let grip = An.socket(a5, man, hand)
+                        let a6 = An.update(An.attach(a5, blade, man, hand, 0.0, 0.0, 0.0, Qt.from_axis_angle(1.0, 0.0, 0.0, Math.pi())), 1.0 /. 60.0)
+                        let cut = An.hit_ray(a6, 0.25, 0.7, 3.0, 0.0, 0.0, -1.0, 10.0, -1)
+                        let skip = An.hit_ray(a6, 0.25, 0.7, 3.0, 0.0, 0.0, -1.0, 10.0, man)
+                        let pairs = An.hit_box(a6, 0.0, 1.75, 0.0, 0.05, 0.05, 0.05, Qt.identity(), -1)
+                        println("  face " ++ float_to_string(hit_dist(face)) ++ " m, chest " ++ float_to_string(hit_dist(chest)) ++ " m, sword " ++ float_to_string(hit_dist(cut)) ++ " m; box pairs " ++ int_to_string(List.length(pairs)))
+                        let bad = check(rig >= 0 && srig >= 0, "the humanoid and the sword are accepted")
+                          + check(hit_is(face, man, head, 4), "a ray through the head reports the head and the face voxel's colour (4)")
+                          + check(hit_voxel(face) == (1, 1, 2), "the struck voxel is the head's (1, 1, 2)")
+                          + check(near(hit_dist(face), 2.85, 0.0001), "2.85 m away")
+                          + check(normal_near(hit_normal(face), 0.0, 0.0, 1.0), "on its +z face")
+                          + check(hit_is(chest, man, torso, 1), "a ray at the chest reports the torso (colour 1)")
+                          + check(Option.is_none(none), "ignoring the man, the ray misses")
+                          + check(socket_at(grip, 0.25, 1.1, 0.0), "the hand socket at (0.25, 1.1, 0)")
+                          + check(hit_is(cut, blade, 0, 5), "the sword hangs from the hand, blade down")
+                          + check(Option.is_none(skip), "ignoring the man skips the sword he carries")
+                          + check(has_pair(pairs, man, head) && !has_pair(pairs, man, torso), "a box at the head finds the head, not the torso")
+                          + check(An.stat(a6, 3) == 0.0, "nothing refused")
+                        let a7 = An.update(An.remove(a6, man), 1.0 /. 60.0)
+                        let kept = An.hit_ray(a7, 0.25, 0.7, 3.0, 0.0, 0.0, -1.0, 10.0, -1)
+                        let bad2 = bad + check(hit_is(kept, blade, 0, 5), "the man removed, the sword stays where it was") + check(Option.is_none(An.socket(a7, man, hand)), "a socket on a removed figure answers none") + check(An.capacity(An.close(a7)) == 0, "closed")
+                        report("hits", bad2 + ray_timing())
+                    end
+                end
+            end
+        end
+    end
+  end
+
+  -- ── arena: 512 figures of a 15-part humanoid, measured headless ──────────
+  -- Voxels of 1/16 m. Parts in order: 0 pelvis (0.94 m up), 1 spine, 2 head,
+  -- 3-5 left upper arm, forearm, hand, 6-8 the right, 9-11 left thigh, shin,
+  -- foot, 12-14 the right. Legs for `ground`; mask 0 is the right arm.
+  pfn arena_rig() : Strata.Rig.Rig do
+    let r0 = Rg.colour(Rg.colour(Rg.colour(Rg.new(0.0625), 1, 0.3, 0.3, 0.8, 0.5, 0.0), 2, 0.8, 0.6, 0.4, 0.5, 0.0), 3, 0.9, 0.7, 0.6, 0.5, 0.0)
+    match Rg.part(r0, -1, 0.0, 15.0, 0.0, 6, 3, 4) do
+      (r1, pelvis) ->
+        match Rg.part(Rg.box(Rg.anchor(r1, pelvis, 3.0, 0.0, 2.0), pelvis, 0, 0, 0, 5, 2, 3, 1), pelvis, 3.0, 3.0, 2.0, 7, 8, 4) do
+          (r2, spine) ->
+            match Rg.part(Rg.box(Rg.anchor(r2, spine, 3.5, 0.0, 2.0), spine, 0, 0, 0, 6, 7, 3, 1), spine, 3.5, 8.0, 2.0, 4, 4, 4) do
+              (r3, head) ->
+                let r4 = Rg.box(Rg.anchor(r3, head, 2.0, 0.0, 2.0), head, 0, 0, 0, 3, 3, 3, 3)
+                let r5 = arena_limb3(arena_limb3(r4, spine, -0.5, 8.0, 2.0, 5, 2), spine, 7.5, 8.0, 2.0, 5, 2)
+                match arena_leg(r5, pelvis, 1.5) do
+                  (r6, lu, ll, lf) ->
+                    match arena_leg(r6, pelvis, 4.5) do
+                      (r7, ru, rl, rf) -> Tuple.first(Rg.mask(Rg.leg(Rg.leg(r7, lu, ll, lf, 0.0625), ru, rl, rf, 0.0625), [6]))
+                    end
+                end
+            end
+        end
+    end
+  end
+  -- an arm hanging from (x, y, z) in its parent's grid: upper and lower of [len] voxels, then a hand of 2
+  pfn arena_limb3(r : Strata.Rig.Rig, parent : Int, x : Float, y : Float, z : Float, len : Int, colour : Int) : Strata.Rig.Rig do
+    let l = int_to_float(len)
+    match Rg.part(r, parent, x, y, z, 2, len, 2) do
+      (r1, u) ->
+        match Rg.part(Rg.box(Rg.anchor(r1, u, 1.0, l, 1.0), u, 0, 0, 0, 1, len - 1, 1, colour), u, 1.0, 0.0, 1.0, 2, len, 2) do
+          (r2, lo) ->
+            match Rg.part(Rg.box(Rg.anchor(r2, lo, 1.0, l, 1.0), lo, 0, 0, 0, 1, len - 1, 1, colour), lo, 1.0, 0.0, 1.0, 2, 2, 2) do
+              (r3, h) -> Rg.box(Rg.anchor(r3, h, 1.0, 2.0, 1.0), h, 0, 0, 0, 1, 1, 1, 3)
+            end
+        end
+    end
+  end
+  -- a leg from x in the pelvis grid: thigh and shin of 7 voxels, a foot 4 long reaching forward, its sole 1 voxel down
+  pfn arena_leg(r : Strata.Rig.Rig, pelvis : Int, x : Float) : (Strata.Rig.Rig, Int, Int, Int) do
+    match Rg.part(r, pelvis, x, 0.0, 2.0, 2, 7, 2) do
+      (r1, u) ->
+        match Rg.part(Rg.box(Rg.anchor(r1, u, 1.0, 7.0, 1.0), u, 0, 0, 0, 1, 6, 1, 2), u, 1.0, 0.0, 1.0, 2, 7, 2) do
+          (r2, lo) ->
+            match Rg.part(Rg.box(Rg.anchor(r2, lo, 1.0, 7.0, 1.0), lo, 0, 0, 0, 1, 6, 1, 2), lo, 1.0, 0.0, 1.0, 2, 1, 4) do
+              (r3, f) -> (Rg.box(Rg.anchor(r3, f, 1.0, 1.0, 1.0), f, 0, 0, 0, 1, 0, 3, 1), u, lo, f)
+            end
+        end
+    end
+  end
+
+  -- three clips: a walk (thighs, shins and arms swinging, a mark at each step), a wave of the right arm (played under mask 0), an additive breath
+  pfn arena_clips(a : Strata.Anim.Anim, r : Strata.Rig.Rig) : (Strata.Anim.Anim, (Int, Int, Int)) do
+    let w0 = Cl.swing(Cl.swing(Cl.swing(Cl.swing(Cl.new(r, 1.0, true), 9, 1.0, 0.0, 0.0, 25.0, 1.0, 0.0), 12, 1.0, 0.0, 0.0, 25.0, 1.0, 0.5), 10, 1.0, 0.0, 0.0, 15.0, 1.0, 0.25), 13, 1.0, 0.0, 0.0, 15.0, 1.0, 0.75)
+    let walk = Cl.mark(Cl.mark(Cl.swing(Cl.swing(w0, 3, 1.0, 0.0, 0.0, 20.0, 1.0, 0.5), 6, 1.0, 0.0, 0.0, 20.0, 1.0, 0.0), 0.0, 1), 0.5, 2)
+    let wave = Cl.swing(Cl.swing(Cl.new(r, 2.0, true), 6, 0.0, 0.0, 1.0, 60.0, 2.0, 0.0), 7, 0.0, 0.0, 1.0, 30.0, 2.0, 0.25)
+    let breathe = Cl.swing(Cl.new(r, 3.0, true), 1, 1.0, 0.0, 0.0, 4.0, 3.0, 0.0)
+    match An.finish_clip(a, walk) do
+      (a1, c1) ->
+        match An.finish_clip(a1, wave) do
+          (a2, c2) -> match An.finish_clip(a2, breathe) do (a3, c3) -> (a3, (c1, c2, c3)) end
+        end
+    end
+  end
+
+  pfn arena_pos(i : Int) : (Float, Float) do (int_to_float(i % 32) *. 2.0, int_to_float(i / 32) *. 2.0) end
+  pfn arena_rate(i : Int) : Float do 0.8 +. int_to_float(i % 5) *. 0.1 end
+
+  -- n figures in a 32-wide grid 2 m apart, each walking (layer 0), waving its right arm (layer 1, mask 0) and breathing (layer 2, additive)
+  pfn arena_spawn(a : Strata.Anim.Anim, rig : Int, cs : (Int, Int, Int), i : Int, n : Int) : Strata.Anim.Anim do
+    if i >= n do a
+    else
+      match (arena_pos(i), cs) do
+        ((x, z), (walk, wave, breathe)) ->
+          match An.spawn_at(a, rig, x, 0.0, z, Qt.identity()) do
+            (a1, f) ->
+              let a2 = An.play(a1, f, 0, walk, 0.0, arena_rate(i), 1.0, -1, false)
+              let a3 = An.play(a2, f, 1, wave, 0.0, 1.0, 0.6, 0, false)
+              arena_spawn(An.play(a3, f, 2, breathe, 0.0, 1.0, 1.0, -1, true), rig, cs, i + 1, n)
+          end
+      end
+    end
+  end
+
+  -- at time t: every figure's head and spine aim at a point swinging in front of it; each foot reaches for a target stepping under its hip
+  pfn arena_drive(a : Strata.Anim.Anim, t : Float, i : Int, n : Int) : Strata.Anim.Anim do
+    if i >= n do a
+    else
+      match arena_pos(i) do
+        (x, z) ->
+          let s = Math.sin(t *. 6.2832 *. arena_rate(i))
+          let a1 = An.aim(a, i, 0, [1, 2], 0.0, 0.0, 1.0, x +. 3.0 *. Math.sin(t +. int_to_float(i)), 1.6, z +. 5.0, 30.0, 1.0)
+          let a2 = An.reach(a1, i, 0, 9, 10, 11, x -. 0.094, 0.0625 +. 0.05 *. most(0.0, s), z +. 0.15 *. s, x -. 0.094, 0.5, z +. 1.0, 1.0)
+          let a3 = An.reach(a2, i, 1, 12, 13, 14, x +. 0.094, 0.0625 +. 0.05 *. most(0.0, 0.0 -. s), z -. 0.15 *. s, x +. 0.094, 0.5, z +. 1.0, 1.0)
+          arena_drive(a3, t, i + 1, n)
+      end
+    end
+  end
+
+  -- the view: from (32, 2, -10) looking down +z, the sides at 0.56 across a metre ahead, so about half the 64 x 32 m crowd lies outside
+  pfn arena_planes() : NativeF32Arr do
+    let t = 0.56
+    NativeArray.from_list_f32([1.0, 0.0, t, 10.0 *. t -. 32.0, -1.0, 0.0, t, 32.0 +. 10.0 *. t, 0.0, 0.0, 1.0, 9.5, 0.0, 0.0, -1.0, 990.0, 0.0, 1.0, 0.0, 1000.0, 0.0, -1.0, 0.0, 1000.0])
+  end
+
+  -- the arena world: 512 figures driven and updated; None if the rig or a clip is refused
+  pfn arena_world() : Option(Strata.Anim.Anim) do
+    let r = arena_rig()
+    match An.finish_rig(An.open(512), r) do
+      (a1, rig) ->
+        match arena_clips(a1, r) do
+          (a2, (walk, wave, breathe)) ->
+            if rig < 0 || walk < 0 || wave < 0 || breathe < 0 || Rg.part_count(r) != 15 do None
+            else Some(An.view(arena_spawn(a2, rig, (walk, wave, breathe), 0, 512), arena_planes(), 32.0, 2.0, -10.0, 0.0)) end
+        end
+    end
+  end
+
+  -- updates k..n-1 at 1/60, driving each first; (world, figures skipped summed, marks summed)
+  pfn arena_run(a : Strata.Anim.Anim, k : Int, n : Int, skipped : Int, marks : Int) : (Strata.Anim.Anim, Int, Int) do
+    if k >= n do (a, skipped, marks)
+    else
+      let a1 = An.update(arena_drive(a, int_to_float(k) /. 60.0, 0, 512), 1.0 /. 60.0)
+      arena_run(a1, k + 1, n, skipped + float_to_int(An.stat(a1, 11)), marks + List.length(An.marks(a1)))
+    end
+  end
+
+  pfn ms(seconds : Float) : String do float_to_string(Math.round(seconds *. 1000000.0) /. 1000.0) ++ " ms" end
+  pfn us(seconds : Float) : String do float_to_string(Math.round(seconds *. 10000000.0) /. 10.0) ++ " us" end
+
+  -- arena: 10 s of updates at 1/60 with half the crowd outside the view, the mean and worst Strata.Anim.update
+  -- (C, timed in the shim); then 2 s with no view, for comparison. Checks: every update skips some
+  -- out-of-view figures, marks fire, nothing is refused, and with no view nothing is skipped
+  pfn arena_scene() : Int do
+    match arena_world() do
+      None -> report("arena", fail("  the arena rig or a clip was refused"))
+      Some(a0) ->
+        match arena_run(a0, 0, 60, 0, 0) do
+          (a1, _, _) ->
+            Strata.Ffi.Anim.timing_reset()
+            match arena_run(a1, 60, 660, 0, 0) do
+              (a2, skipped, marks) ->
+                let mean = Strata.Ffi.Anim.timing(2) /. Strata.Ffi.Anim.timing(3)
+                let worst = Strata.Ffi.Anim.timing(1)
+                let n = float_to_int(Strata.Ffi.Anim.timing(3))
+                Strata.Ffi.Anim.timing_reset()
+                match arena_run(An.view(a2, NativeArray.make_f32(0, 0.0), 0.0, 0.0, 0.0, 0.0), 660, 780, 0, 0) do
+                  (a3, skipped_all, _) ->
+                    let mean_all = Strata.Ffi.Anim.timing(2) /. Strata.Ffi.Anim.timing(3)
+                    let worst_all = Strata.Ffi.Anim.timing(1)
+                    println("  arena, half out of view: update mean " ++ ms(mean) ++ ", worst " ++ ms(worst) ++ " over " ++ int_to_string(n) ++ " updates; " ++ int_to_string(skipped / 600) ++ " of 512 figures skipped an update on average; " ++ int_to_string(marks) ++ " marks")
+                    println("  arena, no view: update mean " ++ ms(mean_all) ++ ", worst " ++ ms(worst_all) ++ " over 120 updates")
+                    let bad = check(n == 600, "600 updates timed")
+                      + check(skipped / 600 > 100 && skipped / 600 < 300, "about three in four of the out-of-view half skip each update")
+                      + check(marks > 1000, "marks fire")
+                      + check(skipped_all == 0, "with no view every figure is posed")
+                      + check(finite_go(An.matrices(a3, 300), 0), "finite")
+                      + check(An.stat(a3, 3) == 0.0, "nothing refused")
+                    report("arena", bad + check(An.capacity(An.close(a3)) == 0, "closed"))
+                end
+            end
+        end
+    end
+  end
+
+  -- ── ground128: foot placement for 128 figures over hills ─────────────────
+  -- voxels of 0.25 m; the ground's top over column (x, z), in voxels above y = 0
+  pfn hill(x : Int, z : Int) : Int do 8 + float_to_int(Math.round(2.0 *. Math.sin(int_to_float(x) *. 0.18) +. 1.5 *. Math.cos(int_to_float(z) *. 0.13))) end
+  pfn hill_cols(a : NativeI32Arr, cx : Int, cz : Int, c : Int) : NativeI32Arr do
+    if c >= 1024 do a
+    else
+      let x = c % 32
+      let z = c / 32
+      hill_cols(hill_fill(a, x, z, 0, hill(cx * 32 + x, cz * 32 + z)), cx, cz, c + 1)
+    end
+  end
+  pfn hill_fill(a : NativeI32Arr, x : Int, z : Int, y : Int, top : Int) : NativeI32Arr do
+    if y >= top || y >= 32 do a else hill_fill(NativeArray.set_i32(a, x + 32 * (z + 32 * y), 1), x, z, y + 1, top) end
+  end
+  pfn hill_chunk(cx : Int, cy : Int, cz : Int) : Strata.Chunk.Chunk do
+    if cy < 0 do Strata.Chunk.uniform(1)
+    else if cy > 0 do Strata.Chunk.uniform(0)
+    else Strata.Chunk.from_flat(hill_cols(NativeArray.make_i32(32768, 0), cx, cz, 0)) end end
+  end
+  pfn hills_load(w : Strata.World.World, i : Int) : Strata.World.World do
+    if i >= 72 do w
+    else
+      let cx = i % 6 - 1
+      let cz = (i / 6) % 4 - 1
+      let cy = i / 24 - 1
+      hills_load(Strata.World.insert(w, Strata.Coord.key(cx, cy, cz), hill_chunk(cx, cy, cz)), i + 1)
+    end
+  end
+  pfn hills_world() : Strata.World.World do
+    hills_load(Strata.World.new(stairs_reg(), Strata.Terrain.gen(fn (k, seed) -> Strata.Chunk.uniform(0)), 1, 0.25), 0)
+  end
+  -- the ground's top in metres under (x, z) metres
+  pfn hill_top(x : Float, z : Float) : Float do int_to_float(hill(float_to_int(Math.floor(x /. 0.25)), float_to_int(Math.floor(z /. 0.25)))) *. 0.25 end
+
+  pfn hill_pos(i : Int) : (Float, Float) do (int_to_float(i % 16) *. 2.0 +. 0.5, int_to_float(i / 16) *. 2.0 +. 0.5) end
+  pfn hill_spawn(a : Strata.Anim.Anim, rig : Int, walk : Int, i : Int, n : Int) : Strata.Anim.Anim do
+    if i >= n do a
+    else
+      match hill_pos(i) do
+        (x, z) ->
+          match An.spawn_at(a, rig, x, hill_top(x, z), z, Qt.identity()) do
+            (a1, f) -> hill_spawn(An.play(a1, f, 0, walk, 0.0, arena_rate(i), 1.0, -1, false), rig, walk, i + 1, n)
+          end
+      end
+    end
+  end
+  pfn ground_all(a : Strata.Anim.Anim, w : Strata.World.World, i : Int, n : Int) : Strata.Anim.Anim do
+    if i >= n do a else ground_all(An.ground(a, i, w, 1.0), w, i + 1, n) end
+  end
+  pfn hill_frames(a : Strata.Anim.Anim, w : Strata.World.World, k : Int, n : Int) : Strata.Anim.Anim do
+    if k >= n do a else hill_frames(An.update(ground_all(a, w, 0, 128), 1.0 /. 60.0), w, k + 1, n) end
+  end
+  -- the feet's rays alone: Strata.Anim.ground_targets for each figure, from its feet's animated origins
+  pfn targets_all(a : Strata.Anim.Anim, r : Strata.Rig.Rig, w : Strata.World.World, i : Int, n : Int, got : Int) : Int do
+    if i >= n do got
+    else
+      let feet = [unwrap_or(An.animated_origin(a, i, 11), (0.0, 0.0, 0.0)), unwrap_or(An.animated_origin(a, i, 14), (0.0, 0.0, 0.0))]
+      match An.ground_targets(r, feet, w) do
+        (ts, _) -> targets_all(a, r, w, i + 1, n, got + List.length(List.filter(ts, fn t -> Option.is_some(t))))
+      end
+    end
+  end
+  pfn targets_frames(a : Strata.Anim.Anim, r : Strata.Rig.Rig, w : Strata.World.World, k : Int, n : Int, got : Int) : Int do
+    if k >= n do got else targets_frames(a, r, w, k + 1, n, got + targets_all(a, r, w, 0, 128, 0)) end
+  end
+
+  -- how many of the 128 figures have both soles within 0.03 m of the ground's top under them
+  pfn soles_go(a : Strata.Anim.Anim, i : Int, n : Int, ok : Int) : Int do
+    if i >= n do ok
+    else
+      let m = An.matrices(a, i)
+      let sole = fn (p : Int) -> Math.abs(NativeArray.get_f32(m, 12 * p + 10) -. 0.0625 -. hill_top(NativeArray.get_f32(m, 12 * p + 9), NativeArray.get_f32(m, 12 * p + 11)))
+      soles_go(a, i + 1, n, if sole(11) <= 0.03 && sole(14) <= 0.03 do ok + 1 else ok end)
+    end
+  end
+
+  -- ground128: Strata.Anim.ground for 128 walking figures over hills, each frame, then the update; the
+  -- time of the 128 ground calls a frame (wall clock less the updates' C time), over 120 frames
+  pfn ground128_scene() : Int do
+    let r = arena_rig()
+    let w = hills_world()
+    match An.finish_rig(An.open(128), r) do
+      (a1, rig) ->
+        match arena_clips(a1, r) do
+          (a2, (walk, _, _)) ->
+            let a3 = hill_frames(hill_spawn(a2, rig, walk, 0, 128), w, 0, 10)
+            Strata.Ffi.Anim.timing_reset()
+            let t0 = unix_time_ms()
+            let a4 = hill_frames(a3, w, 0, 120)
+            let wall = int_to_float(unix_time_ms() - t0) /. 1000.0
+            let grounds = (wall -. Strata.Ffi.Anim.timing(2)) /. 120.0
+            let stood = soles_go(a4, 0, 128, 0)
+            let t1 = unix_time_ms()
+            let found = targets_frames(a4, r, w, 0, 120, 0)
+            let rays = int_to_float(unix_time_ms() - t1) /. 1000.0 /. 120.0
+            println("  ground128: Strata.Anim.ground for 128 figures " ++ ms(grounds) ++ " a frame (wall " ++ ms(wall /. 120.0) ++ " a frame less the update's " ++ ms(Strata.Ffi.Anim.timing(2) /. 120.0) ++ "); " ++ int_to_string(stood) ++ " of 128 with both soles on the ground")
+            println("  of which the feet's origins and 256 rays (ground_targets) " ++ ms(rays) ++ " a frame, " ++ int_to_string(found / 120) ++ " of 256 finding ground")
+            let bad = check(rig >= 0 && walk >= 0, "the rig and the walk are accepted")
+              + check(stood >= 115, "nine in ten figures stand with both soles on the hills")
+              + check(An.stat(a4, 3) == 0.0, "nothing refused")
+            report("ground128", bad + check(An.capacity(An.close(a4)) == 0, "closed"))
+        end
+    end
+  end
+
+  -- ── the hit ray, timed in the arena ──────────────────────────────────────
+  pfn lcg(s : Int) : Int do (s * 1103515245 + 12345) % 2147483648 end
+  -- n rays from a point in front of the crowd (0.2 to 2.6 m up) toward a figure (0 to 2 m up), up to 100 m:
+  -- most strike the first figure in the way, some pass between or over; (seed, hits)
+  pfn rays_go(a : Strata.Anim.Anim, s : Int, k : Int, n : Int, hits : Int) : (Int, Int) do
+    if k >= n do (s, hits)
+    else
+      let s1 = lcg(s)
+      let s2 = lcg(s1)
+      let s3 = lcg(s2)
+      match arena_pos((s1 / 16) % 512) do
+        (tx, tz) ->
+          let ox = int_to_float((s2 / 16) % 6400) /. 100.0
+          let oy = 0.2 +. int_to_float((s3 / 16) % 240) /. 100.0
+          let ty = int_to_float((s3 / 4096) % 200) /. 100.0
+          let h = An.hit_ray(a, ox, oy, -6.0, tx -. ox, ty -. oy, tz +. 6.0, 100.0, -1)
+          rays_go(a, s3, k + 1, n, if Option.is_some(h) do hits + 1 else hits end)
+      end
+    end
+  end
+  -- 10 000 rays after an update of the arena: the first poses the out-of-view figures that update skipped
+  pfn ray_timing() : Int do
+    match arena_world() do
+      None -> fail("  the arena was refused")
+      Some(a0) ->
+        match arena_run(a0, 0, 60, 0, 0) do
+          (a1, _, _) ->
+            let stale = float_to_int(An.stat(a1, 2))
+            Strata.Ffi.Anim.timing_reset()
+            match rays_go(a1, 7, 0, 1, 0) do
+              (s1, h1) ->
+                let first = Strata.Ffi.Anim.timing(4)
+                let t0 = unix_time_ms()
+                match rays_go(a1, s1, 1, 10000, h1) do
+                  (_, hits) ->
+                    let wall = int_to_float(unix_time_ms() - t0) /. 1000.0
+                    let all = Strata.Ffi.Anim.timing(4)
+                    let rays = Strata.Ffi.Anim.timing(5)
+                    println("  hit ray in the arena: mean " ++ us(all /. rays) ++ " over " ++ int_to_string(float_to_int(rays)) ++ " rays (C), " ++ us((all -. first) /. (rays -. 1.0)) ++ " without the first, which posed " ++ int_to_string(stale) ++ " stale figures in " ++ us(first) ++ "; through Strata.Anim " ++ us(wall /. 9999.0) ++ " a ray; " ++ int_to_string(hits) ++ " hits")
+                    check(float_to_int(rays) == 10000, "10 000 rays timed") + check(hits > 3000, "many rays hit a figure") + check(stale > 100, "the update left the out-of-view figures stale") + check(An.capacity(An.close(a1)) == 0, "the arena closed")
+                end
+            end
+        end
+    end
+  end
+
   fn main(_cap : Cap(IO)) : Unit do
     let name = Env.get("ANIMCHECK_SCENE", "")
     if name == "chain" do process_exit(chain_scene())
@@ -272,9 +818,13 @@ mod Animcheck do
     else if name == "marks" do process_exit(marks_scene())
     else if name == "mask" do process_exit(mask_scene())
     else if name == "empty" do process_exit(empty_scene())
+    else if name == "stairs" do process_exit(stairs_scene())
+    else if name == "hits" do process_exit(hits_scene())
+    else if name == "arena" do process_exit(arena_scene())
+    else if name == "ground128" do process_exit(ground128_scene())
     else
-      println("animcheck: no scene named '" ++ name ++ "' (chain, table, determinism, marks, mask, empty)")
+      println("animcheck: no scene named '" ++ name ++ "' (chain, table, determinism, marks, mask, empty, stairs, hits, arena, ground128)")
       process_exit(2)
-    end end end end end end
+    end end end end end end end end end end
   end
 end

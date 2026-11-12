@@ -512,6 +512,183 @@ power within 0.65 dB. A source behind sounds duller than one in front by
 10.4 dB in the 4 to 8 kHz octave, against 1 to 4 dB from the spherical-head
 model used before.
 
+Headphones use filters from a computed spherical head (Woodworth's delay,
+Brown and Duda's shadow, a pinna notch that rises with elevation, a lift in
+front and a dulling behind), diffuse-field equalised. Measured ears (MIT's
+KEMAR set) would place sound more convincingly; fetching them waits for the
+owner's yes.
+
+# Light and water together
+
+A pass over how the two behave side by side, after both were built. Scenes
+were made to show each question, looked at, and the faults fixed.
+
+| question | found | done |
+|---|---|---|
+| Does partly full water reflect? | No. Its mirror ray began inside its own voxel, which the light volume holds as full, and stopped there: flat blue instead of a reflection. | Fixed: a mirror ray leaving water passes see-through voxels in the water's own layer and the one above. Golden `water-reflects`. |
+| Does a draining surface stay even under light? | No. Cells dropped by up to six eighths in a step and showed as pits with walls. Two causes: a cell evening out could give to four far cells at once, and water under water poured all it had into a shallower neighbour. | Fixed: a cell gives away two eighths a step at most while evening out; water under water pours half the difference into a neighbour that holds some. Tests first. |
+| Does moving water unsettle the light around it? | Yes: each fluid step was treated as an edit, so nearby pixels never settled and sampled four times as often. | Fixed: only a change in what blocks or emits light is an edit. Water does neither. |
+| Is spray lit sensibly in shade? | No: it took the sun's full light anywhere. | Fixed: a particle takes the sun only where one ray reaches it, and less sky under a roof. Golden `splash-shaded`. |
+| Is a tilted water surface lit as tilted? | No, it is lit as level. | Left: per-cell tilts of an eighth would show as facets. |
+| Do light rays see partly full water as full blocks? | Yes. | Left: water does not block the sun or sky rays; only reflections OF water in other mirrors are affected. |
+| The light and dark patches on a lake at a low sun | The rim's and the trees' shadows on the lake bed, seen through the water. | Correct as it is. Golden `lake-low-sun`. |
+
+What moving water costs the lighting now, offscreen at 2560 x 1600:
+
+| view | GPU, water at rest | GPU, lake draining | before this pass, the difference |
+|---|---|---|---|
+| over the lake | 7.8 ms | 8.5 ms | 2.5 ms |
+| the valley below | 6.8 ms | 7.1 ms | 4.9 ms |
+
+Beside a running stream, two consecutive frames differ by more than 4 in
+0.16% of pixels, and those are the water itself.
+
+The even surface has a price: the test lake now takes about 8 minutes to
+drain, up from 5.5, with 2.9% left. The 2 minute target was already missed.
+
+Not judged: the soak's frame-time limit. The machine's load average was 54
+during this pass (other work), and the soak was as slow with spray off as
+with it on. Its other checks pass. The last quiet soak, before this pass,
+had a worst frame of 18.8 ms.
+
+Not checked: stillness of lit water at rest, because water ripples by
+design; whether many overlapping spray particles, each tracing two rays,
+cost too much in a large waterfall.
+
+# In the water
+
+Swimming and an underwater look, on branch `swim`.
+
+- `Strata.Fluid.depth_in`, `flow` and `surface` answer what a game needs to
+  move a body in water. The viewer's body floats, swims up, climbs out at a
+  bank, is slower in water and is carried by a current.
+- `Strata.Render.set_underwater` shows the world through the liquid: fog in
+  its colour, less light with depth, sun ripples, the surface from below,
+  a swaying view.
+- Three new golden scenes: `under-sea`, `under-sea-up`, `under-lake`.
+
+Measured at 2560 x 1600 on a loaded machine (load average 46), so the
+numbers are rough.
+
+| view | GPU ms |
+|---|---|
+| under the sea, looking across | 3.1 |
+| under the sea, looking up | 0.4 |
+| the shore from above, for comparison | 7.0 |
+
+Not done: bubbles, drifting specks, sound, a water line across the screen
+when the eye sits exactly at the surface. The current was tested on a body
+in a test world, not judged by playing.
+
+![Under the sea](docs/underwater-sea.png)
+![Looking up](docs/underwater-up.png)
+![On the lake bed](docs/underwater-lake.png)
+
+# Interface and text
+
+Branch `interface`. Plan `docs/2026-11-11-ui-text-plan.md`, rulings in
+`docs/ui-ledger.md`. Measured on an M3 Max while another session was also
+building and testing, so times are rough.
+
+| | target | measured | |
+|---|---|---|---|
+| GPU time for the viewer's display, 2560 x 1600 | 0.2 ms | 0.03 ms | met |
+| CPU time, 200 rectangles and ten lines (about 520 glyph quads), unchanged text | 0.2 ms | 0.09 ms | met |
+| the same with every line changing each frame | none set | 0.11 ms | measured before HarfBuzz; not repeated after |
+| draw calls added | 1 | 1 | met |
+| rasterising in a frame | 1 ms | 1.0 to 1.08 ms | met within a glyph's overshoot |
+| a glyph's first use | | about 45 microseconds | |
+| text edge | sharp from 8 to 200 px, still | sharp on the sheet; frames 58 and 59 identical | met; 8 and 10 px are unhinted and soft |
+| glyph atlas memory | 16 MB | 4 MB after the soak; 16 MB is the ceiling | met |
+
+- The six-script sheet (121 glyphs) is complete after 6 frames.
+- Soak, 3000 frames with the display on: nothing dropped, no glyph waiting,
+  worst frame 9.5, 30.1 and 12.4 ms in three runs (limit 20) on a loaded
+  machine.
+- FreeType's own distance-field renderer took 2 to 4 ms a glyph; the field
+  is worked out in `strata_text.c` from FreeType's coverage instead.
+- Text over 80 pixels uses a second, finer picture of each glyph: nine
+  times the atlas room, for corners that stay sharp.
+
+After the review (one independent reviewer, whole branch), fixed with a test
+each:
+
+- A frame makes no more new glyph pixels than the renderer uploads in a
+  frame, so a glyph is never drawn before its pixels are on the GPU.
+- The glyph table forgets evicted glyphs when it fills, so new glyphs are
+  still drawn after tens of thousands have come and gone.
+- Text written into a display no longer shows through in another display
+  built from the same starting one.
+- Loading a font again, or setting the same fallback list, no longer
+  forgets every remembered layout.
+- The soak's "no glyph waiting" check reads the frame that just ended; it
+  could not fail before.
+- A glyph that finds no room is tried about once a second, not every frame.
+
+Not done: the comparison against macOS's own text rendering; a test of the
+upload path on the GPU; wrapping right-to-left text is checked by a probe,
+not by the suite.
+
+After the review fixes the soak's worst frame was 54.2 and 49.0 ms in two
+runs, with a load average of 40 from another session building on the same
+machine (mean 8 to 11 ms). The frame-time limit is not judged: rerun
+`scripts/soak.sh` on a quiet machine. Every other soak check passed.
+
+# Animation plan
+
+## Task 5: cost control and two poses, measured headless
+
+`scripts/anim_check.sh` runs the scenes. `arena` runs 512 figures of a
+15-part humanoid with 3 layers, an aim on the spine and head, and both legs
+reaching for moving targets, at 1/60 s updates for 10 s. About half the
+crowd is outside the view. `ground128` runs `Strata.Anim.ground` for 128
+figures over hills. `hits` adds 10 000 rays in the arena after 60 updates.
+Update and ray times come from the monotonic clock in the C shim (C only).
+The ground time is March's millisecond clock over 120 frames, less the
+updates' C time.
+
+Load averages were 75-79 during the three runs below (31-48 in earlier runs),
+from other sessions building on the same machine. That is well over 8, so **no
+timing here is judged**. Each number is the range over three runs at 20:55.
+Rerun `ANIMCHECK_SCENE=arena|ground128|hits
+animcheck/.march/build/release/animcheck` on a quiet machine to judge them.
+
+| | target | measured | |
+|---|---|---|---|
+| `Strata.Anim.update`, arena, half out of view (C) | 1.0 ms | mean 0.86-0.95 ms; worst 24.8-38.5 ms (load) | not judged; mean under the target |
+| `Strata.Anim.ground`, 128 figures, 2 legs (March) | 0.5 ms | 0.94-1.28 ms a frame | not judged; above the target |
+| hit ray, arena, mean of 10 000 (C) | 10 µs | 0.5-0.6 µs (0.6-0.7 µs through `Strata.Anim`) | not judged; far under the target |
+
+- **Update.** With no view the same arena takes a mean of 1.07-1.50 ms.
+  About 182 of the 512 figures skip each update: the half out of view, three
+  updates in four. The worst update is load: the no-view worst was 1.19 ms in
+  the quietest run, and 21-38 ms in the others.
+- **The first query after an update** poses every figure that update skipped
+  (185 here), in 0.40-0.41 ms (0.81-0.88 ms at load 30). That keeps answers
+  independent of the camera. The cost is that a game asking one ray each
+  update gets the posing back in that query; only frames that ask nothing
+  save it.
+- **Ground.** `ground_targets` alone (the feet's animated origins and 256 rays
+  through `Strata.Query.raycast`) takes 0.60-0.68 ms a frame, more than the
+  whole target. The rest of `ground` (the knees' origins, the facing, the rig
+  lookup, the reach and drop calls) adds about 0.35-0.6 ms. The cause is
+  March's per-ray and per-call cost, measured, not chased. The design's
+  fallbacks are, in order, one ray per leg every other frame, then fewer
+  figures. 121 of the 128 figures stand with both soles within 0.03 m of the
+  hills.
+- **Rays.** These rays run from 0.2-2.6 m up in front of the crowd toward a
+  figure 0-2 m up, and 9 562 of 10 000 hit. Most stop at the first figure in
+  their way, which is why they are cheap.
+- **Memory** at 4 096 figures (sizeof, decimal MB), rigs excluded: 46.34 MB,
+  leaving 1.66 MB under 48 MB.
+  - Figures 7.90 (AnFig 1 928 B), matrices 12.58, previous matrices 12.58.
+  - Keys 5.51, clips 2.21, rigs 0.87, masks 0.07, marks 0.26, events 1.31.
+  - Ids 0.05, procedural pool 1.70, hit grid 0.38, draw list 0.92 (16 384
+    parts).
+  - Counting the rig data too (sockets 0.26, part grids 2.51) gives 49.11 MB.
+- **Drawing.** A figure posed every few updates is drawn with its blend
+  stretched over that period, one period behind its pose (review fix I1).
+
 # Entities
 
 Measured on the same M3 Max, release builds, headless (`entcheck`). The

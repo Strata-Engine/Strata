@@ -5,6 +5,8 @@ layout(location = 0) in vec2 v_uv;
 layout(location = 0) out vec4 o_lit;
 layout(location = 1) out vec4 o_hist;
 layout(location = 2) out vec4 o_meta;
+// boxes (voxels, low and high corners) round bodies that moved this frame
+layout(std430, set = 0, binding = 21) readonly buffer Movers { vec4 boxes[]; } movers;
 
 // A colour for a light class, for looking at the volume.
 vec3 class_tint(uint c) {
@@ -18,7 +20,8 @@ void main() {
     float depth = texture(gb_depth, v_uv).r;
     int mode = int(u.light.x);
     if (depth >= 1.0) {                                               // nothing drawn here: sky
-        o_lit = vec4(mode >= 1 && mode < 9 ? sky_color(normalize(world_at(v_uv, 1.0) - u.eye.xyz)) : u.sky.rgb, 1.0);
+        // under water there is no sky to see, only water
+        o_lit = vec4(mode >= 1 && mode < 9 ? (submerged() ? water_haze() : sky_color(normalize(world_at(v_uv, 1.0) - u.eye.xyz))) : u.sky.rgb, 1.0);
         return;
     }
     vec3 albedo = texture(gb_albedo, v_uv).rgb;
@@ -38,7 +41,11 @@ void main() {
     }
     if (mode == 0) { o_lit = vec4(shade_flat(albedo, n, nm.a, world), 1.0); return; }
     float ndl = max(dot(n, u.sun.xyz), 0.0);
-    if (mode == 1) { o_lit = vec4(fogged(albedo * (u.sun_color.rgb * ndl + sky_flat(n)), world), 1.0); return; }
+    // What is under the surface the eye is under gets less light the deeper it lies, and the sun's ripples.
+    bool wet = submerged() && world.y < u.water2.x;
+    vec3 dim = wet ? depth_light(world.y) : vec3(1.0);
+    float ripple = wet ? caustics(world) : 1.0;
+    if (mode == 1) { o_lit = vec4(fogged(albedo * (u.sun_color.rgb * ndl * dim * ripple + sky_flat(n) * dim), world), 1.0); return; }
 
     // What the same surface point had last frame, if it was on screen and is
     // the same surface: same face, same distance from that frame's eye.
@@ -63,6 +70,9 @@ void main() {
     // An edit unsettles the pixels it can reach: those within 32 voxels of the chunks it changed.
     // So does a sun that has just moved, everywhere.
     bool settling = u.vol.w <= 2 || u.edit_lo.w > 0.5 && all(greaterThan(at, u.edit_lo.xyz - 32.0)) && all(lessThan(at, u.edit_hi.xyz + 32.0));
+    // so does a body moving near it: its own surface, and its shadow
+    for (int m = 0; m < u.bodies.x && m < 16; m++)
+        if (all(greaterThan(at, movers.boxes[2 * m].xyz)) && all(lessThan(at, movers.boxes[2 * m + 1].xyz))) settling = true;
     if (settling) kept = min(kept, 2.0);
     bool sample_now = kept < 4.0 || settling || (((px.x >> 3) & 1) + 2 * ((px.y >> 3) & 1)) == (frame & 3);
     float sun_vis = old.a;
@@ -84,7 +94,7 @@ void main() {
     // the pixel's light class: flat quads carry it; models and plants do not, and are looked up
     uint cls = uint(nm.b * 255.0 + 0.5);
     if (cls == 0u) cls = class_at(at - n * 0.01);
-    vec3 col = albedo * (u.sun_color.rgb * ndl * sun_vis + sky);
+    vec3 col = albedo * (u.sun_color.rgb * ndl * sun_vis * dim * ripple + sky * dim);
     if (mode >= 4) col += albedo * class_emission(cls) * GLOW;
     if (mode >= 3) {
         // the sun's highlight on anything not fully rough; a mirror ray for what is smooth
@@ -92,7 +102,7 @@ void main() {
         vec3 toward_eye = normalize(u.eye.xyz - world);
         if (rough < 0.25 && u.sun_color.w > 0.5) {
             float share = mirror_share(n, toward_eye, 0.12) * (1.0 - rough);
-            col = mix(col, reflected(at + n * 0.02, mirror_dir(toward_eye, n, n)), share);
+            col = mix(col, reflected(at + n * 0.02, mirror_dir(toward_eye, n, n), -1000000), share);
         }
         col += sun_highlight(n, toward_eye, rough, sun_vis);
     }

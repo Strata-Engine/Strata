@@ -192,13 +192,33 @@ to its `Qq`s). Workaround: `Strata.Rig` and `Strata.Clip` keep rotations as
 `(Float, Float, Float, Float)` tuples inside lists and constructors, and
 build a `Quat` only at the edges.
 
-## S24: calling a function an aliased module lacks reports the alias as an unknown module
+## S24: a call of a function a module lacks reads "Unknown module"
 
-With `alias Strata.Entities as En`, a call `En.blocks_world(...)` before
-`blocks_world` existed was reported as "Unknown module `En`" at that line
-and at every other `En.` call in the same function, including ones that
-exist (`En.ev_code`), and a type `Strata.Entities.Event` that did not yet
-exist as "Unknown module `Strata.Entities`". Met writing entcheck's scenes
-ahead of the code (Task 3). Workaround: none needed; read "Unknown module"
-on an alias that plainly exists as "some function or type named through it
-does not exist" and look for the one that is new.
+`Strata.Anim.ground_targets(...)` in a test, before `ground_targets` was
+written, failed with "Unknown module `Strata.Anim`. [unbound_variable]",
+though `Strata.Anim` exists and compiles. The message names the module, not
+the missing function. Workaround: read it as "no such function in that
+module" and check the name.
+
+Met again through an alias (entities Task 3): with `alias Strata.Entities as
+En`, a call `En.blocks_world(...)` before `blocks_world` existed was reported
+as "Unknown module `En`" at that line and at every other `En.` call in the
+same function, including ones that exist, and a type not yet written
+(`Strata.Entities.Event`) as "Unknown module `Strata.Entities`". Same reading:
+look for the one name that is new.
+
+## S25: a String reaches a C extern as the runtime's own value
+
+An `extern` parameter of type `String` arrives in C as the runtime's string
+value: a pointer to a counted heap string (`march_string`: 16 bytes of
+header, an 8-byte length, then the bytes), or, for strings of seven bytes or
+fewer, the bytes packed into the pointer word itself (top bit set, low bit
+clear). There is no documented C-side accessor outside `march_runtime.h`,
+which a consumer's C does not include. Workaround: `native/strata_text.c`
+carries its own copy of the decoding (`mstr`). It breaks if the runtime's
+string layout changes; `viewer/test/text_test.march` ("Strings reach C")
+would catch it, with short, long and built strings.
+
+The text bindings met S17 again (two private externs named `x_stat`, in the
+renderer's and the text module's bindings): the text module's glyph counts
+came back as the renderer's draw-call count. Its externs are prefixed `xt_`.

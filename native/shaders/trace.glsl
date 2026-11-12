@@ -29,6 +29,15 @@ vec3 class_emission(uint c) {
     return rgb * (float((e >> 24) & 255) / 255.0);
 }
 
+// Bodies (Strata.Physics): each a grid of light classes, one byte a voxel, at
+// a pose. A ray that enters a chunk looks at the bodies listed for that
+// chunk's cell and steps through each one's grid in the body's own frame.
+struct BodyRow { vec4 pos; vec4 rot; ivec4 dims; vec4 sphere; };   // low corner (metres), rotation, size and first word of its classes, bounding sphere (voxels)
+layout(std430, set = 0, binding = 17) readonly buffer BodyTable { BodyRow rows[]; } body_table;
+layout(std430, set = 0, binding = 18) readonly buffer BodyBytes { uint words[]; } body_bytes;
+layout(std430, set = 0, binding = 19) readonly buffer BodyCells { uvec2 cells[]; } body_cells;   // per cell: first entry, count
+layout(std430, set = 0, binding = 20) readonly buffer BodyList { uint ids[]; } body_list;
+
 struct Hit {
     ivec3 voxel;     // the voxel hit
     int face;        // the face the ray entered it by: 0 +y, 1 -y, 2 +x, 3 -x, 4 +z, 5 -z
@@ -49,6 +58,54 @@ bool cutout_blocks(uint c, vec3 p, int face) {
     return textureLod(tiles, vec3(uv, float(layer)), 0.0).a >= 0.5;
 }
 
+// The nearest stopping voxel of body [bi] along a ray (voxel units, world
+// frame) before [best]: updates best and what was hit, in world terms.
+void body_ray(uint bi, vec3 ro, vec3 rd, float tmax, bool stop_glass, inout float best, inout uint bcls, inout int bface) {
+    // the bounding sphere first: most rays miss it, and the rest is a rotation and a walk
+    vec4 sp = body_table.rows[bi].sphere;
+    vec3 oc = sp.xyz - ro;
+    float tca = dot(oc, rd);
+    float lim = min(tmax, best);
+    if (dot(oc, oc) - tca * tca > sp.w * sp.w || tca + sp.w < 0.0 || tca - sp.w > lim) return;
+    BodyRow b = body_table.rows[bi];
+    float sc = u.eye.w;
+    vec4 qi = vec4(-b.rot.xyz, b.rot.w);
+    vec3 o = qrot(qi, ro * sc - b.pos.xyz) / sc;
+    vec3 d = qrot(qi, rd);
+    d += (1.0 - step(1.0e-6, abs(d))) * 1.0e-6;
+    vec3 inv = 1.0 / d;
+    vec3 dims = vec3(b.dims.xyz);
+    vec3 ta = -o * inv, tb = (dims - o) * inv;
+    vec3 tlo = min(ta, tb), thi = max(ta, tb);
+    float tin = max(max(tlo.x, tlo.y), max(tlo.z, 0.0));
+    float tout = min(min(thi.x, thi.y), min(thi.z, min(tmax, best)));
+    if (tin >= tout) return;
+    // a ray that starts on the body's own surface does not stop on it at once
+    int axis = tlo.x >= tlo.y && tlo.x >= tlo.z ? 0 : (tlo.y >= tlo.z ? 1 : 2);
+    vec3 p = o + d * (tin + 1.0e-4);
+    ivec3 v = clamp(ivec3(floor(p)), ivec3(0), b.dims.xyz - 1);
+    ivec3 stp = ivec3(sign(d));
+    vec3 tnext = (vec3(v) + step(0.0, d) - o) * inv;
+    vec3 tstep = abs(inv);
+    float t = tin;
+    for (int k = 0; k < 400; k++) {
+        if (t > tout || any(lessThan(v, ivec3(0))) || any(greaterThanEqual(v, b.dims.xyz))) return;
+        int idx = v.x + b.dims.x * (v.y + b.dims.y * v.z);
+        uint c = (body_bytes.words[uint(b.dims.w) + uint(idx >> 2)] >> (8u * uint(idx & 3))) & 255u;
+        if (c != 0u && t > 0.05) {
+            int kind = class_kind(c);
+            if (kind == 1 || kind == 2 || (kind == 3 && stop_glass)) {
+                vec3 nl = vec3(0.0); nl[axis] = -float(stp[axis]);
+                best = t; bcls = c; bface = nearest_face(qrot(b.rot, nl));
+                return;
+            }
+        }
+        if (tnext.x < tnext.y && tnext.x < tnext.z) { v.x += stp.x; t = tnext.x; tnext.x += tstep.x; axis = 0; }
+        else if (tnext.y < tnext.z) { v.y += stp.y; t = tnext.y; tnext.y += tstep.y; axis = 1; }
+        else { v.z += stp.z; t = tnext.z; tnext.z += tstep.z; axis = 2; }
+    }
+}
+
 // A coarse cell holds how high its contents reach above its floor, 1..8, or 0
 // for nothing. A ray [y] above the floor and not descending passes over them.
 bool skip_cell(uint top, float y, float dy) { return top == 0u || (dy >= 0.0 && y >= float(top)); }
@@ -61,7 +118,11 @@ bool skip_cell(uint top, float y, float dy) { return top == 0u || (dy >= 0.0 && 
 // nothing stopped it, including when it left the loaded world or ran out of
 // [steps]: a ray that skims a surface spends a step per voxel. Past
 // [fine_until] voxels from its start the ray looks at every third voxel only.
-bool trace_steps(vec3 ro, vec3 rd, float tmax, bool stop_glass, int steps, float fine_until, out Hit h) {
+// See-through voxels in layer [skip_y] and the one above never stop it: a
+// ray leaving a water surface starts inside that water's own layer, or
+// just over it beside cells of the same surface that reach a layer higher,
+// and the volume holds every one of those voxels as full.
+bool trace_steps(vec3 ro, vec3 rd, float tmax, bool stop_glass, int steps, float fine_until, int skip_y, out Hit h) {
     h.glow = vec3(0.0); h.t = tmax; h.cls = 0u; h.face = 0; h.voxel = ivec3(0);
     ivec3 dims = u.vol.xyz;                       // the volume's size in chunks
     vec3 d = rd + (1.0 - step(1.0e-6, abs(rd))) * 1.0e-6;      // no exact zeros to divide by
@@ -75,16 +136,23 @@ bool trace_steps(vec3 ro, vec3 rd, float tmax, bool stop_glass, int steps, float
     uint before = 0u;                             // the class of the voxel the ray was in last
     bool strode = false;                          // the last advance skipped voxels
     float fine = fine_until;
+    // the nearest body voxel found so far, from the bodies listed in the chunks the ray has entered
+    float bt = 1.0e30; uint bcls = 0u; int bface = 0;
+    bool any_bodies = u.bodies.y > 0;
     for (int i = 0; i < steps; i++) {
-        if (t >= tmax) return false;
+        if (t >= tmax || t >= bt) break;
         vec3 p = ro + d * t;
         ivec3 v = ivec3(floor(p));
         ivec3 ch = v >> 5;
         if (ch != last_chunk) {
             ivec3 cell = wrap(ch, dims);
             ivec4 own = texelFetch(owner, cell, 0);
-            if (own.w == 0 || own.xyz != ch) return false;         // off the edge of what is loaded
+            if (own.w == 0 || own.xyz != ch) break;                // off the edge of what is loaded
             last_chunk = ch; shift = cell - ch; chunk_top = float(own.w - 1);
+            if (any_bodies) {
+                uvec2 e = body_cells.cells[cell.x + dims.x * (cell.y + dims.y * cell.z)];
+                for (uint k = 0u; k < e.y && k < 64u; k++) body_ray(body_list.ids[e.x + k], ro, d, tmax, stop_glass, bt, bcls, bface);
+            }
         }
         vec3 lo, hi;
         if (chunk_top == 0.0 || (d.y >= 0.0 && p.y - float(ch.y * 32) >= chunk_top)) {
@@ -97,13 +165,14 @@ bool trace_steps(vec3 ro, vec3 rd, float tmax, bool stop_glass, int steps, float
             uint c = texelFetch(vol, v + shift * 32, 0).r;
             if (c != 0u) {
                 int kind = class_kind(c);
-                bool stops = kind == 1 || (kind == 2 && c != before && cutout_blocks(c, p, face)) || (kind == 3 && stop_glass);
+                bool stops = kind == 1 || (kind == 2 && c != before && cutout_blocks(c, p, face)) || (kind == 3 && stop_glass && v.y != skip_y && v.y != skip_y + 1);
                 if (stops && strode) {
                     // found by a stride: go back and walk the last stretch exactly, for a true point and face
                     t -= 3.0; fine = t + 4.0; strode = false; before = 0u;
                     continue;
                 }
-                if (stops) { h.voxel = v; h.face = face; h.t = t; h.cls = c; return true; }
+                if (stops && t < bt) { h.voxel = v; h.face = face; h.t = t; h.cls = c; return true; }
+                if (stops) break;
                 // a thin block the ray starts beside lights it less: the block's own floor is not a hot square
                 if (kind == 4 && v != last_thin) { h.glow += class_emission(c) * (t < 1.0 ? 0.3 : 1.0); last_thin = v; }
             }
@@ -124,11 +193,12 @@ bool trace_steps(vec3 ro, vec3 rd, float tmax, bool stop_glass, int steps, float
         face = tn == tb.y ? (d.y > 0.0 ? 1 : 0) : (tn == tb.x ? (d.x > 0.0 ? 3 : 2) : (d.z > 0.0 ? 5 : 4));
         t = max(tn, t) + 1.0e-3;
     }
+    if (bt < tmax) { h.voxel = ivec3(floor(ro + d * bt)); h.face = bface; h.t = bt; h.cls = bcls; return true; }
     return false;
 }
 
 // A ray with the usual step limit: enough for shadows, which leave the loaded world upward.
-bool trace(vec3 ro, vec3 rd, float tmax, bool stop_glass, out Hit h) { return trace_steps(ro, rd, tmax, stop_glass, 160, 1.0e9, h); }
+bool trace(vec3 ro, vec3 rd, float tmax, bool stop_glass, out Hit h) { return trace_steps(ro, rd, tmax, stop_glass, 160, 1.0e9, -1000000, h); }
 
 // The light class of the voxel holding [p] (voxel units); 0 outside the loaded world.
 uint class_at(vec3 p) {

@@ -43,6 +43,93 @@ mod StrataViewer.Walker do
     end
   end
 
+  -- ── In water ─────────────────────────────────────────────────────────────
+  -- The body floats with its eyes about at the surface: it is as heavy as
+  -- water when eight ninths of it are under.
+  pfn afloat() : Float do 0.89 end
+  pfn water_gravity() : Float do 10.0 end
+  pfn swim_up() : Float do 4.0 end
+  pfn current() : Float do 3.0 end
+
+  pfn exp_decay(rate : Float, dt : Float) : Float do
+    let k = 1.0 -. rate *. dt
+    if k < 0.0 do 0.0 else k end
+  end
+
+  doc "How much of the body, with its eyes at (x, y, z), is under liquid: 0 to 1."
+  fn wet(w : Strata.World.World, f : Strata.Fluid.Fluid, x : Float, y : Float, z : Float) : Float do
+    let cy = y -. eye_up()
+    Strata.Fluid.depth_in(f, w, x -. half_w(), cy -. half_h(), z -. half_w(), x +. half_w(), cy +. half_h(), z +. half_w())
+  end
+
+  -- What water does to a move: the sideways speeds with the water's drag and
+  -- push, the vertical speed with its lift, drag and the swimmer's stroke,
+  -- and whether the body is deep enough to swim. [k] is how much of it is wet.
+  pfn in_water(w : Strata.World.World, f : Strata.Fluid.Fluid, b : Body, k : Float, move_x : Float, move_z : Float, jump : Bool, dt : Float) : (Float, Float, Float, Bool) do
+    match b do
+      Body(x, y, z, vy, on_ground) ->
+        -- the water's flow where the body's middle and its feet are, whichever moves
+        let cy = y -. eye_up()
+        let mid = Strata.Fluid.flow(f, w, float_to_int(Math.floor(x)), float_to_int(Math.floor(cy)), float_to_int(Math.floor(z)))
+        let low = Strata.Fluid.flow(f, w, float_to_int(Math.floor(x)), float_to_int(Math.floor(cy -. half_h() +. 0.05)), float_to_int(Math.floor(z)))
+        let fl = match mid do (a, bb, c) -> if a == 0.0 && bb == 0.0 && c == 0.0 do low else mid end end
+        let push = current() *. (if k < 0.25 do k *. 4.0 else 1.0 end)
+        let slow = 1.0 -. 0.45 *. k
+        let mx = move_x *. slow +. (match fl do (a, _, _) -> a end) *. push
+        let mz = move_z *. slow +. (match fl do (_, _, c) -> c end) *. push
+        -- ankle-deep, the body still walks and jumps; deeper, the water takes its weight
+        let deep = k > 0.3
+        let lift = water_gravity() *. (k /. afloat() -. 1.0)
+        let v_fall = if deep do (vy +. lift *. dt) *. exp_decay(5.0 *. k, dt) else vy -. gravity() *. dt end
+        let v_flow = v_fall +. (match fl do (_, d, _) -> d end) *. 6.0 *. k *. dt
+        let v_swim = if jump && deep do v_flow +. (swim_up() -. v_flow) *. (if 6.0 *. dt > 1.0 do 1.0 else 6.0 *. dt end)
+          else if jump && on_ground do jump_speed() else v_flow end end
+        (mx, if v_swim < 0.0 -. max_fall() do 0.0 -. max_fall() else v_swim end, mz, deep)
+    end
+  end
+
+  -- the body after a move in water, from what the move met
+  pfn landed_in_water(s : Strata.Query.Swept, k : Float, v1 : Float, deep : Bool, jump : Bool) : Body do
+    let hit = Strata.Query.blocked_y(s)
+    -- swimming up against a bank: one kick, enough to clear a block
+    let kick = jump && deep && k < afloat() +. 0.05 && (Strata.Query.blocked_x(s) || Strata.Query.blocked_z(s))
+    Body(Strata.Query.swept_x(s), Strata.Query.swept_y(s) +. eye_up(), Strata.Query.swept_z(s), if kick do jump_speed() else if hit do 0.0 else v1 end end, hit && v1 <= 0.0)
+  end
+
+  doc "`step` for a body that may be in water. Out of water it is `step`. In it, the body is slowed, buoyed up until it floats with its eyes at the surface, and carried by the water's flow; [jump] swims upward, and at a bank it can touch, kicks hard enough to climb out."
+  fn step_in(w : Strata.World.World, f : Strata.Fluid.Fluid, b : Body, move_x : Float, move_z : Float, jump : Bool, dt0 : Float) : Body do
+    let dt = if dt0 < 0.0 do 0.0 else if dt0 > 0.05 do 0.05 else dt0 end end
+    match b do
+      Body(x, y, z, _, _) ->
+        let k = wet(w, f, x, y, z)
+        if k <= 0.0 do step(w, b, move_x, move_z, jump, dt0)
+        else
+          match in_water(w, f, b, k, move_x, move_z, jump, dt) do
+            (mx, v1, mz, deep) ->
+              landed_in_water(Strata.Query.sweep(w, x, y -. eye_up(), z, half_w(), half_h(), half_w(), mx *. dt, v1 *. dt, mz *. dt), k, v1, deep, jump)
+          end
+        end
+    end
+  end
+
+  doc "`drive` for a body that may be in water: `step_in`, moved by physics as driven body [id]. Coordinates are voxels: for a world of one metre to the voxel."
+  fn drive_in(p : Strata.Physics.Physics, w : Strata.World.World, f : Strata.Fluid.Fluid, id : Int, b : Body, move_x : Float, move_z : Float, jump : Bool, dt0 : Float) : (Strata.Physics.Physics, Body) do
+    let dt = if dt0 < 0.0 do 0.0 else if dt0 > 0.05 do 0.05 else dt0 end end
+    match b do
+      Body(x, y, z, _, _) ->
+        let k = wet(w, f, x, y, z)
+        if k <= 0.0 do drive(p, w, id, b, move_x, move_z, jump, dt0)
+        else
+          match in_water(w, f, b, k, move_x, move_z, jump, dt) do
+            (mx, v1, mz, deep) ->
+              match Strata.Physics.drive(p, w, id, mx, v1, mz, dt) do
+                (p2, s) -> (p2, landed_in_water(s, k, v1, deep, jump))
+              end
+          end
+        end
+    end
+  end
+
   doc "Make the body a driven body of physics [p]: a box its size, centred where it is. Returns its id."
   fn add_to(p : Strata.Physics.Physics, b : Body) : (Strata.Physics.Physics, Int) do
     Strata.Physics.add_driven(p, eye_x(b), eye_y(b) -. eye_up(), eye_z(b), half_w(), half_h(), half_w())

@@ -33,10 +33,38 @@ vec3 sky_flat(vec3 n) {
     return above * (0.25 + 0.35 * (0.5 + 0.5 * n.y));
 }
 
-// Fade a lit colour into the sky with distance.
+// ── Under water ─────────────────────────────────────────────────────────
+// Is the eye under liquid?
+bool submerged() { return u.water.w > 0.0 && u.light.x >= 1.0 && u.light.x < 9.0; }
+
+// How much daylight reaches height y (metres) under the surface the eye is
+// under: red goes first, then green, so depth turns blue.
+vec3 depth_light(float y) {
+    return exp(-max(u.water2.x - y, 0.0) * vec3(0.28, 0.085, 0.045));
+}
+
+// The colour distance fades to under water: the liquid's own, as bright as
+// the day above it and as dim as the eye is deep.
+vec3 water_haze() {
+    return u.water.rgb * depth_light(u.eye.y) * (0.12 + 1.5 * smoothstep(-0.12, 0.35, u.sun.y));
+}
+
+// The sun's light rippling on what it reaches under water: two crossing
+// wave patterns that drift, about 0.7 to 1.5.
+float caustics(vec3 world) {
+    float t = u.light.y;
+    vec2 p = world.xz * 1.7;
+    float a = sin(p.x * 1.3 + sin(p.y * 0.9 + t * 0.8) * 1.6 + t * 1.1);
+    float b = sin(p.y * 1.7 + sin(p.x * 1.1 - t * 0.6) * 1.4 - t * 0.9);
+    float c = a * b;
+    return 0.75 + 0.75 * c * c;
+}
+
+// Fade a lit colour into the sky with distance; under water, into the water.
 vec3 fogged(vec3 col, vec3 world) {
     vec3 to = world - u.eye.xyz;
     float d = length(to);
+    if (submerged()) return mix(water_haze(), col, exp(-d * u.water.w));
     float fogk = clamp((d - u.fog.x) / max(u.fog.y - u.fog.x, 0.001), 0.0, 1.0);
     return mix(col, sky_fog(to / max(d, 1.0e-4)), fogk * fogk);
 }
@@ -83,7 +111,7 @@ vec3 sky_light(vec3 at, vec3 n, ivec2 px, int frame, int rays) {
         float rad = sqrt(r.x), ang = r.y * 6.2831853;
         vec3 dir = normalize(a * (rad * cos(ang)) + b * (rad * sin(ang)) + n * sqrt(max(1.0 - r.x, 0.0)));
         Hit h;
-        if (!trace_steps(at + n * 0.02, dir, 48.0, false, 40, 12.0, h)) sum += sky_base(dir) + h.glow * GLOW;
+        if (!trace_steps(at + n * 0.02, dir, 48.0, false, 40, 12.0, -1000000, h)) sum += sky_base(dir) + h.glow * GLOW;
         else {
             vec3 hn = NORMALS[h.face];
             sum += class_emission(h.cls) * GLOW + h.glow * GLOW

@@ -1,0 +1,169 @@
+-- Anim ground: the pure part of foot placement (`Strata.Anim.ground_targets`),
+-- against small worlds: flat ground, a step, ground out of reach or in an
+-- unloaded chunk, a step taller than the leg, and two voxel scales.
+mod Strata.Test.AnimGround do
+
+  needs IO.Clock      -- charged to every test module once any uses Check.all (GAPS S3)
+  needs IO.Process
+  import Test
+  alias Strata.Rig as Rg
+  alias Strata.World as Wd
+  alias Strata.Edit as Ed
+  alias Strata.Coord as Cd
+  alias Strata.Chunk as C
+  alias Strata.Blocks as B
+
+  -- two legs at voxel 0.1: hips 0.2 m either side of the root, a thigh and
+  -- a shin of 0.5 m each (the leg is 1 m), soles 0.05 m below the feet
+  pfn biped() : Strata.Rig.Rig do
+    match Rg.part(Rg.new(0.1), -1, 0.0, 0.0, 0.0, 0, 0, 0) do
+      (r0, root) ->
+        match Rg.part(r0, root, -2.0, 0.0, 0.0, 0, 0, 0) do
+          (r1, lu) ->
+            match Rg.part(r1, lu, 0.0, -5.0, 0.0, 0, 0, 0) do
+              (r2, ll) ->
+                match Rg.part(r2, ll, 0.0, -5.0, 0.0, 0, 0, 0) do
+                  (r3, lf) ->
+                    match Rg.part(r3, root, 2.0, 0.0, 0.0, 0, 0, 0) do
+                      (r4, ru) ->
+                        match Rg.part(r4, ru, 0.0, -5.0, 0.0, 0, 0, 0) do
+                          (r5, rl) ->
+                            match Rg.part(r5, rl, 0.0, -5.0, 0.0, 0, 0, 0) do
+                              (r6, rf) -> Rg.leg(Rg.leg(r6, lu, ll, lf, 0.05), ru, rl, rf, 0.05)
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+  end
+
+  pfn add(r : Strata.Blocks.Registry, d : Strata.Blocks.Def) : Strata.Blocks.Registry do
+    match B.register(r, d) do
+      Ok((r2, _)) -> r2
+      Err(_) -> r
+    end
+  end
+  -- 1 stone; 2 a model whose box is the lower 0.7 of its cell; 3 a plant (a cross, no collision)
+  pfn reg() : Strata.Blocks.Registry do
+    match B.add_model(B.empty(), NativeArray.make_f32(0, 0.0), Cons(Strata.Blocks.Box(0.0, 0.0, 0.0, 1.0, 0.7, 1.0), Nil)) do
+      (r0, m) ->
+        let slab = B.with_style(B.with_opacity(B.def(), Strata.Blocks.Clear), Strata.Blocks.Model(m))
+        let plant = B.with_collide(B.with_style(B.with_opacity(B.def(), Strata.Blocks.Clear), Strata.Blocks.Cross), false)
+        add(add(add(r0, B.def()), slab), plant)
+    end
+  end
+  -- load the 2 x 2 x 2 chunks -1..0 on each axis: voxels -32..31
+  pfn load_go(w : Strata.World.World, i : Int) : Strata.World.World do
+    if i >= 8 do w
+    else load_go(Wd.insert(w, Cd.key(i % 2 - 1, (i / 2) % 2 - 1, i / 4 - 1), C.uniform(0)), i + 1) end
+  end
+  pfn box(w : Strata.World.World, x0 : Int, y0 : Int, z0 : Int, x1 : Int, y1 : Int, z1 : Int, id : Int) : Strata.World.World do
+    Ed.world(Ed.fill_box(w, x0, y0, z0, x1, y1, z1, id))
+  end
+  -- air, loaded around the origin, with stone below y = 0 (its top at 0 m)
+  pfn flat(scale : Float) : Strata.World.World do
+    box(load_go(Wd.new(reg(), Strata.Terrain.gen(fn (k, seed) -> C.uniform(0)), 1, scale), 0), -32, -32, -32, 31, -1, 31, 1)
+  end
+
+  pfn near(a : Float, b : Float) : Bool do Math.abs(a -. b) < 0.0001 end
+  pfn y_of(t : Option((Float, Float, Float))) : Float do
+    match t do
+      Some((_, y, _)) -> y
+      None -> -999.0
+    end
+  end
+  pfn at(ts : List(Option((Float, Float, Float))), i : Int) : Option((Float, Float, Float)) do List.nth(ts, i) end
+  pfn first_t(g : (List(Option((Float, Float, Float))), Float)) : List(Option((Float, Float, Float))) do match g do (ts, _) -> ts end end
+  pfn drop_of(g : (List(Option((Float, Float, Float))), Float)) : Float do match g do (_, d) -> d end end
+
+  -- the animated feet: both 0.05 m above y = h, 0.2 m either side of x = 0
+  pfn feet(h : Float) : List((Float, Float, Float)) do [(-0.2, h +. 0.05, 0.0), (0.2, h +. 0.05, 0.0)] end
+
+  describe "Anim.ground_targets" do
+    test "flat ground: both targets at the ground plus the sole, drop 0" do
+      let g = Strata.Anim.ground_targets(biped(), feet(0.0), flat(0.1))
+      let ts = first_t(g)
+      Test.assert_true(List.length(ts) == 2, "check 1")
+      Test.assert_true(near(y_of(at(ts, 0)), 0.05), "check 2")
+      Test.assert_true(near(y_of(at(ts, 1)), 0.05), "check 3")
+      Test.assert_true(xz_at(at(ts, 0), -0.2, 0.0), "the left target is under the left foot")
+      Test.assert_true(near(drop_of(g), 0.0), "check 4")
+    end
+
+    test "a 1-voxel step under one foot raises that target a voxel; the drop follows the lower foot" do
+      -- the right foot (x 0.2 m, voxel 2) stands over a step one voxel high
+      let w = box(flat(0.1), 1, 0, -2, 4, 0, 2, 1)
+      let g = Strata.Anim.ground_targets(biped(), feet(0.0), w)
+      Test.assert_true(near(y_of(at(first_t(g), 0)), 0.05), "check 5")
+      Test.assert_true(near(y_of(at(first_t(g), 1)), 0.15), "check 6")
+      Test.assert_true(near(drop_of(g), 0.0), "check 7")
+      -- and a voxel dug from under the left foot (x -0.2 m, voxel -2): the drop is that voxel
+      let w2 = box(flat(0.1), -4, -1, -2, -1, -1, 2, 0)
+      let g2 = Strata.Anim.ground_targets(biped(), feet(0.0), w2)
+      Test.assert_true(near(y_of(at(first_t(g2), 0)), -0.05), "check 8")
+      Test.assert_true(near(drop_of(g2), 0.1), "check 9")
+    end
+
+    test "a plant is not ground" do
+      let w = box(flat(0.1), -32, 0, -32, 31, 0, 31, 3)
+      Test.assert_true(near(y_of(at(first_t(Strata.Anim.ground_targets(biped(), feet(0.0), w)), 0)), 0.05), "check 10")
+    end
+
+    test "ground in an unloaded chunk gives none" do
+      -- x 4 m is voxel 40, in chunk 1, never loaded (it reads as air)
+      let g = Strata.Anim.ground_targets(biped(), [(4.0, 0.05, 0.0), (4.4, 0.05, 0.0)], flat(0.1))
+      Test.assert_true(is_none_t(at(first_t(g), 0)), "check 11")
+      Test.assert_true(is_none_t(at(first_t(g), 1)), "check 12")
+      Test.assert_true(near(drop_of(g), 0.0), "check 13")
+    end
+
+    test "no ground within reach gives none" do
+      -- the feet 5 m up: the rays reach 0.5 m above to 1 m below
+      let g = Strata.Anim.ground_targets(biped(), feet(5.0), flat(0.1))
+      Test.assert_true(is_none_t(at(first_t(g), 0)), "check 14")
+      Test.assert_true(is_none_t(at(first_t(g), 1)), "check 15")
+      Test.assert_true(near(drop_of(g), 0.0), "check 16")
+    end
+
+    test "a step taller than the leg: the drop is at most the leg's length" do
+      -- the right foot on a column 1.2 m tall, the left over ground 1.25 m below it: out of reach
+      let w = box(flat(0.1), 1, 0, -2, 4, 11, 2, 1)
+      let g = Strata.Anim.ground_targets(biped(), feet(1.2), w)
+      Test.assert_true(is_none_t(at(first_t(g), 0)), "check 17")
+      Test.assert_true(near(y_of(at(first_t(g), 1)), 1.25), "check 18")
+      Test.assert_true(drop_of(g) <= 1.0, "check 19")
+      -- a column 0.9 m tall: the left reaches ground 0.9 m down, the drop 0.9
+      let w2 = box(flat(0.1), 1, 0, -2, 4, 8, 2, 1)
+      let g2 = Strata.Anim.ground_targets(biped(), feet(0.9), w2)
+      Test.assert_true(near(y_of(at(first_t(g2), 0)), 0.05), "check 20")
+      Test.assert_true(near(drop_of(g2), 0.9), "check 21")
+      Test.assert_true(drop_of(g2) <= 1.0, "check 22")
+    end
+
+    test "at voxel scale 0.1 and 1.0 the drop for a 0.3 m step is the same" do
+      -- scale 0.1: three voxels dug from under the left foot
+      let small = box(flat(0.1), -4, -3, -2, -1, -1, 2, 0)
+      -- scale 1.0: the left foot (x -0.2 m, voxel -1) over a slab 0.7 m tall in the top voxel
+      let big = box(flat(1.0), -1, -1, -1, -1, -1, 1, 2)
+      let a = drop_of(Strata.Anim.ground_targets(biped(), feet(0.0), small))
+      let b = drop_of(Strata.Anim.ground_targets(biped(), feet(0.0), big))
+      Test.assert_true(near(a, 0.3), "check 23")
+      Test.assert_true(near(b, 0.3), "check 24")
+    end
+  end
+
+  pfn xz_at(t : Option((Float, Float, Float)), x : Float, z : Float) : Bool do
+    match t do
+      Some((tx, _, tz)) -> near(tx, x) && near(tz, z)
+      None -> false
+    end
+  end
+  pfn is_none_t(t : Option((Float, Float, Float))) : Bool do
+    match t do
+      None -> true
+      Some(_) -> false
+    end
+  end
+end

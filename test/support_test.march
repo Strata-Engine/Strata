@@ -1,0 +1,118 @@
+-- Support: what comes loose after an edit. Worlds are stone below y = 0 and
+-- air above; blocks at y = -1 and below are anchored (anchor depth -1).
+-- Block ids: 1 stone (span 4 m), 2 stone that reaches 6 m, 3 an anchor.
+mod Strata.Test.Support do
+
+  needs IO.Clock      -- charged to every test module once any uses Check.all (GAPS S3)
+  needs IO.Process
+  import Test
+  alias Strata.Support as Sp
+  alias Strata.Blocks as B
+  alias Strata.World as Wd
+  alias Strata.Edit as Ed
+  alias Strata.Coord as Cd
+  alias Strata.Chunk as C
+
+  pfn reg() : Strata.Blocks.Registry do
+    let add = fn (r, d) -> match B.register(r, d) do
+        Ok((r2, _)) -> r2
+        Err(_) -> r
+      end
+    add(add(add(B.empty(), B.def()), B.with_physics(B.def(), 2000, 50000, 600, 50, false)), B.with_physics(B.def(), 2000, 50000, 400, 50, true))
+  end
+  pfn flat() : Strata.Terrain.Gen do
+    Strata.Terrain.gen(fn (k, seed) -> if Cd.ky(k) < 0 do C.uniform(1) else C.uniform(0) end)
+  end
+  pfn load(w : Strata.World.World, cx : Int, cy : Int, cz : Int) : Strata.World.World do
+    let k = Cd.key(cx, cy, cz)
+    Wd.insert(w, k, Strata.Terrain.run(Wd.terrain(w), k, Wd.seed(w)))
+  end
+  -- chunks x -2..3, y -1..3, z -2..1 (voxels x -64..127, y -32..127, z -64..63)
+  pfn load_box(w : Strata.World.World, i : Int) : Strata.World.World do
+    if i >= 120 do w else load_box(load(w, i % 6 - 2, (i / 6) % 5 - 1, i / 30 - 2), i + 1) end
+  end
+  pfn world_at(scale : Float) : Strata.World.World do load_box(Wd.new(reg(), flat(), 7, scale), 0) end
+  pfn world() : Strata.World.World do world_at(1.0) end
+
+  pfn box(w : Strata.World.World, x0 : Int, y0 : Int, z0 : Int, x1 : Int, y1 : Int, z1 : Int, id : Int) : Strata.World.World do
+    Ed.world(Ed.fill_box(w, x0, y0, z0, x1, y1, z1, id))
+  end
+  -- the pieces after edit [o]
+  pfn after(o : Strata.Edit.Outcome, scale : Float) : Strata.Support.Loose do Sp.loose(reg(), Ed.world(o), Ed.changes(o), -1, scale) end
+  pfn sizes(l : Strata.Support.Loose) : List(Int) do List.map(Sp.pieces(l), fn p -> List.length(p)) end
+  pfn has(p : List((Int, Int, Int)), x : Int, y : Int, z : Int) : Bool do List.any(p, fn c -> same(c, x, y, z)) end
+  pfn same(c : (Int, Int, Int), x : Int, y : Int, z : Int) : Bool do match c do (a, b, d) -> a == x && b == y && d == z end end
+  pfn first_piece(l : Strata.Support.Loose) : List((Int, Int, Int)) do
+    match Sp.pieces(l) do
+      Cons(p, _) -> p
+      Nil -> Nil
+    end
+  end
+
+  describe "Support" do
+    test "a cut pillar's top falls with its roof" do
+      let w = box(box(world(), 0, 0, 0, 0, 5, 0, 1), -1, 6, -1, 1, 6, 1, 1)
+      let l = after(Ed.set_block(w, 0, 2, 0, 0), 1.0)
+      Test.assert_true(sizes(l) == Cons(12, Nil), "one piece: three of the pillar and nine of the roof")
+      Test.assert_true(has(first_piece(l), 0, 3, 0) && has(first_piece(l), 1, 6, 1), "the pillar above the cut and the roof")
+      Test.assert_false(has(first_piece(l), 0, 1, 0), "not the pillar below the cut")
+    end
+
+    test "a joined bridge stays" do
+      let w = box(box(world(), 0, 0, 0, 0, 3, 0, 1), 8, 0, 0, 8, 3, 0, 1)
+      let l = after(Ed.fill_box(w, 0, 4, 0, 8, 4, 0, 1), 1.0)
+      Test.assert_eq_int(List.length(Sp.pieces(l)), 0, "no piece: its middle is 4 m from either pillar")
+    end
+
+    test "a block resting on a held bridge is held" do
+      let w = box(box(box(world(), 0, 0, 0, 0, 3, 0, 1), 8, 0, 0, 8, 3, 0, 1), 0, 4, 0, 8, 4, 0, 1)
+      Test.assert_eq_int(List.length(Sp.pieces(after(Ed.set_block(w, 4, 5, 0, 1), 1.0))), 0, "no piece")
+    end
+
+    test "an overhang past its span breaks off" do
+      let w = box(world(), 0, 0, 0, 0, 9, 0, 1)
+      let l = after(Ed.fill_box(w, 1, 8, 0, 6, 8, 0, 1), 1.0)
+      Test.assert_true(sizes(l) == Cons(2, Nil), "one piece of two cells")
+      Test.assert_true(has(first_piece(l), 5, 8, 0) && has(first_piece(l), 6, 8, 0), "the cells 5 and 6 m out")
+      Test.assert_eq_int(List.length(Sp.pieces(after(Ed.fill_box(w, 1, 8, 0, 6, 8, 0, 2), 1.0))), 0, "with a span of 6 m, none")
+    end
+
+    test "span at 10 cm" do
+      let w = box(world_at(0.1), 0, 0, 0, 0, 90, 0, 1)
+      let l = after(Ed.fill_box(w, 1, 80, 0, 60, 80, 0, 1), 0.1)
+      Test.assert_true(sizes(l) == Cons(20, Nil), "the outer 20 voxels (2 m)")
+      Test.assert_true(has(first_piece(l), 41, 80, 0) && has(first_piece(l), 60, 80, 0), "from 4.1 m out to the end")
+    end
+
+    test "an undercut ledge on a large cliff comes loose" do
+      let w = box(world(), 0, 0, -5, 15, 11, 5, 1)
+      let l = after(Ed.fill_box(w, 10, 0, -5, 15, 9, 5, 0), 1.0)
+      Test.assert_true(sizes(l) == Cons(44, Nil), "the outer 2 m of the ledge: 2 x 2 x 11")
+      Test.assert_true(has(first_piece(l), 14, 10, 0) && has(first_piece(l), 15, 11, 5), "at 5 and 6 m out")
+      Test.assert_false(has(first_piece(l), 13, 10, 0), "not at 4 m")
+    end
+
+    test "an anchor block holds" do
+      let w = box(box(world(), 0, 10, 0, 2, 12, 2, 1), 1, 9, 1, 1, 9, 1, 3)
+      Test.assert_eq_int(List.length(Sp.pieces(after(Ed.set_block(w, 0, 13, 0, 1), 1.0))), 0, "held by the anchor")
+      let l = after(Ed.set_block(w, 1, 9, 1, 0), 1.0)
+      Test.assert_true(sizes(l) == Cons(27, Nil), "without it, the cube falls")
+    end
+
+    test "unloaded is anchored" do
+      -- chunk x -1 is not loaded: a beam three long from its face at x = 0 is held by it
+      let w0 = Wd.unload(Wd.unload(world(), Cd.key(-1, 0, 0)), Cd.key(-1, 0, -1))
+      Test.assert_eq_int(List.length(Sp.pieces(after(Ed.fill_box(w0, 0, 20, 0, 2, 20, 0, 1), 1.0))), 0, "no piece")
+    end
+
+    test "the fill cap counts a big loose mass as held" do
+      -- a floating 40-cube; two anchor blocks at opposite corners make the edits' bounds cover it
+      let w = box(world(), 10, 30, -20, 49, 69, 19, 1)
+      let o1 = Ed.set_block(w, 9, 70, -21, 3)
+      let o2 = Ed.set_block(Ed.world(o1), 50, 29, 20, 3)
+      let l = Sp.loose_capped(reg(), Ed.world(o2), List.append(Ed.changes(o1), Ed.changes(o2)), -1, 1.0, 1000)
+      Test.assert_eq_int(List.length(Sp.pieces(l)), 0, "no piece")
+      Test.assert_eq_int(Sp.capped(l), 1, "one fill stopped at the cap")
+    end
+  end
+end
