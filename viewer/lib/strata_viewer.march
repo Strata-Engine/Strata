@@ -53,7 +53,8 @@
 -- STRATA_AUDIO_METER=1   a line of voices, refusals, underruns, CPU and level once a second
 -- STRATA_STALL=n    hold the main thread 100 ms every n frames, as a hitch would (soak runs)
 -- STRATA_AUDIO_LEVEL=x   the main level at start, 0..1 (9 and 0 change it while playing)
--- STRATA_FIGURES=n  n humanoids walking in small circles in rows ahead of the camera (StrataViewer.Figures)
+-- STRATA_FIGURES=n  n humanoids walking in small circles in rows ahead of the camera, on dry ground (StrataViewer.Figures)
+-- STRATA_SHORE=1  start on the shore nearest the origin, just above sea level, looking along it
 -- STRATA_FIG_SHADOWS=0  plain figures cast no sun shadow (read by the renderer; the stored figure scenes 31 and 32 predate the shadows)
 --                   the worst and mean frame time and what the renderer still holds
 --
@@ -1361,8 +1362,44 @@ mod StrataViewer do
     end
   end
 
+  -- The shore nearest the origin: a column 1 to 3 m above sea level with the
+  -- open sea along x or z (water from within 12 m out to 48 m), searched ring by ring (8 m apart) out to
+  -- 2 km. Answers the column and the step toward the sea; the origin, facing
+  -- +x, if there is none.
+  pfn sea_toward(land : Land, seed : Int, x : Int, z : Int, dx : Int, dz : Int) : Bool do
+    -- open sea, not a river: water from within 12 m out to 48 m
+    (land_height(land, x + 6 * dx, z + 6 * dz, seed) < sea() || land_height(land, x + 12 * dx, z + 12 * dz, seed) < sea()) && land_height(land, x + 24 * dx, z + 24 * dz, seed) < sea() && land_height(land, x + 48 * dx, z + 48 * dz, seed) < sea()
+  end
+  pfn shore_at(land : Land, seed : Int, x : Int, z : Int) : (Int, Int) do
+    let h = land_height(land, x, z, seed)
+    if h < sea() + 1 || h > sea() + 3 do (0, 0)
+    else if sea_toward(land, seed, x, z, 1, 0) do (1, 0)
+    else if sea_toward(land, seed, x, z, -1, 0) do (-1, 0)
+    else if sea_toward(land, seed, x, z, 0, 1) do (0, 1)
+    else if sea_toward(land, seed, x, z, 0, -1) do (0, -1)
+    else (0, 0) end end end end end
+  end
+  pfn shore_go(land : Land, seed : Int, r : Int, k : Int) : (Int, Int, Int, Int) do
+    let n = if r / 2 < 16 do 16 else r / 2 end
+    if r > 2000 do (0, 0, 1, 0)
+    else if k >= n do shore_go(land, seed, r + 8, 0)
+    else
+      let a = 6.2831853 *. int_to_float(k) /. int_to_float(n)
+      let x = float_to_int(Math.round(int_to_float(r) *. Math.cos(a)))
+      let z = float_to_int(Math.round(int_to_float(r) *. Math.sin(a)))
+      match shore_at(land, seed, x, z) do
+        (0, 0) -> shore_go(land, seed, r, k + 1)
+        (dx, dz) -> (x, z, dx, dz)
+      end
+    end end
+  end
+
   pfn pose(scene : Int, seed : Int, land : Land, tl : (Int, Int, Int, Int, Int, Int, Int)) : (Float, Float, Float, Float, Float) do
-    if scene == 0 || scene == 11 do (0.5, int_to_float(land_height(land, 0, 0, seed)) +. 2.7, 0.5, 0.62, -0.1)
+    if scene == 0 && Env.get_int("STRATA_SHORE", 0) == 1 do
+      match shore_go(land, seed, 8, 0) do
+        (x, z, dx, dz) -> (int_to_float(x) +. 0.5, int_to_float(land_height(land, x, z, seed)) +. 2.7, int_to_float(z) +. 0.5, Math.atan2(int_to_float(dz), int_to_float(dx)), -0.1)
+      end
+    else if scene == 0 || scene == 11 do (0.5, int_to_float(land_height(land, 0, 0, seed)) +. 2.7, 0.5, 0.62, -0.1)
     else if scene == 2 || scene == 28 do
       match deep_water(seed, 0) do
         (wx, wz) -> (int_to_float(wx) +. 0.5, int_to_float(sea()) +. 3.5, int_to_float(wz) +. 0.5, 0.9, -0.15)
@@ -1425,7 +1462,7 @@ mod StrataViewer do
           let ey = int_to_float(land_height(land, bx, bz, seed)) +. 5.0
           (int_to_float(bx) +. 0.5, ey, int_to_float(bz) +. 0.5, int_to_float(d) *. 0.39269908, 0.0 -. Math.atan2(ey -. int_to_float(line), int_to_float(2 * rad + 8)))
       end
-    else (-70.0, int_to_float(land_height(land, 0, 0, seed)) +. 46.0, 96.0, 0.62, -0.42) end end end end end end end end end end end end end end end end end end end end end end end end
+    else (-70.0, int_to_float(land_height(land, 0, 0, seed)) +. 46.0, 96.0, 0.62, -0.42) end end end end end end end end end end end end end end end end end end end end end end end end end
   end
 
   -- The land for STRATA_ISLAND: the island's atlas from the cache in
@@ -1496,11 +1533,14 @@ mod StrataViewer do
     if i >= n do c
     else
       let ahead = 8.0 +. int_to_float(i / 32) *. 3.0
-      let side = (int_to_float(i % 32) -. 15.5) *. 2.5
+      -- a row of up to 32, centred on the view
+      let row = if n - (i / 32) * 32 < 32 do n - (i / 32) * 32 else 32 end
+      let side = (int_to_float(i % 32) -. int_to_float(row - 1) /. 2.0) *. 2.5
       let x = ex +. Math.sin(yaw) *. ahead +. Math.cos(yaw) *. side
       let z = ez -. Math.cos(yaw) *. ahead +. Math.sin(yaw) *. side
-      let y = StrataViewer.Figures.ground_at(w, x +. 1.0, z, ey +. 4.0)
-      crowd_go(StrataViewer.Figures.add_walker(c, x, z, 1.0, int_to_float(i) *. 0.7, y, 1.0), w, ex, ey, ez, yaw, i + 1, n)
+      -- the ground on the walker's circle, searched from well above the eye: the row crosses hills and hollows; no walker on water
+      let y = StrataViewer.Figures.dry_ground_at(w, x +. 1.0, z, ey +. 40.0, 120.0)
+      crowd_go(if y < -999.0 do c else StrataViewer.Figures.add_walker(c, x, z, 1.0, int_to_float(i) *. 0.7, y, 1.0) end, w, ex, ey, ez, yaw, i + 1, n)
     end
   end
   pfn crowd_for(scene : Int, n : Int, w : Strata.World.World, ex : Float, ey : Float, ez : Float, yaw : Float) : StrataViewer.Figures.Crowd do
@@ -1665,6 +1705,7 @@ mod StrataViewer do
             end
           -- figures: scene 31 the humanoid's seven clips side by side, 32 one walking across the forest floor, STRATA_FIGURES=n a crowd
           let crowd = crowd_for(scene, Env.get_int("STRATA_FIGURES", 0), Strata.Stream.world(s1), ex, ey, ez, yaw0)
+          let _ = if Env.get_int("STRATA_FIGURES", 0) > 0 do println("strata_viewer: " ++ int_to_string(StrataViewer.Figures.walking(crowd)) ++ " of " ++ int_to_string(Env.get_int("STRATA_FIGURES", 0)) ++ " figures on dry ground") else () end
           let sl_f = if StrataViewer.Figures.walking(crowd) > 0 || scene == 31 do Strata.Render.figures(sl, StrataViewer.Figures.anim(crowd), Cons(StrataViewer.Figures.rig(crowd), Nil)) else sl end
           frame_loop(s1, Strata.Fluid.with_limits(Strata.Fluid.with_sea_top(Strata.Fluid.new(reg, Cons((lake_base(), Strata.Fluid.flowing()), Cons((5, Strata.Fluid.sea()), Nil))), sea()), Env.get_int("STRATA_FLUID_CAP", 4096), Env.get_int("STRATA_FLUID_REACH", 16), 4), None, sl_f, reg, cam, rig, 0, frames, if soak > 0 do 2 else if scene == 11 && frames > 0 do 1 else if scene == 4 && frames > 0 do 3 else 0 end end end, hole, tl, 0.0, 0.0, 0.0, Strata.Ffi.Vk.time(), Strata.Ffi.Vk.time(), NativeArray.make_f32(16, 0.0), audio_start(frames), 0.0, crowd)
       end
