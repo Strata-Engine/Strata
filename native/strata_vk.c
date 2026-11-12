@@ -1435,6 +1435,29 @@ int64_t sv_rig_shape(int64_t rig, int64_t part, void *bytes, int64_t n, int64_t 
     fg.glow[rig * SV_FIG_PARTS + part] = -1.0f;
     return 1;
 }
+/* Forget rig [rig] whole: every part's pieces, ray shape, anchor and glow,
+ * so a rig uploaded again under the same id (a figure world opened again
+ * starts its rig ids at 0) keeps nothing of the last one's. Ranges frames in
+ * flight may still draw are held two frames, as a replaced piece's are. */
+int64_t sv_rig_clear(int64_t rig) {
+    if (!g.ok || !fg.pieces || !fg.shape || rig < 0 || rig >= SV_FIG_RIGS) return 0;
+    for (int p = 0; p < SV_FIG_PARTS; p++) {
+        int32_t rp = (int32_t)(rig * SV_FIG_PARTS + p);
+        for (int32_t i = fg.head[rp], nx; i >= 0; i = nx) {
+            nx = fg.pieces[i].next;
+            sa_release(&g_quads, (Range){ fg.pieces[i].first, fg.pieces[i].count }, g.frame_no);
+            fg.pieces[i].next = fg.free_head; fg.free_head = i;
+        }
+        fg.head[rp] = -1;
+        struct FigShape *sh = &fg.shape[rp];
+        if (sh->shaped) sa_release(&g_bbytes, (SaRange){ sh->first, sh->nwords }, g.frame_no);
+        sh->shaped = 0;
+        fg.anchor[rp][0] = fg.anchor[rp][1] = fg.anchor[rp][2] = 0.0f; fg.anchor[rp][3] = 1.0f;
+        fg.sphere[rp][3] = -1.0f;
+        if (fg.glow) fg.glow[rp] = -1.0f;
+    }
+    return 1;
+}
 /* how far (metres) rig part rp's glowing voxels light their surroundings above
  * SV_GLOW_FLOOR: n emitting voxels of the brightest emission e seen as a blob
  * of n^(2/3) voxel faces, lighting a surface r away by about

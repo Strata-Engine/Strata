@@ -269,6 +269,8 @@ struct AnWorld {
     int32_t *ids; uint32_t ids_mask;   /* id -> slot: open addressing, linear probing, -1 empty; 2 x capacity rounded up to a power of two */
     int32_t *free_slots; int nfree;
     int32_t next_id;
+    int32_t first_id;            /* the id the world's first figure took (or will): the hash counts ids from it */
+    uint32_t generation;         /* bumped by each world opened in another's place (an_open_next, an_reopen) */
     AnEvent *events, *events_tmp; int nevents, fig_events;   /* capacity x AN_FIG_EVENTS */
     int live, posed;
     double refused, negative_dt, dropped; int reason;
@@ -373,6 +375,23 @@ static inline AnWorld *an_open(int capacity) {
     for (int i = 0; i < capacity; i++) { w->figs[i].id = -1; w->free_slots[i] = capacity - 1 - i; }   /* slot 0 handed out first */
     w->nfree = capacity;
     return w;
+}
+
+/* a world in place of one of [generation] whose next figure id was [next_id]:
+ * its generation is one past, and its ids carry on from there, so an id held
+ * from the last world does not name a figure of this one (until 2^20 ids
+ * later). Rig, mask, clip and socket ids start again at 0. */
+static inline AnWorld *an_open_next(int capacity, uint32_t generation, int32_t next_id) {
+    AnWorld *w = an_open(capacity);
+    if (w) { w->generation = generation + 1; w->next_id = w->first_id = next_id & (AN_IDS - 1); }
+    return w;
+}
+/* close [old] (NULL for none) and open its successor */
+static inline AnWorld *an_reopen(AnWorld *old, int capacity) {
+    uint32_t gen = old ? old->generation : 0;
+    int32_t nid = old ? old->next_id : 0;
+    an_close(old);
+    return an_open_next(capacity, gen, nid);
 }
 
 /* ---- rigs and masks ---- */
@@ -1603,20 +1622,29 @@ static inline uint64_t an_hash_layers(uint64_t h, const AnFig *f) {
 }
 /* every live figure's carried state: its layers; its matrices if the last
  * update posed it (a skipped figure's are its last pose, rewritten whole at
- * its next, and a query may have posed it since); its schedule; the drop,
+ * its next, and a query may have posed it since); its schedule; its
+ * placement and culling bounds; the drop,
  * the procedural records and the attachment */
 static inline uint64_t an_hash(const AnWorld *w) {
     uint64_t h = 1469598103934665603ull;
     for (int s = 0; s < w->capacity; s++) {
         const AnFig *f = &w->figs[s];
         if (f->id < 0) continue;
-        const unsigned char *p = (const unsigned char *)&f->id;
-        for (size_t i = 0; i < sizeof f->id; i++) { h ^= p[i]; h *= 1099511628211ull; }
+        /* ids counted from the world's first, so the same calls in a world
+         * opened after another (whose ids carry on) hash the same */
+        int32_t rid = (f->id - w->first_id) & (AN_IDS - 1);
+        const unsigned char *p = (const unsigned char *)&rid;
+        for (size_t i = 0; i < sizeof rid; i++) { h ^= p[i]; h *= 1099511628211ull; }
         h = an_hash_layers(h, f);
         uint8_t sched[4] = {f->always, f->cls, f->frozen, f->wait};
         h = an_fnv(h, sched, sizeof sched);
         h = an_fnv(h, &f->pend, sizeof f->pend);
         if (f->wait == 0) h = an_fnv(h, an_fig_mats(w, f), (size_t)w->rigs[f->rig].nparts * 12 * sizeof(float));
+        /* where it stands, whatever the schedule: a free figure's placement (a
+         * hanging one's is its parent's socket), and the bounds and placement
+         * of its last scheduled pose, which decide its next class */
+        if (f->att < 0) { h = an_fnv(h, f->pos, sizeof f->pos); h = an_fnv(h, f->q, sizeof f->q); }
+        h = an_fnv(h, f->vbmin, sizeof f->vbmin); h = an_fnv(h, f->vbmax, sizeof f->vbmax); h = an_fnv(h, f->vpos, sizeof f->vpos);
         /* what the matrices do not show: the drop and its motion, and every
          * procedural record (spring state, reach fades, settings), in list order */
         float dr[3] = {f->drop, f->drop_goal, f->drop_rate};
@@ -1631,7 +1659,7 @@ static inline uint64_t an_hash(const AnWorld *w) {
             for (size_t k = 0; k < sizeof q->v; k++) { h ^= p[k]; h *= 1099511628211ull; }
         }
         /* the attachment: the parent's id (-1 for none), the socket and the offset */
-        int32_t link[2] = {f->att >= 0 ? w->figs[f->att].id : -1, f->att_socket};
+        int32_t link[2] = {f->att >= 0 ? (w->figs[f->att].id - w->first_id) & (AN_IDS - 1) : -1, f->att_socket};
         p = (const unsigned char *)link;
         for (size_t i = 0; i < sizeof link; i++) { h ^= p[i]; h *= 1099511628211ull; }
         float off[7] = {f->att_pos[0], f->att_pos[1], f->att_pos[2], f->att_q[0], f->att_q[1], f->att_q[2], f->att_q[3]};

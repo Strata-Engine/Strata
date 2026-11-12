@@ -679,7 +679,7 @@ animcheck/.march/build/release/animcheck` on a quiet machine to judge them.
 - **Rays.** These rays run from 0.2-2.6 m up in front of the crowd toward a
   figure 0-2 m up, and 9 562 of 10 000 hit. Most stop at the first figure in
   their way, which is why they are cheap.
-- **Memory** at 4 096 figures (sizeof, decimal MB), rigs excluded: 46.34 MB,
+- **Memory** at 4 096 figures (sizeof, decimal MB), rig sockets and part grids excluded: 46.34 MB,
   leaving 1.66 MB under 48 MB.
   - Figures 7.90 (AnFig 1 928 B), matrices 12.58, previous matrices 12.58.
   - Keys 5.51, clips 2.21, rigs 0.87, masks 0.07, marks 0.26, events 1.31.
@@ -775,6 +775,16 @@ frame means:
   0.1 ms difference at this load: it was 94 ms. The same load failed the soak's own frame-time,
   fluid-step and mixer checks, which have nothing to do with figures (see
   the soak notes above).
+
+- **A hit ray every frame forfeits culling's CPU saving** (final review). The
+  first query after an update poses every figure the update skipped, and
+  README's frame loop casts a hit ray every frame, so a game written from it
+  poses every figure every frame until the kernel poses only the figures
+  along the ray; the update row above assumes no per-frame query.
+- **The far tier is unmeasured on the drawn arena** (final review): neither
+  the viewer nor the arena passes a far distance, so the stale-pose rate for
+  distant figures, the cost ladder's first rung, is exercised only by the C
+  tests. Say so when the arena is re-measured on a quiet machine.
 
 Rerun on a quiet machine to judge:
 `STRATA_SCENE=40 STRATA_SIZE=2560x1600 STRATA_PIXELS=1 STRATA_OFFSCREEN=1 STRATA_VSYNC=0 STRATA_LIGHT=4 STRATA_ARENA_LOG=1`,
