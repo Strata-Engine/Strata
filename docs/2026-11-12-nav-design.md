@@ -41,7 +41,8 @@ cell climbed, 1 more a cell dropped, three times as much into water.
 
 **`find`** is A* over those moves, from one standable cell to another,
 through the world as it is loaded now. It works in a window of at most
-96 x 40 x 96 cells about the two places and expands at most a budget of
+96 cells across, and 40 and twice the walker's height up and down, about
+the two places and expands at most a budget of
 cells the caller gives. It reads each cell of the world at most once and
 keeps what it read, so one search sees one world. When it cannot arrive
 (no way, the budget spent, the goal outside the window or the loaded
@@ -53,7 +54,10 @@ cell a game's own test accepts. Cover from a threat, dry land, a cell out
 of sight are all one call.
 
 **`straight`** says whether the walker can go directly from one cell to
-another (the line between is walked a straight step at a time), and
+another: the line between is walked a straight step at a time, through the
+exact corner of a cell only when both cells beside it are open, and on one
+footing throughout (a line into or out of water is not straight, so a path
+routed round a pond is never cut back through it), and
 **`smooth`** uses it to keep only a path's corners. **`points`** turns
 cells into metres for a mover and **`advance`** drops the points reached.
 
@@ -80,12 +84,16 @@ by its mover's speed.
   swims asks `straight` for its goal. If the straight way is shut it plans
   (`find`, 1200 cells at most), keeps the path's corners, and heads for the
   next one; the plan is kept a second (two when it did not arrive) and made
-  again. Blocked for a second on a path, it drops the path and plans anew.
+  again, sooner if its goal has moved more than four cells. While a plan's
+  time runs no other is made, so a fighter with no way to its goal does not
+  search four times a second. Blocked for a second on a path, it drops the
+  path and plans anew.
   The old sidestep stays underneath for fighters in each other's way.
 - A swimmer plans its way to its target if it has one, else to the spawn
   point it was making for, and follows it in the water.
 - A rusher goes on after a target that has stepped out of sight for 6 s
-  (while it is within 40 m). Before, a wall between them made it forget.
+  (while it is within 40 m). Before, a wall between them made it forget. It
+  does not swing at a target it cannot see.
 - `STRATA_COMBAT_NAV=0` turns all three off, for comparison.
 - The **fence** scene (`STRATA_COMBAT_SCENE=fence`): a rusher has seen its
   target 20 m off; at frame 30 a stone wall 13 long and 4 high rises between

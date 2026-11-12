@@ -27,6 +27,20 @@ Finding: on March main the suite's 148 properties run for the first time (GAPS S
 Finding: a lambda that prints or reads a file fails March main's capability check, charged to no module (GAPS S35).
 Finding: a search costs about 10 microseconds a cell expanded in the match (see RESULTS). Not yet profiled against the March performance goal: how much is `Strata.World.get_block` (a store lookup a cell) and how much the search itself is not known.
 
+## Review (one fresh reviewer, read-only, lib/strata/nav.march, steer.march and the match's use of them)
+
+Sound, by its reading: the heap, the stale-entry test, the heuristic against the costs, the key and index widths, the cells a search reads against the cells it has classified, the move rules, `smooth`, `advance`, `cell_of`, `walker_of`, `Strata.Steer`, the fence.
+
+Review: fixed a walker taller than 16 cells finding no path at all (its head lay outside the window's height: a 1.8 m fighter at 0.1 m a voxel) -- the window is 40 and twice the height tall; test `a walker taller than the window's margin` (18 cells: arrives, and `nearest` finds).
+Review: fixed a fighter with no way to its goal searching four times a second (the plan's wait was skipped whenever no corners were left) -- the wait holds with or without corners.
+Review: fixed a plan followed after its goal had changed (a new target, a patrol point turned, the idle rule's move to a spawn point) -- a plan keeps the cell it was made for and is dropped when the goal is more than four cells from it; the idle rule clears the way, the plan and the remembered target.
+Review: fixed `straight` passing a line through the exact corner of a cell with a block on one side (A* refuses that diagonal; `smooth` and the match's straight test let it back in, and a 0.6 m fighter would rub the corner) -- both ways round the corner must be open and end at one height; tests `through the exact corner of a cell`, four cases.
+Review: fixed `straight` and `smooth` cutting a swimmer's path back through a pond the search had routed it round -- a straight line keeps one footing; test `a line into or out of water is not straight`.
+Review: fixed a rusher swinging at a remembered target through a wall (a swing lands on whoever is in reach, with no line tested) -- a target out of sight is chased, not swung at.
+Review: fixed the heap's size, which a walker with a long drop could outrun (a neighbour was then silently dropped) -- sized from the walker's step and drop.
+Review: Ruling: the rusher's memory counts 0.25 s a decision, not elapsed time; decisions are every 15 frames and the match's step is fixed, so they agree.
+Review: a test helper of mine was wrong, not the code: two neighbouring cells of a path are one legal move and need not be `straight` under the stricter rule (a diagonal beside water).
+
 ## Before main
 
 Merging this to main makes main need March `f6481bbe6` or later. Sessions still building with 0.5.0, and the shared `~/code/march-main` checkout, will fail on `Authority.must` and `int_wrapping_mul` after they take main. That is what the user asked for ("target march main"), and it is not something to do to other sessions unannounced: the merge to main waits on the user's word.

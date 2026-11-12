@@ -547,7 +547,8 @@ Strata.Nav.nearest(w, k, ax, ay, az, fn (x, y, z) -> hidden_from(threat, x, y, z
 A path that is not `arrived` ends at the cell nearest the goal that the
 search reached: walk it and ask again. A search reads the world as it is, so
 an edit is seen by the next one; there is nothing to rebuild. It works in a
-window of at most 96 x 40 x 96 cells and on loaded chunks only.
+window of at most 96 cells across (and 40 and twice the walker's height up
+and down) and on loaded chunks only.
 
 ## Using it from a game
 
