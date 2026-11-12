@@ -649,6 +649,137 @@ mod Entcheck do
       + check(!En.is_open(En.close(e2)), "closed"))
   end
 
+  -- ── The sweep and walking ────────────────────────────────────────────────
+  -- box i of the sweep scene: its size (one of three) and seeded place and move, all inside the held chunks
+  pfn sweep_half(i : Int) : (Float, Float, Float) do
+    if i % 3 == 0 do (0.3, 0.9, 0.3) else if i % 3 == 1 do (0.05, 0.05, 0.05) else (0.45, 0.25, 0.35) end end
+  end
+  pfn bool_f(b : Bool) : Float do if b do 1.0 else 0.0 end end
+  -- one box: (1 if the two disagree by more than 1e-4 voxels (1e-5 m) or on a blocked axis, 1 if they end at the very
+  -- same place, blocked on x, on y, on z)
+  pfn sweep_one(w : Strata.World.World, out : NativeFloatArr, i : Int) : (Int, Int, Int, Int, Int) do
+    let h1 = Strata.Seed.cell(41, 4, i, 0, 0)
+    let h2 = Strata.Seed.next(h1)
+    let h3 = Strata.Seed.next(h2)
+    let h4 = Strata.Seed.next(h3)
+    let h5 = Strata.Seed.next(h4)
+    let h6 = Strata.Seed.next(h5)
+    let x = 8.0 *. Strata.Seed.unit(h1) -. 4.0
+    let y = 3.45 *. Strata.Seed.unit(h2) +. 0.05
+    let z = 8.0 *. Strata.Seed.unit(h3) -. 4.0
+    let dx = 3.0 *. Strata.Seed.unit(h4) -. 1.5
+    let dy = 3.0 *. Strata.Seed.unit(h5) -. 1.5
+    let dz = 3.0 *. Strata.Seed.unit(h6) -. 1.5
+    let (hx, hy, hz) = sweep_half(i)
+    let want = Strata.Query.sweep(w, x, y, z, hx, hy, hz, dx, dy, dz)
+    let got = Ech.sweep(x, y, z, hx, hy, hz, dx, dy, dz, out)
+    let near = Math.abs(NativeArray.get_float(out, 0) -. Strata.Query.swept_x(want)) < 0.00001
+      && Math.abs(NativeArray.get_float(out, 1) -. Strata.Query.swept_y(want)) < 0.00001
+      && Math.abs(NativeArray.get_float(out, 2) -. Strata.Query.swept_z(want)) < 0.00001
+    let exact = NativeArray.get_float(out, 0) == Strata.Query.swept_x(want) && NativeArray.get_float(out, 1) == Strata.Query.swept_y(want)
+      && NativeArray.get_float(out, 2) == Strata.Query.swept_z(want)
+    let bx = bool_f(Strata.Query.blocked_x(want))
+    let by_ = bool_f(Strata.Query.blocked_y(want))
+    let bz = bool_f(Strata.Query.blocked_z(want))
+    let axes = NativeArray.get_float(out, 3) == bx && NativeArray.get_float(out, 4) == by_ && NativeArray.get_float(out, 5) == bz
+    let cx = float_to_int(bx)
+    let cy = float_to_int(by_)
+    let cz = float_to_int(bz)
+    let same = if exact do 1 else 0 end
+    if got == 0 && near && axes do (0, same, cx, cy, cz)
+    else (fail("  box " ++ int_to_string(i) ++ ": Strata.Query ends at (" ++ float_to_string(Strata.Query.swept_x(want)) ++ ", " ++ float_to_string(Strata.Query.swept_y(want)) ++ ", " ++ float_to_string(Strata.Query.swept_z(want)) ++ ") blocked " ++ float_to_string(bx) ++ float_to_string(by_) ++ float_to_string(bz) ++ "; the kernel answers " ++ int_to_string(got) ++ " at (" ++ float_to_string(NativeArray.get_float(out, 0)) ++ ", " ++ float_to_string(NativeArray.get_float(out, 1)) ++ ", " ++ float_to_string(NativeArray.get_float(out, 2)) ++ ") blocked " ++ float_to_string(NativeArray.get_float(out, 3)) ++ float_to_string(NativeArray.get_float(out, 4)) ++ float_to_string(NativeArray.get_float(out, 5))), same, cx, cy, cz) end
+  end
+  pfn sweeps_go(w : Strata.World.World, out : NativeFloatArr, i : Int, n : Int, acc : (Int, Int, Int, Int, Int)) : (Int, Int, Int, Int, Int) do
+    if i >= n do acc
+    else
+      let (b, e, x, y, z) = sweep_one(w, out, i)
+      let (b0, e0, x0, y0, z0) = acc
+      sweeps_go(w, out, i + 1, n, (b0 + b, e0 + e, x0 + x, y0 + y, z0 + z))
+    end
+  end
+
+  -- sweep: 2,000 seeded boxes of three sizes moved through the ray scene's world; the kernel and Strata.Query agree on
+  -- each within 1e-4 voxels and on every blocked axis
+  pfn sweep_scene() : Int do
+    let w = ground_world()
+    let e = En.blocks_world(world([flyer(0, 0)], 16), w)
+    let (bad, same, bx, by_, bz) = sweeps_go(w, NativeArray.make_float(6, 0.0), 0, 2000, (0, 0, 0, 0, 0))
+    println("  blocked on x " ++ int_to_string(bx) ++ ", on y " ++ int_to_string(by_) ++ ", on z " ++ int_to_string(bz) ++ " of 2,000 boxes; " ++ int_to_string(same) ++ " end at the very same place")
+    report("sweep", bad + check(by_ >= 300, "at least 300 boxes stopped on y")
+      + check(bx >= 50 && bz >= 50, "at least 50 each on x and on z")
+      + check(!En.is_open(En.close(e)), "closed"))
+  end
+
+  -- the walk scene's ground: a step 0.5 m high for x -2.0..1.0 m, on it one 0.3 m higher for x -1.0..0.0 m, and a
+  -- pillar 3 m tall at x 2.6..3.0 m, z -0.5..0.5 m, on the flat stone of the ray scene's box
+  pfn walk_world() : Strata.World.World do
+    let w0 = air_go(Strata.World.new(registry(), Strata.Terrain.gen(fn (k, seed) -> Strata.Chunk.uniform(0)), 41, 0.1), 0)
+    let w1 = Strata.Edit.world(Strata.Edit.fill_box(w0, -64, -32, -64, 63, -1, 63, 1))
+    let w2 = Strata.Edit.world(Strata.Edit.fill_box(w1, -20, 0, -30, 9, 4, 30, 1))
+    let w3 = Strata.Edit.world(Strata.Edit.fill_box(w2, -10, 5, -30, -1, 7, 30, 2))
+    Strata.Edit.world(Strata.Edit.fill_box(w3, 26, 0, -5, 29, 29, 4, 1))
+  end
+  -- the route: up the steps, down off them, round the pillar
+  pfn walk_route() : List((Float, Float, Float)) do
+    [(-5.0, 0.9, 0.0), (1.8, 0.9, 0.0), (1.8, 0.9, 1.4), (3.8, 0.9, 1.4), (3.8, 0.9, 0.0), (5.0, 0.9, 0.0)]
+  end
+  pfn walkers_go(e : Strata.Entities.Entities, route : Int, i : Int) : Strata.Entities.Entities do
+    if i >= 50 do e
+    else
+      let (e1, id) = En.add(e, 0, -5.6 +. int_to_float(i % 5) *. 0.2, 1.0, -0.8 +. int_to_float(i / 5) *. 0.16, 0.0)
+      walkers_go(En.follow(e1, id, route, 2.0, false), route, i + 1)
+    end
+  end
+  pfn code_count(evs : List(Strata.Entities.Event), code : Int, n : Int) : Int do
+    match evs do
+      Nil -> n
+      Cons(v, t) -> code_count(t, code, if En.ev_code(v) == code do n + 1 else n end)
+    end
+  end
+  -- ticks: (world, route finished events, blocked events)
+  pfn walk_go(e : Strata.Entities.Entities, w : Strata.World.World, tick : Int, fives : Int, eights : Int) : (Strata.Entities.Entities, Int, Int) do
+    if tick >= 900 do (e, fives, eights)
+    else
+      let e1 = En.step(e, [(0.0, 1.0, 0.0)], 1.0 /. 60.0)
+      let evs = En.events(e1, w)
+      walk_go(e1, w, tick + 1, code_count(evs, 5, fives), code_count(evs, 8, eights))
+    end
+  end
+  -- how many walkers stand within 0.3 m of the route's end, grounded
+  pfn arrived(e : Strata.Entities.Entities, ids : NativeIntArr, i : Int, n : Int) : Int do
+    if i >= NativeArray.length_int(ids) do n
+    else
+      let id = NativeArray.get_int(ids, i)
+      let (x, _y, z) = En.position(e, id)
+      let there = Math.sqrt((x -. 5.0) *. (x -. 5.0) +. z *. z) < 0.3 && En.grounded(e, id)
+      arrived(e, ids, i + 1, if there do n + 1 else n end)
+    end
+  end
+  -- one walk: (bad, hash, route finished events, blocked events, arrived)
+  pfn walk_run(w : Strata.World.World) : (Int, Int, Int, Int, Int) do
+    let e0 = En.blocks_world(world([En.with_mover(En.kind(), En.walking(), 0.3, 0.9, 0.3, 0.6, 9.8)], 64), w)
+    let (e1, route) = En.route(e0, walk_route())
+    let e2 = walkers_go(e1, route, 0)
+    let (e3, fives, eights) = walk_go(e2, w, 0, 0, 0)
+    let n = arrived(e3, En.each(e3, 0), 0, 0)
+    let h = En.hash(e3)
+    let bad = check(route >= 0, "the route is made") + check(refused(e3) == 0, "nothing refused")
+      + check(!En.is_open(En.close(e3)), "closed")
+    (bad, h, fives, eights, n)
+  end
+
+  -- walk: 50 walkers follow a route up two steps, off a ledge and round a pillar; all arrive, twice alike
+  pfn walk_scene() : Int do
+    let w = walk_world()
+    let (bad1, h1, fives1, eights1, n1) = walk_run(w)
+    let (bad2, h2, _fives2, _eights2, _n2) = walk_run(w)
+    println("  " ++ int_to_string(n1) ++ " of 50 arrived; " ++ int_to_string(fives1) ++ " route finished, " ++ int_to_string(eights1) ++ " blocked; hash " ++ int_to_string(h1))
+    report("walk", bad1 + bad2 + check(n1 == 50, "all 50 walkers stand at the route's end, grounded")
+      + check(fives1 == 50, "each reports the route finished once")
+      + check(eights1 == 0, "none is blocked on the way")
+      + check(h1 == h2, "two runs give one hash"))
+  end
+
   fn main(_cap : Cap(IO)) : Unit do
     let name = Env.get("ENTCHECK_SCENE", "")
     if name == "basics" do process_exit(basics_scene())
@@ -658,9 +789,11 @@ mod Entcheck do
     else if name == "ray" do process_exit(ray_scene())
     else if name == "bullets" do process_exit(bullets_scene())
     else if name == "storm" do process_exit(storm_scene())
+    else if name == "sweep" do process_exit(sweep_scene())
+    else if name == "walk" do process_exit(walk_scene())
     else
-      println("entcheck: no scene named '" ++ name ++ "' (basics, columns, determinism, closed, ray, bullets, storm)")
+      println("entcheck: no scene named '" ++ name ++ "' (basics, columns, determinism, closed, ray, bullets, storm, sweep, walk)")
       process_exit(2)
-    end end end end end end end
+    end end end end end end end end end
   end
 end

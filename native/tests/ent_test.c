@@ -1,6 +1,7 @@
 /* The entity kernel, headless: kinds and their refusals, adding and reading,
- * slots, stale ids, bad numbers, a full world, each and columns, and the
- * hash's determinism. */
+ * slots, stale ids, bad numbers, a full world, each and columns, the hash's
+ * determinism, blocks and the ray, the tick, the grid, the sweep, walking
+ * and routes. */
 #include <stdio.h>
 #include <string.h>
 #include <math.h>
@@ -848,6 +849,327 @@ static void test_removal_in_loop(void) {
     en_close(w);
 }
 
+/* ---- the sweep, walking and routes ---- */
+static const uint8_t three_blocks[3] = {0, 1, 0};   /* 0 air, 1 stone, 2 a plant (a cross: the table says it passes) */
+
+/* stone below y 0 (chunk y -1) and air above (chunk y 0 to 2, to 9.6 m), chunks x and z from c0 to c1 */
+static void flat_floor(EnWorld *w, int c0, int c1) {
+    en_block_table(w, 3, three_blocks);
+    for (int cx = c0; cx <= c1; cx++)
+        for (int cz = c0; cz <= c1; cz++) {
+            en_chunk_uniform(w, cx, -1, cz, 1);
+            en_chunk_uniform(w, cx, 0, cz, 0);
+            en_chunk_uniform(w, cx, 1, cz, 0);
+            en_chunk_uniform(w, cx, 2, cz, 0);
+        }
+}
+/* chunk (cx, 0, cz) of air with stone in local y below ly where local x is in x0..x1 */
+static void ledge_chunk(EnWorld *w, int cx, int cz, int x0, int x1, int ly) {
+    static int32_t ids[32768];
+    memset(ids, 0, sizeof ids);
+    for (int y = 0; y < ly; y++)
+        for (int z = 0; z < 32; z++)
+            for (int x = x0; x <= x1; x++) ids[x + 32 * (z + 32 * y)] = 1;
+    en_chunk(w, cx, 0, cz, ids);
+}
+
+static void test_sweep(void) {
+    EnWorld *w = world(16);
+    flat_floor(w, 0, 0);
+    en_chunk_uniform(w, 1, 0, 0, 1);   /* a wall from x 3.2 m */
+    double h[3] = {0.3, 0.9, 0.3}, out[3]; int b[3];
+    double p1[3] = {1.6, 2.0, 1.6}, down[3] = {0, -5, 0};
+    CHECK(en_sweep(w, p1, h, down, out, b) == 0, "a box dropped onto the floor sweeps");
+    CHECK(fabs(out[1] - 0.9 - 0.00001) < 1e-9, "... and rests with its base 1e-4 voxels (1e-5 m) above the floor");
+    CHECK(out[0] == 1.6 && out[2] == 1.6, "... straight down");
+    CHECK(b[0] == 0 && b[1] == 1 && b[2] == 0, "... blocked on y alone");
+    double p2[3] = {2.0, 1.0, 1.6}, east[3] = {3, 0, 0};
+    CHECK(en_sweep(w, p2, h, east, out, b) == 0, "a box pushed at the wall sweeps");
+    CHECK(fabs(out[0] - (3.2 - 0.3 - 0.00001)) < 1e-9, "... and stops 1e-4 voxels short of it");
+    CHECK(b[0] == 1 && b[1] == 0 && b[2] == 0, "... blocked on x alone");
+    double small[3] = {0.5, 0, 0};
+    CHECK(en_sweep(w, p2, h, small, out, b) == 0 && fabs(out[0] - 2.5) < 1e-12 && b[0] == 0, "a move short of the wall is not blocked");
+    en_close(w);
+
+    w = world(16);
+    flat_floor(w, 0, 1);
+    static int32_t ids[32768];
+    for (int i = 0; i < 32768; i++) ids[i] = 2;   /* plants throughout chunk (1, 0, 0) */
+    en_chunk(w, 1, 0, 0, ids);
+    double p3[3] = {2.0, 1.0, 1.6};
+    CHECK(en_sweep(w, p3, h, east, out, b) == 0 && fabs(out[0] - 5.0) < 1e-12 && b[0] == 0, "it passes through cross-style voxels");
+    double far[3] = {4, 0, 0};
+    double p4[3] = {5.0, 1.0, 1.6};
+    out[0] = out[1] = out[2] = -7;
+    CHECK(en_sweep(w, p4, h, far, out, b) == -1, "a box moved into a chunk not held answers -1");
+    CHECK(out[0] == 5.0 && out[1] == 1.0 && out[2] == 1.6 && b[0] == 0 && b[1] == 0 && b[2] == 0, "... and does not move");
+    double up_then_far[3] = {4, 0.5, 0};
+    CHECK(en_sweep(w, p4, h, up_then_far, out, b) == -1 && out[1] == 1.0, "... not even on the axes swept before");
+    en_close(w);
+}
+
+/* a walking kind: half extents 0.3 x 0.9 x 0.3, step height, gravity 9.8, divisor */
+static int walk_kind(EnWorld *w, float step, int divisor) {
+    int32_t ki[9];
+    kind_ints(ki, 2, divisor, 0, 0, 0);
+    ki[5] = 1;
+    float fl[7] = {0.3f, 0.9f, 0.3f, step, 0, 0, 9.8f};
+    return en_kind(w, ki, fl);
+}
+/* ticks of 1/60 with one focus at the entity's own position (so it is seen) */
+static void seen_ticks(EnWorld *w, int64_t id, int n) {
+    for (int i = 0; i < n; i++) {
+        double p[3]; en_get(w, id, 0, p);
+        en_tick(w, 1, p, 1.0 / 60);
+    }
+}
+
+static void test_walking(void) {
+    EnWorld *w = world(16);
+    flat_floor(w, -1, 1);
+    int k = walk_kind(w, 0.6f, 1);
+    int64_t id = en_add(w, k, 1.6, 5.9, 1.6, 0);
+    CHECK(en_grounded(w, id) == 0, "a walker added in the air is not grounded");
+    seen_ticks(w, id, 120);
+    CHECK(en_grounded(w, id) == 1, "a walker dropped 5 m lands grounded");
+    CHECK(fabs(pos_axis(w, id, 1) - 0.9) < 0.02, "... within 0.02 m of the floor");
+    double v[3]; en_get(w, id, 1, v);
+    CHECK(v[1] == 0, "... its vertical velocity 0");
+    CHECK(en_grounded(w, 12345) == 0, "an unknown id is not grounded");
+    en_close(w);
+
+    /* a step 0.5 m (5 voxels) high from x 2.0 m, and one 1.2 m high */
+    for (int tall = 0; tall < 2; tall++) {
+        w = world(16);
+        flat_floor(w, -1, 1);
+        int ly = tall ? 12 : 5;
+        ledge_chunk(w, 0, 0, 20, 31, ly);
+        ledge_chunk(w, 1, 0, 0, 31, ly);
+        k = walk_kind(w, 0.6f, 1);
+        id = en_add(w, k, 1.0, 0.95, 1.6, 0);
+        seen_ticks(w, id, 10);
+        double go[3] = {2, 0, 0};
+        en_set(w, id, 1, go);
+        seen_ticks(w, id, 120);
+        if (!tall) {
+            CHECK(pos_axis(w, id, 0) > 4.5, "a walker with step height 0.6 walks up a 0.5 m step");
+            CHECK(fabs(pos_axis(w, id, 1) - 1.4) < 0.02 && en_grounded(w, id), "... and stands on it");
+        } else {
+            CHECK(fabs(pos_axis(w, id, 0) - (2.0 - 0.3 - 0.00001)) < 1e-6, "... and is stopped by a 1.2 m one");
+            CHECK(fabs(pos_axis(w, id, 1) - 0.9) < 0.02 && en_grounded(w, id), "... still on the floor");
+        }
+        en_close(w);
+    }
+
+    /* a platform 0.5 m high for x below 2.0 m: walk off it */
+    w = world(16);
+    flat_floor(w, -1, 1);
+    ledge_chunk(w, -1, 0, 0, 31, 5);
+    ledge_chunk(w, 0, 0, 0, 19, 5);
+    k = walk_kind(w, 0.6f, 1);
+    id = en_add(w, k, 1.0, 1.45, 1.6, 0);
+    seen_ticks(w, id, 10);
+    CHECK(en_grounded(w, id) && fabs(pos_axis(w, id, 1) - 1.4) < 0.02, "a walker stands on the platform");
+    double go[3] = {2, 0, 0};
+    en_set(w, id, 1, go);
+    int fell = 0;
+    for (int i = 0; i < 120; i++) {
+        seen_ticks(w, id, 1);
+        double y = pos_axis(w, id, 1);
+        if (!en_grounded(w, id) && y < 1.39 && y > 0.91) fell = 1;
+    }
+    CHECK(fell, "it walks off the ledge and falls");
+    CHECK(fabs(pos_axis(w, id, 1) - 0.9) < 0.02 && en_grounded(w, id), "... landing on the floor below");
+    en_close(w);
+}
+
+/* events of code in the last tick */
+static int count_code(EnWorld *w, int code) {
+    int n = en_events(w, EN_EVENTS, ev_i, ev_f), c = 0;
+    for (int e = 0; e < n; e++) c += ev_i[e * 7] == code;
+    return c;
+}
+
+static void test_routes(void) {
+    double line[9] = {0, 0, 0, 10, 0, 0, 20, 0, 0};
+    /* unseen, not looping */
+    EnWorld *w = world(16);
+    int k = walk_kind(w, 0.6f, 1);
+    int r = en_route(w, 3, line);
+    CHECK(r >= 0, "a route of 3 points is made");
+    int64_t id = en_add(w, k, 0, 0, 0, 0);
+    en_follow(w, id, r, 2.0, 0);
+    for (int i = 0; i < 300; i++) en_tick(w, 0, NULL, 1.0 / 60);
+    CHECK(fabs(pos_axis(w, id, 0) - 10.0) < 0.05, "an unseen follower at 2 m/s is 10 m along after 5 s");
+    double f[3]; en_get(w, id, 2, f);
+    CHECK(fabs(f[0] - 1.5707963) < 1e-5, "... facing its travel (+x: pi/2)");
+    int fives = 0, at = -1;
+    for (int i = 300; i < 900; i++) {
+        en_tick(w, 0, NULL, 1.0 / 60);
+        int c = count_code(w, EN_E_ROUTE);
+        if (c && at < 0) at = i + 1;
+        fives += c;
+        if (c) CHECK(ev_i[1] == id && ev_i[3] == r, "event 5 names the follower and the route");
+    }
+    CHECK(fives == 1, "it reports event 5 once");
+    CHECK(at >= 599 && at <= 601, "... at 10 s");
+    CHECK(fabs(pos_axis(w, id, 0) - 20.0) < 1e-9, "... and stops at the end");
+    double v[3]; en_get(w, id, 1, v);
+    CHECK(v[0] == 0 && v[1] == 0 && v[2] == 0, "... still");
+    en_close(w);
+
+    /* unseen, looping */
+    w = world(16);
+    k = walk_kind(w, 0.6f, 1);
+    r = en_route(w, 3, line);
+    id = en_add(w, k, 0, 0, 0, 0);
+    en_follow(w, id, r, 2.0, 1);
+    fives = 0;
+    for (int i = 0; i < 1200; i++) { en_tick(w, 0, NULL, 1.0 / 60); fives += count_code(w, EN_E_ROUTE); }
+    CHECK(fives == 0, "looping, it reports no event 5");
+    CHECK(fabs(pos_axis(w, id, 0)) < 0.05, "... and is back at the start at 20 s");
+    en_close(w);
+
+    /* seen, on flat ground */
+    w = world(16);
+    flat_floor(w, -1, 3);
+    k = walk_kind(w, 0.6f, 1);
+    double path[9] = {1.6, 0, 1.6, 6.4, 0, 1.6, 6.4, 0, 6.4};
+    r = en_route(w, 3, path);
+    id = en_add(w, k, 1.6, 0.91, 1.6, 0);
+    en_follow(w, id, r, 2.0, 0);
+    fives = 0;
+    for (int i = 0; i < 600; i++) { seen_ticks(w, id, 1); fives += count_code(w, EN_E_ROUTE); }
+    double p[3]; en_get(w, id, 0, p);
+    CHECK(hypot(p[0] - 6.4, p[2] - 6.4) < 0.3, "a seen follower on flat ground reaches the end within 0.3 m");
+    CHECK(fives == 1, "... reporting event 5 once");
+    CHECK(en_grounded(w, id), "... on the ground");
+    en_close(w);
+
+    /* seen, against a wall */
+    w = world(16);
+    flat_floor(w, -1, 0);
+    en_chunk_uniform(w, 1, 0, 0, 1);
+    k = walk_kind(w, 0.6f, 1);
+    double into[6] = {2.899, 0, 1.6, 6.0, 0, 1.6};
+    r = en_route(w, 2, into);
+    id = en_add(w, k, 2.899, 0.91, 1.6, 0);
+    seen_ticks(w, id, 10);
+    en_follow(w, id, r, 2.0, 0);
+    int eights = 0; at = -1;
+    for (int i = 0; i < 240; i++) {
+        seen_ticks(w, id, 1);
+        int c = count_code(w, EN_E_BLOCKED);
+        if (c && at < 0) at = i + 1;
+        eights += c;
+    }
+    CHECK(eights == 1, "a seen follower facing a wall reports event 8 once in 4 s");
+    CHECK(at >= 59 && at <= 62, "... after 1 s");
+    CHECK(fabs(pos_axis(w, id, 0) - (3.2 - 0.3 - 0.00001)) < 1e-6, "... pressed against the wall");
+    en_get(w, id, 1, v);
+    CHECK(v[0] > 1.9, "... still pushing toward its waypoint");
+    en_close(w);
+}
+
+static void test_divisor(void) {
+    double line[6] = {0, 0, 0, 100, 0, 0};
+    double moved[2];
+    for (int t = 0; t < 2; t++) {
+        EnWorld *w = world(16);
+        int k = walk_kind(w, 0.6f, t ? 4 : 1);
+        int r = en_route(w, 2, line);
+        int64_t a = en_add(w, k, 0, 0, 0, 0), b = en_add(w, k, 0, 0, 0, 0);
+        en_follow(w, a, r, 2.0, 0); en_follow(w, b, r, 2.0, 0);
+        en_tick(w, 0, NULL, 1.0 / 60);
+        if (t) CHECK(pos_axis(w, a, 0) > 0 && pos_axis(w, b, 0) == 0, "divisor 4: row 0 steps on tick 0, row 1 not");
+        for (int i = 1; i < 240; i++) en_tick(w, 0, NULL, 1.0 / 60);
+        moved[t] = pos_axis(w, a, 0);
+        if (t) CHECK(fabs(pos_axis(w, b, 0) - moved[t]) < 0.1, "... and row 1 catches up on its own ticks");
+        en_close(w);
+    }
+    CHECK(fabs(moved[0] - 8.0) < 0.05, "divisor 1: 8 m in 240 ticks at 2 m/s");
+    CHECK(fabs(moved[1] - moved[0]) < 0.1, "divisor 4 moves an unseen follower as far in 240 ticks within 0.1 m");
+}
+
+static void test_route_limits(void) {
+    static double pts[300 * 3];
+    for (int i = 0; i < 300; i++) { pts[i * 3] = i; pts[i * 3 + 1] = 0; pts[i * 3 + 2] = 0; }
+    EnWorld *w = world(16);   /* 4,096 route points */
+    int k = walk_kind(w, 0.6f, 1);
+    double before = en_stat(w, 3);
+    CHECK(en_route(w, 257, pts) == -1 && en_stat(w, 6) == EN_R_VALUE, "a route of 257 points is refused");
+    CHECK(en_route(w, 0, pts) == -1, "... and one of 0");
+    double bad[3] = {0, NAN, 0};
+    CHECK(en_route(w, 1, bad) == -1 && en_stat(w, 6) == EN_R_VALUE, "... and one with a point not finite");
+    CHECK(en_stat(w, 3) == before + 3, "... each counted");
+    int r[32];
+    for (int i = 0; i < 32; i++) r[i] = en_route(w, 128, pts);
+    int ok = 1;
+    for (int i = 0; i < 32; i++) ok &= r[i] >= 0;
+    CHECK(ok, "32 routes of 128 points fill the 4,096-point pool");
+    CHECK(en_stat(w, 8) == 4096 && en_stat(w, 9) == 32, "... stat 8 counts the points held and stat 9 the routes");
+    CHECK(en_route(w, 1, pts) == -1 && en_stat(w, 6) == EN_R_FULL, "a route that would pass the pool is refused");
+    en_route_free(w, r[3]); en_route_free(w, r[5]);
+    CHECK(en_stat(w, 8) == 4096 - 256, "freeing two gives back their points");
+    CHECK(en_route(w, 129, pts) == -1 && en_stat(w, 6) == EN_R_FULL,
+          "a route of 129 points is refused with 256 free in two blocks of 128 (first fit, nothing compacted)");
+    int r3 = en_route(w, 128, pts);
+    CHECK(r3 >= 0, "... a route of 128 fits in a freed block");
+    en_route_free(w, r[4]);
+    CHECK(en_route(w, 256, pts) >= 0, "two neighbouring freed blocks join: a route of 256 fits");
+    en_route_free(w, r[0]);
+    before = en_stat(w, 3);
+    en_route_free(w, r[0]);
+    en_route_free(w, 9999);
+    CHECK(en_stat(w, 3) == before + 2 && en_stat(w, 6) == EN_R_ROUTE, "freeing a freed or an unknown route is refused and counted");
+    en_close(w);
+
+    /* follow on a freed or unknown route */
+    w = world(16);
+    k = walk_kind(w, 0.6f, 1);
+    double line[6] = {0, 0, 0, 100, 0, 0};
+    int ra = en_route(w, 2, line);
+    int64_t id = en_add(w, k, 0, 0, 0, 0);
+    en_route_free(w, ra);
+    before = en_stat(w, 3);
+    en_follow(w, id, ra, 2.0, 0);
+    en_follow(w, id, 77, 2.0, 0);
+    en_follow(w, id, -5, 2.0, 0);
+    CHECK(en_stat(w, 3) == before + 3 && en_stat(w, 6) == EN_R_ROUTE, "follow on a freed, an unknown or a negative route is refused and counted");
+    int rb = en_route(w, 2, line);
+    en_follow(w, id, rb, -1.0, 0);
+    en_follow(w, id, rb, NAN, 0);
+    en_follow(w, id, rb, 2.0, 2);
+    CHECK(en_stat(w, 3) == before + 6, "... and a speed negative or not finite, or loops not 0/1");
+    for (int i = 0; i < 60; i++) en_tick(w, 0, NULL, 1.0 / 60);
+    CHECK(pos_axis(w, id, 0) == 0, "an entity whose follows were all refused stays");
+    en_close(w);
+
+    /* a route freed while followed lives until its last follower stops */
+    w = world(16);
+    k = walk_kind(w, 0.6f, 1);
+    int rr = en_route(w, 2, line);
+    int64_t a = en_add(w, k, 0, 0, 0, 0), b = en_add(w, k, 0, 0, 0, 0), c = en_add(w, k, 0, 0, 2, 0);
+    double back[6] = {0, 0, 0, -100, 0, 0};
+    en_follow(w, a, rr, 2.0, 0); en_follow(w, b, rr, 2.0, 0);
+    en_route_free(w, rr);
+    CHECK(en_stat(w, 9) == 1 && en_stat(w, 8) == 2, "a route freed while followed is still held");
+    int other = en_route(w, 2, back);
+    CHECK(other >= 0 && other != rr, "a route made meanwhile takes another id and other points");
+    for (int i = 0; i < 60; i++) en_tick(w, 0, NULL, 1.0 / 60);
+    CHECK(fabs(pos_axis(w, a, 0) - 2.0) < 0.01 && fabs(pos_axis(w, b, 0) - 2.0) < 0.01, "its followers still follow its points");
+    before = en_stat(w, 3);
+    en_follow(w, c, rr, 2.0, 0);
+    CHECK(en_stat(w, 3) == before + 1, "... but a new follower is refused");
+    en_follow(w, a, -1, 0, 0);
+    CHECK(en_stat(w, 9) == 2, "one follower stopping leaves it held");
+    for (int i = 0; i < 60; i++) en_tick(w, 0, NULL, 1.0 / 60);
+    CHECK(fabs(pos_axis(w, a, 0) - 2.0) < 0.01 && fabs(pos_axis(w, b, 0) - 4.0) < 0.02, "the stopped one stays, the other goes on");
+    en_remove(w, b, 0);
+    CHECK(en_stat(w, 9) == 1 && en_stat(w, 8) == 2, "removing its last follower frees it");
+    en_close(w);
+}
+
 int main(void) {
     test_kinds();
     test_add_and_read();
@@ -872,6 +1194,11 @@ int main(void) {
     test_flyer_against_flyer();
     test_event_overflow();
     test_removal_in_loop();
+    test_sweep();
+    test_walking();
+    test_routes();
+    test_divisor();
+    test_route_limits();
     if (fails == 0) printf("ent_test: ok\n");
     return fails == 0 ? 0 : 1;
 }

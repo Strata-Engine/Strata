@@ -21,8 +21,11 @@
 -- kernel differs from `Strata.Query`). `blocks` hands it what
 -- `Strata.Stream` loaded, edited and unloaded since the last call; call it
 -- once a frame after `Strata.Stream.tick`. `step` runs the kernel's tick:
--- ages and lifetimes, and flying movement, seen flyers stopping at the first
--- block on their way. After movement the tick puts every live entity in a
+-- ages and lifetimes, then movement: seen flyers stop at the first block on
+-- their way; seen walkers are boxes swept against the blocks with gravity and
+-- a step height; unseen walkers follow their routes touching no blocks. A
+-- route (`route`) is a list of points held by the kernel and shared by any
+-- number of followers (`follow`). After movement the tick puts every live entity in a
 -- grid of 4 m cells, from which `near` and `raycast` answer until the next
 -- tick, and reports a touch for each overlapping pair of kinds declared with
 -- `touching`. `events` reads what the last tick reported.
@@ -215,7 +218,7 @@ mod Strata.Entities do
 
   doc "(live, seen, waiting for ground, refused calls)."
   fn stats(e : Entities) : (Int, Int, Int, Int) do (float_to_int(stat(e, 0)), float_to_int(stat(e, 1)), float_to_int(stat(e, 2)), float_to_int(stat(e, 3))) end
-  doc "A number of the kernel's: 0 live, 1 seen, 2 waiting for ground, 3 refused calls, 4 negative dt, 5 events dropped, 6 the last refusal's reason (EN_R_* in strata_ent.h), 7 over the body budget."
+  doc "A number of the kernel's: 0 live, 1 seen, 2 waiting for ground, 3 refused calls, 4 negative dt, 5 events dropped, 6 the last refusal's reason (EN_R_* in strata_ent.h), 7 over the body budget, 8 route points held, 9 routes held (a freed route still followed is held)."
   fn stat(e : Entities, which : Int) : Float do if e.en_live do Fen.stat(which) else 0.0 end end
 
   -- ── Blocks ───────────────────────────────────────────────────────────────
@@ -285,6 +288,7 @@ mod Strata.Entities do
   end
 
   -- ── The tick ─────────────────────────────────────────────────────────────
+  -- points as 3 Floats each into [a], from index 3 i (focus points and route points)
   pfn focus_go(a : NativeFloatArr, ps : List((Float, Float, Float)), i : Int) : NativeFloatArr do
     match ps do
       Nil -> a
@@ -292,7 +296,7 @@ mod Strata.Entities do
     end
   end
 
-  doc "The kernel's tick alone, [dt] seconds, with the [focus] points in metres (an entity within its kind's seen distance of one, measured horizontally, is seen; no focus, none is): ages and lifetimes, then movement (placed entities stay; flying ones move by their velocity, with gravity if the kind asks, and while seen stop at the first block in their way, reporting it); then the grid `near` and `raycast` read, and a touch event for each overlapping pair of declared kinds. A negative dt is counted (stat 4) and moves nothing. No figures, bodies or voices: those come with `tick`."
+  doc "The kernel's tick alone, [dt] seconds, with the [focus] points in metres (an entity within its kind's seen distance of one, measured horizontally, is seen; no focus, none is): ages and lifetimes, then movement (placed entities stay; flying ones move by their velocity, with gravity if the kind asks, and while seen stop at the first block in their way, reporting it; seen walking ones are swept against the blocks with gravity and their kind's step height, moved by their velocity or steered along their route; unseen walking ones follow their route touching no blocks, or stay). Unseen entities of a kind with tick divisor n move on every nth tick by n times dt. Then the grid `near` and `raycast` read, and a touch event for each overlapping pair of declared kinds. A negative dt is counted (stat 4) and moves nothing. No figures, bodies or voices: those come with `tick`."
   fn step(e : Entities, focus : List((Float, Float, Float)), dt : Float) : Entities do
     if !e.en_live do e
     else
@@ -333,6 +337,29 @@ mod Strata.Entities do
       if id >= 0 do (id, NativeArray.get_float(t, 0)) else (-1, -1.0) end
     end
   end
+
+  -- ── Routes and walking ────────────────────────────────────────────────────
+  doc "A route through [points] (metres; 1 to 256 of them), held by the kernel and shared by any number of followers. Answers its id, or -1 if refused: too many or too few points, a point not finite, or no room left in the kernel's pool of 262,144 points (a freed route's points are reused only by a route that fits in them)."
+  fn route(e : Entities, points : List((Float, Float, Float))) : (Entities, Int) do
+    if !e.en_live do (e, -1)
+    else
+      let n = List.length(points)
+      (e, Fen.route(focus_go(NativeArray.make_float(3 * n, 0.0), points, 0)))
+    end
+  end
+
+  doc "Free [route]: at once if nothing follows it, else once its last follower stops; from now on no new entity may follow it. Freeing a route not held, or freed already, is refused and counted."
+  fn free_route(e : Entities, route : Int) : Entities do
+    if e.en_live do after(Fen.route_free(route), e) else e end
+  end
+
+  doc "Walking entity [id] follows [route] from its first point at [speed] m/s, measured horizontally, starting again at the first point at the end if [loops]. Seen, it is steered toward each waypoint in turn (reached within 0.25 m) and reports event 8 if it makes no headway for a second; unseen, it moves along the straight lines between the points touching no blocks. At the end of a route that does not loop it reports event 5 and stops. Route -1 stops following. A route not held or freed, a speed negative or not finite, or an entity not walking is refused and counted."
+  fn follow(e : Entities, id : Int, route : Int, speed : Float, loops : Bool) : Entities do
+    if e.en_live do after(Fen.follow(id, route, speed, if loops do 1 else 0 end), e) else e end
+  end
+
+  doc "Whether walking entity [id] stood on something after its last seen step. False for an unseen walker, or a dead id."
+  fn grounded(e : Entities, id : Int) : Bool do if e.en_live do Fen.grounded(id) == 1 else false end end
 
   -- ── Events ───────────────────────────────────────────────────────────────
   -- code, a, b, i0, i1, i2, i3, x, y, z, and the block (read from the world for a block hit, else -1)
