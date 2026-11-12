@@ -50,10 +50,12 @@ if twice trap STRATA_COMBAT_SCENE=trap STRATA_FRAMES=1800; then
   else echo "FAIL trap: fell $fell cm (want 250 or more), inside at the end $inside (want 0), respawns $back (want 1 or more)"; cat "$OUT/trap.txt"; FAILED=1; fi
 fi
 # Fire: a fireball thrown at a tree's trunk burns wood and grass within 2 m and hurts the shooter standing a metre off by about 40.
-if twice fire STRATA_COMBAT_SCENE=fire STRATA_FRAMES=200; then
+# What it reaches catches over seconds and burns for seconds more: still burning a second after the throw, out by the end.
+if twice fire STRATA_COMBAT_SCENE=fire STRATA_FRAMES=720; then
   wood=$(num fire '^combat: fire burned [0-9]* cells: wood \([0-9]*\), .*$'); grass=$(num fire '^combat: fire burned .*, grass \([0-9]*\), .*$'); left=$(num fire '^combat: fire burned .*, bystander health \([0-9]*\)$')
-  if [ "$wood" -ge 1 ] && [ "$grass" -ge 1 ] && [ "$left" -ge 10 ] && [ "$left" -le 35 ]; then echo "ok   fire: burned $wood wood and $grass grass; the bystander is left with $left of 60"
-  else echo "FAIL fire: wood $wood, grass $grass (want 1 or more of each), bystander left with $left (want 10 to 35)"; cat "$OUT/fire.txt"; FAILED=1; fi
+  burning=$(num fire '^combat: fire burning \([0-9]*\) cells at frame 120$'); later=$(num fire '^combat: fire burning \([0-9]*\) cells at frame 600$')
+  if [ "$wood" -ge 1 ] && [ "$grass" -ge 1 ] && [ "$left" -ge 10 ] && [ "$left" -le 35 ] && [ "$burning" -ge 1 ] && [ "$later" -eq -1 ]; then echo "ok   fire: burned $wood wood and $grass grass, $burning cells burning at frame 120 and none at 600; the bystander is left with $left of 60"
+  else echo "FAIL fire: wood $wood, grass $grass (want 1 or more of each), burning at frame 120 $burning (want 1 or more), at 600 $later (want none), bystander left with $left (want 10 to 35)"; cat "$OUT/fire.txt"; FAILED=1; fi
 fi
 # Water: a rusher swims a 6 m channel to its target, at the surface, climbs out and strikes.
 if twice channel STRATA_COMBAT_SCENE=channel STRATA_FRAMES=1800; then
@@ -92,8 +94,8 @@ fi
 if twice ten STRATA_COMBAT_PLAYER=0 STRATA_COMBAT_WIN=3 STRATA_COMBAT_REPEAT=9 STRATA_FRAMES=90000; then
   wins=$(grep -c '^combat: winner [A-Za-z]* 3 at frame' "$OUT/ten.txt"); ents=$(num ten '^combat: matches 10, live entities \([0-9]*\), figures [0-9]*$'); figs=$(num ten '^combat: matches 10, live entities [0-9]*, figures \([0-9]*\)$')
   starts=$(sed -n 's/^combat: rematch [0-9]*: \(.*\)$/\1/p' "$OUT/ten.txt" | sort -u | wc -l | tr -d ' '); first=$(sed -n 's/^combat: rematch [0-9]*: \(.*\)$/\1/p' "$OUT/ten.txt" | head -1)
-  if [ "$wins" -eq 10 ] && [ "$(grep -c '^combat: rematch ' "$OUT/ten.txt")" -eq 9 ] && [ "$starts" -eq 1 ] && [ "$first" = "entities added 11, figures 15" ]; then echo "ok   ten matches: ten winners; each rematch begins with 11 entities and 15 figures, nothing left over"
-  else echo "FAIL ten matches: $wins winners (want 10); rematches begin with $starts different counts (want 1: entities added 11, figures 15), the first: $first"; cat "$OUT/ten.txt"; FAILED=1; fi
+  if [ "$wins" -eq 10 ] && [ "$(grep -c '^combat: rematch ' "$OUT/ten.txt")" -eq 9 ] && [ "$starts" -eq 1 ] && [ "$first" = "entities added 11, figures 15, burning 0, emitters 0" ]; then echo "ok   ten matches: ten winners; each rematch begins with 11 entities and 15 figures, no fire and no emitters, nothing left over"
+  else echo "FAIL ten matches: $wins winners (want 10); rematches begin with $starts different counts (want 1: entities added 11, figures 15, burning 0, emitters 0), the first: $first"; cat "$OUT/ten.txt"; FAILED=1; fi
 fi
 # The match with no player: someone reaches 30, and the same someone the second time.
 if twice match STRATA_COMBAT_PLAYER=0 STRATA_FRAMES=90000; then
