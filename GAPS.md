@@ -335,8 +335,29 @@ change a March user meets with no pointer from the old behaviour.
 - **A panic in one test can end the run.** With the hash panicking, the test
   binary died with SIGSEGV or SIGBUS part of the way through and printed no
   list of failures; `--verbose` on the binary was the way to see them.
-- **Names for one-line matches.** `match o do Some(p) -> a  None -> b end`
+- **One-line matches.** `match o do Some(p) -> a  None -> b end`
   on one line is a parse error; each arm needs its own line.
 - **Test aliases share one space.** `alias Strata.Steer as Sr` in a test
   collided with `alias Strata.Store as Sr` in another ("`Strata.Store.seek`
   is not a function in scope"); as before, a test's aliases must be its own.
+
+## S38: on March main the suite's properties really run, from a seed taken off the clock
+
+S31 said a `Check.all` never fails under `forge test`. That was March 0.5.0.
+On main (`f6481bbe6`) a false property fails, with the run, the shrunk input
+and the seed. Strata has 148 `Check.all` calls that had therefore never
+checked anything, and they now run 100 cases each from a seed that differs
+every run (`MARCH_PROP_SEED`, or `forge test --seed=N`, fixes it). Two
+things followed on the first full run:
+
+- `Query.raycast agrees with a fine sampler` failed on run 69: a ray that
+  passes through the very edge of a voxel. The ray cast reports the hit; the
+  test's own check that the ray is inside the voxel 0.002 past the hit is
+  false, because it has already left. The test was wrong, not the ray cast;
+  it now accepts a hit whose point lies on the voxel when the 1/64 sampler
+  saw nothing.
+- `Fluid properties: the amount is conserved...` runs a 400-step simulation
+  a hundred times and takes minutes.
+
+The properties are worth having. What is owed: a fixed seed in the gate so a
+failure can be replayed, and a pass over the slow ones.
