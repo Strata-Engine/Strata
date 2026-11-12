@@ -908,3 +908,38 @@ Misses and what is not known:
 - The bots-only match takes 15.8 minutes; the design gave no length.
 - Nothing here was played by hand yet.
 
+
+## Path finding (Strata.Nav), measured in the match
+
+March main (`f6481bbe6`), release build, hidden scripted runs
+(`scripts/combat_check.sh`). The machine was heavily loaded by other work
+while these ran (load average near 90), so the times are upper bounds.
+
+| | going straight (`STRATA_COMBAT_NAV=0`) | with path finding |
+|---|---|---|
+| fence scene, 900 frames: strikes on the target behind the wall | 0 | 3 |
+| bots-only match: frame the winner reaches 30 | 51,697 | 42,475 |
+| bots-only match: kills in all | 168 | 213 |
+| bots-only match: fighters put back by the idle rule | 3 | 2 |
+
+The match of twelve is 18% shorter and has a quarter more kills in it:
+fighters reach each other sooner. The idle rule already fired rarely once
+fighters could swim; path finding does not change that much.
+
+Cost of a plan (a `straight` test that failed, then `find` with a budget of
+1200 cells and `smooth`), on the frame that makes it:
+
+| | plans | arrived | cells expanded | mean | worst |
+|---|---|---|---|---|---|
+| fence scene | 8 | 8 | 2,571 | 1.8 ms | 3.2 ms |
+| bots-only match, 42,475 frames | 1,993 | 1,991 | 1,064,318 | 3.0 ms | 9.2 ms |
+
+That is about one plan every 21 frames among eleven fighters, 534 cells
+expanded a plan, and near 5.5 microseconds a cell. A worst plan of 9 ms is
+more than half a 16.7 ms frame: planning belongs on a worker, or the cost a
+cell must come down, before a game with many walkers leans on it. What the
+cost is made of (the store lookup behind `Strata.World.get_block`, or the
+search's own arrays) has not been profiled.
+
+All twelve combat checks pass, each run twice with the same result. The
+library's Nav and Steer tests (27) and the viewer's tests (92) pass.

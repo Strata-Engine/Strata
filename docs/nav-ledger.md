@@ -25,7 +25,7 @@ Ruling: `STRATA_COMBAT_NAV=0` keeps the old behaviour runnable, so the differenc
 Finding: on March main `Strata.Coord.key_hash` panicked with integer overflow, which stopped 197 library tests and crashed the test binary. One multiplication; fixed with `int_wrapping_mul` (and three more like it).
 Finding: on March main the suite's 148 properties run for the first time (GAPS S38). One test's own checker was wrong for a ray grazing a voxel's edge (fixed); one fluid property is very slow.
 Finding: a lambda that prints or reads a file fails March main's capability check, charged to no module (GAPS S35).
-Finding: a search costs about 10 microseconds a cell expanded in the match (see RESULTS). Not yet profiled against the March performance goal: how much is `Strata.World.get_block` (a store lookup a cell) and how much the search itself is not known.
+Finding: a search costs about 5.5 microseconds a cell expanded in the match, 3 ms a plan and 9 ms at worst, on a loaded machine (see RESULTS). Not yet profiled against the March performance goal: how much is `Strata.World.get_block` (a store lookup a cell) and how much the search itself is not known.
 
 ## Review (one fresh reviewer, read-only, lib/strata/nav.march, steer.march and the match's use of them)
 
@@ -40,6 +40,14 @@ Review: fixed a rusher swinging at a remembered target through a wall (a swing l
 Review: fixed the heap's size, which a walker with a long drop could outrun (a neighbour was then silently dropped) -- sized from the walker's step and drop.
 Review: Ruling: the rusher's memory counts 0.25 s a decision, not elapsed time; decisions are every 15 frames and the match's step is fixed, so they agree.
 Review: a test helper of mine was wrong, not the code: two neighbouring cells of a path are one legal move and need not be `straight` under the stricter rule (a diagonal beside water).
+
+## Checks on the final code (feb4463)
+
+scripts/combat_check.sh: PASS, twelve scenes, each twice (23 minutes). Bots-only match: winner at frame 42,475 with path finding, 51,697 without, same build.
+forge lint --strict: clean in the library, viewer, demo and the three checkers.
+Viewer tests: 92 of 92. Nav 20 of 20, Steer 7 of 7.
+Library suite as a whole: NOT passed. With a fixed seed 461 tests passed and none failed, then the test program ended with no summary inside `Fluid properties: the amount is conserved`, 18 minutes in. Open.
+Not run on March main: scripts/golden.sh (the stored pictures; the three combat pictures will have moved), audio_golden.sh, anim_check.sh, ent_check.sh, the C tests, the demo's build and test.
 
 ## Before main
 
