@@ -298,3 +298,45 @@ assignment `A="1 B=2"`. Three scripted viewer runs lost STRATA_HIDDEN that
 way and opened a window. Workaround: a shell function that lists the
 settings and takes the rest as "$@" (`scripts/combat_check.sh`'s `run`).
 
+
+## S35: on March main a lambda that prints or reads a file fails the capability check
+
+Met moving the viewer to March main (`f6481bbe6`): `List.find(ds, fn p ->
+Authority.must(File.exists(p)))` and a `List.fold_left` whose lambda prints,
+both inside a module that declares `needs IO` and `IO.FileSystem`, fail the
+build with "Module `LibCheck` uses `IO.FileRead` but does not declare `needs
+IO.FileRead`" (and the same for `IO.Console`), at no file and line 0:0.
+`LibCheck` is the module forge wraps a multi-file build in; the lambda's code
+is charged to it, not to the module it was written in. Workaround: a named
+private function in place of the lambda (`first_there` and `say_lines` in
+the viewer).
+
+## S36: `on` cannot be a parameter name
+
+`fn with_nav(m : MtMatch, on : Bool)` is "I got stuck here" at `on`: it is
+the actor keyword. Workaround: another name. (With `by`, S32.)
+
+## S37: what moving from March 0.5.0 to main (`f6481bbe6`) took
+
+Recorded so the next toolchain step is cheaper, and because each is a
+change a March user meets with no pointer from the old behaviour.
+
+- **Capability results.** `File.*`, `Dir.*`, `Env.get*`, `println`,
+  `Process.pid` now answer `Result(_, CapError)`; every call was wrapped in
+  `Authority.must` (about 150 sites, by script). `File.read` answers a
+  result inside that result.
+- **Integers are 63 bits and overflow panics.** `attempt to multiply with
+  overflow` stopped 197 of the library's tests, all through one function:
+  `Strata.Coord.key_hash` multiplies a 32-bit value by a 31-bit constant.
+  Under 0.5.0 that wrapped silently. Fixed with `int_wrapping_mul` there and
+  in `Strata.Stream`'s and `Strata.Physics`'s hashes and one test's; the
+  low 32 bits, which are all those hashes keep, are the same as before. A
+  panic of this kind names no file or line.
+- **A panic in one test can end the run.** With the hash panicking, the test
+  binary died with SIGSEGV or SIGBUS part of the way through and printed no
+  list of failures; `--verbose` on the binary was the way to see them.
+- **Names for one-line matches.** `match o do Some(p) -> a  None -> b end`
+  on one line is a parse error; each arm needs its own line.
+- **Test aliases share one space.** `alias Strata.Steer as Sr` in a test
+  collided with `alias Strata.Store as Sr` in another ("`Strata.Store.seek`
+  is not a function in scope"); as before, a test's aliases must be its own.
