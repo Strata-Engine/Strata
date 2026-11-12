@@ -722,7 +722,7 @@ trusted numbers only.
 | figures / layers / parts | 4096 / 8 / 64 | `AN_FIGURES`, `AN_LAYERS`, `AN_PARTS` in `strata_anim.h` | | met (the kernel's limits) |
 | C memory, 4096 figures, two poses | 48 MB | 46.34 MB (Task 5, sizeof) | | met |
 | GPU memory for figure quads | 64 MB | 708 quads, 5.7 KB, for all six rigs; 2 MB of instance buffers | | met |
-| added to the soak's worst frame, no figures | under 0.1 ms | 0.021 ms CPU (worst figure preparation), 0 ms GPU (no shadow pass), 0 updates; soak at load 37-54 | | met as measured by the figure path's own clocks; the soak's frame-time checks not judged |
+| added to the soak's worst frame, no figures | under 0.1 ms | CPU: the figure path's worst 0.021 ms (stat 20); GPU: no figure shadow pass ran (stat 21, 0 ms); 0 updates; load 37-54 | | not judged; both parts under the target even at this load, but the light pass's share with no figures is unmeasured (see "traced, none opted in") |
 
 The configurations: A0 is the arena with no figure world (`STRATA_ARENA=-1`).
 A is the world open with no figures. B is 512 runners, none traced, no
@@ -749,7 +749,9 @@ frame means:
 - **Traced.** 32 traced add about 3.1 ms, and 64 add 4.5-5.1 ms. That is
   more than Task 8's 2.1 ms for 64 because the pixels are four times as
   many (2560 x 1600 against 1280 x 800): the rays are paid per pixel.
-- **Frame rate.** The frame is GPU-bound: the CPU spends 1.1-1.4 ms in
+- **Frame rate.** These runs were scripted with the display off
+  (`STRATA_UI` is 0 by default), so the HUD and the crosshair's hit ray
+  are not in their frames. The frame is GPU-bound: the CPU spends 1.1-1.4 ms in
   the shim and March (the update and ground included), then waits 6-8 ms
   for the GPU. At about 10.5-11.3 ms of GPU it runs at 87-95 fps. Where
   the time goes: the world alone (A) about 5.3 ms, the figure pass about
@@ -766,8 +768,11 @@ frame means:
   The animation was never updated. The renderer's figure path took at
   most 21 µs of CPU in any of 3000 frames (the draw-list call that finds
   nothing) and ran no shadow pass. The soak now checks these (stats 20 and
-  21). The worst frame itself cannot show a 0.1 ms difference at this
-  load: it was 94 ms. The same load failed the soak's own frame-time,
+  21). That is CPU time and the figure shadow pass only: the light pass's
+  figure code with none traced (the traced-figure list check, the movers
+  buffer of 144 boxes) and the G-buffer's empty figure path are not timed
+  by them, so the row is not judged. The worst frame itself cannot show a
+  0.1 ms difference at this load: it was 94 ms. The same load failed the soak's own frame-time,
   fluid-step and mixer checks, which have nothing to do with figures (see
   the soak notes above).
 
