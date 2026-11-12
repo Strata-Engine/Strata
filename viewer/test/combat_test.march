@@ -1,0 +1,232 @@
+-- Combat: the rules of the free-for-all (docs/2026-11-12-combat-design.md).
+mod StrataViewer.Test.Combat do
+
+  -- the app's capabilities are charged to its test module too (GAPS S3)
+  needs IO.Console
+  needs IO.FileRead
+  needs IO.Process
+  needs IO.Spawn
+  needs IO.FileSystem
+  needs IO.Clock
+  import Test
+  alias StrataViewer.Combat as Cb
+
+  -- [n] hits of [damage] on [victim] by [who]; the fighters after, and how many of the hits killed
+  pfn hits(fs : List(StrataViewer.Combat.CbFighter), victim : Int, who : Int, damage : Int, n : Int, killed : Int) : (List(StrataViewer.Combat.CbFighter), Int) do
+    if n <= 0 do (fs, killed)
+    else
+      match Cb.hit(fs, victim, who, damage) do
+        (fs2, o) -> hits(fs2, victim, who, damage, n - 1, if Cb.killed(o) do killed + 1 else killed end)
+      end
+    end
+  end
+  -- fighter [i] given [k] kills by killing fighter 11 over and over (it is brought back between)
+  pfn with_kills(fs : List(StrataViewer.Combat.CbFighter), i : Int, k : Int) : List(StrataViewer.Combat.CbFighter) do
+    if k <= 0 do fs
+    else
+      match Cb.hit(fs, 11, i, 1000) do
+        (fs2, _) -> match Cb.tick(fs2, 3.1) do (fs3, _) -> with_kills(fs3, i, k - 1) end
+      end
+    end
+  end
+  pfn idle_for(f : StrataViewer.Combat.CbFighter, steps : Int, moved : Float, fought : Bool) : (StrataViewer.Combat.CbFighter, Bool) do
+    if steps <= 0 do (f, false)
+    else
+      match Cb.idle(f, moved, fought, 0.1) do
+        (f2, true) -> (f2, true)
+        (f2, false) -> if steps == 1 do (f2, false) else idle_for(f2, steps - 1, moved, fought) end
+      end
+    end
+  end
+  pfn dist(a : (Float, Float), b : (Float, Float)) : Float do
+    match a do (ax, az) -> match b do (bx, bz) -> Math.sqrt((ax -. bx) *. (ax -. bx) +. (az -. bz) *. (az -. bz)) end end
+  end
+  pfn closest(p : (Float, Float), l : List((Float, Float)), best : Float) : Float do
+    match l do
+      Nil -> best
+      Cons(q, rest) -> closest(p, rest, if dist(p, q) < best do dist(p, q) else best end)
+    end
+  end
+  -- the least distance between any two of the points
+  pfn least_gap(l : List((Float, Float)), best : Float) : Float do
+    match l do
+      Nil -> best
+      Cons(p, rest) -> least_gap(rest, closest(p, rest, best))
+    end
+  end
+  pfn all_between(l : List((Float, Float)), lo : Float, hi : Float) : Bool do
+    match l do
+      Nil -> true
+      Cons(p, rest) -> if dist(p, (0.0, 0.0)) < lo do false else if dist(p, (0.0, 0.0)) > hi do false else all_between(rest, lo, hi) end end
+    end
+  end
+  pfn has_cell(l : List((Int, Int, Int)), x : Int, y : Int, z : Int) : Bool do
+    match l do
+      Nil -> false
+      Cons((a, b, c), rest) -> if a == x && b == y && c == z do true else has_cell(rest, x, y, z) end
+    end
+  end
+  pfn same_intent(a : StrataViewer.Combat.CbIntent, b : Int) : Bool do Cb.intent_code(a) == b end
+
+  describe "Combat rules" do
+    test "damage_table: arrows and fire fell fighters as the design's table says" do
+      let fs = Cb.roster()
+      Test.assert_eq_int(List.length(fs), 12, "twelve fighters")
+      Test.assert_eq_int(match hits(fs, 1, 0, Cb.arrow_damage(), 2, 0) do (_, k) -> k end, 0, "two arrows do not fell a rusher")
+      Test.assert_eq_int(match hits(fs, 1, 0, Cb.arrow_damage(), 3, 0) do (_, k) -> k end, 1, "three do")
+      Test.assert_eq_int(match hits(fs, 8, 0, Cb.arrow_damage(), 1, 0) do (_, k) -> k end, 0, "one arrow does not fell a shooter")
+      Test.assert_eq_int(match hits(fs, 8, 0, Cb.arrow_damage(), 2, 0) do (_, k) -> k end, 1, "two do")
+      Test.assert_eq_int(Cb.fire_damage(0.0), 60, "fire at the centre")
+      Test.assert_eq_int(Cb.fire_damage(1.0), 40, "fire at 1 m")
+      Test.assert_eq_int(Cb.fire_damage(2.0), 20, "fire at 2 m")
+      Test.assert_eq_int(Cb.fire_damage(2.01), 0, "fire beyond 2 m")
+      Test.assert_eq_int(match hits(fs, 8, 0, Cb.fire_damage(0.0), 1, 0) do (_, k) -> k end, 1, "one fireball fells a shooter")
+      Test.assert_eq_int(match hits(fs, 1, 0, Cb.fire_damage(0.0), 1, 0) do (_, k) -> k end, 0, "one does not fell a rusher")
+      Test.assert_eq_int(match hits(fs, 1, 0, Cb.fire_damage(0.0), 2, 0) do (_, k) -> k end, 1, "two do")
+      Test.assert_eq_int(Cb.swing_damage(), 25, "a swing")
+    end
+
+    test "one_death_a_tick: a second killing hit on a dead fighter is ignored" do
+      match Cb.hit(Cb.roster(), 3, 1, 100) do
+        (fs1, o1) ->
+          match Cb.hit(fs1, 3, 2, 100) do
+            (fs2, o2) ->
+              Test.assert_eq_int(Cb.credit(o1), 1, "the first hit kills, credited to 1")
+              Test.assert_eq_int(Cb.credit(o2), -20, "the second is ignored")
+              Test.assert_eq_int(Cb.deaths(fs2, 3), 1, "one death")
+              Test.assert_eq_int(Cb.kills(fs2, 2), 0, "no kill for the second")
+              Test.assert_eq_int(Cb.kills(fs2, 1), 1, "one for the first")
+          end
+      end
+    end
+
+    test "self_kill_credits_no_one" do
+      match Cb.hit(Cb.roster(), 0, 0, 100) do
+        (fs, o) ->
+          Test.assert_eq_int(Cb.credit(o), -1, "killed, no credit")
+          Test.assert_eq_int(Cb.kills(fs, 0), 0, "no kill")
+          Test.assert_eq_int(Cb.deaths(fs, 0), 1, "one death")
+      end
+    end
+
+    test "credit_outlives_the_shooter: a dead fighter's arrow still counts" do
+      match Cb.hit(Cb.roster(), 8, 1, 100) do
+        (fs1, _) ->
+          match Cb.hit(fs1, 1, 8, 100) do
+            (fs2, o) ->
+              Test.assert_eq_int(Cb.credit(o), 8, "credited to the dead shooter")
+              Test.assert_eq_int(Cb.kills(fs2, 8), 1, "its kill is kept")
+          end
+      end
+    end
+
+    test "first_to_thirty_wins: nothing counts after the winning kill" do
+      let fs = with_kills(with_kills(Cb.roster(), 1, 29), 2, 29)
+      Test.assert_eq_int(Cb.winner(fs), -1, "no winner at 29")
+      match Cb.hit(fs, 5, 1, 1000) do
+        (fs1, _) ->
+          match Cb.hit(fs1, 6, 2, 1000) do
+            (fs2, o) ->
+              Test.assert_eq_int(Cb.winner(fs2), 1, "the first to thirty")
+              Test.assert_eq_int(Cb.kills(fs2, 2), 29, "the later kill does not count")
+              Test.assert_eq_int(Cb.credit(o), -1, "and is credited to no one")
+          end
+      end
+    end
+
+    test "back_after_three_seconds: at full health" do
+      match Cb.hit(Cb.roster(), 8, 0, 100) do
+        (fs1, _) ->
+          match Cb.tick(fs1, 2.9) do
+            (fs2, back2) ->
+              Test.assert_eq_int(List.length(back2), 0, "not yet")
+              match Cb.tick(fs2, 0.2) do
+                (fs3, back3) ->
+                  Test.assert_true(back3 == [8], "the shooter is back")
+                  Test.assert_true(Cb.alive(fs3, 8), "alive")
+                  Test.assert_eq_int(Cb.health(fs3, 8), 60, "at a shooter's full health")
+              end
+          end
+      end
+    end
+
+    test "standings_order: kills, then fewer deaths, then index" do
+      -- 0: 5 kills 2 deaths; 1: 5 kills 1 death; 2: 7 kills 0 deaths
+      let a = with_kills(with_kills(with_kills(Cb.roster(), 0, 5), 1, 5), 2, 7)
+      let b = match Cb.hit(a, 0, 11, 1000) do (x, _) -> match Cb.tick(x, 3.1) do (y, _) -> y end end
+      let c = match Cb.hit(b, 0, 11, 1000) do (x, _) -> match Cb.tick(x, 3.1) do (y, _) -> y end end
+      let d = match Cb.hit(c, 1, 11, 1000) do (x, _) -> match Cb.tick(x, 3.1) do (y, _) -> y end end
+      Test.assert_true(List.take(Cb.standings(d), 3) == [2, 1, 0], "2, then 1, then 0")
+      Test.assert_eq_int(List.length(Cb.standings(d)), 12, "everyone is listed")
+    end
+
+    test "idle_rule: twenty seconds without moving or fighting" do
+      let f = Cb.at(Cb.roster(), 1)
+      Test.assert_false(match idle_for(f, 199, 0.0, false) do (_, hit) -> hit end, "19.9 s is not yet")
+      Test.assert_true(match idle_for(f, 201, 0.0, false) do (_, hit) -> hit end, "20 s is")
+      let nearly = match idle_for(f, 199, 0.0, false) do (g, _) -> g end
+      let moved = match Cb.idle(nearly, 2.0, false, 0.1) do (g, _) -> g end
+      Test.assert_false(match idle_for(moved, 150, 0.0, false) do (_, hit) -> hit end, "moving 2 m starts the count again")
+      let fought = match Cb.idle(nearly, 0.0, true, 0.1) do (g, _) -> g end
+      Test.assert_false(match idle_for(fought, 150, 0.0, false) do (_, hit) -> hit end, "so does a hit")
+    end
+
+    test "nearest_clear_target" do
+      let at = [(0.0, 0.0, 0.0), (10.0, 0.0, 0.0), (0.0, 0.0, 20.0), (50.0, 0.0, 0.0)]
+      let alive = [true, true, true, true]
+      Test.assert_eq_int(Cb.target(0, at, alive, fn i -> i != 1), 2, "the nearest it can see")
+      Test.assert_eq_int(Cb.target(0, at, alive, fn _ -> false), -1, "none clear")
+      Test.assert_eq_int(Cb.target(0, at, alive, fn _ -> true), 1, "never itself")
+      Test.assert_eq_int(Cb.target(0, at, [true, false, true, true], fn _ -> true), 2, "never the dead")
+      Test.assert_eq_int(Cb.target(0, [(0.0, 0.0, 0.0), (50.0, 0.0, 0.0)], [true, true], fn _ -> true), -1, "none beyond 40 m")
+    end
+
+    test "intents: what a fighter means to do" do
+      Test.assert_true(same_intent(Cb.intent(Cb.rusher(), true, false, 3, 5.0, 0.0), 0), "off the field: return")
+      Test.assert_true(same_intent(Cb.intent(Cb.rusher(), false, true, 3, 1.0, 0.0), 7), "swimming, even in reach: swim")
+      Test.assert_true(same_intent(Cb.intent(Cb.rusher(), false, false, -1, 0.0, 0.0), 1), "no target: wander")
+      Test.assert_true(same_intent(Cb.intent(Cb.rusher(), false, false, 3, 1.5, 0.0), 3), "a rusher in reach, cool: swing")
+      Test.assert_true(same_intent(Cb.intent(Cb.rusher(), false, false, 3, 1.5, 0.4), 2), "in reach, not cool: chase")
+      Test.assert_true(same_intent(Cb.intent(Cb.rusher(), false, false, 3, 9.0, 0.0), 2), "out of reach: chase")
+      Test.assert_true(same_intent(Cb.intent(Cb.shooter(), false, false, 3, 8.0, 0.0), 5), "a shooter under 12 m: retreat")
+      Test.assert_true(same_intent(Cb.intent(Cb.shooter(), false, false, 3, 30.0, 0.0), 2), "over 25 m: chase")
+      Test.assert_true(same_intent(Cb.intent(Cb.shooter(), false, false, 3, 18.0, 0.0), 6), "between, cool: shoot")
+      Test.assert_true(same_intent(Cb.intent(Cb.shooter(), false, false, 3, 18.0, 0.7), 4), "between, not cool: hold")
+    end
+
+    test "spawn_farthest: the point farthest from its nearest living fighter" do
+      let points = [(10.0, 0.0, 0.0), (40.0, 0.0, 0.0), (70.0, 0.0, 0.0)]
+      Test.assert_eq_int(Cb.spawn_at(points, [(0.0, 0.0, 0.0)]), 2, "the third")
+      Test.assert_eq_int(Cb.spawn_at(points, [(0.0, 0.0, 0.0), (72.0, 0.0, 0.0)]), 1, "the middle one, with a fighter at each end")
+      Test.assert_eq_int(Cb.spawn_at(points, Nil), 0, "the first with no one living")
+    end
+
+    test "ring_shape: sixteen spread points" do
+      let r = Cb.ring(0.0, 0.0)
+      Test.assert_eq_int(List.length(r), 16, "sixteen")
+      Test.assert_true(all_between(r, 30.0, 72.0), "between 30 and 72 m of the middle")
+      Test.assert_true(least_gap(r, 1000.0) > 10.0, "no two within 10 m")
+    end
+
+    test "fire_burns: wood, leaves, tall grass and ice go; grass turns to dirt" do
+      Test.assert_eq_int(Cb.burns(7), 0, "wood")
+      Test.assert_eq_int(Cb.burns(8), 0, "leaves")
+      Test.assert_eq_int(Cb.burns(11), 0, "tall grass")
+      Test.assert_eq_int(Cb.burns(13), 0, "ice")
+      Test.assert_eq_int(Cb.burns(3), 2, "grass to dirt")
+      Test.assert_true(Cb.burns(1) == -1 && Cb.burns(2) == -1 && Cb.burns(4) == -1 && Cb.burns(5) == -1 && Cb.burns(6) == -1 && Cb.burns(10) == -1, "stone, dirt, sand, water, snow and glass stay")
+      let cells = Cb.burn_cells(0.5, 0.5, 0.5)
+      Test.assert_eq_int(List.length(cells), 33, "33 cells within 2 m of a cell's centre")
+      Test.assert_true(has_cell(cells, 0, 0, 0) && has_cell(cells, 1, 0, 0) && has_cell(cells, 0, -2, 0), "the centre, a neighbour, two below")
+      Test.assert_false(has_cell(cells, 2, 2, 0), "not a far corner")
+    end
+
+    test "tools: the bow, fire, then blocks" do
+      Test.assert_eq_int(Cb.tool(0), 0, "the bow")
+      Test.assert_eq_int(Cb.tool(1), 1, "fire")
+      Test.assert_eq_int(Cb.tool(2), 3, "stone")
+      Test.assert_eq_int(Cb.tool(3), 4, "dirt")
+      Test.assert_true(Cb.tool(8) >= 3, "a block in the last slot")
+    end
+  end
+end
