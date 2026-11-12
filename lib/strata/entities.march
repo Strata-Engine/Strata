@@ -45,6 +45,10 @@
 -- entity's velocity and reads a dynamic one back, and removes the body when
 -- the entity leaves view or is removed. Without a body it stays where it is.
 --
+-- `snapshot` copies the whole entity world into three native arrays and
+-- `restore` rebuilds it from them, every entity unseen; `restore_with` and
+-- `close_with` first free the parts entities hold.
+--
 -- A consumer lists native/strata_ent.c in its own [ffi] sources (GAPS S11).
 -- `spawn` is a March keyword, so an entity is made with `add` (GAPS S22).
 mod Strata.Entities do
@@ -160,7 +164,7 @@ mod Strata.Entities do
     { en_kinds: kinds, en_bodies: budget, en_live: ok, en_table: false }
   end
 
-  doc "Free the entity world. Its entities are gone; open again to start over."
+  doc "Free the entity world. Its entities are gone; open again to start over. It does not free their parts: the figures, bodies and voices entities hold, and those waiting on the release list, stay in Strata.Anim, Strata.Physics and Strata.Sound. A game that gave its entities parts closes with `close_with`."
   fn close(e : Entities) : Entities do
     if e.en_live do Strata.Ffi.Ent.close() else () end
     { e with en_live: false }
@@ -528,6 +532,68 @@ mod Strata.Entities do
       let (n, figs, poses) = holders(0)
       let a3 = if n == 0 do a2 else Strata.Anim.place_many(a2, n, figs, poses) end
       (e2, p1, a3, moved(3, moved(2, s2)))
+    end
+  end
+
+  -- every part held, and every part waiting on the release list, freed: the list drained (so the parts fit on it),
+  -- every held part put on it, and drained again
+  pfn release_every(p : Strata.Physics.Physics, a : Strata.Anim.Anim, s : Strata.Sound.Sound) : (Strata.Physics.Physics, Strata.Anim.Anim, Strata.Sound.Sound) do
+    let (p1, a1, s1) = released(p, a, s)
+    after(Fen.release_all(), released(p1, a1, s1))
+  end
+
+  doc "`close`, after freeing every part the entities hold and every part waiting on the release list, as `tick` frees them (`Strata.Anim.remove`, `Strata.Physics.remove`, `Strata.Sound.stop` with a 0.1 s fade)."
+  fn close_with(e : Entities, p : Strata.Physics.Physics, a : Strata.Anim.Anim, s : Strata.Sound.Sound) : (Entities, Strata.Physics.Physics, Strata.Anim.Anim, Strata.Sound.Sound) do
+    if !e.en_live do (e, p, a, s)
+    else
+      let (p1, a1, s1) = release_every(p, a, s)
+      (close(e), p1, a1, s1)
+    end
+  end
+
+  -- ── Snapshot and restore ─────────────────────────────────────────────────
+  -- The whole entity world as three native arrays: ints, floats and doubles, laid out as native/strata_ent_snap.h
+  -- describes (the rows in dense order, generations, free rows, routes, the tick counter and the removals not yet
+  -- reported). No seen state, parts, events or blocks.
+  type Snapshot = Snapshot(NativeI32Arr, NativeF32Arr, NativeFloatArr)
+
+  doc "The snapshot's three arrays: (ints, floats, doubles). Byte for byte what a save or a wire format would carry."
+  fn snapshot_arrays(s : Snapshot) : (NativeI32Arr, NativeF32Arr, NativeFloatArr) do match s do Snapshot(i, f, d) -> (i, f, d) end end
+  doc "A snapshot from three arrays as `snapshot_arrays` gave them."
+  fn snapshot_of(ints : NativeI32Arr, floats : NativeF32Arr, doubles : NativeFloatArr) : Snapshot do Snapshot(ints, floats, doubles) end
+
+  doc "A copy of the whole entity world: every entity's kind, id, position, velocity, facing, age, slots and route progress, in dense order, with the routes, the free rows and generations (so ids handed out before still resolve after a restore), the tick counter and the removals the next `step` will report. Seen state is not kept: a seen entity is copied as leaving view would leave it. Empty arrays when not open."
+  fn snapshot(e : Entities) : Snapshot do
+    let ni = if e.en_live do Fen.snapshot_size(0) else 0 end
+    let ints = NativeArray.make_i32(ni, 0)
+    let floats = NativeArray.make_f32(if e.en_live do Fen.snapshot_size(1) else 0 end, 0.0)
+    let doubles = NativeArray.make_float(if e.en_live do Fen.snapshot_size(2) else 0 end, 0.0)
+    if ni == 0 do Snapshot(ints, floats, doubles)
+    else if Fen.snapshot(ints, floats, doubles) == 1 do Snapshot(ints, floats, doubles)
+    else Snapshot(NativeArray.make_i32(0, 0), NativeArray.make_f32(0, 0.0), NativeArray.make_float(0, 0.0)) end end
+  end
+
+  doc "Rebuild the entity world from [s]: every entity, route and free row as the snapshot holds them, every entity unseen with no parts; the next `tick` gives the near ones their parts back. The kinds are not in the snapshot: the world must have been opened with the same kinds (count and slot counts are checked) and capacity. False, and nothing changed, if the snapshot does not fit (another capacity or kinds, another version, cut short) or while any entity holds a figure, body or voice (use `restore_with`). The blocks the kernel holds are kept."
+  fn restore(e : Entities, s : Snapshot) : (Entities, Bool) do
+    if !e.en_live do (e, false)
+    else
+      match s do Snapshot(i, f, d) -> (e, Fen.restore(i, f, d) == 1) end
+    end
+  end
+
+  doc "`restore`, freeing first every part the entities hold and every part waiting on the release list (as `tick` frees them when entities leave view). False, and nothing changed (no part freed), if the snapshot does not fit."
+  fn restore_with(e : Entities, s : Snapshot, p : Strata.Physics.Physics, a : Strata.Anim.Anim, snd : Strata.Sound.Sound)
+      : (Entities, Bool, Strata.Physics.Physics, Strata.Anim.Anim, Strata.Sound.Sound) do
+    if !e.en_live do (e, false, p, a, snd)
+    else
+      match s do
+        Snapshot(i, f, d) ->
+          if Fen.snapshot_fits(i, f, d) != 1 do (e, false, p, a, snd)
+          else
+            let (p1, a1, s1) = release_every(p, a, snd)
+            (e, Fen.restore(i, f, d) == 1, p1, a1, s1)
+          end
+      end
     end
   end
 

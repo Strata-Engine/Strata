@@ -1,7 +1,7 @@
 /* The entity kernel, headless: kinds and their refusals, adding and reading,
  * slots, stale ids, bad numbers, a full world, each and columns, the hash's
  * determinism, blocks and the ray, the tick, the grid, the sweep, walking,
- * routes, seen and unseen, and setting on the ground. */
+ * routes, seen and unseen, setting on the ground, parts, and snapshot and restore. */
 #include <stdio.h>
 #include <string.h>
 #include <math.h>
@@ -1590,6 +1590,208 @@ static void test_bodies(void) {
     en_close(w);
 }
 
+/* ---- snapshot and restore ---- */
+/* kinds: 0 a walker with 3 float and 2 int slots (divisor 4, freezing unseen), 1 a flyer with 1 and 1 (live, with gravity),
+ * 2 a placed kind with a figure */
+static void snap_kinds(EnWorld *w, int islots0) {
+    int32_t ki[9];
+    kind_ints(ki, 2, 4, 3, islots0, 0);
+    ki[1] = 1; ki[5] = 1;
+    float fl[7] = {0.3f, 0.9f, 0.3f, 0.6f, 0, 40, 9.8f};
+    en_kind(w, ki, fl);
+    kind_ints(ki, 1, 1, 1, 1, 0);
+    ki[5] = 1;
+    float ff[7] = {0.1f, 0.1f, 0.1f, 0, 30, 40, 9.8f};
+    en_kind(w, ki, ff);
+    kind_ints(ki, 0, 1, 0, 0, 0);
+    float fp[7] = {0.5f, 0.5f, 0.5f, 0, 0, 40, 0};
+    en_kind(w, ki, fp);
+}
+static EnWorld *snap_world(int capacity, int islots0) {
+    EnWorld *w = world(capacity);
+    snap_kinds(w, islots0);
+    return w;
+}
+/* a scripted world: adds, removes (rows reused, generations raised), slots, velocities, routes followed (looping or not),
+ * a route freed while followed, a route freed outright, removals queued between ticks, ticks with no focus */
+static EnWorld *snap_script(int64_t *keep, int *nkeep) {
+    EnWorld *w = snap_world(512, 2);
+    int64_t ids[512]; int n = 0;
+    rng_state = 4242;
+    int routes[8];
+    for (int r = 0; r < 8; r++) {
+        double pts[3 * 6];
+        int np = 2 + r % 5;
+        for (int i = 0; i < np; i++) { pts[3 * i] = r * 7.0 + (i & 1) * 9.0; pts[3 * i + 1] = 0.5 * i; pts[3 * i + 2] = -r * 3.0 + (i >> 1) * 6.0; }
+        routes[r] = en_route(w, np, pts);
+    }
+    en_route_free(w, routes[5]);   /* freed outright: its points go back to the pool */
+    for (int step = 0; step < 2000; step++) {
+        uint32_t r = rng() % 20;
+        if (r < 8 || n == 0) {
+            int k = (int)(rng() % 3);
+            int64_t id = en_add(w, k, rng() % 400 * 0.25, rng() % 40 * 0.25, rng() % 400 * 0.25, 0.01 * (rng() % 628));
+            if (id < 0) continue;
+            ids[n++] = id;
+            if (k == 0) {
+                int rt = routes[rng() % 8];
+                en_follow(w, id, rt, 0.5 + (rng() % 8) * 0.25, (int)(rng() & 1));
+            }
+            if (k == 1) { double v[3] = {rng() % 9 - 4.0, rng() % 5 * 1.0, rng() % 9 - 4.0}; en_set(w, id, 1, v); }
+        } else if (r < 12) {
+            int64_t id = ids[rng() % n];
+            en_set_float(w, id, 0, rng() % 100 * 0.01);
+            en_set_int(w, id, 1, (int64_t)rng() * 100003 - 7);
+        } else if (r < 15) {
+            int i = (int)(rng() % n);
+            en_remove(w, ids[i], 0);
+            ids[i] = ids[--n];
+        } else {
+            en_tick(w, 0, NULL, 1.0 / 60);
+        }
+        if (step == 1000) en_route_free(w, routes[2]);   /* freed while followed: held until its last follower stops */
+    }
+    for (int i = 0; i < 3 && n > 0; i++) { en_remove(w, ids[n - 1], 0); n--; }   /* queued for the next tick's events */
+    for (int i = 0; i < n; i++) keep[i] = ids[i];
+    *nkeep = n;
+    return w;
+}
+
+static int32_t snap_i[2][200000]; static float snap_f[2][200000]; static double snap_d[2][200000];
+
+/* snapshot w into buffer b; how many of each into sizes */
+static void snap_take(const EnWorld *w, int b, int sizes[3]) {
+    en_snapshot_sizes(w, sizes);
+    CHECK(sizes[0] <= 200000 && sizes[1] <= 200000 && sizes[2] <= 200000, "the snapshot fits the test's buffers");
+    en_snapshot(w, snap_i[b], snap_f[b], snap_d[b]);
+}
+
+static void test_snapshot_round_trip(void) {
+    int64_t keep[512]; int nkeep = 0;
+    EnWorld *a = snap_script(keep, &nkeep);
+    CHECK(nkeep > 50 && en_stat(a, 9) >= 6 && a->nremoved >= 3, "the script leaves entities, routes and queued removals");
+    int sa[3]; snap_take(a, 0, sa);
+    CHECK(snap_i[0][0] == 1 && snap_i[0][1] == 512 && snap_i[0][2] == 3 && snap_i[0][3] == 3 && snap_i[0][4] == 2,
+          "the ints begin with the version, the capacity, the kind count and each kind's slot counts");
+    EnWorld *b = snap_world(512, 2);
+    uint64_t fresh = en_hash(b);
+    CHECK(en_snapshot_fits(b, sa[0], snap_i[0], sa[1], snap_f[0], sa[2], snap_d[0]) == 1, "the snapshot fits a fresh world of the same capacity and kinds");
+    CHECK(en_hash(b) == fresh, "... and asking changes nothing");
+    CHECK(en_restore(b, sa[0], snap_i[0], sa[1], snap_f[0], sa[2], snap_d[0]) == 1, "it restores into the fresh world");
+    int sb[3]; snap_take(b, 1, sb);
+    CHECK(sa[0] == sb[0] && sa[1] == sb[1] && sa[2] == sb[2], "snapshotting the restored world gives arrays of the same sizes");
+    CHECK(memcmp(snap_i[0], snap_i[1], (size_t)sa[0] * sizeof(int32_t)) == 0 && memcmp(snap_f[0], snap_f[1], (size_t)sa[1] * sizeof(float)) == 0 &&
+          memcmp(snap_d[0], snap_d[1], (size_t)sa[2] * sizeof(double)) == 0, "... byte for byte equal");
+    CHECK(en_hash(a) == en_hash(b), "the restored world hashes as the original (no parts held)");
+    int alive = 0, same = 1;
+    for (int i = 0; i < nkeep; i++) {
+        alive += en_alive(b, keep[i]);
+        double p[3], q[3];
+        en_get(a, keep[i], 0, p); en_get(b, keep[i], 0, q);
+        same &= p[0] == q[0] && p[1] == q[1] && p[2] == q[2] && en_kind_of(a, keep[i]) == en_kind_of(b, keep[i]) &&
+                en_int(a, keep[i], 1) == en_int(b, keep[i], 1) && en_float(a, keep[i], 0) == en_float(b, keep[i], 0);
+    }
+    CHECK(alive == nkeep && same, "every id handed out before resolves after, to the same kind, position and slots");
+    CHECK(en_stat(b, 8) == en_stat(a, 8) && en_stat(b, 9) == en_stat(a, 9), "route points and routes held are as before");
+    int equal = 1;
+    for (int t = 0; t < 120; t++) {
+        en_tick(a, 0, NULL, 1.0 / 60); en_tick(b, 0, NULL, 1.0 / 60);
+        equal &= en_hash(a) == en_hash(b) && en_events(a, 0, NULL, NULL) == en_events(b, 0, NULL, NULL);
+    }
+    CHECK(equal, "with no focus, both tick to the same hash and event count for 120 ticks");
+    CHECK(en_events(b, 0, NULL, NULL) >= 0, "events read");
+    /* adds and routes after the restore follow the same free lists */
+    double pts[6] = {0, 0, 0, 5, 0, 5};
+    CHECK(en_add(a, 0, 1, 2, 3, 0) == en_add(b, 0, 1, 2, 3, 0) && en_route(a, 2, pts) == en_route(b, 2, pts),
+          "the next add and route take the same row and the same route id");
+    en_tick(a, 0, NULL, 1.0 / 60); en_tick(b, 0, NULL, 1.0 / 60);
+    CHECK(en_hash(a) == en_hash(b), "... and the hashes stay equal");
+    en_close(a); en_close(b);
+}
+
+static void test_snapshot_seen(void) {
+    /* a seen world: restored, everything is unseen with no parts, and the next tick sees the near ones again */
+    EnWorld *a = snap_world(64, 2);
+    flat_floor(a, -2, 1);
+    int64_t p = en_add(a, 2, 1, 0.5, 1, 0), f = en_add(a, 1, 2, 3, 2, 0);
+    tick_at(a, 0, 0, 0);
+    CHECK(en_seen(a, p) && en_seen(a, f), "two near entities are seen");
+    en_set_part(a, p, 0, 5);
+    int s[3]; snap_take(a, 0, s);
+    EnWorld *b = snap_world(64, 2);
+    flat_floor(b, -2, 1);
+    CHECK(en_restore(b, s[0], snap_i[0], s[1], snap_f[0], s[2], snap_d[0]) == 1, "a world with a seen entity holding a figure snapshots and restores");
+    CHECK(!en_seen(b, p) && !en_seen(b, f) && en_part(b, p, 0) == -1 && en_stat(b, 1) == 0, "restored, nothing is seen and nothing holds a part");
+    tick_at(b, 0, 0, 0);
+    CHECK(en_seen(b, p) && en_seen(b, f) && en_wanting(b, 0, 0, NULL) == 2, "one tick later both are seen again and want their figures");
+    /* restore refuses while any entity holds a part */
+    uint64_t h = en_hash(a);
+    double refused = en_stat(a, 3);
+    CHECK(en_restore(a, s[0], snap_i[0], s[1], snap_f[0], s[2], snap_d[0]) == 0, "a restore into a world whose entity holds a figure is refused");
+    CHECK(en_hash(a) == h && en_part(a, p, 0) == 5 && en_stat(a, 3) == refused + 1 && en_stat(a, 6) == EN_R_PART, "... nothing changed, the refusal counted");
+    en_release_all(a);
+    int n = en_releases(a, 64, rel_c, rel_i);
+    CHECK(n == 1 && rel_c[0] == 0 && rel_i[0] == 5 && en_part(a, p, 0) == -1, "en_release_all puts every held part on the release list");
+    CHECK(en_restore(a, s[0], snap_i[0], s[1], snap_f[0], s[2], snap_d[0]) == 1 && !en_seen(a, p), "... after which the restore goes ahead");
+    en_close(a); en_close(b);
+}
+
+static void test_snapshot_refusals(void) {
+    int64_t keep[512]; int nkeep = 0;
+    EnWorld *a = snap_script(keep, &nkeep);
+    int s[3]; snap_take(a, 0, s);
+    en_close(a);
+    EnWorld *wide = snap_world(1024, 2);
+    en_add(wide, 2, 1, 1, 1, 0);
+    en_tick(wide, 0, NULL, 1.0 / 60);
+    uint64_t h = en_hash(wide);
+    CHECK(en_restore(wide, s[0], snap_i[0], s[1], snap_f[0], s[2], snap_d[0]) == 0 && en_hash(wide) == h, "a snapshot of capacity 512 into capacity 1,024 is refused, the hash unchanged");
+    CHECK(en_stat(wide, 6) == EN_R_SNAPSHOT, "... for a snapshot that does not fit");
+    en_close(wide);
+    {   /* the brief's case: capacity 1,024 into 2,048 */
+        EnWorld *k1 = snap_world(1024, 2), *k2 = snap_world(2048, 2);
+        for (int i = 0; i < 40; i++) en_add(k1, i % 3, i, 1, -i, 0);
+        en_add(k2, 2, 5, 5, 5, 0);
+        en_tick(k2, 0, NULL, 1.0 / 60);
+        int s1[3]; snap_take(k1, 1, s1);
+        uint64_t h2 = en_hash(k2);
+        CHECK(en_restore(k2, s1[0], snap_i[1], s1[1], snap_f[1], s1[2], snap_d[1]) == 0 && en_hash(k2) == h2 && en_stat(k2, 0) == 1,
+              "a snapshot of capacity 1,024 into capacity 2,048 is refused, the hash unchanged");
+        en_close(k1); en_close(k2);
+    }
+    EnWorld *b = snap_world(512, 2);
+    en_add(b, 1, 3, 3, 3, 0);
+    h = en_hash(b);
+    snap_i[0][0] = 2;
+    CHECK(en_restore(b, s[0], snap_i[0], s[1], snap_f[0], s[2], snap_d[0]) == 0 && en_hash(b) == h, "a wrong version is refused, the hash unchanged");
+    snap_i[0][0] = 1;
+    CHECK(en_restore(b, s[0] - 1, snap_i[0], s[1], snap_f[0], s[2], snap_d[0]) == 0 && en_hash(b) == h, "truncated ints are refused");
+    CHECK(en_restore(b, s[0], snap_i[0], s[1] - 1, snap_f[0], s[2], snap_d[0]) == 0 && en_hash(b) == h, "truncated floats are refused");
+    CHECK(en_restore(b, s[0], snap_i[0], s[1], snap_f[0], s[2] - 1, snap_d[0]) == 0 && en_hash(b) == h, "truncated doubles are refused");
+    CHECK(en_restore(b, s[0] + 1, snap_i[0], s[1], snap_f[0], s[2], snap_d[0]) == 0 && en_hash(b) == h, "ints running long are refused");
+    CHECK(en_restore(b, s[0], NULL, s[1], snap_f[0], s[2], snap_d[0]) == 0 && en_hash(b) == h, "a missing array is refused");
+    int32_t g = snap_i[0][3 + 2 * 3 + 8 + 3];   /* the first generation */
+    snap_i[0][3 + 2 * 3 + 8 + 3] = 0;
+    CHECK(en_restore(b, s[0], snap_i[0], s[1], snap_f[0], s[2], snap_d[0]) == 0 && en_hash(b) == h, "a generation of 0 is refused");
+    snap_i[0][3 + 2 * 3 + 8 + 3] = g;
+    double d0 = snap_d[0][0];
+    snap_d[0][0] = NAN;
+    CHECK(en_restore(b, s[0], snap_i[0], s[1], snap_f[0], s[2], snap_d[0]) == 0 && en_hash(b) == h, "a position not finite is refused");
+    snap_d[0][0] = d0;
+    CHECK(en_restore(b, s[0], snap_i[0], s[1], snap_f[0], s[2], snap_d[0]) == 1, "the snapshot put right restores");
+    en_close(b);
+    EnWorld *c = snap_world(512, 3);
+    en_add(c, 0, 2, 2, 2, 0);
+    h = en_hash(c);
+    CHECK(en_restore(c, s[0], snap_i[0], s[1], snap_f[0], s[2], snap_d[0]) == 0 && en_hash(c) == h, "a kind with different slot counts is refused, the hash unchanged");
+    en_close(c);
+    EnWorld *d = world(512);
+    snap_kinds(d, 2);
+    plain_kind(d, 0, 0);
+    CHECK(en_restore(d, s[0], snap_i[0], s[1], snap_f[0], s[2], snap_d[0]) == 0, "a world with another kind count is refused");
+    en_close(d);
+}
+
 int main(void) {
     test_kinds();
     test_add_and_read();
@@ -1630,6 +1832,9 @@ int main(void) {
     test_wanting();
     test_figure_refusals();
     test_bodies();
+    test_snapshot_round_trip();
+    test_snapshot_seen();
+    test_snapshot_refusals();
     if (fails == 0) printf("ent_test: ok\n");
     return fails == 0 ? 0 : 1;
 }

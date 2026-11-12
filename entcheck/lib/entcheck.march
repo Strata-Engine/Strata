@@ -1352,6 +1352,296 @@ mod Entcheck do
     report("bodies", bad + bad2 + bad3 + bad4 + budget_part(w))
   end
 
+  -- ── Snapshot and restore ─────────────────────────────────────────────────
+  -- restore: 5 placed entities near the focus and 5 far, of a kind with a figure; after a tick the near ones hold figures,
+  -- so `restore` answers false and changes nothing; `restore_with` frees the figures and restores; one tick later the
+  -- near ones have figures again; `close_with` frees them
+  pfn restore_scene() : Int do
+    let (a0, rig) = An.finish_rig(An.open(16), cube_rig())
+    let kind = En.with_figure(En.with_seen_distance(En.kind(), 20.0), rig)
+    let e0 = world([kind], 64)
+    let (e1, near_ids) = add_row(e0, NativeArray.make_int(5, -1), 0, 5, 0.0, 1.0)
+    let (e2, far_ids) = add_row(e1, NativeArray.make_int(5, -1), 0, 5, 200.0, 1.0)
+    let w = empty_world()
+    let focus = [(0.0, 0.0, 0.0)]
+    let (e3, p3, a3, s3) = En.tick(e2, w, physics(), a0, Snd.new(), focus, 1.0 /. 60.0)
+    let snap = En.snapshot(e3)
+    let before = En.hash(e3)
+    let (e4, plain) = En.restore(e3, snap)
+    let bad = check(rig >= 0, "the cube rig is accepted")
+      + check(holding(e3, near_ids, false, 0, 0) == 5 && figures(a3) == 5, "after one tick the 5 near entities hold figures")
+      + check(!plain, "restore answers false while an entity holds a figure")
+      + check(En.hash(e4) == before && holding(e4, near_ids, false, 0, 0) == 5 && float_to_int(En.stat(e4, 6)) == 10, "... changing nothing (the refusal counted, reason 10: a part held)")
+    let (e5, ok, p5, a5, s5) = En.restore_with(e4, snap, p3, a3, s3)
+    let ids = NativeArray.from_list_int(List.append(NativeArray.to_list_int(near_ids), NativeArray.to_list_int(far_ids)))
+    let bad2 = check(ok, "restore_with succeeds")
+      + check(figures(a5) == 0, "... the figure count is 0")
+      + check(without_parts(e5, ids, 0, 0) == 10 && live(e5) == 10, "... all 10 entities are back, none holding a part")
+      + check(match En.stats(e5) do (_, seen, _, _) -> seen == 0 end, "... and none seen")
+      + check(NativeArray.to_list_int(En.each(e5, 0)) == NativeArray.to_list_int(En.each(e3, 0)), "... the same ids in the same dense order")
+    let (e6, p6, a6, s6) = En.tick(e5, w, p5, a5, s5, focus, 1.0 /. 60.0)
+    let bad3 = check(holding(e6, near_ids, false, 0, 0) == 5 && figures(a6) == 5, "one tick later the near entities have figures again")
+      + check(without_parts(e6, far_ids, 0, 0) == 5, "... the far ones none")
+    let (e7, _p7, a7, _s7) = En.close_with(e6, p6, a6, s6)
+    report("restore", bad + bad2 + bad3 + check(!En.is_open(e7), "closed") + check(figures(a7) == 0, "close_with frees the figures"))
+  end
+
+  -- ── The city: 10,000 workers on the island ───────────────────────────────
+  -- The viewer's island (its Def and seed 7), read from the atlas cache in ENTCHECK_ATLAS_DIR (built and written there
+  -- the first time). The land is plain: 1 m voxels, stone below each column's top, air above; a column's top is the
+  -- atlas height at its centre (bilinear, as Strata.Atlas.height_at), floored. The sea is not drawn: no route crosses it.
+  pfn city_def() : Strata.Atlas.Def do Strata.Atlas.def(512, 4.0, 800.0, 160.0, 5, 40.0) end
+  pfn city_dir() : String do Env.get("ENTCHECK_ATLAS_DIR", ".march/atlas") end
+
+  -- the height at (xm, zm) from a window of heights copied from sample (i0, j0), side samples a row
+  pfn city_win_h(hs : NativeF32Arr, i0 : Int, j0 : Int, side : Int, xm : Float, zm : Float) : Float do
+    let gx = xm /. 4.0 +. 256.0 -. int_to_float(i0)
+    let gz = zm /. 4.0 +. 256.0 -. int_to_float(j0)
+    let fx = Math.floor(gx)
+    let fz = Math.floor(gz)
+    let i = float_to_int(fx)
+    let j = float_to_int(fz)
+    let tx = gx -. fx
+    let tz = gz -. fz
+    let a0 = NativeArray.get_f32(hs, i + side * j) *. (1.0 -. tx) +. NativeArray.get_f32(hs, i + 1 + side * j) *. tx
+    let a1 = NativeArray.get_f32(hs, i + side * (j + 1)) *. (1.0 -. tx) +. NativeArray.get_f32(hs, i + 1 + side * (j + 1)) *. tx
+    a0 *. (1.0 -. tz) +. a1 *. tz
+  end
+  pfn city_tops(hs : NativeF32Arr, i0 : Int, j0 : Int, x0 : Int, z0 : Int, i : Int, out : NativeIntArr) : NativeIntArr do
+    if i >= 1024 do out
+    else city_tops(hs, i0, j0, x0, z0, i + 1, NativeArray.set_int(out, i, fl(city_win_h(hs, i0, j0, 11, int_to_float(x0 + i % 32) +. 0.5, int_to_float(z0 + i / 32) +. 0.5)))) end
+  end
+  -- the chunk at k: the atlas heights under it copied once (GAPS S15), stone below each column's top
+  pfn city_chunk(a : Strata.Atlas.Atlas, k : Strata.Coord.Key) : Strata.Chunk.Chunk do
+    let x0 = 32 * Strata.Coord.kx(k)
+    let z0 = 32 * Strata.Coord.kz(k)
+    let y0 = 32 * Strata.Coord.ky(k)
+    let i0 = x0 / 4 + 255 - (if x0 < 0 && x0 % 4 != 0 do 1 else 0 end)
+    let j0 = z0 / 4 + 255 - (if z0 < 0 && z0 % 4 != 0 do 1 else 0 end)
+    let hs = city_tops(Strata.Atlas.window(a, 0, i0, j0, 11), i0, j0, x0, z0, 0, NativeArray.make_int(1024, 0))
+    let (lo, hi) = jump_span(hs, 0, 1000000, -1000000)
+    if y0 >= hi do Strata.Chunk.uniform(0)
+    else if y0 + 32 <= lo do Strata.Chunk.uniform(1)
+    else Strata.Chunk.from_flat(jump_fill(NativeArray.make_i32(32768, 0), y0, hs, 0)) end end
+  end
+  -- the top of the ground (whole metres) at the column holding (x, z)
+  pfn city_top(a : Strata.Atlas.Atlas, x : Float, z : Float) : Float do
+    Math.floor(Strata.Atlas.height_at(a, Math.floor(x) +. 0.5, Math.floor(z) +. 0.5))
+  end
+  pfn city_land(a : Strata.Atlas.Atlas, x : Float, z : Float) : Bool do Strata.Atlas.height_at(a, x, z) > 41.0 end
+
+  -- a candidate place: on land, and the ground over the 80 m square about it (9 points) within 20 m of height
+  pfn city_cand(c : Int) : (Float, Float) do
+    let h = Strata.Seed.cell(7, 8, c, 0, 0)
+    (1300.0 *. Strata.Seed.unit(h) -. 650.0, 1300.0 *. Strata.Seed.unit(Strata.Seed.next(h)) -. 650.0)
+  end
+  pfn city_flat(a : Strata.Atlas.Atlas, x : Float, z : Float) : Bool do
+    let hs = List.map(List.range(0, 9), fn i -> Strata.Atlas.height_at(a, x +. 40.0 *. int_to_float(i % 3 - 1), z +. 40.0 *. int_to_float(i / 3 - 1)))
+    let lo = List.fold_left(hs, 100000.0, fn (m, v) -> if v < m do v else m end)
+    let hi = List.fold_left(hs, -100000.0, fn (m, v) -> if v > m do v else m end)
+    lo > 41.0 && hi -. lo <= 20.0
+  end
+  pfn dist2(x : Float, z : Float, p : (Float, Float)) : Float do match p do (px, pz) -> (x -. px) *. (x -. px) +. (z -. pz) *. (z -. pz) end end
+  -- the start (the first flat candidate), then up to 10 districts, flat, at least 250 m from it and 160 m from each other
+  pfn city_places(a : Strata.Atlas.Atlas, c : Int, start : Option((Float, Float)), ds : List((Float, Float))) : ((Float, Float), List((Float, Float))) do
+    let st = unwrap_or(start, (0.0, 0.0))
+    if c >= 4000 || List.length(ds) >= 10 do (st, List.reverse(ds))
+    else
+      let (x, z) = city_cand(c)
+      if !city_flat(a, x, z) do city_places(a, c + 1, start, ds)
+      else match start do
+        None -> city_places(a, c + 1, Some((x, z)), ds)
+        Some(s) ->
+          let apart = dist2(x, z, s) >= 62500.0 && List.all(ds, fn d -> dist2(x, z, d) >= 25600.0)
+          city_places(a, c + 1, start, if apart do Cons((x, z), ds) else ds end)
+      end end
+    end
+  end
+
+  -- every point every 2 m along the leg from p to q is on land
+  pfn city_leg(a : Strata.Atlas.Atlas, p : (Float, Float, Float), q : (Float, Float, Float)) : Bool do
+    match (p, q) do
+      ((px, _py, pz), (qx, _qy, qz)) ->
+        let n = 1 + float_to_int(Math.sqrt((qx -. px) *. (qx -. px) +. (qz -. pz) *. (qz -. pz)) /. 2.0)
+        List.all(List.range(0, n + 1), fn i -> city_land(a, px +. (qx -. px) *. int_to_float(i) /. int_to_float(n), pz +. (qz -. pz) *. int_to_float(i) /. int_to_float(n)))
+    end
+  end
+  pfn city_legs(a : Strata.Atlas.Atlas, first : (Float, Float, Float), ps : List((Float, Float, Float))) : Bool do
+    match ps do
+      Nil -> true
+      Cons(p, Nil) -> city_leg(a, p, first)
+      Cons(p, Cons(q, t)) -> if city_leg(a, p, q) do city_legs(a, first, Cons(q, t)) else false end
+    end
+  end
+  -- route r of district (cx, cz), drawn for [attempt]: 4 to 7 points round the centre, 8 to 38 m out, each at the
+  -- ground's top plus 1.2 m (the walker's centre 0.3 m above it)
+  pfn city_draw(a : Strata.Atlas.Atlas, cx : Float, cz : Float, r : Int, attempt : Int) : List((Float, Float, Float)) do
+    let h = Strata.Seed.cell(7, 9, r, attempt, 0)
+    let n = 4 + int_and(int_shr(h, 3), 3)
+    List.map(List.range(0, n), fn i ->
+      let hi = Strata.Seed.cell(7, 10, r, attempt, i)
+      let ang = 6.283185307179586 *. (int_to_float(i) +. 0.6 *. Strata.Seed.unit(hi)) /. int_to_float(n)
+      let rad = 8.0 +. 30.0 *. Strata.Seed.unit(Strata.Seed.next(hi))
+      let x = cx +. rad *. Math.cos(ang)
+      let z = cz +. rad *. Math.sin(ang)
+      (x, city_top(a, x, z) +. 1.2, z))
+  end
+  -- (the route, the drawings dropped before it): a drawing with a leg over the sea is dropped and the next drawn
+  pfn city_route(a : Strata.Atlas.Atlas, cx : Float, cz : Float, r : Int, attempt : Int) : (List((Float, Float, Float)), Int) do
+    let ps = city_draw(a, cx, cz, r, attempt)
+    let ok = match ps do
+      Cons(p0, _) -> List.all(ps, fn p -> match p do (x, _, z) -> city_land(a, x, z) end) && city_legs(a, p0, ps)
+      Nil -> false
+    end
+    if ok || attempt >= 63 do (if ok do ps else Nil end, attempt) else city_route(a, cx, cz, r, attempt + 1) end
+  end
+
+  -- the walkers of route [route] (points ps): 50 spread along its closing leg, at 1 to 1.5 m/s
+  pfn city_walkers(e : Strata.Entities.Entities, a : Strata.Atlas.Atlas, route : Int, last : (Float, Float, Float), first : (Float, Float, Float), j : Int) : Strata.Entities.Entities do
+    if j >= 50 do e
+    else
+      match (last, first) do
+        ((lx, _, lz), (fx, _, fz)) ->
+          let f = (int_to_float(j) +. 0.5) /. 50.0
+          let x = lx +. (fx -. lx) *. f
+          let z = lz +. (fz -. lz) *. f
+          let (e1, id) = En.add(e, 0, x, city_top(a, x, z) +. 1.2, z, 0.0)
+          city_walkers(En.follow(e1, id, route, 1.0 +. 0.125 *. int_to_float(j % 5), true), a, route, last, first, j + 1)
+      end
+    end
+  end
+  -- district d's routes (56 for the first, 16 for each other) and their walkers; (world, routes made, drawings dropped)
+  pfn city_district(e : Strata.Entities.Entities, a : Strata.Atlas.Atlas, d : Int, c : (Float, Float), r : Int, made : Int, dropped : Int) : (Strata.Entities.Entities, Int, Int) do
+    if r >= (if d == 0 do 56 else 16 end) do (e, made, dropped)
+    else
+      let (cx, cz) = c
+      let (ps, drops) = city_route(a, cx, cz, 100 * d + r, 0)
+      match ps do
+        Nil -> city_district(e, a, d, c, r + 1, made, dropped + drops + 1)
+        Cons(p0, _) ->
+          let (e1, route) = En.route(e, ps)
+          let e2 = city_walkers(e1, a, route, unwrap_or(List.nth_opt(ps, List.length(ps) - 1), p0), p0, 0)
+          city_district(e2, a, d, c, r + 1, if route >= 0 do made + 1 else made end, dropped + drops)
+      end
+    end
+  end
+  pfn city_populate(e : Strata.Entities.Entities, a : Strata.Atlas.Atlas, ds : List((Float, Float)), d : Int, made : Int, dropped : Int) : (Strata.Entities.Entities, Int, Int) do
+    match ds do
+      Nil -> (e, made, dropped)
+      Cons(c, t) ->
+        let (e1, m1, d1) = city_district(e, a, d, c, 0, made, dropped)
+        city_populate(e1, a, t, d + 1, m1, d1)
+    end
+  end
+
+  -- [n] frames at the focus, each step timed; (stream, world, step seconds newest first)
+  pfn city_ticks(s : Strata.Stream.Stream, e : Strata.Entities.Entities, focus : (Float, Float, Float), n : Int, times : List(Float)) : (Strata.Stream.Stream, Strata.Entities.Entities, List(Float)) do
+    if n <= 0 do (s, e, times)
+    else
+      let (s1, e1, secs) = jump_frame(s, e, focus)
+      city_ticks(s1, e1, focus, n - 1, Cons(secs, times))
+    end
+  end
+  -- how many of ids stand within 64 m (horizontally) of (x, z)
+  pfn city_near(e : Strata.Entities.Entities, ids : NativeIntArr, x : Float, z : Float, i : Int, n : Int) : Int do
+    if i >= NativeArray.length_int(ids) do n
+    else
+      let (px, _py, pz) = En.position(e, NativeArray.get_int(ids, i))
+      city_near(e, ids, x, z, i + 1, if (px -. x) *. (px -. x) +. (pz -. z) *. (pz -. z) <= 4096.0 do n + 1 else n end)
+    end
+  end
+  -- (within 64 m, seen, standing: grounded with solid under its feet, stepping down: not standing, with solid under its
+  -- feet within 3 m (it walked off a ledge this tick, the sweep moving it down before across, or is falling from one),
+  -- box clear) of the walkers about (fx, fz)
+  pfn city_count(e : Strata.Entities.Entities, ids : NativeIntArr, fx : Float, fz : Float, i : Int, acc : (Int, Int, Int, Int, Int)) : (Int, Int, Int, Int, Int) do
+    if i >= NativeArray.length_int(ids) do acc
+    else
+      let id = NativeArray.get_int(ids, i)
+      let (x, y, z) = En.position(e, id)
+      let (a, b, c, d, f) = acc
+      if (x -. fx) *. (x -. fx) +. (z -. fz) *. (z -. fz) > 4096.0 do city_count(e, ids, fx, fz, i + 1, acc)
+      else
+        let one = fn ok -> if ok do 1 else 0 end
+        let grounded = En.grounded(e, id)
+        let standing = if grounded do feet_solid(x, y, z, 0) else false end
+        let below = if feet_solid(x, y, z, 0) do true else if feet_solid(x, y -. 1.0, z, 0) do true else feet_solid(x, y -. 2.0, z, 0) end end
+        let stepping = if standing do false else below end
+        city_count(e, ids, fx, fz, i + 1, (a + 1, b + one(En.seen(e, id)), c + one(standing), d + one(stepping), f + one(box_clear(x, y, z, 0))))
+      end
+    end
+  end
+  pfn densest(e : Strata.Entities.Entities, ids : NativeIntArr, ds : List((Float, Float)), best : (Float, Float), most : Int) : ((Float, Float), Int) do
+    match ds do
+      Nil -> (best, most)
+      Cons((x, z), t) ->
+        let n = city_near(e, ids, x, z, 0, 0)
+        if n > most do densest(e, ids, t, (x, z), n) else densest(e, ids, t, best, most) end
+    end
+  end
+
+  -- one city: (bad, hash, median, worst, routes, drawings dropped, frames to settle, densest count, frames after the jump,
+  -- settled at, worst step after the jump, entered, (near, seen, standing, stepping down, clear))
+  type CityRun = CityRun(Int, Int, Float, Float, Int, Int, Int, Int, Int, Int, Float, Int, (Int, Int, Int, Int, Int))
+  pfn city_run(a : Strata.Atlas.Atlas, ticks : Int) : CityRun do
+    let (start, ds) = city_places(a, 0, None, Nil)
+    let (sx, sz) = start
+    let sfocus = (sx, city_top(a, sx, sz) +. 1.7, sz)
+    let w = Strata.World.new(registry(), Strata.Terrain.gen(fn (k, seed) -> city_chunk(a, k)), 7, 1.0)
+    let s0 = Strata.Stream.set_focus(Strata.Stream.start(w, Strata.Stream.config(4, 2, 32, 4)), [sfocus])
+    let kind = En.with_unseen(En.with_mover(En.kind(), En.walking(), 0.3, 0.9, 0.3, 1.1, 9.8), En.lives(), 4)
+    let (e0, made, dropped) = city_populate(En.open([kind], 16384, 128, 4, 32.0, 1.0), a, ds, 0, 0, 0)
+    let (s1, e1, settle) = jump_settle(s0, e0, sfocus, 0)
+    let (s2, e2, times) = city_ticks(s1, e1, sfocus, ticks, Nil)
+    let sorted = List.sort_by(times, fn (x, y) -> x <= y)
+    let unseen = match En.stats(e2) do (n, seen, _, _) -> n == 10000 && seen == 0 end
+    let ids = En.each(e2, 0)
+    let ((dx, dz), most) = densest(e2, ids, ds, (0.0, 0.0), 0)
+    let focus = (dx, city_top(a, dx, dz) +. 1.7, dz)
+    let (s3, e3, n3, at, worst3, _total, entered, bad3) = jump_go(Strata.Stream.set_focus(s2, [focus]), e2, focus, 0, -1, 0.0, 0.0, 0, 0)
+    let counts = city_count(e3, En.each(e3, 0), dx, dz, 0, (0, 0, 0, 0, 0))
+    let (near, seen, standing, stepping, clear) = counts
+    let h = En.hash(e3)
+    Strata.Stream.stop(s3)
+    let bad = bad3 + check(List.length(ds) == 10, "ten districts are found on the island")
+      + check(made == 200, "200 routes over the land")
+      + check(unseen, "10,000 walkers, all unseen while the focus is at the start")
+      + check(at >= 0, "the stream settles after the jump")
+      + check(near == most && near > 0, "the walkers about the densest district are those counted before the jump")
+      + check(entered == near, "each came into view once, set down grounded on solid with its box clear on that tick")
+      + check(seen == near, "every walker within seen distance is seen")
+      + check(standing + stepping == near, "... on the ground: grounded with solid under it, or stepping down a ledge onto solid within 3 m")
+      + check(clear == near, "... and its box clear")
+      + check(!En.is_open(En.close(e3)), "closed")
+    CityRun(bad, h, pick(sorted, List.length(sorted) / 2), pick(sorted, List.length(sorted) - 1), made, dropped, settle, most, n3, at, worst3, entered, counts)
+  end
+
+  -- city: the island, 10,000 walkers on 200 looping routes in ten districts, all unseen (divisor 4) while the focus
+  -- stands at the start; the step timed over the ticks; then the focus jumps to the densest district, and once the
+  -- stream has settled plus 30 frames every walker within seen distance is seen, on the ground (grounded on solid, or
+  -- stepping down a ledge onto solid within 3 m), its box clear; each was set down grounded on solid as it came into view
+  pfn city_scene() : Int do
+    let cached = File.exists(city_dir() ++ "/" ++ Strata.Atlas.cache_name(city_def(), 7))
+    let t0 = Ech.clock()
+    let a = Strata.Atlas.load_or_build(city_dir(), city_def(), 7)
+    let t1 = Ech.clock()
+    let ticks = 600
+    println("  atlas " ++ (if cached do "read from " else "built and cached in " end) ++ city_dir() ++ " in " ++ ms(t1 -. t0) ++ " ms")
+    let r1 = city_run(a, ticks)
+    let t2 = Ech.clock()
+    let r2 = city_run(a, ticks)
+    let load = Env.get_int("ENTCHECK_LOAD", 99)
+    match (r1, r2) do
+      (CityRun(bad1, h1, med, worst, made, dropped, settle, most, n3, at, worst3, entered, counts), CityRun(bad2, h2, med2, worst2, _, _, _, _, _, _, _, _, _)) ->
+        let (near, seen, standing, stepping, clear) = counts
+        println("  " ++ int_to_string(made) ++ " routes (" ++ int_to_string(dropped) ++ " drawings dropped for crossing the sea); settled round the start in " ++ int_to_string(settle) ++ " frames; one run " ++ ms(t2 -. t1) ++ " ms")
+        println("  run 1: step median " ++ ms(med) ++ " ms, worst " ++ ms(worst) ++ " ms over " ++ int_to_string(ticks) ++ " ticks, all unseen; run 2: median " ++ ms(med2) ++ " ms, worst " ++ ms(worst2) ++ " ms")
+        println("  jump to the densest district (" ++ int_to_string(most) ++ " walkers): settled on frame " ++ int_to_string(at) ++ " of " ++ int_to_string(n3) ++ ", " ++ int_to_string(entered) ++ " entered view, worst step " ++ ms(worst3) ++ " ms")
+        println("  at the end: " ++ int_to_string(seen) ++ " of " ++ int_to_string(near) ++ " within seen distance seen, " ++ int_to_string(standing) ++ " grounded on solid, " ++ int_to_string(stepping) ++ " stepping down onto solid, " ++ int_to_string(clear) ++ " with a clear box")
+        println("  0.5 ms target: " ++ (if load < 8 do (if med <= 0.0005 do "met" else "MISSED" end) else "not judged (load " ++ int_to_string(load) ++ ")" end))
+        report("city", bad1 + bad2 + check(h1 == h2, "two runs give one hash"))
+    end
+  end
+
   fn main(_cap : Cap(IO)) : Unit do
     let name = Env.get("ENTCHECK_SCENE", "")
     if name == "basics" do process_exit(basics_scene())
@@ -1368,9 +1658,11 @@ mod Entcheck do
     else if name == "cap" do process_exit(cap_scene())
     else if name == "arena" do process_exit(arena_scene())
     else if name == "bodies" do process_exit(bodies_scene())
+    else if name == "restore" do process_exit(restore_scene())
+    else if name == "city" do process_exit(city_scene())
     else
-      println("entcheck: no scene named '" ++ name ++ "' (basics, columns, determinism, closed, ray, bullets, storm, sweep, walk, jump, parts, cap, arena, bodies)")
+      println("entcheck: no scene named '" ++ name ++ "' (basics, columns, determinism, closed, ray, bullets, storm, sweep, walk, jump, parts, cap, arena, bodies, restore, city)")
       process_exit(2)
-    end end end end end end end end end end end end end end
+    end end end end end end end end end end end end end end end end
   end
 end

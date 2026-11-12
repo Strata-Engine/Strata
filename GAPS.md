@@ -222,3 +222,16 @@ would catch it, with short, long and built strings.
 The text bindings met S17 again (two private externs named `x_stat`, in the
 renderer's and the text module's bindings): the text module's glyph counts
 came back as the renderer's draw-call count. Its externs are prefixed `xt_`.
+
+## S26: a `Check.all` property that returns false passes under `forge test`
+
+`Check.all(Gen.int(0, 10), fn n -> false)` passes, in the library's tests
+and in an app's (forge 0.5.0, met in entcheck's snapshot property).
+`Check.try_prop(fn n -> n > 100, 3)` answers `Ok(true)`: the property's
+`false` does not reach `Check`, so no run is ever failing. A property that
+raises does fail, with its counterexample shrunk:
+`fn n -> if n > 5 do panic("over five") else true end` reports 6.
+Workaround: a property raises (`panic` with a message)
+instead of returning false; `entcheck/test/snapshot_test.march` does.
+Every existing Strata property that ends in a Bool checks nothing until it
+is rewritten so; an audit is worth doing.

@@ -7,7 +7,8 @@
  * for each held chunk that is neither all solid nor all clear, the chunk
  * table, which doubles as it fills (section "blocks"), and the copy of the
  * focus points, which grows to the most a tick has been given (section "parts
- * of seen entities").
+ * of seen entities"), and a restore's check, which borrows a scratch array for
+ * the length of the call (strata_ent_snap.h).
  *
  * Storage. An entity is a row in packed columns, one array per column, each
  * capacity long. A row keeps its index for its whole life; removing it raises
@@ -33,7 +34,8 @@
  * strata_ent_grid.h, included here); the sweep, walking and routes (in
  * strata_ent_move.h, included here); seen and unseen, and setting on the
  * ground (in strata_ent_seen.h, included here); the tick; parts of seen
- * entities (what the game gives a figure or voices, and places each tick). */
+ * entities (what the game gives a figure or voices, and places each tick);
+ * snapshot and restore (in strata_ent_snap.h, included last). */
 #ifndef STRATA_ENT_H
 #define STRATA_ENT_H
 #include <stdint.h>
@@ -87,7 +89,8 @@ enum {
     EN_R_PART = 10,     /* a part outside 0..3, a flag not 0/1, too many voices, or a part the kind lacks */
     EN_R_WHICH = 11,    /* en_set or a column: no such field, or one a game may not set (age) */
     EN_R_ROWS = 12,     /* en_set_column: rows not the kind's live count */
-    EN_R_ROUTE = 13     /* no such route, or one freed (strata_ent_move.h) */
+    EN_R_ROUTE = 13,    /* no such route, or one freed (strata_ent_move.h) */
+    EN_R_SNAPSHOT = 14  /* a snapshot that does not fit the world (strata_ent_snap.h) */
 };
 
 /* kind ints, in en_kind's order */
@@ -1042,5 +1045,7 @@ static inline void en_body_over(EnWorld *w, int n) {
     if (n < 0) { en_refuse(w, EN_R_VALUE); return; }
     w->body_over = n;
 }
+
+#include "strata_ent_snap.h"
 
 #endif

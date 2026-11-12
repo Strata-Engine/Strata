@@ -7,15 +7,16 @@
  * 4 for NativeI32Arr and NativeF32Arr, 1 for NativeU8Arr). Inputs are only
  * read; en_x_each, en_x_column, en_x_ray, en_x_events, en_x_near,
  * en_x_ray_entities, en_x_sweep, en_x_releases, en_x_seen_parts,
- * en_x_wanting and en_x_holding fill a caller-owned
+ * en_x_wanting, en_x_holding and en_x_snapshot fill a caller-owned
  * array, as strata_anim.c's matrices do. Reads of three numbers come back one
  * number a call (en_x_get's k). Calls March makes only for their effect
  * answer an Int it can use (GAPS S9).
  *
  * With no world open every call does nothing and answers its default
  * (0, -1 for a kind or an id, 0.0). */
-/* Rewritten by stamp_ent.sh whenever strata_ent.h, strata_ent_grid.h, strata_ent_move.h or strata_ent_seen.h changes (GAPS S14). */
-#define STRATA_ENT_STAMP "71e494a56ba1b89a"
+/* Rewritten by stamp_ent.sh whenever strata_ent.h, strata_ent_grid.h, strata_ent_move.h, strata_ent_seen.h or strata_ent_snap.h
+ * changes (GAPS S14). */
+#define STRATA_ENT_STAMP "f72b732b76f1ee00"
 #include <stdint.h>
 #include <time.h>
 #include "strata_ent.h"
@@ -279,6 +280,45 @@ int64_t en_x_body_over(int64_t n) {
     if (g_w) en_body_over(g_w, n < 0 ? -1 : n > INT32_MAX ? INT32_MAX : (int)n);
     return 1;
 }
+
+/* ---- snapshot and restore ---- */
+/* the ints (which 0), floats (1) or doubles (2) a snapshot needs; 0 with no world */
+int64_t en_x_snapshot_size(int64_t which) {
+    if (!g_w || which < 0 || which > 2) return 0;
+    int sizes[3];
+    en_snapshot_sizes(g_w, sizes);
+    return sizes[which];
+}
+/* the snapshot into a NativeI32Arr, a NativeF32Arr and a NativeFloatArr each at least en_x_snapshot_size long; 1 if
+ * written, 0 if an array is short (nothing written) */
+int64_t en_x_snapshot(void *ints, void *floats, void *doubles) {
+    if (!g_w || !ints || !floats || !doubles) return 0;
+    int sizes[3];
+    en_snapshot_sizes(g_w, sizes);
+    if (en_x_len(ints) < sizes[0] || en_x_len(floats) < sizes[1] || en_x_len(doubles) < sizes[2]) return 0;
+    return en_snapshot(g_w, en_x_i32(ints), en_x_f32(floats), en_x_f64(doubles));
+}
+static int en_x_snap_lens(void *ints, void *floats, void *doubles, int n[3]) {
+    int64_t a = en_x_len(ints), b = en_x_len(floats), c = en_x_len(doubles);
+    if (!ints || !floats || !doubles || a > INT32_MAX || b > INT32_MAX || c > INT32_MAX) return 0;
+    n[0] = (int)a; n[1] = (int)b; n[2] = (int)c;
+    return 1;
+}
+/* 1 if a restore from the three arrays (their whole lengths) would be accepted, parts held aside */
+int64_t en_x_snapshot_fits(void *ints, void *floats, void *doubles) {
+    int n[3];
+    if (!g_w || !en_x_snap_lens(ints, floats, doubles, n)) return 0;
+    return en_snapshot_fits(g_w, n[0], en_x_i32(ints), n[1], en_x_f32(floats), n[2], en_x_f64(doubles));
+}
+/* en_restore from the three arrays' whole lengths: 1, or 0 and nothing changed */
+int64_t en_x_restore(void *ints, void *floats, void *doubles) {
+    int n[3];
+    if (!g_w) return 0;
+    if (!en_x_snap_lens(ints, floats, doubles, n)) { en_refuse(g_w, EN_R_SNAPSHOT); return 0; }
+    return en_restore(g_w, n[0], en_x_i32(ints), n[1], en_x_f32(floats), n[2], en_x_f64(doubles));
+}
+/* every held part onto the release list; answers 1 */
+int64_t en_x_release_all(void) { if (g_w) en_release_all(g_w); return 1; }
 
 /* seconds on a monotonic clock, for timing scenes; the kernel never reads it (its time is the dt it is given) */
 double en_x_clock(void) {

@@ -400,6 +400,27 @@ let vel = Strata.Entities.column(e2, 0, Strata.Entities.col_velocity())        -
 let e3 = Strata.Entities.set_column(e2, 0, Strata.Entities.col_velocity(), vel)
 ```
 
+| Call | Does |
+|---|---|
+| `Strata.Entities.blocks(e, stream)` | hands the kernel the chunks loaded, edited and unloaded since the last call; once a frame after `Strata.Stream.tick` |
+| `Strata.Entities.tick(e, w, p, a, s, focus, dt)` | the frame's step (ages, lifetimes, movement, seen and unseen, the grid, touches), then figures, bodies and voices given, placed and freed |
+| `Strata.Entities.step(e, focus, dt)` | the step alone, without parts |
+| `Strata.Entities.events(e, w)` | what the last step reported: touches, block hits, entered and left view, routes finished, removals, bodies lost, blocked walkers |
+| `Strata.Entities.route(e, points)`, `follow(e, id, route, speed, loops)` | a shared route of up to 256 points, and a walker following it |
+| `Strata.Entities.touching(e, a, b)`, `near(...)`, `raycast(...)` | touch events between two kinds; entities within a radius; the first entity on a ray |
+| `Strata.Entities.snapshot(e)`, `restore(e, s)` | the whole entity world as three native arrays, and a world rebuilt from them, every entity unseen |
+| `Strata.Entities.restore_with(e, s, p, a, snd)`, `close_with(e, p, a, s)` | restore or close after freeing every figure, body and voice the entities hold |
+
+An entity is **seen** within its kind's seen distance of a focus, measured
+across the ground, and stays seen until it is a chunk's side beyond it.
+Only seen entities touch blocks, get figures, bodies and voices, and are
+swept as walkers; becoming seen sets a walker on the ground first, once the
+chunks around it are loaded. An **unseen** entity is cheap: by its kind's
+rule it lives on (a walker follows its route through everything, a flyer
+flies on, every nth tick for a tick divisor of n), freezes until seen
+again, or is removed. A snapshot keeps no seen state; a restored world
+gives the near entities their parts back at the next tick.
+
 `scripts/ent_check.sh` builds `entcheck/` and runs its scenes:
 
     (cd entcheck && forge build --release) && ENTCHECK_SCENE=basics entcheck/.march/build/release/entcheck
