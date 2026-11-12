@@ -68,6 +68,14 @@ static void *two_model_file(void) {
     return a;
 }
 
+/* A fake native u8 array holding the given 32-bit little-endian words. */
+static void *words(const uint32_t *w, int n) {
+    void *a = make_arr(4 * n, 0);
+    memcpy(narr_data(a), w, 4 * (size_t)n);
+    return a;
+}
+#define FOURCC(a, b, c, d) ((uint32_t)(a) | ((uint32_t)(b) << 8) | ((uint32_t)(c) << 16) | ((uint32_t)(d) << 24))
+
 static int at(void *grid, int sx, int sy, int x, int y, int z) {
     return ((uint8_t *)narr_data(grid))[x + sx * (y + sy * z)];
 }
@@ -120,6 +128,25 @@ int main(void) {
     CHECK(sv_vox_fill(junk, 64, out, 16) == 0, "junk fills nothing");
     CHECK(((uint8_t *)narr_data(out))[0] == 99, "and writes nothing");
     free(junk); free(out); free(file);
+
+    /* corrupt files: 0, and the process carries on. A MAIN chunk whose
+     * declared children run past the buffer (ogt_vox stops at the end and
+     * finds no model); a SIZE chunk whose declared size is wrong (an
+     * ogt_assert inside ogt_vox, which aborted before the hook) */
+    {
+        const uint32_t trunc[] = {FOURCC('V', 'O', 'X', ' '), 150, FOURCC('M', 'A', 'I', 'N'), 0, 1000};
+        const uint32_t badsize[] = {FOURCC('V', 'O', 'X', ' '), 150, FOURCC('M', 'A', 'I', 'N'), 0, 32,
+                                    FOURCC('S', 'I', 'Z', 'E'), 8, 0, 2, 2};
+        void *t = words(trunc, 5), *b = words(badsize, 10), *o = make_arr(64, 99);
+        CHECK(sv_vox_size(t, narr_len(t)) == 0, "a truncated MAIN chunk has no size");
+        CHECK(sv_vox_fill(t, narr_len(t), o, 64) == 0, "and fills nothing");
+        CHECK(sv_vox_size(b, narr_len(b)) == 0, "a SIZE chunk of the wrong size has no size");
+        CHECK(sv_vox_fill(b, narr_len(b), o, 64) == 0, "and fills nothing");
+        CHECK(((uint8_t *)narr_data(o))[0] == 99, "nor writes");
+        void *good = two_model_file();
+        CHECK(sv_vox_size(good, narr_len(good)) == (7 | (3 << 10) | (4 << 20)), "a good file still reads after a bad one");
+        free(t); free(b); free(o); free(good);
+    }
 
     if (fails) { printf("vox_test: %d failure(s)\n", fails); return 1; }
     printf("vox_test: ok\n");

@@ -23,8 +23,28 @@
  * is at +16 and the data at +32. Every call is a pure function of its
  * arguments.
  */
+#include <setjmp.h>
 #include <stdint.h>
 #include <string.h>
+
+/* A corrupt file must not take the host down: ogt_vox checks its input with
+ * ogt_assert (plain assert by default, about 78 sites), and the header lets
+ * that be replaced. A failed check marks the file bad and jumps back out of
+ * the read (sv_read), because carrying on past it can index out of bounds
+ * (an nSHP model id is asserted, then used). The jump skips the reader's
+ * own frees, so a corrupt file leaks what was allocated before the failed
+ * check (on the order of the file's size); a good file is unaffected.
+ * ogt_assert_warn marks things MagicaVoxel itself tolerates (a voxel outside
+ * its model, a reserved field) and is ignored. Per thread: reads may run on
+ * several worker tasks at once. */
+static thread_local int sv_bad;
+static thread_local jmp_buf *sv_escape;
+static void sv_fail(void) {
+    sv_bad = 1;
+    if (sv_escape) longjmp(*sv_escape, 1);
+}
+#define ogt_assert(cond, msg) do { if (!(cond)) { (void)(msg); sv_fail(); } } while (0)
+#define ogt_assert_warn(cond, msg) do { (void)sizeof(cond); (void)(msg); } while (0)
 #define OGT_VOX_IMPLEMENTATION
 #include "ogt_vox.h"
 
@@ -65,7 +85,18 @@ static int sv_shown(const ogt_vox_scene *s, uint32_t i) {
 /* The scene in the first n bytes, or NULL. */
 static const ogt_vox_scene *sv_read(void *bytes, int64_t n) {
     if (n <= 0 || n > narr_len(bytes) || n > (int64_t)UINT32_MAX) return NULL;
-    return ogt_vox_read_scene((const uint8_t *)narr_data(bytes), (uint32_t)n);
+    jmp_buf here;
+    const ogt_vox_scene *volatile s = NULL;
+    sv_bad = 0;
+    sv_escape = &here;
+    if (setjmp(here) == 0)
+        s = ogt_vox_read_scene((const uint8_t *)narr_data(bytes), (uint32_t)n);
+    sv_escape = NULL;
+    if (sv_bad) {
+        if (s) ogt_vox_destroy_scene(s);
+        return NULL;
+    }
+    return s;
 }
 
 /* The union box (vox axes, inclusive); 0 when no shown instance. */
