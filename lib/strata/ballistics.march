@@ -1,0 +1,103 @@
+-- Ballistics — the arithmetic of things that are thrown and shot: where to
+-- aim, how far the air and water slow a shot, where its step enters
+-- something, how it comes off a face. Pure: no world, no entities. A game
+-- moves its shots however it likes (Strata.Entities' flying mover gives
+-- gravity and stops at blocks) and asks these.
+--
+-- Directions are unit vectors; yaw is radians about the vertical, 0 toward
+-- +z, and pitch radians up, so a direction is
+-- (sin yaw cos pitch, sin pitch, cos yaw cos pitch).
+mod Strata.Ballistics do
+
+  doc "Shot number [n] of a stream seeded [seed], aimed along [yaw] (radians about the vertical, 0 toward +z) and [pitch] (radians up): a unit direction within [spread_deg] degrees of that axis, spread evenly over the cone's disc. The same seed and number give the same direction."
+  fn aim(seed : Int, n : Int, yaw : Float, pitch : Float, spread_deg : Float) : (Float, Float, Float) do
+    let off = spread_deg *. 3.14159265 /. 180.0 *. Math.sqrt(Strata.Seed.unit(Strata.Seed.mix(seed, 2 * n)))
+    let round_ = 6.2831853 *. Strata.Seed.unit(Strata.Seed.mix(seed, 2 * n + 1))
+    -- the axis, and two unit vectors across it: to the right, and up
+    let ax = Math.sin(yaw) *. Math.cos(pitch)
+    let ay = Math.sin(pitch)
+    let az = Math.cos(yaw) *. Math.cos(pitch)
+    let rx = Math.cos(yaw)
+    let rz = 0.0 -. Math.sin(yaw)
+    let ux = 0.0 -. Math.sin(yaw) *. Math.sin(pitch)
+    let uy = Math.cos(pitch)
+    let uz = 0.0 -. Math.cos(yaw) *. Math.sin(pitch)
+    let c = Math.cos(off)
+    let s = Math.sin(off)
+    (ax *. c +. (rx *. Math.cos(round_) +. ux *. Math.sin(round_)) *. s, ay *. c +. uy *. Math.sin(round_) *. s, az *. c +. (rz *. Math.cos(round_) +. uz *. Math.sin(round_)) *. s)
+  end
+
+  pfn lead_go(src : (Float, Float, Float), dst : (Float, Float, Float), v : (Float, Float, Float), speed : Float, t : Float, n : Int) : Float do
+    if n <= 0 do t
+    else
+      match src do
+        (fx, fy, fz) ->
+          match dst do
+            (tx, ty, tz) ->
+              match v do
+                (vx, vy, vz) ->
+                  let dx = tx +. vx *. t -. fx
+                  let dy = ty +. vy *. t -. fy
+                  let dz = tz +. vz *. t -. fz
+                  lead_go(src, dst, v, speed, Math.sqrt(dx *. dx +. dy *. dy +. dz *. dz) /. speed, n - 1)
+              end
+          end
+      end
+    end
+  end
+  doc "Where dst aim a shot of [speed] m/s, falling at [gravity] m/s2, from [src] at a target now at [dst] moving at [velocity]: (yaw, pitch, seconds in flight). The yaw and pitch point ahead of the target by its travel in that time and above it by the shot's fall."
+  fn lead(src : (Float, Float, Float), dst : (Float, Float, Float), velocity : (Float, Float, Float), speed : Float, gravity : Float) : (Float, Float, Float) do
+    let t = lead_go(src, dst, velocity, speed, 0.0, 4)
+    match src do
+      (fx, fy, fz) ->
+        match dst do
+          (tx, ty, tz) ->
+            match velocity do
+              (vx, vy, vz) ->
+                let dx = tx +. vx *. t -. fx
+                let dy = ty +. vy *. t -. fy +. 0.5 *. gravity *. t *. t
+                let dz = tz +. vz *. t -. fz
+                (Math.atan2(dx, dz), Math.atan2(dy, Math.sqrt(dx *. dx +. dz *. dz)), t)
+            end
+        end
+    end
+  end
+
+  doc "How far ahead of its start a shot of [speed] m/s should be tested for a block before it is let go, [dt] seconds a frame: its first step and a quarter metre. (A Strata.Entities entity's first tick passes through blocks.)"
+  fn first_step(speed : Float, dt : Float) : Float do speed *. dt +. 0.25 end
+
+  doc "What a shot keeps of its velocity over [dt] seconds in something that slows it by [steady] a second plus [square] times its [speed] a second: a factor from 1 (no loss) down to 0, never below. Air on an arrow is about (0, 0.002); water about (4, 0.5)."
+  fn drag(speed : Float, steady : Float, square : Float, dt : Float) : Float do
+    let k = 1.0 -. (steady +. square *. speed) *. dt
+    if k < 0.0 do 0.0 else k end
+  end
+
+  pfn enters_go(is_it : Int -> Int -> Int -> Bool, x0 : Float, y0 : Float, z0 : Float, dx : Float, dy : Float, dz : Float, i : Int, n : Int) : (Bool, Float, Float, Float) do
+    if i > n do (false, 0.0, 0.0, 0.0)
+    else
+      let k = int_to_float(i) /. int_to_float(n)
+      let x = x0 +. dx *. k
+      let y = y0 +. dy *. k
+      let z = z0 +. dz *. k
+      if is_it(float_to_int(Math.floor(x)), float_to_int(Math.floor(y)), float_to_int(Math.floor(z))) do (true, x, y, z)
+      else enters_go(is_it, x0, y0, z0, dx, dy, dz, i + 1, n) end
+    end
+  end
+  doc "Where a step from (x0, y0, z0) to (x1, y1, z1), in voxels, first enters a cell [is_it] is true of, sampled every eighth of a voxel: (true, the point), or (false, ...) when it enters none. For a shot meeting water, smoke, a trigger volume: anything the block ray does not stop at."
+  fn enters(is_it : Int -> Int -> Int -> Bool, x0 : Float, y0 : Float, z0 : Float, x1 : Float, y1 : Float, z1 : Float) : (Bool, Float, Float, Float) do
+    let dx = x1 -. x0
+    let dy = y1 -. y0
+    let dz = z1 -. z0
+    let n = float_to_int(Math.sqrt(dx *. dx +. dy *. dy +. dz *. dz) *. 8.0) + 1
+    enters_go(is_it, x0, y0, z0, dx, dy, dz, 0, n)
+  end
+
+  doc "How squarely the unit direction (dx, dy, dz) meets a face whose unit normal is (nx, ny, nz): 1 head on, 0 grazing, below 0 going away from it."
+  fn squareness(dx : Float, dy : Float, dz : Float, nx : Float, ny : Float, nz : Float) : Float do 0.0 -. (dx *. nx +. dy *. ny +. dz *. nz) end
+
+  doc "The direction (dx, dy, dz) after it comes off a face with unit normal (nx, ny, nz): what runs along the face kept, what runs into it turned back."
+  fn bounce(dx : Float, dy : Float, dz : Float, nx : Float, ny : Float, nz : Float) : (Float, Float, Float) do
+    let into = squareness(dx, dy, dz, nx, ny, nz)
+    (dx +. 2.0 *. into *. nx, dy +. 2.0 *. into *. ny, dz +. 2.0 *. into *. nz)
+  end
+end

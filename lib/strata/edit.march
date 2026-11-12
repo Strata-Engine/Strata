@@ -235,4 +235,155 @@ mod Strata.Edit do
   fn set_many(w : Strata.World.World, cells : List((Int, Int, Int, Int))) : Outcome do
     Strata.Store.fold(gather(cells, Strata.Store.empty(Nil)), Outcome(w, Nil, Nil, Nil), fn (o, k, l) -> chunk_cells(o, k, l))
   end
+
+  -- ── Blasts ───────────────────────────────────────────────────────────────
+  -- A crater is a sphere whose radius varies with direction only: a voxel at
+  -- offset (dx, dy, dz) and distance d from the centre is carved when d is
+  -- within the radius times the direction's factor, in [0.7, 1.3]. The
+  -- factor is hashed (salt 30) per band of the unit direction, 8 bands of
+  -- longitude by 4 of latitude (so each band lies in one octant), and
+  -- blended bilinearly between band centres, so it varies smoothly round
+  -- the crater and never with distance. A crater is star-shaped: a voxel is
+  -- carved only if every voxel on its integer segment to the centre is
+  -- (`blast_segment`), so no shell is left standing between carved voxels.
+  -- Never past 1.3 times the radius; the same seed gives the same crater
+  -- wherever it is.
+
+  pfn fdiv2(a : Int, b : Int) : Int do if a >= 0 do a / b else 0 - ((b - 1 - a) / b) end end
+
+  doc "Voxel k of the integer segment from a blast's centre to offset (dx, dy, dz), k from 0 (the centre) to n = max(|dx|, |dy|, |dz|) (the offset): each coordinate k / n of the offset's, rounded half up. The segment a crater is star-shaped along."
+  fn blast_segment(dx : Int, dy : Int, dz : Int, k : Int) : (Int, Int, Int) do
+    let n = maxn(dx, dy, dz)
+    if n == 0 do (0, 0, 0)
+    else (fdiv2(2 * k * dx + n, 2 * n), fdiv2(2 * k * dy + n, 2 * n), fdiv2(2 * k * dz + n, 2 * n)) end
+  end
+  pfn absi(v : Int) : Int do if v < 0 do 0 - v else v end end
+  pfn maxn(dx : Int, dy : Int, dz : Int) : Int do hi(absi(dx), hi(absi(dy), absi(dz))) end
+
+  -- band (i, j)'s factor: i longitude 0..7 (wrapping), j latitude 0..3
+  pfn band(seed : Int, i : Int, j : Int) : Float do
+    0.7 +. 0.6 *. Strata.Seed.unit(Strata.Seed.cell(seed, 30, ((i % 8) + 8) % 8, j, 0))
+  end
+
+  doc "The factor in [0.7, 1.3] a blast of [seed] scales its radius by in the direction of offset (dx, dy, dz) from its centre: band factors (8 of longitude by 4 of latitude) blended bilinearly between band centres. 1 at the centre itself."
+  fn blast_factor(seed : Int, dx : Int, dy : Int, dz : Int) : Float do
+    let d = Math.sqrt(int_to_float(dx * dx + dy * dy + dz * dz))
+    if d <= 0.0 do 1.0
+    else
+      let lon = Math.atan2(int_to_float(dz), int_to_float(dx)) +. 3.141592653589793
+      let lat = Math.asin(int_to_float(dy) /. d) +. 1.5707963267948966
+      let u = lon /. 6.283185307179586 *. 8.0 -. 0.5
+      let v0 = lat /. 3.141592653589793 *. 4.0 -. 0.5
+      let v = if v0 < 0.0 do 0.0 else if v0 > 3.0 do 3.0 else v0 end end
+      let i = float_to_int(Math.floor(u))
+      let j = lo(float_to_int(Math.floor(v)), 2)
+      let tu = u -. int_to_float(i)
+      let tv = v -. int_to_float(j)
+      let a0 = band(seed, i, j) *. (1.0 -. tu) +. band(seed, i + 1, j) *. tu
+      let a1 = band(seed, i, j + 1) *. (1.0 -. tu) +. band(seed, i + 1, j + 1) *. tu
+      a0 *. (1.0 -. tv) +. a1 *. tv
+    end
+  end
+
+  -- whether offset (dx, dy, dz) lies within the radius times its direction's factor
+  pfn blast_within(seed : Int, radius : Int, dx : Int, dy : Int, dz : Int) : Bool do
+    let r = int_to_float(radius) *. blast_factor(seed, dx, dy, dz)
+    int_to_float(dx * dx + dy * dy + dz * dz) <= r *. r
+  end
+
+  -- the cube's index of offset (dx, dy, dz)
+  pfn cube_i(reach : Int, dx : Int, dy : Int, dz : Int) : Int do
+    let side = 2 * reach + 1
+    (dx + reach) + side * ((dy + reach) + side * (dz + reach))
+  end
+
+  -- every voxel k = 1 .. n - 1 of the segment to (dx, dy, dz) is kept
+  pfn seg_kept(kept : NativeIntArr, reach : Int, dx : Int, dy : Int, dz : Int, k : Int, n : Int) : Bool do
+    if k >= n do true
+    else
+      match blast_segment(dx, dy, dz, k) do
+        (x, y, z) -> if NativeArray.get_int(kept, cube_i(reach, x, y, z)) == 0 do false else seg_kept(kept, reach, dx, dy, dz, k + 1, n) end
+      end
+    end
+  end
+
+  -- Shell n (offsets whose largest coordinate is n), the shells inside it
+  -- settled: an offset is kept when it is within the crater and its whole
+  -- segment to the centre is kept (its segment's voxels lie in inner shells).
+  pfn shell(seed : Int, radius : Int, reach : Int, n : Int, kept : NativeIntArr, i : Int) : NativeIntArr do
+    let side = 2 * reach + 1
+    if i >= side * side * side do kept
+    else
+      let dx = i % side - reach
+      let dy = (i / side) % side - reach
+      let dz = i / (side * side) - reach
+      if maxn(dx, dy, dz) != n do shell(seed, radius, reach, n, kept, i + 1)
+      else
+        let keep = if !blast_within(seed, radius, dx, dy, dz) do false else seg_kept(kept, reach, dx, dy, dz, 1, n) end
+        shell(seed, radius, reach, n, if keep do NativeArray.set_int(kept, i, 1) else kept end, i + 1)
+      end
+    end
+  end
+  pfn shells(seed : Int, radius : Int, reach : Int, n : Int, kept : NativeIntArr) : NativeIntArr do
+    if n > reach do kept else shells(seed, radius, reach, n + 1, shell(seed, radius, reach, n, kept, 0)) end
+  end
+
+  pfn blast_cells(cx : Int, cy : Int, cz : Int, reach : Int, kept : NativeIntArr, id : Int, i : Int, acc : List((Int, Int, Int, Int))) : List((Int, Int, Int, Int)) do
+    let side = 2 * reach + 1
+    if i >= side * side * side do acc
+    else
+      let dx = i % side - reach
+      let dy = (i / side) % side - reach
+      let dz = i / (side * side) - reach
+      blast_cells(cx, cy, cz, reach, kept, id, i + 1, if NativeArray.get_int(kept, i) != 0 do Cons((cx + dx, cy + dy, cz + dz, id), acc) else acc end)
+    end
+  end
+
+  doc "A crater: every voxel within [radius] of (cx, cy, cz) times its direction's factor (`blast_factor`, 0.7 to 1.3) whose segment to the centre is all within it too, set to [id]: star-shaped, never past 1.3 radii. One Cell change per voxel that changed or was queued; the dirty chunks are those the changed voxels touch. A negative radius is no edit."
+  fn blast(w : Strata.World.World, cx : Int, cy : Int, cz : Int, radius : Int, seed : Int, id : Int) : Outcome do
+    if radius < 0 do Outcome(w, Nil, Nil, Nil)
+    else
+      let reach = (13 * radius + 9) / 10
+      let side = 2 * reach + 1
+      let kept = shells(seed, radius, reach, 0, NativeArray.make_int(side * side * side, 0))
+      set_many(w, blast_cells(cx, cy, cz, reach, kept, id, 0, Nil))
+    end
+  end
+
+  -- ── What an edit leaves hanging ──────────────────────────────────────────
+  pfn hanging_in(w : Strata.World.World, wants : Int -> Bool, holds : Int -> Bool, x0 : Int, y0 : Int, z0 : Int, nx : Int, ny : Int, nz : Int, i : Int, acc : List((Int, Int, Int, Int))) : List((Int, Int, Int, Int)) do
+    if i >= nx * ny * nz do acc
+    else
+      let x = x0 + i % nx
+      let y = y0 + (i / nx) % ny
+      let z = z0 + i / (nx * ny)
+      let id = Wl.get_block(w, x, y, z)
+      -- the block below is looked at only for a block that needs one (both sides of && are evaluated: GAPS S26)
+      if id == 0 do hanging_in(w, wants, holds, x0, y0, z0, nx, ny, nz, i + 1, acc)
+      else if !wants(id) do hanging_in(w, wants, holds, x0, y0, z0, nx, ny, nz, i + 1, acc)
+      else if holds(Wl.get_block(w, x, y - 1, z)) do hanging_in(w, wants, holds, x0, y0, z0, nx, ny, nz, i + 1, acc)
+      else hanging_in(w, wants, holds, x0, y0, z0, nx, ny, nz, i + 1, Cons((x, y, z, 0), acc)) end end end
+    end
+  end
+  pfn hanging(w : Strata.World.World, cs : List(Change), wants : Int -> Bool, holds : Int -> Bool, acc : List((Int, Int, Int, Int))) : List((Int, Int, Int, Int)) do
+    match cs do
+      Nil -> acc
+      Cons(c, rest) ->
+        match low(c) do
+          (lx, ly, lz) ->
+            match high(c) do
+              (hx, hy, hz) ->
+                let nx = hx - lx + 1
+                let ny = hy - ly + 2
+                let nz = hz - lz + 1
+                hanging(w, rest, wants, holds, if nx * ny * nz > 100000 do acc else hanging_in(w, wants, holds, lx, ly, lz, nx, ny, nz, 0, acc) end)
+            end
+        end
+    end
+  end
+
+  doc "What an edit left hanging in world [w] (the world after it): every cell, in the box each of its [changes] covers and the layer over that box, whose block [wants] something under it (true for such blocks) and whose cell below holds a block [holds] is false of (give false for 0 so that air holds nothing). Answers them as (x, y, z, 0) cells for `set_many`: plants over ground that was dug away, a torch whose wall is gone. One layer only: what stood on what is removed is not followed. A change covering more than 100,000 cells is not searched; a cell under two changes is listed twice."
+  fn unsupported(w : Strata.World.World, changes_ : List(Change), wants : Int -> Bool, holds : Int -> Bool) : List((Int, Int, Int, Int)) do
+    hanging(w, changes_, wants, holds, Nil)
+  end
 end

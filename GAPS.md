@@ -260,14 +260,30 @@ caller's array, which is how `Strata.Noise.field2` and `field3` work.
 Workaround: return the array, or, where an out-parameter API is wanted,
 write the loop in C (`sl_fill` in `native/strata_noise.c`).
 
-## S31: `by` cannot be a parameter name; `1.0e12` is not a number
+## S31: a `Check.all` property never fails under `forge test`
+
+Met writing the far field's slot tests (generation Task 12): a property
+that is plainly false, `Check.all(Gen.int(0, 10), fn x -> false)`, passes,
+as do `Check.all_with` with a fixed seed and a `Check.all` whose result is
+bound and followed by an assertion. `MARCH_SKIP_PROPERTIES` is not set
+(forge sets it only for `--skip-properties`). So every `Check.all` in the
+suite checks nothing: a mutation of `Strata.Slots`' draw rule that drew a
+region twice went unnoticed by the property written for it, and was caught
+at once by the same walk run as an ordinary loop. Workaround: properties
+that matter are written as a fixed set of pseudo-random walks (a small
+linear congruential generator in the test) asserted with `Test.assert_*`;
+`test/slots_test.march` does this for the which-chunk-draws rule. The
+existing properties (chunk, slots under random traffic, and others) are
+left as they are, and are worth rewriting the same way.
+
+## S34: `by` cannot be a parameter name; `1.0e12` is not a number
 
 `pfn hits(fs, victim : Int, by : Int, ...)` is "I got stuck here" at `by`:
 it is reserved. A float written with an exponent (`1.0e12`) is a bare
 "parse error" on its line. Workaround: another name (`who` in
 `StrataViewer.Combat.hit`); the number written out (`1000000000000.0`).
 
-## S32: another module's constructors cannot be matched by their qualified names
+## S34: another module's constructors cannot be matched by their qualified names
 
 `match o do StrataViewer.Combat.CbKilled(c) -> ...` in a test is "I got
 stuck here" at the dot, and through an alias (`Cb.CbKilled`) "I don't know
@@ -275,10 +291,26 @@ a constructor". A qualified constructor is fine in an expression, not in a
 pattern. Workaround: the module exports accessors (`Combat.credit`,
 `intent_code`, `kind_code`), as the rest of Strata reads `Strata.Query.Hit`.
 
-## S33: an unquoted shell variable holding several settings is one word in zsh
+## S34: an unquoted shell variable holding several settings is one word in zsh
 
 Not March: `base="A=1 B=2"; env $base cmd` under zsh gives `env` the single
 assignment `A="1 B=2"`. Three scripted viewer runs lost STRATA_HIDDEN that
 way and opened a window. Workaround: a shell function that lists the
 settings and takes the rest as "$@" (`scripts/combat_check.sh`'s `run`).
+
+## S35: a module alias is not private to its module in a test build
+
+`alias StrataViewer.Combat as Cb` in `viewer/lib/match.march` and
+`alias Strata.Coord as Cb` in `viewer/test/blast_test.march`: the test build
+resolved the test's `Cb.chunk_of` to `StrataViewer.Combat.chunk_of`, which
+clang then could not find ("use of undefined value"). The same family as
+S27. Workaround: aliases unique across the app (`Rules` in the match, `Cmb`
+in its test).
+
+## S36: `needs` cannot be a parameter name, nor `linear` (again)
+
+`fn unsupported(..., needs : Int -> Bool, ...)` reads as the capability
+keyword: "This `mod` has no matching `end`", reported at the module's
+first line. `linear` (S22) is refused as a parameter too. Workaround:
+`wants`, `steady`.
 
