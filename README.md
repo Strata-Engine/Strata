@@ -607,6 +607,13 @@ shaded effect is lit once a particle unless `Pt.lit_per_pixel` asks for
 spray's per-pixel lighting. `Strata.Render.spray` is the built-in effect 0:
 tumbling cubes in the texture of the block they were thrown from.
 
+In the viewer, `STRATA_FX=1` shows the six effects side by side at frame
+10. In a match (`STRATA_COMBAT=1`) a fireball trails flame, smoke and
+embers and bursts in sparks; what it reaches catches over half a second
+and burns for seconds (grass 1 to 2, leaves 2 to 3, wood 4 to 6) as glowing
+embers blocks that light the ground, before it is gone. Cost: `RESULTS.md`,
+Particles.
+
 ## The far field
 
 Past the near chunks the world goes on in rings of coarser chunks (Part F

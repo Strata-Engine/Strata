@@ -908,3 +908,49 @@ Misses and what is not known:
 - The bots-only match takes 15.8 minutes; the design gave no length.
 - Nothing here was played by hand yet.
 
+
+# Particles
+
+Design `docs/2026-11-12-particles-design.md`, plan and ledger beside it.
+Release builds with March main, hidden and offscreen, 1280 x 800, light
+mode 4, the island's shore start, two runs each, the viewer's own lines
+every 240 frames. The machine was at a load average of 22 to 44: the
+numbers are reported, not judged.
+
+What is checked: the closed form, the ring and its overwrites, bursts from
+a point, a sphere and a box, the cube's winding (`native/tests/particles_test.c`);
+`Strata.Particles` (12 tests: rates and carried fractions, dt 0, stopping,
+trails, the 4 m jump, the 4096 a frame cap, seeds, the 63 effects, the table
+floats); the viewer's effects and embers blocks (4 tests); the burn schedule
+(7 tests); the match's fire and ten-matches scenes (`scripts/combat_check.sh`:
+3 wood and 13 grass burned, 15 cells burning at frame 120, none at 600;
+every rematch begins with no fire and no emitters); goldens `fx-showcase`,
+`combat-fire`, `combat-burning`, and spray as cubes in the splash scenes.
+
+| | live particles | GPU, median of the run's lines | CPU: step and hand-over |
+|---|---|---|---|
+| shore, no particles | 0 | 1.36 to 1.44 ms | |
+| spray fountain, 150 a frame | 27 000 | 1.53 to 1.59 ms | 0 to 1 us |
+| spray fountain, 350 a frame | 63 000 | 1.80 to 2.60 ms | 0 to 2 us |
+| the fire scene, a trunk burning (frame 239) | 1 116, 6 emitters | 2.99 to 3.03 ms (2.57 to 3.03 later) | 10 to 11 us |
+
+Spray is the dearest particle: lit per pixel, two rays a fragment. At
+27 000 live cubes the particles cost about 0.15 ms of GPU; at 63 000
+(the ring nearly full) 0.4 to 1.2 ms. The match's own particles are a
+thousand or so at a time, and the March side of them (`Strata.Particles.step`
+and `Strata.Render.particles`) about 10 us a frame.
+
+The bots-only match (58 161 frames, a winner at 30) wrote no particle over
+a live one: the ring never filled.
+
+Misses and what is not known:
+
+- Particles meet nothing: sparks fall through the ground.
+- Shaded particles are drawn in birth order, not by depth: two smoke cubes
+  may blend in the wrong order (soft and grey, it does not show).
+- The effect table is written in place while frames may be in flight; the
+  viewer defines its effects once, at start, so no frame reads one half
+  written. A game redefining effects mid-run could see one frame of it.
+- Glowing particles light nothing; the light about a fire comes from the
+  embers blocks.
+- Nothing here was played by hand yet.
