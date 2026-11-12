@@ -29,14 +29,69 @@ the shaders (`native/build_shaders.sh`).
 
 In the viewer: W A S D move, the mouse looks, space jumps, F switches
 between walking and flying (space and left shift then rise and sink), left
-click carves a sphere, right click builds one, escape quits. Carve the
-rim of a lake in the hills and it drains. `L` steps
-through the light modes and `[` and `]` lower and raise the sun.
+click blasts a crater (with a spray in the colour of what it threw up),
+right click builds a sphere, escape quits. Blast the rim of a lake in the
+hills and it drains. `L` steps through the light modes, `[` and `]` lower
+and raise the sun, and `R` rereads the island's settings and regenerates.
+
+## The island
 
 The world is an island 2 km across, read from `Strata.Atlas`: rivers run
-to the sea in their channels and lakes stand at their spill level. Its atlas
-takes about 4 s to build and is cached in `.march/atlas` (read in about
-30 ms after that); `STRATA_ISLAND=0` brings back the older noise terrain.
+to the sea in their channels and lakes stand at their spill level. Under
+its surface the land is a 3D density (`Strata.Lattice`) with overhangs and
+caves that open here and there, its steepest slopes relaxed to scree
+(`Strata.Thermal`), grass over dirt over stone laid by `Strata.Surface`.
+Trees, grown at start-up by a procedural branching generator (oak, birch,
+pine, willow) and scattered by `Strata.Feature`, stand across chunk borders;
+ruins stand on the atlas's sites with the ground pulled up to them.
+
+**The atlas cache.** The atlas is one pass over the whole island (height,
+erosion, drainage, rivers, lakes, regions, sites); at 512 x 512 samples it
+takes seconds to build, so `Strata.Atlas.load_or_build(dir, def, seed)` keeps
+it in `dir` (the viewer's `.march/atlas`) under a name made from the
+definition and the seed, and reads it back in tens of milliseconds. Change a
+setting of the definition and a new atlas is built beside the old.
+
+**The generator calls a game makes.** A generator is a pure function of a
+chunk key and a seed, and may carry a second one, its stamps:
+
+```march
+-- the chunk function, and the replay of its template pass alone
+let g = Strata.Terrain.with_stamps(Strata.Terrain.gen(fn (k, seed) -> chunk(k, seed)),
+                                   Strata.Terrain.Stamps(fn (k, seed) -> stamps(k, seed)))
+let w = Strata.World.new(reg, g, seed, 0.25)          -- metres a voxel
+
+-- which voxels of a chunk a placed structure wrote: its index + 1, 0 for none
+let st = Strata.Terrain.stamps(g, k, seed)            -- all zeros without stamps
+
+-- a crater: a sphere whose radius varies by direction, up to 1.3 times
+let o = Strata.Edit.blast(Strata.Stream.world(s), x, y, z, 6, crater_seed, 0)
+
+-- tuning: drop every unedited chunk and remake it from a new generator
+let s2 = Strata.Stream.regenerate(s, g2)
+```
+
+Stamps are not stored: a game asks for them when it needs them (a blast on
+a ruin), and a stamped voxel that is now air was removed by an edit.
+
+**The scale rule.** Everything the generator knows is in metres: lengths,
+heights, noise periods. The world's scale (metres a voxel, given to
+`Strata.World.new`) only decides how finely that shape is cut into voxels,
+so the same seed makes the same island at 1 m, 0.5 m or 0.25 m a voxel, its
+features as many metres across. Voxel counts (a blast's radius, a chunk's 32)
+stay voxels. The stream's focus and `Strata.Query.raycast` take metres;
+the renderer, the camera, edits and `Strata.Fluid` work in voxels. The
+viewer's fixed scenes are posed at 1 m; `STRATA_SCALE=0.25` runs it finer.
+
+**The parameter file.** Every number the viewer's generator uses (the atlas
+definition, the detail and density noise, the cave thresholds, the surface
+lines, the tree kind, each region's tree density, species mix and cave
+factor) is a line of `viewer/assets/island.gen`, `name = value`, read at
+start and again on `R` (or `STRATA_REGEN=1` in a scripted run). A name the
+file leaves out takes the code's default and is said once a load; a name it
+does not know, or a line it cannot read, is said and ignored. Regenerating
+first finishes the fluid's step in flight and starts the fluid afresh, then
+drops every chunk nobody edited and makes it again.
 
 Environment switches for scripted runs are listed at the top of
 `viewer/lib/strata_viewer.march`: a fixed scene (`STRATA_SCENE`), a frame
@@ -370,6 +425,40 @@ chain's matrices at t = 0, 0.25 and 0.5:
 
     (cd animcheck && forge build --release) && ANIMCHECK_SCENE=table animcheck/.march/build/release/animcheck
 
+## Entities
+
+Players, creatures and bullets: tens of thousands of entities kept as rows
+in C columns and reached by id. Design:
+`docs/2026-11-11-entities-design.md`; rulings: `docs/entities-ledger.md`.
+
+A game describes **kinds** as data, in the style of `Strata.Blocks`:
+`Strata.Entities.kind()` and the `with_` functions (mover, unseen rule,
+lifetime, slots, seen distance), checked with `valid`. `open` takes the
+kinds (numbered 0, 1, ... in order), a capacity (65,536 by default), a body
+budget and the stream's radius and chunk and voxel sizes; a kind's seen
+distance is at most `(radius_h - 2)` chunks. The rows live in C
+(`native/strata_ent.h`, bound by `native/strata_ent.c`), one world per
+process. A dead or unknown id reads as defaults and a write to it is
+ignored and counted in `stats`; every call on a closed world does nothing.
+
+```march
+let bullet = Strata.Entities.with_slots(Strata.Entities.with_lifetime(
+  Strata.Entities.with_mover(Strata.Entities.kind(), Strata.Entities.flying(), 0.05, 0.05, 0.05, 0.0, 0.0), 2.0), 1, 0)
+let e0 = Strata.Entities.open([bullet], 0, 0, 12, 3.2, 0.1)    -- capacity and bodies 0: the defaults
+let (e1, id) = Strata.Entities.add(e0, 0, 1.0, 2.0, 3.0, 0.0)  -- `spawn` is not a legal name (GAPS S22)
+let e2 = Strata.Entities.set_velocity(e1, id, 40.0, 0.0, 0.0)
+let (x, y, z) = Strata.Entities.position(e2, id)
+
+-- a whole kind at once, in dense order
+let ids = Strata.Entities.each(e2, 0)                                          -- NativeIntArr
+let vel = Strata.Entities.column(e2, 0, Strata.Entities.col_velocity())        -- 3 floats a row
+let e3 = Strata.Entities.set_column(e2, 0, Strata.Entities.col_velocity(), vel)
+```
+
+`scripts/ent_check.sh` builds `entcheck/` and runs its scenes:
+
+    (cd entcheck && forge build --release) && ENTCHECK_SCENE=basics entcheck/.march/build/release/entcheck
+
 ## Using it from a game
 
     [deps]
@@ -379,14 +468,15 @@ A game that draws also lists Strata's C shim itself, because forge does not
 build a dependency's C sources:
 
     [ffi]
-    sources = ["../strata/native/strata_vk.c", "../strata/native/strata_audio.c", "../strata/native/strata_anim.c"]
+    sources = ["../strata/native/strata_vk.c", "../strata/native/strata_audio.c", "../strata/native/strata_anim.c", "../strata/native/strata_ent.c"]
     link = ["-I../strata/native", "-I/opt/homebrew/include", "-L/opt/homebrew/lib",
             "-lglfw", "-lvulkan", "-Wl,-rpath,/opt/homebrew/lib"]
 
 and must run with `MARCH_PIN_MAIN=1`. A game that only uses the core needs
 neither; one that only plays sound lists `strata_audio.c` alone, which needs
-no library beyond the system's, and one that animates figures lists
-`strata_anim.c`, which needs none either.
+no library beyond the system's, one that animates figures lists
+`strata_anim.c`, and one with entities lists `strata_ent.c`; neither needs
+a library either.
 
 ```march
 -- register blocks
@@ -413,6 +503,21 @@ let (s3, gone) = Strata.Stream.take_unloads(s2)
 let s4 = Strata.Stream.apply(s3, Strata.Edit.fill_sphere(Strata.Stream.world(s3), 0, 0, 0, 6, 0))
 ```
 
+Levels of detail (the far field, Part F of
+`docs/2026-11-10-renderer-design.md`): a generator made with
+`Strata.Terrain.gen_levels(f, max_level)` makes a chunk for a key of any
+level up to `max_level` (`Strata.Coord.key_at(cx, cy, cz, level)`): 32
+voxels a side, each `scale * 2^level` metres, so it should be solid where
+any fine voxel under it would be. `Strata.Stream.config_levels(6, 3, 8, 4,
+10, 1, 4)` also keeps, for each level 1..4, a box 10 of that level's
+chunks out and 1 up and down about the focus; `take_meshes` returns meshes
+of every level (`Strata.Mesh.level`). Edits stay at level 0: a coarse
+chunk has the edited level-0 chunks under it coarsened over it
+(`Strata.World.coarsen`; the stream does it on the worker that generates
+the chunk), and an edit makes its ancestors stale (`Strata.World.stale`),
+which the stream puts through its generation queue again without waiting.
+Nothing draws the coarse levels yet.
+
 ## Modules
 
 | Module | Holds |
@@ -424,9 +529,9 @@ let s4 = Strata.Stream.apply(s3, Strata.Edit.fill_sphere(Strata.Stream.world(s3)
 | `Strata.Quad` | the packed 8-byte quad and instance formats |
 | `Strata.Occupancy` | one-bit-per-voxel solid masks |
 | `Strata.Mesh` | the greedy mesher |
-| `Strata.Terrain` | the generator contract |
+| `Strata.Terrain` | the generator contract; a generator's stamps (its structure layer) |
 | `Strata.World` | loaded chunks, the edited-chunk cache, queued edits |
-| `Strata.Edit` | single, list, box and sphere edits |
+| `Strata.Edit` | single, list, box and sphere edits; blasts |
 | `Strata.Stream` | loading around focus points; task-built chunks and meshes |
 | `Strata.Query` | raycast and swept box collision |
 | `Strata.Fluid` | finite fluids: fall, run to a drop, stay level, sink, rest |
@@ -434,6 +539,9 @@ let s4 = Strata.Stream.apply(s3, Strata.Edit.fill_sphere(Strata.Stream.world(s3)
 | `Strata.Model` | a model block's drawing geometry |
 | `Strata.Rig`, `Strata.Clip` | a jointed figure's description and part meshes; its animations |
 | `Strata.Anim`, `Strata.Ffi.Anim` | figures posed by the C kernel in `native/strata_anim.h` |
+| `Strata.Feature` | scattering features by hashed cells: the same placements however an area is cut |
+| `Strata.Template`, `Strata.Ffi.Vox` | voxel templates (holes, probabilities, turns) blitted into chunks; MagicaVoxel `.vox` import (`native/strata_vox.cpp`, link with `-fno-exceptions`) |
+| `Strata.Entities`, `Strata.Ffi.Ent` | entity kinds, and entities kept as rows by the C kernel in `native/strata_ent.h` |
 | `Strata.Ffi.Vk` | window, input and the Vulkan renderer |
 | `Strata.Math.*`, `Strata.Noise`, `Strata.Tree` | vectors, matrices, noise, a persistent tree |
 

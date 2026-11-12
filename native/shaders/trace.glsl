@@ -1,13 +1,17 @@
 // Rays through the light volume.
 //
 // The volume holds one byte per voxel, a light class (0 = empty), for every
-// chunk the renderer has been given, addressed by voxel coordinate modulo its
-// size. `owner` says, per chunk-sized cell, which chunk's voxels are in it,
-// so a ray never mistakes a wrapped-round chunk for the one it is in: where
+// chunk the renderer has been given whose voxels are not all one class, each
+// in a 32-voxel page of a pool (16 x 16 pages a layer). `owner` says, per
+// chunk-sized cell (a chunk's coordinate modulo the stream's box), which
+// chunk is in it and where its voxels are: a page, or one class throughout.
+// So a ray never mistakes a wrapped-round chunk for the one it is in: where
 // the owner is not the chunk the ray is in, the ray has left the loaded
 // world and sees nothing. `coarse` says how high each 8-voxel cell's contents
 // reach, so empty space, and the air over the ground, is crossed eight voxels
-// at a time.
+// at a time. It and the owner each hold two heights: of everything, and of
+// everything but see-through classes. A ray that passes through water and
+// glass uses the second, so it crosses a lake as it crosses air.
 layout(set = 0, binding = 11) uniform usampler3D vol;
 layout(set = 0, binding = 12) uniform usampler3D coarse;
 layout(set = 0, binding = 13) uniform isampler3D owner;
@@ -32,7 +36,10 @@ vec3 class_emission(uint c) {
 // Bodies (Strata.Physics): each a grid of light classes, one byte a voxel, at
 // a pose. A ray that enters a chunk looks at the bodies listed for that
 // chunk's cell and steps through each one's grid in the body's own frame.
-struct BodyRow { vec4 pos; vec4 rot; ivec4 dims; vec4 sphere; };   // low corner (metres), rotation, size and first word of its classes, bounding sphere (voxels)
+// Traced figures (Strata.Anim) are listed the same way, one group row a
+// figure (pos.w -1; dims: its first part row, how many, its rig): each part
+// row is a grid of its rig's palette indices at its own voxel size (pos.w).
+struct BodyRow { vec4 pos; vec4 rot; ivec4 dims; vec4 sphere; };   // low corner (metres) and voxel size (0: the world's), rotation, size and first word of its classes, bounding sphere (voxels)
 layout(std430, set = 0, binding = 17) readonly buffer BodyTable { BodyRow rows[]; } body_table;
 layout(std430, set = 0, binding = 18) readonly buffer BodyBytes { uint words[]; } body_bytes;
 layout(std430, set = 0, binding = 19) readonly buffer BodyCells { uvec2 cells[]; } body_cells;   // per cell: first entry, count
@@ -42,11 +49,37 @@ struct Hit {
     ivec3 voxel;     // the voxel hit
     int face;        // the face the ray entered it by: 0 +y, 1 -y, 2 +x, 3 -x, 4 +z, 5 -z
     float t;         // distance along the ray, in voxels
-    uint cls;        // its light class
+    uint cls;        // its light class; a figure's voxel: PALETTE_HIT | rig x 256 + palette index
     vec3 glow;       // emission gathered from thin voxels the ray passed through
 };
 
+// The rigs' palettes (strata_vk.c, sv_rig_palette): 256 entries a rig, two
+// words each: red and green in 11 bits, blue in 10 (linear); roughness and
+// emission in 16 bits each. A figure voxel a ray hits takes its colour and
+// emission from there, never from a light class.
+layout(std430, set = 0, binding = 24) readonly buffer Palette { uvec2 e[]; } palette;
+const uint PALETTE_HIT = 0x80000000u;
+// The colour of what a ray hit: a class's mean colour, or a figure voxel's palette colour.
+vec3 hit_color(uint c) {
+    if (c < PALETTE_HIT) return class_color(c);
+    uvec2 pe = palette.e[c & 65535u];
+    return vec3(float(pe.x & 2047u) / 2047.0, float((pe.x >> 11) & 2047u) / 2047.0, float(pe.x >> 22) / 1023.0);
+}
+// What it emits: a class's emission, or a figure voxel's colour times its palette emission (as light.frag lights a figure's own pixels).
+vec3 hit_emission(uint c) {
+    if (c < PALETTE_HIT) return class_emission(c);
+    return hit_color(c) * (float(palette.e[c & 65535u].y >> 16) / 65535.0);
+}
+
 ivec3 wrap(ivec3 v, ivec3 size) { return ((v % size) + size) % size; }
+
+// Where a chunk's voxels start in the pool, from its owner texel's w; -1
+// when they are all one class (w >> 13 is that class).
+ivec3 page_of(int w) {
+    if (((w >> 12) & 1) == 0) return ivec3(-1);
+    int p = w >> 13;
+    return ivec3((p % 16) * 32, ((p / 16) % 16) * 32, (p / 256) * 32);
+}
 
 // Is the texture of a cutout class solid where the ray enters this voxel?
 bool cutout_blocks(uint c, vec3 p, int face) {
@@ -59,8 +92,12 @@ bool cutout_blocks(uint c, vec3 p, int face) {
 }
 
 // The nearest stopping voxel of body [bi] along a ray (voxel units, world
-// frame) before [best]: updates best and what was hit, in world terms.
-void body_ray(uint bi, vec3 ro, vec3 rd, float tmax, bool stop_glass, inout float best, inout uint bcls, inout int bface) {
+// frame) before [best]: updates best and what was hit, in world terms. [pal]
+// is 0 for a body of light classes, or PALETTE_HIT | rig x 256 for a figure
+// part, every voxel of which stops the ray; a part's grid has voxels of its
+// own size (pos.w metres), so it is walked in its own voxels and the
+// distances converted.
+void body_ray(uint bi, vec3 ro, vec3 rd, float tmax, bool stop_glass, uint pal, inout float best, inout uint bcls, inout int bface) {
     // the bounding sphere first: most rays miss it, and the rest is a rotation and a walk
     vec4 sp = body_table.rows[bi].sphere;
     vec3 oc = sp.xyz - ro;
@@ -68,9 +105,10 @@ void body_ray(uint bi, vec3 ro, vec3 rd, float tmax, bool stop_glass, inout floa
     float lim = min(tmax, best);
     if (dot(oc, oc) - tca * tca > sp.w * sp.w || tca + sp.w < 0.0 || tca - sp.w > lim) return;
     BodyRow b = body_table.rows[bi];
-    float sc = u.eye.w;
+    float sc = b.pos.w > 0.0 ? b.pos.w : u.eye.w;     // metres a voxel of its grid
+    float kv = b.pos.w > 0.0 ? sc / u.eye.w : 1.0;      // its voxel in world voxels: exactly 1 for a body (a GPU's x / x need not be)
     vec4 qi = vec4(-b.rot.xyz, b.rot.w);
-    vec3 o = qrot(qi, ro * sc - b.pos.xyz) / sc;
+    vec3 o = qrot(qi, ro * u.eye.w - b.pos.xyz) / sc;
     vec3 d = qrot(qi, rd);
     d += (1.0 - step(1.0e-6, abs(d))) * 1.0e-6;
     vec3 inv = 1.0 / d;
@@ -78,7 +116,9 @@ void body_ray(uint bi, vec3 ro, vec3 rd, float tmax, bool stop_glass, inout floa
     vec3 ta = -o * inv, tb = (dims - o) * inv;
     vec3 tlo = min(ta, tb), thi = max(ta, tb);
     float tin = max(max(tlo.x, tlo.y), max(tlo.z, 0.0));
-    float tout = min(min(thi.x, thi.y), min(thi.z, min(tmax, best)));
+    float lim2 = min(tmax, best);
+    if (pal != 0u) lim2 /= kv;
+    float tout = min(min(thi.x, thi.y), min(thi.z, lim2));
     if (tin >= tout) return;
     // a ray that starts on the body's own surface does not stop on it at once
     int axis = tlo.x >= tlo.y && tlo.x >= tlo.z ? 0 : (tlo.y >= tlo.z ? 1 : 2);
@@ -93,10 +133,9 @@ void body_ray(uint bi, vec3 ro, vec3 rd, float tmax, bool stop_glass, inout floa
         int idx = v.x + b.dims.x * (v.y + b.dims.y * v.z);
         uint c = (body_bytes.words[uint(b.dims.w) + uint(idx >> 2)] >> (8u * uint(idx & 3))) & 255u;
         if (c != 0u && t > 0.05) {
-            int kind = class_kind(c);
-            if (kind == 1 || kind == 2 || (kind == 3 && stop_glass)) {
+            if (pal != 0u || class_kind(c) == 1 || class_kind(c) == 2 || (class_kind(c) == 3 && stop_glass)) {
                 vec3 nl = vec3(0.0); nl[axis] = -float(stp[axis]);
-                best = t; bcls = c; bface = nearest_face(qrot(b.rot, nl));
+                best = pal != 0u ? t * kv : t; bcls = pal != 0u ? pal | c : c; bface = nearest_face(qrot(b.rot, nl));
                 return;
             }
         }
@@ -104,6 +143,17 @@ void body_ray(uint bi, vec3 ro, vec3 rd, float tmax, bool stop_glass, inout floa
         else if (tnext.y < tnext.z) { v.y += stp.y; t = tnext.y; tnext.y += tstep.y; axis = 1; }
         else { v.z += stp.z; t = tnext.z; tnext.z += tstep.z; axis = 2; }
     }
+}
+
+// A traced figure's group row [gi]: its sphere first, then each of its parts.
+void figure_ray(uint gi, vec3 ro, vec3 rd, float tmax, inout float best, inout uint bcls, inout int bface) {
+    vec4 sp = body_table.rows[gi].sphere;
+    vec3 oc = sp.xyz - ro;
+    float tca = dot(oc, rd);
+    if (dot(oc, oc) - tca * tca > sp.w * sp.w || tca + sp.w < 0.0 || tca - sp.w > min(tmax, best)) return;
+    ivec4 gd = body_table.rows[gi].dims;
+    uint pal = PALETTE_HIT | (uint(gd.z) << 8);
+    for (int j = 0; j < gd.y && j < 64; j++) body_ray(uint(gd.x + j), ro, rd, tmax, false, pal, best, bcls, bface);
 }
 
 // A coarse cell holds how high its contents reach above its floor, 1..8, or 0
@@ -131,6 +181,8 @@ bool trace_steps(vec3 ro, vec3 rd, float tmax, bool stop_glass, int steps, float
     int face = 0;
     ivec3 last_chunk = ivec3(-1000000);
     ivec3 shift = ivec3(0);                       // from a chunk coordinate to its cell in the volume
+    ivec3 page = ivec3(-1);                       // where the chunk's voxels start in the pool, or -1 when they are all one class
+    uint whole = 0u;                              // ... that class
     float chunk_top = 0.0;                        // how high the contents of the chunk the ray is in reach, in voxels
     ivec3 last_thin = ivec3(-1000000);
     uint before = 0u;                             // the class of the voxel the ray was in last
@@ -148,21 +200,26 @@ bool trace_steps(vec3 ro, vec3 rd, float tmax, bool stop_glass, int steps, float
             ivec3 cell = wrap(ch, dims);
             ivec4 own = texelFetch(owner, cell, 0);
             if (own.w == 0 || own.xyz != ch) break;                // off the edge of what is loaded
-            last_chunk = ch; shift = cell - ch; chunk_top = float(own.w - 1);
+            last_chunk = ch; shift = cell - ch; chunk_top = stop_glass ? float((own.w & 63) - 1) : float((own.w >> 6) & 63);
+            page = page_of(own.w); whole = uint(own.w >> 13);
             if (any_bodies) {
                 uvec2 e = body_cells.cells[cell.x + dims.x * (cell.y + dims.y * cell.z)];
-                for (uint k = 0u; k < e.y && k < 64u; k++) body_ray(body_list.ids[e.x + k], ro, d, tmax, stop_glass, bt, bcls, bface);
+                for (uint k = 0u; k < e.y && k < 128u; k++) {
+                    uint id = body_list.ids[e.x + k];
+                    if (body_table.rows[id].pos.w < 0.0) figure_ray(id, ro, d, tmax, bt, bcls, bface);
+                    else body_ray(id, ro, d, tmax, stop_glass, 0u, bt, bcls, bface);
+                }
             }
         }
         vec3 lo, hi;
         if (chunk_top == 0.0 || (d.y >= 0.0 && p.y - float(ch.y * 32) >= chunk_top)) {
             lo = vec3(ch * 32); hi = lo + 32.0;                      // nothing in this chunk on the ray's way: cross it whole
             before = 0u;
-        } else if (skip_cell(texelFetch(coarse, (v >> 3) + shift * 4, 0).r, p.y - float((v.y >> 3) * 8), d.y)) {
+        } else if (skip_cell(stop_glass ? texelFetch(coarse, (v >> 3) + shift * 4, 0).r & 15u : texelFetch(coarse, (v >> 3) + shift * 4, 0).r >> 4, p.y - float((v.y >> 3) * 8), d.y)) {
             lo = vec3((v >> 3) * 8); hi = lo + 8.0;                  // nothing in this 8-voxel cell on the ray's way: cross it whole
             before = 0u;
         } else {
-            uint c = texelFetch(vol, v + shift * 32, 0).r;
+            uint c = page.x >= 0 ? texelFetch(vol, page + (v & 31), 0).r : whole;
             if (c != 0u) {
                 int kind = class_kind(c);
                 bool stops = kind == 1 || (kind == 2 && c != before && cutout_blocks(c, p, face)) || (kind == 3 && stop_glass && v.y != skip_y && v.y != skip_y + 1);
@@ -207,5 +264,6 @@ uint class_at(vec3 p) {
     ivec3 cell = wrap(ch, u.vol.xyz);
     ivec4 own = texelFetch(owner, cell, 0);
     if (own.w == 0 || own.xyz != ch) return 0u;
-    return texelFetch(vol, v + (cell - ch) * 32, 0).r;
+    ivec3 page = page_of(own.w);
+    return page.x >= 0 ? texelFetch(vol, page + (v & 31), 0).r : uint(own.w >> 13);
 }

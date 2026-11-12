@@ -14,14 +14,30 @@
  *
  * Hits come back through caller-owned arrays: a ray's ints and floats, a
  * box's pairs (an_x_hit_box answers how many there are, so a caller whose
- * array was short can ask again with a longer one). */
+ * array was short can ask again with a longer one).
+ *
+ * The view (an_x_view) takes its 24 plane floats from a NativeF32Arr; one
+ * shorter than 24 means no planes. The renderer reads the draw list through
+ * an_x_draw_list (an_draw_list on this world), C to C, never through March.
+ *
+ * Timing, for measurements only: an_x_update and an_x_hit_ray time
+ * themselves on the monotonic clock (an_x_timing). The kernel never reads a
+ * clock, so no answer depends on it. */
 /* Rewritten by stamp_anim.sh whenever strata_anim.h changes (GAPS S14). */
-#define STRATA_ANIM_STAMP "a6ae6b6ecf7c2942"
+#define STRATA_ANIM_STAMP "2e2d1d055752d99c"
 #include <stdint.h>
+#include <time.h>
 #include "strata_anim.h"
 
 static AnWorld *g_w;
 static int32_t g_mask_base[AN_RIGS], g_mask_n[AN_RIGS];
+/* seconds: the last update, the worst, the sum, how many; rays' sum and count */
+static double g_t_last, g_t_worst, g_t_sum, g_t_n, g_r_sum, g_r_n;
+static double an_x_now(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+}
 
 static const int32_t *an_x_i32(void *a) { return a ? (const int32_t *)((char *)a + 32) : NULL; }
 static const float *an_x_f32(void *a) { return a ? (const float *)((char *)a + 32) : NULL; }
@@ -97,7 +113,7 @@ int64_t an_x_spawn(int64_t rig, double x, double y, double z, double qx, double 
     if (id < 0) return id;
     AnFig *f = an_fig(g_w, id);
     an_place(g_w, id, pos, q);
-    an_pose(g_w, f, 0);
+    an_settle(g_w, f);
     return id;
 }
 void an_x_remove(int64_t fig) { if (g_w) an_remove(g_w, (int)fig); }
@@ -119,7 +135,43 @@ void an_x_blend(int64_t fig, int64_t layer, int64_t n, void *clips, void *positi
 void an_x_set(int64_t fig, int64_t layer, int64_t what, double v, double fade) {
     if (g_w) an_set(g_w, (int)fig, (int)layer, (int)what, (float)v, (float)fade);
 }
-void an_x_update(double dt) { if (g_w) an_update(g_w, (float)dt); }
+void an_x_update(double dt) {
+    if (!g_w) return;
+    double t0 = an_x_now();
+    an_update(g_w, (float)dt);
+    double t = an_x_now() - t0;
+    g_t_last = t; g_t_sum += t; g_t_n += 1;
+    if (t > g_t_worst) g_t_worst = t;
+}
+/* the measurements: 0 the last update's seconds, 1 the worst since the reset, 2 their sum, 3 how many, 4 rays' seconds, 5 how many rays */
+double an_x_timing(int64_t k) {
+    switch (k) {
+    case 0: return g_t_last;
+    case 1: return g_t_worst;
+    case 2: return g_t_sum;
+    case 3: return g_t_n;
+    case 4: return g_r_sum;
+    case 5: return g_r_n;
+    default: return 0;
+    }
+}
+void an_x_timing_reset(void) { g_t_last = g_t_worst = g_t_sum = g_t_n = g_r_sum = g_r_n = 0; }
+
+/* the camera: 24 plane floats (fewer: no planes, all in view), the eye, and the far distance (0: none) */
+void an_x_view(void *planes, double ex, double ey, double ez, double far_m) {
+    if (!g_w) return;
+    float eye[3] = {(float)ex, (float)ey, (float)ez};
+    an_view(g_w, an_x_len(planes) >= 24 ? an_x_f32(planes) : NULL, eye, (float)far_m);
+}
+/* the sun the drawing casts shadows by (toward it; at or below 0.01 up for
+ * none): strata_vk.c gives it each frame before it reads the draw list */
+void an_x_draw_sun(double x, double y, double z) {
+    if (!g_w) return;
+    float s[3] = {(float)x, (float)y, (float)z};
+    an_draw_sun(g_w, s);
+}
+void an_x_always(int64_t fig, int64_t on) { if (g_w) an_always(g_w, (int)fig, on != 0); }
+void an_x_traced(int64_t fig, int64_t on) { if (g_w) an_traced(g_w, (int)fig, on != 0); }
 
 /* how many parts figure fig has; 0 if there is no such figure */
 int64_t an_x_parts(int64_t fig) {
@@ -224,7 +276,10 @@ int64_t an_x_hit_ray(double ox, double oy, double oz, double dx, double dy, doub
     if (!g_w || an_x_len(ints) < 6 || an_x_len(floats) < 4) return 0;
     float o[3] = {(float)ox, (float)oy, (float)oz}, d[3] = {(float)dx, (float)dy, (float)dz};
     AnHit h;
-    if (!an_hit_ray(g_w, o, d, (float)max, (int)ignore, &h)) return 0;
+    double t0 = an_x_now();
+    int got = an_hit_ray(g_w, o, d, (float)max, (int)ignore, &h);
+    g_r_sum += an_x_now() - t0; g_r_n += 1;
+    if (!got) return 0;
     int32_t *i = (int32_t *)((char *)ints + 32);
     float *f = (float *)((char *)floats + 32);
     i[0] = h.fig; i[1] = h.part; i[2] = h.x; i[3] = h.y; i[4] = h.z; i[5] = h.colour;
@@ -254,3 +309,13 @@ double an_x_mark_weight(int64_t i) {
 /* the hash, folded to 62 bits so it is the same number as a March Int */
 int64_t an_x_hash(void) { return g_w ? (int64_t)(an_hash(g_w) & 0x3fffffffffffffffull) : 0; }
 double an_x_stat(int64_t which) { return g_w ? an_stat(g_w, (int)which) : 0; }
+
+/* The renderer's draw list (strata_vk.c reads it each frame; it defines a
+ * weak stand-in answering no parts, so a game that draws but does not
+ * animate still links): every visible part of every figure, drawn at blend
+ * 0..1 between its last two poses, as an_draw_list lists them. The arrays
+ * are the world's, valid until the next call; 0 with no world. */
+int an_x_draw_list(double blend, const int32_t **rig_part, const float **xf, const int32_t **flags) {
+    if (!g_w) { if (rig_part) *rig_part = NULL; if (xf) *xf = NULL; if (flags) *flags = NULL; return 0; }
+    return an_draw_list(g_w, (float)blend, rig_part, xf, flags);
+}

@@ -6,29 +6,39 @@
 -- the uploads and frees. A chunk is uploaded whole or not at all: one the
 -- renderer has no room for is kept and tried again on the next sync, and
 -- until it lands the chunk's previous mesh stays on screen, all of it.
+--
+-- Figures (Strata.Anim): `figures` uploads each rig's part meshes, shapes
+-- for the rays and palette once; from then on every figure the animation
+-- lists is drawn at each frame, straight from C, at the blend `draw` passes,
+-- and a traced one (Strata.Anim.traced) is placed among what the rays hit.
 mod Strata.Render do
 
   alias Strata.Slots as Sr2
 
-  -- the slot table, and an empty mesh to stand in where one is required
-  type Render = Render(Strata.Slots.Slots, Strata.Mesh.Meshed)
+  -- the slot table, an empty mesh to stand in where one is required, and the rig ids whose meshes the renderer holds
+  type Render = Render(Strata.Slots.Slots, Strata.Mesh.Meshed, List(Int))
 
   pfn no_mesh() : Strata.Mesh.Meshed do
     Strata.Mesh.build(Strata.Blocks.empty(), Strata.Mesh.around_from(fn (dx, dy, dz) -> Strata.Chunk.uniform(0)))
   end
 
   doc "A renderer-side table of [capacity] chunk slots. The shim holds 16384."
-  fn new(capacity : Int) : Render do Render(Sr2.new(capacity), no_mesh()) end
+  fn new(capacity : Int) : Render do Render(Sr2.new(capacity), no_mesh(), Nil) end
 
   doc "Chunk slots in use."
-  fn used(r : Render) : Int do match r do Render(sl, _) -> Sr2.used(sl) end end
+  fn used(r : Render) : Int do match r do Render(sl, _, _) -> Sr2.used(sl) end end
   doc "Meshes waiting for a slot or for room in the quad buffer."
-  fn waiting(r : Render) : Int do match r do Render(sl, _) -> Sr2.waiting(sl) end end
+  fn waiting(r : Render) : Int do match r do Render(sl, _, _) -> Sr2.waiting(sl) end end
   doc "The slot a chunk's mesh is in, or -1."
-  fn slot_of(r : Render, k : Strata.Coord.Key) : Int do match r do Render(sl, _) -> Sr2.slot_of(sl, k) end end
+  fn slot_of(r : Render, k : Strata.Coord.Key) : Int do match r do Render(sl, _, _) -> Sr2.slot_of(sl, k) end end
 
   doc "How many blocks could not have a light class of their own and share the nearest of their kind: 0 unless the registry holds more than 255 blocks that differ in what they are to light. Such a block is lit and reflected with another block's texture, smoothness or glow."
   fn light_overflow(r : Strata.Blocks.Registry) : Int do Strata.Blocks.light_overflow(r) end
+
+  doc "The light volume's pool: (pages in use, pages it has, chunks that found no page). A chunk whose voxels are all one class takes no page; a chunk that finds none is seen by light rays as outside the world."
+  fn light_pages() : (Int, Int, Int) do
+    (float_to_int(Strata.Ffi.Vk.stat(10)), float_to_int(Strata.Ffi.Vk.stat(12) /. 32768.0), float_to_int(Strata.Ffi.Vk.stat(11)))
+  end
 
   doc "Give the renderer the registry's per-block data (textures, flags, emission). Call once the registry is built, and again if it changes."
   fn upload_blocks(r : Strata.Blocks.Registry) : Bool do
@@ -158,7 +168,7 @@ mod Strata.Render do
     match Strata.Physics.take_meshes(p) do
       (p2, made) ->
         match r do
-          Render(sl, none) ->
+          Render(sl, none, rg) ->
             let held = Sr2.keys(sl)
             let gone = List.filter(held, fn k -> Strata.Physics.is_part_key(k) && !Strata.Physics.exists(p2, Strata.Coord.kx(k)))
             let keyed = List.map(made, fn m -> keyed_part(m))
@@ -169,7 +179,7 @@ mod Strata.Render do
                 let sl3 = perform(sl2, acts, none)
                 give_shapes(sl3, p2, made)
                 pose_parts(sl3, p2, t, Sr2.keys(sl3))
-                (Render(sl3, none), p2)
+                (Render(sl3, none, rg), p2)
             end
         end
     end
@@ -207,12 +217,85 @@ mod Strata.Render do
         match Strata.Stream.take_unloads(s2) do
           (s3, gone) ->
             match r do
-              Render(sl, none) ->
+              Render(sl, none, rg) ->
                 match Sr2.plan(sl, meshes, gone) do
-                  (sl2, acts) -> (Render(perform(sl2, acts, none), none), s3)
+                  (sl2, acts) -> (Render(perform(sl2, acts, none), none, rg), s3)
                 end
             end
         end
     end
+  end
+  -- ── Figures ────────────────────────────────────────────────────────────────
+  -- a rig's palette as the renderer takes it: 256 x (red, green, blue, roughness, emission)
+  pfn palette_go(out : NativeF32Arr, cs : List((Int, Float, Float, Float, Float, Float))) : NativeF32Arr do
+    match cs do
+      Nil -> out
+      Cons((i, cr, cg, cb, ro, em), t) ->
+        let o = i * 5
+        palette_go(NativeArray.set_f32(NativeArray.set_f32(NativeArray.set_f32(NativeArray.set_f32(NativeArray.set_f32(out, o, cr), o + 1, cg), o + 2, cb), o + 3, ro), o + 4, em), t)
+    end
+  end
+  -- every part's anchor and voxel size; true if all were taken
+  pfn anchors_go(id : Int, rg : Strata.Rig.Rig, p : Int, n : Int, ok : Bool) : Bool do
+    if p >= n do ok
+    else
+      match Strata.Rig.anchor_at(rg, p) do
+        (ax, ay, az) -> anchors_go(id, rg, p + 1, n, Strata.Ffi.Vk.rig_part_anchor(id, p, ax, ay, az, Strata.Rig.voxel_size(rg)) && ok)
+      end
+    end
+  end
+  -- every piece of every part's mesh; true if all were taken
+  pfn pieces_go(id : Int, ps : List((Int, Int, Int, Int, NativeI32Arr)), ok : Bool) : Bool do
+    match ps do
+      Nil -> ok
+      Cons((part, ox, oy, oz, quads), t) ->
+        let b = Strata.Ffi.Vk.rig_part_begin(id, part, ox, oy, oz)
+        let q = Strata.Ffi.Vk.chunk_part(0, quads, NativeArray.length_i32(quads) / 2)
+        -- commit is called whatever came before, so a failed part cannot leave a piece staged
+        let done = Strata.Ffi.Vk.chunk_commit()
+        pieces_go(id, t, b && q && done && ok)
+    end
+  end
+  -- every part's shape for the rays (a part of no voxels has none); true if all were taken
+  pfn shapes_go(id : Int, rg : Strata.Rig.Rig, p : Int, n : Int, ok : Bool) : Bool do
+    if p >= n do ok
+    else
+      match Strata.Rig.size(rg, p) do
+        (sx, sy, sz) ->
+          let took = if sx * sy * sz == 0 do true else Strata.Ffi.Vk.rig_shape(id, p, Strata.Rig.grid(rg, p), sx, sy, sz) end
+          shapes_go(id, rg, p + 1, n, took && ok)
+      end
+    end
+  end
+  pfn upload_rig(id : Int, rg : Strata.Rig.Rig) : Bool do
+    let pal = Strata.Ffi.Vk.rig_palette(id, palette_go(NativeArray.make_f32(256 * 5, 0.0), Strata.Rig.palette(rg)))
+    let anc = anchors_go(id, rg, 0, Strata.Rig.part_count(rg), true)
+    let shp = shapes_go(id, rg, 0, Strata.Rig.part_count(rg), true)
+    pal && anc && shp && pieces_go(id, Strata.Rig.meshes(rg), true)
+  end
+  pfn figures_go(a : Strata.Anim.Anim, rigs : List(Strata.Rig.Rig), held : List(Int)) : List(Int) do
+    match rigs do
+      Nil -> held
+      Cons(rg, t) ->
+        let id = Strata.Anim.rig_id(a, rg)
+        if id < 0 do figures_go(a, t, held)
+        else if List.any(held, fn i -> i == id) do figures_go(a, t, held)
+        else if upload_rig(id, rg) do figures_go(a, t, Cons(id, held))
+        else figures_go(a, t, held) end end end
+    end
+  end
+
+  doc "Give the renderer the meshes, ray shapes and palettes of these rigs, each finished in [a] (Strata.Anim.finish_rig): uploaded once per rig, shared by every figure made from it; a rig already held, or not finished in [a], is passed over. A rig the renderer had no room for is tried again at the next call. From then on every figure of those rigs that the animation lists is drawn at each frame, at its pose: a game calls nothing per figure."
+  fn figures(r : Render, a : Strata.Anim.Anim, rigs : List(Strata.Rig.Rig)) : Render do
+    match r do Render(sl, none, held) -> Render(sl, none, figures_go(a, rigs, held)) end
+  end
+
+  doc "Rigs whose meshes the renderer holds."
+  fn figure_rigs(r : Render) : Int do match r do Render(_, _, held) -> List.length(held) end end
+
+  doc "Draw and present one frame, figures drawn [blend] (0..1) of the way from each one's pose before last to its last: the fraction of an animation step that has passed since the last `Strata.Anim.update`. False when the frame was skipped."
+  fn draw(blend : Float) : Bool do
+    Strata.Ffi.Vk.set_blend(blend)
+    Strata.Ffi.Vk.frame()
   end
 end

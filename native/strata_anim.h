@@ -23,7 +23,16 @@
  * the pose before springs, and pose a stale figure (placed, played or changed
  * since its last pose, or hanging from one) before they answer; posing for a
  * query changes nothing an update carries forward. Hits find figures through
- * a coarse grid of their bounds (cells AN_CELL metres), rebuilt each update. */
+ * a coarse grid of their bounds (cells AN_CELL metres), rebuilt each update.
+ *
+ * Cost control: an_view sets the camera's planes, eye and far distance. A
+ * figure outside the planes (with AN_MARGIN metres to spare) and not marked
+ * always still advances and fires its marks every update but is posed at most
+ * one update in AN_OUT_EVERY; past the far distance it is posed every other
+ * update with its springs frozen. A skipped figure is stale, so a query poses
+ * it first: the camera never changes a mark, a socket or a hit. Each figure
+ * keeps its last two posed matrix sets; an_draw_matrices and an_draw_list
+ * draw between them. */
 #ifndef STRATA_ANIM_H
 #define STRATA_ANIM_H
 #include <stdint.h>
@@ -57,6 +66,12 @@
 #define AN_BRICK_INDEX (1 << 16)   /* brick table entries over every part grid */
 #define AN_CELL 4.0f               /* the hit grid's cells, metres a side */
 #define AN_CELLS_PER_FIG 8         /* a figure covering more cells is kept in a list every query tests */
+#define AN_MARGIN 2.0f             /* metres a figure's bounds may lie outside the view planes and still count as in view */
+#define AN_OUT_EVERY 4             /* a figure out of view poses one update in this many */
+#define AN_FAR_EVERY 2             /* a figure past the far distance poses one update in this many */
+#define AN_TRACED 64               /* figures drawn traced at once; more are counted in stat 9 and drawn plain */
+#define AN_DRAW_MAX (1 << 14)      /* parts in one draw list (twice the arena's 7 680); more are counted in stat 10 */
+#define AN_SHADOW_REACH 24.0f      /* metres along the ground a figure out of view may lie from the view and still be listed for its shadow */
 
 /* why the last refused call was refused: an_stat(5) */
 enum {
@@ -206,6 +221,14 @@ typedef struct {
     uint8_t depth, pad;          /* links above it */
     float att_pos[3], att_q[4];  /* its placement in the socket's frame */
     float bmin[3], bmax[3];      /* world bounds of its part boxes before springs; bmin > bmax: none */
+    /* cost control: set by the schedule in an_update, never by a query */
+    uint8_t always, traced;      /* always posed; traced: 0 no, 1 drawn traced, 2 waiting past the cap */
+    uint8_t cls, frozen;         /* AN_C_* as the last update found it; springs frozen (far, not always) */
+    uint8_t wait, unposed;       /* updates skipped since its last scheduled pose (reset to a stagger on a class change); never posed by an update */
+    uint8_t dspan, dsince;       /* drawing: updates between its last two poses, and since the last (the blend is stretched over the span) */
+    float pend;                  /* seconds since its last scheduled pose (the springs' dt) */
+    float dmove;                 /* drawing: updates of motion from the pose before last to the last */
+    float vbmin[3], vbmax[3], vpos[3];   /* its bounds and placement at its last scheduled pose (culling reads them) */
     AnLayer layer[AN_LAYERS];
 } AnFig;
 typedef struct { float u; int32_t fig, layer, tag; float weight; } AnEvent;   /* u: how far through the update */
@@ -217,6 +240,7 @@ typedef struct { float u; int32_t fig, layer, tag; float weight; } AnEvent;   /*
  *   reach:    slot 0..7; chain[0..2]; v = target xyz, pole xyz, weight, the weight it fades to, fade speed (weight a second)
  *   spring:   slot = part; v = stiffness, damping, world rotation xyzw, angular velocity xyz (world); fresh until first posed */
 enum { AN_K_OVERRIDE = 0, AN_K_AIM = 1, AN_K_REACH = 2, AN_K_SPRING = 3 };
+enum { AN_C_OUT = 1, AN_C_FAR = 2 };   /* a figure's class: out of view, past the far distance */
 typedef struct {
     int32_t next;                /* the figure's next record, -1 at the end */
     uint8_t kind, slot, n, fresh;
@@ -264,6 +288,15 @@ struct AnWorld {
     int32_t *cand;                                               /* capacity: a box query's candidate slots */
     int nstale;                                                  /* live figures marked dirty: a query with none poses nothing */
     double scans;                                                /* passes a query made over the figures to pose stale ones (stat 8) */
+    float *prev;                                                 /* capacity x AN_PARTS x 12: the pose before the last */
+    float planes[24]; int nplanes;                               /* the view: 0 or 6 unit planes, n.p + d >= 0 inside */
+    float eye[3], far_m; int has_far;                            /* the eye, and the distance past which a figure is far */
+    float dsun[3]; int has_dsun;                                 /* the drawing's sun (an_draw_sun): toward it, unit, above the horizon */
+    int ntraced, nwaiting;                                       /* figures drawn traced, and those waiting past the cap */
+    int skipped;                                                 /* figures the last update did not pose (stat 11) */
+    double draw_over;                                            /* parts left out of the last draw list (stat 10) */
+    float *dscratch;                                             /* AN_PARTS x 12: an_draw_matrices */
+    int32_t *dl_rp, *dl_flags; float *dl_xf;                     /* AN_DRAW_MAX: the draw list */
 };
 typedef struct AnWorld AnWorld;
 
@@ -279,6 +312,7 @@ static inline void an_close(AnWorld *w) {
     free(w->procs); free(w->proc_free);
     free(w->sockets); free(w->shapes); free(w->shape_of); free(w->brick_index); free(w->bricks);
     free(w->grid_head); free(w->grid_next); free(w->grid_slot); free(w->big); free(w->stamp); free(w->scratch); free(w->cand);
+    free(w->prev); free(w->dscratch); free(w->dl_rp); free(w->dl_flags); free(w->dl_xf);
     free(w);
 }
 
@@ -321,10 +355,16 @@ static inline AnWorld *an_open(int capacity) {
     w->stamp = (uint32_t *)calloc((size_t)capacity, sizeof *w->stamp);
     w->scratch = (float *)calloc(AN_PARTS * 12, sizeof *w->scratch);
     w->cand = (int32_t *)malloc((size_t)capacity * sizeof *w->cand);
+    w->prev = (float *)calloc((size_t)capacity * AN_PARTS * 12, sizeof *w->prev);
+    w->dscratch = (float *)calloc(AN_PARTS * 12, sizeof *w->dscratch);
+    w->dl_rp = (int32_t *)malloc(AN_DRAW_MAX * sizeof *w->dl_rp);
+    w->dl_flags = (int32_t *)malloc(AN_DRAW_MAX * sizeof *w->dl_flags);
+    w->dl_xf = (float *)malloc((size_t)AN_DRAW_MAX * 12 * sizeof *w->dl_xf);
     if (!w->rigs || !w->masks || !w->clips || !w->keys || !w->key_interp || !w->mark_t || !w->mark_tag || !w->figs ||
         !w->mats || !w->ids || !w->free_slots || !w->events || !w->events_tmp || !w->procs || !w->proc_free ||
         !w->sockets || !w->shapes || !w->shape_of || !w->brick_index || !w->bricks || !w->grid_head || !w->grid_next ||
-        !w->grid_slot || !w->big || !w->stamp || !w->scratch || !w->cand) { an_close(w); return NULL; }
+        !w->grid_slot || !w->big || !w->stamp || !w->scratch || !w->cand || !w->prev || !w->dscratch || !w->dl_rp ||
+        !w->dl_flags || !w->dl_xf) { an_close(w); return NULL; }
     for (int i = 0; i < AN_RIGS * AN_PARTS; i++) w->shape_of[i] = -1;
     for (uint32_t i = 0; i < gn; i++) w->grid_head[i] = -1;
     for (int i = 0; i < w->nprocs; i++) w->proc_free[i] = w->nprocs - 1 - i;   /* record 0 handed out first */
@@ -478,7 +518,14 @@ static inline AnFig *an_fig(AnWorld *w, int fig) {
     return s < 0 ? NULL : &w->figs[s];
 }
 static inline float *an_fig_mats(const AnWorld *w, const AnFig *f) { return w->mats + (size_t)(f - w->figs) * AN_PARTS * 12; }
+static inline float *an_fig_prev(const AnWorld *w, const AnFig *f) { return w->prev + (size_t)(f - w->figs) * AN_PARTS * 12; }
 static inline void an_pose(AnWorld *w, AnFig *f, float dt);
+/* pose f as it stands, with nothing to draw between: both matrix sets, and the bounds culling reads */
+static inline void an_settle(AnWorld *w, AnFig *f) {
+    an_pose(w, f, 0);
+    memcpy(an_fig_prev(w, f), an_fig_mats(w, f), (size_t)w->rigs[f->rig].nparts * 12 * sizeof(float));
+    memcpy(f->vbmin, f->bmin, sizeof f->vbmin); memcpy(f->vbmax, f->bmax, sizeof f->vbmax); memcpy(f->vpos, f->pos, sizeof f->vpos);
+}
 
 static inline int an_spawn(AnWorld *w, int rig) {
     if (rig < 0 || rig >= w->nrigs) return an_refuse(w, AN_R_RIG);
@@ -491,13 +538,15 @@ static inline int an_spawn(AnWorld *w, int rig) {
     memset(f, 0, sizeof *f);
     f->id = id; f->rig = rig; f->q[3] = 1; f->proc = -1;
     f->att = -1; f->att_q[3] = 1;
+    f->unposed = 1; f->dspan = 1; f->dmove = 1;
     an_id_insert(w, id, s);
     w->live++;
-    an_pose(w, f, 0);                          /* the rest pose, at the origin */
+    an_settle(w, f);                           /* the rest pose, at the origin */
     return id;
 }
 
 static inline void an_recount(AnWorld *w);
+static inline void an_untrace(AnWorld *w, AnFig *f);
 static inline void an_attach_place(AnWorld *w, AnFig *f);
 static inline void an_place_chain(AnWorld *w, AnFig *f);
 static inline void an_unhang(AnFig *f) {   /* no longer attached; it keeps its placement */
@@ -523,6 +572,7 @@ static inline void an_remove(AnWorld *w, int fig) {
         an_unhang(f);
     }
     if (f->dirty) { f->dirty = 0; w->nstale--; }
+    an_untrace(w, f);
     w->grid_dirty = 1;
     an_id_erase(w, fig);
     for (int i = f->proc; i >= 0; i = w->procs[i].next) w->proc_free[w->nproc_free++] = i;
@@ -1057,7 +1107,10 @@ static inline void an_bounds(const AnRig *r, const AnBody *b, AnFig *f) {
 
 /* poses figure f: the pose up to the springs, then the hierarchy with the
  * springs advanced by dt (0 holds them), into its matrices; its bounds come
- * from the pose before springs */
+ * from the pose before springs. A frozen figure's springs are left as they
+ * are and its parts drawn where the pose before springs puts them, as is a
+ * fresh spring posed without time (for a query), so posing with dt 0 changes
+ * no spring. */
 static inline void an_pose(AnWorld *w, AnFig *f, float dt) {
     const AnRig *r = &w->rigs[f->rig];
     AnBody b;
@@ -1067,8 +1120,9 @@ static inline void an_pose(AnWorld *w, AnFig *f, float dt) {
     int16_t spring[AN_PARTS];
     int any = 0;
     for (int p = 0; p < r->nparts; p++) spring[p] = -1;
-    for (int i = f->proc; i >= 0; i = w->procs[i].next)
-        if (w->procs[i].kind == AN_K_SPRING) { spring[w->procs[i].slot] = (int16_t)i; any = 1; }
+    if (!f->frozen)
+        for (int i = f->proc; i >= 0; i = w->procs[i].next)
+            if (w->procs[i].kind == AN_K_SPRING) { spring[w->procs[i].slot] = (int16_t)i; any = 1; }
     float *out = an_fig_mats(w, f);
     for (int p = 0; p < r->nparts; p++) {
         if (any) {   /* parents are final before their children: rebuild in place */
@@ -1079,7 +1133,7 @@ static inline void an_pose(AnWorld *w, AnFig *f, float dt) {
             for (int i = 0; i < 3; i++) b.wp[p][i] = pp[i] + ro[i];
             an_qmul(pq, b.q[p], b.wq[p]);
             an_qnorm(b.wq[p]);
-            if (spring[p] >= 0) {
+            if (spring[p] >= 0 && !(w->procs[spring[p]].fresh && !(dt > 0))) {
                 AnProc *s = &w->procs[spring[p]];
                 an_spring_step(s, b.wq[p], dt);
                 memcpy(b.wq[p], s->v + 2, sizeof b.wq[p]);
@@ -1189,20 +1243,131 @@ static inline void an_sort_events(AnWorld *w) {
     if (a != w->events) memcpy(w->events, a, (size_t)n * sizeof *a);
 }
 
-/* advances every figure (marks in slot order), then poses them parents
- * first: depth 0, then 1, ... each attached figure placed at its parent's
- * socket; then rebuilds the hit grid */
+/* a rotation's quaternion from its 3x3 (column-major, as an_qmat writes it) */
+static inline void an_mat_q(const float *m, float q[4]) {
+    float m00 = m[0], m10 = m[1], m20 = m[2], m01 = m[3], m11 = m[4], m21 = m[5], m02 = m[6], m12 = m[7], m22 = m[8];
+    float tr = m00 + m11 + m22;
+    if (tr > 0) {
+        float s = sqrtf(tr + 1) * 2;
+        q[3] = 0.25f * s; q[0] = (m21 - m12) / s; q[1] = (m02 - m20) / s; q[2] = (m10 - m01) / s;
+    } else if (m00 > m11 && m00 > m22) {
+        float s = sqrtf(1 + m00 - m11 - m22) * 2;
+        q[3] = (m21 - m12) / s; q[0] = 0.25f * s; q[1] = (m01 + m10) / s; q[2] = (m02 + m20) / s;
+    } else if (m11 > m22) {
+        float s = sqrtf(1 + m11 - m00 - m22) * 2;
+        q[3] = (m02 - m20) / s; q[0] = (m01 + m10) / s; q[1] = 0.25f * s; q[2] = (m12 + m21) / s;
+    } else {
+        float s = sqrtf(1 + m22 - m00 - m11) * 2;
+        q[3] = (m10 - m01) / s; q[0] = (m02 + m20) / s; q[1] = (m12 + m21) / s; q[2] = 0.25f * s;
+    }
+    an_qnorm(q);
+}
+/* a part between two 3x4s: the rotation slerped, the origin lerped; u 0 is a, 1 is b, exactly */
+static inline void an_mat_mix(const float *a, const float *b, float u, float *o) {
+    if (!(u > 0)) { memcpy(o, a, 12 * sizeof(float)); return; }
+    if (u >= 1) { memcpy(o, b, 12 * sizeof(float)); return; }
+    float qa[4], qb[4], q[4], p[3];
+    an_mat_q(a, qa); an_mat_q(b, qb);
+    an_slerp(qa, qb, u, q);
+    for (int k = 0; k < 3; k++) p[k] = a[9 + k] + (b[9 + k] - a[9 + k]) * u;
+    an_write_mat(q, p, o);
+}
+/* ---- cost control: the view, and which figures an update poses ---- */
+
+/* f's bounds as culling sees them: as of its last scheduled pose, carried
+ * along by any placement since; a figure of no volume is its placement */
+static inline void an_cull_box(const AnFig *f, float lo[3], float hi[3]) {
+    if (!(f->vbmin[0] <= f->vbmax[0])) { memcpy(lo, f->pos, 3 * sizeof(float)); memcpy(hi, f->pos, 3 * sizeof(float)); return; }
+    for (int k = 0; k < 3; k++) { float m = f->pos[k] - f->vpos[k]; lo[k] = f->vbmin[k] + m; hi[k] = f->vbmax[k] + m; }
+}
+/* is f in view: no planes, or its bounds within AN_MARGIN of the inside of every plane */
+static inline int an_in_view(const AnWorld *w, const AnFig *f) {
+    if (!w->nplanes) return 1;
+    float lo[3], hi[3];
+    an_cull_box(f, lo, hi);
+    for (int i = 0; i < w->nplanes; i++) {
+        const float *pl = w->planes + 4 * i;
+        float d = pl[3];
+        for (int k = 0; k < 3; k++) d += pl[k] * (pl[k] > 0 ? hi[k] : lo[k]);   /* the corner furthest inside */
+        if (d < -AN_MARGIN) return 0;
+    }
+    return 1;
+}
+/* f's class from the view: out of view, past the far distance (from the eye to its bounds' nearest point) */
+static inline int an_classify(const AnWorld *w, const AnFig *f) {
+    int c = an_in_view(w, f) ? 0 : AN_C_OUT;
+    if (w->has_far) {
+        float lo[3], hi[3], d2 = 0;
+        an_cull_box(f, lo, hi);
+        for (int k = 0; k < 3; k++) {
+            float e = w->eye[k], g = e < lo[k] ? lo[k] - e : (e > hi[k] ? e - hi[k] : 0);
+            d2 += g * g;
+        }
+        if (d2 > w->far_m * w->far_m) c |= AN_C_FAR;
+    }
+    return c;
+}
+/* does this update pose f (slot s)? A free figure by its class: always, or in
+ * view and near, every update; out of view one in AN_OUT_EVERY; far one in
+ * AN_FAR_EVERY. An attached figure poses when its parent does (it takes the
+ * parent's class), unless it is always posed. A figure entering a class waits
+ * a share of its period set by its slot, so a crowd entering at once spreads
+ * over the updates. Springs freeze while far (not always) and start again at
+ * rest when that ends. */
+static inline int an_sched(AnWorld *w, AnFig *f, int s, float dt) {
+    f->pend += dt;
+    const AnFig *par = f->att >= 0 ? &w->figs[f->att] : NULL;
+    int cls = f->always ? 0 : (par ? par->cls : an_classify(w, f));
+    int frozen = (cls & AN_C_FAR) && !f->always;
+    if (f->frozen && !frozen)
+        for (int i = f->proc; i >= 0; i = w->procs[i].next) if (w->procs[i].kind == AN_K_SPRING) w->procs[i].fresh = 1;
+    f->frozen = (uint8_t)frozen;
+    int every = cls & AN_C_OUT ? AN_OUT_EVERY : (cls & AN_C_FAR ? AN_FAR_EVERY : 1);
+    if (cls != f->cls) { f->cls = (uint8_t)cls; f->wait = (uint8_t)(s % every); }
+    int pose = (par && !f->always) ? par->wait == 0 : f->wait + 1 >= every;
+    if (pose) f->wait = 0;
+    else if (f->wait < 255) f->wait++;
+    return pose;
+}
+
+/* advances every figure (marks in slot order), then poses those the schedule
+ * picks, parents first: depth 0, then 1, ... each attached figure placed at
+ * its parent's socket; a figure not posed is left stale. Then rebuilds the hit
+ * grid. A posed figure's last pose becomes the one before it. */
 static inline void an_update(AnWorld *w, float dt) {
     if (!(dt >= 0) || !isfinite(dt)) { w->negative_dt += 1; return; }
     w->nevents = 0;
     w->posed = 0;
+    w->skipped = 0;
     for (int s = 0; s < w->capacity; s++) if (w->figs[s].id >= 0) an_advance(w, &w->figs[s], dt);
     for (int d = 0; d <= w->max_depth; d++)
         for (int s = 0; s < w->capacity; s++) {
             AnFig *f = &w->figs[s];
             if (f->id < 0 || f->depth != d) continue;
+            if (!an_sched(w, f, s, dt)) { an_mark(w, f); w->skipped++; if (f->dsince < 255) f->dsince++; continue; }
             if (f->att >= 0) an_attach_place(w, f);
-            an_pose(w, f, dt);
+            int np = w->rigs[f->rig].nparts;
+            size_t len = (size_t)np * 12 * sizeof(float);
+            /* the pose before last is where the drawing has got to: the last pose, unless
+             * its span was longer than the updates since (a figure whose period shrank,
+             * coming into view); then the motion left to draw (in updates) is drawn over
+             * half as many updates, so the drawn lag halves each pose and nothing jumps */
+            int span = f->dspan ? f->dspan : 1;
+            float reached = (float)(f->dsince + 1) / (float)span;
+            if (reached >= 1) {
+                memcpy(an_fig_prev(w, f), an_fig_mats(w, f), len);
+                f->dspan = (uint8_t)(f->dsince + 1); f->dmove = (float)f->dspan;
+            } else {
+                for (int p = 0; p < np; p++) an_mat_mix(an_fig_prev(w, f) + p * 12, an_fig_mats(w, f) + p * 12, reached, an_fig_prev(w, f) + p * 12);
+                f->dmove = (1 - reached) * f->dmove + (float)(f->dsince + 1);
+                int half = (int)ceilf(f->dmove * 0.5f - 1e-3f);
+                f->dspan = (uint8_t)(half < 1 ? 1 : (half > 255 ? 255 : half));
+            }
+            f->dsince = 0;
+            an_pose(w, f, f->pend);
+            if (f->unposed) { memcpy(an_fig_prev(w, f), an_fig_mats(w, f), len); f->unposed = 0; f->dspan = 1; f->dmove = 1; }
+            f->pend = 0;
+            memcpy(f->vbmin, f->bmin, sizeof f->vbmin); memcpy(f->vbmax, f->bmax, sizeof f->vbmax); memcpy(f->vpos, f->pos, sizeof f->vpos);
             w->posed++;
         }
     an_grid_build(w);
@@ -1412,6 +1577,34 @@ static inline int an_marks(const AnWorld *w, int max, int32_t *ints, float *weig
     return n < 0 ? 0 : n;
 }
 
+static inline uint64_t an_fnv(uint64_t h, const void *v, size_t n) {
+    const unsigned char *p = (const unsigned char *)v;
+    for (size_t i = 0; i < n; i++) { h ^= p[i]; h *= 1099511628211ull; }
+    return h;
+}
+/* a figure's layers, field by field (never padding) */
+static inline uint64_t an_hash_layers(uint64_t h, const AnFig *f) {
+    for (int l = 0; l < AN_LAYERS; l++) {
+        const AnLayer *L = &f->layer[l];
+        float lv[6] = {L->weight.from, L->weight.to, L->weight.t, L->weight.len, L->fade_t, L->fade_len};
+        h = an_fnv(h, lv, sizeof lv);
+        h = an_fnv(h, &L->nsrc, sizeof L->nsrc);
+        for (int i = 0; i < L->nsrc; i++) {
+            const AnSource *s = &L->src[i];
+            float sv[8 + AN_BLEND] = {s->t, s->rate, s->w, s->base, s->value.from, s->value.to, s->value.t, s->value.len};
+            int16_t si[AN_BLEND + 1];
+            for (int k = 0; k < AN_BLEND; k++) { sv[8 + k] = k < s->n ? s->pos[k] : 0; si[k] = k < s->n ? s->clip[k] : -1; }
+            si[AN_BLEND] = s->mask;
+            uint8_t sf[6] = {s->n, s->blend, s->paused, s->fresh, s->loops, s->additive};
+            h = an_fnv(h, sv, sizeof sv); h = an_fnv(h, si, sizeof si); h = an_fnv(h, sf, sizeof sf);
+        }
+    }
+    return h;
+}
+/* every live figure's carried state: its layers; its matrices if the last
+ * update posed it (a skipped figure's are its last pose, rewritten whole at
+ * its next, and a query may have posed it since); its schedule; the drop,
+ * the procedural records and the attachment */
 static inline uint64_t an_hash(const AnWorld *w) {
     uint64_t h = 1469598103934665603ull;
     for (int s = 0; s < w->capacity; s++) {
@@ -1419,9 +1612,11 @@ static inline uint64_t an_hash(const AnWorld *w) {
         if (f->id < 0) continue;
         const unsigned char *p = (const unsigned char *)&f->id;
         for (size_t i = 0; i < sizeof f->id; i++) { h ^= p[i]; h *= 1099511628211ull; }
-        p = (const unsigned char *)an_fig_mats(w, f);
-        size_t len = (size_t)w->rigs[f->rig].nparts * 12 * sizeof(float);
-        for (size_t i = 0; i < len; i++) { h ^= p[i]; h *= 1099511628211ull; }
+        h = an_hash_layers(h, f);
+        uint8_t sched[4] = {f->always, f->cls, f->frozen, f->wait};
+        h = an_fnv(h, sched, sizeof sched);
+        h = an_fnv(h, &f->pend, sizeof f->pend);
+        if (f->wait == 0) h = an_fnv(h, an_fig_mats(w, f), (size_t)w->rigs[f->rig].nparts * 12 * sizeof(float));
         /* what the matrices do not show: the drop and its motion, and every
          * procedural record (spring state, reach fades, settings), in list order */
         float dr[3] = {f->drop, f->drop_goal, f->drop_rate};
@@ -1862,8 +2057,149 @@ static inline int an_hit_box(AnWorld *w, const float c[3], const float half[3], 
     return n;
 }
 
-/* 0 figures, 1 posed, 2 stale, 3 refused calls, 4 negative dt, 5 last refusal reason, 6 marks dropped,
- * 7 procedural records in use, 8 passes queries made over the figures to pose stale ones */
+/* ---- the view, always, traced, and drawing between the last two poses ---- */
+
+/* the camera: planes (6 of ax + by + cz + d >= 0 inside; NULL for none: all
+ * in view), the eye (NULL for none) and the distance past which a figure is
+ * far (0, below or infinite for none). Used from the next update; refused,
+ * changing nothing, if a value is not finite or a plane has no normal. */
+static inline void an_view(AnWorld *w, const float planes[24], const float eye[3], float far_metres) {
+    if ((planes && !an_finite(planes, 24)) || (eye && !an_finite(eye, 3)) || isnan(far_metres)) { an_refuse(w, AN_R_VALUE); return; }
+    float pn[24];
+    if (planes)
+        for (int i = 0; i < 6; i++) {
+            float l = sqrtf(planes[4 * i] * planes[4 * i] + planes[4 * i + 1] * planes[4 * i + 1] + planes[4 * i + 2] * planes[4 * i + 2]);
+            if (!(l > 1e-12f) || !isfinite(l)) { an_refuse(w, AN_R_VALUE); return; }
+            for (int k = 0; k < 4; k++) pn[4 * i + k] = planes[4 * i + k] / l;
+        }
+    w->nplanes = planes ? 6 : 0;
+    if (planes) memcpy(w->planes, pn, sizeof pn);
+    w->has_far = eye && far_metres > 0 && isfinite(far_metres);
+    if (eye) memcpy(w->eye, eye, sizeof w->eye);
+    w->far_m = w->has_far ? far_metres : 0;
+}
+/* figure fig posed every update, in view or not, near or far (its springs run) */
+static inline void an_always(AnWorld *w, int fig, int on) {
+    AnFig *f = an_fig(w, fig);
+    if (!f) { an_refuse(w, AN_R_FIGURE); return; }
+    f->always = on != 0;
+}
+/* f no longer traced; a figure that held a place gives it to the waiting one in the lowest slot */
+static inline void an_untrace(AnWorld *w, AnFig *f) {
+    if (f->traced == 2) w->nwaiting--;
+    if (f->traced == 1) {
+        w->ntraced--;
+        for (int s = 0; s < w->capacity && w->nwaiting > 0; s++)
+            if (w->figs[s].id >= 0 && w->figs[s].traced == 2) { w->figs[s].traced = 1; w->nwaiting--; w->ntraced++; break; }
+    }
+    f->traced = 0;
+}
+/* figure fig drawn traced (a flag for the renderer: the draw list's bit 0).
+ * Past AN_TRACED figures one waits, counted in stat 9 and drawn plain, until
+ * a traced one is let go. */
+static inline void an_traced(AnWorld *w, int fig, int on) {
+    AnFig *f = an_fig(w, fig);
+    if (!f) { an_refuse(w, AN_R_FIGURE); return; }
+    if (!on) { an_untrace(w, f); return; }
+    if (f->traced) return;
+    if (w->ntraced < AN_TRACED) { f->traced = 1; w->ntraced++; }
+    else { f->traced = 2; w->nwaiting++; }
+}
+
+/* how far along from the pose before last to the last pose f is drawn at
+ * blend 0..1: a figure posed every update, blend itself; one posed every
+ * span updates walks the span over that many updates, (since + blend) /
+ * span, so its drawn motion runs on, never back, one period behind */
+static inline float an_draw_u(const AnFig *f, float blend) {
+    float b = blend > 0 ? (blend < 1 ? blend : 1) : 0;
+    if (f->dspan <= 1) return f->dsince ? 1 : b;
+    float u = ((float)f->dsince + b) / (float)f->dspan;
+    return u < 1 ? u : 1;
+}
+/* figure fig drawn between the pose before its last and its last, at blend
+ * 0..1 of the time since the last update; 12 floats a part, valid until the
+ * next call. A figure posed every update draws its last two poses at blend
+ * (0 and 1 exactly); one the schedule poses every few updates is stretched
+ * over that period (an_draw_u). NULL if there is no such figure. */
+static inline const float *an_draw_matrices(AnWorld *w, int fig, float blend) {
+    AnFig *f = an_fig(w, fig);
+    if (!f) return NULL;
+    const float *a = an_fig_prev(w, f), *b = an_fig_mats(w, f);
+    float u = an_draw_u(f, blend);
+    for (int p = 0; p < w->rigs[f->rig].nparts; p++) an_mat_mix(a + p * 12, b + p * 12, u, w->dscratch + p * 12);
+    return w->dscratch;
+}
+/* the sun the drawing casts shadows by (the direction toward it; NULL, or
+ * one at or below 0.01 up, for none). Drawing only: it widens the draw list
+ * to figures out of view whose shadows may fall in it, and changes no
+ * answer, no hash and no figure's posing class. Refused, changing nothing,
+ * if a value is not finite. */
+static inline void an_draw_sun(AnWorld *w, const float sun[3]) {
+    if (sun && !an_finite(sun, 3)) { an_refuse(w, AN_R_VALUE); return; }
+    float l = sun ? sqrtf(sun[0] * sun[0] + sun[1] * sun[1] + sun[2] * sun[2]) : 0;
+    w->has_dsun = sun && l > 1e-12f && sun[1] / l > 0.01f;
+    for (int k = 0; k < 3; k++) w->dsun[k] = w->has_dsun ? sun[k] / l : 0;
+}
+/* is f, out of view, near enough that its sun shadow may fall in view: its
+ * bounds swept away from the sun until their top has come down by their
+ * height, but at most AN_SHADOW_REACH metres along the ground, reach within
+ * AN_MARGIN of the inside of every plane */
+static inline int an_shadow_in_view(const AnWorld *w, const AnFig *f) {
+    if (!w->nplanes || !w->has_dsun) return 0;
+    float lo[3], hi[3];
+    an_cull_box(f, lo, hi);
+    const float *s = w->dsun;
+    float flat = sqrtf(s[0] * s[0] + s[2] * s[2]);
+    float t = (hi[1] - lo[1]) / s[1];                         /* along -sun, down by the height */
+    if (flat * t > AN_SHADOW_REACH) t = AN_SHADOW_REACH / flat;
+    float sweep[3] = { -s[0] * t, -s[1] * t, -s[2] * t };
+    for (int i = 0; i < w->nplanes; i++) {
+        const float *pl = w->planes + 4 * i;
+        float d = pl[3], along = 0;
+        for (int k = 0; k < 3; k++) { d += pl[k] * (pl[k] > 0 ? hi[k] : lo[k]); along += pl[k] * sweep[k]; }
+        if (along > 0) d += along;                             /* the swept box's corner furthest inside */
+        if (d < -AN_MARGIN) return 0;
+    }
+    return 1;
+}
+/* the renderer's source: every part with volume of every figure in view now
+ * (or always posed), in slot then part order, drawn at blend as
+ * an_draw_matrices draws it: rig x AN_PARTS + part, its 3x4 and its flags
+ * (bit 0 traced; bit 1 out of view, listed only because its sun shadow may
+ * fall in view (an_draw_sun): for the shadow and the rays, not to be drawn;
+ * the figure's id from bit 8). Answers how many; the arrays are the world's,
+ * valid until the next call. Past AN_DRAW_MAX parts the rest are left out,
+ * counted in stat 10. */
+static inline int an_draw_list(AnWorld *w, float blend, const int32_t **rig_part, const float **xf, const int32_t **flags) {
+    int n = 0;
+    w->draw_over = 0;
+    for (int s = 0; s < w->capacity; s++) {
+        const AnFig *f = &w->figs[s];
+        if (f->id < 0) continue;
+        int shade = 0;
+        if (!(f->always || an_in_view(w, f))) { if (!an_shadow_in_view(w, f)) continue; shade = 2; }
+        const AnRig *r = &w->rigs[f->rig];
+        const float *a = an_fig_prev(w, f), *b = an_fig_mats(w, f);
+        float u = an_draw_u(f, blend);
+        for (int p = 0; p < r->nparts; p++) {
+            if (!an_has_box(r, p)) continue;
+            if (n >= AN_DRAW_MAX) { w->draw_over += 1; continue; }
+            an_mat_mix(a + p * 12, b + p * 12, u, w->dl_xf + (size_t)n * 12);
+            w->dl_rp[n] = f->rig * AN_PARTS + p;
+            w->dl_flags[n] = (f->traced == 1 ? 1 : 0) | shade | (f->id << 8);
+            n++;
+        }
+    }
+    if (rig_part) *rig_part = w->dl_rp;
+    if (xf) *xf = w->dl_xf;
+    if (flags) *flags = w->dl_flags;
+    return n;
+}
+
+/* 0 figures, 1 posed by the last update, 2 stale, 3 refused calls, 4 negative dt, 5 last refusal reason,
+ * 6 marks dropped, 7 procedural records in use, 8 passes queries made over the figures to pose stale ones,
+ * 9 figures traced past the cap of AN_TRACED (drawn plain), 10 parts left out of the last draw list,
+ * 11 figures the last update did not pose (out of view or far) */
 static inline double an_stat(const AnWorld *w, int which) {
     switch (which) {
     case 0: return w->live;
@@ -1875,6 +2211,9 @@ static inline double an_stat(const AnWorld *w, int which) {
     case 6: return w->dropped;
     case 7: return w->nprocs - w->nproc_free;
     case 8: return w->scans;
+    case 9: return w->nwaiting;
+    case 10: return w->draw_over;
+    case 11: return w->skipped;
     default: return 0;
     }
 }
