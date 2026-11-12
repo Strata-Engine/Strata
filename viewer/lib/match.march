@@ -8,9 +8,10 @@
 -- (placed), 2 an arrow (flying), 3 a fireball (flying).
 --
 -- Scenes (STRATA_COMBAT_SCENE), for the scripted checks: 0 the match; 1
--- `duel`, two shooters 15 m apart; 2 `trap`, a rusher and a shooter, the
--- ground dug from under the one at frame 60 and a block set in the other's
--- place at frame 300.
+-- `duel`, two shooters 15 m apart; 2 `trap`, a rusher and a shooter
+-- standing still, the ground dug from under the one at frame 60 and a
+-- block set in the other's place at frame 300; 3 `fire`, a fireball thrown at a tree's trunk from
+-- 10 m at frame 30, a shooter standing a metre from where it lands.
 mod StrataViewer.Match do
 
   needs IO.Foreign
@@ -50,7 +51,9 @@ mod StrataViewer.Match do
                    mt_body_rig : Int, mt_clips : List(Int), mt_bow_rig : Int, mt_arrow_rig : Int,
                    mt_fs : List(StrataViewer.Combat.CbFighter), mt_bodies : List(MtBody), mt_shots : List(MtShot),
                    mt_points : List((Float, Float, Float)), mt_cx : Float, mt_cy : Float, mt_cz : Float,
-                   mt_dry : Int, mt_moved : Float, mt_won : Bool, mt_idles : Int, mt_changes : List((Int, Int, Int, Int)) }
+                   mt_dry : Int, mt_moved : Float, mt_won : Bool, mt_idles : Int, mt_changes : List((Int, Int, Int, Int)),
+                   mt_fire_rig : Int, mt_still : Bool, mt_staged : Bool, mt_eye : (Float, Float, Float, Float, Float),
+                   mt_stage : (Float, Float, Float, Float, Float, Float), mt_burned : (Int, Int, Int, Int) }
 
   pfn turn(facing : Float) : Strata.Math.Quat.Quat do Qt.from_axis_angle(0.0, 1.0, 0.0, facing) end
   pfn hyp(dx : Float, dz : Float) : Float do Math.sqrt(dx *. dx +. dz *. dz) end
@@ -62,7 +65,8 @@ mod StrataViewer.Match do
       mt_ent: { en_kinds: Nil, en_bodies: 0, en_live: false, en_table: false }, mt_anim: { rigs: Nil, capacity: 0 }, mt_rigs: Nil,
       mt_body_rig: -1, mt_clips: Nil, mt_bow_rig: -1, mt_arrow_rig: -1,
       mt_fs: Nil, mt_bodies: Nil, mt_shots: Nil, mt_points: Nil, mt_cx: 0.0, mt_cy: 0.0, mt_cz: 0.0,
-      mt_dry: 0, mt_moved: 0.0, mt_won: false, mt_idles: 0, mt_changes: Nil }
+      mt_dry: 0, mt_moved: 0.0, mt_won: false, mt_idles: 0, mt_changes: Nil,
+      mt_fire_rig: -1, mt_still: false, mt_staged: false, mt_eye: (0.0, 0.0, 0.0, 0.0, 0.0), mt_stage: (0.0, 0.0, 0.0, 0.0, 0.0, 0.0), mt_burned: (0, 0, 0, 0) }
   end
   doc "Is a match being played?"
   fn is_on(m : MtMatch) : Bool do m.mt_live end
@@ -71,6 +75,9 @@ mod StrataViewer.Match do
   fn rigs(m : MtMatch) : List(Strata.Rig.Rig) do m.mt_rigs end
   doc "The middle of the field, metres."
   fn middle(m : MtMatch) : (Float, Float) do (m.mt_cx, m.mt_cz) end
+  doc "Does the match set the camera (a scripted scene)? Then `eye` is where it stands and looks: (x, y, z, the viewer's yaw, pitch)."
+  fn staged(m : MtMatch) : Bool do m.mt_staged end
+  fn eye(m : MtMatch) : (Float, Float, Float, Float, Float) do m.mt_eye end
   doc "Has a fighter won? A scripted run ends here."
   fn won(m : MtMatch) : Bool do m.mt_won end
   doc "A fighter's kills and health, and the winner's index or -1."
@@ -115,14 +122,20 @@ mod StrataViewer.Match do
     end
   end
 
+  -- the ground's top under (x, z), searched from [top] down 160 m; where there is only water or nothing, 60 m under [top] (the start's height)
+  pfn ground(w : Strata.World.World, x : Float, z : Float, top : Float) : Float do
+    let y = Fg.dry_ground_at(w, x, z, top, 160.0)
+    if y > -999.0 do y else top -. 60.0 end
+  end
+
   -- a ring column set on dry ground; a wet one is moved toward the middle 4 m at a time
   pfn point_go(w : Strata.World.World, cx : Float, cz : Float, top : Float, x : Float, z : Float, tries : Int) : (Float, Float, Float) do
     let y = Fg.dry_ground_at(w, x, z, top, 160.0)
     if y > -999.0 do (x, y, z)
-    else if tries <= 0 do (cx, Fg.ground_at(w, cx, cz, top), cz)
+    else if tries <= 0 do (cx, ground(w, cx, cz, top), cz)
     else
       let d = hyp(cx -. x, cz -. z)
-      if d < 4.0 do (cx, Fg.ground_at(w, cx, cz, top), cz)
+      if d < 4.0 do (cx, ground(w, cx, cz, top), cz)
       else point_go(w, cx, cz, top, x +. (cx -. x) /. d *. 4.0, z +. (cz -. z) /. d *. 4.0, tries - 1) end
     end end
   end
@@ -259,6 +272,64 @@ mod StrataViewer.Match do
     if i >= 12 do fs else bench_but(if i == a || i == b do fs else Cb.bench(fs, i) end, a, b, i + 1) end
   end
 
+  pfn finish_two(a : Strata.Anim.Anim, r1 : Strata.Rig.Rig, r2 : Strata.Rig.Rig) : (Strata.Anim.Anim, Int, Int) do
+    match An.finish_rig(a, r1) do
+      (a1, id1) -> match An.finish_rig(a1, r2) do (a2, id2) -> (a2, id1, id2) end
+    end
+  end
+
+  -- The nearest tree trunk's base cell to the middle, within 48 m: a wood cell with neither wood nor air under it. (0, -1000, 0) if there is none.
+  pfn trunk_go(w : Strata.World.World, cx : Int, cy : Int, cz : Int, i : Int, best : (Int, Int, Int), bd : Int) : (Int, Int, Int) do
+    if i >= 97 * 97 * 36 do best
+    else
+      let x = cx + i % 97 - 48
+      let z = cz + (i / 97) % 97 - 48
+      let y = cy - 10 + i / (97 * 97)
+      let d = (x - cx) * (x - cx) + (z - cz) * (z - cz)
+      if d >= bd do trunk_go(w, cx, cy, cz, i + 1, best, bd)
+      else if Strata.World.get_block(w, x, y, z) != 7 do trunk_go(w, cx, cy, cz, i + 1, best, bd)
+      else
+        let under = Strata.World.get_block(w, x, y - 1, z)
+        if under == 7 || under == 0 || under == 8 do trunk_go(w, cx, cy, cz, i + 1, best, bd)
+        else if Strata.World.get_block(w, x, y + 1, z) != 7 do trunk_go(w, cx, cy, cz, i + 1, best, bd)
+        else trunk_go(w, cx, cy, cz, i + 1, (x, y, z), d) end end
+      end end
+    end
+  end
+  -- of eight places 10 m from the target, the first with a clear line to it: (x, eye y, z)
+  pfn stand_go(w : Strata.World.World, top : Float, tx : Float, ty : Float, tz : Float, k : Int) : (Float, Float, Float) do
+    let a = int_to_float(k % 8) *. 0.78539816
+    let x = tx +. 10.0 *. Math.cos(a)
+    let z = tz +. 10.0 *. Math.sin(a)
+    let y = ground(w, x, z, ty +. 5.0) +. 1.5
+    let d = len3(tx -. x, ty -. y, tz -. z)
+    if k >= 8 do (x, y, z)
+    else if Strata.Query.is_hit(Strata.Query.raycast(w, x, y, z, tx -. x, ty -. y, tz -. z, d -. 0.9, solid(Strata.World.registry(w)))) do stand_go(w, top, tx, ty, tz, k + 1)
+    else (x, y, z) end end
+  end
+  -- The fire scene: the thrower's place 10 m from a trunk, the mark a metre up the trunk, a still shooter a metre from the mark, the camera behind the thrower.
+  pfn fire_stage(m : MtMatch, w : Strata.World.World, top : Float) : MtMatch do
+    match trunk_go(w, float_to_int(m.mt_cx), float_to_int(m.mt_cy), float_to_int(m.mt_cz), 0, (0, -1000, 0), 1000000) do
+      (bx, by0, bz) ->
+        let tx = int_to_float(bx) +. 0.5
+        let ty = int_to_float(by0) +. 1.0
+        let tz = int_to_float(bz) +. 0.5
+        match stand_go(w, top, tx, ty, tz, 0) do
+          (sx, sy, sz) ->
+            let d = hyp(tx -. sx, tz -. sz)
+            let ux = (tx -. sx) /. d
+            let uz = (tz -. sz) /. d
+            -- the shooter: a metre to the side of the trunk's near face
+            let px = tx -. ux *. 0.6 -. uz *. 1.0
+            let pz = tz -. uz *. 0.6 +. ux *. 1.0
+            let m1 = set_down(m, 8, px, ground(w, px, pz, ty +. 2.0), pz)
+            println("combat: fire trunk at (" ++ int_to_string(bx) ++ ", " ++ int_to_string(by0) ++ ", " ++ int_to_string(bz) ++ ")")
+            { m1 with mt_still: true, mt_staged: true, mt_stage: (sx, sy, sz, tx, ty, tz),
+                      mt_eye: (sx -. ux *. 5.0 -. uz *. 1.5, sy +. 1.5, sz -. uz *. 5.0 +. ux *. 1.5, Math.atan2(ux, 0.0 -. uz), -0.12) }
+        end
+    end
+  end
+
   doc "Start a match: the field's middle found from the shore start (sx, sy, sz), sixteen spawn points on dry ground, the entity world opened for a stream of [radius_h] chunks, the fighters set down (the player nearest the start). With [player] false there is no player's box and the field's middle is the only focus. [scene] is 0 for the match, or a scripted scene (see the module's head). Prints the field. Not on (`is_on` false) if the entity or figure world would not open."
   fn start(seed : Int, w : Strata.World.World, sx : Float, sy : Float, sz : Float, radius_h : Int, player : Bool, scene : Int) : MtMatch do
     let top = sy +. 60.0
@@ -266,24 +337,25 @@ mod StrataViewer.Match do
       (cx, cz, dry) ->
         let points = points_go(w, cx, cz, top, Cb.ring(cx, cz))
         let crowd = Fg.open(512)
-        let ent = En.touching(En.touching(En.open(kinds(), 4096, 0, radius_h, 32.0, 1.0), 2, 0), 2, 1)
+        let ent = En.touching(En.touching(En.touching(En.touching(En.open(kinds(), 4096, 0, radius_h, 32.0, 1.0), 2, 0), 2, 1), 3, 0), 3, 1)
         match An.finish_rig(Fg.anim(crowd), Fg.bow()) do
           (a1, bow_rig) ->
-            match An.finish_rig(a1, Fg.arrow()) do
-              (a2, arrow_rig) ->
+            match finish_two(a1, Fg.arrow(), Fg.fireball()) do
+              (a2, arrow_rig, fire_rig) ->
                 if !En.is_open(ent) || Fg.body_id(crowd) < 0 do
                   println("combat: could not open the entity or figure world")
                   off()
                 else
-                  let fs = if scene == 1 do bench_but(Cb.roster(), 8, 9, 0) else if scene == 2 do bench_but(Cb.roster(), 1, 8, 0) else Cb.roster() end end
+                  let fs = if scene == 1 do bench_but(Cb.roster(), 8, 9, 0) else if scene == 2 do bench_but(Cb.roster(), 1, 8, 0) else if scene == 3 do bench_but(Cb.roster(), 8, 8, 0) else Cb.roster() end end end
                   let m0 = { off() with mt_live: true, mt_seed: seed, mt_player: player && scene == 0, mt_scene: scene, mt_ent: ent, mt_anim: a2,
-                             mt_rigs: List.append(Fg.rigs(crowd), [Fg.bow(), Fg.arrow()]), mt_body_rig: Fg.body_id(crowd), mt_clips: Fg.clip_ids(crowd),
+                             mt_rigs: List.append(Fg.rigs(crowd), [Fg.bow(), Fg.arrow(), Fg.fireball()]), mt_fire_rig: fire_rig, mt_body_rig: Fg.body_id(crowd), mt_clips: Fg.clip_ids(crowd),
                              mt_bow_rig: bow_rig, mt_arrow_rig: arrow_rig, mt_fs: fs, mt_bodies: empty_bodies(0),
-                             mt_points: points, mt_cx: cx, mt_cy: Fg.ground_at(w, cx, cz, top), mt_cz: cz, mt_dry: dry }
+                             mt_points: points, mt_cx: cx, mt_cy: ground(w, cx, cz, top), mt_cz: cz, mt_dry: dry }
                   println("combat: 12 fighters, " ++ int_to_string(List.length(points)) ++ " spawn points, middle (" ++ int_to_string(float_to_int(Math.round(cx))) ++ ", " ++ int_to_string(float_to_int(Math.round(cz))) ++ "), dry " ++ int_to_string(dry) ++ " of 64")
-                  if scene == 1 do set_down(set_down(m0, 8, cx -. 7.5, Fg.ground_at(w, cx -. 7.5, cz, top), cz), 9, cx +. 7.5, Fg.ground_at(w, cx +. 7.5, cz, top), cz)
-                  else if scene == 2 do set_down(set_down(m0, 1, cx -. 15.0, Fg.ground_at(w, cx -. 15.0, cz, top), cz), 8, cx +. 15.0, Fg.ground_at(w, cx +. 15.0, cz, top), cz)
-                  else set_all(m0, nearest_go(points, sx, sz, 0, 0, 1000000.0), 0) end end
+                  if scene == 1 do set_down(set_down(m0, 8, cx -. 7.5, ground(w, cx -. 7.5, cz, top), cz), 9, cx +. 7.5, ground(w, cx +. 7.5, cz, top), cz)
+                  else if scene == 2 do { set_down(set_down(m0, 1, cx -. 15.0, ground(w, cx -. 15.0, cz, top), cz), 8, cx +. 15.0, ground(w, cx +. 15.0, cz, top), cz) with mt_still: true }
+                  else if scene == 3 do fire_stage(m0, w, top)
+                  else set_all(m0, nearest_go(points, sx, sz, 0, 0, 1000000.0), 0) end end end
                 end
             end
         end
@@ -346,6 +418,51 @@ mod StrataViewer.Match do
     end
   end
 
+  doc "Fighter [who] throws a fireball from (ox, oy, oz) along the unit (dx, dy, dz): 18 m/s in an arc, lighting what it passes."
+  fn throw_fire(m : MtMatch, who : Int, ox : Float, oy : Float, oz : Float, dx : Float, dy : Float, dz : Float) : MtMatch do
+    match En.add(m.mt_ent, 3, ox, oy, oz, Math.atan2(dx, dz)) do
+      (e1, id) ->
+        if id < 0 do { m with mt_ent: e1 }
+        else
+          match An.spawn_at(m.mt_anim, m.mt_fire_rig, ox, oy, oz, Qt.identity()) do
+            (a1, fig) -> { m with mt_ent: En.set_velocity(e1, id, dx *. 18.0, dy *. 18.0, dz *. 18.0), mt_anim: if fig < 0 do a1 else An.traced(a1, fig, true) end,
+                                  mt_shots: Cons({ ms_ent: id, ms_fig: fig, ms_who: who, ms_fire: true, ms_age: 0.0, ms_stuck: 0.0 }, m.mt_shots) }
+          end
+        end
+    end
+  end
+
+  -- Fire's damage about (x, y, z): every living fighter within 2 m by its distance, the one touched (or -1) in full.
+  pfn scorch(m : MtMatch, ps : List((Float, Float, Float)), who : Int, touched : Int, x : Float, y : Float, z : Float, j : Int) : MtMatch do
+    if j >= 12 do m
+    else if !Cb.alive(m.mt_fs, j) || (j == 0 && !m.mt_player) do scorch(m, ps, who, touched, x, y, z, j + 1)
+    else
+      match point(ps, j) do
+        (px, py, pz) ->
+          let dmg = if j == touched do Cb.fire_damage(0.0) else Cb.fire_damage(len3(px -. x, py -. y, pz -. z)) end
+          scorch(if dmg > 0 do strike(m, j, who, dmg) else m end, ps, who, touched, x, y, z, j + 1)
+      end
+    end end
+  end
+  pfn tally(cs : List((Int, Int, Int, Int)), w : Strata.World.World, t : (Int, Int, Int, Int)) : (Int, Int, Int, Int) do
+    match cs do
+      Nil -> t
+      Cons((x, y, z, _), rest) ->
+        match t do
+          (n, wood, leaves, grass) ->
+            let b = Strata.World.get_block(w, x, y, z)
+            tally(rest, w, (n + 1, if b == 7 do wood + 1 else wood end, if b == 8 do leaves + 1 else leaves end, if b == 3 || b == 11 do grass + 1 else grass end))
+        end
+    end
+  end
+  -- A fireball ends at (x, y, z): its damage, what it burns (kept for the frame's edit), and the shot gone. Over water it does neither.
+  pfn burst(m : MtMatch, w : Strata.World.World, ps : List((Float, Float, Float)), s : MtShot, touched : Int, x : Float, y : Float, z : Float) : MtMatch do
+    let m1 = { m with mt_ent: if s.ms_ent >= 0 do En.remove(m.mt_ent, s.ms_ent) else m.mt_ent end, mt_anim: An.remove(m.mt_anim, s.ms_fig) }
+    let m2 = scorch(m1, ps, s.ms_who, touched, x, y, z, 0)
+    let cs = Cb.fire_changes(fn (cx, cy, cz) -> Strata.World.get_block(w, cx, cy, cz), x, y, z)
+    { m2 with mt_changes: List.append(cs, m2.mt_changes), mt_burned: tally(cs, w, m2.mt_burned) }
+  end
+
   -- the shot whose entity is [id], as (found, the shot) and the others
   pfn pull_shot(ss : List(MtShot), id : Int, acc : List(MtShot)) : (Bool, MtShot, List(MtShot)) do
     match ss do
@@ -355,7 +472,7 @@ mod StrataViewer.Match do
   end
 
   -- What the entity step reported: an arrow touching a fighter hurts it and is gone; one meeting a block sticks there for 5 s.
-  pfn events_go(m : MtMatch, evs : List(Strata.Entities.Event)) : MtMatch do
+  pfn events_go(m : MtMatch, w : Strata.World.World, ps : List((Float, Float, Float)), evs : List(Strata.Entities.Event)) : MtMatch do
     match evs do
       Nil -> m
       Cons(v, rest) ->
@@ -368,16 +485,24 @@ mod StrataViewer.Match do
           match pull_shot(m.mt_shots, sid, Nil) do
             (found, s, others) ->
               let victim = fighter_of(m.mt_bodies, fid, 0)
-              if !found || victim < 0 || victim == s.ms_who || !Cb.alive(m.mt_fs, victim) do events_go(m, rest)
+              if !found || victim < 0 || victim == s.ms_who || !Cb.alive(m.mt_fs, victim) do events_go(m, w, ps, rest)
+              else if s.ms_fire do
+                match En.position(m.mt_ent, s.ms_ent) do
+                  (x, y, z) -> events_go(burst({ m with mt_shots: others }, w, ps, s, victim, x, y, z), w, ps, rest)
+                end
               else
                 let m1 = { m with mt_shots: others, mt_ent: En.remove(m.mt_ent, s.ms_ent), mt_anim: An.remove(m.mt_anim, s.ms_fig) }
-                events_go(strike(m1, victim, s.ms_who, Cb.arrow_damage()), rest)
-              end
+                events_go(strike(m1, victim, s.ms_who, Cb.arrow_damage()), w, ps, rest)
+              end end
           end
         else if code == 2 do
           match pull_shot(m.mt_shots, En.ev_a(v), Nil) do
             (found, s, others) ->
-              if !found do events_go(m, rest)
+              if !found do events_go(m, w, ps, rest)
+              else if s.ms_fire do
+                match En.ev_point(v) do
+                  (px, py, pz) -> events_go(burst({ m with mt_shots: others }, w, ps, s, -1, px, py, pz), w, ps, rest)
+                end
               else
                 match En.ev_point(v) do
                   (px, py, pz) ->
@@ -388,12 +513,26 @@ mod StrataViewer.Match do
                         let uy = if l < 0.01 do -1.0 else vy /. l end
                         let uz = if l < 0.01 do 0.0 else vz /. l end
                         let a1 = An.place(m.mt_anim, s.ms_fig, px -. ux *. 0.3, py -. uy *. 0.3, pz -. uz *. 0.3, along(ux, uy, uz))
-                        events_go({ m with mt_ent: En.remove(m.mt_ent, s.ms_ent), mt_anim: a1, mt_shots: Cons({ s with ms_ent: -1, ms_stuck: 5.0 }, others) }, rest)
+                        events_go({ m with mt_ent: En.remove(m.mt_ent, s.ms_ent), mt_anim: a1, mt_shots: Cons({ s with ms_ent: -1, ms_stuck: 5.0 }, others) }, w, ps, rest)
                     end
                 end
-              end
+              end end
           end
-        else events_go(m, rest) end end
+        else events_go(m, w, ps, rest) end end
+    end
+  end
+
+  -- fireballs in the air 4 s burst where they are
+  pfn spent_fire(m : MtMatch, w : Strata.World.World, ps : List((Float, Float, Float)), ss : List(MtShot)) : MtMatch do
+    match ss do
+      Nil -> m
+      Cons(s, rest) ->
+        if !s.ms_fire || s.ms_ent < 0 || s.ms_age < 4.0 do spent_fire(m, w, ps, rest)
+        else
+          match pull_shot(m.mt_shots, s.ms_ent, Nil) do
+            (_, _, others) -> match En.position(m.mt_ent, s.ms_ent) do (x, y, z) -> spent_fire(burst({ m with mt_shots: others }, w, ps, s, -1, x, y, z), w, ps, rest) end
+          end
+        end
     end
   end
 
@@ -405,7 +544,7 @@ mod StrataViewer.Match do
         if s.ms_ent < 0 do
           (if s.ms_stuck -. dt <= 0.0 do shots_go(rest, e, An.remove(a, s.ms_fig), dt, acc)
            else shots_go(rest, e, a, dt, Cons({ s with ms_stuck: s.ms_stuck -. dt }, acc)) end)
-        else if s.ms_age +. dt > 1.34 || !En.alive(e, s.ms_ent) do shots_go(rest, En.remove(e, s.ms_ent), An.remove(a, s.ms_fig), dt, acc)
+        else if (!s.ms_fire && s.ms_age +. dt > 1.34) || !En.alive(e, s.ms_ent) do shots_go(rest, En.remove(e, s.ms_ent), An.remove(a, s.ms_fig), dt, acc)
         else
           match En.position(e, s.ms_ent) do
             (x, y, z) ->
@@ -474,7 +613,7 @@ mod StrataViewer.Match do
         let ux = if d < 0.01 do 0.0 else dx /. d end
         let uz = if d < 0.01 do 0.0 else dz /. d end
         -- 0 return and 2 chase run (a chaser stops at arm's length); 1 wander jogs to the middle and then about it; 5 retreat backs away; 3, 4, 6 stand and face
-        if Cb.winner(m.mt_fs) >= 0 do (0.0, 0.0, 0.0, ux, uz)
+        if Cb.winner(m.mt_fs) >= 0 || m.mt_still do (0.0, 0.0, 0.0, ux, uz)
         else if code == 0 do (ux, uz, 4.2, ux, uz)
         else if code == 2 do (ux, uz, if d < 1.0 do 0.0 else 4.2 end, ux, uz)
         else if code == 1 do (ux, uz, if d < 1.0 do 0.0 else 2.8 end, ux, uz)
@@ -489,7 +628,7 @@ mod StrataViewer.Match do
     if i >= 12 do m0
     else if b0.mb_ent < 0 || !Cb.alive(m0.mt_fs, i) do steer(m0, w, ps, alive_, i + 1, dt)
     else
-      let m = if (m0.mt_frame + i) % 15 == 0 do decide(m0, w, ps, alive_, i) else m0 end
+      let m = if (m0.mt_frame + i) % 15 == 0 && !m0.mt_still do decide(m0, w, ps, alive_, i) else m0 end
       let b1 = body(m.mt_bodies, i)
       match heading(m, ps, i, b1) do
         (ux, uz, speed, fx, fz) ->
@@ -564,7 +703,7 @@ mod StrataViewer.Match do
     if i >= 12 do m
     else
       let b = body(m.mt_bodies, i)
-      if b.mb_ent < 0 || !Cb.alive(m.mt_fs, i) || Cb.winner(m.mt_fs) >= 0 do idles(m, ps, alive_, i + 1, dt)
+      if b.mb_ent < 0 || !Cb.alive(m.mt_fs, i) || Cb.winner(m.mt_fs) >= 0 || m.mt_scene == 3 do idles(m, ps, alive_, i + 1, dt)
       else
         match Cb.idle(Cb.at(m.mt_fs, i), hyp(b.mb_x -. b.mb_ix, b.mb_z -. b.mb_iz), b.mb_fought, dt) do
           (f2, stuck) ->
@@ -618,6 +757,19 @@ mod StrataViewer.Match do
     else Nil end end end
   end
 
+  -- the fire scene throws its fireball at frame 30: from the stand at the mark, aimed for the arc
+  pfn staged_throw(m : MtMatch) : MtMatch do
+    if m.mt_scene != 3 || m.mt_frame != 30 do m
+    else
+      match m.mt_stage do
+        (sx, sy, sz, tx, ty, tz) ->
+          match Cb.lead((sx, sy, sz), (tx, ty, tz), (0.0, 0.0, 0.0), 18.0, 9.8) do
+            (yaw, pitch, _) -> throw_fire(m, 1, sx, sy, sz, Math.sin(yaw) *. Math.cos(pitch), Math.sin(pitch), Math.cos(yaw) *. Math.cos(pitch))
+          end
+      end
+    end
+  end
+
   doc "One frame of the match, [dt] seconds: the entity world's blocks brought up to date with the stream, the player's box set, the dead brought back, the computer fighters deciding, shooting, swinging and steering, the entities stepped, what they report acted on, the figures placed and advanced. Answers the match, the stream, and the block changes the match asks for, (x, y, z, id) each, for the viewer to apply as one edit."
   fn frame(m0 : MtMatch, s : Strata.Stream.Stream, _f : Strata.Fluid.Fluid, inp : MtInput, dt : Float) : (MtMatch, Strata.Stream.Stream, List((Int, Int, Int, Int))) do
     if !m0.mt_live do (m0, s, Nil)
@@ -632,10 +784,10 @@ mod StrataViewer.Match do
             end
           let ps = places(m1, inp, m1.mt_bodies, 0)
           let alive_ = living(m1, 0)
-          let m2 = steer(m1, w, ps, alive_, 1, dt)
+          let m2 = staged_throw(steer(m1, w, ps, alive_, 1, dt))
           let focus = if m2.mt_player do [(inp.mi_x, inp.mi_y, inp.mi_z), (m2.mt_cx, m2.mt_cy, m2.mt_cz)] else [(m2.mt_cx, m2.mt_cy, m2.mt_cz)] end
           let e3 = En.step(m2.mt_ent, focus, dt)
-          let m3 = events_go({ m2 with mt_ent: e3 }, En.events(e3, w))
+          let m3 = spent_fire(events_go({ m2 with mt_ent: e3 }, w, ps, En.events(e3, w)), w, ps, m2.mt_shots)
           let m4 = settle(blows(m3, ps, alive_, 1, dt), 1, dt)
           let m5 = match shots_go(m4.mt_shots, m4.mt_ent, m4.mt_anim, dt, Nil) do
               (e5, a5, ss) -> { m4 with mt_ent: e5, mt_anim: a5, mt_shots: ss }
@@ -646,8 +798,8 @@ mod StrataViewer.Match do
             println("combat: winner " ++ Cb.name(m6.mt_fs, win) ++ " " ++ int_to_string(Cb.kills(m6.mt_fs, win)) ++ " at frame " ++ int_to_string(m6.mt_frame))
             print_table(table(m6))
           else () end
-          let changes = trap_edits(m6)
-          ({ m6 with mt_anim: An.update(m6.mt_anim, dt), mt_frame: m6.mt_frame + 1, mt_won: win >= 0 }, s1, changes)
+          let changes = List.append(trap_edits(m6), m6.mt_changes)
+          ({ m6 with mt_anim: An.update(m6.mt_anim, dt), mt_frame: m6.mt_frame + 1, mt_won: win >= 0, mt_changes: Nil }, s1, changes)
       end
     end
   end
@@ -694,6 +846,10 @@ mod StrataViewer.Match do
     let head = "combat: frame " ++ int_to_string(m.mt_frame) ++ " fingerprint " ++ int_to_string(fingerprint(m)) ++ ", moved " ++ int_to_string(float_to_int(m.mt_moved)) ++ " m, outside " ++ int_to_string(outside_go(m, m.mt_bodies, 0, 0))
     if m.mt_scene == 1 do head ++ "\ncombat: duel kills " ++ int_to_string(Cb.kills(m.mt_fs, 8)) ++ " " ++ int_to_string(Cb.kills(m.mt_fs, 9))
     else if m.mt_scene == 2 do head ++ "\ncombat: trap inside " ++ int_to_string(inside_go(m, w, m.mt_bodies, 0, 0)) ++ ", respawns " ++ int_to_string(m.mt_idles)
-    else head ++ "\ncombat: leader " ++ leader(table(m)) ++ ", kills in all " ++ int_to_string(total_kills(table(m), 0)) ++ ", idle respawns " ++ int_to_string(m.mt_idles) end end
+    else if m.mt_scene == 3 do
+      match m.mt_burned do
+        (n, wood, leaves, grass) -> head ++ "\ncombat: fire burned " ++ int_to_string(n) ++ " cells: wood " ++ int_to_string(wood) ++ ", leaves " ++ int_to_string(leaves) ++ ", grass " ++ int_to_string(grass) ++ ", bystander health " ++ int_to_string(Cb.health(m.mt_fs, 8))
+      end
+    else head ++ "\ncombat: leader " ++ leader(table(m)) ++ ", kills in all " ++ int_to_string(total_kills(table(m), 0)) ++ ", idle respawns " ++ int_to_string(m.mt_idles) end end end
   end
 end

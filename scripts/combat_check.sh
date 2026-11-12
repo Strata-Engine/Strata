@@ -46,6 +46,12 @@ if twice trap STRATA_COMBAT_SCENE=trap STRATA_FRAMES=1800; then
   if [ "$inside" -eq 0 ] && [ "$back" -ge 1 ]; then echo "ok   trap: no one inside a block, $back put back by the idle rule"
   else echo "FAIL trap: inside $inside (want 0), respawns $back (want 1 or more)"; cat "$OUT/trap.txt"; FAILED=1; fi
 fi
+# Fire: a fireball thrown at a tree's trunk burns wood and grass within 2 m and hurts the shooter standing a metre off by about 40.
+if twice fire STRATA_COMBAT_SCENE=fire STRATA_FRAMES=200; then
+  wood=$(num fire '^combat: fire burned [0-9]* cells: wood \([0-9]*\), .*$'); grass=$(num fire '^combat: fire burned .*, grass \([0-9]*\), .*$'); left=$(num fire '^combat: fire burned .*, bystander health \([0-9]*\)$')
+  if [ "$wood" -ge 1 ] && [ "$grass" -ge 1 ] && [ "$left" -ge 10 ] && [ "$left" -le 35 ]; then echo "ok   fire: burned $wood wood and $grass grass; the bystander is left with $left of 60"
+  else echo "FAIL fire: wood $wood, grass $grass (want 1 or more of each), bystander left with $left (want 10 to 35)"; cat "$OUT/fire.txt"; FAILED=1; fi
+fi
 # The match with no player: someone reaches 30, and the same someone the second time.
 if twice match STRATA_COMBAT_PLAYER=0 STRATA_FRAMES=90000; then
   if grep -q '^combat: winner [A-Za-z]* 30 at frame [0-9]*$' "$OUT/match.txt" && [ "$(grep -c '^combat: table ' "$OUT/match.txt")" -eq 12 ]; then echo "ok   match: $(grep '^combat: winner' "$OUT/match.txt" | sed 's/^combat: //')"
