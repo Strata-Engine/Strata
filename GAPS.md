@@ -361,3 +361,12 @@ things followed on the first full run:
 
 The properties are worth having. What is owed: a fixed seed in the gate so a
 failure can be replayed, and a pass over the slow ones.
+
+## S39: a match with two arms on one line does not parse
+
+`fn slot(o : Option(Int)) : Int do match o do Some(s) -> s _ -> -1 end end`
+is "parse error: I was expecting `end` to close the match here" at the
+second arm (met writing `Strata.Population`'s readers). The same match
+with each arm on its own line parses. A one-line match with one arm
+(`match a do (x, _) -> x end`) is fine. Workaround: put each arm on its own
+line.
