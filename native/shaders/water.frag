@@ -20,6 +20,8 @@ layout(set = 0, binding = 31, r32f) uniform writeonly image2D wd_now;
 layout(std430, set = 0, binding = 21) readonly buffer Movers { vec4 boxes[]; } movers;
 
 void main() {
+    uint face = v_face & 7u;
+    bool far = v_face >= 8u;    // a chunk above level 0: lit by the sun and sky, mirroring the sky, without rays
     uint tex = v_w1 & 65535u;
     if (tex >= uint(u.misc.z)) tex = 0u;
     vec4 base = texture(tiles, vec3(v_tex, float(tex)));
@@ -27,10 +29,10 @@ void main() {
     vec2 f = fract(v_uv);
     float a0 = float(ao & 3u), a1 = float((ao >> 2) & 3u), a2 = float((ao >> 4) & 3u), a3 = float((ao >> 6) & 3u);
     float occ = mix(mix(a0, a1, f.x), mix(a2, a3, f.x), f.y) / 3.0;
-    vec3 n = qrot(v_rot, NORMALS[min(v_face, 5u)]);
+    vec3 n = qrot(v_rot, NORMALS[min(face, 5u)]);
     if (u.light.x < 1.0 || u.light.x >= 9.0) { o_color = vec4(shade_flat(base.rgb, n, occ, v_world), base.a); return; }
     vec3 toward = normalize(u.eye.xyz - v_world);
-    if (submerged() && v_face == 0u && toward.y < 0.0) {
+    if (submerged() && face == 0u && toward.y < 0.0) {
         // The surface seen from underneath. Straight overhead the sky shows
         // through, bent into a bright round window; beyond about 49 degrees
         // from straight up the surface is a mirror of the water below it.
@@ -73,7 +75,7 @@ void main() {
         if (all(greaterThan(at, movers.boxes[2 * b].xyz)) && all(lessThan(at, movers.boxes[2 * b + 1].xyz))) settling = true;
     bool now = !have || settling || (((px.x >> 3) & 1) + 2 * ((px.y >> 3) & 1)) == (frame & 3);
     // one ray at the sun's centre
-    float sun_mem = u.light.x < 2.0 ? 1.0 : (now ? sun_visible(at, n, u.sun.xyz) : old.a);
+    float sun_mem = u.light.x < 2.0 || far ? 1.0 : (now ? sun_visible(at, n, u.sun.xyz) : old.a);
     // figures move every frame: their shadow is never remembered
     float sun_vis = sun_mem;
     if (u.fshadow.x > 0.5 && sun_vis > 0.0) sun_vis = min(sun_vis, fig_shadow(v_world, n));
@@ -88,14 +90,14 @@ void main() {
             // seen from underneath, the surface faces down
             vec3 m = dot(n, toward_eye) < 0.0 ? -n : n;
             // a smooth top face ripples: a small moving tilt, in voxel-sized steps so it keeps the world's grain
-            if (v_face == 0u) {
+            if (face == 0u) {
                 vec2 q = floor(v_world.xz / u.eye.w * 4.0) / 4.0;
                 float t = u.light.y;
                 m = normalize(m + 0.010 * vec3(sin(q.x * 2.3 + t * 1.3) + sin(q.y * 1.1 - t * 0.9), 0.0, sin(q.y * 2.9 + t * 1.6) + sin(q.x * 0.7 + t * 1.1)));
             }
             float share = mirror_share(m, toward_eye, 0.03) * (1.0 - rough);
             if (u.sun_color.w > 0.5) {
-                mirror = now ? reflected(at + sign(dot(n, toward_eye)) * n * 0.02, mirror_dir(toward_eye, m, sign(dot(n, toward_eye)) * n), int(floor(at.y - 0.001))) : old.rgb;
+                mirror = far ? sky_color(mirror_dir(toward_eye, m, sign(dot(n, toward_eye)) * n)) : now ? reflected(at + sign(dot(n, toward_eye)) * n * 0.02, mirror_dir(toward_eye, m, sign(dot(n, toward_eye)) * n), int(floor(at.y - 0.001))) : old.rgb;
                 col = mix(col, mirror, share);
             }
             col += sun_highlight(m, toward_eye, rough, sun_vis);

@@ -27,7 +27,7 @@
 /* Rewritten by build_shaders.sh whenever the shaders change: forge decides
  * whether to recompile this file from its text alone, not from the headers
  * it includes (GAPS S14). */
-#define STRATA_SHADERS_STAMP "3e1d04e0945e2bd9"
+#define STRATA_SHADERS_STAMP "dbd687867761280d"
 #include "strata_shaders.h"
 #include "strata_spray.h"
 #include "strata_alloc.h"
@@ -82,7 +82,7 @@ typedef struct { int shaped, placed; float pos[3], rot[4], seen_pos[3], seen_rot
  * replaced range stays intact for two frames. */
 typedef struct {
     int32_t  origin[3];        /* chunk's low corner, in voxels */
-    int32_t  level_flags;      /* bits 0-7 level, bit 8 in use */
+    int32_t  level_flags;      /* bits 0-7 level, bit 8 in use, bit 9 a body, bit 10 hidden */
     uint32_t first[SV_RANGES];
     uint32_t count[SV_RANGES];
     float    pos[4];           /* a body slot: its low corner in metres */
@@ -90,6 +90,7 @@ typedef struct {
 } ChunkEntry;
 #define SV_IN_USE 256
 #define SV_BODY   512          /* a part of a body: drawn at its pose, never in the light volume */
+#define SV_HIDDEN 1024         /* held but not drawn (Strata.Slots' which-chunk-draws rule); kept across uploads, cleared by a free */
 
 /* An image a pass renders to and a later pass samples. */
 typedef struct { VkImage img; VkDeviceMemory mem; VkImageView view; } Target;
@@ -247,7 +248,7 @@ static struct {
     int vsync_off;                 /* ask for the immediate present mode */
     double stat[6];                /* last frame: CPU ms, ms waiting, draw calls, GPU ms, translucent chunks drawn, microseconds ordering them */
     /* a chunk being assembled by sv_chunk_begin .. sv_chunk_commit */
-    struct { int64_t slot; int32_t origin[3]; uint32_t *part[4]; uint32_t n[4], cap[4]; int open; int body; int fig; int32_t rp; } stage;
+    struct { int64_t slot; int32_t origin[3]; uint32_t *part[4]; uint32_t n[4], cap[4]; int open; int body; int fig; int32_t rp; int level; } stage;
     VkQueryPool qpool; int have_ts; float ts_period;   /* four timestamps a Frame: the frame's start and end, the figure shadow pass's */
     VkDeviceSize max_ssbo;         /* the most of a buffer one storage descriptor may reach */
     int64_t refused;               /* uploads turned away because the buffer was full */
@@ -276,6 +277,7 @@ static struct {
 #define UBO_LIGHT 68
 #define UBO_SUN_COLOR 72
 #define SV_MAX_BLOCKS 65536    /* rows in the block table: block ids are sixteen bits */
+#define SV_TOP_OF (SV_MAX_BLOCKS * 8)   /* after the rows, in words: each texture's top texture, for a far chunk's side faces */
 
 static void die(const char *what, int code) {
     fprintf(stderr, "strata_vk: %s failed (%d)\n", what, code);
@@ -930,6 +932,23 @@ int64_t sv_blocks_set(void *words_i32, int64_t nblocks) {
     if (!g.blocks_map || !words_i32 || nblocks < 0 || nblocks > SV_MAX_BLOCKS || narr_len(words_i32) < nblocks * 8) return 0;
     memcpy(g.blocks_map, narr_data(words_i32), (size_t)nblocks * 32);
     g.nblocks = (uint32_t)nblocks;
+    /* each texture's top texture: a block's side texture that differs from its top (a grass side) maps to the
+     * top, so a chunk above level 0, whose risers are many voxels tall, keeps the ground's colour; the first
+     * block to name a side texture decides it; every other texture maps to itself */
+    uint32_t *top = (uint32_t *)g.blocks_map + SV_TOP_OF;
+    for (uint32_t t = 0; t < 65536; t++) top[t] = t;
+    const int32_t *rows = narr_data(words_i32);
+    static uint8_t named[65536];
+    memset(named, 0, sizeof named);
+    for (int64_t b = 0; b < nblocks; b++) {
+        int32_t t0 = rows[b * 8];
+        for (int f = 2; f < 6; f++) {
+            int32_t tf = rows[b * 8 + f];
+            if (tf < 0 || tf > 65535 || t0 < 0 || t0 > 65535 || named[tf]) continue;
+            named[tf] = 1;
+            if (tf != t0) top[tf] = (uint32_t)t0;
+        }
+    }
     return 1;
 }
 
@@ -2099,9 +2118,10 @@ int64_t sv_open(int64_t w, int64_t h, int64_t capture_mouse, int64_t quad_capaci
     if (!g.trans || !g.trans_at || !g.trans_keys) { die("translucent list", 0); return 0; }
     for (int i = 0; i < SV_MAX_SLOTS; i++) g.trans_at[i] = -1;
 
-    if (!make_buffer((VkDeviceSize)SV_MAX_BLOCKS * 32, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &g.blocks, &g.blocks_mem, &map)) return 0;
+    if (!make_buffer((VkDeviceSize)SV_MAX_BLOCKS * 32 + 65536 * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &g.blocks, &g.blocks_mem, &map)) return 0;
     g.blocks_map = map;
     memset(g.blocks_map, 0, (size_t)SV_MAX_BLOCKS * 32);
+    for (uint32_t t = 0; t < 65536; t++) ((uint32_t *)g.blocks_map)[SV_TOP_OF + t] = t;
     VkDescriptorPoolSize dps[4] = { { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, SV_FRAMES }, { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 16 * SV_FRAMES }, { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 13 * SV_FRAMES },
                                     { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 4 * SV_FRAMES } };
     VkDescriptorPoolCreateInfo dpi = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = SV_FRAMES, .poolSizeCount = 4, .pPoolSizes = dps };
@@ -2459,6 +2479,7 @@ static uint32_t order_translucent(uint32_t region) {
     uint32_t n = 0;
     for (uint32_t i = 0; i < g.ntrans; i++) {
         const ChunkEntry *e = &g.entries[g.trans[i]];
+        if (e->level_flags & SV_HIDDEN) continue;
         float side = (float)(32 << (e->level_flags & 255));
         float cx, cy, cz;
         if (e->level_flags & SV_BODY) {
@@ -2500,7 +2521,7 @@ static void touch(uint32_t slot) {
 
 /* A chunk is uploaded whole or not at all:
  *
- *     sv_chunk_begin(slot, ox, oy, oz)
+ *     sv_chunk_begin(slot, ox, oy, oz, level)
  *     sv_chunk_part(0, opaque quads, n)        each part is optional;
  *     sv_chunk_part(1, cutout quads, n)        a part not given is empty
  *     sv_chunk_part(2, translucent quads, n)
@@ -2511,10 +2532,17 @@ static void touch(uint32_t slot) {
  * as it is given, so the caller's arrays need not outlive the call. Commit
  * finds room for everything first; if any of it does not fit, nothing
  * changes and the slot keeps drawing what it had. It never waits for the
- * GPU: ranges the chunk held before are reused two frames later. */
-int64_t sv_chunk_begin(int64_t slot, double ox, double oy, double oz) {
+ * GPU: ranges the chunk held before are reused two frames later.
+ *
+ * (ox, oy, oz) is the low corner in voxels of level 0. A level-L chunk
+ * (Part F's far field, L 0..30) is drawn with each voxel 2^L voxels of
+ * level 0 on a side; its textures repeat per level-0 voxel. Above level 0 a
+ * chunk never enters the light volume, and the light pass lights it by the
+ * sun and sky alone: its rays would start inside the finer world. */
+int64_t sv_chunk_begin(int64_t slot, double ox, double oy, double oz, int64_t level) {
     g.stage.open = 0;
-    if (!g.ok || slot < 0 || slot >= SV_MAX_SLOTS) return 0;
+    if (!g.ok || slot < 0 || slot >= SV_MAX_SLOTS || level < 0 || level > 30) return 0;
+    g.stage.level = (int)level;
     g.stage.slot = slot;
     g.stage.origin[0] = (int32_t)ox; g.stage.origin[1] = (int32_t)oy; g.stage.origin[2] = (int32_t)oz;
     for (int i = 0; i < 4; i++) g.stage.n[i] = 0;
@@ -2683,7 +2711,7 @@ static void lamps_to_frame(Frame *F) {
  * [slot]; parts and commit as for a chunk. It is drawn at the pose
  * sv_slot_pose gives and never written into the light volume. */
 int64_t sv_body_begin(int64_t slot) {
-    if (!sv_chunk_begin(slot, 0.0, 0.0, 0.0)) return 0;
+    if (!sv_chunk_begin(slot, 0.0, 0.0, 0.0, 0)) return 0;
     g.stage.body = 1;
     return 1;
 }
@@ -2776,12 +2804,12 @@ int64_t sv_chunk_commit(void) {
     e->origin[0] = g.stage.origin[0]; e->origin[1] = g.stage.origin[1]; e->origin[2] = g.stage.origin[2];
     for (int r = 0; r < 4; r++) { e->first[r] = firsts[r]; e->count[r] = counts[r]; }
     e->first[4] = lfirst; e->count[4] = nloose;
-    e->level_flags = SV_IN_USE | (g.stage.body ? SV_BODY : 0);
+    e->level_flags = SV_IN_USE | (g.stage.body ? SV_BODY : g.stage.level) | (e->level_flags & SV_HIDDEN);
     if (!g.stage.body) { e->pos[0] = e->pos[1] = e->pos[2] = e->pos[3] = 0.0f; e->rot[0] = e->rot[1] = e->rot[2] = 0.0f; e->rot[3] = 1.0f; }
     if ((uint32_t)slot + 1 > g.hi_slot) g.hi_slot = (uint32_t)slot + 1;
     trans_track((uint32_t)slot, counts[2] > 0);
     touch((uint32_t)slot);
-    if (g.stage.body) return 1;            /* a body is not in the light volume */
+    if (g.stage.body || g.stage.level > 0) return 1;   /* neither a body nor a coarse chunk is in the light volume */
     /* its voxels go into the light volume at the start of the next frame */
     int32_t chunk[3] = { e->origin[0] >> 5, e->origin[1] >> 5, e->origin[2] >> 5 };
     if (g.stage_light_n == 32768) {
@@ -2794,10 +2822,10 @@ int64_t sv_chunk_commit(void) {
 void sv_chunk_free(int64_t slot) {
     if (!g.ok || slot < 0 || slot >= SV_MAX_SLOTS) return;
     ChunkEntry *e = &g.entries[slot];
-    if (!(e->level_flags & SV_IN_USE)) return;
-    int body = (e->level_flags & SV_BODY) != 0;
+    if (!(e->level_flags & SV_IN_USE)) { e->level_flags = 0; return; }   /* a slot hidden before its first upload landed */
+    int body = (e->level_flags & SV_BODY) != 0, coarse = (e->level_flags & 255) > 0;
     e->level_flags = 0;                      /* the cull pass skips it once the frames have their copy */
-    if (!body) {   /* and its cell of the light volume empties, if it is still this chunk's */
+    if (!body && !coarse) {   /* and its cell of the light volume empties, if it is still this chunk's */
         int32_t chunk[3] = { e->origin[0] >> 5, e->origin[1] >> 5, e->origin[2] >> 5 };
         int cell[3];
         struct LightCell *c = cell_of(chunk, cell);
@@ -2809,6 +2837,17 @@ void sv_chunk_free(int64_t slot) {
     touch((uint32_t)slot);
 }
 
+
+/* Draw slot [slot]'s mesh ([shown] 1) or keep it undrawn (0): the
+ * which-chunk-draws rule of Strata.Slots. Kept across uploads into the slot;
+ * a free clears it. The cull pass and the translucent order skip a hidden slot. */
+void sv_chunk_show(int64_t slot, int64_t shown) {
+    if (!g.ok || slot < 0 || slot >= SV_MAX_SLOTS) return;
+    ChunkEntry *e = &g.entries[slot];
+    int32_t was = e->level_flags;
+    if (shown) e->level_flags &= ~SV_HIDDEN; else e->level_flags |= SV_HIDDEN;
+    if (e->level_flags != was) touch((uint32_t)slot);
+}
 
 /* Give model [index] its drawing geometry: [nquads] quads of 21 floats
  * (Strata.Model). Chunks uploaded afterwards draw it; ones already uploaded

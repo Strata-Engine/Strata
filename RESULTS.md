@@ -852,3 +852,110 @@ a fix to the March compiler is under way apart from this branch.
 
 The viewer steps fluids 30 times a second (`STRATA_FLUID_HZ`), up from
 10, so a dug-out lake drains three times sooner.
+
+# Generation plan
+
+## Task 10: the island measured against the design's targets
+
+Release builds, one task for the chunk timings, on the shared development
+machine (14 cores). Every row gives the load average it was measured at.
+The load never fell under 28 during the task and the timings below were all
+taken between 37 and 58; the chunk numbers move by half again between runs
+at the same load, so they are ranges, not points. A target missed at a load
+over 8 is not judged: on this machine at that load a number says more about
+the other sessions than about the code. Nothing was cut to meet a number.
+
+| target | result | load | |
+|---|---|---|---|
+| atlas build, 512 x 512: under 60 s | 13.5 s (built fresh into an empty cache) | 46 | met |
+| atlas build, 256 x 256: under 15 s | 2.0 s (the demo, fresh cache) | 53 | met |
+| atlas read from the cache | 41 to 47 ms | 40 to 55 | |
+| surface chunk at 1 m, median: 1 ms | 25.9 to 41.7 ms | 37 to 56 | not judged (load 37 to 56) |
+| surface chunk at 1 m, worst: 3 ms | 57.8 to 72.3 ms | 37 to 56 | not judged (load 37 to 56) |
+| surface chunk at 0.5 m, median / worst | 27.3 to 41.7 ms / 59.1 to 92.6 ms | 43 to 56 | not judged (load 43 to 56) |
+| surface chunk at 0.25 m, median / worst: 1 ms / 3 ms | 37.3 to 43.3 ms / 84.9 to 107.2 ms | 43 to 56 | not judged (load 43 to 56) |
+| air chunk: under 20 us | 54 to 114 us at 1 m, 39 to 57 us at 0.5 m, 34 us at 0.25 m | 37 to 56 | not judged (load 37 to 56) |
+| solid chunk: under 20 us | 59 to 112 us at 1 m, 41 to 56 us at 0.5 m, 23 us at 0.25 m | 37 to 56 | not judged (load 37 to 56) |
+| soak worst frame: 16.7 ms (the soak allows 20) | 294 to 399 ms at 0.25 m (mean 30.5 to 38.9 ms); 146 ms at 1 m (mean 7.7 ms) | 55 to 67 | not judged (load 55 to 67) |
+| soak fluid step on the main thread: under 6 ms | 3.4 to 33.9 ms at 0.25 m; 0.2 ms at 1 m | 55 to 67 | not judged (load 55 to 67) |
+| lakes at rest: no lake loses over 1% in 1000 fluid steps | 0 eighths lost: the one lake loaded at both ends at 0.25 m kept 194 720 of 194 720; at 1 m two lakes kept 3392 and 2776 | 55 to 67 | met |
+
+A surface chunk is the one holding the ground at the middle of each of 200
+columns about the origin; an air (solid) chunk is the one 224 m over
+(under) it: 7 chunks at 1 m, 14 at 0.5 m, 28 at 0.25 m, every one uniform.
+(Seven chunks at 0.25 m, 56 m, is inside the early-out's margin over the
+hills and was generated in full; the first 0.25 m run measured that, 6.6 ms,
+by mistake.)
+
+Against the code before this task: the Task 9 viewer, built from its commit
+and run alternately with this one in the same minutes, timed 31.5 and
+29.3 ms median at 1 m where this one timed 33.7 and 35.7 ms (load 37 to
+46): a tenth to a fifth slower, about as much as one run differs from the
+next. The likeliest share is the eight settings the density now takes as
+arguments a voxel where it had constants; reading them from an array each
+voxel instead had timed 27.6 ms against 25.9 ms for the arguments, in runs
+a few minutes apart. Not chased further.
+
+The soak flies 40 m round the test lake 12 m over its water at 0.25 m for
+6010 frames (1000 fluid steps), blasting a crater where it looks every 100
+frames. Nothing was refused or left waiting, no buffer space was lost, the
+GPU held 1.64 million quads (1.45 million at 1 m). Its slow frames are not
+the frame's own work: the slowest (294 ms) spent 0.94 ms in March and 0.59
+ms in the renderer's shim, the rest out of the process's hands on a machine
+at load 55. At 0.25 m the stream keeps eight workers generating chunks four
+times as small as at 1 m, so the main thread competes for cores more often
+(2857 frames over 25 ms at 0.25 m, 367 at 1 m, in runs a minute apart).
+
+## Task 12: the far field drawn
+
+Release builds on the shared development machine (14 cores), the island at
+seed 7, four levels (`config_levels(r, 3, 8, 4, 10, 1, 4)`). Timings taken
+above a load average of 8 are not judged.
+
+| | result | load | |
+|---|---|---|---|
+| far-field chunk count, the reference scene (scene 135, radius 10, 1 m) | 11 971: level 0 3872, level 1 2904, levels 2 and 3 1936 each, level 4 1323 (Part F's reference: about 8400) | 37 to 41 | over; see below |
+| time to settle, scene 135, radius 10 | 2997 ticks, 12.0 and 13.8 s (two runs), generation and meshing on 4 workers | 37 to 41 | not judged (load 37 to 41) |
+| time to settle, scene 135 at the goldens' radius 6 | 9667 chunks, 2421 ticks, 10.1 to 12.7 s | 12 to 16 | not judged (load 12 to 16) |
+| GPU quads, scene 135, radius 10 | 1.88 million (14.7 MB) | | under Part F's 64 MB |
+| level-1 surface chunk at 1 m: under 1 ms | median 8.5 ms, worst 12.4 ms (level 0 in the same minute: 10.4 / 25.5 ms) | 33 | not judged (load 33) |
+| far shore visible from the highest hill (scene 135) | yes: the land runs to the shore and the sea to the horizon | | met |
+| ring boundary (scene 136): no holes, no double drawing | none seen: past the level-0 edge, about 100 m out at radius 4, the trees go on coarsened (2 m voxels, then 4 m) on their trunks, the hills keep their green and their terraces coarsen | | met |
+| the soak at 0.25 m with four levels: chunks at the start | 12 939 (3872 / 2904 / 2904 / 1936 / 1323), settled after 3239 ticks in 34.7 s | 21 | not judged (load 21) |
+| the soak: worst frame against 16.7 ms (the soak allows 20) | 165.6 ms, mean 21.3 ms over 6010 frames; the near field alone in the next minutes: 205.1 ms, mean 18.7 ms | 21 to 41 | not judged (load 21 to 41) |
+| the soak: refused, waiting, leaked, retained at the end | 0, 0, 0, 0; 6287 slots in use, 12 413 chunks loaded | | met |
+| the soak: quads held | 3.37 million (27 MB) with the far field, 1.62 million without | | under 64 MB |
+| the soak: the lake at rest | 194 720 of 194 720 eighths kept | | met |
+
+The chunk count is over Part F's 8400 because each level's meshed inside
+is snapped out to whole chunks of the level above, and holds the parents of
+the inside below it: level 0's 19 x 19 x 5 inside becomes 20 x 20 x 6 and
+its box, with the unmeshed ring, 22 x 22 x 8; each coarse level's one
+chunk up and down becomes two to four. Without the snapping no coarse
+chunk could be hidden over a finer level's edge (the first try drew the
+top level over the near field); without the nesting a departed chunk
+could have no parent to wait for. The radii are settings; 8400 is the
+benchmark, not a ceiling, and the slot table (16 384) holds the meshed
+ones with room.
+
+Lighting: a coarse chunk is lit as light mode 1 lights everything (sun
+times n.l and the flat sky term). From the hill (scene 135) the near land
+and the far land are of a brightness; no shadow falls past the near
+chunks. A first version showed a line of sand across the sea and brown
+far hills. The line was water: each level filled the sea to the voxel
+holding 40 m, so its top stood at 41, 42, 44, 48 and 48 m at levels 0 to
+4, and where an outer level's water stood over an inner one's, its side
+toward the camera was open (the face against the finer level's hidden
+chunk, which holds water, is culled) and showed the outer level's sand
+floor through it. Above level 0 water now stands no higher than level
+0's (40, 40, 40 and 32 m at levels 1 to 4) and the line is gone. The
+brown was the grass side's dirt on risers many metres tall; a far
+chunk's sides now take the top texture. Levels 1 and 2 carry the trees,
+coarsened; levels 3 and 4 none.
+
+The soak's other misses (sound underruns: 2 with the far field, 4
+without; an acoustics update over 2 ms; the fluid step over 6 ms without
+the far field) came in both runs, minutes apart at loads of 21 to 41, and
+are the machine's, not judged. The soak's ceiling on quads held is 64 MB
+with the far field (3 million quads for the near field alone, as before). It is the generator's, not
+the renderer's; left for the generator's owner.
