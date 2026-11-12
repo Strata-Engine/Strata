@@ -21,6 +21,7 @@ build cull.comp
 build quad.vert
 build cross.vert
 build loose.vert
+build figure.vert
 build fullscreen.vert
 build gbuffer.frag tiles.glsl
 build light.frag shade.glsl tiles.glsl gbuf.glsl trace.glsl sky.glsl reflect.glsl

@@ -17,8 +17,8 @@
  * array was short can ask again with a longer one).
  *
  * The view (an_x_view) takes its 24 plane floats from a NativeF32Arr; one
- * shorter than 24 means no planes. The renderer reads the draw list straight
- * from strata_anim.h (an_draw_list), never through March.
+ * shorter than 24 means no planes. The renderer reads the draw list through
+ * an_x_draw_list (an_draw_list on this world), C to C, never through March.
  *
  * Timing, for measurements only: an_x_update and an_x_hit_ray time
  * themselves on the monotonic clock (an_x_timing). The kernel never reads a
@@ -302,3 +302,13 @@ double an_x_mark_weight(int64_t i) {
 /* the hash, folded to 62 bits so it is the same number as a March Int */
 int64_t an_x_hash(void) { return g_w ? (int64_t)(an_hash(g_w) & 0x3fffffffffffffffull) : 0; }
 double an_x_stat(int64_t which) { return g_w ? an_stat(g_w, (int)which) : 0; }
+
+/* The renderer's draw list (strata_vk.c reads it each frame; it defines a
+ * weak stand-in answering no parts, so a game that draws but does not
+ * animate still links): every visible part of every figure, drawn at blend
+ * 0..1 between its last two poses, as an_draw_list lists them. The arrays
+ * are the world's, valid until the next call; 0 with no world. */
+int an_x_draw_list(double blend, const int32_t **rig_part, const float **xf, const int32_t **flags) {
+    if (!g_w) { if (rig_part) *rig_part = NULL; if (xf) *xf = NULL; if (flags) *flags = NULL; return 0; }
+    return an_draw_list(g_w, (float)blend, rig_part, xf, flags);
+}
