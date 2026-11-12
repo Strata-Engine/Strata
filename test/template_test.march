@@ -1,0 +1,197 @@
+-- Templates: holes, probabilities, rotation, clipping to a chunk, and a
+-- template read from a MagicaVoxel file.
+mod Strata.Test.Template do
+
+  needs IO.Clock
+  needs IO.Process
+  needs IO.Console    -- charged to every test module once any prints (GAPS S3)
+  needs IO.FileSystem -- from_vox reads viewer/assets/ruins/wall.vox
+
+  import Test
+  alias Strata.Template as Tp
+  alias Strata.Chunk as C
+
+  pfn fill_ids(a : NativeI32Arr, i : Int, n : Int, id : Int) : NativeI32Arr do
+    if i >= n do a else fill_ids(NativeArray.set_i32(a, i, id), i + 1, n, id) end
+  end
+
+  -- a 3 x 3 x 3 block of id 2 with a hole at its centre
+  pfn hollow() : Strata.Template.Template do
+    Tp.make(3, 3, 3, NativeArray.set_i32(fill_ids(NativeArray.make_i32(27, 0), 0, 27, 2), 13, 0), 1.0)
+  end
+
+  -- an L, 3 x 1 x 2: a bar along x (ids 10, 11, 12) and a foot at (0, 0, 1) (id 20)
+  pfn ell() : Strata.Template.Template do
+    let a0 = NativeArray.make_i32(6, 0)
+    let a1 = NativeArray.set_i32(NativeArray.set_i32(NativeArray.set_i32(a0, 0, 10), 1, 11), 2, 12)
+    Tp.make(3, 1, 2, NativeArray.set_i32(a1, 3, 20), 1.0)
+  end
+
+  pfn count_go(c : Strata.Chunk.Chunk, i : Int, acc : Int) : Int do
+    if i >= 32768 do acc else count_go(c, i + 1, if C.get_idx(c, i) != 0 do acc + 1 else acc end) end
+  end
+  pfn solid(c : Strata.Chunk.Chunk) : Int do count_go(c, 0, 0) end
+
+  pfn at(c : Strata.Chunk.Chunk, x : Int, y : Int, z : Int) : Int do C.get_or(c, x, y, z, 0 - 1) end
+
+  pfn origin() : Strata.Coord.Key do Strata.Coord.key(0, 0, 0) end
+
+  -- the ell blitted at (10, 0, 10) with rot; (world x, world z, id) for each of its four voxels
+  pfn ell_lands(rot : Int, cells : List((Int, Int, Int))) : Bool do
+    let c = Tp.blit(C.uniform(0), origin(), ell(), 10, 0, 10, rot, 5)
+    if solid(c) != 4 do false
+    else
+      List.all(cells, fn cell -> match cell do (x, z, id) -> at(c, x, 0, z) == id end)
+    end
+  end
+
+  -- every even index probability 0, every odd one 255
+  pfn halves_go(t : Strata.Template.Template, i : Int, n : Int) : Strata.Template.Template do
+    if i >= n do t else halves_go(Tp.with_prob(t, i, if i % 2 == 0 do 0 else 255 end), i + 1, n) end
+  end
+
+  -- whether the 4 x 4 x 4 template blitted at the origin wrote exactly its odd indices
+  pfn odd_only_go(c : Strata.Chunk.Chunk, i : Int) : Bool do
+    if i >= 64 do true
+    else
+      let x = i % 4
+      let y = (i / 4) % 4
+      let z = i / 16
+      let want = if i % 2 == 0 do 0 else 3 end
+      if at(c, x, y, z) != want do false else odd_only_go(c, i + 1) end
+    end
+  end
+
+  pfn streams_ok(t : Strata.Template.Template, s : Int) : Bool do
+    if s >= 20 do true
+    else if odd_only_go(Tp.blit(C.uniform(0), origin(), t, 0, 0, 0, 0, Strata.Seed.mix(s, 3)), 0) do streams_ok(t, s + 1)
+    else false end end
+  end
+
+  -- a 5 x 3 x 4 template with three holes: 57 voxels
+  pfn holed() : Strata.Template.Template do
+    let a = fill_ids(NativeArray.make_i32(60, 0), 0, 60, 4)
+    Tp.make(5, 3, 4, NativeArray.set_i32(NativeArray.set_i32(NativeArray.set_i32(a, 0, 0), 31, 0), 59, 0), 1.0)
+  end
+
+  pfn across(t : Strata.Template.Template, ox : Int, oy : Int, oz : Int, rot : Int, keys : List(Strata.Coord.Key)) : Int do
+    match keys do
+      Nil -> 0
+      Cons(k, rest) -> solid(Tp.blit(C.uniform(0), k, t, ox, oy, oz, rot, 9)) + across(t, ox, oy, oz, rot, rest)
+    end
+  end
+
+  pfn palette(stone : Int, dark : Int, rubble : Int) : NativeI32Arr do
+    NativeArray.set_i32(NativeArray.set_i32(NativeArray.set_i32(NativeArray.make_i32(256, 0), 1, stone), 2, dark), 3, rubble)
+  end
+
+  pfn wall_bytes() : NativeU8Arr do
+    match File.read("viewer/assets/ruins/wall.vox") do
+      Ok(text) -> Bytes.to_u8_arr(Bytes.from_string(text))
+      Err(_) -> NativeArray.make_u8(0, 0)
+    end
+  end
+
+  pfn ids_count_go(ids : NativeI32Arr, id : Int, i : Int, n : Int, acc : Int) : Int do
+    if i >= n do acc else ids_count_go(ids, id, i + 1, n, if NativeArray.get_i32(ids, i) == id do acc + 1 else acc end) end
+  end
+  pfn ids_count(t : Strata.Template.Template, id : Int) : Int do
+    ids_count_go(Tp.t_ids(t), id, 0, Tp.t_sx(t) * Tp.t_sy(t) * Tp.t_sz(t), 0)
+  end
+
+  -- 32-bit little-endian words as bytes, and a FourCC as its word
+  pfn words_go(a : NativeU8Arr, ws : List(Int), i : Int) : NativeU8Arr do
+    match ws do
+      Nil -> a
+      Cons(w, rest) ->
+        let a1 = NativeArray.set_u8(NativeArray.set_u8(a, i, int_and(w, 255)), i + 1, int_and(int_shr(w, 8), 255))
+        let a2 = NativeArray.set_u8(NativeArray.set_u8(a1, i + 2, int_and(int_shr(w, 16), 255)), i + 3, int_and(int_shr(w, 24), 255))
+        words_go(a2, rest, i + 4)
+    end
+  end
+  pfn words(ws : List(Int)) : NativeU8Arr do words_go(NativeArray.make_u8(4 * List.length(ws), 0), ws, 0) end
+  pfn fourcc(a : Int, b : Int, c : Int, d : Int) : Int do a + 256 * (b + 256 * (c + 256 * d)) end
+  pfn vox_head() : List(Int) do Cons(fourcc(86, 79, 88, 32), Cons(150, Nil)) end -- "VOX ", version 150
+  pfn main_id() : Int do fourcc(77, 65, 73, 78) end                            -- "MAIN"
+
+  describe "Template" do
+    test "a hole is never written: the middle of a hollow block stays stone" do
+      let c = Tp.blit(C.uniform(1), origin(), hollow(), 4, 4, 4, 0, 7)
+      Test.assert_eq_int(at(c, 5, 5, 5), 1, "the hole leaves the stone")
+      Test.assert_eq_int(at(c, 4, 4, 4), 2, "a corner is written")
+      Test.assert_eq_int(at(c, 6, 6, 6), 2, "the far corner is written")
+      Test.assert_eq_int(at(c, 5, 4, 5), 2, "the bottom centre is written")
+      Test.assert_eq_int(at(c, 7, 4, 4), 1, "outside the template is untouched")
+      Test.assert_eq_int(at(c, 3, 5, 5), 1, "and on the other side")
+    end
+
+    test "the four rotations of an L land where expected" do
+      Test.assert_true(ell_lands(0, Cons((10, 10, 10), Cons((11, 10, 11), Cons((12, 10, 12), Cons((10, 11, 20), Nil))))), "rot 0")
+      Test.assert_true(ell_lands(1, Cons((11, 10, 10), Cons((11, 11, 11), Cons((11, 12, 12), Cons((10, 10, 20), Nil))))), "rot 1")
+      Test.assert_true(ell_lands(2, Cons((12, 11, 10), Cons((11, 11, 11), Cons((10, 11, 12), Cons((12, 10, 20), Nil))))), "rot 2")
+      Test.assert_true(ell_lands(3, Cons((10, 12, 10), Cons((10, 11, 11), Cons((10, 10, 12), Cons((11, 12, 20), Nil))))), "rot 3")
+      Test.assert_true(ell_lands(5, Cons((11, 10, 10), Cons((11, 11, 11), Cons((11, 12, 12), Cons((10, 10, 20), Nil))))), "rot 5 is rot 1")
+    end
+
+    test "bounds is the inclusive world box after rotation" do
+      Test.assert_true(Tp.bounds(ell(), 10, 0, 10, 0) == (10, 0, 10, 12, 0, 11), "rot 0: 3 along x, 2 along z")
+      Test.assert_true(Tp.bounds(ell(), 10, 0, 10, 1) == (10, 0, 10, 11, 0, 12), "rot 1: 2 along x, 3 along z")
+      Test.assert_true(Tp.bounds(hollow(), 0 - 5, 2, 7, 3) == (0 - 5, 2, 7, 0 - 3, 4, 9), "a cube")
+    end
+
+    test "prob 0 voxels are never written and prob 255 always" do
+      let t = halves_go(Tp.make(4, 4, 4, fill_ids(NativeArray.make_i32(64, 0), 0, 64, 3), 1.0), 0, 64)
+      Test.assert_true(streams_ok(t, 0), "over twenty streams")
+    end
+
+    test "a y slice at 0 drops its whole row, at 255 keeps it" do
+      let t = Tp.with_yslice(Tp.make(4, 4, 4, fill_ids(NativeArray.make_i32(64, 0), 0, 64, 3), 1.0), 2, 0)
+      let c = Tp.blit(C.uniform(0), origin(), t, 0, 0, 0, 0, 11)
+      Test.assert_eq_int(solid(c), 48, "three rows of sixteen")
+      Test.assert_eq_int(at(c, 1, 2, 1), 0, "row 2 is gone")
+      Test.assert_eq_int(at(c, 1, 3, 1), 3, "row 3 stays")
+    end
+
+    test "a blit straddling chunks writes, across them, exactly the template's non-hole count" do
+      let t = holed()
+      Test.assert_eq_int(across(t, 29, 4, 5, 0, Cons(Strata.Coord.key(0, 0, 0), Cons(Strata.Coord.key(1, 0, 0), Nil))), 57, "two chunks along x")
+      let four = Cons(Strata.Coord.key(0 - 1, 0, 0 - 1), Cons(Strata.Coord.key(0, 0, 0 - 1), Cons(Strata.Coord.key(0 - 1, 0, 0), Cons(Strata.Coord.key(0, 0, 0), Nil))))
+      Test.assert_eq_int(across(t, 0 - 2, 4, 0 - 3, 1, four), 57, "four chunks, turned")
+      Test.assert_true(solid(Tp.blit(C.uniform(0), Strata.Coord.key(0, 0, 0), t, 29, 4, 5, 0, 9)) < 57, "and neither alone holds it all")
+    end
+
+    test "from_vox of wall.vox has the tool's size and maps the palette" do
+      match Tp.from_vox(wall_bytes(), palette(7, 8, 9), 0.5) do
+        None -> Test.assert_true(false, "wall.vox read")
+        Some(t) ->
+          Test.assert_eq_int(Tp.t_sx(t), 12, "12 long")
+          Test.assert_eq_int(Tp.t_sy(t), 5, "5 high")
+          Test.assert_eq_int(Tp.t_sz(t), 2, "2 thick")
+          Test.assert_true(Tp.t_voxel_size(t) == 0.5, "the voxel size given")
+          Test.assert_eq_int(NativeArray.get_i32(Tp.t_ids(t), 0), 7, "the bottom course is stone, palette 1")
+          Test.assert_eq_int(ids_count(t, 7) + ids_count(t, 8) + ids_count(t, 9) + ids_count(t, 0), 120, "only mapped ids and holes")
+          Test.assert_true(ids_count(t, 9) > 0, "rubble, palette 3")
+          Test.assert_true(ids_count(t, 0) > 0, "and gaps")
+      end
+    end
+
+    test "from_vox maps an unmapped palette index to a hole, and refuses junk" do
+      match Tp.from_vox(wall_bytes(), palette(7, 0, 9), 1.0) do
+        None -> Test.assert_true(false, "wall.vox read")
+        Some(t) -> Test.assert_eq_int(ids_count(t, 8), 0, "no dark stone")
+      end
+      Test.assert_true(Option.is_none(Tp.from_vox(NativeArray.make_u8(64, 7), palette(7, 8, 9), 1.0)), "junk is None")
+    end
+
+    test "from_vox of a corrupt file is None, and the process carries on" do
+      -- a MAIN chunk whose children run past the buffer
+      let trunc = words(List.append(vox_head(), Cons(main_id(), Cons(0, Cons(1000, Nil)))))
+      Test.assert_true(Option.is_none(Tp.from_vox(trunc, palette(7, 8, 9), 1.0)), "a truncated MAIN chunk")
+      -- a SIZE chunk declaring 8 bytes, not 12: an ogt_vox assert
+      let size_id = fourcc(83, 73, 90, 69)
+      let bad = words(List.append(vox_head(), Cons(main_id(), Cons(0, Cons(32, Cons(size_id, Cons(8, Cons(0, Cons(2, Cons(2, Nil))))))))))
+      Test.assert_true(Option.is_none(Tp.from_vox(bad, palette(7, 8, 9), 1.0)), "a SIZE chunk of the wrong size")
+      Test.assert_true(Option.is_some(Tp.from_vox(wall_bytes(), palette(7, 8, 9), 1.0)), "wall.vox still reads")
+    end
+  end
+end

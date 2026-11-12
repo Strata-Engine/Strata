@@ -7,9 +7,10 @@
 -- renderer has no room for is kept and tried again on the next sync, and
 -- until it lands the chunk's previous mesh stays on screen, all of it.
 --
--- Figures (Strata.Anim): `figures` uploads each rig's part meshes and
--- palette once; from then on every figure the animation lists is drawn at
--- each frame, straight from C, at the blend `draw` passes.
+-- Figures (Strata.Anim): `figures` uploads each rig's part meshes, shapes
+-- for the rays and palette once; from then on every figure the animation
+-- lists is drawn at each frame, straight from C, at the blend `draw` passes,
+-- and a traced one (Strata.Anim.traced) is placed among what the rays hit.
 mod Strata.Render do
 
   alias Strata.Slots as Sr2
@@ -33,6 +34,11 @@ mod Strata.Render do
 
   doc "How many blocks could not have a light class of their own and share the nearest of their kind: 0 unless the registry holds more than 255 blocks that differ in what they are to light. Such a block is lit and reflected with another block's texture, smoothness or glow."
   fn light_overflow(r : Strata.Blocks.Registry) : Int do Strata.Blocks.light_overflow(r) end
+
+  doc "The light volume's pool: (pages in use, pages it has, chunks that found no page). A chunk whose voxels are all one class takes no page; a chunk that finds none is seen by light rays as outside the world."
+  fn light_pages() : (Int, Int, Int) do
+    (float_to_int(Strata.Ffi.Vk.stat(10)), float_to_int(Strata.Ffi.Vk.stat(12) /. 32768.0), float_to_int(Strata.Ffi.Vk.stat(11)))
+  end
 
   doc "Give the renderer the registry's per-block data (textures, flags, emission). Call once the registry is built, and again if it changes."
   fn upload_blocks(r : Strata.Blocks.Registry) : Bool do
@@ -250,10 +256,22 @@ mod Strata.Render do
         pieces_go(id, t, b && q && done && ok)
     end
   end
+  -- every part's shape for the rays (a part of no voxels has none); true if all were taken
+  pfn shapes_go(id : Int, rg : Strata.Rig.Rig, p : Int, n : Int, ok : Bool) : Bool do
+    if p >= n do ok
+    else
+      match Strata.Rig.size(rg, p) do
+        (sx, sy, sz) ->
+          let took = if sx * sy * sz == 0 do true else Strata.Ffi.Vk.rig_shape(id, p, Strata.Rig.grid(rg, p), sx, sy, sz) end
+          shapes_go(id, rg, p + 1, n, took && ok)
+      end
+    end
+  end
   pfn upload_rig(id : Int, rg : Strata.Rig.Rig) : Bool do
     let pal = Strata.Ffi.Vk.rig_palette(id, palette_go(NativeArray.make_f32(256 * 5, 0.0), Strata.Rig.palette(rg)))
     let anc = anchors_go(id, rg, 0, Strata.Rig.part_count(rg), true)
-    pal && anc && pieces_go(id, Strata.Rig.meshes(rg), true)
+    let shp = shapes_go(id, rg, 0, Strata.Rig.part_count(rg), true)
+    pal && anc && shp && pieces_go(id, Strata.Rig.meshes(rg), true)
   end
   pfn figures_go(a : Strata.Anim.Anim, rigs : List(Strata.Rig.Rig), held : List(Int)) : List(Int) do
     match rigs do
@@ -267,7 +285,7 @@ mod Strata.Render do
     end
   end
 
-  doc "Give the renderer the meshes and palettes of these rigs, each finished in [a] (Strata.Anim.finish_rig): uploaded once per rig, shared by every figure made from it; a rig already held, or not finished in [a], is passed over. A rig the renderer had no room for is tried again at the next call. From then on every figure of those rigs that the animation lists is drawn at each frame, at its pose: a game calls nothing per figure."
+  doc "Give the renderer the meshes, ray shapes and palettes of these rigs, each finished in [a] (Strata.Anim.finish_rig): uploaded once per rig, shared by every figure made from it; a rig already held, or not finished in [a], is passed over. A rig the renderer had no room for is tried again at the next call. From then on every figure of those rigs that the animation lists is drawn at each frame, at its pose: a game calls nothing per figure."
   fn figures(r : Render, a : Strata.Anim.Anim, rigs : List(Strata.Rig.Rig)) : Render do
     match r do Render(sl, none, held) -> Render(sl, none, figures_go(a, rigs, held)) end
   end

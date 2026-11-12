@@ -1,0 +1,59 @@
+-- Surface — how deep each voxel lies under the open surface above it.
+--
+-- A chunk's density (32768 values at Strata.Coord.index; solid where it is
+-- 0 or more, air where negative) is scanned column by column from the top.
+-- A solid voxel with air over it is at depth 0, the one under it 1, and so
+-- on down the solid run; air is depth -1 and starts the count again, so the
+-- floor under an overhang is a surface too. A solid voxel with air under it
+-- is a ceiling and is given the sentinel `ceiling()` (1000) instead of its
+-- depth. The row above the chunk (`above`, 1024 values at x + 32 * z) says
+-- whether the chunk's top row is a surface; under a solid row the true
+-- depth is unknown, and the count starts as if the run began a chunk above
+-- (32 at y = 31).
+--
+-- The caller's rule turns (depth, local y, under water) into a block id; it
+-- is called once for every voxel. `scan_wet` takes a water line per column
+-- (local y; the voxels at or below it are under water): an air voxel is
+-- under water at or below the line, a solid one when the air over its run's
+-- top is. `scan` has no water.
+mod Strata.Surface do
+
+  doc "The depth given to a ceiling voxel: solid with air directly under it."
+  fn ceiling() : Int do 1000 end
+
+  pfn col_go(d : NativeF32Arr, out : NativeI32Arr, rule : Int -> Int -> Bool -> Int, c : Int, line : Int, y : Int, dep : Int, wet : Bool) : NativeI32Arr do
+    if y < 0 do out
+    else
+      let i = c + 1024 * y
+      if NativeArray.get_f32(d, i) < 0.0 do
+        col_go(d, NativeArray.set_i32(out, i, rule(0 - 1, y, y <= line)), rule, c, line, y - 1, 0 - 1, false)
+      else
+        let fresh = dep < 0
+        let dep2 = if fresh do 0 else dep + 1 end
+        let wet2 = if fresh do y + 1 <= line else wet end
+        -- not `&&`: the read must not run at y = 0 (GAPS S16)
+        let ceil = if y == 0 do false else NativeArray.get_f32(d, i - 1024) < 0.0 end
+        col_go(d, NativeArray.set_i32(out, i, rule(if ceil do ceiling() else dep2 end, y, wet2)), rule, c, line, y - 1, dep2, wet2)
+      end
+    end
+  end
+
+  pfn cols_go(d : NativeF32Arr, above : NativeF32Arr, lines : NativeIntArr, out : NativeI32Arr, rule : Int -> Int -> Bool -> Int, c : Int) : NativeI32Arr do
+    if c >= 1024 do out
+    else
+      let line = NativeArray.get_int(lines, c)
+      let solid_above = NativeArray.get_f32(above, c) >= 0.0
+      cols_go(d, above, lines, col_go(d, out, rule, c, line, 31, if solid_above do 31 else 0 - 1 end, 33 <= line), rule, c + 1)
+    end
+  end
+
+  doc "Block ids for a chunk from its density and the row above it: rule(depth, local y, under water) for every voxel, depth as the module notes say; with a water line (local y) per column, x + 32 * z."
+  fn scan_wet(density : NativeF32Arr, above : NativeF32Arr, lines : NativeIntArr, rule : Int -> Int -> Bool -> Int) : NativeI32Arr do
+    cols_go(density, above, lines, NativeArray.make_i32(32768, 0), rule, 0)
+  end
+
+  doc "Block ids for a chunk from its density and the row above it, with no water: rule(depth, local y, false) for every voxel."
+  fn scan(density : NativeF32Arr, above : NativeF32Arr, rule : Int -> Int -> Bool -> Int) : NativeI32Arr do
+    scan_wet(density, above, NativeArray.make_int(1024, 0 - 1000), rule)
+  end
+end

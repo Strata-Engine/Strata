@@ -223,7 +223,44 @@ The text bindings met S17 again (two private externs named `x_stat`, in the
 renderer's and the text module's bindings): the text module's glyph counts
 came back as the renderer's draw-call count. Its externs are prefixed `xt_`.
 
-## S26: a `Check.all` property that returns false passes under `forge test`
+## S26: `||` does not short-circuit in compiled code
+
+`if id1 == 0 || NativeArray.get_int(d, 12 * (id1 - 1)) == key do ...` reads
+the array at index -12 when `id1` is 0: the compiled code works out both
+sides and then combines them. Reproduced in a 12-line app. Workaround:
+nested `if`s where the right side must not run (`Strata.Fluid.probe`). Being
+fixed in the March compiler on a branch of its own.
+
+## S27: two types with the same constructor name in different modules break codegen
+
+A private `type Box = Box(Int, Int, Int, Int, Int, Int)` in `Strata.Fluid`,
+beside `Strata.Blocks.Box` (six Floats), made clang refuse
+`Strata.Query.lim_cells`: "floating point constant invalid for type", a
+Float stored into an `i64` slot. Workaround: a distinct name
+(`Strata.Fluid.ChunkSpan`).
+
+## S28: `RRB.get` walks a list
+
+`RRB.get` on a vector of 75 chunks spent most of its time in
+`Array.lst_nth`: the vector's leaves are lists, so a read is linear in the
+leaf. Workaround: `Strata.Fluid.ChunkTree`, a balanced tree over the
+chunks' numbers.
+
+## S29: `on` and `none` cannot be parameter names
+
+Each is a bare "parse error" at the function. Workaround: other names.
+
+## S30: a March function cannot fill an array the caller passed in
+
+Native arrays are copy-on-write values: `NativeArray.set_f32(out, i, v)`
+on an array the caller still holds writes a fresh copy, so a March
+`fill(samples, out) : Int` returned 32768 and left the caller's `out` all
+zeros (met in `Strata.Lattice`). Only a C write through the FFI lands in the
+caller's array, which is how `Strata.Noise.field2` and `field3` work.
+Workaround: return the array, or, where an out-parameter API is wanted,
+write the loop in C (`sl_fill` in `native/strata_noise.c`).
+
+## S31: a `Check.all` property that returns false passes under `forge test`
 
 `Check.all(Gen.int(0, 10), fn n -> false)` passes, in the library's tests
 and in an app's (forge 0.5.0, met in entcheck's snapshot property).

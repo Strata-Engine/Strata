@@ -17,6 +17,7 @@ OUT="${TMPDIR:-/tmp}/strata-golden.$$"; mkdir -p "$OUT" test/golden native/tests
 trap 'rm -rf "$OUT"' EXIT
 
 cc -O1 -Wall -Wextra -o native/tests/bin/ppm_diff native/tests/ppm_diff.c || exit 1
+cc -O1 -Wall -Wextra -o native/tests/bin/ppm_mean native/tests/ppm_mean.c || exit 1
 DIFF=native/tests/bin/ppm_diff
 
 # the comparison tool itself: identical passes, 1% changed fails, sizes must match
@@ -69,11 +70,11 @@ full-lantern:STRATA_SCENE=17 STRATA_LIGHT=4 STRATA_SUN=-5
 full-overview:STRATA_SCENE=1 STRATA_LIGHT=4 STRATA_SUN=35
 lake-breached:STRATA_SCENE=18 STRATA_ISLAND=1 STRATA_LIGHT=4 STRATA_BREACH=30 STRATA_FRAMES=63 DRAWS=6
 lake-draining:STRATA_SCENE=18 STRATA_ISLAND=1 STRATA_LIGHT=4 STRATA_BREACH=30 STRATA_FRAMES=363 DRAWS=6
-lake-later:STRATA_SCENE=18 STRATA_ISLAND=1 STRATA_LIGHT=4 STRATA_BREACH=30 STRATA_FRAMES=1203 DRAWS=6
-valley-later:STRATA_SCENE=19 STRATA_ISLAND=1 STRATA_LIGHT=4 STRATA_BREACH=30 STRATA_FRAMES=1203 DRAWS=6
+lake-later:STRATA_SCENE=18 STRATA_ISLAND=1 STRATA_LIGHT=4 STRATA_BREACH=30 STRATA_FRAMES=1203
+valley-later:STRATA_SCENE=19 STRATA_ISLAND=1 STRATA_LIGHT=4 STRATA_BREACH=30 STRATA_FRAMES=1203
 water-levels:STRATA_SCENE=20 STRATA_LIGHT=4 STRATA_FLUID=0
-splash-early:STRATA_SCENE=21 STRATA_LIGHT=4 STRATA_SPLASH=30 STRATA_FRAMES=57 DRAWS=6
-splash-late:STRATA_SCENE=21 STRATA_LIGHT=4 STRATA_SPLASH=30 STRATA_FRAMES=69 DRAWS=6
+splash-early:STRATA_SCENE=21 STRATA_LIGHT=4 STRATA_SPLASH=30 STRATA_FRAMES=57 STRATA_FLUID_HZ=10 DRAWS=6
+splash-late:STRATA_SCENE=21 STRATA_LIGHT=4 STRATA_SPLASH=30 STRATA_FRAMES=69 STRATA_FLUID_HZ=10 DRAWS=6
 island-mouth:STRATA_SCENE=22 STRATA_ISLAND=1 STRATA_LIGHT=4
 island-lake:STRATA_SCENE=23 STRATA_ISLAND=1 STRATA_LIGHT=4
 crate-drop-air:STRATA_SCENE=25 STRATA_CRATE=10 STRATA_FRAMES=43
@@ -83,7 +84,7 @@ fine-overview:STRATA_SCENE=27 STRATA_SCALE=0.1 STRATA_FRAMES=63
 tilted-slab-lit:STRATA_SCENE=26 STRATA_LIGHT=4 STRATA_SUN=12 STRATA_FRAMES=123
 body-by-lake:STRATA_SCENE=28 STRATA_LIGHT=3 STRATA_SUN=12 STRATA_FRAMES=90
 water-reflects:STRATA_SCENE=126 STRATA_LIGHT=4 STRATA_FLUID=0 STRATA_SUN=30
-splash-shaded:STRATA_SCENE=127 STRATA_LIGHT=4 STRATA_SPLASH=30 STRATA_FRAMES=57 DRAWS=6
+splash-shaded:STRATA_SCENE=127 STRATA_LIGHT=4 STRATA_SPLASH=30 STRATA_FRAMES=57 STRATA_FLUID_HZ=10 DRAWS=6
 lake-low-sun:STRATA_SCENE=18 STRATA_LIGHT=4 STRATA_BREACH=30 STRATA_FRAMES=1203 STRATA_SUN=25 DRAWS=6
 under-sea:STRATA_SCENE=8 STRATA_LIGHT=4
 under-sea-up:STRATA_SCENE=124 STRATA_LIGHT=4
@@ -103,13 +104,25 @@ figure-walk-lit-4s:STRATA_SCENE=32 STRATA_LIGHT=4 STRATA_FRAMES=243 STRATA_FIG_S
 figure-shadow:STRATA_SCENE=33 STRATA_LIGHT=4 STRATA_SUN=18 DRAWS=35
 figure-shadow-walk-2s:STRATA_SCENE=33 STRATA_LIGHT=4 STRATA_SUN=18 STRATA_FRAMES=123 DRAWS=35
 figure-shadow-walk-4s:STRATA_SCENE=33 STRATA_LIGHT=4 STRATA_SUN=18 STRATA_FRAMES=243 DRAWS=35
+traced-shadow:STRATA_SCENE=34 STRATA_LIGHT=4 STRATA_SUN=18 DRAWS=35
+traced-shadow-walk-2s:STRATA_SCENE=34 STRATA_LIGHT=4 STRATA_SUN=18 STRATA_FRAMES=123 DRAWS=35
+traced-shadow-walk-4s:STRATA_SCENE=34 STRATA_LIGHT=4 STRATA_SUN=18 STRATA_FRAMES=243 DRAWS=35
+figure-reflection:STRATA_SCENE=35 STRATA_LIGHT=3 STRATA_SUN=12 STRATA_FRAMES=90 DRAWS=20
+glowing-figure:STRATA_SCENE=36 STRATA_LIGHT=4 STRATA_SUN=2 STRATA_FRAMES=123 DRAWS=21
+glowing-figure-4s:STRATA_SCENE=36 STRATA_LIGHT=4 STRATA_SUN=2 STRATA_FRAMES=243 DRAWS=21
+island-cliff:STRATA_SCENE=24 STRATA_ISLAND=1 STRATA_LIGHT=4
+island-cave:STRATA_SCENE=29 STRATA_ISLAND=1 STRATA_LIGHT=4
+forest-border:STRATA_SCENE=128 STRATA_ISLAND=1 STRATA_LIGHT=4
+ruin-slope:STRATA_SCENE=129 STRATA_ISLAND=1 STRATA_LIGHT=4
 '
 # indirect draw calls a frame must issue, whatever the scene holds; a scene
 # with a kind of geometry nowhere in it says DRAWS=n (a figure scene adds one
 # draw per figure piece shown: the humanoid's 15 parts are one piece each, and
 # as many again for the plain figures' shadow map in light modes 2 to 8; scenes
 # 31 and 32 were stored before figures cast shadows and keep them off with
-# STRATA_FIG_SHADOWS=0, scene 33 shows them). STRICT=1 holds a scene
+# STRATA_FIG_SHADOWS=0, scene 33 shows them; a traced figure is left out of
+# the map: scene 34 maps its one plain runner, 35 and 36 map none, 36 adds the
+# torch's one piece; 36 walks its torch-bearer in, shot at 2 s and 4 s). STRICT=1 holds a scene
 # to a difference of 4 in 0.05% of pixels: small text is few pixels. Line 9's note stands:
 # a new scene's first picture is left as test/golden/name.actual.ppm to be
 # looked at and stored by hand (gzip -9 -c it to test/golden/name.ppm.gz)
@@ -144,6 +157,16 @@ for line in $(echo "$SCENES" | tr ' ' ','); do
   if res=$($DIFF "$OUT/want.ppm" "$shot" $strict 2>&1); then echo "ok   $name: $res"
   else echo "FAIL $name: $res"; cp "$shot" "test/golden/$name.actual.ppm"; FAILED=1; fi
 done
+# Glow through a figure's grid: at 2 s in glowing-figure, sky rays from the
+# tunnel's right wall reach the torch's flame across the empty voxels round its
+# handle (a 4 x 15 x 4 grid, the handle 2 x 10 x 2), so the wall beside it is
+# lit. Measured 26.6 with the hit distance right; 17.6 when a figure hit's
+# distance was scaled wrong (Task 8 review C1), which the image comparison's
+# default tolerance lets through. The floor is between.
+if [ $UPDATE -eq 0 ] && [ -s "$OUT/glowing-figure.ppm" ]; then
+  if res=$(native/tests/bin/ppm_mean "$OUT/glowing-figure.ppm" 775 380 810 470 22 2>&1); then echo "ok   torch glow on the wall: $res"
+  else echo "FAIL torch glow on the wall (glowing-figure): $res"; FAILED=1; fi
+fi
 # Stillness: with nothing moving, the lit picture must have stopped changing.
 # Frames 118 and 119 of the overview under shadows (the forest camera stands in
 # dappled leaves on this land and never settles to 0.05%), from two runs of the

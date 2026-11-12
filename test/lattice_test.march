@@ -1,0 +1,79 @@
+-- The density lattice: 9 x 5 x 9 samples a chunk, one every (4, 8, 4)
+-- voxels, filled trilinearly to the chunk's 32768 voxels.
+mod Strata.Test.Lattice do
+
+  needs IO.Clock
+  needs IO.Process
+  needs IO.Spawn
+
+  import Test
+  alias Strata.Lattice as Lt
+
+  -- 405 samples of v
+  pfn flat(v : Float) : NativeF32Arr do NativeArray.make_f32(405, v) end
+
+  -- samples of the ramp 0.5 x - 3 (x in voxels), x = 4 i
+  pfn ramp_go(a : NativeF32Arr, k : Int) : NativeF32Arr do
+    if k >= 405 do a else ramp_go(NativeArray.set_f32(a, k, 0.5 *. int_to_float(4 * (k % 9)) -. 3.0), k + 1) end
+  end
+
+  -- samples of y - z / 4, y = 8 j and z = 4 k
+  pfn yz_go(a : NativeF32Arr, k : Int) : NativeF32Arr do
+    if k >= 405 do a else yz_go(NativeArray.set_f32(a, k, int_to_float(8 * ((k / 9) % 5)) -. 0.25 *. int_to_float(4 * (k / 45))), k + 1) end
+  end
+
+  -- every voxel within 0.0001 of f(x, y, z)
+  pfn all_near(out : NativeF32Arr, f : Int -> Int -> Int -> Float, i : Int) : Bool do
+    if i >= 32768 do true
+    else
+      let x = i % 32
+      let z = (i / 32) % 32
+      let y = i / 1024
+      if Math.abs(NativeArray.get_f32(out, Strata.Coord.index(x, y, z)) -. f(x, y, z)) > 0.0001 do false
+      else all_near(out, f, i + 1) end
+    end
+  end
+
+  pfn fill_n(s : NativeF32Arr, out : NativeF32Arr, left : Int, acc : Int) : Int do
+    if left <= 0 do acc else fill_n(s, out, left - 1, acc + Lt.fill(s, out)) end
+  end
+
+  describe "Lattice" do
+    test "samples all 1.0 fill to all 1.0" do
+      let out = NativeArray.make_f32(32768, 0.0)
+      Test.assert_eq_int(Lt.fill(flat(1.0), out), 32768, "every voxel written")
+      Test.assert_true(all_near(out, fn (x, y, z) -> 1.0, 0), "all 1.0")
+    end
+    test "a linear ramp in x fills to the exact ramp at every voxel" do
+      let out = NativeArray.make_f32(32768, 0.0)
+      Test.assert_eq_int(Lt.fill(ramp_go(flat(0.0), 0), out), 32768, "every voxel written")
+      Test.assert_true(all_near(out, fn (x, y, z) -> 0.5 *. int_to_float(x) -. 3.0, 0), "0.5 x - 3 within 0.0001")
+    end
+    test "a ramp in y and z is exact too" do
+      let s2 = yz_go(flat(0.0), 0)
+      let out = NativeArray.make_f32(32768, 0.0)
+      Test.assert_eq_int(Lt.fill(s2, out), 32768, "every voxel written")
+      Test.assert_true(all_near(out, fn (x, y, z) -> int_to_float(y) -. 0.25 *. int_to_float(z), 0), "y - z / 4")
+    end
+    test "the bounds of a ramp are its ends" do
+      match Lt.bounds(ramp_go(flat(0.0), 0)) do
+        (lo, hi) ->
+          Test.assert_true(Math.abs(lo -. (0.0 -. 3.0)) < 0.0001, "min -3")
+          Test.assert_true(Math.abs(hi -. 13.0) < 0.0001, "max 13")
+      end
+    end
+    -- The plan asks for this cost to be recorded (target 60 us a call, in
+    -- release); it is printed, not asserted, because the unit suite runs
+    -- under arbitrary load (127 us measured at a load average of 72).
+    test "fill fills the chunk on every call, its cost printed" do
+      let s = ramp_go(flat(0.0), 0)
+      let out = NativeArray.make_f32(32768, 0.0)
+      let t0 = unix_time_ms()
+      let n = fill_n(s, out, 1000, 0)
+      let ms = unix_time_ms() - t0
+      -- 1000 calls: the milliseconds are the microseconds a call
+      println("lattice fill: " ++ int_to_string(ms) ++ " us (target 60 in release)")
+      Test.assert_eq_int(n, 32768000, "every call filled the chunk")
+    end
+  end
+end

@@ -27,7 +27,7 @@
 /* Rewritten by build_shaders.sh whenever the shaders change: forge decides
  * whether to recompile this file from its text alone, not from the headers
  * it includes (GAPS S14). */
-#define STRATA_SHADERS_STAMP "09040d4b9862cd4d"
+#define STRATA_SHADERS_STAMP "3e1d04e0945e2bd9"
 #include "strata_shaders.h"
 #include "strata_spray.h"
 #include "strata_alloc.h"
@@ -48,7 +48,13 @@ static inline void   *narr_data(void *a) { return (char *)a + NARR_HDR; }
 #define SV_GLYPH_STAGE ST_UPLOAD_BYTES   /* bytes of new glyph pixels a frame carries to the atlas: all strata_text makes in a frame */
 #define SV_GLYPH_RECTS ST_UPLOAD_RECTS
 #define SV_LIGHT_PER_FRAME 128 /* chunks whose light bytes one frame may copy into the volume */
-#define SV_LIGHT_WRITE_BYTES (32768 + 64 + 8)   /* per write: the voxels, the coarse cells, the owner texel */
+#define SV_LIGHT_WRITE_BYTES (32768 + 64 + 16)  /* per write: the voxels, the coarse cells, the owner texel */
+/* The light volume keeps a chunk's voxels only when they are not all one
+ * class: in a page of a pool, 16 x 16 pages a layer. A chunk all of one class
+ * (air, stone, sea) is that class in its owner texel. Measured, 70 to 77% of
+ * the chunks a stream holds are all one class; the pool holds half of them. */
+#define SV_PAGES_X 16
+#define SV_PAGES_Y 16
 #define SV_MAX_KEYS 512
 
 #define SV_RANGES 6            /* 0 opaque, 1 cutout, 2 translucent, 3 cross, 4 loose, 5 spare */
@@ -100,6 +106,9 @@ typedef struct {
     VkBuffer table; VkDeviceMemory table_mem; ChunkEntry *table_map;
     VkBuffer btable, bcells, blist, bmovers; VkDeviceMemory btable_mem, bcells_mem, blist_mem, bmovers_mem;
     BodyRow *btable_map; uint32_t *bcells_map, *blist_map; float *bmovers_map;
+    /* lamps near each cell of the light volume, for the light pass to aim at: per cell (first, count), then the list */
+    VkBuffer lcells, llist; VkDeviceMemory lcells_mem, llist_mem; uint32_t *lcells_map; int32_t *llist_map;
+    uint32_t lamp_version;         /* the lamp lists this frame's copy holds */
     uint32_t *pending; uint32_t npending; unsigned char *is_pending;   /* slots changed since this Frame's table was last brought up to date */
     VkBuffer lstage; VkDeviceMemory lstage_mem; unsigned char *lstage_map;   /* this frame's light-volume writes, before they are copied in */
     VkBuffer stats; VkDeviceMemory stats_mem; uint32_t *stats_map;   /* written by the cull pass: commands per range [6], chunks, quads */
@@ -127,6 +136,10 @@ static SaAlloc g_bbytes;       /* ranges of the body class buffer, in 32-bit wor
 #define SV_BODY_LIST    262144           /* list entries a frame */
 #define SV_MOVERS       16               /* boxes a frame where moving bodies unsettle light history */
 #define SV_MAX_CELLS    65536            /* light volume cells (chunks) the body lists can cover */
+#define SV_CHUNK_LAMPS  64               /* glowing voxels a chunk keeps for the light pass to aim at */
+#define SV_LAMP_LIST    65536            /* entries in all cells' lists of nearby lamps, together */
+#define SV_LAMP_REACH   16               /* voxels a lamp's light reaches (the light pass fades it out from 12) */
+#define SV_CELL_LAMPS   16               /* lamps a cell lists at most */
 
 #define SV_LOOSE_QUADS 262144  /* 16 MB of 64-byte loose quads */
 #define SV_MAX_MODELS 4096
@@ -152,17 +165,30 @@ static struct {
      * flight: a frame reads the other's and writes its own. hist: rgb sky
      * light, a sun visibility. hmeta: r samples, g view depth, b face. */
     Target hist[SV_FRAMES], hmeta[SV_FRAMES];
+    /* What the translucent pass remembers between frames, one pair per frame
+     * in flight, read and written by the water shader as storage images:
+     * whist rgb the mirror colour, a the sun's visibility; wdist the view
+     * depth of the surface it belongs to (0: nothing). A water pixel traces
+     * one frame in four and reuses the rest, as the light pass does. */
+    Target whist[SV_FRAMES], wdist[SV_FRAMES];
+    int water_mem;                 /* the device lets a fragment shader write images: water keeps that memory */
+    int water_fresh;               /* the water memory images are new and must be cleared before use */
     int hist_reset;                /* frames left in which that memory must not be read (fresh images) */
     VkSampler nearest;             /* for reading the frame's own images, texel for texel */
     int sky_rays, reflections;     /* light quality: sky rays a pixel a sample, 0..8; mirror rays on or off */
     int light_mode;                /* 0: the pre-ray-tracing shading, through the deferred passes */
     /* The light volume: a light class per voxel for every chunk held, the
      * coarse copy (how high each 8-voxel cell's contents reach), and which chunk each cell holds. */
-    Target vol, coarse, owner;
+    Target vol, coarse, owner;     /* vol: the pool of pages */
+    int32_t *cell_page;            /* per cell: the page its chunk's voxels are in, or -1 */
+    int32_t *free_pages; int nfree_pages, npages;   /* pages not in use, as a stack; how many the pool has */
+    uint64_t pages_refused;        /* chunks whose voxels found no page: their cells hold nothing */
     int vn, vnv;                   /* its size in chunks: vn across (x and z), vnv up */
     VkBuffer ltable; VkDeviceMemory ltable_mem; int32_t *ltable_map;
     float *tex_mean; uint32_t tex_mean_n;   /* each texture layer's mean colour, linear, three floats a layer */
-    struct LightCell { int32_t chunk[3]; int valid; int uniform; uint32_t hash, solid; } *cells;   /* per cell, as last queued: its chunk, and its class if it is one class throughout, else -1 */
+    struct LightCell { int32_t chunk[3]; int valid; int uniform; uint32_t hash, solid; int nlamps; int32_t *lamps; } *cells;   /* lamps: nlamps glowing voxels, 4 ints each (x, y, z voxels, class) */
+    uint32_t lamp_version;        /* bumped whenever any cell's lamps change */
+    int vn_old_cells;             /* how many cells g.cells has */   /* per cell, as last queued: its chunk, and its class if it is one class throughout, else -1 */
     struct LightWrite { int cell[3]; int32_t chunk[3]; int valid; int uniform; int edit; unsigned char *bytes; } *lq;   /* writes waiting to be copied in, oldest first */
     uint32_t nlq, lq_cap;
     int32_t edit_lo[3], edit_hi[3];   /* the chunks an edit changed, while light_edit counts down */
@@ -302,7 +328,7 @@ static void destroy_swapchain(void) {
     if (g.off_mem) vkFreeMemory(g.dev, g.off_mem, NULL);
     g.off_fb = VK_NULL_HANDLE; g.off_view = VK_NULL_HANDLE; g.off = VK_NULL_HANDLE; g.off_mem = VK_NULL_HANDLE;
     if (g.fb_g) vkDestroyFramebuffer(g.dev, g.fb_g, NULL);
-    for (int f = 0; f < SV_FRAMES; f++) { if (g.fb_l[f]) vkDestroyFramebuffer(g.dev, g.fb_l[f], NULL); g.fb_l[f] = VK_NULL_HANDLE; drop_target(&g.hist[f]); drop_target(&g.hmeta[f]); }
+    for (int f = 0; f < SV_FRAMES; f++) { if (g.fb_l[f]) vkDestroyFramebuffer(g.dev, g.fb_l[f], NULL); g.fb_l[f] = VK_NULL_HANDLE; drop_target(&g.hist[f]); drop_target(&g.hmeta[f]); drop_target(&g.whist[f]); drop_target(&g.wdist[f]); }
     g.fb_g = VK_NULL_HANDLE;
     drop_target(&g.gb_albedo); drop_target(&g.gb_nm); drop_target(&g.lit);
     if (g.depth_view) vkDestroyImageView(g.dev, g.depth_view, NULL);
@@ -389,7 +415,11 @@ static int make_swapchain(void) {
     for (int f = 0; f < SV_FRAMES; f++) {
         if (!make_image(FMT_LIT, tu, VK_IMAGE_ASPECT_COLOR_BIT, &g.hist[f].img, &g.hist[f].mem, &g.hist[f].view)) return 0;
         if (!make_image(FMT_LIT, tu, VK_IMAGE_ASPECT_COLOR_BIT, &g.hmeta[f].img, &g.hmeta[f].mem, &g.hmeta[f].view)) return 0;
+        VkImageUsageFlags su = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        if (!make_image(FMT_LIT, su, VK_IMAGE_ASPECT_COLOR_BIT, &g.whist[f].img, &g.whist[f].mem, &g.whist[f].view)) return 0;
+        if (!make_image(VK_FORMAT_R32_SFLOAT, su, VK_IMAGE_ASPECT_COLOR_BIT, &g.wdist[f].img, &g.wdist[f].mem, &g.wdist[f].view)) return 0;
     }
+    g.water_fresh = 1;
     g.hist_reset = SV_FRAMES;
     if (!make_image(g.format, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, VK_IMAGE_ASPECT_COLOR_BIT, &g.off, &g.off_mem, &g.off_view)) return 0;
     return 1;
@@ -420,6 +450,15 @@ static void bind_targets(void) {
             hw[b] = (VkWriteDescriptorSet){ .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = g.frames[f].dset, .dstBinding = 15 + b, .descriptorCount = 1,
                 .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .pImageInfo = &hi[b] };
         vkUpdateDescriptorSets(g.dev, 2, hw, 0, NULL);
+        /* the water's memory: the other frame's to read, this frame's to write */
+        VkDescriptorImageInfo wi[4] = {
+            { VK_NULL_HANDLE, g.whist[o].view, VK_IMAGE_LAYOUT_GENERAL }, { VK_NULL_HANDLE, g.wdist[o].view, VK_IMAGE_LAYOUT_GENERAL },
+            { VK_NULL_HANDLE, g.whist[f].view, VK_IMAGE_LAYOUT_GENERAL }, { VK_NULL_HANDLE, g.wdist[f].view, VK_IMAGE_LAYOUT_GENERAL } };
+        VkWriteDescriptorSet ww[4];
+        for (uint32_t b = 0; b < 4; b++)
+            ww[b] = (VkWriteDescriptorSet){ .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = g.frames[f].dset, .dstBinding = 28 + b, .descriptorCount = 1,
+                .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .pImageInfo = &wi[b] };
+        vkUpdateDescriptorSets(g.dev, 4, ww, 0, NULL);
     }
 }
 
@@ -933,12 +972,23 @@ static int light_box(int64_t radius_h, int64_t radius_v) {
     g.nlq = 0;
     g.vn = (int)(2 * radius_h + 3); g.vnv = (int)(2 * radius_v + 3);
     uint32_t n = (uint32_t)g.vn, nv = (uint32_t)g.vnv;
-    if (!make_volume(&g.vol, VK_FORMAT_R8_UINT, n * 32, nv * 32, n * 32)) return 0;
+    uint32_t ncells = n * nv * n;
+    uint32_t layers = (ncells / 2 + SV_PAGES_X * SV_PAGES_Y - 1) / (SV_PAGES_X * SV_PAGES_Y);
+    if (layers < 1) layers = 1;
+    g.npages = (int)(layers * SV_PAGES_X * SV_PAGES_Y);
+    if (!make_volume(&g.vol, VK_FORMAT_R8_UINT, SV_PAGES_X * 32, SV_PAGES_Y * 32, layers * 32)) return 0;
     if (!make_volume(&g.coarse, VK_FORMAT_R8_UINT, n * 4, nv * 4, n * 4)) return 0;
-    if (!make_volume(&g.owner, VK_FORMAT_R16G16B16A16_SINT, n, nv, n)) return 0;
-    free(g.cells);
-    g.cells = calloc((size_t)n * nv * n, sizeof *g.cells);
-    if (!g.cells) { g.vn = 0; g.vnv = 0; return 0; }
+    if (!make_volume(&g.owner, VK_FORMAT_R32G32B32A32_SINT, n, nv, n)) return 0;
+    if (g.cells) for (int i = 0; i < g.vn_old_cells; i++) free(g.cells[i].lamps);
+    free(g.cells); free(g.cell_page); free(g.free_pages);
+    g.cells = calloc(ncells, sizeof *g.cells);
+    g.vn_old_cells = (int)ncells; g.lamp_version++;
+    g.cell_page = malloc(ncells * sizeof *g.cell_page);
+    g.free_pages = malloc((size_t)g.npages * sizeof *g.free_pages);
+    if (!g.cells || !g.cell_page || !g.free_pages) { g.vn = 0; g.vnv = 0; return 0; }
+    for (uint32_t i = 0; i < ncells; i++) g.cell_page[i] = -1;
+    for (int i = 0; i < g.npages; i++) g.free_pages[i] = g.npages - 1 - i;
+    g.nfree_pages = g.npages; g.pages_refused = 0;
     /* everything starts empty and owned by nobody */
     VkCommandBufferAllocateInfo cai = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, .commandPool = g.cpool, .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1 };
     VkCommandBuffer cb; VKOK(vkAllocateCommandBuffers(g.dev, &cai, &cb), "light volume command buffer");
@@ -1019,6 +1069,31 @@ static void light_queue(const int32_t *chunk, int valid, int uniform, unsigned c
         solid = (row[0] == 1 || row[0] == 2 || row[0] == 4 || row[3] != 0) ? (uint32_t)uniform * 16777619u : 2166136261u;
     }
     if (valid && same_owner && bytes && c->uniform < 0 && c->hash == hash) { free(bytes); return; }
+    /* the chunk's glowing voxels, at most SV_CHUNK_LAMPS of them, spread over all it has */
+    {
+        int32_t found[SV_CHUNK_LAMPS * 4]; int nf = 0, seen = 0;
+        if (valid && g.ltable_map) {
+            if (bytes) {
+                for (int i = 0; i < 32768; i++) {
+                    unsigned char k = bytes[i];
+                    if (!k || g.ltable_map[k * 8 + 3] == 0) continue;
+                    /* past the cap, a later lamp replaces one at a stride, so the kept ones spread across the chunk */
+                    int slot = nf < SV_CHUNK_LAMPS ? nf++ : (seen % SV_CHUNK_LAMPS);
+                    seen++;
+                    found[slot * 4] = chunk[0] * 32 + (i & 31); found[slot * 4 + 1] = chunk[1] * 32 + (i >> 10); found[slot * 4 + 2] = chunk[2] * 32 + ((i >> 5) & 31); found[slot * 4 + 3] = k;
+                }
+            } else if (uniform > 0 && g.ltable_map[uniform * 8 + 3] != 0) {
+                for (int i = 0; i < SV_CHUNK_LAMPS; i++) { int x = (i & 3) * 8 + 4, y = ((i >> 2) & 3) * 8 + 4, z = (i >> 4) * 8 + 4;
+                    found[i * 4] = chunk[0] * 32 + x; found[i * 4 + 1] = chunk[1] * 32 + y; found[i * 4 + 2] = chunk[2] * 32 + z; found[i * 4 + 3] = uniform; }
+                nf = SV_CHUNK_LAMPS;
+            }
+        }
+        if (nf != c->nlamps || (nf && memcmp(found, c->lamps, (size_t)nf * 16) != 0)) {
+            free(c->lamps); c->lamps = NULL; c->nlamps = 0;
+            if (nf) { c->lamps = malloc((size_t)nf * 16); if (c->lamps) { memcpy(c->lamps, found, (size_t)nf * 16); c->nlamps = nf; } }
+            g.lamp_version++;
+        }
+    }
     /* new voxels for a chunk the volume already held: an edit, whose lighting must be re-estimated */
     int edit = valid && same_owner && c->solid != solid;
     if (g.nlq == g.lq_cap) {
@@ -1035,18 +1110,33 @@ static void light_queue(const int32_t *chunk, int valid, int uniform, unsigned c
     c->valid = valid; c->uniform = w->uniform; c->hash = hash; c->solid = solid;
 }
 
+/* Is light class [c] see-through (kind 3: water, glass)? Rays that pass
+ * through those need not look at them. */
+static int see_through(unsigned char c) { return g.ltable_map && g.ltable_map[c * 8] == 3; }
+
 /* Record, in this frame's commands, the copies that bring the volume up to
  * date: as many queued writes as one frame may carry, oldest first. */
 static void light_flush(Frame *F) {
     if (g.nlq == 0) return;
     uint32_t n = g.nlq < SV_LIGHT_PER_FRAME ? g.nlq : SV_LIGHT_PER_FRAME;
     static VkBufferImageCopy rv[SV_LIGHT_PER_FRAME], rc[SV_LIGHT_PER_FRAME], ro[SV_LIGHT_PER_FRAME];
+    uint32_t nv_copies = 0;
     for (uint32_t i = 0; i < n; i++) {
         struct LightWrite *w = &g.lq[i];
         unsigned char *dst = F->lstage_map + (size_t)i * SV_LIGHT_WRITE_BYTES;
         unsigned char *coarse = dst + 32768;
-        int16_t *own = (int16_t *)(dst + 32768 + 64);
+        int32_t *own = (int32_t *)(dst + 32768 + 64);
+        int ci = w->cell[0] + g.vn * (w->cell[1] + g.vnv * w->cell[2]);
+        /* a chunk with voxels of more than one class keeps its page, or takes one; any other lets its page go */
+        int page = -1;
+        if (w->bytes && w->valid) {
+            page = g.cell_page[ci];
+            if (page < 0 && g.nfree_pages > 0) page = g.free_pages[--g.nfree_pages];
+            if (page < 0) g.pages_refused++;
+        } else if (g.cell_page[ci] >= 0) g.free_pages[g.nfree_pages++] = g.cell_page[ci];
+        g.cell_page[ci] = page;
         int any = 0;                 /* how high the chunk's contents reach, 0..32 */
+        int hard = 0;                /* ... leaving out see-through classes (kind 3: water, glass), 0..32 */
         if (w->bytes) {
             /* the chunk's flat index is x + 32 * (z + 32 * y); the volume wants x fastest, then y, then z */
             for (int z = 0; z < 32; z++) for (int y = 0; y < 32; y++)
@@ -1054,22 +1144,39 @@ static void light_flush(Frame *F) {
             memset(coarse, 0, 64);
             for (int z = 0; z < 32; z++) for (int y = 0; y < 32; y++) {
                 const unsigned char *row = dst + 32 * (y + 32 * z);
-                /* a coarse cell holds how high its contents reach, 1..8 (0: nothing): a ray above that and rising can cross the cell whole */
+                /* A coarse cell holds two heights, 1..8 (0: nothing): in its low four
+                 * bits how high its contents reach, in its high four how high its
+                 * contents other than see-through classes reach. A ray above the
+                 * height that matters to it and rising can cross the cell whole; a
+                 * ray that passes through water and glass (sun and sky rays)
+                 * crosses a lake eight voxels at a time. */
                 for (int x = 0; x < 32; x++) if (row[x]) {
                     unsigned char *cc = &coarse[(x >> 3) + 4 * ((y >> 3) + 4 * (z >> 3))];
-                    if (*cc < (y & 7) + 1) *cc = (unsigned char)((y & 7) + 1);
+                    unsigned char h = (unsigned char)((y & 7) + 1);
+                    if ((*cc & 15) < h) *cc = (unsigned char)((*cc & 0xF0) | h);
                     if (any < y + 1) any = y + 1;
+                    if (!see_through(row[x])) {
+                        if ((*cc >> 4) < h) *cc = (unsigned char)((*cc & 15) | (h << 4));
+                        if (hard < y + 1) hard = y + 1;
+                    }
                 }
             }
         } else {
-            memset(dst, w->uniform, 32768);
-            memset(coarse, w->uniform ? 8 : 0, 64);
-            any = w->uniform != 0 ? 32 : 0;
+            int clear = w->uniform == 0, glassy = !clear && see_through((unsigned char)w->uniform);
+            memset(coarse, clear ? 0 : (glassy ? 8 : 8 | (8 << 4)), 64);
+            any = clear ? 0 : 32;
+            hard = clear || glassy ? 0 : 32;
         }
-        own[0] = (int16_t)w->chunk[0]; own[1] = (int16_t)w->chunk[1]; own[2] = (int16_t)w->chunk[2]; own[3] = (int16_t)(w->valid ? 1 + any : 0);   /* 0: no chunk here; else 1 + how high its contents reach */
+        /* w: 0, no chunk here; else 1 + how high its contents reach, plus 64
+         * times how high its contents other than see-through ones reach, plus
+         * from bit 12 where its voxels are: 1 + 2 * its page, or 2 * its one class */
+        int where = w->bytes ? (page >= 0 ? 1 + 2 * page : -1) : 2 * (w->uniform > 0 ? w->uniform : 0);
+        own[0] = w->chunk[0]; own[1] = w->chunk[1]; own[2] = w->chunk[2];
+        own[3] = (w->valid && where >= 0) ? (1 + any + 64 * hard) | (where << 12) : 0;
         VkDeviceSize base = (VkDeviceSize)i * SV_LIGHT_WRITE_BYTES;
-        rv[i] = (VkBufferImageCopy){ .bufferOffset = base, .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
-            .imageOffset = { w->cell[0] * 32, w->cell[1] * 32, w->cell[2] * 32 }, .imageExtent = { 32, 32, 32 } };
+        /* only a chunk with a page has voxels to copy */
+        if (page >= 0) rv[nv_copies++] = (VkBufferImageCopy){ .bufferOffset = base, .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+            .imageOffset = { (page % SV_PAGES_X) * 32, ((page / SV_PAGES_X) % SV_PAGES_Y) * 32, (page / (SV_PAGES_X * SV_PAGES_Y)) * 32 }, .imageExtent = { 32, 32, 32 } };
         rc[i] = (VkBufferImageCopy){ .bufferOffset = base + 32768, .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
             .imageOffset = { w->cell[0] * 4, w->cell[1] * 4, w->cell[2] * 4 }, .imageExtent = { 4, 4, 4 } };
         ro[i] = (VkBufferImageCopy){ .bufferOffset = base + 32768 + 64, .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
@@ -1080,9 +1187,11 @@ static void light_flush(Frame *F) {
     g.nlq -= n;
     VkImage imgs[3] = { g.vol.img, g.coarse.img, g.owner.img };
     VkBufferImageCopy *regs[3] = { rv, rc, ro };
+    uint32_t counts[3] = { nv_copies, n, n };
     for (int k = 0; k < 3; k++) {
+        if (counts[k] == 0) continue;
         volume_layout(F->cmd, imgs[k], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-        vkCmdCopyBufferToImage(F->cmd, F->lstage, imgs[k], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, n, regs[k]);
+        vkCmdCopyBufferToImage(F->cmd, F->lstage, imgs[k], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, counts[k], regs[k]);
         volume_layout(F->cmd, imgs[k], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     }
 }
@@ -1119,12 +1228,25 @@ __attribute__((weak)) int an_x_draw_list(double blend, const int32_t **rig_part,
     return 0;
 }
 
+/* The sun the drawing casts shadows by, given to the kernel before each
+ * draw list so it lists figures out of view whose shadows may fall in it
+ * (flag bit 1). Absent strata_anim.c it does nothing. */
+__attribute__((weak)) void an_x_draw_sun(double x, double y, double z) { (void)x; (void)y; (void)z; }
+
 #define SV_FIG_RIGS 256                   /* AN_RIGS */
 #define SV_FIG_PARTS 64                   /* AN_PARTS */
 #define SV_FIG_RP (SV_FIG_RIGS * SV_FIG_PARTS)
 #define SV_FIG_PIECES 16384
 #define SV_FIG_INST 16384                 /* AN_DRAW_MAX: parts in one draw list */
 #define SV_FIG_SEEN 32768                 /* figures remembered between frames, to tell which moved (twice the most a list holds) */
+#define SV_FIG_TRACED 64                  /* AN_TRACED: figures in the rays' list at once; more are drawn plain */
+#define SV_TRACE_ROWS (SV_FIG_TRACED * (1 + SV_FIG_PARTS))   /* body table rows for them: a group row and its parts' */
+#define SV_FIG_SETTLE 8                   /* frames a traced figure's surroundings keep settling after it stops */
+#define SV_FIG_REACH 24.0f                /* metres along the ground a moving traced figure's shadow is followed for history */
+#define SV_FIG_BOXES (2 * SV_FIG_TRACED)  /* history boxes for traced figures: a shadow box and a glow box each */
+#define SV_GLOW 5.0f                      /* must equal GLOW in native/shaders/sky.glsl */
+#define SV_GLOW_FLOOR 0.01f               /* light (linear, of a sun of about 1) below which a figure's glow is not followed for history */
+#define SV_TABLE_ROWS (SV_MAX_BODIES + SV_TRACE_ROWS)
 typedef struct { int32_t rp, next; uint32_t first, count; int32_t o[3]; float lo[3], hi[3]; } FigPiece;   /* lo, hi: what its quads cover, voxels of the piece */
 static struct {
     FigPiece *pieces; int32_t npieces, free_head;
@@ -1135,7 +1257,18 @@ static struct {
     int32_t *count, *base, *touched; int32_t ntouched;         /* per rig part: instances this frame, where they start */
     int32_t *order;                       /* the culled draw list's entries, in order */
     uint8_t *moving;                      /* per draw-list entry: its figure moved */
-    struct FigSeen { int32_t id; float sum; } *seen[2]; int now;   /* figures drawn last frame and this, by id: a checksum of their matrices */
+    struct FigSeen { int32_t id; float sum; int32_t still; } *seen[2]; int now;   /* figures drawn last frame and this, by id: a checksum of their matrices, frames since it moved */
+    uint8_t *quiet;                       /* per draw-list entry: frames since its figure moved (to 255) */
+    uint8_t *placed;                      /* per draw-list entry: placed in the rays' list this frame (left out of the shadow map) */
+    /* traced figures (design section 9): each rig part's shape for the rays, palette indices in the body
+     * class buffer, shared by every figure of the rig; each frame a group row per traced figure and a row
+     * per part with a shape, appended to the body table by bodies_to_frame */
+    struct FigShape { uint32_t first, nwords; int32_t dims[3]; int shaped; } *shape;   /* SV_FIG_RP */
+    BodyRow *trows; int32_t tgroups, tparts;   /* SV_TRACE_ROWS: groups first, then parts (a group's dims.x counts from the first part row) */
+    float (*tmov)[8]; int32_t ntmov;      /* SV_FIG_BOXES: boxes (voxels) round traced figures that moved lately: their shadows (w 1), their glow (w 0) */
+    float *glow;                          /* SV_FIG_RP: how far (metres) a part's glowing voxels light what is round them, past SV_GLOW_FLOOR; < 0 until worked out */
+    int boxes_off;                        /* STRATA_FIG_BOXES=0: traced figures unsettle no history round them (to show what they prevent) */
+    int64_t traced_figs, traced_parts, traced_over;
     struct FigGroup { int32_t rp, base, n; } *groups; int32_t ngroups;
     float blend;
     int64_t parts, draws; double cpu_us, list_us;
@@ -1172,6 +1305,14 @@ static int fig_init(void) {
     fg.seen[0] = calloc(SV_FIG_SEEN, sizeof *fg.seen[0]);
     fg.seen[1] = calloc(SV_FIG_SEEN, sizeof *fg.seen[1]);
     fg.sgroups = calloc(SV_FIG_RP, sizeof *fg.sgroups);
+    fg.quiet = calloc(SV_FIG_INST, 1);
+    fg.placed = calloc(SV_FIG_INST, 1);
+    fg.shape = calloc(SV_FIG_RP, sizeof *fg.shape);
+    fg.trows = calloc(SV_TRACE_ROWS, sizeof *fg.trows);
+    fg.tmov = calloc(SV_FIG_BOXES, sizeof *fg.tmov);
+    fg.glow = malloc(SV_FIG_RP * sizeof *fg.glow);
+    if (!fg.quiet || !fg.placed || !fg.shape || !fg.trows || !fg.tmov || !fg.glow) return 0;
+    for (int i = 0; i < SV_FIG_RP; i++) fg.glow[i] = -1.0f;
     if (!fg.pieces || !fg.head || !fg.anchor || !fg.sphere || !fg.count || !fg.base || !fg.touched || !fg.order || !fg.moving || !fg.groups || !fg.seen[0] || !fg.seen[1] || !fg.sgroups) return 0;
     for (int i = 0; i < SV_FIG_RP; i++) { fg.head[i] = -1; fg.anchor[i][3] = 1.0f; fg.sphere[i][3] = -1.0f; }
     fg.npieces = 0; fg.free_head = -1; fg.blend = 1.0f;
@@ -1180,12 +1321,15 @@ static int fig_init(void) {
     fg.pal_map = map; memset(fg.pal_map, 0, (size_t)SV_FIG_RIGS * 256 * 8);
     const char *fs = getenv("STRATA_FIG_SHADOWS");
     fg.fsm_off = fs && fs[0] == '0';
+    const char *fb = getenv("STRATA_FIG_BOXES");
+    fg.boxes_off = fb && fb[0] == '0';
     return fig_shadow_make();
 }
 static void fig_free(void) {
     if (g.dev) { if (fg.pal) vkDestroyBuffer(g.dev, fg.pal, NULL); if (fg.pal_mem) vkFreeMemory(g.dev, fg.pal_mem, NULL); fig_shadow_free(); }
     free(fg.pieces); free(fg.head); free(fg.anchor); free(fg.sphere); free(fg.count); free(fg.base); free(fg.touched);
     free(fg.order); free(fg.moving); free(fg.groups); free(fg.seen[0]); free(fg.seen[1]); free(fg.sgroups);
+    free(fg.quiet); free(fg.placed); free(fg.shape); free(fg.trows); free(fg.tmov); free(fg.glow);
     memset(&fg, 0, sizeof fg);
 }
 
@@ -1251,6 +1395,7 @@ int64_t sv_rig_part_anchor(int64_t rig, int64_t part, double ax, double ay, doub
     int32_t rp = (int32_t)(rig * SV_FIG_PARTS + part);
     fg.anchor[rp][0] = (float)ax; fg.anchor[rp][1] = (float)ay; fg.anchor[rp][2] = (float)az; fg.anchor[rp][3] = (float)voxel;
     fg.sphere[rp][3] = -1.0f;
+    if (fg.glow) fg.glow[rp] = -1.0f;                 /* its glow's reach depends on the voxel size */
     return 1;
 }
 static uint32_t unorm(double v, double scale) { return v <= 0.0 ? 0u : (v >= 1.0 ? (uint32_t)scale : (uint32_t)(v * scale + 0.5)); }
@@ -1266,7 +1411,49 @@ int64_t sv_rig_palette(int64_t rig, void *floats) {
         e[i * 2] = unorm(c[0], 2047.0) | (unorm(c[1], 2047.0) << 11) | (unorm(c[2], 1023.0) << 22);
         e[i * 2 + 1] = unorm(c[3], 65535.0) | (unorm(c[4], 65535.0) << 16);
     }
+    if (fg.glow) for (int p = 0; p < SV_FIG_PARTS; p++) fg.glow[rig * SV_FIG_PARTS + p] = -1.0f;
     return 1;
+}
+/* Rig [rig]'s part [part] as the rays see it: one palette index a voxel (0
+ * empty), x fastest, then y, then z, [sx] x [sy] x [sz], its low corner the
+ * part grid's (the anchor and voxel size are rig_part_anchor's). Shared by
+ * every traced figure of the rig, as its meshes are; a ray that hits a voxel
+ * takes its colour, roughness and emission from the rig's palette. Replaces
+ * the shape the part had. */
+int64_t sv_rig_shape(int64_t rig, int64_t part, void *bytes, int64_t n, int64_t sx, int64_t sy, int64_t sz) {
+    if (!g.ok || !fg.shape || rig < 0 || rig >= SV_FIG_RIGS || part < 0 || part >= SV_FIG_PARTS || !bytes) return 0;
+    if (sx < 1 || sy < 1 || sz < 1 || sx > 128 || sy > 128 || sz > 128 || n < sx * sy * sz) return 0;
+    struct FigShape *sh = &fg.shape[rig * SV_FIG_PARTS + part];
+    uint32_t words = (uint32_t)((sx * sy * sz + 3) / 4), first = 0;
+    if (!sa_alloc(&g_bbytes, words, &first)) { g.refused++; return 0; }
+    if (sh->shaped) sa_release(&g_bbytes, (SaRange){ sh->first, sh->nwords }, g.frame_no);
+    memset(g.bbytes_map + first, 0, (size_t)words * 4);
+    memcpy(g.bbytes_map + first, bytes, (size_t)(sx * sy * sz));
+    sh->first = first; sh->nwords = words; sh->dims[0] = (int32_t)sx; sh->dims[1] = (int32_t)sy; sh->dims[2] = (int32_t)sz;
+    sh->shaped = 1;
+    fg.glow[rig * SV_FIG_PARTS + part] = -1.0f;
+    return 1;
+}
+/* how far (metres) rig part rp's glowing voxels light their surroundings above
+ * SV_GLOW_FLOOR: n emitting voxels of the brightest emission e seen as a blob
+ * of n^(2/3) voxel faces, lighting a surface r away by about
+ * e x GLOW x area / (pi r^2); 0 when nothing in it glows */
+static float fig_glow(int32_t rp) {
+    if (fg.glow[rp] >= 0.0f) return fg.glow[rp];
+    const struct FigShape *sh = &fg.shape[rp];
+    const uint32_t *pal = fg.pal_map + (size_t)(rp / SV_FIG_PARTS) * 256 * 2;
+    const unsigned char *b = (const unsigned char *)(g.bbytes_map + sh->first);
+    uint32_t nv = (uint32_t)(sh->dims[0] * sh->dims[1] * sh->dims[2]), lit = 0;
+    float emax = 0.0f;
+    for (uint32_t i = 0; i < nv; i++) {
+        if (!b[i]) continue;
+        float e = (float)(pal[b[i] * 2 + 1] >> 16) / 65535.0f;
+        if (e > 0.0f) { lit++; if (e > emax) emax = e; }
+    }
+    float v = fg.anchor[rp][3], area = cbrtf((float)lit * (float)lit) * v * v;
+    /* SV_GLOW is sky.glsl's GLOW: how bright a fully emitting voxel is against a sun of about 1 */
+    fg.glow[rp] = lit ? sqrtf(emax * SV_GLOW * area / (3.14159265f * SV_GLOW_FLOOR)) : 0.0f;
+    return fg.glow[rp];
 }
 /* How far between its last two poses each figure is drawn (0..1), passed to
  * the draw list each frame. 1 until a game sets it: the last pose. */
@@ -1300,11 +1487,18 @@ static uint32_t fig_hash(int32_t id) { uint32_t h = (uint32_t)id * 2654435761u; 
  * part: the draw list at the blend set, each part culled by its sphere
  * against the view, and each figure marked moving when its matrices differ
  * from last frame's (or it was not drawn then). */
-static void fig_shadow_prepare(Frame *F, int n, const int32_t *rp, const float *xf, const int32_t *fl);
+static void fig_shadow_prepare(Frame *F, int n, const int32_t *rp, const float *xf);
+static void fig_trace_prepare(int n, const int32_t *rp, const float *xf, const int32_t *fl);
+/* do the light modes cast rays this frame (2 to 8): else every figure is plain */
+static int fig_rays_on(void) { return g.light_mode >= 2 && g.light_mode <= 8; }
 static void fig_prepare(Frame *F) {
     fg.ngroups = 0; fg.parts = 0; fg.nsgroups = 0; fg.sparts = 0;
+    fg.tgroups = 0; fg.tparts = 0; fg.ntmov = 0; fg.traced_figs = 0; fg.traced_parts = 0; fg.traced_over = 0;
     g.ubo_map[UBO_FSHADOW] = 0.0f;        /* no shadow map this frame unless plain figures fill it below */
     double t0 = glfwGetTime();
+    /* the sun the kernel follows figures' shadows into view by: none when no shadow is cast */
+    const float *sun = g.ubo_map + 16;
+    if (fig_rays_on() && sun[1] > 0.01f) an_x_draw_sun(sun[0], sun[1], sun[2]); else an_x_draw_sun(0.0, 0.0, 0.0);
     const int32_t *rp = NULL, *fl = NULL; const float *xf = NULL;
     int n = an_x_draw_list((double)fg.blend, &rp, &xf, &fl);
     double t1 = glfwGetTime();
@@ -1326,14 +1520,14 @@ static void fig_prepare(Frame *F) {
     for (int i = 0; i < n; ) {
         int32_t id = fl[i] >> 8; int j = i; float sum = 0.0f;
         for (; j < n && (fl[j] >> 8) == id; j++) for (int k = 0; k < 12; k++) sum += xf[(size_t)j * 12 + k] * (float)(k + 1 + (j - i) * 13);
-        int mv = 1;
+        int mv = 1, still = 0;
         for (uint32_t h = fig_hash(id), probes = 0; probes < SV_FIG_SEEN; h = (h + 1) & (SV_FIG_SEEN - 1), probes++) {
             if (was[h].id == 0) break;
-            if (was[h].id == id + 1) { mv = was[h].sum != sum; break; }
+            if (was[h].id == id + 1) { mv = was[h].sum != sum; still = mv ? 0 : (was[h].still < 255 ? was[h].still + 1 : 255); break; }
         }
         for (uint32_t h = fig_hash(id), probes = 0; probes < SV_FIG_SEEN; h = (h + 1) & (SV_FIG_SEEN - 1), probes++)
-            if (is[h].id == 0) { is[h].id = id + 1; is[h].sum = sum; break; }
-        for (int k = i; k < j; k++) fg.moving[k] = (uint8_t)mv;
+            if (is[h].id == 0) { is[h].id = id + 1; is[h].sum = sum; is[h].still = still; break; }
+        for (int k = i; k < j; k++) { fg.moving[k] = (uint8_t)mv; fg.quiet[k] = (uint8_t)still; }
         i = j;
     }
     fg.now ^= 1;
@@ -1342,7 +1536,7 @@ static void fig_prepare(Frame *F) {
     fg.ntouched = 0;
     for (int i = 0; i < n; i++) {
         int32_t r = rp[i];
-        if (r < 0 || r >= SV_FIG_RP || fg.head[r] < 0) continue;
+        if ((fl[i] & 2) || r < 0 || r >= SV_FIG_RP || fg.head[r] < 0) continue;   /* bit 1: listed for its shadow only */
         if (fg.sphere[r][3] < 0.0f) fig_sphere(r);
         const float *x = xf + (size_t)i * 12, *s = fg.sphere[r];
         float c[3];
@@ -1370,8 +1564,105 @@ static void fig_prepare(Frame *F) {
     }
     for (int t = 0; t < fg.ntouched; t++) fg.count[fg.touched[t]] = 0;
     fg.parts = kept;
-    fig_shadow_prepare(F, n, rp, xf, fl);
+    fig_trace_prepare(n, rp, xf, fl);
+    fig_shadow_prepare(F, n, rp, xf);
     fg.cpu_us = (glfwGetTime() - t0) * 1e6;
+}
+/* Traced figures into the rays' list (design section 9): the first
+ * SV_FIG_TRACED figures the draw list flags traced (bit 0), in light modes 2
+ * to 8, each as a group row (a sphere round it all, its rig, where its parts'
+ * rows start and how many) and a row per part with a shape (rig_shape),
+ * placed at the part's drawn pose: the grid's low corner in metres, its
+ * rotation, its size and first word, its voxel size in pos.w (a group row
+ * has -1 there). Those parts are marked placed and left out of the shadow
+ * map; a traced figure past the cap, or a part with no shape, stays plain.
+ * A traced figure that moved in the last SV_FIG_SETTLE frames adds up to two
+ * boxes to the light pass's history: its shadow's footprint (its bounds and
+ * 0.5 m, swept away from the sun until its top has come down 2 m below its
+ * feet, at most SV_FIG_REACH m along the ground), where only the sun term
+ * samples every frame and lean on 2 past samples (w 1); and, if any of its
+ * parts glows, what that glow lights above SV_GLOW_FLOOR (fig_glow), where
+ * every term settles (w 0). bodies_to_frame appends them. */
+static void fig_trace_prepare(int n, const int32_t *rp, const float *xf, const int32_t *fl) {
+    memset(fg.placed, 0, (size_t)n);
+    if (!fig_rays_on()) return;
+    float scale = g.ubo_map[31] > 0.0f ? g.ubo_map[31] : 1.0f;
+    const float *sun = g.ubo_map + 16;
+    float sl = sqrtf(sun[0] * sun[0] + sun[1] * sun[1] + sun[2] * sun[2]);
+    int shadows = sl > 0.0f && sun[1] / sl > 0.01f;
+    for (int i = 0; i < n; ) {
+        int32_t id = fl[i] >> 8; int j = i;
+        while (j < n && (fl[j] >> 8) == id) j++;
+        if (!(fl[i] & 1)) { i = j; continue; }
+        if (fg.tgroups >= SV_FIG_TRACED) { fg.traced_over++; i = j; continue; }
+        BodyRow *gr = &fg.trows[fg.tgroups];
+        int32_t first = fg.tparts, rig = -1;
+        float lo[3] = { 1e30f, 1e30f, 1e30f }, hi[3] = { -1e30f, -1e30f, -1e30f };
+        float glo[3] = { 1e30f, 1e30f, 1e30f }, ghi[3] = { -1e30f, -1e30f, -1e30f };   /* round its glowing parts, out to their glow's reach */
+        for (int k = i; k < j; k++) {
+            int32_t r = rp[k];
+            if (r < 0 || r >= SV_FIG_RP || !fg.shape[r].shaped) continue;
+            const struct FigShape *sh = &fg.shape[r];
+            const float *x = xf + (size_t)k * 12, *an = fg.anchor[r];
+            float v = an[3];
+            BodyRow *pr = &fg.trows[SV_FIG_TRACED + fg.tparts];
+            /* the grid's low corner: the part's origin less its anchor, turned */
+            for (int c = 0; c < 3; c++) pr->pos[c] = x[9 + c] - (x[c] * an[0] + x[3 + c] * an[1] + x[6 + c] * an[2]) * v;
+            pr->pos[3] = v;
+            fig_mat_q(x, pr->rot);
+            pr->dims[0] = sh->dims[0]; pr->dims[1] = sh->dims[1]; pr->dims[2] = sh->dims[2]; pr->dims[3] = (int32_t)sh->first;
+            float h[3] = { sh->dims[0] * v * 0.5f, sh->dims[1] * v * 0.5f, sh->dims[2] * v * 0.5f };
+            float rad = sqrtf(h[0] * h[0] + h[1] * h[1] + h[2] * h[2]);
+            for (int c = 0; c < 3; c++) {
+                float m = pr->pos[c] + x[c] * h[0] + x[3 + c] * h[1] + x[6 + c] * h[2];
+                pr->sphere[c] = m / scale;
+                if (m - rad < lo[c]) lo[c] = m - rad;
+                if (m + rad > hi[c]) hi[c] = m + rad;
+            }
+            pr->sphere[3] = rad / scale + 0.01f;
+            float gr2 = fig_glow(r);
+            if (gr2 > 0.0f) {
+                gr2 = fminf(gr2, 48.0f * scale) + rad;              /* a sky ray reaches 48 voxels */
+                for (int c = 0; c < 3; c++) { float m = pr->sphere[c] * scale; glo[c] = fminf(glo[c], m - gr2); ghi[c] = fmaxf(ghi[c], m + gr2); }
+            }
+            rig = r / SV_FIG_PARTS;
+            fg.placed[k] = 1;
+            fg.tparts++;
+        }
+        if (fg.tparts > first) {
+            float c[3], rad2 = 0.0f;
+            for (int k = 0; k < 3; k++) { c[k] = 0.5f * (lo[k] + hi[k]); float d = 0.5f * (hi[k] - lo[k]); rad2 += d * d; }
+            memset(gr, 0, sizeof *gr);
+            gr->pos[3] = -1.0f;
+            gr->rot[3] = 1.0f;
+            gr->dims[0] = first; gr->dims[1] = fg.tparts - first; gr->dims[2] = rig;
+            for (int k = 0; k < 3; k++) gr->sphere[k] = c[k] / scale;
+            gr->sphere[3] = sqrtf(rad2) / scale + 0.01f;
+            fg.tgroups++;
+            fg.traced_figs++;
+            if (!fg.boxes_off && fg.quiet[i] < SV_FIG_SETTLE) {
+                if (shadows) {   /* its shadow's footprint: its bounds and 0.5 m, swept away from the sun to 2 m under its feet: the sun term alone */
+                    float *m = fg.tmov[fg.ntmov++], sweep[3];
+                    float s[3] = { sun[0] / sl, sun[1] / sl, sun[2] / sl }, flat = sqrtf(s[0] * s[0] + s[2] * s[2]);
+                    float t = (hi[1] - lo[1] + 2.0f) / s[1];
+                    if (flat * t > SV_FIG_REACH) t = SV_FIG_REACH / flat;
+                    for (int k = 0; k < 3; k++) sweep[k] = -s[k] * t;
+                    for (int k = 0; k < 3; k++) {
+                        m[k] = (fminf(lo[k], lo[k] + sweep[k]) - 0.5f) / scale;
+                        m[4 + k] = (fmaxf(hi[k], hi[k] + sweep[k]) + 0.5f) / scale;
+                    }
+                    m[3] = 1.0f; m[7] = 0.0f;
+                }
+                if (glo[0] <= ghi[0]) {   /* what its glow reaches: every term */
+                    float *m = fg.tmov[fg.ntmov++];
+                    for (int k = 0; k < 3; k++) { m[k] = glo[k] / scale; m[4 + k] = ghi[k] / scale; }
+                    m[3] = m[7] = 0.0f;
+                }
+            }
+        }
+        i = j;
+    }
+    fg.traced_parts = fg.tparts;
 }
 /* Draw this frame's figure parts, in the geometry pass: each piece of each
  * rig part shown, instanced over the figures showing it. Answers the draws. */
@@ -1501,9 +1792,11 @@ static void fig_shadow_free(void) {
 }
 /* The map's view for this frame (into the uniforms) and the parts it holds
  * (into the Frame's instance buffer from SV_FIG_INST, grouped by rig part).
- * The draw list's flags say which figures are traced (bit 0): those are left
- * out, their shadows being traced. */
-static void fig_shadow_prepare(Frame *F, int n, const int32_t *rp, const float *xf, const int32_t *fl) {
+ * Parts fig_trace_prepare placed in the rays' list are left out, their
+ * shadows being traced; a figure flagged traced past the cap, with lighting
+ * off, or of a part with no shape is plain and in the map. Figures listed
+ * only for their shadow (bit 1, out of view) are in it too. */
+static void fig_shadow_prepare(Frame *F, int n, const int32_t *rp, const float *xf) {
     const float *sun = g.ubo_map + 16, *eye = g.ubo_map + 28;
     if (fg.fsm_off || !fg.fsm_pipe || g.light_mode < 2 || g.light_mode > 8 || !(sun[1] > 0.01f)) return;
     float sl = sqrtf(sun[0] * sun[0] + sun[1] * sun[1] + sun[2] * sun[2]);
@@ -1525,7 +1818,7 @@ static void fig_shadow_prepare(Frame *F, int n, const int32_t *rp, const float *
     fg.ntouched = 0;
     for (int i = 0; i < n; i++) {
         int32_t q = rp[i];
-        if ((fl[i] & 1) || q < 0 || q >= SV_FIG_RP || fg.head[q] < 0) continue;
+        if (fg.placed[i] || q < 0 || q >= SV_FIG_RP || fg.head[q] < 0) continue;
         if (fg.sphere[q][3] < 0.0f) fig_sphere(q);
         const float *x = xf + (size_t)i * 12, *sp = fg.sphere[q];
         float c[3];
@@ -1651,7 +1944,9 @@ int64_t sv_open(int64_t w, int64_t h, int64_t capture_mouse, int64_t quad_capaci
     /* every indirect command carries a first instance: where its chunk's quads start */
     if (!have.multiDrawIndirect || !have.drawIndirectFirstInstance || !have11.shaderDrawParameters) { die("device lacks multiDrawIndirect, drawIndirectFirstInstance or shaderDrawParameters", 0); return 0; }
     g.aniso = have.samplerAnisotropy ? 1 : 0;
-    VkPhysicalDeviceFeatures feats = { .multiDrawIndirect = VK_TRUE, .drawIndirectFirstInstance = VK_TRUE, .samplerAnisotropy = have.samplerAnisotropy };
+    VkPhysicalDeviceFeatures feats = { .multiDrawIndirect = VK_TRUE, .drawIndirectFirstInstance = VK_TRUE, .samplerAnisotropy = have.samplerAnisotropy,
+        .fragmentStoresAndAtomics = have.fragmentStoresAndAtomics };
+    g.water_mem = have.fragmentStoresAndAtomics ? 1 : 0;
     VkPhysicalDeviceVulkan11Features feats11 = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES, .shaderDrawParameters = VK_TRUE };
     VkDeviceCreateInfo dci = { .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, .pNext = &feats11, .queueCreateInfoCount = 1, .pQueueCreateInfos = &qci,
         .enabledExtensionCount = nd, .ppEnabledExtensionNames = dext, .pEnabledFeatures = &feats };
@@ -1670,7 +1965,7 @@ int64_t sv_open(int64_t w, int64_t h, int64_t capture_mouse, int64_t quad_capaci
     g.swap_ok = 1;
 
     /* one set layout for every pipeline: 0 uniforms, 1 chunk table, 2 indirect commands, 3 cull statistics, 4 command -> slot */
-    VkDescriptorSetLayoutBinding dslb[28] = {
+    VkDescriptorSetLayoutBinding dslb[34] = {
         { .binding = 0, .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, .descriptorCount = 1,
           .stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT },
         { .binding = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1,
@@ -1710,8 +2005,16 @@ int64_t sv_open(int64_t w, int64_t h, int64_t capture_mouse, int64_t quad_capaci
         { .binding = 25, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_VERTEX_BIT },
         { .binding = 26, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_VERTEX_BIT },
         /* 27 the plain figures' sun shadow map, a comparing sampler */
-        { .binding = 27, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT } };
-    VkDescriptorSetLayoutCreateInfo dsli = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 28, .pBindings = dslb };
+        { .binding = 27, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT },
+        /* the water's memory: last frame's mirror colour and depth, this frame's */
+        { .binding = 28, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT },
+        { .binding = 29, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT },
+        { .binding = 30, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT },
+        { .binding = 31, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT },
+        /* lamps near each light-volume cell: per cell (first, count), and the list */
+        { .binding = 32, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT },
+        { .binding = 33, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT } };
+    VkDescriptorSetLayoutCreateInfo dsli = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 34, .pBindings = dslb };
     VKOK(vkCreateDescriptorSetLayout(g.dev, &dsli, NULL, &g.dsl), "descriptor set layout");
     /* where the call's range starts in draw_slot, and per-call flags (bit 0: cutout, bit 1: a figure);
      * a figure piece's draw adds eight words more (fig_record) */
@@ -1775,8 +2078,9 @@ int64_t sv_open(int64_t w, int64_t h, int64_t capture_mouse, int64_t quad_capaci
     if (!make_buffer((VkDeviceSize)SV_MAX_BLOCKS * 32, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &g.blocks, &g.blocks_mem, &map)) return 0;
     g.blocks_map = map;
     memset(g.blocks_map, 0, (size_t)SV_MAX_BLOCKS * 32);
-    VkDescriptorPoolSize dps[3] = { { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, SV_FRAMES }, { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 14 * SV_FRAMES }, { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 13 * SV_FRAMES } };
-    VkDescriptorPoolCreateInfo dpi = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = SV_FRAMES, .poolSizeCount = 3, .pPoolSizes = dps };
+    VkDescriptorPoolSize dps[4] = { { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, SV_FRAMES }, { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 16 * SV_FRAMES }, { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 13 * SV_FRAMES },
+                                    { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 4 * SV_FRAMES } };
+    VkDescriptorPoolCreateInfo dpi = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = SV_FRAMES, .poolSizeCount = 4, .pPoolSizes = dps };
     VKOK(vkCreateDescriptorPool(g.dev, &dpi, NULL, &g.dpool), "descriptor pool");
     for (int f = 0; f < SV_FRAMES; f++) {
         Frame *F = &g.frames[f];
@@ -1797,14 +2101,18 @@ int64_t sv_open(int64_t w, int64_t h, int64_t capture_mouse, int64_t quad_capaci
         F->table_map = map; memset(F->table_map, 0, (size_t)SV_MAX_SLOTS * sizeof(ChunkEntry));
         if (!make_buffer((VkDeviceSize)SV_LIGHT_PER_FRAME * SV_LIGHT_WRITE_BYTES, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, &F->lstage, &F->lstage_mem, &map)) return 0;
         F->lstage_map = map;
-        if (!make_buffer((VkDeviceSize)SV_MAX_BODIES * sizeof(BodyRow), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &F->btable, &F->btable_mem, &map)) return 0;
+        if (!make_buffer((VkDeviceSize)SV_TABLE_ROWS * sizeof(BodyRow), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &F->btable, &F->btable_mem, &map)) return 0;
         F->btable_map = map;
         if (!make_buffer((VkDeviceSize)SV_MAX_CELLS * 8 + 16, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &F->bcells, &F->bcells_mem, &map)) return 0;
         F->bcells_map = map; memset(F->bcells_map, 0, (size_t)SV_MAX_CELLS * 8 + 16);
         if (!make_buffer((VkDeviceSize)SV_BODY_LIST * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &F->blist, &F->blist_mem, &map)) return 0;
         F->blist_map = map;
-        if (!make_buffer((VkDeviceSize)SV_MOVERS * 32, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &F->bmovers, &F->bmovers_mem, &map)) return 0;
-        F->bmovers_map = map; memset(F->bmovers_map, 0, SV_MOVERS * 32);
+        if (!make_buffer((VkDeviceSize)(SV_MOVERS + SV_FIG_BOXES) * 32, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &F->bmovers, &F->bmovers_mem, &map)) return 0;
+        F->bmovers_map = map; memset(F->bmovers_map, 0, (SV_MOVERS + SV_FIG_BOXES) * 32);
+        if (!make_buffer((VkDeviceSize)SV_MAX_CELLS * 8, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &F->lcells, &F->lcells_mem, &map)) return 0;
+        F->lcells_map = map; memset(F->lcells_map, 0, (size_t)SV_MAX_CELLS * 8);
+        if (!make_buffer((VkDeviceSize)SV_LAMP_LIST * 16, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &F->llist, &F->llist_mem, &map)) return 0;
+        F->llist_map = map; F->lamp_version = (uint32_t)-1;
         F->pending = calloc(SV_MAX_SLOTS, sizeof *F->pending);
         F->is_pending = calloc(SV_MAX_SLOTS, 1);
         if (!F->pending || !F->is_pending) return 0;
@@ -1828,6 +2136,12 @@ int64_t sv_open(int64_t w, int64_t h, int64_t capture_mouse, int64_t quad_capaci
             bw[b] = (VkWriteDescriptorSet){ .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = F->dset, .dstBinding = 17 + b, .descriptorCount = 1,
                 .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &bb[b] };
         vkUpdateDescriptorSets(g.dev, 5, bw, 0, NULL);
+        VkDescriptorBufferInfo lb2[2] = { { F->lcells, 0, VK_WHOLE_SIZE }, { F->llist, 0, VK_WHOLE_SIZE } };
+        VkWriteDescriptorSet lw2[2];
+        for (uint32_t b = 0; b < 2; b++)
+            lw2[b] = (VkWriteDescriptorSet){ .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = F->dset, .dstBinding = 32 + b, .descriptorCount = 1,
+                .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &lb2[b] };
+        vkUpdateDescriptorSets(g.dev, 2, lw2, 0, NULL);
     }
     if (!fig_init()) { die("figures", 0); return 0; }
     for (int f = 0; f < SV_FRAMES; f++) {
@@ -1978,7 +2292,7 @@ void sv_close(void) {
     free(g.trans); free(g.trans_at); free(g.trans_keys);
     free(g.spray_births); g.spray_births = NULL;
     free(g.ui_cpu); g.ui_cpu = NULL; g.ui_n = 0;
-    free(g.ubo_map); free(g.entries); free(g.cells); free(g.stage_light);
+    free(g.ubo_map); free(g.entries); if (g.cells) for (int i = 0; i < g.vn_old_cells; i++) free(g.cells[i].lamps); free(g.cells); g.vn_old_cells = 0; free(g.cell_page); free(g.free_pages); free(g.stage_light);
     for (uint32_t i = 0; i < g.nlq; i++) free(g.lq[i].bytes);
     free(g.lq);
     for (int i = 0; i < 4; i++) free(g.stage.part[i]);
@@ -2009,9 +2323,14 @@ void sv_set_vsync(int64_t on) { int off = on ? 0 : 1; if (g.ok && off != g.vsync
  * them (the draw list, culling, grouping), 13 microseconds of that in the
  * draw list alone (an_x_draw_list: the slerps), 14 GPU milliseconds of the
  * figure shadow map's pass (0 when it did not run or there are no
- * timestamps), 15 parts drawn into it, 16 its draws. */
+ * timestamps), 15 parts drawn into it, 16 its draws, 17 traced figures in
+ * the rays' list, 18 their parts placed there, 19 figures flagged traced
+ * past the first SV_FIG_TRACED, drawn plain. */
 double sv_stat(int64_t which) {
     if (which == 6) return (double)g.rebuilds;
+    if (which == 10) return (double)(g.npages - g.nfree_pages);   /* light pages in use */
+    if (which == 11) return (double)g.pages_refused;               /* chunks that found no light page */
+    if (which == 12) return (double)g.npages * 32768.0;          /* bytes the light volume's pool holds */
     if (which == 7) return (double)g_quads.leaked + (double)g_loose.leaked;
     if (which == 8) return g.spray_births ? (double)sp_count(&g.ring) : 0.0;
     if (which == 9) return (double)g.ui_dropped;
@@ -2022,6 +2341,9 @@ double sv_stat(int64_t which) {
     if (which == 14) return fg.shadow_ms;
     if (which == 15) return (double)fg.sparts;
     if (which == 16) return (double)fg.sdraws;
+    if (which == 17) return (double)fg.traced_figs;
+    if (which == 18) return (double)fg.traced_parts;
+    if (which == 19) return (double)fg.traced_over;
     return (which >= 0 && which < 6) ? g.stat[which] : -1.0;
 }
 int64_t sv_drawn_chunks(void) { return g.drawn_chunks; }
@@ -2221,7 +2543,7 @@ static void bodies_to_frame(Frame *F) {
     if (ncells > SV_MAX_CELLS) return;
     memset(F->bcells_map, 0, (size_t)ncells * 8);
     /* the table, each body's box in chunks, and how many cells each lists it in */
-    static int32_t box[SV_MAX_BODIES][6];
+    static int32_t box[SV_MAX_BODIES + SV_FIG_TRACED][6];
     static uint32_t which[SV_MAX_BODIES];
     uint32_t n = 0, nmov = 0;
     for (uint32_t h = 0; h < SV_MAX_BODIES; h++) {
@@ -2258,22 +2580,74 @@ static void bodies_to_frame(Frame *F) {
         which[n] = h;
         n++;
     }
-    /* count, then place: cell c lists its bodies from its start */
-    for (uint32_t i = 0; i < n; i++)
+    /* then the traced figures (fig_trace_prepare): each one's group row is listed in the cells its
+     * sphere reaches, its parts' rows follow the groups; and their boxes after the bodies' */
+    uint32_t nlisted = n;
+    for (int32_t t = 0; t < fg.tgroups; t++) {
+        BodyRow *r = &F->btable_map[n + (uint32_t)t];
+        *r = fg.trows[t];
+        r->dims[0] += (int32_t)n + fg.tgroups;
+        for (int k = 0; k < 3; k++) { box[nlisted][k] = (int32_t)floorf(r->sphere[k] - r->sphere[3]) >> 5; box[nlisted][3 + k] = (int32_t)floorf(r->sphere[k] + r->sphere[3]) >> 5; }
+        nlisted++;
+    }
+    if (fg.tparts > 0) memcpy(F->btable_map + n + fg.tgroups, fg.trows + SV_FIG_TRACED, (size_t)fg.tparts * sizeof(BodyRow));
+    for (int32_t t = 0; t < fg.ntmov; t++) { memcpy(F->bmovers_map + nmov * 8, fg.tmov[t], 32); nmov++; }
+    /* count, then place: cell c lists its bodies (and traced figures) from its start */
+    for (uint32_t i = 0; i < nlisted; i++)
         for (int cz = box[i][2]; cz <= box[i][5]; cz++) for (int cy = box[i][1]; cy <= box[i][4]; cy++) for (int cx = box[i][0]; cx <= box[i][3]; cx++) {
             uint32_t c = (uint32_t)(wrapi(cx, nx) + nx * (wrapi(cy, ny) + ny * wrapi(cz, nz)));
             F->bcells_map[c * 2 + 1]++;
         }
     uint32_t at = 0;
     for (uint32_t c = 0; c < ncells; c++) { F->bcells_map[c * 2] = at; at += F->bcells_map[c * 2 + 1]; F->bcells_map[c * 2 + 1] = 0; }
-    for (uint32_t i = 0; i < n; i++)
+    for (uint32_t i = 0; i < nlisted; i++)
         for (int cz = box[i][2]; cz <= box[i][5]; cz++) for (int cy = box[i][1]; cy <= box[i][4]; cy++) for (int cx = box[i][0]; cx <= box[i][3]; cx++) {
             uint32_t c = (uint32_t)(wrapi(cx, nx) + nx * (wrapi(cy, ny) + ny * wrapi(cz, nz)));
             uint32_t k = F->bcells_map[c * 2] + F->bcells_map[c * 2 + 1];
             if (k < SV_BODY_LIST) { F->blist_map[k] = i; F->bcells_map[c * 2 + 1]++; }
         }
     (void)which;
-    bu[0] = (int32_t)nmov; bu[1] = (int32_t)n;
+    bu[0] = (int32_t)nmov; bu[1] = (int32_t)(n + (uint32_t)fg.tgroups + (uint32_t)fg.tparts);
+}
+
+/* The lamps near each cell of the light volume, into this frame's copy when
+ * they have changed: every glowing voxel a chunk keeps is listed for each
+ * cell whose chunk comes within SV_LAMP_REACH voxels of it, at most
+ * SV_CELL_LAMPS a cell, so a point finds every lamp whose light reaches it. */
+static void lamps_to_frame(Frame *F) {
+    float *wt = g.ubo_map + UBO_WATER;
+    if (!g.cells || g.vn <= 0 || g.vnv <= 0) { wt[6] = 0.0f; return; }
+    int nx = g.vn, ny = g.vnv, nz = g.vn;
+    uint32_t ncells = (uint32_t)(nx * ny * nz);
+    if (ncells > SV_MAX_CELLS) { wt[6] = 0.0f; return; }
+    if (F->lamp_version != g.lamp_version) {
+        memset(F->lcells_map, 0, (size_t)ncells * 8);
+        for (int pass = 0; pass < 2; pass++) {
+            if (pass == 1) { uint32_t at = 0; for (uint32_t c = 0; c < ncells; c++) { uint32_t k = F->lcells_map[c * 2 + 1]; if (k > SV_CELL_LAMPS) k = SV_CELL_LAMPS; F->lcells_map[c * 2] = at; at += k; F->lcells_map[c * 2 + 1] = 0; } }
+            for (uint32_t c = 0; c < ncells; c++) {
+                struct LightCell *lc = &g.cells[c];
+                if (!lc->valid || lc->nlamps == 0) continue;
+                for (int i = 0; i < lc->nlamps; i++) {
+                    const int32_t *l = lc->lamps + i * 4;
+                    int lo[3], hi[3];
+                    for (int a = 0; a < 3; a++) { lo[a] = (l[a] - SV_LAMP_REACH) >> 5; hi[a] = (l[a] + SV_LAMP_REACH) >> 5; }
+                    for (int cz = lo[2]; cz <= hi[2]; cz++) for (int cy = lo[1]; cy <= hi[1]; cy++) for (int cx = lo[0]; cx <= hi[0]; cx++) {
+                        uint32_t t = (uint32_t)(wrapi(cx, nx) + nx * (wrapi(cy, ny) + ny * wrapi(cz, nz)));
+                        if (pass == 0) { F->lcells_map[t * 2 + 1]++; continue; }
+                        uint32_t k = F->lcells_map[t * 2 + 1];
+                        if (k >= SV_CELL_LAMPS || F->lcells_map[t * 2] + k >= SV_LAMP_LIST) continue;
+                        memcpy(F->llist_map + (F->lcells_map[t * 2] + k) * 4, l, 16);
+                        F->lcells_map[t * 2 + 1]++;
+                    }
+                }
+            }
+        }
+        F->lamp_version = g.lamp_version;
+    }
+    /* how many lamps the light pass may aim at, anywhere (0: none, skip the lists) */
+    uint32_t total = 0;
+    for (uint32_t c = 0; c < ncells && total == 0; c++) total += F->lcells_map[c * 2 + 1];
+    wt[6] = total > 0 && !(getenv("STRATA_LAMPS") && getenv("STRATA_LAMPS")[0] == '0') ? 1.0f : 0.0f;
 }
 
 /* Begin uploading one part of a body (a 32-cubed piece of its grid) into
@@ -2518,7 +2892,7 @@ void sv_set_underwater(double surface_y, double r, double gr, double b, double d
     if (!g.ok) return;
     float *wt = g.ubo_map + UBO_WATER;
     wt[0] = (float)r; wt[1] = (float)gr; wt[2] = (float)b; wt[3] = density > 0.0 ? (float)density : 0.0f;
-    wt[4] = (float)surface_y; wt[5] = 0.0f; wt[6] = 0.0f; wt[7] = 0.0f;
+    wt[4] = (float)surface_y;   /* wt[5] is the water-memory flag and wt[6] the lamps flag, both set each frame */
 }
 void sv_set_eye(double x, double y, double z, double scale) {
     if (!g.ok) return;
@@ -2638,8 +3012,10 @@ int64_t sv_frame(void) {
     /* this Frame's fence has been waited on, so the GPU is done with its
      * copies: bring them up to date. From here to the next time this Frame
      * comes round, nothing the CPU does can change what it draws. */
+    fig_prepare(F);               /* first: it chooses the traced figures' rows bodies_to_frame appends */
     bodies_to_frame(F);
-    fig_prepare(F);
+    lamps_to_frame(F);
+    g.ubo_map[UBO_WATER + 5] = g.water_mem ? 1.0f : 0.0f;
     memcpy(F->ubo_map, g.ubo_map, UBO_FLOATS * 4);
     for (uint32_t i = 0; i < F->npending; i++) {
         uint32_t slot = F->pending[i];
@@ -2710,6 +3086,36 @@ int64_t sv_frame(void) {
     vkCmdBindPipeline(F->cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g.pipe_light);
     vkCmdDraw(F->cmd, 3, 1, 0, 0);
     vkCmdEndRenderPass(F->cmd);
+
+    /* the water's memory: this frame's depth image is cleared (nothing
+     * remembered yet); last frame's writes are made visible to this frame's reads */
+    if (g.water_mem) {
+        int fi = (int)(g.frame_no % SV_FRAMES);
+        VkImageSubresourceRange rr = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+        VkClearColorValue zero_c = { .float32 = { 0.0f, 0.0f, 0.0f, 0.0f } };
+        if (g.water_fresh) {
+            VkImageMemoryBarrier wb[2 * SV_FRAMES];
+            for (int k = 0; k < SV_FRAMES; k++) {
+                wb[2 * k] = (VkImageMemoryBarrier){ .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, .srcAccessMask = 0, .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+                    .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED, .newLayout = VK_IMAGE_LAYOUT_GENERAL, .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                    .image = g.whist[k].img, .subresourceRange = rr };
+                wb[2 * k + 1] = wb[2 * k]; wb[2 * k + 1].image = g.wdist[k].img;
+            }
+            vkCmdPipelineBarrier(F->cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 2 * SV_FRAMES, wb);
+            for (int k = 0; k < SV_FRAMES; k++) {
+                vkCmdClearColorImage(F->cmd, g.whist[k].img, VK_IMAGE_LAYOUT_GENERAL, &zero_c, 1, &rr);
+                vkCmdClearColorImage(F->cmd, g.wdist[k].img, VK_IMAGE_LAYOUT_GENERAL, &zero_c, 1, &rr);
+            }
+            g.water_fresh = 0;
+        } else {
+            VkMemoryBarrier rb = { .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT, .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT };
+            vkCmdPipelineBarrier(F->cmd, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &rb, 0, NULL, 0, NULL);
+            vkCmdClearColorImage(F->cmd, g.wdist[fi].img, VK_IMAGE_LAYOUT_GENERAL, &zero_c, 1, &rr);
+        }
+        VkMemoryBarrier mb2 = { .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT };
+        vkCmdPipelineBarrier(F->cmd, VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 1, &mb2, 0, NULL, 0, NULL);
+    }
 
     /* 3. final: the lit image to the screen, then translucent surfaces over
      * it, far to near, blended, tested against the geometry pass's depth */

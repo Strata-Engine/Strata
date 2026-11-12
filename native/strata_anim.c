@@ -24,7 +24,7 @@
  * themselves on the monotonic clock (an_x_timing). The kernel never reads a
  * clock, so no answer depends on it. */
 /* Rewritten by stamp_anim.sh whenever strata_anim.h changes (GAPS S14). */
-#define STRATA_ANIM_STAMP "73cc95d6621233e8"
+#define STRATA_ANIM_STAMP "2e2d1d055752d99c"
 #include <stdint.h>
 #include <time.h>
 #include "strata_anim.h"
@@ -172,6 +172,13 @@ void an_x_view(void *planes, double ex, double ey, double ez, double far_m) {
     if (!g_w) return;
     float eye[3] = {(float)ex, (float)ey, (float)ez};
     an_view(g_w, an_x_len(planes) >= 24 ? an_x_f32(planes) : NULL, eye, (float)far_m);
+}
+/* the sun the drawing casts shadows by (toward it; at or below 0.01 up for
+ * none): strata_vk.c gives it each frame before it reads the draw list */
+void an_x_draw_sun(double x, double y, double z) {
+    if (!g_w) return;
+    float s[3] = {(float)x, (float)y, (float)z};
+    an_draw_sun(g_w, s);
 }
 void an_x_always(int64_t fig, int64_t on) { if (g_w) an_always(g_w, (int)fig, on != 0); }
 void an_x_traced(int64_t fig, int64_t on) { if (g_w) an_traced(g_w, (int)fig, on != 0); }
