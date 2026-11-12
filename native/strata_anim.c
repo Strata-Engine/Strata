@@ -14,14 +14,30 @@
  *
  * Hits come back through caller-owned arrays: a ray's ints and floats, a
  * box's pairs (an_x_hit_box answers how many there are, so a caller whose
- * array was short can ask again with a longer one). */
+ * array was short can ask again with a longer one).
+ *
+ * The view (an_x_view) takes its 24 plane floats from a NativeF32Arr; one
+ * shorter than 24 means no planes. The renderer reads the draw list straight
+ * from strata_anim.h (an_draw_list), never through March.
+ *
+ * Timing, for measurements only: an_x_update and an_x_hit_ray time
+ * themselves on the monotonic clock (an_x_timing). The kernel never reads a
+ * clock, so no answer depends on it. */
 /* Rewritten by stamp_anim.sh whenever strata_anim.h changes (GAPS S14). */
-#define STRATA_ANIM_STAMP "a6ae6b6ecf7c2942"
+#define STRATA_ANIM_STAMP "c4c4020d7ec59a4b"
 #include <stdint.h>
+#include <time.h>
 #include "strata_anim.h"
 
 static AnWorld *g_w;
 static int32_t g_mask_base[AN_RIGS], g_mask_n[AN_RIGS];
+/* seconds: the last update, the worst, the sum, how many; rays' sum and count */
+static double g_t_last, g_t_worst, g_t_sum, g_t_n, g_r_sum, g_r_n;
+static double an_x_now(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+}
 
 static const int32_t *an_x_i32(void *a) { return a ? (const int32_t *)((char *)a + 32) : NULL; }
 static const float *an_x_f32(void *a) { return a ? (const float *)((char *)a + 32) : NULL; }
@@ -97,7 +113,7 @@ int64_t an_x_spawn(int64_t rig, double x, double y, double z, double qx, double 
     if (id < 0) return id;
     AnFig *f = an_fig(g_w, id);
     an_place(g_w, id, pos, q);
-    an_pose(g_w, f, 0);
+    an_settle(g_w, f);
     return id;
 }
 void an_x_remove(int64_t fig) { if (g_w) an_remove(g_w, (int)fig); }
@@ -119,7 +135,36 @@ void an_x_blend(int64_t fig, int64_t layer, int64_t n, void *clips, void *positi
 void an_x_set(int64_t fig, int64_t layer, int64_t what, double v, double fade) {
     if (g_w) an_set(g_w, (int)fig, (int)layer, (int)what, (float)v, (float)fade);
 }
-void an_x_update(double dt) { if (g_w) an_update(g_w, (float)dt); }
+void an_x_update(double dt) {
+    if (!g_w) return;
+    double t0 = an_x_now();
+    an_update(g_w, (float)dt);
+    double t = an_x_now() - t0;
+    g_t_last = t; g_t_sum += t; g_t_n += 1;
+    if (t > g_t_worst) g_t_worst = t;
+}
+/* the measurements: 0 the last update's seconds, 1 the worst since the reset, 2 their sum, 3 how many, 4 rays' seconds, 5 how many rays */
+double an_x_timing(int64_t k) {
+    switch (k) {
+    case 0: return g_t_last;
+    case 1: return g_t_worst;
+    case 2: return g_t_sum;
+    case 3: return g_t_n;
+    case 4: return g_r_sum;
+    case 5: return g_r_n;
+    default: return 0;
+    }
+}
+void an_x_timing_reset(void) { g_t_last = g_t_worst = g_t_sum = g_t_n = g_r_sum = g_r_n = 0; }
+
+/* the camera: 24 plane floats (fewer: no planes, all in view), the eye, and the far distance (0: none) */
+void an_x_view(void *planes, double ex, double ey, double ez, double far_m) {
+    if (!g_w) return;
+    float eye[3] = {(float)ex, (float)ey, (float)ez};
+    an_view(g_w, an_x_len(planes) >= 24 ? an_x_f32(planes) : NULL, eye, (float)far_m);
+}
+void an_x_always(int64_t fig, int64_t on) { if (g_w) an_always(g_w, (int)fig, on != 0); }
+void an_x_traced(int64_t fig, int64_t on) { if (g_w) an_traced(g_w, (int)fig, on != 0); }
 
 /* how many parts figure fig has; 0 if there is no such figure */
 int64_t an_x_parts(int64_t fig) {
@@ -224,7 +269,10 @@ int64_t an_x_hit_ray(double ox, double oy, double oz, double dx, double dy, doub
     if (!g_w || an_x_len(ints) < 6 || an_x_len(floats) < 4) return 0;
     float o[3] = {(float)ox, (float)oy, (float)oz}, d[3] = {(float)dx, (float)dy, (float)dz};
     AnHit h;
-    if (!an_hit_ray(g_w, o, d, (float)max, (int)ignore, &h)) return 0;
+    double t0 = an_x_now();
+    int got = an_hit_ray(g_w, o, d, (float)max, (int)ignore, &h);
+    g_r_sum += an_x_now() - t0; g_r_n += 1;
+    if (!got) return 0;
     int32_t *i = (int32_t *)((char *)ints + 32);
     float *f = (float *)((char *)floats + 32);
     i[0] = h.fig; i[1] = h.part; i[2] = h.x; i[3] = h.y; i[4] = h.z; i[5] = h.colour;
