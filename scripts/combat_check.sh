@@ -54,8 +54,9 @@ fi
 if twice fire STRATA_COMBAT_SCENE=fire STRATA_FRAMES=720; then
   wood=$(num fire '^combat: fire burned [0-9]* cells: wood \([0-9]*\), .*$'); grass=$(num fire '^combat: fire burned .*, grass \([0-9]*\), .*$'); left=$(num fire '^combat: fire burned .*, bystander health \([0-9]*\)$')
   burning=$(num fire '^combat: fire burning \([0-9]*\) cells at frame 120$'); later=$(num fire '^combat: fire burning \([0-9]*\) cells at frame 600$')
-  if [ "$wood" -ge 1 ] && [ "$grass" -ge 1 ] && [ "$left" -ge 10 ] && [ "$left" -le 35 ] && [ "$burning" -ge 1 ] && [ "$later" -eq -1 ]; then echo "ok   fire: burned $wood wood and $grass grass, $burning cells burning at frame 120 and none at 600; the bystander is left with $left of 60"
-  else echo "FAIL fire: wood $wood, grass $grass (want 1 or more of each), burning at frame 120 $burning (want 1 or more), at 600 $later (want none), bystander left with $left (want 10 to 35)"; cat "$OUT/fire.txt"; FAILED=1; fi
+  quiet=$(grep -c '^combat: fire at the end burning 0 cells, 0 cells with flames, 0 trails$' "$OUT/fire.txt")
+  if [ "$wood" -ge 1 ] && [ "$grass" -ge 1 ] && [ "$left" -ge 10 ] && [ "$left" -le 35 ] && [ "$burning" -ge 1 ] && [ "$later" -eq -1 ] && [ "$quiet" -eq 1 ]; then echo "ok   fire: burned $wood wood and $grass grass, $burning cells burning at frame 120 and none at 600, nothing left emitting; the bystander is left with $left of 60"
+  else echo "FAIL fire: wood $wood, grass $grass (want 1 or more of each), burning at frame 120 $burning (want 1 or more), at 600 $later (want none), nothing left emitting $quiet (want 1), bystander left with $left (want 10 to 35)"; cat "$OUT/fire.txt"; FAILED=1; fi
 fi
 # Water: a rusher swims a 6 m channel to its target, at the surface, climbs out and strikes.
 if twice channel STRATA_COMBAT_SCENE=channel STRATA_FRAMES=1800; then

@@ -112,9 +112,9 @@ void main() {
     v_color = colour_at(e, age);
     v_effect = e;
     v_light = vec4(0.0);
-    // a shaded effect lit once a particle: the sun where it reaches the particle's middle, less sky under a roof
-    // (traced at its first vertex only would differ per vertex; every vertex traces the same middle, so they agree)
-    if (pc.pass == 0u && fxv(e, 0).z > 0.5) {
+    // a shaded effect lit once a particle: the sun where it reaches the particle's middle, less sky under a roof.
+    // v_light is flat, read from each triangle's first (provoking) vertex alone: only those trace.
+    if (pc.pass == 0u && fxv(e, 0).z > 0.5 && gl_VertexIndex % 3 == 0) {
         float sun = 1.0, open_sky = 1.0;
         if (u.light.x >= 2.0 && u.light.x < 9.0) {
             vec3 at = pos / u.eye.w;
