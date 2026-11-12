@@ -1,0 +1,195 @@
+-- Population: declarations freeze into checked tables; layers run in
+-- declaration order unless one reads another's cover; every mistake is an
+-- Err naming the offender.
+mod Strata.Test.Population do
+
+  needs IO.Clock      -- charged to every test module once any uses Check.all (GAPS S3)
+  needs IO.Process
+  import Test
+  alias Strata.Population as Pn
+
+  pfn ramp() : Strata.Population.PopCurve do Pn.curve([(0.0, 0.0), (10.0, 1.0)]) end
+  pfn plain(base : Float) : Strata.Population.PopRule do Pn.rule(base, Nil, Nil, Nil) end
+  pfn grass() : Strata.Population.Pop do Pn.shapes_blocks(Pn.new(), "grass", [7, 8]) end
+
+  -- the message of an Err, or "" when freeze succeeded
+  pfn failure(p : Strata.Population.Pop) : String do
+    match Pn.freeze(p) do
+      Ok(_) -> ""
+      Err(m) -> m
+    end
+  end
+  pfn names(p : Strata.Population.Pop) : List(String) do
+    match Pn.freeze(p) do
+      Ok(f) -> Pn.layer_names(f)
+      Err(m) -> [m]
+    end
+  end
+  pfn grounds(p : Strata.Population.Pop) : List(Int) do
+    match Pn.freeze(p) do
+      Ok(f) -> Pn.missing_ground(f)
+      Err(_) -> [-1]
+    end
+  end
+  pfn names_str(xs : List(String)) : String do string_join(xs, ",") end
+  pfn ints_str(xs : List(Int)) : String do string_join(List.map(xs, int_to_string), ",") end
+
+  -- freeze fails, and its message names every one of `who`
+  pfn rejects(p : Strata.Population.Pop, who : List(String), what : String) : Unit do
+    let m = failure(p)
+    Test.assert_true(m != "", what ++ ": freeze is Err")
+    names_each(m, who, what)
+  end
+  pfn names_each(m : String, who : List(String), what : String) : Unit do
+    match who do
+      Nil -> ()
+      Cons(w, rest) ->
+        Test.assert_true(string_contains(m, w), what ++ ": the message names " ++ w ++ " (got: " ++ m ++ ")")
+        names_each(m, rest, what)
+    end
+  end
+
+  pfn site_at(xm : Float, radius : Float) : Strata.Population.PopSite do Pn.site(xm, 0.0, 10.0, radius, 0) end
+
+  describe "Population" do
+    test "an empty population freezes, with no layers" do
+      Test.assert_eq_str(names_str(names(Pn.new())), "", "no layers")
+      Test.assert_eq_str(failure(Pn.new()), "", "freeze is Ok")
+    end
+
+    test "layers run in declaration order" do
+      let p = Pn.layer_cover(Pn.layer_cover(grass(), "a", "grass", plain(0.1), 1), "b", "grass", plain(0.1), 2)
+      Test.assert_eq_str(names_str(names(p)), "a,b", "a then b")
+    end
+
+    test "a layer reading another's cover runs after it" do
+      let p0 = Pn.field_cover(grass(), "b_cover", "b", 3.0)
+      let ra = Pn.rule(0.1, [("b_cover", ramp())], Nil, Nil)
+      let p = Pn.layer_cover(Pn.layer_cover(p0, "a", "grass", ra, 1), "b", "grass", plain(0.1), 2)
+      Test.assert_eq_str(names_str(names(p)), "b,a", "b then a")
+    end
+
+    test "a cover read through a curve field and a zone still orders the layers" do
+      let p0 = Pn.field_cover(grass(), "shade", "canopy", 3.0)
+      let p1 = Pn.zone_band(Pn.field_curve(p0, "dim", "shade", ramp()), "under", "dim", 0.5, 2.0)
+      let p2 = Pn.layer_cover(p1, "fern", "grass", Pn.rule(0.1, Nil, ["under"], Nil), 1)
+      let p3 = Pn.layer_cover(p2, "moss", "grass", plain(0.1), 2)
+      let p = Pn.layer_cover(p3, "canopy", "grass", plain(0.1), 3)
+      Test.assert_eq_str(names_str(names(p)), "moss,canopy,fern", "fern moves after canopy; moss keeps its place")
+    end
+
+    test "a duplicate name within a kind is refused, the same name in two kinds is not" do
+      rejects(Pn.field_ground(Pn.field_ground(Pn.new(), "height", 0), "height", 1), ["height"], "duplicate field")
+      rejects(Pn.zone_regions(Pn.zone_regions(Pn.new(), "marsh", [1]), "marsh", [2]), ["marsh"], "duplicate zone")
+      rejects(Pn.shapes_blocks(grass(), "grass", [9]), ["grass"], "duplicate shape set")
+      rejects(Pn.layer_cover(Pn.layer_cover(grass(), "lawn", "grass", plain(0.1), 1), "lawn", "grass", plain(0.1), 2), ["lawn"], "duplicate layer")
+      let p = Pn.layer_cover(Pn.zone_regions(Pn.field_ground(grass(), "grass", 0), "grass", [1]), "grass", "grass", plain(0.1), 1)
+      Test.assert_eq_str(failure(p), "", "four kinds, four namespaces")
+    end
+
+    test "a field naming an undeclared field or layer is refused" do
+      rejects(Pn.field_curve(Pn.new(), "dim", "nowhere_field", ramp()), ["dim", "nowhere_field"], "curve of an undeclared field")
+      rejects(Pn.field_cover(Pn.new(), "shade", "nowhere_layer", 3.0), ["shade", "nowhere_layer"], "cover of an undeclared layer")
+    end
+
+    test "a zone naming an undeclared field or zone is refused" do
+      rejects(Pn.zone_band(Pn.new(), "high", "elevation", 0.0, 1.0), ["high", "elevation"], "band of an undeclared field")
+      rejects(Pn.zone_all(Pn.zone_regions(Pn.new(), "a", [1]), "both", ["a", "phantom"]), ["both", "phantom"], "all of an undeclared zone")
+      rejects(Pn.zone_any(Pn.new(), "either", ["ghost"]), ["either", "ghost"], "any of an undeclared zone")
+      rejects(Pn.zone_not(Pn.new(), "outside", "spectre"), ["outside", "spectre"], "not of an undeclared zone")
+    end
+
+    test "a rule naming an undeclared field or zone is refused" do
+      rejects(Pn.layer_cover(grass(), "lawn", "grass", Pn.rule(0.1, [("moisture", ramp())], Nil, Nil), 1), ["lawn", "moisture"], "rule reads an undeclared field")
+      rejects(Pn.layer_cover(grass(), "lawn", "grass", Pn.rule(0.1, Nil, ["meadow"], Nil), 1), ["lawn", "meadow"], "rule inside an undeclared zone")
+      rejects(Pn.layer_cover(grass(), "lawn", "grass", Pn.rule(0.1, Nil, Nil, ["swamp"]), 1), ["lawn", "swamp"], "rule outside an undeclared zone")
+    end
+
+    test "a layer naming an undeclared shape set is refused" do
+      rejects(Pn.layer_cover(Pn.new(), "lawn", "turf", plain(0.1), 1), ["lawn", "turf"], "cover layer")
+      rejects(Pn.layer_scatter(Pn.new(), "wood", "oaks", plain(0.1), 6.0, 0.5, 1), ["wood", "oaks"], "scatter layer")
+      rejects(Pn.layer_site(Pn.new(), "ruins", "rubble", Nil, 2.0, 1), ["ruins", "rubble"], "site layer")
+    end
+
+    test "weights naming an undeclared shape set or zone, or of the wrong length, are refused" do
+      let z = Pn.zone_regions(grass(), "north", [1])
+      rejects(Pn.weights(z, "flowers", "north", [1.0, 1.0]), ["flowers"], "weights of an undeclared shape set")
+      rejects(Pn.weights(z, "grass", "south", [1.0, 1.0]), ["grass", "south"], "weights in an undeclared zone")
+      rejects(Pn.weights(z, "grass", "north", [1.0, 1.0, 1.0]), ["grass", "north"], "three weights for two variants")
+      Test.assert_eq_str(failure(Pn.weights(z, "grass", "north", [2.0, 1.0])), "", "two weights for two variants")
+    end
+
+    test "a shape set with no variants is refused" do
+      rejects(Pn.shapes_blocks(Pn.new(), "nothing_blocks", Nil), ["nothing_blocks"], "no blocks")
+      rejects(Pn.shapes_templates(Pn.new(), "nothing_templates", Nil), ["nothing_templates"], "no templates")
+    end
+
+    test "a ground slot outside 0..9 is refused" do
+      rejects(Pn.field_ground(Pn.new(), "eleventh", 10), ["eleventh"], "slot 10")
+      rejects(Pn.field_ground(Pn.new(), "minus", -1), ["minus"], "slot -1")
+      Test.assert_eq_str(failure(Pn.field_ground(Pn.field_ground(Pn.new(), "sky", 9), "alt", 0)), "", "slots 0 and 9")
+    end
+
+    test "a curve with no points is refused" do
+      rejects(Pn.field_curve(Pn.field_ground(Pn.new(), "alt", 0), "pointless", "alt", Pn.curve(Nil)), ["pointless"], "in a curve field")
+      let p = Pn.field_ground(grass(), "alt", 0)
+      rejects(Pn.layer_cover(p, "lawn", "grass", Pn.rule(0.1, [("alt", Pn.curve(Nil))], Nil, Nil), 1), ["lawn", "alt"], "in a rule")
+    end
+
+    test "a negative radius is refused" do
+      rejects(Pn.field_cover(Pn.layer_cover(grass(), "lawn", "grass", plain(0.1), 1), "nearby", "lawn", -1.0), ["nearby"], "cover radius")
+      rejects(Pn.zone_ring(Pn.new(), "halo", [site_at(0.0, 5.0)], -1.0, 4.0), ["halo"], "ring inner radius")
+      rejects(Pn.zone_ring(Pn.new(), "aura", [site_at(0.0, 5.0)], 1.0, -4.0), ["aura"], "ring outer radius")
+      rejects(Pn.zone_ring(Pn.new(), "circlet", [site_at(0.0, -5.0)], 1.0, 4.0), ["circlet"], "a ring's site radius")
+      rejects(Pn.layer_site(grass(), "camps", "grass", [site_at(0.0, -5.0)], 2.0, 1), ["camps"], "a layer's site radius")
+    end
+
+    test "a negative cell or margin is refused" do
+      rejects(Pn.layer_scatter(grass(), "wood", "grass", plain(0.1), -6.0, 0.5, 1), ["wood"], "negative cell")
+      rejects(Pn.layer_site(grass(), "ruins", "grass", [site_at(0.0, 5.0)], -2.0, 1), ["ruins"], "negative margin")
+    end
+
+    test "a jitter above 0.6 is refused" do
+      rejects(Pn.layer_scatter(grass(), "wood", "grass", plain(0.1), 6.0, 0.61, 1), ["wood"], "jitter 0.61")
+      Test.assert_eq_str(failure(Pn.layer_scatter(grass(), "wood", "grass", plain(0.1), 6.0, 0.6, 1)), "", "jitter 0.6")
+    end
+
+    test "a cycle through cover fields is refused, naming both layers" do
+      let p0 = Pn.field_cover(Pn.field_cover(grass(), "near_oak", "oak", 3.0), "near_elm", "elm", 3.0)
+      let p1 = Pn.layer_cover(p0, "oak", "grass", Pn.rule(0.1, [("near_elm", ramp())], Nil, Nil), 1)
+      let p = Pn.layer_cover(p1, "elm", "grass", Pn.rule(0.1, [("near_oak", ramp())], Nil, Nil), 2)
+      rejects(p, ["oak", "elm"], "oak reads elm reads oak")
+      let self_p = Pn.layer_cover(Pn.field_cover(grass(), "near_self", "narcissus", 3.0), "narcissus", "grass", Pn.rule(0.1, [("near_self", ramp())], Nil, Nil), 1)
+      rejects(self_p, ["narcissus"], "a layer reading its own cover")
+    end
+
+    test "a cycle among curve fields or zones is refused" do
+      rejects(Pn.field_curve(Pn.field_curve(Pn.new(), "ping", "pong", ramp()), "pong", "ping", ramp()), ["ping", "pong"], "fields")
+      rejects(Pn.zone_not(Pn.zone_not(Pn.new(), "yin", "yang"), "yang", "yin"), ["yin", "yang"], "zones")
+    end
+
+    test "missing_ground lists the slots rules and zones reach, through curve chains" do
+      let p0 = Pn.field_ground(Pn.field_ground(Pn.field_ground(Pn.field_ground(grass(), "alt", 0), "slope", 1), "wet", 6), "sky", 9)
+      let p1 = Pn.field_curve(Pn.field_curve(p0, "wet_c", "wet", ramp()), "wet_cc", "wet_c", ramp())
+      let p2 = Pn.field_curve(p1, "unused_c", "slope", ramp())
+      let p3 = Pn.zone_band(p2, "open", "sky", 0.5, 2.0)
+      Test.assert_eq_str(ints_str(grounds(p3)), "9", "a zone alone reaches sky")
+      let p4 = Pn.layer_cover(p3, "lawn", "grass", Pn.rule(0.1, [("wet_cc", ramp())], Nil, Nil), 1)
+      Test.assert_eq_str(ints_str(grounds(p4)), "6,9", "wet through two curves; slope only through an unused curve; alt not at all")
+      Test.assert_eq_str(ints_str(grounds(grass())), "", "nothing declared, nothing missing")
+    end
+
+    test "curve_at is piecewise linear and flat beyond its ends" do
+      let c = ramp()
+      Test.assert_true(Pn.curve_at(c, -5.0) == 0.0, "before the first point")
+      Test.assert_true(Pn.curve_at(c, 0.0) == 0.0, "at the first point")
+      Test.assert_true(Pn.curve_at(c, 5.0) == 0.5, "half way")
+      Test.assert_true(Pn.curve_at(c, 10.0) == 1.0, "at the last point")
+      Test.assert_true(Pn.curve_at(c, 20.0) == 1.0, "beyond the last point")
+      let v = Pn.curve([(4.0, 1.0), (0.0, 0.0), (8.0, 0.0)])
+      Test.assert_true(Pn.curve_at(v, 2.0) == 0.5, "points are taken in order of x")
+      Test.assert_true(Pn.curve_at(v, 6.0) == 0.5, "the falling side")
+      Test.assert_true(Pn.curve_at(Pn.curve([(3.0, 0.7)]), -100.0) == 0.7, "one point is a constant")
+    end
+  end
+end
