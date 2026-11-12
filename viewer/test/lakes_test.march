@@ -431,38 +431,47 @@ mod StrataViewer.Test.Lakes do
 
   -- Tunnels: along lines of 64 m through the cave scene's chunks, at every
   -- height, the longest run of air lying more than 6 m under the island height
+  -- air that only a tunnel cut: its column's entrance noise at or under 0.6
+  -- and the cavern noise there under its 0.55 threshold (by 0.05, as the
+  -- voxel's value is filled from the lattice); the viewer's settings and seeds
+  pfn tunnel_only(x : Int, y : Int, z : Int) : Bool do
+    let one = Strata.Noise.settings(0, 1, 2.0, 0.5, 0, 0.0)
+    let en = Strata.Noise.sample2(one, Strata.Seed.mix(7, 9), 1.0 /. 120.0, int_to_float(x), int_to_float(z))
+    if en > 0.6 do false
+    else Strata.Noise.sample3(one, Strata.Seed.mix(7, 8), 1.0 /. 90.0, int_to_float(x), int_to_float(y), int_to_float(z)) < 0.5 end
+  end
   -- x runs from 0 to 63 (chunks 0 and 1), z in chunk 2 (64..95), y from 42 to 98; h0 and h1 the two chunks' relaxed heights
-  pfn tunnel_go(a : Strata.Atlas.Atlas, ca : Cache, h0 : NativeF32Arr, h1 : NativeF32Arr, z : Int, y : Int, best : Int) : Int do
-    if z >= 96 do best
-    else if y >= 100 do tunnel_go(a, ca, h0, h1, z + 4, 42, best)
+  -- the relaxed H of the 96 x 96 columns from (0, 32), x + 96 z: chunks x 0..2, z 1..3
+  pfn area_h(a : Strata.Atlas.Atlas, out : NativeF32Arr, k : Int) : NativeF32Arr do
+    if k >= 9 do out
+    else area_h(a, put_h(Vw.relaxed_heights(a, 1.0, 32 * (k % 3), 32 + 32 * (k / 3), 7), out, 32 * (k % 3), 32 * (k / 3), 0), k + 1) end
+  end
+  pfn put_h(hs : NativeF32Arr, out : NativeF32Arr, ox : Int, oz : Int, c : Int) : NativeF32Arr do
+    if c >= 1024 do out else put_h(hs, NativeArray.set_f32(out, (ox + c % 32) + 96 * (oz + c / 32), NativeArray.get_f32(hs, c)), ox, oz, c + 1) end
+  end
+  -- lines along x (dir 0) at every other z, and along z (dir 1) at every other x, for y 42..110:
+  -- the longest run of tunnel air 6 m or more under H
+  pfn tunnel_go(a : Strata.Atlas.Atlas, ca : Cache, hs : NativeF32Arr, dir : Int, w : Int, y : Int, best : Int) : Int do
+    if dir >= 2 do best
+    else if w >= 96 do tunnel_go(a, ca, hs, dir + 1, 0, 42, best)
+    else if y > 110 do tunnel_go(a, ca, hs, dir, w + 2, 42, best)
     else
-      match run2(a, ca, h0, h1, z, y) do
-        (r, ca2) -> tunnel_go(a, ca2, h0, h1, z, y + 2, if r > best do r else best end)
+      match run_line(a, ca, hs, dir, w, y, 0, 0, 0) do
+        (r, ca2) -> tunnel_go(a, ca2, hs, dir, w, y + 1, if r > best do r else best end)
       end
-    end end
+    end end end
   end
-  pfn run2(a : Strata.Atlas.Atlas, ca : Cache, h0 : NativeF32Arr, h1 : NativeF32Arr, z : Int, y : Int) : (Int, Cache) do
-    -- one 64 m line, the first 32 m over chunk 0's heights and the rest over chunk 1's, joined
-    let hs = join_go(h0, h1, NativeArray.make_f32(2048, 0.0), 0)
-    run_line(a, ca, hs, z, y, 0, 0, 0)
-  end
-  pfn join_go(h0 : NativeF32Arr, h1 : NativeF32Arr, out : NativeF32Arr, i : Int) : NativeF32Arr do
-    if i >= 2048 do out
+  pfn run_line(a : Strata.Atlas.Atlas, ca : Cache, hs : NativeF32Arr, dir : Int, w : Int, y : Int, t : Int, run : Int, best : Int) : (Int, Cache) do
+    if t >= 96 do (if run > best do run else best end, ca)
     else
-      let x = i % 64
-      let z = i / 64
-      join_go(h0, h1, NativeArray.set_f32(out, i, if x < 32 do NativeArray.get_f32(h0, x + 32 * z) else NativeArray.get_f32(h1, x - 32 + 32 * z) end), i + 1)
-    end
-  end
-  pfn run_line(a : Strata.Atlas.Atlas, ca : Cache, hs : NativeF32Arr, z : Int, y : Int, x : Int, run : Int, best : Int) : (Int, Cache) do
-    if x >= 64 do (if run > best do run else best end, ca)
-    else
-      match cblock(a, ca, x, y, z) do
+      let x = if dir == 0 do t else w end
+      let z = if dir == 0 do w else t end
+      match cblock(a, ca, x, y, z + 32) do
         (b, ca2) ->
-          let deep = int_to_float(y) < NativeArray.get_f32(hs, x + 64 * (z - 64)) -. 6.0
-          let air = if b == 0 do deep else false end
-          if air do run_line(a, ca2, hs, z, y, x + 1, run + 1, best)
-          else run_line(a, ca2, hs, z, y, x + 1, 0, if run > best do run else best end) end
+          let deep = int_to_float(y) < NativeArray.get_f32(hs, x + 96 * z) -. 6.0
+          let air = if b != 0 do false else if !deep do false else tunnel_only(x, y, z + 32) end end
+          if air do run_line(a, ca2, hs, dir, w, y, t + 1, run + 1, best)
+          else run_line(a, ca2, hs, dir, w, y, t + 1, 0, if run > best do run else best end) end
       end
     end
   end
@@ -553,6 +562,37 @@ mod StrataViewer.Test.Lakes do
       let cz = 2 * (k / 20) - 1
       match coast_go(a, Cache(Nil), cx, cz, Vw.relaxed_heights(a, 1.0, cx * 32, cz * 32, 7), 0, 0, 0) do
         (c2, b2, _) -> coasts_go(a, k + 1, cols + c2, bad + b2)
+      end
+    end
+  end
+
+  -- Early-outs: the decision from the atlas against full generation. Keys:
+  -- 300 drawn from the island's box (chunk x and z -32..31, y 0..5), and for
+  -- 30 drawn columns the chunks one under and one over the surface chunk.
+  -- (keys checked, declared uniform but not so in full, missed: uniform in full but not declared)
+  pfn early_check(a : Strata.Atlas.Atlas, cx : Int, cy : Int, cz : Int) : (Int, Int) do
+    let e = Vw.island_early(a, 1.0, cx, cy, cz)
+    let u = Chl2.uniform_id(Vw.island_full_chunk(a, 1.0, cx, cy, cz, 7))
+    let bad = if e < 0 do 0 else if u == e do 0 else 1 end end
+    let missed = if e >= 0 do 0 else if u == 0 || u == 1 do 1 else 0 end end
+    (bad, missed)
+  end
+  pfn early_go(a : Strata.Atlas.Atlas, k : Int, n : Int, bad : Int, missed : Int) : (Int, Int, Int) do
+    if k >= 390 do (n, bad, missed)
+    else
+      let h = if k < 300 do Strata.Seed.cell(7, 77, k, 0, 0) else Strata.Seed.cell(7, 78, (k - 300) / 3, 0, 0) end
+      let cx = int_abs(h) % 64 - 32
+      let cz = int_abs(h / 64) % 64 - 32
+      let key = if k < 300 do (cx, int_abs(h / 4096) % 6, cz)
+        else
+          let g = col_h(Vw.island_column(a, cx * 32 + 16, cz * 32 + 16, 7, 1.0))
+          (cx, Cl2.chunk_of(g) + (k - 300) % 3 - 1, cz)
+        end
+      match key do
+        (x, y, z) ->
+          match early_check(a, x, y, z) do
+            (b, m) -> early_go(a, k + 1, n + 1, bad + b, missed + m)
+          end
       end
     end
   end
@@ -705,10 +745,10 @@ mod StrataViewer.Test.Lakes do
           Test.assert_true(worst <= 0.01, "within 0.01 m of a patch centred on the border")
       end
     end
-    test "a tunnel crosses the cave scene's chunks: an air run over 8 m, 6 m or more under the ground" do
+    test "a tunnel crosses the cave scene's chunks: a run over 8 m of tunnel air, 6 m or more under the ground" do
       let a = island()
-      let best = tunnel_go(a, Cache(Nil), Vw.relaxed_heights(a, 1.0, 0, 64, 7), Vw.relaxed_heights(a, 1.0, 32, 64, 7), 64, 42, 0)
-      println("tunnels: longest air run " ++ int_to_string(best) ++ " m")
+      let best = tunnel_go(a, Cache(Nil), area_h(a, NativeArray.make_f32(9216, 0.0), 0), 0, 0, 42, 0)
+      println("tunnels: longest run of tunnel air " ++ int_to_string(best) ++ " m")
       Test.assert_true(best > 8, "a run longer than 8 m")
     end
     test "land within 4 m of a lake column holds no air or water from 4 m under the bed to the line" do
@@ -726,6 +766,14 @@ mod StrataViewer.Test.Lakes do
           println("coast: " ++ int_to_string(cols) ++ " land columns 1.5 to 11.5 m over the sea checked")
           Test.assert_true(cols > 100, "over 100 such columns")
           Test.assert_eq_int(bad, 0, "no sea water or air from 30 m to the sea line under them")
+      end
+    end
+    test "the early-out agrees with full generation on 390 chunk keys" do
+      match early_go(island(), 0, 0, 0, 0) do
+        (n, bad, missed) ->
+          println("early-outs: " ++ int_to_string(n) ++ " keys, " ++ int_to_string(bad) ++ " declared uniform but not, " ++ int_to_string(missed) ++ " uniform in full but generated")
+          Test.assert_eq_int(n, 390, "390 keys")
+          Test.assert_eq_int(bad, 0, "every chunk declared uniform is that uniform chunk in full")
       end
     end
     test "a chunk 200 m over the ground is uniform air, and one 200 m under it uniform stone" do
