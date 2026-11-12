@@ -18,6 +18,7 @@
 -- STRATA_SCALE=0.1  the 10 cm world (StrataViewer.Fine): a tower, a wall, a cliff and a stream to knock down; stream radius 8 (STRATA_RADIUS is ignored)
 -- STRATA_CRATE=f     drop a crate ahead of the camera at frame f (C does it by hand)
 -- STRATA_CRATES=n    n crates in rows ahead of the camera at the start (for timing the rays)
+-- STRATA_SUPPORT=0|1 terrain without support comes loose and falls (default: on when playing, off in scripted runs)
 -- STRATA_LIGHT_BOX=n the light volume's horizontal radius in chunks (default: the stream's)
 -- STRATA_SLAB_AT=f, STRATA_SLAB_OFF=f   scene 12: the frame its slab appears at, and the frame it goes
 -- STRATA_LIGHT=n     light mode: 0 the old flat shading, 1 sky and sun, 2 + shadows, 3 + reflections, 4 + sky light (default), 9 the light volume
@@ -1568,16 +1569,20 @@ mod StrataViewer do
           -- physics on the clock: the step begun last frame is finished, and the next begun; at most two steps a frame
           let tphys = if scripted do int_to_float(frame) /. 60.0 else now -. tz end
           let focus = Cons((x2, y2, z2), Nil)
-          let (pa, sa) = match pjob do
-              Some(j) -> Strata.Physics.finish(j, sim_phys(m4c), sim_stream(m4c))
-              None -> (sim_phys(m4c), sim_stream(m4c))
+          -- what physics did to the world (loose terrain, snapped rubble) wakes the water, as any edit does
+          let (pa, sa, fa) = match pjob do
+              Some(j) ->
+                match Strata.Physics.finish_world(j, sim_phys(m4c), Strata.Stream.world(sim_stream(m4c))) do
+                  (p5, o5) -> (p5, Strata.Stream.apply(sim_stream(m4c), o5), Strata.Fluid.wake(sim_fluid(m4c), Strata.Edit.world(o5), o5))
+                end
+              None -> (sim_phys(m4c), sim_stream(m4c), sim_fluid(m4c))
             end
           let owed = Strata.Physics.due(pa, tphys)
           let (pb, sb) = if owed >= 2 do Strata.Physics.step(pa, sa, focus) else (pa, sa) end
           let (pc, pjob2) = if owed >= 1 do
               match Strata.Physics.begin(pb, Strata.Stream.world(sb), focus) do (p4, j4) -> (p4, Some(j4)) end
             else (pb, None) end
-          let m4 = Sim(sb, sim_fluid(m4c), pc)
+          let m4 = Sim(sb, fa, pc)
           -- the fluid: ten steps a second (a scripted run: every sixth frame)
           let t_fluid = Strata.Ffi.Vk.time()
           let due = Env.get_int("STRATA_FLUID", 1) != 0 && (if scripted do frame % 6 == 0 else Math.floor(now *. 10.0) != Math.floor(t_prev *. 10.0) end)
@@ -2043,7 +2048,9 @@ mod StrataViewer do
           -- the fixed scenes fly, holding their pose; the default and the walk scene stand on the ground
           let cam = Cam(ex, ey, ez, yaw0, pitch0, Strata.Coord.chunk_of(float_to_int(Math.floor(ex /. sc))), Strata.Coord.chunk_of(float_to_int(Math.floor(ey /. sc))), Strata.Coord.chunk_of(float_to_int(Math.floor(ez /. sc))), false, false, soak > 0 || (scene != 0 && scene != 11), 0.0, false, false, int_to_float(Env.get_int("STRATA_SUN", 55)), Env.get_int("STRATA_LIGHT", 4), false, level_bits(start_level()), 0.0, 0)
           -- physics: the walker is a driven body; scene 26 leans a slab on a crate
-          let ph0 = Strata.Physics.new(reg, Strata.Physics.with_scale(Strata.Physics.config(), sc))
+          -- support: on when playing, off in scripted runs unless STRATA_SUPPORT=1 (the stored scenes dig and breach without it); anchored deep under the terrain
+          let support = Env.get_int("STRATA_SUPPORT", if frames > 0 do 0 else 1 end) == 1
+          let ph0 = Strata.Physics.new(reg, Strata.Physics.with_support(Strata.Physics.with_scale(Strata.Physics.config(), sc), support, if fine do -10 else 4 end))
           let ph1 = if scene != 26 || fine do ph0
             else
               -- the crate 8 m ahead and a little left; the slab runs to its right, across the view
