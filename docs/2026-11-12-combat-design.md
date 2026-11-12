@@ -86,6 +86,12 @@ Every fighter has health and takes the same damage from the same hit.
    every 1.5 s, with its aim off by up to 4 degrees. Nearer than 12 m it
    backs away.
 
+Fighters jump (the user asked for a jump animation; the humanoid already
+has a jump clip). A fighter going up a one-block step hops it, and one
+that leaves the ground, off a ledge or thrown back by a hit, is shown with
+the jump clip until it lands. The jump is how the step up looks; it does
+not let a fighter clear two blocks or a gap.
+
 There is no path finding. A fighter steps up one block as the walking mover
 allows; blocked for a second, it sidesteps and tries again. A pit holds it
 until it finds a one-block step out or is killed. A computer fighter that
@@ -174,7 +180,7 @@ Intent, not instruction; the builder may find better.
   between ticks moves its first tick as unseen, and unseen flyers pass
   through blocks; at 60 m/s that is a metre, enough to pass a one-block
   wall the shooter stands against.
-- **Animations**: idle, walk, run and swing exist. New in
+- **Animations**: idle, walk, run, jump, swim and swing exist. New in
   `viewer/lib/figures.march`: `flinch` (upper body, 0.25 s) and `fall`
   (whole body, 0.6 s), written like the existing clips. Shooters hold a bow
   in the hand socket, as the torch-bearer holds a torch.
@@ -266,3 +272,5 @@ Intent, not instruction; the builder may find better.
 10. A computer fighter idle for 20 s is respawned, so a match always ends.
 11. The hit flash is a small engine addition (a per-figure tint).
 12. Swimmers cannot attack; shots stop at the water's surface; no drowning.
+13. The jump clip plays on a step up and whenever a fighter is off the
+    ground; it adds no new reach (still one block up).
