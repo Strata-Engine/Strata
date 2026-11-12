@@ -47,3 +47,9 @@ Task 7: Ruling: scripted players run on their own grounds (scene 5 `range`, 6 `v
 Task 7: Ruling: the viewer also moves the walker's physics body when the match sets the player down (`Physics.place_driven`); setting the eye alone left the player 16 m from its spawn point.
 Task 7: Ruling: `Match.start` takes the script as well as the scene; `Match.view` gives a scripted player's view to the camera; the plan's `script_input` is inside `frame`.
 Task 7: Note: the single_edit test was written after the function and passed at once.
+Task 8: Ruling: the hit flash (the per-figure tint, the task's one engine change) is not built yet. The animation session has unmerged work in the anim kernel, its bindings, render.march and the figure shaders, and asked that the tint be built on main once its branch lands (expected within hours). Its four requirements: carry the tint in the traced figure records too; keep it render-only or fold it into an_hash; reset it on spawn and id reuse; leave the shadow map alone. Until then a hit shows by the flinch and the push only.
+Task 8: Ruling: the flinch plays as an additive layer (layer 1): a plain layer at full weight would put the legs in their rest pose.
+Task 8: Ruling: a killed fighter's entity is removed at once and its figure plays the fall alone; the plan held the entity for the 0.6 s. A corpse that still had a box would stop arrows.
+Task 8: Ruling: shirt-coloured loose parts are rigs per fighter (15 a fighter, 180 in all, of AN_RIGS 256 with the twelve humanoids and four props: 196). Simpler than sharing the unshirted shapes; room is the cost.
+Task 8: Ruling: knockback from a swing is 1 m (the design gives arrows 1.5 m and fire up to 3 m; it names none for a swing).
+Task 8: Measured: bots-only match, winner at frame 56,993 (15.8 minutes): pushed fighters take longer to finish.

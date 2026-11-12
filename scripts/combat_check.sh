@@ -37,8 +37,10 @@ fi
 # A duel: two shooters 15 m apart loose arrows until one falls.
 if twice duel STRATA_COMBAT_SCENE=duel STRATA_FRAMES=1200; then
   a=$(num duel '^combat: duel kills \([0-9]*\) [0-9]*$'); b=$(num duel '^combat: duel kills [0-9]* \([0-9]*\)$')
-  if [ "$a" -ge 0 ] && [ $((a + b)) -ge 1 ]; then echo "ok   duel: kills $a and $b"
-  else echo "FAIL duel: kills $a and $b (want one at least)"; cat "$OUT/duel.txt"; FAILED=1; fi
+  fl=$(num duel '^combat: duel flinches \([0-9]*\), .*$'); fa=$(num duel '^combat: duel flinches [0-9]*, falls \([0-9]*\), .*$')
+  most=$(num duel '^combat: duel .*, pieces at most \([0-9]*\), .*$'); now=$(num duel '^combat: duel .*, pieces now \([0-9]*\), .*$'); rigs=$(num duel '^combat: duel .*, rigs \([0-9]*\)$')
+  if [ "$a" -ge 0 ] && [ $((a + b)) -ge 1 ] && [ "$fl" -ge 1 ] && [ "$fa" -ge 1 ] && [ "$most" -ge 15 ] && [ "$most" -le $((15 * fa)) ] && [ "$rigs" -eq 12 ]; then echo "ok   duel: kills $a and $b; $fl flinches, $fa falls, $most loose pieces at most ($now left), 12 shirts"
+  else echo "FAIL duel: kills $a and $b (want one at least), flinches $fl, falls $fa (want one of each), pieces at most $most (want 15 to 15 a fall), rigs $rigs (want 12)"; cat "$OUT/duel.txt"; FAILED=1; fi
 fi
 # A trap: the ground dug from under a rusher, a block set where a shooter stands. No one ends inside a block, and the idle rule frees the stuck.
 if twice trap STRATA_COMBAT_SCENE=trap STRATA_FRAMES=1800; then
