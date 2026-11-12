@@ -18,7 +18,19 @@ from the same shell is 0.7.0. Seen in the binaries: the viewer calls
 "reproduced from main" were checked with a compiler that does not build
 Strata. Workaround: `export MARCH_HOME=<a directory with no current link>`
 before forge (it then falls back to `PATH`), or a `.march-version` naming an
-installed build of main. Not yet applied to `scripts/env.sh`.
+installed build of main. Applied on 12 November: `scripts/env.sh` exports a
+`MARCH_HOME` with no `current` link.
+
+What the switch to 0.7.0 needed, for the record: `*`, `+` and `-` trap on
+overflow where 0.5.0 wrapped, so five hash products that passed 2^62 before
+being masked became `int_wrapping_mul` (`Coord.key_hash`, `Stream`'s `mix`,
+`Noise.hash2`, `Physics.hash`, and `stamp` in the fluid test; same values).
+0.7.0's property generator draws other inputs from the same seed and found
+a fluid bug (two eighths in one column with air between: the upper came to
+rest over air; `Strata.Fluid`'s `changed` now keeps a cell that gave as much
+as it took) and an exact edge touch in the raycast property (the test now
+accepts a hit within 0.002 of the voxel's box). No stored hash and no golden
+image changed.
 
 ## B: an `if` or `match` whose value is a Float allocates
 
