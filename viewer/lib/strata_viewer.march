@@ -38,6 +38,8 @@
 -- STRATA_RADIUS=n   horizontal radius in chunks (default 10)
 -- STRATA_FRAMES=n   draw n frames, save a screenshot, exit (for scripts)
 -- STRATA_SHOT=path  where the screenshot goes (a PPM)
+-- STRATA_FALLS=0|1  spray where a river's surface steps down (default: on when playing, off in scripted runs)
+-- Key P            when playing: a picture of the view, saved as screenshots/strata-<process>-<frame>.png
 -- STRATA_DIG=1      carve once at frame 10, as a left click would (for scripts)
 -- STRATA_SCENE=n    start from fixed camera pose n (see `pose`); with STRATA_FRAMES the run is deterministic
 -- STRATA_VSYNC=0    present immediately, for timing
@@ -1542,9 +1544,51 @@ mod StrataViewer do
   pfn sim_phys(m : Sim) : Strata.Physics.Physics do match m do Sim(_, _, p) -> p end end
 
   -- Apply an edit and tell the fluid and physics about it.
-  pfn edit(m : Sim, o : Strata.Edit.Outcome) : Sim do
+  pfn edit_one(m : Sim, o : Strata.Edit.Outcome) : Sim do
     match m do
       Sim(s, f, p) -> Sim(Strata.Stream.apply(s, o), Strata.Fluid.wake(f, Strata.Edit.world(o), o), Strata.Physics.wake(p, o))
+    end
+  end
+
+  -- Tall grass (block 11) left with nothing to stand on by an edit: in the box each change covers and the layer over it, every tall grass cell whose cell below
+  -- is air or does not collide. A change covering more than 100,000 cells is not searched.
+  pfn loose_grass_in(w : Strata.World.World, reg : Strata.Blocks.Registry, x0 : Int, y0 : Int, z0 : Int, nx : Int, ny : Int, nz : Int, i : Int, acc : List((Int, Int, Int, Int))) : List((Int, Int, Int, Int)) do
+    if i >= nx * ny * nz do acc
+    else
+      let x = x0 + i % nx
+      let y = y0 + (i / nx) % ny
+      let z = z0 + i / (nx * ny)
+      if Strata.World.get_block(w, x, y, z) != 11 do loose_grass_in(w, reg, x0, y0, z0, nx, ny, nz, i + 1, acc)
+      else
+        let under = Strata.World.get_block(w, x, y - 1, z)
+        loose_grass_in(w, reg, x0, y0, z0, nx, ny, nz, i + 1, if under == 0 || !Strata.Blocks.collides(reg, under) do Cons((x, y, z, 0), acc) else acc end)
+      end
+    end
+  end
+  pfn loose_grass(w : Strata.World.World, reg : Strata.Blocks.Registry, cs : List(Strata.Edit.Change), acc : List((Int, Int, Int, Int))) : List((Int, Int, Int, Int)) do
+    match cs do
+      Nil -> acc
+      Cons(c, rest) ->
+        match Strata.Edit.low(c) do
+          (lx, ly, lz) ->
+            match Strata.Edit.high(c) do
+              (hx, hy, hz) ->
+                let nx = hx - lx + 1
+                let ny = hy - ly + 2
+                let nz = hz - lz + 1
+                loose_grass(w, reg, rest, if nx * ny * nz > 100000 do acc else loose_grass_in(w, reg, lx, ly, lz, nx, ny, nz, 0, acc) end)
+            end
+        end
+    end
+  end
+
+  -- An edit applied to the simulation: the stream, the fluid and the physics hear of it; then the tall grass it left hanging is taken away, as a second edit.
+  pfn edit(m : Sim, o : Strata.Edit.Outcome) : Sim do
+    let m1 = edit_one(m, o)
+    let w = Strata.Edit.world(o)
+    match loose_grass(w, Strata.World.registry(w), Strata.Edit.changes(o), Nil) do
+      Nil -> m1
+      gone -> edit_one(m1, Strata.Edit.set_many(Strata.Stream.world(sim_stream(m1)), gone))
     end
   end
 
@@ -1554,6 +1598,17 @@ mod StrataViewer do
       cs -> edit(m, Strata.Edit.set_many(Strata.Stream.world(sim_stream(m)), cs))
     end
   end
+  -- A picture of the next frame drawn, as screenshots/strata-<process>-<frame>.png under the folder the viewer was started in.
+  -- The renderer writes a PPM; a second later `sips` (macOS) turns it into a PNG and the PPM is removed.
+  pfn take_picture(frame : Int) : Unit do
+    let stem = "screenshots/strata-" ++ int_to_string(Process.pid()) ++ "-" ++ int_to_string(frame)
+    let _ = Dir.mkdir_p("screenshots")
+    let _ = Process.set_env("STRATA_SHOT", stem ++ ".ppm")
+    Strata.Ffi.Vk.request_shot()
+    let _ = Process.run("sh", ["-c", "(sleep 1; sips -s format png '" ++ stem ++ ".ppm' --out '" ++ stem ++ ".png' && rm '" ++ stem ++ ".ppm') >/dev/null 2>&1 &"])
+    println("strata_viewer: picture saved as " ++ stem ++ ".png")
+  end
+
   -- STRATA_COMBAT_SCRIPT: the match's scripted players by name; 0 none
   pfn combat_script(name : String) : Int do
     if name == "archer" do 1 else if name == "victim" do 2 else if name == "far" do 3 else if name == "waller" do 4 else 0 end end end end
@@ -1858,7 +1913,7 @@ mod StrataViewer do
     end
   end
 
-  pfn frame_loop(s : Strata.Stream.Stream, fl : Strata.Fluid.Fluid, job : Option(Strata.Fluid.Job), sl : Strata.Render.Render, reg : Strata.Blocks.Registry, cam : Cam, rig : PhysRig, frame : Int, frames : Int, script : Int, hole : (Int, Int, Int), tl : (Int, Int, Int, Int, Int, Int, Int), worst : Float, total : Float, fworst : Float, t_prev : Float, t_mark : Float, vp : NativeF32Arr, snd : Strata.Sound.Sound, aworst : Float, cr : StrataViewer.Figures.Crowd, mt : StrataViewer.Match.MtMatch) : Unit do
+  pfn frame_loop(s : Strata.Stream.Stream, fl : Strata.Fluid.Fluid, job : Option(Strata.Fluid.Job), sl : Strata.Render.Render, reg : Strata.Blocks.Registry, cam : Cam, rig : PhysRig, frame : Int, frames : Int, script : Int, hole : (Int, Int, Int), tl : (Int, Int, Int, Int, Int, Int, Int), worst : Float, total : Float, fworst : Float, t_prev : Float, t_mark : Float, vp : NativeF32Arr, snd : Strata.Sound.Sound, aworst : Float, cr : StrataViewer.Figures.Crowd, mt : StrataViewer.Match.MtMatch, falls : StrataViewer.Falls.FlFalls) : Unit do
     Strata.Ffi.Vk.poll()
     if Strata.Ffi.Vk.should_close() || Strata.Ffi.Vk.key(256) || (frames > 0 && frame >= frames) || (frames > 0 && StrataViewer.Match.won(mt) && Env.get_int("STRATA_COMBAT_HOLD", 0) == 0) do
       match Strata.Render.light_pages() do (pu, pn, pr) -> println("strata_viewer: light pages " ++ int_to_string(pu) ++ " of " ++ int_to_string(pn) ++ " in use (" ++ int_to_string(pn / 32) ++ " MB), " ++ int_to_string(pr) ++ " chunks found none") end
@@ -1984,7 +2039,10 @@ mod StrataViewer do
           let tenths0 = level_tenths(keys0)
           let tenths1 = if k9 && int_and(keys0, 8) == 0 do tenths0 - 1 else if k0 && int_and(keys0, 16) == 0 do tenths0 + 1 else tenths0 end end
           let tenths = if tenths1 < 0 do 0 else if tenths1 > 10 do 10 else tenths1 end end
-          let keys = (if nkey do 1 else 0 end) + (if hkey do 2 else 0 end) + (if hp_now do 4 else 0 end) + (if k9 do 8 else 0 end) + (if k0 do 16 else 0 end) + (10 - tenths) * 256
+          -- P saves a picture of the next frame, once per press
+          let pkey = !scripted && Strata.Ffi.Vk.key(80)
+          if pkey && int_and(keys0, 32) == 0 do take_picture(frame) else () end
+          let keys = (if pkey do 32 else 0 end) + (if nkey do 1 else 0 end) + (if hkey do 2 else 0 end) + (if hp_now do 4 else 0 end) + (if k9 do 8 else 0 end) + (if k0 do 16 else 0 end) + (10 - tenths) * 256
           let snd_n = if nkey && int_and(keys0, 1) == 0 do place_recording(snd_f, frame, x2 +. fx *. 5.0, y2 +. fy *. 5.0, z2 +. fz *. 5.0) else snd_f end
           let snd_lv = if tenths != tenths0 do
               println("strata_viewer: main level " ++ ms2(int_to_float(tenths) /. 10.0))
@@ -2087,6 +2145,8 @@ mod StrataViewer do
               if stall > 0 do (if frame % stall == stall - 1 do Strata.Ffi.Audio.debug_stall(100) else () end) else () end
               -- the figures: walkers moved and every figure advanced, then drawn at their last pose
               let cr2 = StrataViewer.Figures.step(cr, Strata.Stream.world(s3), tphys, dt, frame)
+              -- spray where the island's rivers drop (StrataViewer.Falls): on when playing, off in scripted runs unless STRATA_FALLS=1
+              let falls2 = if sc == 1.0 && Env.get_int("STRATA_FALLS", if scripted do 0 else 1 end) == 1 do StrataViewer.Falls.step(falls, Strata.Stream.world(s3), 5, sea(), x2, z2, frame) else falls end
               let next = if Strata.Render.draw(1.0) do frame + 1 else frame end
               let spent = now -. t_prev
               -- in a soak, name any frame slower than 25 ms and where its time went
@@ -2104,8 +2164,8 @@ mod StrataViewer do
                 else () end
                 if StrataViewer.Figures.walking(cr2) > 0 || Strata.Render.figure_rigs(sl3) > 0 do println("  figures: " ++ int_to_string(float_to_int(Strata.Ffi.Vk.stat(10))) ++ " parts drawn in " ++ int_to_string(float_to_int(Strata.Ffi.Vk.stat(11))) ++ " draws; " ++ int_to_string(float_to_int(Strata.Ffi.Vk.stat(12))) ++ " us preparing them, " ++ int_to_string(float_to_int(Strata.Ffi.Vk.stat(13))) ++ " us of it the draw list; update " ++ ms2(Strata.Ffi.Anim.timing(0) *. 1000.0) ++ " ms; shadow map " ++ int_to_string(float_to_int(Strata.Ffi.Vk.stat(15))) ++ " parts in " ++ int_to_string(float_to_int(Strata.Ffi.Vk.stat(16))) ++ " draws, gpu " ++ ms2(Strata.Ffi.Vk.stat(14)) ++ " ms; traced " ++ int_to_string(float_to_int(Strata.Ffi.Vk.stat(17))) ++ " figures, " ++ int_to_string(float_to_int(Strata.Ffi.Vk.stat(18))) ++ " parts") else () end
                 if Strata.Fluid.active_count(fl2) + Strata.Fluid.dormant_count(fl2) > 0 do println("  fluid: active " ++ int_to_string(Strata.Fluid.active_count(fl2)) ++ ", waiting " ++ int_to_string(Strata.Fluid.waiting_count(fl2)) ++ ", dormant " ++ int_to_string(Strata.Fluid.dormant_count(fl2)) ++ "; last step " ++ ms2(fluid_ms) ++ " ms") else () end
-                frame_loop(s3, fl2, job2, sl3, reg, cam2, rig2, next, frames, script, hole, tl, worst2, total2, fworst2, now, now, vp2, snd2, aworst2, cr2, mt2)
-              else frame_loop(s3, fl2, job2, sl3, reg, cam2, rig2, next, frames, script, hole, tl, worst2, total2, fworst2, now, t_mark, vp2, snd2, aworst2, cr2, mt2) end
+                frame_loop(s3, fl2, job2, sl3, reg, cam2, rig2, next, frames, script, hole, tl, worst2, total2, fworst2, now, now, vp2, snd2, aworst2, cr2, mt2, falls2)
+              else frame_loop(s3, fl2, job2, sl3, reg, cam2, rig2, next, frames, script, hole, tl, worst2, total2, fworst2, now, t_mark, vp2, snd2, aworst2, cr2, mt2, falls2) end
           end
       end
     end
@@ -2710,7 +2770,7 @@ mod StrataViewer do
           let mt0 = if Env.get_int("STRATA_COMBAT", 0) == 1 && !fine do StrataViewer.Match.start(seed, Strata.Stream.world(s1), ex, ey, ez, r, Env.get_int("STRATA_COMBAT_PLAYER", 1) == 1, combat_scene(Env.get("STRATA_COMBAT_SCENE", "")), combat_script(Env.get("STRATA_COMBAT_SCRIPT", "")), Env.get_int("STRATA_COMBAT_WIN", 30), Env.get_int("STRATA_COMBAT_REPEAT", 0)) else StrataViewer.Match.off() end
           let sl_f = if StrataViewer.Match.is_on(mt0) do Strata.Render.figures(sl, StrataViewer.Match.anim(mt0), StrataViewer.Match.rigs(mt0))
             else if StrataViewer.Figures.walking(crowd) > 0 || scene == 31 || scene == 35 do Strata.Render.figures(sl, StrataViewer.Figures.anim(crowd), StrataViewer.Figures.rigs(crowd)) else sl end end
-          frame_loop(s1, Strata.Fluid.with_limits(Strata.Fluid.with_sea_top(Strata.Fluid.new(reg, Cons((lake_base(), Strata.Fluid.flowing()), Cons((5, Strata.Fluid.sea()), Nil))), sea()), Env.get_int("STRATA_FLUID_CAP", 4096), Env.get_int("STRATA_FLUID_REACH", 16), 4), None, sl_f, reg, cam, rig, 0, frames, if soak > 0 do 2 else if scene == 11 && frames > 0 do 1 else if scene == 4 && frames > 0 do 3 else 0 end end end, hole, tl, 0.0, 0.0, 0.0, Strata.Ffi.Vk.time(), Strata.Ffi.Vk.time(), NativeArray.make_f32(16, 0.0), audio_start(frames), 0.0, crowd, mt0)
+          frame_loop(s1, Strata.Fluid.with_limits(Strata.Fluid.with_sea_top(Strata.Fluid.new(reg, Cons((lake_base(), Strata.Fluid.flowing()), Cons((5, Strata.Fluid.sea()), Nil))), sea()), Env.get_int("STRATA_FLUID_CAP", 4096), Env.get_int("STRATA_FLUID_REACH", 16), 4), None, sl_f, reg, cam, rig, 0, frames, if soak > 0 do 2 else if scene == 11 && frames > 0 do 1 else if scene == 4 && frames > 0 do 3 else 0 end end end, hole, tl, 0.0, 0.0, 0.0, Strata.Ffi.Vk.time(), Strata.Ffi.Vk.time(), NativeArray.make_f32(16, 0.0), audio_start(frames), 0.0, crowd, mt0, StrataViewer.Falls.none())
       end
       Strata.Ffi.Vk.close()
     end

@@ -86,3 +86,8 @@ Final: minor (deferred): a retreating shooter faces the way it walks, not its ta
 Final: minor (deferred): a swimmer making for the nearest spawn point can turn back to its own bank; a shooter firing at a submerged player never retargets.
 Final: minor (deferred): no strike sound on a hit and no knockback for the player (both in the design); 196 of 256 rigs used.
 Final: Ruling (declined to judge, now measured): the walking mover puts a fighter out of a block set in its place (trap: 0 inside at frame 420).
+Final: the gate on 06bf059 passed all but the two combat pictures, which the knockback fix moved (the target is pushed up the slope, so the archer's view tips up); looked at and re-stored.
+
+## After the plan (asked for by the user while playing)
+
+Key P saves a picture (PPM by the renderer, turned into a PNG by `sips`). Tall grass left with nothing under it by any edit is removed (the viewer's `edit`). Spray where a river's surface steps down (`StrataViewer.Falls`): found on a worker every 5 s, on when playing only.
