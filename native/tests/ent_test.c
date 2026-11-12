@@ -291,6 +291,204 @@ static void test_hash(void) {
     en_close(a); en_close(b);
 }
 
+/* ---- blocks, the ray and the tick ---- */
+static const uint8_t two_blocks[2] = {0, 1};   /* id 0 air passes, id 1 stops */
+
+/* a chunk of air with one solid voxel at local (lx, ly, lz) */
+static void one_voxel_chunk(EnWorld *w, int cx, int cy, int cz, int lx, int ly, int lz) {
+    static int32_t ids[32768];
+    memset(ids, 0, sizeof ids);
+    ids[lx + 32 * (lz + 32 * ly)] = 1;
+    en_chunk(w, cx, cy, cz, ids);
+}
+
+static void test_masks(void) {
+    EnWorld *w = world(16);
+    en_block_table(w, 2, two_blocks);
+    one_voxel_chunk(w, 1, 0, -1, 3, 4, 5);
+    CHECK(en_solid(w, 32 + 3, 4, -32 + 5) == 1, "the voxel at local (3, 4, 5) of chunk (1, 0, -1) is solid");
+    CHECK(en_solid(w, 32 + 4, 4, -32 + 5) == 0, "the voxel beside it is clear");
+    CHECK(en_solid(w, 32 + 3, 5, -32 + 5) == 0, "the voxel above it is clear");
+    CHECK(en_solid(w, 9 * 32, 9 * 32, 9 * 32) == -1, "chunk (9, 9, 9) is not held");
+    en_chunk_uniform(w, 0, 0, 0, 1);
+    CHECK(en_solid(w, 0, 0, 0) == 1 && en_solid(w, 31, 31, 31) == 1, "a uniform solid chunk is solid throughout");
+    en_chunk_uniform(w, 0, 0, 1, 0);
+    CHECK(en_solid(w, 5, 5, 40) == 0, "a uniform air chunk is clear");
+    en_chunk_drop(w, 0, 0, 0);
+    CHECK(en_solid(w, 0, 0, 0) == -1, "a dropped chunk is not held");
+    CHECK(en_solid(w, 32 + 3, 4, -32 + 5) == 1, "... and the others are kept");
+    en_chunk_uniform(w, 0, 0, 1, 7);
+    CHECK(en_solid(w, 5, 5, 40) == 0, "an id past the block table passes");
+    for (int i = 0; i < 3000; i++) en_chunk_uniform(w, i, -5, i % 7, i & 1);   /* the chunk table grows */
+    CHECK(en_solid(w, 2999 * 32, -5 * 32, (2999 % 7) * 32) == 1 && en_solid(w, 2998 * 32, -5 * 32, (2998 % 7) * 32) == 0,
+          "3,000 more chunks are each held");
+    CHECK(en_solid(w, 32 + 3, 4, -32 + 5) == 1, "... and the first still reads");
+    en_close(w);
+}
+
+static void test_ray(void) {
+    EnWorld *w = world(16);
+    en_block_table(w, 2, two_blocks);
+    en_chunk_uniform(w, 0, -1, 0, 1);    /* a floor: voxels y -32..-1 */
+    en_chunk_uniform(w, 0, 0, 0, 0);
+    one_voxel_chunk(w, -1, 0, 0, 31, 2, 7);   /* voxel (-1, 2, 7) */
+    int32_t out[4]; double t = -9;
+    double o1[3] = {1.65, 2.0, 1.65}, down[3] = {0, -1, 0};
+    CHECK(en_ray(w, o1, down, 10.0, out, &t) == 1, "a ray straight down hits the floor");
+    CHECK(out[0] == 16 && out[1] == -1 && out[2] == 16 && out[3] == 0, "... its top voxel (16, -1, 16), face 0");
+    CHECK(fabs(t - 2.0) < 1e-9, "... 2 m away");
+    CHECK(en_ray(w, o1, down, 1.5, out, &t) == 0, "the same ray of 1.5 m misses");
+    double o2[3] = {0.55, 0.25, 0.75}, west[3] = {-3, 0, 0};
+    CHECK(en_ray(w, o2, west, 5.0, out, &t) == 1, "a ray west across the chunk border hits");
+    CHECK(out[0] == -1 && out[1] == 2 && out[2] == 7 && out[3] == 2, "... voxel (-1, 2, 7) of chunk (-1, 0, 0), face 2");
+    CHECK(fabs(t - 0.55) < 1e-9, "... 0.55 m away");
+    double o3[3] = {1.6, 1.6, 1.6}, east[3] = {1, 0, 0};
+    CHECK(en_ray(w, o3, east, 10.0, out, &t) == -1, "a ray east out of the held chunks answers -1");
+    double zero[3] = {0, 0, 0};
+    CHECK(en_ray(w, o3, zero, 10.0, out, &t) == 0, "a zero direction is a miss");
+    double o4[3] = {1.65, -0.05, 1.65};
+    CHECK(en_ray(w, o4, east, 10.0, out, &t) == 1 && t == 0 && out[1] == -1 && out[3] == 3,
+          "a ray starting inside a solid voxel hits it at 0, by the face facing back along it");
+    en_close(w);
+}
+
+/* a flying kind seen at the cap: gravity flag, gravity m/s2, lifetime */
+static int fly_kind(EnWorld *w, int gravity, float g, float lifetime) {
+    int32_t ki[9];
+    kind_ints(ki, 1, 1, 0, 0, 0);
+    ki[5] = gravity;
+    float fl[7] = {0.1f, 0.1f, 0.1f, 0, lifetime, 0, g};
+    return en_kind(w, ki, fl);
+}
+static double pos_axis(EnWorld *w, int64_t id, int axis) { double v[3]; en_get(w, id, 0, v); return v[axis]; }
+
+/* events of the last tick as (code, a, i0); how many */
+static int events(EnWorld *w, int64_t *ints, double *floats) { return en_events(w, 64, ints, floats); }
+
+static void test_flying(void) {
+    EnWorld *w = world(16);
+    int k = fly_kind(w, 0, 0, 0);
+    int64_t a = en_add(w, k, 0, 0, 0, 0), b = en_add(w, k, 300, 0, 0, 0);
+    double v10[3] = {10, 0, 0};
+    en_set(w, a, 1, v10); en_set(w, b, 1, v10);
+    double focus[3] = {300, 0, 0};
+    en_tick(w, 1, focus, 0.1);
+    CHECK(fabs(pos_axis(w, a, 0) - 1.0) < 1e-6, "unseen, velocity (10, 0, 0) and dt 0.1 advance x by 1.0");
+    CHECK(fabs(pos_axis(w, b, 0) - 301.0) < 1e-6, "seen with no blocks held, the same");
+    CHECK(en_stat(w, 1) == 1, "one of the two is seen");
+    en_tick(w, 1, focus, 0.1); en_tick(w, 1, focus, 0.1);
+    CHECK(fabs(pos_axis(w, a, 0) - 3.0) < 1e-6, "... 1.0 a tick");
+    double age[3]; en_get(w, a, 3, age);
+    CHECK(fabs(age[0] - 0.3) < 1e-9, "three ticks of 0.1 age it 0.3");
+    en_close(w);
+
+    w = world(16);
+    k = fly_kind(w, 1, 10.0f, 0);
+    a = en_add(w, k, 0, 50, 0, 0);
+    for (int i = 0; i < 60; i++) en_tick(w, 0, NULL, 1.0 / 60);
+    CHECK(fabs((50 - pos_axis(w, a, 1)) - 5.0) < 0.1, "gravity 10 from rest falls 5 m in 1 s of 60 ticks, within 0.1");
+    en_close(w);
+}
+
+/* a world with a solid chunk (1, 0, 0) (x from 3.2 m) and air chunk (0, 0, 0), a flyer at x 0.25 going east */
+static EnWorld *wall_world(int64_t *id, double speed) {
+    EnWorld *w = world(16);
+    en_block_table(w, 2, two_blocks);
+    en_chunk_uniform(w, 0, 0, 0, 0);
+    en_chunk_uniform(w, 1, 0, 0, 1);
+    int k = fly_kind(w, 0, 0, 0);
+    *id = en_add(w, k, 0.25, 1.65, 1.65, 0);
+    double v[3] = {speed, 0, 0};
+    en_set(w, *id, 1, v);
+    return w;
+}
+
+static void test_wall(void) {
+    int64_t id, ints[64 * 7]; double floats[64 * 3];
+    EnWorld *w = wall_world(&id, 10);
+    double focus[3] = {0, 0, 0};
+    int hits = 0;
+    for (int i = 0; i < 6; i++) {
+        en_tick(w, 1, focus, 0.1);
+        int n = events(w, ints, floats);
+        for (int e = 0; e < n; e++) if (ints[e * 7] == 2) {
+            hits++;
+            CHECK(ints[e * 7 + 1] == id && ints[e * 7 + 2] == 0, "the block hit names the flyer");
+            CHECK(ints[e * 7 + 3] == 32 && ints[e * 7 + 4] == 16 && ints[e * 7 + 5] == 16 && ints[e * 7 + 6] == 3,
+                  "... the wall voxel (32, 16, 16) and face 3");
+            CHECK(fabs(floats[e * 3] - 3.2) < 1e-6, "... and the point on the wall");
+        }
+    }
+    CHECK(hits == 1, "a seen flyer aimed at a wall 3 m away reports one block hit");
+    CHECK(fabs(pos_axis(w, id, 0) - 3.2) < 1e-6, "it stops at the wall");
+    double v[3]; en_get(w, id, 1, v);
+    CHECK(v[0] == 0 && v[1] == 0 && v[2] == 0, "... with velocity 0");
+    en_close(w);
+
+    w = wall_world(&id, 10);
+    for (int i = 0; i < 6; i++) en_tick(w, 0, NULL, 0.1);
+    CHECK(fabs(pos_axis(w, id, 0) - 6.25) < 1e-6, "the same flyer unseen passes through");
+    CHECK(events(w, ints, floats) == 0, "... reporting nothing");
+    en_close(w);
+
+    w = wall_world(&id, 100);
+    en_tick(w, 1, focus, 10.0);
+    CHECK(fabs(pos_axis(w, id, 0) - 3.2) < 1e-6, "one dt of 10 s at 100 m/s still stops at the wall");
+    CHECK(events(w, ints, floats) == 1 && ints[0] == 2, "... with one block hit");
+    en_close(w);
+}
+
+static void test_lifetime_and_removal(void) {
+    int64_t ints[64 * 7]; double floats[64 * 3];
+    EnWorld *w = world(16);
+    int k = fly_kind(w, 0, 0, 0.5f);
+    int64_t a = en_add(w, k, 1, 2, 3, 0);
+    for (int i = 0; i < 5; i++) en_tick(w, 0, NULL, 0.1);
+    CHECK(en_alive(w, a) && events(w, ints, floats) == 0, "a lifetime of 0.5 s lives through an age of 0.5");
+    en_tick(w, 0, NULL, 0.1);
+    CHECK(!en_alive(w, a), "it is removed on the tick its age passes 0.5");
+    CHECK(events(w, ints, floats) == 1 && ints[0] == 6 && ints[1] == a && ints[3] == 1, "... with event 6, reason 1");
+    CHECK(floats[0] == 1 && floats[1] == 2 && floats[2] == 3, "... at its position");
+    en_tick(w, 0, NULL, 0.1);
+    CHECK(events(w, ints, floats) == 0, "the next tick clears the list");
+    en_close(w);
+
+    w = world(16);
+    k = fly_kind(w, 0, 0, 0);
+    a = en_add(w, k, 4, 5, 6, 0);
+    en_tick(w, 0, NULL, 0.1);
+    en_remove(w, a, 0);
+    int64_t b = en_add(w, k, 0, 0, 0, 0);
+    CHECK((b & EN_ROW_MASK) == (a & EN_ROW_MASK), "B takes removed A's row before the next tick");
+    en_tick(w, 0, NULL, 0.1);
+    CHECK(events(w, ints, floats) == 1 && ints[0] == 6 && ints[1] == a && ints[3] == 0,
+          "the tick after the game removes A lists one event 6 for A, reason 0");
+    CHECK(floats[0] == 4 && floats[1] == 5 && floats[2] == 6, "... at A's last position");
+    CHECK(en_events(w, 0, NULL, NULL) == 1, "the count alone reads 1");
+    en_tick(w, 0, NULL, 0.1);
+    CHECK(events(w, ints, floats) == 0, "a third tick lists none");
+    en_close(w);
+}
+
+static void test_dt_edges(void) {
+    EnWorld *w = world(16);
+    int k = fly_kind(w, 1, 10.0f, 0);
+    int64_t a = en_add(w, k, 1, 2, 3, 0);
+    double v[3] = {5, 5, 5}, p[3], age[3];
+    en_set(w, a, 1, v);
+    en_tick(w, 0, NULL, 0);
+    en_get(w, a, 0, p); en_get(w, a, 3, age);
+    CHECK(p[0] == 1 && p[1] == 2 && p[2] == 3 && age[0] == 0, "dt 0 moves nothing and ages nothing");
+    CHECK(en_stat(w, 4) == 0, "... and is not a negative dt");
+    en_tick(w, 0, NULL, -1);
+    en_get(w, a, 0, p); en_get(w, a, 3, age);
+    CHECK(p[0] == 1 && p[1] == 2 && p[2] == 3 && age[0] == 0, "dt -1 moves nothing and ages nothing");
+    en_get(w, a, 1, v);
+    CHECK(v[0] == 5 && v[1] == 5 && v[2] == 5, "... nor changes the velocity");
+    CHECK(en_stat(w, 4) == 1, "... and stat 4 is 1");
+    en_close(w);
+}
+
 int main(void) {
     test_kinds();
     test_add_and_read();
@@ -302,6 +500,12 @@ int main(void) {
     test_order_after_removal();
     test_seen_cap();
     test_hash();
+    test_masks();
+    test_ray();
+    test_flying();
+    test_wall();
+    test_lifetime_and_removal();
+    test_dt_edges();
     if (fails == 0) printf("ent_test: ok\n");
     return fails == 0 ? 0 : 1;
 }

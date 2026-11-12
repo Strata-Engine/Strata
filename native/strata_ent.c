@@ -3,21 +3,25 @@
  * nothing of Vulkan, GLFW, physics or audio.
  *
  * March values: a NativeArray arrives as its heap pointer, element count at
- * +16, data at +32 (8 bytes an element for NativeIntArr, 4 for NativeI32Arr
- * and NativeF32Arr). Inputs are only read; en_x_each and en_x_column fill a
- * caller-owned array, as strata_anim.c's matrices do. Reads of three numbers
- * come back one number a call (en_x_get's k).
+ * +16, data at +32 (8 bytes an element for NativeIntArr and NativeFloatArr,
+ * 4 for NativeI32Arr and NativeF32Arr, 1 for NativeU8Arr). Inputs are only
+ * read; en_x_each, en_x_column, en_x_ray and en_x_events fill a caller-owned
+ * array, as strata_anim.c's matrices do. Reads of three numbers come back one
+ * number a call (en_x_get's k). Calls March makes only for their effect
+ * answer an Int it can use (GAPS S9).
  *
  * With no world open every call does nothing and answers its default
  * (0, -1 for a kind or an id, 0.0). */
 /* Rewritten by stamp_ent.sh whenever strata_ent.h changes (GAPS S14). */
-#define STRATA_ENT_STAMP "322fea8965c05bc0"
+#define STRATA_ENT_STAMP "e89d7ba304ce4adb"
 #include <stdint.h>
 #include "strata_ent.h"
 
 static EnWorld *g_w;
 
-static const int32_t *en_x_i32(void *a) { return a ? (const int32_t *)((char *)a + 32) : NULL; }
+static int32_t *en_x_i32(void *a) { return a ? (int32_t *)((char *)a + 32) : NULL; }
+static double *en_x_f64(void *a) { return a ? (double *)((char *)a + 32) : NULL; }
+static const uint8_t *en_x_u8(void *a) { return a ? (const uint8_t *)((char *)a + 32) : NULL; }
 static float *en_x_f32(void *a) { return a ? (float *)((char *)a + 32) : NULL; }
 static int64_t *en_x_i64(void *a) { return a ? (int64_t *)((char *)a + 32) : NULL; }
 static int64_t en_x_len(void *a) { return a ? *(const int64_t *)((char *)a + 16) : 0; }
@@ -101,3 +105,69 @@ void en_x_set_column(int64_t kind, int64_t col, void *in) {
 /* the hash, folded to 62 bits so it is the same number as a March Int */
 int64_t en_x_hash(void) { return g_w ? (int64_t)(en_hash(g_w) & 0x3fffffffffffffffull) : 0; }
 double en_x_stat(int64_t which) { return g_w ? en_stat(g_w, (int)which) : 0; }
+
+/* ---- blocks ---- */
+static int en_x_chunk_ok(int64_t cx, int64_t cy, int64_t cz) {
+    return cx >= -EN_CHUNK_COORD_MAX && cx <= EN_CHUNK_COORD_MAX && cy >= -EN_CHUNK_COORD_MAX && cy <= EN_CHUNK_COORD_MAX &&
+           cz >= -EN_CHUNK_COORD_MAX && cz <= EN_CHUNK_COORD_MAX;
+}
+/* which block ids stop, a byte an id (NativeU8Arr, at most 65,536); answers how many ids were taken, or 0 */
+int64_t en_x_block_table(void *collides) {
+    if (!g_w) return 0;
+    int64_t n = en_x_len(collides);
+    if (n > EN_BLOCK_IDS) { en_refuse(g_w, EN_R_VALUE); return 0; }
+    en_block_table(g_w, (int)n, en_x_u8(collides));
+    return n;
+}
+/* hold a chunk from its 32,768 ids (NativeI32Arr, Coord.index order); 1 if held, 0 if refused */
+int64_t en_x_chunk(int64_t cx, int64_t cy, int64_t cz, void *ids) {
+    if (!g_w) return 0;
+    if (!en_x_chunk_ok(cx, cy, cz) || en_x_len(ids) != 32768) { en_refuse(g_w, EN_R_VALUE); return 0; }
+    double before = g_w->refused;
+    en_chunk(g_w, (int)cx, (int)cy, (int)cz, en_x_i32(ids));
+    return g_w->refused == before;
+}
+int64_t en_x_chunk_uniform(int64_t cx, int64_t cy, int64_t cz, int64_t id) {
+    if (!g_w) return 0;
+    if (!en_x_chunk_ok(cx, cy, cz)) { en_refuse(g_w, EN_R_VALUE); return 0; }
+    double before = g_w->refused;
+    en_chunk_uniform(g_w, (int)cx, (int)cy, (int)cz, id < 0 || id >= EN_BLOCK_IDS ? -1 : (int)id);
+    return g_w->refused == before;
+}
+/* answers 1 */
+int64_t en_x_chunk_drop(int64_t cx, int64_t cy, int64_t cz) {
+    if (g_w && en_x_chunk_ok(cx, cy, cz)) en_chunk_drop(g_w, (int)cx, (int)cy, (int)cz);
+    return 1;
+}
+/* 1 solid, 0 clear, -1 not held (or no world) */
+int64_t en_x_solid(int64_t vx, int64_t vy, int64_t vz) {
+    int64_t lim = (int64_t)EN_CHUNK_COORD_MAX * 32;
+    if (!g_w || vx < -lim || vx >= lim || vy < -lim || vy >= lim || vz < -lim || vz >= lim) return -1;
+    return en_solid(g_w, (int)vx, (int)vy, (int)vz);
+}
+/* en_ray: the distance in metres, -1.0 a miss, -2.0 the ray left the held chunks; out (NativeI32Arr of at
+ * least 4) gets the voxel and the face on a hit */
+double en_x_ray(double ox, double oy, double oz, double dx, double dy, double dz, double max, void *out) {
+    if (!g_w || en_x_len(out) < 4) return -1.0;
+    double o[3] = {ox, oy, oz}, d[3] = {dx, dy, dz}, t = 0;
+    int32_t hit[4];
+    int r = en_ray(g_w, o, d, max, hit, &t);
+    if (r == 1) { memcpy(en_x_i32(out), hit, sizeof hit); return t; }
+    return r == 0 ? -1.0 : -2.0;
+}
+
+/* ---- the tick and events ---- */
+/* en_tick with the focus points as a NativeFloatArr of 3 doubles each; answers the events written */
+int64_t en_x_tick(void *focus, double dt) {
+    if (!g_w) return 0;
+    int64_t n = en_x_len(focus) / 3;
+    en_tick(g_w, n > EN_CAPACITY_MAX ? EN_CAPACITY_MAX : (int)n, en_x_f64(focus), dt);
+    return g_w->nev;
+}
+int64_t en_x_event_count(void) { return g_w ? g_w->nev : 0; }
+/* the last tick's events into a NativeIntArr (7 each) and a NativeFloatArr (3 each); how many copied */
+int64_t en_x_events(void *ints, void *floats) {
+    if (!g_w || !ints || !floats) return 0;
+    int64_t a = en_x_len(ints) / 7, b = en_x_len(floats) / 3, n = a < b ? a : b;
+    return en_events(g_w, n > EN_EVENTS ? EN_EVENTS : (int)n, en_x_i64(ints), en_x_f64(floats));
+}

@@ -191,3 +191,14 @@ such a type. Reproduced in a 15-line app (a `List(Holder(Int, Qq))` mapped
 to its `Qq`s). Workaround: `Strata.Rig` and `Strata.Clip` keep rotations as
 `(Float, Float, Float, Float)` tuples inside lists and constructors, and
 build a `Quat` only at the edges.
+
+## S24: calling a function an aliased module lacks reports the alias as an unknown module
+
+With `alias Strata.Entities as En`, a call `En.blocks_world(...)` before
+`blocks_world` existed was reported as "Unknown module `En`" at that line
+and at every other `En.` call in the same function, including ones that
+exist (`En.ev_code`), and a type `Strata.Entities.Event` that did not yet
+exist as "Unknown module `Strata.Entities`". Met writing entcheck's scenes
+ahead of the code (Task 3). Workaround: none needed; read "Unknown module"
+on an alias that plainly exists as "some function or type named through it
+does not exist" and look for the one that is new.

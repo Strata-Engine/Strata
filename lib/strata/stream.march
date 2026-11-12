@@ -59,12 +59,35 @@ mod Strata.Stream do
   --   clock  the last stamp issued
   type Meshing = Meshing(Strata.Store.Store(Int), Strata.Store.Store(Int), Strata.Store.Store(Strata.Mesh.Meshed), List(Strata.Coord.Key), Int)
 
+  -- What has happened to the loaded chunks, kept for two readers that take it
+  -- apart: unloads not yet taken by `take_unloads` (the renderer's), and the
+  -- chunks loaded or edited and the chunks unloaded not yet taken by
+  -- `take_changed` (the entity kernel's). The two sets keep each key once: a
+  -- chunk loaded after it was unloaded leaves the unloaded set, and the
+  -- other way about. (Fields carry `sl_` so no other record shares them,
+  -- GAPS S18, S19.)
+  type ChunkLog = { sl_unloads : List(Strata.Coord.Key), sl_changed : Strata.Store.Store(Bool), sl_dropped : Strata.Store.Store(Bool) }
+
+  pfn no_log() : ChunkLog do { sl_unloads: Nil, sl_changed: So.empty(false), sl_dropped: So.empty(false) } end
+  pfn log_unload(lg : ChunkLog, k : Strata.Coord.Key) : ChunkLog do
+    { sl_unloads: Cons(k, lg.sl_unloads), sl_changed: So.remove(lg.sl_changed, k), sl_dropped: So.put(lg.sl_dropped, k, true) }
+  end
+  pfn log_loaded(lg : ChunkLog, k : Strata.Coord.Key) : ChunkLog do
+    { lg with sl_changed: So.put(lg.sl_changed, k, true), sl_dropped: So.remove(lg.sl_dropped, k) }
+  end
+  -- the loaded keys of [ks] as changed (an edit's dirty chunks)
+  pfn log_edited(lg : ChunkLog, w : Strata.World.World, ks : List(Strata.Coord.Key)) : ChunkLog do
+    match ks do
+      Nil -> lg
+      Cons(k, t) -> log_edited(if Wo.is_loaded(w, k) do log_loaded(lg, k) else lg end, w, t)
+    end
+  end
+
   -- world, config, focus chunks, wanted-and-missing queue (nearest first),
   -- generated chunks waiting for budget, the generation and mesh tasks to
-  -- collect on the next tick, meshing, unloads not yet taken, and the
-  -- generation and mesh tasks started on the last tick (collected the tick
-  -- after next)
-  type Stream = Stream(Strata.World.World, Config, List(Strata.Coord.Key), List(Strata.Coord.Key), List(GenRes), List(GenTask), List(MeshTask), Meshing, List(Strata.Coord.Key), List(GenTask), List(MeshTask))
+  -- collect on the next tick, meshing, the chunk log, and the generation
+  -- and mesh tasks started on the last tick (collected the tick after next)
+  type Stream = Stream(Strata.World.World, Config, List(Strata.Coord.Key), List(Strata.Coord.Key), List(GenRes), List(GenTask), List(MeshTask), Meshing, ChunkLog, List(GenTask), List(MeshTask))
 
   pfn no_mesh(w : Strata.World.World) : Strata.Mesh.Meshed do
     Strata.Mesh.build(Strata.World.registry(w), Strata.Mesh.around_from(fn (dx, dy, dz) -> Strata.Chunk.uniform(0)))
@@ -72,7 +95,7 @@ mod Strata.Stream do
 
   doc "Start streaming [w]. Nothing loads until a focus is set and `tick` is called."
   fn start(w : Strata.World.World, c : Config) : Stream do
-    Stream(w, c, Nil, Nil, Nil, Nil, Nil, Meshing(So.empty(0), So.empty(0), So.empty(no_mesh(w)), Nil, 0), Nil, Nil, Nil)
+    Stream(w, c, Nil, Nil, Nil, Nil, Nil, Meshing(So.empty(0), So.empty(0), So.empty(no_mesh(w)), Nil, 0), no_log(), Nil, Nil)
   end
 
   -- ── Collecting tasks ─────────────────────────────────────────────────────
@@ -213,7 +236,7 @@ mod Strata.Stream do
   end
 
   -- ── Unloading ────────────────────────────────────────────────────────────
-  type Dropped = Dropped(Strata.World.World, Meshing, List(Strata.Coord.Key))
+  type Dropped = Dropped(Strata.World.World, Meshing, ChunkLog)
 
   pfn forget(m : Meshing, k : Strata.Coord.Key) : Meshing do
     match m do
@@ -228,7 +251,7 @@ mod Strata.Stream do
         if near(fs, k, rh(c) + 1, rv(c) + 1) do drop_far(d, t, c, fs)
         else
           match d do
-            Dropped(w, m, gone) -> drop_far(Dropped(Wo.unload(w, k), forget(m, k), Cons(k, gone)), t, c, fs)
+            Dropped(w, m, gone) -> drop_far(Dropped(Wo.unload(w, k), forget(m, k), log_unload(gone, k)), t, c, fs)
           end
         end
     end
@@ -289,7 +312,7 @@ mod Strata.Stream do
     match s do
       Stream(_, c, fs, q, got, gts, mts, m, gone, gts2, mts2) ->
         let w2 = Strata.Edit.world(o)
-        Stream(w2, c, fs, q, got, gts, mts, stale(m, w2, Strata.Edit.dirty(o)), gone, gts2, mts2)
+        Stream(w2, c, fs, q, got, gts, mts, stale(m, w2, Strata.Edit.dirty(o)), log_edited(gone, w2, Strata.Edit.dirty(o)), gts2, mts2)
     end
   end
 
@@ -301,7 +324,7 @@ mod Strata.Stream do
     end
   end
 
-  type Applied = Applied(Strata.World.World, Meshing, List(GenRes))
+  type Applied = Applied(Strata.World.World, Meshing, List(GenRes), ChunkLog)
 
   -- Insert up to n generated chunks; one for a key no longer wanted, or
   -- already loaded, is dropped. What is over budget waits for the next tick.
@@ -310,12 +333,12 @@ mod Strata.Stream do
       Nil -> a
       Cons(GenRes(k, ch), t) ->
         match a do
-          Applied(w, m, rest) ->
+          Applied(w, m, rest, lg) ->
             if !near(fs, k, rh(c), rv(c)) || Wo.is_loaded(w, k) do apply_gens(a, t, n, c, fs)
-            else if n <= 0 do apply_gens(Applied(w, m, Cons(GenRes(k, ch), rest)), t, n, c, fs)
+            else if n <= 0 do apply_gens(Applied(w, m, Cons(GenRes(k, ch), rest), lg), t, n, c, fs)
             else
               let w2 = match ch do Made(c, h) -> Wo.insert_hashed(w, k, c, h) end
-              apply_gens(Applied(w2, arrived(m, w2, k), rest), t, n - 1, c, fs)
+              apply_gens(Applied(w2, arrived(m, w2, k), rest, log_loaded(lg, k)), t, n - 1, c, fs)
             end end
         end
     end
@@ -433,15 +456,15 @@ mod Strata.Stream do
         match await_gens(gts, Got(Nil, Nil)) do
           Got(gens, failed) ->
             let m1 = await_meshes(mts, m)
-            match apply_gens(Applied(w, m1, Nil), append(got, gens), budget(c), c, fs) do
-              Applied(w2, m2, waiting) ->
+            match apply_gens(Applied(w, m1, Nil, gone), append(got, gens), budget(c), c, fs) do
+              Applied(w2, m2, waiting, gone2) ->
                 match send_gens(skip_running(prepend(failed, q), gts_new), Nil, w2, c, fs, waiting, nworkers(c)) do
                   Sent(q2, gts2) ->
                     match take_todo(m2) do
                       (m3, todo) ->
                         match send_meshes(todo, So.empty(false), m3, Nil, Nil, w2, nworkers(c)) do
                           -- what was started last tick is collected next tick; what starts now, the tick after
-                          Asked(m4, mts2, left) -> Stream(w2, c, fs, q2, waiting, gts_new, mts_new, with_todo(m4, left), gone, gts2, mts2)
+                          Asked(m4, mts2, left) -> Stream(w2, c, fs, q2, waiting, gts_new, mts_new, with_todo(m4, left), gone2, gts2, mts2)
                         end
                     end
                 end
@@ -486,7 +509,15 @@ mod Strata.Stream do
   doc "Chunks unloaded since the last take. The renderer frees their meshes."
   fn take_unloads(s : Stream) : (Stream, List(Strata.Coord.Key)) do
     match s do
-      Stream(w, c, fs, q, got, gts, mts, m, gone, gts2, mts2) -> (Stream(w, c, fs, q, got, gts, mts, m, Nil, gts2, mts2), gone)
+      Stream(w, c, fs, q, got, gts, mts, m, gone, gts2, mts2) -> (Stream(w, c, fs, q, got, gts, mts, m, { gone with sl_unloads: Nil }, gts2, mts2), gone.sl_unloads)
+    end
+  end
+
+  doc "Chunks loaded or edited, and chunks unloaded, since the last take: each chunk once, in one list or the other. Apart from `take_meshes` and `take_unloads`, which the renderer empties; Strata.Entities reads this to keep its copy of the blocks. Until taken, the keys are kept: a stream nobody takes from keeps one key for each chunk unloaded and not loaded again."
+  fn take_changed(s : Stream) : (Stream, List(Strata.Coord.Key), List(Strata.Coord.Key)) do
+    match s do
+      Stream(w, c, fs, q, got, gts, mts, m, gone, gts2, mts2) ->
+        (Stream(w, c, fs, q, got, gts, mts, m, { gone with sl_changed: So.empty(false), sl_dropped: So.empty(false) }, gts2, mts2), So.keys(gone.sl_changed), So.keys(gone.sl_dropped))
     end
   end
 
