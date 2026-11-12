@@ -5,16 +5,18 @@
  * March values: a NativeArray arrives as its heap pointer, element count at
  * +16, data at +32 (8 bytes an element for NativeIntArr and NativeFloatArr,
  * 4 for NativeI32Arr and NativeF32Arr, 1 for NativeU8Arr). Inputs are only
- * read; en_x_each, en_x_column, en_x_ray and en_x_events fill a caller-owned
+ * read; en_x_each, en_x_column, en_x_ray, en_x_events, en_x_near and
+ * en_x_ray_entities fill a caller-owned
  * array, as strata_anim.c's matrices do. Reads of three numbers come back one
  * number a call (en_x_get's k). Calls March makes only for their effect
  * answer an Int it can use (GAPS S9).
  *
  * With no world open every call does nothing and answers its default
  * (0, -1 for a kind or an id, 0.0). */
-/* Rewritten by stamp_ent.sh whenever strata_ent.h changes (GAPS S14). */
-#define STRATA_ENT_STAMP "e89d7ba304ce4adb"
+/* Rewritten by stamp_ent.sh whenever strata_ent.h or strata_ent_grid.h changes (GAPS S14). */
+#define STRATA_ENT_STAMP "b92b3eecb5ce6eeb"
 #include <stdint.h>
+#include <time.h>
 #include "strata_ent.h"
 
 static EnWorld *g_w;
@@ -170,4 +172,35 @@ int64_t en_x_events(void *ints, void *floats) {
     if (!g_w || !ints || !floats) return 0;
     int64_t a = en_x_len(ints) / 7, b = en_x_len(floats) / 3, n = a < b ? a : b;
     return en_events(g_w, n > EN_EVENTS ? EN_EVENTS : (int)n, en_x_i64(ints), en_x_f64(floats));
+}
+
+/* ---- the grid: touch pairs, near, the entity ray ---- */
+/* ask for touches between two kinds; 1 if taken, 0 if refused */
+int64_t en_x_touching(int64_t kind_a, int64_t kind_b) {
+    if (!g_w) return 0;
+    if (!en_x_kind_ok(kind_a) || !en_x_kind_ok(kind_b)) { en_refuse(g_w, EN_R_KIND); return 0; }
+    en_touching(g_w, (int)kind_a, (int)kind_b);
+    return 1;
+}
+/* en_near into a caller-owned NativeIntArr, sorted by id: how many written; with an empty array, how many there are */
+int64_t en_x_near(double x, double y, double z, double radius, int64_t mask, void *out) {
+    if (!g_w) return 0;
+    double p[3] = {x, y, z};
+    int64_t n = en_x_len(out);
+    if (n <= 0) return en_near(g_w, p, radius, (uint64_t)mask, 0, NULL);
+    return en_near(g_w, p, radius, (uint64_t)mask, n > EN_CAPACITY_MAX ? EN_CAPACITY_MAX : (int)n, en_x_i64(out));
+}
+/* en_ray_entities: the id, or -1; on a hit the distance in metres into out[0] (a NativeFloatArr of at least 1) */
+int64_t en_x_ray_entities(double ox, double oy, double oz, double dx, double dy, double dz, double max, int64_t mask, void *out) {
+    if (!g_w || en_x_len(out) < 1) return -1;
+    double o[3] = {ox, oy, oz}, d[3] = {dx, dy, dz}, t = 0;
+    int64_t id = en_ray_entities(g_w, o, d, max, (uint64_t)mask, &t);
+    if (id >= 0) en_x_f64(out)[0] = t;
+    return id;
+}
+/* seconds on a monotonic clock, for timing scenes; the kernel never reads it (its time is the dt it is given) */
+double en_x_clock(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (double)t.tv_sec + (double)t.tv_nsec * 1e-9;
 }

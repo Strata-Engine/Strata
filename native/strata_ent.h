@@ -27,7 +27,8 @@
  *
  * Sections: kinds; rows and ids; slots and parts; each and columns; hash and
  * stats; blocks (the kernel's one-bit-a-voxel copy of the loaded chunks);
- * the ray; events; the tick. */
+ * the ray; events; the grid, near, the entity ray and touch pairs (in
+ * strata_ent_grid.h, included here); the tick. */
 #ifndef STRATA_ENT_H
 #define STRATA_ENT_H
 #include <stdint.h>
@@ -47,6 +48,8 @@
 #define EN_EVENTS 65536            /* events a tick, and removals queued between ticks, at most */
 #define EN_BLOCK_IDS 65536         /* block ids are sixteen bits */
 #define EN_CHUNK_COORD_MAX (1 << 25) /* |chunk coordinate| at most: its voxels fit an int */
+#define EN_CELL 4.0                /* the grid's cell, metres */
+#define EN_CELL_MAX 1000000000.0   /* |grid cell coordinate| at most; farther positions share the last cell */
 
 /* a row's flags */
 enum { EN_F_SEEN = 1, EN_F_STUCK = 2 };   /* seen this tick; a flyer that hit a block, still until the game moves it */
@@ -80,6 +83,14 @@ typedef struct {
     int32_t cx, cy, cz, state;
     uint8_t *mask;               /* 4096 bytes, bit Coord.index(x, y, z) is bit i % 8 of byte i / 8; state 4 only */
 } EnChunk;
+
+/* an entity in the grid, as the last tick left it (strata_ent_grid.h) */
+typedef struct {
+    int64_t id;
+    double p[3];                 /* position */
+    double lo[3], hi[3];         /* touch box: the box swept over the tick's step */
+    int32_t cell[3], kind;
+} EnGridEnt;
 
 /* a removal made between ticks, written as event 6 at the start of the next tick */
 typedef struct { int64_t id; int32_t reason; double pos[3]; } EnRemoval;
@@ -122,6 +133,16 @@ struct EnWorld {
     EnRemoval *removed; int nremoved;
     int in_tick;
     double bad_dt, dropped; int seen;
+    /* the grid (strata_ent_grid.h) */
+    double *from;                /* 3 a row: the position the tick's step began at */
+    EnGridEnt *g_ent;            /* capacity: the last tick's live entities, bucket by bucket */
+    int32_t *g_start;            /* g_nbmax + 1: bucket b is g_ent[g_start[b] .. g_start[b+1]) */
+    int32_t *g_bucket;           /* capacity: each entry's bucket, while building */
+    int32_t *g_byk;              /* capacity: kind by kind in dense order, each entry's index in g_ent */
+    int32_t g_kstart[EN_KINDS + 1];   /* kind k's entries are g_byk[g_kstart[k] .. g_kstart[k+1]) */
+    double g_reach[EN_KINDS][3]; /* how far any of the kind's touch boxes reaches from its position, a side */
+    int g_n, g_nb, g_nbmax;      /* entries, buckets this tick (a power of 2), buckets at most */
+    uint64_t pairs[EN_KINDS];    /* bit j of pairs[i], i <= j: touches between kinds i and j are asked for */
 };
 typedef struct EnWorld EnWorld;
 
@@ -133,6 +154,7 @@ static inline void en_close(EnWorld *w) {
     free(w->kind); free(w->gen); free(w->dense_at); free(w->dense); free(w->pos); free(w->vel);
     free(w->facing); free(w->age); free(w->fslot); free(w->islot); free(w->part); free(w->free_rows);
     free(w->flags); free(w->stops); free(w->ev_ints); free(w->ev_floats); free(w->removed);
+    free(w->from); free(w->g_ent); free(w->g_start); free(w->g_bucket); free(w->g_byk);
     if (w->chunks) for (int i = 0; i < w->chunk_cap; i++) free(w->chunks[i].mask);
     free(w->chunks);
     free(w);
@@ -171,9 +193,17 @@ static inline EnWorld *en_open(int capacity, int route_points, int bodies, doubl
     w->ev_ints = (int64_t *)malloc((size_t)EN_EVENTS * 7 * sizeof *w->ev_ints);
     w->ev_floats = (double *)malloc((size_t)EN_EVENTS * 3 * sizeof *w->ev_floats);
     w->removed = (EnRemoval *)malloc((size_t)EN_EVENTS * sizeof *w->removed);
+    w->g_nbmax = 16;
+    while (w->g_nbmax < 2 * capacity) w->g_nbmax <<= 1;
+    w->from = (double *)calloc(n * 3, sizeof *w->from);
+    w->g_ent = (EnGridEnt *)malloc(n * sizeof *w->g_ent);
+    w->g_start = (int32_t *)calloc((size_t)w->g_nbmax + 1, sizeof *w->g_start);
+    w->g_bucket = (int32_t *)malloc(n * sizeof *w->g_bucket);
+    w->g_byk = (int32_t *)malloc(n * sizeof *w->g_byk);
     if (!w->kind || !w->gen || !w->dense_at || !w->dense || !w->pos || !w->vel || !w->facing || !w->age ||
         !w->fslot || !w->islot || !w->part || !w->free_rows || !w->flags || !w->stops || !w->chunks ||
-        !w->ev_ints || !w->ev_floats || !w->removed) { en_close(w); return NULL; }
+        !w->ev_ints || !w->ev_floats || !w->removed || !w->from || !w->g_ent || !w->g_start || !w->g_bucket ||
+        !w->g_byk) { en_close(w); return NULL; }
     for (int r = 0; r < capacity; r++) {
         w->kind[r] = -1; w->gen[r] = 1;
         w->free_rows[r] = capacity - 1 - r;   /* row 0 handed out first */
@@ -666,6 +696,8 @@ static inline int en_events(const EnWorld *w, int max, int64_t *ints, double *fl
     return n;
 }
 
+#include "strata_ent_grid.h"
+
 /* ---- the tick ---- */
 /* seen: within the kind's seen distance of any focus, measured horizontally (x and z) */
 static inline int en_seen_by(const double *p, double dist, int nfocus, const double *focus) {
@@ -706,7 +738,9 @@ static inline void en_fly(EnWorld *w, int r, const EnKind *kd, double dt) {
  * (reason 1, event 6); the seen flag is set from the focus points (nfocus of them, 3 doubles each; none: all
  * unseen); flying entities move (en_fly), placed ones do not. A flyer stopped by a block stays until the game
  * sets its position or velocity. dt negative or not finite is counted (en_stat(4)) and taken as 0. Entities
- * added between ticks take part from the next tick: every live entity does. */
+ * added between ticks take part from the next tick: every live entity does. Last, the grid is rebuilt from the
+ * rows still live (en_grid_build) and the declared touch pairs tested on it (en_touches): an entity removed in
+ * the tick is in neither. */
 static inline void en_tick(EnWorld *w, int nfocus, const double *focus, double dt) {
     if (!isfinite(dt) || dt < 0) { w->bad_dt += 1; dt = 0; }
     if (nfocus < 0 || !focus) nfocus = 0;
@@ -726,6 +760,7 @@ static inline void en_tick(EnWorld *w, int nfocus, const double *focus, double d
             int r = dense[i];
             w->age[r] += dt;
             if (life > 0 && w->age[r] > life) { en_remove(w, en_id(w, r), 1); continue; }
+            memcpy(w->from + r * 3, w->pos + r * 3, 3 * sizeof *w->pos);
             int s = en_seen_by(w->pos + r * 3, kd->floats[EN_K_SEEN], nfocus, focus);
             w->flags[r] = (uint8_t)((w->flags[r] & ~EN_F_SEEN) | (s ? EN_F_SEEN : 0));
             seen += s;
@@ -734,6 +769,8 @@ static inline void en_tick(EnWorld *w, int nfocus, const double *focus, double d
         }
     }
     w->seen = seen;
+    en_grid_build(w);
+    en_touches(w);
     w->in_tick = 0;
 }
 
