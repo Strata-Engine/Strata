@@ -3,10 +3,9 @@
 Where the CPU time of one island surface chunk goes, stage by stage.
 
 ```sh
-bench/chunk_stages/build.sh     # builds the harness with both compilers
+bench/chunk_stages/build.sh     # builds the harness
 bench/chunk_stages/run.sh       # every stage: CPU us, instructions, cycles a chunk
 bench/chunk_stages/run.sh 5 11  # only the thermal relax and the density
-COMPILER=default bench/chunk_stages/run.sh   # the binary `forge build` makes by default
 ```
 
 The viewer must have run once, so that `viewer/.march/atlas` holds the island
@@ -28,11 +27,8 @@ lake flag cleared, or both, to size the river damp and the lake-rim search.
 river samples per window and how many chunks of each chunk column are
 generated in full.
 
-`build.sh` makes two binaries because `forge build` does not use the `march`
-that `scripts/env.sh` puts on `PATH`: it puts the toolchain `~/.march/current`
-names (March 0.5.0 here) ahead of it. `out/chunk_stages_default` is that
-build; `out/chunk_stages_main` is built with `MARCH_HOME` pointing at an
-empty directory, which makes forge fall back to `PATH` (march-main, 0.7.0).
-`run.sh` uses the march-main binary unless `COMPILER=default`.
+`build.sh` builds with the compiler `scripts/env.sh` names. (Until 12
+November 2026 forge silently used March 0.5.0 from `~/.march/current`; the
+findings' first tables compare the two.)
 
 Results and what they mean: `docs/2026-11-12-chunk-performance-findings.md`.

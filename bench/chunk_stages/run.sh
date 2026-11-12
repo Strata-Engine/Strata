@@ -6,9 +6,8 @@
 # once so that viewer/.march/atlas holds the island atlas.
 #   ./run.sh            every stage
 #   ./run.sh 5 11       only stages 5 and 11
-#   COMPILER=default ./run.sh   the binary forge builds by default (see build.sh); main is march-main
 cd "$(dirname "$0")/../.." || exit 1
-BIN=bench/chunk_stages/out/chunk_stages_${COMPILER:-main}
+BIN=bench/chunk_stages/out/chunk_stages_main
 [ -x "$BIN" ] || { echo "run bench/chunk_stages/build.sh first"; exit 1; }
 export STRATA_ATLAS_DIR=viewer/.march/atlas MARCH_PIN_MAIN=1
 REPS=${REPS:-10}

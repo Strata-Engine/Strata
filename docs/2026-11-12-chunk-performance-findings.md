@@ -413,6 +413,62 @@ algorithm) do.
 Early-outs: 27 us today; about 9 us with gap 1 closed; about 2 us shared per
 column (restructuring 1).
 
+## Addendum, the same evening: after March 07b58d065
+
+Everything above was measured on March 0.5.0 and on march-main at
+1a4251bc8, with the generator as it stood at 5960ca3. Since then March
+main gained the Float-valued-`if` fix (march-language/march#1263, merged as
+07b58d065; it also has short-circuit `&&` and `||` and faster array
+access), and Strata's main (acd6697) builds only with March main. Measured
+again with the same harness on Strata main at acd6697 and March 07b58d065:
+
+| stage | CPU us before | CPU us now |
+|---|---:|---:|
+| **`island_full`, whole chunk** | **11 765** | **4 050** |
+| instructions, whole chunk (k) | 224 577 | 63 967 |
+| column heights (`cols3_go`) | 5 435 | 1 980 |
+| ... river damp | 2 285 | 570 |
+| ... lake-rim search | 1 315 | 200 |
+| ... the rest | 1 810 | 1 095 |
+| thermal relax | 1 700 | 225 |
+| `area_n`, all | 7 540 | 2 370 |
+| per-voxel density | 2 255 | 250 |
+| `any_cut` and `drop_islands` | 535 | 425 |
+| scan and its rule | 285 | 290 |
+| `finish_go` | 325 | 125 |
+| `Chunk.from_flat` | 245 | 120 |
+| trees (candidates and blits) | 295 | 275 |
+| C fields and fills | 135 | 150 |
+| air early-out | 26.7 | 4.0 |
+| stone early-out | 26.6 | 3.8 |
+
+The chunk is 2.9 times cheaper with no change to the generator's
+algorithm; the projection for "gap 1 closed" was 5.1 ms. The early-outs now
+meet their 20 us target. The reduced cases on the same compiler: `float_if`
+0.85 ns (was 22.3; C 0.56), `stage_thermal` 9.8 ns (was 110; C 3.4),
+`stage_density` 6.1 ns (was 71 to 85; C 2.8), `voxel_loop` 1.75 ns (was
+3.70; C 0.56), `short_circuit` 0.49 ns and the right side no longer runs
+(was 18.2). Unchanged: `shared_tasks` (692 ns a read from 8 tasks),
+`callee_fill` (the caller's array is still not filled), `list_walk` from
+the list (11.1 ns), `hash64` in lanes (28.3 ns). On current March the hand
+rewrites "with no Float-valued `if`" are now slower than the plain code
+(13.6 against 9.8 ns in the thermal relax), so nothing in Strata should be
+rewritten that way.
+
+What is left is mostly the column stage: 2.37 ms of the 4.05, still made
+over 66 x 66 columns and still once per chunk of a column (4.9 a column).
+Restructuring 1 is now worth about 1.9 to 2.1 ms a chunk (2.37 less 2.37 /
+4.9, or less 1.27 / 4.9 with 48 x 48 tiles) and would bring the chunk to
+about 2 ms; the river damp and rim search together are 0.9 ms before it.
+The stages after `area_n` sum to 1.7 ms, of which `drop_islands` (0.43),
+the scan (0.29) and the trees (0.28) are the largest: March's array-call
+and closure overheads (gaps 2 and 7) and the 32-bit-lane hash (gap 6).
+
+The bench sources now wrap `Env.get_int` and `println` in `Authority.must`,
+which current March requires, so they no longer build with 0.5.0 or
+1a4251bc8; `bench/chunk_stages/build.sh` builds one binary with the
+compiler `scripts/env.sh` names.
+
 ## To reproduce
 
 ```sh
@@ -420,9 +476,7 @@ column (restructuring 1).
 (cd viewer && forge build --release)            # and run it once, for the atlas
 bench/chunk_stages/build.sh
 bench/chunk_stages/run.sh                       # the breakdown, march-main build
-COMPILER=default bench/chunk_stages/run.sh      # the build forge makes by default
 bench/march/run_all.sh                          # the reduced cases
-MARCH=$HOME/.march/versions/v0.5.0/bin/march bench/march/run_all.sh
 ```
 
 The profile: start `STAGE=1 REPS=60
