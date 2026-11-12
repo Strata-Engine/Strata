@@ -200,6 +200,13 @@ though `Strata.Anim` exists and compiles. The message names the module, not
 the missing function. Workaround: read it as "no such function in that
 module" and check the name.
 
+Met again through an alias (entities Task 3): with `alias Strata.Entities as
+En`, a call `En.blocks_world(...)` before `blocks_world` existed was reported
+as "Unknown module `En`" at that line and at every other `En.` call in the
+same function, including ones that exist, and a type not yet written
+(`Strata.Entities.Event`) as "Unknown module `Strata.Entities`". Same reading:
+look for the one name that is new.
+
 ## S25: a String reaches a C extern as the runtime's own value
 
 An `extern` parameter of type `String` arrives in C as the runtime's string

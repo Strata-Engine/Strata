@@ -13,6 +13,7 @@ mod Entcheck do
   needs Ent
 
   alias Strata.Entities as En
+  alias Strata.Ffi.Ent as Ech
 
   pfn fail(msg : String) : Int do
     println(msg)
@@ -300,15 +301,175 @@ mod Entcheck do
     report("closed", bad + bad2 + bad3 + bad4)
   end
 
+  -- ── Blocks: a world built with Strata.Edit ───────────────────────────────
+  -- ids: 1 stone, 2 glass (stops, see-through), 3 a plant (cross: never stops), 4 a ghost (collides false)
+  pfn reg_add(r : Strata.Blocks.Registry, d : Strata.Blocks.Def) : Strata.Blocks.Registry do
+    match Strata.Blocks.register(r, d) do
+      Ok((r2, _)) -> r2
+      Err(_) -> r
+    end
+  end
+  pfn registry() : Strata.Blocks.Registry do
+    let r1 = reg_add(Strata.Blocks.empty(), Strata.Blocks.def())
+    let r2 = reg_add(r1, Strata.Blocks.with_opacity(Strata.Blocks.def(), Strata.Blocks.SeeThrough))
+    let r3 = reg_add(r2, Strata.Blocks.with_style(Strata.Blocks.with_opacity(Strata.Blocks.def(), Strata.Blocks.Clear), Strata.Blocks.Cross))
+    reg_add(r3, Strata.Blocks.with_collide(Strata.Blocks.def(), false))
+  end
+  -- what Strata.Query must stop at to agree with the kernel: collides, and not a cross
+  pfn stops(r : Strata.Blocks.Registry) : Int -> Bool do
+    fn id -> if Strata.Blocks.collides(r, id) do Strata.Blocks.style_index(r, id) != 1 else false end
+  end
+
+  -- chunks x -2..1, y -1..1, z -2..1 of air, loaded, at 0.1 m a voxel: a box 12.8 x 9.6 x 12.8 m
+  pfn air_go(w : Strata.World.World, i : Int) : Strata.World.World do
+    if i >= 48 do w
+    else air_go(Strata.World.insert(w, Strata.Coord.key(i % 4 - 2, (i / 4) % 3 - 1, i / 12 - 2), Strata.Chunk.uniform(0)), i + 1) end
+  end
+  pfn pillars_go(w : Strata.World.World, i : Int) : Strata.World.World do
+    if i >= 40 do w
+    else
+      let h = Strata.Seed.cell(41, 1, i, 0, 0)
+      let px = h % 120 - 60
+      let pz = (h / 128) % 120 - 60
+      let top = (h / 16384) % 50 + 3
+      let id = (h / 1048576) % 4 + 1
+      pillars_go(Strata.Edit.world(Strata.Edit.fill_box(w, px, 0, pz, px + 2, top, pz + 2, id)), i + 1)
+    end
+  end
+  -- flat stone ground under y = 0 (the whole lowest layer, and one voxel more), with 40 pillars of the four blocks
+  pfn ground_world() : Strata.World.World do
+    let w0 = air_go(Strata.World.new(registry(), Strata.Terrain.gen(fn (k, seed) -> Strata.Chunk.uniform(0)), 41, 0.1), 0)
+    let w1 = Strata.Edit.world(Strata.Edit.fill_box(w0, -64, -32, -64, 63, -1, 63, 1))
+    pillars_go(w1, 0)
+  end
+
+  -- one ray: (1 if the two disagree, a hit, a hit on a pillar (voxel y >= 0), a miss, a ray that left the held chunks)
+  pfn ray_one(w : Strata.World.World, stop : Int -> Bool, out : NativeI32Arr, i : Int) : (Int, Int, Int, Int, Int) do
+    let h1 = Strata.Seed.cell(41, 2, i, 0, 0)
+    let h2 = Strata.Seed.next(h1)
+    let h3 = Strata.Seed.next(h2)
+    let h4 = Strata.Seed.next(h3)
+    let h5 = Strata.Seed.next(h4)
+    let h6 = Strata.Seed.next(h5)
+    let h7 = Strata.Seed.next(h6)
+    let ox = 12.0 *. Strata.Seed.unit(h1) -. 6.0
+    let oy = 5.0 *. Strata.Seed.unit(h2) +. 0.05
+    let oz = 12.0 *. Strata.Seed.unit(h3) -. 6.0
+    let dx = 2.0 *. Strata.Seed.unit(h4) -. 1.0
+    let dy = 2.0 *. Strata.Seed.unit(h5) -. 1.0
+    let dz = 2.0 *. Strata.Seed.unit(h6) -. 1.0
+    let max = 15.0 *. Strata.Seed.unit(h7) +. 0.5
+    let want = Strata.Query.raycast(w, ox, oy, oz, dx, dy, dz, max, stop)
+    let got = Ech.ray(ox, oy, oz, dx, dy, dz, max, out)
+    if Strata.Query.is_hit(want) do
+      let same = got >= 0.0 && NativeArray.get_i32(out, 0) == Strata.Query.hit_x(want) && NativeArray.get_i32(out, 1) == Strata.Query.hit_y(want)
+        && NativeArray.get_i32(out, 2) == Strata.Query.hit_z(want) && NativeArray.get_i32(out, 3) == Strata.Query.hit_face(want)
+        && Math.abs(got -. Strata.Query.hit_dist(want)) < 0.0001
+      if same do (0, 1, if Strata.Query.hit_y(want) >= 0 do 1 else 0 end, 0, 0)
+      else (fail("  ray " ++ int_to_string(i) ++ ": Strata.Query hits (" ++ int_to_string(Strata.Query.hit_x(want)) ++ ", " ++ int_to_string(Strata.Query.hit_y(want)) ++ ", " ++ int_to_string(Strata.Query.hit_z(want)) ++ ") face " ++ int_to_string(Strata.Query.hit_face(want)) ++ " at " ++ float_to_string(Strata.Query.hit_dist(want)) ++ "; the kernel answers " ++ float_to_string(got) ++ " (" ++ int_to_string(NativeArray.get_i32(out, 0)) ++ ", " ++ int_to_string(NativeArray.get_i32(out, 1)) ++ ", " ++ int_to_string(NativeArray.get_i32(out, 2)) ++ ") face " ++ int_to_string(NativeArray.get_i32(out, 3))), 0, 0, 0, 0) end
+    else if got == -1.0 do (0, 0, 0, 1, 0)
+    else if got == -2.0 do (0, 0, 0, 0, 1)
+    else (fail("  ray " ++ int_to_string(i) ++ ": Strata.Query misses; the kernel answers " ++ float_to_string(got)), 0, 0, 0, 0) end end end
+  end
+  pfn rays_go(w : Strata.World.World, stop : Int -> Bool, out : NativeI32Arr, i : Int, n : Int, acc : (Int, Int, Int, Int, Int)) : (Int, Int, Int, Int, Int) do
+    if i >= n do acc
+    else
+      let (b, h, p, m, l) = ray_one(w, stop, out, i)
+      let (b0, h0, p0, m0, l0) = acc
+      rays_go(w, stop, out, i + 1, n, (b0 + b, h0 + h, p0 + p, m0 + m, l0 + l))
+    end
+  end
+
+  -- ray: 2,000 seeded rays through flat ground with pillars; the kernel and Strata.Query agree on every one
+  pfn ray_scene() : Int do
+    let w = ground_world()
+    let e = En.blocks_world(world([flyer(0, 0)], 16), w)
+    let (bad, hits, pillar, misses, left) = rays_go(w, stops(Strata.World.registry(w)), NativeArray.make_i32(4, 0), 0, 2000, (0, 0, 0, 0, 0))
+    println("  " ++ int_to_string(hits) ++ " hits (" ++ int_to_string(pillar) ++ " on pillars), " ++ int_to_string(misses) ++ " misses, " ++ int_to_string(left) ++ " left the held chunks")
+    report("ray", bad + check(hits >= 500, "at least 500 of the rays hit")
+      + check(pillar >= 50, "at least 50 of them on a pillar")
+      + check(misses + left >= 100, "at least 100 miss")
+      + check(!En.is_open(En.close(e)), "closed"))
+  end
+
+  -- a glass wall 0.4 m thick, its near face at x = 4.0 m, across the whole box
+  pfn wall_world() : Strata.World.World do
+    let w0 = air_go(Strata.World.new(registry(), Strata.Terrain.gen(fn (k, seed) -> Strata.Chunk.uniform(0)), 41, 0.1), 0)
+    Strata.Edit.world(Strata.Edit.fill_box(w0, 40, -32, -64, 43, 63, 63, 2))
+  end
+  -- 1,000 bullets on a 40 x 25 grid at x = -5 m, each going east at 50 m/s
+  pfn fire_go(e : Strata.Entities.Entities, i : Int) : Strata.Entities.Entities do
+    if i >= 1000 do e
+    else
+      let (e1, id) = En.add(e, 0, -5.0, 0.15 +. int_to_float(i / 40) *. 0.25, -6.0 +. int_to_float(i % 40) *. 0.3, 0.0)
+      fire_go(En.set_velocity(e1, id, 50.0, 0.0, 0.0), i + 1)
+    end
+  end
+  -- (block hits, hits whose block is not the wall's or whose point is not on its face); each hit's
+  -- entity is marked in [seen] (a byte a row), so a second hit by one bullet is counted as wrong too
+  pfn hits_go(evs : List(Strata.Entities.Event), seen : NativeU8Arr, n : Int, wrong : Int) : (NativeU8Arr, Int, Int) do
+    match evs do
+      Nil -> (seen, n, wrong)
+      Cons(v, t) ->
+        if En.ev_code(v) != 2 do hits_go(t, seen, n, wrong)
+        else
+          let (px, _py, _pz) = En.ev_point(v)
+          let (vx, _vy, _vz) = En.ev_voxel(v)
+          let row = row_of(En.ev_a(v))
+          let first = if row < 2048 do NativeArray.get_u8(seen, row) == 0 else false end
+          let ok = first && En.ev_block(v) == 2 && En.ev_face(v) == 3 && vx == 40 && Math.abs(px -. 4.0) < 0.0001
+          let seen2 = if first do NativeArray.set_u8(seen, row, 1) else seen end
+          hits_go(t, seen2, n + 1, if ok do wrong else wrong + 1 end)
+        end
+    end
+  end
+  pfn count_u8(a : NativeU8Arr, i : Int, n : Int) : Int do
+    if i >= NativeArray.length_u8(a) do n else count_u8(a, i + 1, n + NativeArray.get_u8(a, i)) end
+  end
+  pfn volley_go(e : Strata.Entities.Entities, w : Strata.World.World, seen : NativeU8Arr, tick : Int, n : Int, wrong : Int) : (Strata.Entities.Entities, Int, Int, Int) do
+    if tick >= 30 do (e, n, wrong, count_u8(seen, 0, 0))
+    else
+      let e1 = En.step(e, [(0.0, 1.0, 0.0)], 1.0 /. 60.0)
+      let (seen1, n1, w1) = hits_go(En.events(e1, w), seen, n, wrong)
+      volley_go(e1, w, seen1, tick + 1, n1, w1)
+    end
+  end
+  -- every bullet's position, from the position column, on the wall's face (x = 4.0)
+  pfn at_wall(p : NativeF32Arr, i : Int) : Bool do
+    if i >= NativeArray.length_f32(p) / 3 do true
+    else if Math.abs(NativeArray.get_f32(p, 3 * i) -. 4.0) > 0.0001 do false
+    else at_wall(p, i + 1) end end
+  end
+
+  -- bullets: 1,000 flyers fired at a glass wall each report one block hit, of the wall's block
+  pfn bullets_scene() : Int do
+    let w = wall_world()
+    let e0 = En.blocks_world(world([En.with_mover(En.kind(), En.flying(), 0.05, 0.05, 0.05, 0.0, 0.0)], 2048), w)
+    let e1 = fire_go(e0, 0)
+    let (e2, hits, wrong, distinct) = volley_go(e1, w, NativeArray.make_u8(2048, 0), 0, 0, 0)
+    let first = NativeArray.get_int(En.each(e2, 0), 0)
+    let (fx, _fy, _fz) = En.position(e2, first)
+    println("  " ++ int_to_string(hits) ++ " block hits in 30 ticks")
+    report("bullets", check(hits == 1000, "1,000 block hits")
+      + check(distinct == 1000, "from 1,000 different bullets: one hit each")
+      + check(at_wall(En.column(e2, 0, En.col_position()), 0), "every row of the position column is on the wall")
+      + check(wrong == 0, "each of the wall's block (glass, id 2), at voxel x 40, face 3, on x = 4.0 m")
+      + check(Math.abs(fx -. 4.0) < 0.0001 && En.velocity(e2, first) == (0.0, 0.0, 0.0), "a bullet rests on the wall")
+      + check(live(e2) == 1000 && refused(e2) == 0, "all still live, nothing refused")
+      + check(!En.is_open(En.close(e2)), "closed"))
+  end
+
   fn main(_cap : Cap(IO)) : Unit do
     let name = Env.get("ENTCHECK_SCENE", "")
     if name == "basics" do process_exit(basics_scene())
     else if name == "columns" do process_exit(columns_scene())
     else if name == "determinism" do process_exit(determinism_scene())
     else if name == "closed" do process_exit(closed_scene())
+    else if name == "ray" do process_exit(ray_scene())
+    else if name == "bullets" do process_exit(bullets_scene())
     else
-      println("entcheck: no scene named '" ++ name ++ "' (basics, columns, determinism, closed)")
+      println("entcheck: no scene named '" ++ name ++ "' (basics, columns, determinism, closed, ray, bullets)")
       process_exit(2)
-    end end end end
+    end end end end end end
   end
 end
