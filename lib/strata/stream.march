@@ -316,8 +316,8 @@ mod Strata.Stream do
         let fs = focus_keys(w, points, Nil)
         match drop_far(Dropped(w, m, gone), So.keys(Wo.chunks(w)), c, fs) do
           Dropped(w2, m2, gone2) ->
-            -- stale keys still wanted keep their place at the head of the queue
-            let rd2 = match rd do Redo(st, n) -> Redo(So.fold(st, So.empty(0), fn (acc, k, v) -> if in_box(c, top(c, w2), fs, k, 0) do So.put(acc, k, v) else acc end), n) end
+            -- stale keys still loaded (kept within the unload band) or wanted keep their place at the head of the queue
+            let rd2 = match rd do Redo(st, n) -> Redo(So.fold(st, So.empty(0), fn (acc, k, v) -> if stale_wanted(c, top(c, w2), fs, w2, k) do So.put(acc, k, v) else acc end), n) end
             let ks = match rd2 do Redo(st, _) -> So.keys(st) end
             Stream(w2, c, fs, prepend(ks, missing(w2, c, fs)), got, gts, mts, m2, gone2, gts2, mts2, rd2)
         end
@@ -368,6 +368,12 @@ mod Strata.Stream do
   end
 
   -- ── Stale coarse chunks ──────────────────────────────────────────────────
+  -- A stale key is worth generating again while it is loaded (a loaded
+  -- chunk is kept within the unload band, one chunk past its box) or wanted.
+  pfn stale_wanted(c : Config, hi : Int, fs : List(Strata.Coord.Key), w : Strata.World.World, k : Strata.Coord.Key) : Bool do
+    if Wo.is_loaded(w, k) do in_box(c, hi, fs, k, 1) else in_box(c, hi, fs, k, 0) end
+  end
+
   -- Take the world's stale keys (clearing them): each loaded or wanted one
   -- gets a fresh stamp and goes to the head of the queue [q].
   pfn start_stale(w : Strata.World.World, c : Config, fs : List(Strata.Coord.Key), rd : Redo, q : List(Strata.Coord.Key)) : (Strata.World.World, Redo, List(Strata.Coord.Key)) do
@@ -376,8 +382,7 @@ mod Strata.Stream do
     List.fold_left(Wo.stale(w), (w2, rd, q), fn (acc, k) ->
       match acc do
         (wa, Redo(st, n), qa) ->
-          let want = if Wo.is_loaded(wa, k) do true else in_box(c, hi, fs, k, 0) end
-          if want do (wa, Redo(So.put(st, k, n + 1), n + 1), Cons(k, qa)) else acc end
+          if stale_wanted(c, hi, fs, wa, k) do (wa, Redo(So.put(st, k, n + 1), n + 1), Cons(k, qa)) else acc end
       end)
   end
 
@@ -415,7 +420,9 @@ mod Strata.Stream do
         match a do
           Applied(w, m, rest, rd, again) ->
             let cur = So.get(rd, k)
-            if !in_box(c, top(c, w), fs, k, 0) do apply_gens(Applied(w, m, rest, So.remove(rd, k), again), t, n, c, fs)
+            -- a stale key is kept while loaded in the unload band; anything else must be wanted
+            let keep = if cur == 0 do in_box(c, top(c, w), fs, k, 0) else stale_wanted(c, top(c, w), fs, w, k) end
+            if !keep do apply_gens(Applied(w, m, rest, So.remove(rd, k), again), t, n, c, fs)
             else if cur != 0 && st != cur do apply_gens(Applied(w, m, rest, rd, Cons(k, again)), t, n, c, fs)
             else if cur == 0 && Wo.is_loaded(w, k) do apply_gens(a, t, n, c, fs)
             else if n <= 0 do apply_gens(Applied(w, m, Cons(GenRes(k, st, ch), rest), rd, again), t, n, c, fs)
@@ -465,7 +472,8 @@ mod Strata.Stream do
       Cons(k, t) ->
         let st = So.get(rd, k)
         let skip = if st == 0 do Wo.is_loaded(w, k) else false end
-        if skip || waiting_has(waiting, k) || running(out, k) || !in_box(c, top(c, w), fs, k, 0) do send_gens(t, out, w, c, fs, waiting, room, rd)
+        let want = if st == 0 do in_box(c, top(c, w), fs, k, 0) else stale_wanted(c, top(c, w), fs, w, k) end
+        if skip || !want || waiting_has(waiting, k) || running(out, k) do send_gens(t, out, w, c, fs, waiting, room, rd)
         else if room <= 0 do Sent(q, out)
         else
           let fines = if Ko.level(k) > 0 do Wo.edits_under(w, k) else Nil end

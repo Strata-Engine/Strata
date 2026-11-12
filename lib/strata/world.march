@@ -192,6 +192,20 @@ mod Strata.World do
     if Strata.Blocks.is_fluid(r, id) do Strata.Blocks.with_state(r, id, 7) else id end
   end
 
+  -- The registry read once a coarsening into an array the task owns (GAPS
+  -- S15): for each registered id, 4 * the id it stands as + its rank.
+  pfn table_go(r : Strata.Blocks.Registry, t : NativeIntArr, id : Int, n : Int) : NativeIntArr do
+    if id >= n do t else table_go(r, NativeArray.set_int(t, id, 4 * stands_as(r, id) + rank(r, id)), id + 1, n) end
+  end
+  pfn table(r : Strata.Blocks.Registry) : NativeIntArr do
+    let n = Strata.Blocks.count(r)
+    table_go(r, NativeArray.make_int(if n < 1 do 1 else n end, 0), 0, n)
+  end
+  -- an id's entry: an unregistered id is air
+  pfn entry(tab : NativeIntArr, id : Int) : Int do
+    if id <= 0 do 0 else if id >= NativeArray.length_int(tab) do 0 else NativeArray.get_int(tab, id) end end
+  end
+
   -- one more of id in the tally
   pfn tally(l : List((Int, Int)), id : Int) : List((Int, Int)) do
     match l do
@@ -199,46 +213,56 @@ mod Strata.World do
       Cons((i, n), t) -> if i == id do Cons((i, n + 1), t) else Cons((i, n), tally(t, id)) end
     end
   end
-  -- the winner of a tally of ids stood as (stands_as): the highest rank, then the most common, a tie to the lower id; air when nothing ranks
-  pfn best(r : Strata.Blocks.Registry, l : List((Int, Int)), bid : Int, brank : Int, bn : Int) : Int do
+  -- the winner of a tally of table entries: the highest rank, then the most common, a tie to the lower id; air when nothing ranks
+  pfn best(l : List((Int, Int)), bid : Int, brank : Int, bn : Int) : Int do
     match l do
       Nil -> bid
-      Cons((i, n), t) ->
-        let k = rank(r, i)
-        if k == 0 do best(r, t, bid, brank, bn)
-        else if k > brank do best(r, t, i, k, n)
-        else if k < brank do best(r, t, bid, brank, bn)
-        else if n > bn do best(r, t, i, k, n)
-        else if n == bn && i < bid do best(r, t, i, k, n)
-        else best(r, t, bid, brank, bn) end end end end end
+      Cons((e, n), t) ->
+        let k = e % 4
+        let i = e / 4
+        if k == 0 do best(t, bid, brank, bn)
+        else if k > brank do best(t, i, k, n)
+        else if k < brank do best(t, bid, brank, bn)
+        else if n > bn do best(t, i, k, n)
+        else if n == bn && i < bid do best(t, i, k, n)
+        else best(t, bid, brank, bn) end end end end end
     end
   end
-  pfn cube_go(r : Strata.Blocks.Registry, c : Strata.Chunk.Chunk, x0 : Int, y0 : Int, z0 : Int, s : Int, t : Int, acc : List((Int, Int))) : List((Int, Int)) do
+  pfn cube_go(tab : NativeIntArr, c : Strata.Chunk.Chunk, x0 : Int, y0 : Int, z0 : Int, s : Int, t : Int, acc : List((Int, Int))) : List((Int, Int)) do
     if t >= s * s * s do acc
-    else cube_go(r, c, x0, y0, z0, s, t + 1, tally(acc, stands_as(r, Ck.get_or(c, x0 + t % s, y0 + t / (s * s), z0 + (t / s) % s, 0))))
+    else cube_go(tab, c, x0, y0, z0, s, t + 1, tally(acc, entry(tab, Ck.get_or(c, x0 + t % s, y0 + t / (s * s), z0 + (t / s) % s, 0))))
     end
   end
   -- the coarse id of the s-cube from (x0, y0, z0) of c
-  pfn cube_id(r : Strata.Blocks.Registry, c : Strata.Chunk.Chunk, x0 : Int, y0 : Int, z0 : Int, s : Int) : Int do
+  pfn cube_id(tab : NativeIntArr, c : Strata.Chunk.Chunk, x0 : Int, y0 : Int, z0 : Int, s : Int) : Int do
     let u = Ck.uniform_id(c)
-    if u >= 0 do (if rank(r, u) == 0 do 0 else stands_as(r, u) end)
-    else best(r, cube_go(r, c, x0, y0, z0, s, 0, Nil), 0, 0, 0) end
+    let e = if u >= 0 do entry(tab, u) else 0 end
+    if u < 0 do best(cube_go(tab, c, x0, y0, z0, s, 0, Nil), 0, 0, 0)
+    else if e % 4 == 0 do 0
+    else e / 4 end end
   end
 
   -- lay the coarsening of level-0 chunk f (content c) into a, the flat voxels of level-l key k
-  pfn lay_go(r : Strata.Blocks.Registry, a : NativeI32Arr, c : Strata.Chunk.Chunk, s : Int, n : Int, ox : Int, oy : Int, oz : Int, t : Int) : NativeI32Arr do
+  pfn lay_go(tab : NativeIntArr, a : NativeI32Arr, c : Strata.Chunk.Chunk, s : Int, n : Int, ox : Int, oy : Int, oz : Int, t : Int) : NativeI32Arr do
     if t >= n * n * n do a
     else
       let i = t % n
       let m = (t / n) % n
       let j = t / (n * n)
-      lay_go(r, NativeArray.set_i32(a, (ox + i) + 32 * ((oz + m) + 32 * (oy + j)), cube_id(r, c, i * s, j * s, m * s, s)), c, s, n, ox, oy, oz, t + 1)
+      lay_go(tab, NativeArray.set_i32(a, (ox + i) + 32 * ((oz + m) + 32 * (oy + j)), cube_id(tab, c, i * s, j * s, m * s, s)), c, s, n, ox, oy, oz, t + 1)
     end
   end
-  pfn lay(r : Strata.Blocks.Registry, a : NativeI32Arr, k : Strata.Coord.Key, f : Strata.Coord.Key, c : Strata.Chunk.Chunk) : NativeI32Arr do
+  pfn lay(tab : NativeIntArr, a : NativeI32Arr, k : Strata.Coord.Key, f : Strata.Coord.Key, c : Strata.Chunk.Chunk) : NativeI32Arr do
     let s = pow2(Kd.level(k))
     let n = 32 / s
-    lay_go(r, a, c, s, n, (Kd.kx(f) - s * Kd.kx(k)) * n, (Kd.ky(f) - s * Kd.ky(k)) * n, (Kd.kz(f) - s * Kd.kz(k)) * n, 0)
+    lay_go(tab, a, c, s, n, (Kd.kx(f) - s * Kd.kx(k)) * n, (Kd.ky(f) - s * Kd.ky(k)) * n, (Kd.kz(f) - s * Kd.kz(k)) * n, 0)
+  end
+
+  pfn lay_all(tab : NativeIntArr, k : Strata.Coord.Key, a : NativeI32Arr, fs : List(Fine)) : NativeI32Arr do
+    match fs do
+      Nil -> a
+      Cons(Fine(f, c, _), t) -> lay_all(tab, k, lay(tab, a, k, f, c), t)
+    end
   end
 
   -- the captured fine chunks that are edited: cached, or differing from their generation
@@ -255,7 +279,7 @@ mod Strata.World do
       let mine = List.fold_left(fines, Nil, fn (acc, p) -> match p do Fine(f, _, _) -> if under(k, n, f) do Cons(p, acc) else acc end end)
       match edited(mine) do
         Nil -> generated
-        fs -> Ck.from_flat(List.fold_left(fs, Ck.to_flat(generated), fn (a, p) -> match p do Fine(f, c, _) -> lay(r, a, k, f, c) end))
+        fs -> Ck.from_flat(lay_all(table(r), k, Ck.to_flat(generated), fs))
       end
     end
   end
