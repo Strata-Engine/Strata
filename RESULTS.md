@@ -803,3 +803,50 @@ ms in the renderer's shim, the rest out of the process's hands on a machine
 at load 55. At 0.25 m the stream keeps eight workers generating chunks four
 times as small as at 1 m, so the main thread competes for cores more often
 (2857 frames over 25 ms at 0.25 m, 367 at 1 m, in runs a minute apart).
+
+## Task 12: the far field drawn
+
+Release builds on the shared development machine (14 cores), the island at
+seed 7, four levels (`config_levels(r, 3, 8, 4, 10, 1, 4)`). Timings taken
+above a load average of 8 are not judged.
+
+| | result | load | |
+|---|---|---|---|
+| far-field chunk count, the reference scene (scene 135, radius 10, 1 m) | 11 971: level 0 3872, level 1 2904, levels 2 and 3 1936 each, level 4 1323 (Part F's reference: about 8400) | 37 to 41 | over; see below |
+| time to settle, scene 135, radius 10 | 2997 ticks, 12.0 and 13.8 s (two runs), generation and meshing on 4 workers | 37 to 41 | not judged (load 37 to 41) |
+| time to settle, scene 135 at the goldens' radius 6 | 9667 chunks, 2421 ticks, 10.1 to 12.7 s | 12 to 16 | not judged (load 12 to 16) |
+| GPU quads, scene 135, radius 10 | 1.88 million (14.7 MB) | | under Part F's 64 MB |
+| level-1 surface chunk at 1 m: under 1 ms | median 8.5 ms, worst 12.4 ms (level 0 in the same minute: 10.4 / 25.5 ms) | 33 | not judged (load 33) |
+| far shore visible from the highest hill (scene 135) | yes: the land runs to the shore and the sea to the horizon | | met |
+| ring boundary (scene 136): no holes, no double drawing | none seen; the near trees end and the hillside's terraces coarsen past them | | met |
+| the soak at 0.25 m with four levels: chunks at the start | 12 939 (3872 / 2904 / 2904 / 1936 / 1323), settled after 3239 ticks in 34.7 s | 21 | not judged (load 21) |
+| the soak: worst frame against 16.7 ms (the soak allows 20) | 165.6 ms, mean 21.3 ms over 6010 frames; the near field alone in the next minutes: 205.1 ms, mean 18.7 ms | 21 to 41 | not judged (load 21 to 41) |
+| the soak: refused, waiting, leaked, retained at the end | 0, 0, 0, 0; 6287 slots in use, 12 413 chunks loaded | | met |
+| the soak: quads held | 3.37 million (27 MB) with the far field, 1.62 million without | | under 64 MB |
+| the soak: the lake at rest | 194 720 of 194 720 eighths kept | | met |
+
+The chunk count is over Part F's 8400 because each level's meshed inside
+is snapped out to whole chunks of the level above, and holds the parents of
+the inside below it: level 0's 19 x 19 x 5 inside becomes 20 x 20 x 6 and
+its box, with the unmeshed ring, 22 x 22 x 8; each coarse level's one
+chunk up and down becomes two to four. Without the snapping no coarse
+chunk could be hidden over a finer level's edge (the first try drew the
+top level over the near field); without the nesting a departed chunk
+could have no parent to wait for. The radii are settings; 8400 is the
+benchmark, not a ceiling, and the slot table (16 384) holds the meshed
+ones with room.
+
+Lighting: a coarse chunk is lit as light mode 1 lights everything (sun
+times n.l and the flat sky term). From the hill (scene 135) the near land
+and the far land are of a brightness; no shadow falls past the near
+chunks. Out at sea a straight line of sand shows near the horizon: the
+generator's beyond-the-atlas sea (Task 11) meets the atlas's own sea floor
+there with an underwater step of up to about 18 m, and with coarse voxels
+of 8 and 16 m that step reaches the water line.
+
+The soak's other misses (sound underruns: 2 with the far field, 4
+without; an acoustics update over 2 ms; the fluid step over 6 ms without
+the far field) came in both runs, minutes apart at loads of 21 to 41, and
+are the machine's, not judged. The soak's ceiling on quads held is 64 MB
+with the far field (3 million quads for the near field alone, as before). It is the generator's, not
+the renderer's; left for the generator's owner.

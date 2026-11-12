@@ -516,7 +516,43 @@ chunk has the edited level-0 chunks under it coarsened over it
 (`Strata.World.coarsen`; the stream does it on the worker that generates
 the chunk), and an edit makes its ancestors stale (`Strata.World.stale`),
 which the stream puts through its generation queue again without waiting.
-Nothing draws the coarse levels yet.
+
+## The far field
+
+Past the near chunks the world goes on in rings of coarser chunks (Part F
+of `docs/2026-11-10-renderer-design.md`): level L is 32 voxels a side,
+each `scale * 2^L` metres, and each level reaches twice as far as the one
+before. A game asks for it with `config_levels` and a generator made with
+`gen_levels`, and draws it with the same two calls as before:
+
+```march
+-- level 0 out 10 chunks (3 up and down), levels 1..4 each 10 of their own chunks out and 1 up and down
+let s0 = Strata.Stream.start(world, Strata.Stream.config_levels(10, 3, 8, 4, 10, 1, 4))
+-- each frame, as always: the renderer takes meshes of every level
+let (r2, s2) = Strata.Render.sync(r, Strata.Stream.tick(s1))
+```
+
+- **One level draws each region.** `Strata.Render.sync` applies the rule
+  in `Strata.Slots`: a coarse chunk is kept undrawn, its mesh held, while
+  its eight children all have meshes; a fine chunk is drawn only when its
+  seven siblings have theirs. While fine chunks arrive the coarse one
+  stands in for them, and when they leave their meshes stay on screen
+  until the coarse one's mesh is uploaded (`Strata.Render.retained`).
+- **Each level loads its whole box**, under the finer levels too, but a
+  coarse chunk over chunks that will be drawn is not meshed. Each level's
+  meshed inside is snapped out to whole chunks of the level above, so the
+  levels meet on whole coarse chunks.
+- **Lit without rays.** A coarse chunk is lit by the sun and the sky alone,
+  as light mode 1 lights everything; it is not in the light volume, casts
+  no shadow and is reflected only as sky.
+- **Seams.** Where two levels meet the ground can step by one coarse voxel,
+  and a ring passing over terrain changes its shape once. The fog closes
+  at the outer ring.
+
+In the viewer the far field is on: four levels, to 5.1 km at 1 m a voxel
+(1.3 km at 0.25 m). `STRATA_LEVELS=n` sets the number of levels, 0 the near
+field alone. Scene 135 is the island from its highest hill, 136 a ring
+boundary over the ground; their numbers are in `RESULTS.md`.
 
 ## Modules
 
@@ -566,8 +602,9 @@ Nothing draws the coarse levels yet.
 - Light from a small lamp takes several seconds to stop shimmering.
 - A reflection shows surfaces lit by the sun and a flat sky term, without
   their own highlights or sky light, and misses thin things far away.
-- The view reaches the stream's radius, about 300 m by default. The far
-  field is the next plan.
+- The far field is lit without rays: no shadows, sky light or reflections
+  past the near chunks. Where two levels meet the ground can step by one
+  coarse voxel; the levels meet on whole coarse chunks.
 - Translucent quads are ordered by chunk, not within one, and draw from
   both sides, so a one-block pane blends twice.
 - Model faces light as the nearest of the six axis directions.

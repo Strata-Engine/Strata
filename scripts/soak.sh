@@ -54,8 +54,10 @@ fi
 [ "$(get text_waiting)" = "0" ] || { echo "FAIL: glyphs were still waiting at the end"; fail=1; }
 [ "$(get atlas_bytes)" -le 16777216 ] || { echo "FAIL: the glyph atlas is over 16 MB"; fail=1; }
 [ "$(get leaked)" = "0" ] || { echo "FAIL: an allocator lost buffer space"; fail=1; }
-# the circuit keeps a steady view, so what the GPU holds must stay near what it started with
-[ "$(get live_quads)" -le 3000000 ] || { echo "FAIL: the quad buffer grew without bound"; fail=1; }
+# the circuit keeps a steady view, so what the GPU holds must stay near what it started with: 3 million
+# quads for the near field alone, Part F's 64 MB (8 388 608 quads) with the far field
+qmax=3000000; [ "$(get levels)" != "0" ] && qmax=8388608
+[ "$(get live_quads)" -le $qmax ] || { echo "FAIL: the quad buffer grew without bound"; fail=1; }
 awk "BEGIN { exit !($(get worst_ms) <= 20.0) }" || { echo "FAIL: a frame took over 20 ms"; fail=1; }
 [ "$(get fluid_waiting)" = "0" ] || { echo "FAIL: fluid cells were left waiting at the end: the cap was exceeded"; fail=1; }
 # offscreen a frame is about 3 ms, so six frames can be less than the worker needs and the main thread waits for it
