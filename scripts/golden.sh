@@ -17,6 +17,7 @@ OUT="${TMPDIR:-/tmp}/strata-golden.$$"; mkdir -p "$OUT" test/golden native/tests
 trap 'rm -rf "$OUT"' EXIT
 
 cc -O1 -Wall -Wextra -o native/tests/bin/ppm_diff native/tests/ppm_diff.c || exit 1
+cc -O1 -Wall -Wextra -o native/tests/bin/ppm_mean native/tests/ppm_mean.c || exit 1
 DIFF=native/tests/bin/ppm_diff
 
 # the comparison tool itself: identical passes, 1% changed fails, sizes must match
@@ -152,6 +153,16 @@ for line in $(echo "$SCENES" | tr ' ' ','); do
   if res=$($DIFF "$OUT/want.ppm" "$shot" $strict 2>&1); then echo "ok   $name: $res"
   else echo "FAIL $name: $res"; cp "$shot" "test/golden/$name.actual.ppm"; FAILED=1; fi
 done
+# Glow through a figure's grid: at 2 s in glowing-figure, sky rays from the
+# tunnel's right wall reach the torch's flame across the empty voxels round its
+# handle (a 4 x 15 x 4 grid, the handle 2 x 10 x 2), so the wall beside it is
+# lit. Measured 26.6 with the hit distance right; 17.6 when a figure hit's
+# distance was scaled wrong (Task 8 review C1), which the image comparison's
+# default tolerance lets through. The floor is between.
+if [ $UPDATE -eq 0 ] && [ -s "$OUT/glowing-figure.ppm" ]; then
+  if res=$(native/tests/bin/ppm_mean "$OUT/glowing-figure.ppm" 775 380 810 470 22 2>&1); then echo "ok   torch glow on the wall: $res"
+  else echo "FAIL torch glow on the wall (glowing-figure): $res"; FAILED=1; fi
+fi
 # Stillness: with nothing moving, the lit picture must have stopped changing.
 # Frames 118 and 119 of the overview under shadows (the forest camera stands in
 # dappled leaves on this land and never settles to 0.05%), from two runs of the

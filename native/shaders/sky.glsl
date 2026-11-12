@@ -96,7 +96,7 @@ float sun_visible(vec3 at, vec3 n, vec3 toward) {
 }
 
 // How bright a fully emitting block is, against a sun of about 1.
-const float GLOW = 5.0;
+const float GLOW = 5.0;   // strata_vk.c's SV_GLOW (a figure's glow reach for history) must equal it
 
 // The light arriving at a point (voxel units) on a face with normal n from
 // everything but the sun: [rays] rays over the hemisphere, more of them near

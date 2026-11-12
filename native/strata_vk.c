@@ -1135,6 +1135,7 @@ __attribute__((weak)) void an_x_draw_sun(double x, double y, double z) { (void)x
 #define SV_FIG_SETTLE 8                   /* frames a traced figure's surroundings keep settling after it stops */
 #define SV_FIG_REACH 24.0f                /* metres along the ground a moving traced figure's shadow is followed for history */
 #define SV_FIG_BOXES (2 * SV_FIG_TRACED)  /* history boxes for traced figures: a shadow box and a glow box each */
+#define SV_GLOW 5.0f                      /* must equal GLOW in native/shaders/sky.glsl */
 #define SV_GLOW_FLOOR 0.01f               /* light (linear, of a sun of about 1) below which a figure's glow is not followed for history */
 #define SV_TABLE_ROWS (SV_MAX_BODIES + SV_TRACE_ROWS)
 typedef struct { int32_t rp, next; uint32_t first, count; int32_t o[3]; float lo[3], hi[3]; } FigPiece;   /* lo, hi: what its quads cover, voxels of the piece */
@@ -1285,6 +1286,7 @@ int64_t sv_rig_part_anchor(int64_t rig, int64_t part, double ax, double ay, doub
     int32_t rp = (int32_t)(rig * SV_FIG_PARTS + part);
     fg.anchor[rp][0] = (float)ax; fg.anchor[rp][1] = (float)ay; fg.anchor[rp][2] = (float)az; fg.anchor[rp][3] = (float)voxel;
     fg.sphere[rp][3] = -1.0f;
+    if (fg.glow) fg.glow[rp] = -1.0f;                 /* its glow's reach depends on the voxel size */
     return 1;
 }
 static uint32_t unorm(double v, double scale) { return v <= 0.0 ? 0u : (v >= 1.0 ? (uint32_t)scale : (uint32_t)(v * scale + 0.5)); }
@@ -1340,7 +1342,8 @@ static float fig_glow(int32_t rp) {
         if (e > 0.0f) { lit++; if (e > emax) emax = e; }
     }
     float v = fg.anchor[rp][3], area = cbrtf((float)lit * (float)lit) * v * v;
-    fg.glow[rp] = lit ? sqrtf(emax * 5.0f * area / (3.14159265f * SV_GLOW_FLOOR)) : 0.0f;
+    /* SV_GLOW is sky.glsl's GLOW: how bright a fully emitting voxel is against a sun of about 1 */
+    fg.glow[rp] = lit ? sqrtf(emax * SV_GLOW * area / (3.14159265f * SV_GLOW_FLOOR)) : 0.0f;
     return fg.glow[rp];
 }
 /* How far between its last two poses each figure is drawn (0..1), passed to
