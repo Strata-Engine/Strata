@@ -1639,6 +1639,80 @@ static void test_drawn_steady(void) {
     }
 }
 
+/* the drawing's sun (an_draw_sun) widens the draw list to figures out of view whose shadows may fall
+ * in it: swept away from the sun until their top comes down by their height, at most 24 m along the
+ * ground; such a figure is flagged bit 1 (shadow and rays only, not drawn); answers, the hash and the
+ * posing schedule do not change. Chain figures stand 3 m tall; the view is the box -5..5 */
+static int listed_flags(AnWorld *w, int fig) {   /* -1 if fig is not in the draw list, else its flags' low byte */
+    const int32_t *rp, *fl;
+    const float *xf;
+    int n = an_draw_list(w, 1, &rp, &xf, &fl);
+    for (int i = 0; i < n; i++) if ((fl[i] >> 8) == fig) return fl[i] & 255;
+    return -1;
+}
+static AnWorld *sun_world(int *in, int *near_, int *far_, int *beside, int sun) {
+    AnWorld *w = an_open(8);
+    int rig = chain(w, 0);
+    TK swing[2] = {{1, 1, 0, 0}, {1, 1, 1, 90}};
+    int c = turns(w, rig, 1, 1, 2, swing, 0, NULL, NULL);
+    float lo[3] = {-5, -5, -5}, hi[3] = {5, 5, 5}, p[24], eye[3] = {0, 0, 0};
+    box_planes(lo, hi, p);
+    an_view(w, p, eye, 0);
+    float at[4][3] = {{0, -2, 0}, {9, -2, 0}, {40, -2, 0}, {0, -2, 12}};
+    int *f[4] = {in, near_, far_, beside};
+    for (int i = 0; i < 4; i++) { *f[i] = an_spawn(w, rig); an_place(w, *f[i], at[i], an_qid); an_play(w, *f[i], 0, c, 0, 1, 1, -1, 0); }
+    if (sun) {   /* 12 degrees up, toward +x: shadows fall toward -x, about 14 m from a 3 m figure */
+        float s[3] = {cosf(12 * 3.14159265f / 180), sinf(12 * 3.14159265f / 180), 0};
+        an_draw_sun(w, s);
+    }
+    return w;
+}
+static void test_draw_sun(void) {
+    int in, near_, far_, beside;
+    AnWorld *w = sun_world(&in, &near_, &far_, &beside, 0);
+    an_update(w, 1.0f / 60);
+    CHECK(listed_flags(w, in) == 0 && listed_flags(w, near_) == -1 && listed_flags(w, far_) == -1 && listed_flags(w, beside) == -1,
+          "with no sun only the figure in view is listed");
+    float s[3] = {cosf(12 * 3.14159265f / 180), sinf(12 * 3.14159265f / 180), 0};
+    an_draw_sun(w, s);
+    CHECK(listed_flags(w, in) == 0, "the figure in view is listed as before, to be drawn");
+    CHECK(listed_flags(w, near_) == 2, "a figure 4 m outside the view, the sun beyond it, is listed for its shadow (bit 1), not to be drawn");
+    CHECK(listed_flags(w, far_) == -1, "one 35 m out is not: its shadow is followed 24 m at most");
+    CHECK(listed_flags(w, beside) == -1, "nor one whose shadow falls away from the view");
+    float grazing[3] = {cosf(3 * 3.14159265f / 180), sinf(3 * 3.14159265f / 180), 0};
+    an_draw_sun(w, grazing);
+    CHECK(listed_flags(w, near_) == 2 && listed_flags(w, far_) == -1, "at 3 degrees the 3 m figure's shadow would reach 57 m; it is followed 24 m, so the one 35 m out is still not listed");
+    an_draw_sun(w, s);
+    an_traced(w, near_, 1);
+    CHECK(listed_flags(w, near_) == 3, "a traced figure out of view is listed for its shadow and the rays, traced");
+    float back[3] = {-s[0], s[1], 0};
+    an_draw_sun(w, back);
+    CHECK(listed_flags(w, near_) == -1, "with the sun on the view's side its shadow falls away: not listed");
+    float low[3] = {1, 0.005f, 0};
+    an_draw_sun(w, low);
+    CHECK(listed_flags(w, near_) == -1, "a sun at the horizon casts no shadow to follow");
+    an_draw_sun(w, s);
+    float tall[3] = {0, 1, 0};
+    an_draw_sun(w, tall);
+    CHECK(listed_flags(w, near_) == -1, "a sun overhead throws a shadow straight down: not listed");
+    double refused = an_stat(w, 3);
+    float bad[3] = {NAN, 1, 0};
+    an_draw_sun(w, s);
+    an_draw_sun(w, bad);
+    CHECK(an_stat(w, 3) == refused + 1 && listed_flags(w, near_) == 3, "a sun not finite is refused and changes nothing");
+    an_close(w);
+    /* the same script with and without the sun: the same hash, the same figures posed each update */
+    int i2[2], n2[2], f2[2], b2[2];
+    AnWorld *ws[2] = {sun_world(&i2[0], &n2[0], &f2[0], &b2[0], 0), sun_world(&i2[1], &n2[1], &f2[1], &b2[1], 1)};
+    int same = 1;
+    for (int k = 0; k < 24; k++) {
+        for (int i = 0; i < 2; i++) { an_update(ws[i], 1.0f / 60); listed_flags(ws[i], n2[i]); }
+        if (an_hash(ws[0]) != an_hash(ws[1]) || an_stat(ws[0], 1) != an_stat(ws[1], 1) || an_stat(ws[0], 11) != an_stat(ws[1], 11)) same = 0;
+    }
+    CHECK(same && an_stat(ws[1], 11) > 0, "the drawing's sun changes no hash and no figure's posing (those out of view still skip updates)");
+    an_close(ws[0]); an_close(ws[1]);
+}
+
 static void test_traced_cap(void) {
     AnWorld *w = an_open(80);
     int rig = chain(w, 0);
@@ -1743,6 +1817,7 @@ int main(void) {
     test_traced_cap();
     test_draw_cap();
     test_view_refusals();
+    test_draw_sun();
     if (fails == 0) printf("anim_test: ok\n");
     return fails == 0 ? 0 : 1;
 }

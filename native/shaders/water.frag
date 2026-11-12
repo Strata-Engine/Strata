@@ -68,7 +68,8 @@ void main() {
         }
     }
     bool settling = u.vol.w <= 2 || u.edit_lo.w > 0.5 && all(greaterThan(at, u.edit_lo.xyz - 32.0)) && all(lessThan(at, u.edit_hi.xyz + 32.0));
-    for (int b = 0; b < u.bodies.x && b < 16; b++)
+    // the moving bodies' boxes, then the traced figures' (shadow and glow): any of them unsettles the remembered sun and mirror
+    for (int b = 0; b < u.bodies.x && b < 144; b++)
         if (all(greaterThan(at, movers.boxes[2 * b].xyz)) && all(lessThan(at, movers.boxes[2 * b + 1].xyz))) settling = true;
     bool now = !have || settling || (((px.x >> 3) & 1) + 2 * ((px.y >> 3) & 1)) == (frame & 3);
     // one ray at the sun's centre
