@@ -18,12 +18,14 @@ for d in . demo viewer soundcheck animcheck; do
 done
 # C tests, the audio goldens, then the golden images; all need a compiler, the last a GPU
 mkdir -p native/tests/bin
-for t in native/tests/*_test.c; do
+# (*_test.cpp: tests of native/strata_vox.cpp, C++ because ogt_vox.h is;
+# -fno-exceptions keeps them free of the C++ runtime, as in the forge builds)
+for t in native/tests/*_test.c native/tests/*_test.cpp; do
   [ -f "$t" ] || continue
-  b="native/tests/bin/$(basename "$t" .c)"
+  b="native/tests/bin/$(basename "${t%.*}")"
   # the text test links the text module and what it stands on
   extra=""; [ "$(basename "$t")" = "text_test.c" ] && extra="native/strata_text.c -Inative/sheenbidi/Headers -I/opt/homebrew/include/freetype2 -I/opt/homebrew/include/harfbuzz -L/opt/homebrew/lib -lfreetype -lharfbuzz"
-  if ! cc -O1 -Wall -Wextra -Inative -o "$b" "$t" $extra > .verify.log 2>&1 || ! "$b" >> .verify.log 2>&1; then
+  if ! cc -O1 -Wall -Wextra -fno-exceptions -Inative -o "$b" "$t" $extra > .verify.log 2>&1 || ! "$b" >> .verify.log 2>&1; then
     echo "FAIL: $t"; tail -20 .verify.log; exit 1
   fi
 done

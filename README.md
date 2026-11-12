@@ -437,6 +437,7 @@ let s4 = Strata.Stream.apply(s3, Strata.Edit.fill_sphere(Strata.Stream.world(s3)
 | `Strata.Model` | a model block's drawing geometry |
 | `Strata.Rig`, `Strata.Clip` | a jointed figure's description and part meshes; its animations |
 | `Strata.Anim`, `Strata.Ffi.Anim` | figures posed by the C kernel in `native/strata_anim.h` |
+| `Strata.Template`, `Strata.Ffi.Vox` | voxel templates (holes, probabilities, turns) blitted into chunks; MagicaVoxel `.vox` import (`native/strata_vox.cpp`, link with `-fno-exceptions`) |
 | `Strata.Ffi.Vk` | window, input and the Vulkan renderer |
 | `Strata.Math.*`, `Strata.Noise`, `Strata.Tree` | vectors, matrices, noise, a persistent tree |
 
