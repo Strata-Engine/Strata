@@ -298,3 +298,15 @@ assignment `A="1 B=2"`. Three scripted viewer runs lost STRATA_HIDDEN that
 way and opened a window. Workaround: a shell function that lists the
 settings and takes the rest as "$@" (`scripts/combat_check.sh`'s `run`).
 
+
+## S35: an alias leaks across modules in a compiled test build
+
+Met merging `combat` into main: `viewer/test/blast_test.march` says
+`alias Strata.Coord as Cb`, and `viewer/test/combat_test.march` and
+`viewer/lib/match.march` say `alias StrataViewer.Combat as Cb`. Each file
+typechecks, but `forge test` in `viewer/` (March 0.7.0, the test binary
+holding every test module) fails in clang: `use of undefined value
+'@StrataViewer.Combat.chunk_of'` from `blast_test`, its `Cb.chunk_of`
+resolved to the other module's `Cb`. An alias should name its target in
+its own module only. Workaround: no two modules of one build alias
+different modules by the same name (`blast_test` now says `Cco`).

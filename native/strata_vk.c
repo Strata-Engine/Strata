@@ -212,7 +212,7 @@ static struct {
      * effect table they read, PT_EFFECTS effects of PT_EFFECT_FLOATS, effect
      * 0 spray's. [fx_set] marks the effects defined. */
     VkBuffer spray; VkDeviceMemory spray_mem; float *spray_map;
-    VkBuffer fx; VkDeviceMemory fx_mem; float *fx_map; uint8_t fx_set[PT_EFFECTS]; int any_glow;
+    VkBuffer fx; VkDeviceMemory fx_mem; float *fx_map; uint8_t fx_set[PT_EFFECTS]; double glow_until;   /* when the last glowing particle born so far dies */
     SprayRing ring; float *spray_births;
     /* The 2D layer: the quads the game last handed over, drawn last. Each
      * Frame copies them when it is recorded. */
@@ -2072,7 +2072,7 @@ int64_t sv_open(int64_t w, int64_t h, int64_t capture_mouse, int64_t quad_capaci
         if (!make_buffer((VkDeviceSize)PT_EFFECTS * PT_EFFECT_FLOATS * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &g.fx, &g.fx_mem, &smap)) return 0;
         g.fx_map = smap; memset(g.fx_map, 0, (size_t)PT_EFFECTS * PT_EFFECT_FLOATS * 4);
         memset(g.fx_set, 0, sizeof g.fx_set);
-        pt_effect_spray(g.fx_map); g.fx_set[0] = 1; g.any_glow = 0;
+        pt_effect_spray(g.fx_map); g.fx_set[0] = 1; g.glow_until = -1.0;
     }
 
     void *map = NULL;
@@ -2932,6 +2932,10 @@ int64_t sv_emit(int64_t effect, int64_t shape, void *f18, int64_t count, int64_t
     const float *f = (const float *)narr_data(f18);
     if (f[13] <= 0.0f) return 0;
     int64_t n = sp_clamp(count);
+    if (n > 0 && g.fx_map[(size_t)effect * PT_EFFECT_FLOATS] > 0.5f) {
+        double until = g.time_s + (double)f[13] * (1.0 + fabs((double)f[14]));
+        if (until > g.glow_until) g.glow_until = until;
+    }
     for (int64_t i = 0; i < n; i++) {
         float life = f[13] * (1.0f + fabsf(f[14]));
         uint32_t slot = sp_push(&g.ring, (float)g.time_s, life);
@@ -2951,7 +2955,6 @@ int64_t sv_effect_set(int64_t index, void *floats) {
     if (!g.ok || !g.fx_map || !floats || index < 1 || index >= PT_EFFECTS || narr_len(floats) < PT_EFFECT_FLOATS) return 0;
     memcpy(g.fx_map + (size_t)index * PT_EFFECT_FLOATS, narr_data(floats), PT_EFFECT_FLOATS * sizeof(float));
     g.fx_set[index] = 1;
-    if (g.fx_map[(size_t)index * PT_EFFECT_FLOATS] > 0.5f) g.any_glow = 1;
     return 1;
 }
 
@@ -3230,8 +3233,8 @@ int64_t sv_frame(void) {
         uint32_t first = sp_first(&g.ring), n = sp_count(&g.ring);
         uint32_t run = first + n > SV_SPRAY_CAP ? SV_SPRAY_CAP - first : n;
         vkCmdBindVertexBuffers(F->cmd, 0, 1, &g.spray, &zero);
-        /* shaded, then glowing (once a glowing effect is defined): each sends the other look's particles off screen */
-        for (int pass = 0; pass < (g.any_glow ? 2 : 1); pass++) {
+        /* shaded, then glowing (while a glowing particle may be alive): each sends the other look's particles off screen */
+        for (int pass = 0; pass < (g.time_s <= g.glow_until ? 2 : 1); pass++) {
             uint32_t ppc[2] = { (uint32_t)pass, 0u };
             vkCmdBindPipeline(F->cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pass == 0 ? g.pipe_spray : g.pipe_glow);
             vkCmdPushConstants(F->cmd, g.layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, 8, ppc);
