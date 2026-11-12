@@ -47,6 +47,55 @@ mod StrataViewer.Test.Walker do
   end
 
 
+  -- ── Tree wood connectivity ─────────────────────────────────────────────
+  -- (wood voxels, wood voxels reached from the trunk's base by a 6-connected flood through wood)
+  pfn wood_count(ids : NativeI32Arr, i : Int, n : Int, acc : Int) : Int do
+    if i >= n do acc else wood_count(ids, i + 1, n, if NativeArray.get_i32(ids, i) == 7 do acc + 1 else acc end) end
+  end
+  -- a neighbour index of i along axis d (0..5), or -1 off the template
+  pfn nb(sx : Int, sy : Int, sz : Int, i : Int, d : Int) : Int do
+    let x = i % sx
+    let y = (i / sx) % sy
+    let z = i / (sx * sy)
+    if d == 0 do (if x + 1 < sx do i + 1 else -1 end)
+    else if d == 1 do (if x > 0 do i - 1 else -1 end)
+    else if d == 2 do (if y + 1 < sy do i + sx else -1 end)
+    else if d == 3 do (if y > 0 do i - sx else -1 end)
+    else if d == 4 do (if z + 1 < sz do i + sx * sy else -1 end)
+    else (if z > 0 do i - sx * sy else -1 end) end end end end end
+  end
+  pfn flood(ids : NativeI32Arr, sx : Int, sy : Int, sz : Int, seen : NativeIntArr, stack : List(Int), n : Int) : Int do
+    match stack do
+      Nil -> n
+      Cons(i, rest) -> flood_nb(ids, sx, sy, sz, seen, i, 0, rest, n)
+    end
+  end
+  pfn flood_nb(ids : NativeI32Arr, sx : Int, sy : Int, sz : Int, seen : NativeIntArr, i : Int, d : Int, stack : List(Int), n : Int) : Int do
+    if d >= 6 do flood(ids, sx, sy, sz, seen, stack, n)
+    else
+      let j = nb(sx, sy, sz, i, d)
+      let fresh = if j < 0 do false else if NativeArray.get_i32(ids, j) != 7 do false else NativeArray.get_int(seen, j) == 0 end end
+      if fresh do flood_nb(ids, sx, sy, sz, NativeArray.set_int(seen, j, 1), i, d + 1, Cons(j, stack), n + 1)
+      else flood_nb(ids, sx, sy, sz, seen, i, d + 1, stack, n) end
+    end
+  end
+  -- (wood, reached from the base, the trunk tip's voxel is wood)
+  pfn wood_check(sp : Int, seed : Int, vs : Float) : (Int, Int, Bool) do
+    let t = StrataViewer.Trees.build(sp, seed, vs)
+    let sx = Strata.Template.t_sx(t)
+    let sy = Strata.Template.t_sy(t)
+    let sz = Strata.Template.t_sz(t)
+    let ids = Strata.Template.t_ids(t)
+    let h = StrataViewer.Trees.base_offset(t)
+    let base = h + sx * sy * h
+    let total = wood_count(ids, 0, sx * sy * sz, 0)
+    let reached = if NativeArray.get_i32(ids, base) != 7 do 0 else flood(ids, sx, sy, sz, NativeArray.set_int(NativeArray.make_int(sx * sy * sz, 0), base, 1), Cons(base, Nil), 1) end
+    let tip = match StrataViewer.Trees.trunk_tip(sp, seed, vs) do
+        (x, y, z) -> if y >= sy do false else NativeArray.get_i32(ids, x + sx * (y + sy * z)) == 7 end
+      end
+    (total, reached, tip)
+  end
+
   -- ── Trees and ruins on the island ──────────────────────────────────────
   pfn island() : Strata.Atlas.Atlas do Strata.Atlas.load_or_build(".march/atlas", StrataViewer.island_def(), 7) end
 
@@ -285,6 +334,15 @@ mod StrataViewer.Test.Walker do
       Test.assert_true(List.all(StrataViewer.decor_ruins(d), fn t -> int_to_float(Strata.Template.t_sy(t) + 1) <= StrataViewer.feature_top()), "every ruin under feature_top")
       Test.assert_true(List.all(ts, fn t -> NativeArray.get_i32(Strata.Template.t_ids(t), StrataViewer.Trees.base_offset(t) * (1 + Strata.Template.t_sx(t) * Strata.Template.t_sy(t))) == 7), "wood at the base")
       Test.assert_true(List.all(ts, fn t -> Strata.Template.t_sx(t) == Strata.Template.t_sz(t)), "square")
+    end
+    test "every library tree's wood is one 6-connected piece from its trunk's base, and the trunk reaches its top, at 1 m and 0.25 m" do
+      let rs = List.flat_map(Cons(1.0, Cons(0.25, Nil)), fn vs -> List.map(List.range(0, 12), fn i ->
+          match wood_check(i / 3, Strata.Seed.mix(7, 600 + i), vs) do
+            (total, reached, tip) -> (i, vs, total, reached, tip)
+          end))
+      List.map(rs, fn r -> match r do (i, vs, total, reached, tip) -> if reached != total || !tip do println("tree " ++ int_to_string(i) ++ " at " ++ float_to_string(vs) ++ " m: " ++ int_to_string(reached) ++ " of " ++ int_to_string(total) ++ " wood voxels joined; tip wood " ++ bool_to_string(tip)) else () end end)
+      Test.assert_true(List.all(rs, fn r -> match r do (_, _, total, reached, _) -> if total == 0 do false else reached == total end end), "all wood joined to the base")
+      Test.assert_true(List.all(rs, fn r -> match r do (_, _, _, _, tip) -> tip end), "the voxel holding the trunk's top is wood")
     end
     test "a tree whose canopy straddles a chunk border: the chunks hold its voxels, none missing and none doubled, at each of the four rotations" do
       let a = island()
