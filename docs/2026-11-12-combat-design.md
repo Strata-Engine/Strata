@@ -55,11 +55,14 @@ is off in a match, and while the player is more than 150 m from the middle
 the match is paused, with a line on screen saying so: the world is only
 loaded, and entities only move, near the player.
 
-**Water** (open: see the question to the user at the end). As designed:
-computer fighters treat water deeper than one block as a wall and do not
-enter it. The player can swim, as now, and can be shot there. An arrow or
-fireball stops at the water's surface; a fireball there burns nothing and
-hurts no one.
+**Water.** Fighters swim (the user's choice). A computer fighter in water
+deeper than its chest floats at the surface, swims toward where it was
+going at 1.5 m/s with the swim clip, is carried by a current as the player
+is, and climbs out at a bank one block high. While swimming it cannot
+swing or shoot, but it can be hit. The player swims as now and can shoot
+from the water. An arrow or fireball stops at the water's surface; a
+fireball there burns nothing and hurts no one. A swimmer's head and
+shoulders are above the surface, so shots still find it.
 
 ## Fighters
 
@@ -144,6 +147,13 @@ does.
 
 Intent, not instruction; the builder may find better.
 
+- **Swimming is the game's own mover.** The entity movers know nothing of
+  fluids: a walker in water sinks and walks the bed. While
+  `Strata.Fluid.depth_in` puts a fighter chest-deep, the game moves its
+  entity itself (position set each tick: held at `Strata.Fluid.surface`,
+  pushed by `Strata.Fluid.flow`, as `viewer/lib/walker.march` does for the
+  player) and hands it back to the walking mover on the bank. Shots meet
+  water by the game testing each projectile's step against fluid cells.
 - **Fighters and projectiles are entities** (`Strata.Entities`): walking
   movers for fighters, flying movers for arrows and fireballs, a kind for
   the player's own box that is set to the player's position each frame so
@@ -207,6 +217,8 @@ Intent, not instruction; the builder may find better.
 - Path finding, cover seeking, team play, difficulty settings.
 - Enemies that dig, place or burn.
 - Fire that spreads; ice that melts to water.
+- Breath and drowning. A player who stays under water cannot be shot, and
+  swimmers cannot attack: a known way to hide, left as it is.
 - New sounds or music.
 - More than one map, saving a match, network play.
 
@@ -222,6 +234,8 @@ Intent, not instruction; the builder may find better.
 
 ## How we know it works
 
+- A scripted scene with a fighter set down across a channel from its
+  target: it swims over, climbs out and attacks.
 - Unit tests of the rules: the damage table above, credit and
   self-kills, the table's order, target and spawn choice, the burn list.
 - A scripted, hidden match (fixed seed, the player standing still or
@@ -251,12 +265,4 @@ Intent, not instruction; the builder may find better.
 9. Flight is off in a match; the match pauses while the player is far away.
 10. A computer fighter idle for 20 s is respawned, so a match always ends.
 11. The hit flash is a small engine addition (a per-figure tint).
-
-## Open question for the user
-
-Water. The start is on a shore, and the entity movers know nothing of
-fluids: left alone, computer fighters would walk the sea bed and shots
-would pass through the surface. The design above makes water a wall for
-computer fighters and a stop for shots, and lets the player swim. The
-other choices are fighters that swim (a mover of the game's own: more
-work) or accepting the sea-bed walking.
+12. Swimmers cannot attack; shots stop at the water's surface; no drowning.
