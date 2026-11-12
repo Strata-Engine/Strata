@@ -370,6 +370,40 @@ chain's matrices at t = 0, 0.25 and 0.5:
 
     (cd animcheck && forge build --release) && ANIMCHECK_SCENE=table animcheck/.march/build/release/animcheck
 
+## Entities
+
+Players, creatures and bullets: tens of thousands of entities kept as rows
+in C columns and reached by id. Design:
+`docs/2026-11-11-entities-design.md`; rulings: `docs/entities-ledger.md`.
+
+A game describes **kinds** as data, in the style of `Strata.Blocks`:
+`Strata.Entities.kind()` and the `with_` functions (mover, unseen rule,
+lifetime, slots, seen distance), checked with `valid`. `open` takes the
+kinds (numbered 0, 1, ... in order), a capacity (65,536 by default), a body
+budget and the stream's radius and chunk and voxel sizes; a kind's seen
+distance is at most `(radius_h - 2)` chunks. The rows live in C
+(`native/strata_ent.h`, bound by `native/strata_ent.c`), one world per
+process. A dead or unknown id reads as defaults and a write to it is
+ignored and counted in `stats`; every call on a closed world does nothing.
+
+```march
+let bullet = Strata.Entities.with_slots(Strata.Entities.with_lifetime(
+  Strata.Entities.with_mover(Strata.Entities.kind(), Strata.Entities.flying(), 0.05, 0.05, 0.05, 0.0, 0.0), 2.0), 1, 0)
+let e0 = Strata.Entities.open([bullet], 0, 0, 12, 3.2, 0.1)    -- capacity and bodies 0: the defaults
+let (e1, id) = Strata.Entities.add(e0, 0, 1.0, 2.0, 3.0, 0.0)  -- `spawn` is not a legal name (GAPS S22)
+let e2 = Strata.Entities.set_velocity(e1, id, 40.0, 0.0, 0.0)
+let (x, y, z) = Strata.Entities.position(e2, id)
+
+-- a whole kind at once, in dense order
+let ids = Strata.Entities.each(e2, 0)                                          -- NativeIntArr
+let vel = Strata.Entities.column(e2, 0, Strata.Entities.col_velocity())        -- 3 floats a row
+let e3 = Strata.Entities.set_column(e2, 0, Strata.Entities.col_velocity(), vel)
+```
+
+`scripts/ent_check.sh` builds `entcheck/` and runs its scenes:
+
+    (cd entcheck && forge build --release) && ENTCHECK_SCENE=basics entcheck/.march/build/release/entcheck
+
 ## Using it from a game
 
     [deps]
@@ -379,14 +413,15 @@ A game that draws also lists Strata's C shim itself, because forge does not
 build a dependency's C sources:
 
     [ffi]
-    sources = ["../strata/native/strata_vk.c", "../strata/native/strata_audio.c", "../strata/native/strata_anim.c"]
+    sources = ["../strata/native/strata_vk.c", "../strata/native/strata_audio.c", "../strata/native/strata_anim.c", "../strata/native/strata_ent.c"]
     link = ["-I../strata/native", "-I/opt/homebrew/include", "-L/opt/homebrew/lib",
             "-lglfw", "-lvulkan", "-Wl,-rpath,/opt/homebrew/lib"]
 
 and must run with `MARCH_PIN_MAIN=1`. A game that only uses the core needs
 neither; one that only plays sound lists `strata_audio.c` alone, which needs
-no library beyond the system's, and one that animates figures lists
-`strata_anim.c`, which needs none either.
+no library beyond the system's, one that animates figures lists
+`strata_anim.c`, and one with entities lists `strata_ent.c`; neither needs
+a library either.
 
 ```march
 -- register blocks
@@ -434,6 +469,7 @@ let s4 = Strata.Stream.apply(s3, Strata.Edit.fill_sphere(Strata.Stream.world(s3)
 | `Strata.Model` | a model block's drawing geometry |
 | `Strata.Rig`, `Strata.Clip` | a jointed figure's description and part meshes; its animations |
 | `Strata.Anim`, `Strata.Ffi.Anim` | figures posed by the C kernel in `native/strata_anim.h` |
+| `Strata.Entities`, `Strata.Ffi.Ent` | entity kinds, and entities kept as rows by the C kernel in `native/strata_ent.h` |
 | `Strata.Ffi.Vk` | window, input and the Vulkan renderer |
 | `Strata.Math.*`, `Strata.Noise`, `Strata.Tree` | vectors, matrices, noise, a persistent tree |
 

@@ -3,7 +3,8 @@
  * degenerate clips, removed figures, refusals and determinism; then the
  * procedural stage: overrides, aim, reach (and its degenerate targets),
  * springs, the drop; then attachments, sockets, and ray and box hit tests
- * (against brute force). */
+ * (against brute force); then cost control: culling, far figures, the two
+ * poses kept for drawing, the draw list and the traced cap. */
 #include <stdio.h>
 #include <string.h>
 #include <math.h>
@@ -1348,6 +1349,358 @@ static void test_shape_refusals(void) {
     an_close(w);
 }
 
+/* ---- cost control: culling, distance, two poses, the draw list, tracing ---- */
+
+/* six planes (ax + by + cz + d >= 0 inside) of a box lo..hi: a view that sees only that box */
+static void box_planes(const float lo[3], const float hi[3], float p[24]) {
+    memset(p, 0, 24 * sizeof(float));
+    for (int k = 0; k < 3; k++) {
+        p[(2 * k) * 4 + k] = 1; p[(2 * k) * 4 + 3] = -lo[k];         /* x >= lo */
+        p[(2 * k + 1) * 4 + k] = -1; p[(2 * k + 1) * 4 + 3] = hi[k];  /* x <= hi */
+    }
+}
+/* a view of the box around (100, 100, 100): nothing near the origin is in it */
+static void far_view(AnWorld *w) {
+    float lo[3] = {99, 99, 99}, hi[3] = {101, 101, 101}, p[24], eye[3] = {100, 100, 100};
+    box_planes(lo, hi, p);
+    an_view(w, p, eye, 0);
+}
+
+/* a figure on the chain rig playing a clip with marks, with an aim, a spring and a child (playing
+ * too) on its hand socket; the view that sees none of it set first, or no view */
+#define CS_UPDATES 41
+static AnWorld *cull_world(int view, int *fig, int *child, int *sock) {
+    AnWorld *w = an_open(8);
+    int rig = chain(w, 0);
+    shape_chain(w, rig);
+    float sp[3] = {0, 0.5f, 0};
+    *sock = an_socket_def(w, rig, 2, sp, an_qid);
+    TK swing[2] = {{1, 1, 0, 0}, {1, 1, 1, 90}};
+    float mt[3] = {0.1f, 0.4f, 0.7f};
+    int32_t tags[3] = {1, 2, 3};
+    int c = turns(w, rig, 1, 1, 2, swing, 3, mt, tags);
+    if (view) far_view(w);
+    *fig = an_spawn(w, rig);
+    *child = an_spawn(w, rig);
+    an_play(w, *fig, 0, c, 0, 1.3f, 1, -1, 0);
+    an_play(w, *child, 0, c, 0, 0.7f, 1, -1, 0);
+    float off[3] = {0, 0, 0.2f};
+    an_attach(w, *child, *fig, *sock, off, an_qid);
+    an_spring(w, *fig, 2, 30, 3);
+    int32_t ch[2] = {1, 2};
+    float axis[3] = {0, 1, 0}, tgt[3] = {2, 3, 1};
+    an_aim(w, *fig, 0, 2, ch, axis, tgt, 30, 1);
+    return w;
+}
+static int same_bits(const void *a, const void *b, size_t n) { return memcmp(a, b, n) == 0; }
+
+static void test_cull_marks(void) {
+    int f[2], c[2], s[2];
+    AnWorld *w[2] = {cull_world(0, &f[0], &c[0], &s[0]), cull_world(1, &f[1], &c[1], &s[1])};
+    int same = 1, posed_culled = 0, gap = 0, most_gap = 0, any_marks = 0;
+    for (int k = 0; k < CS_UPDATES; k++) {
+        float dt = (k % 3 == 0) ? 1.0f / 30 : 1.0f / 60;
+        int32_t ints[2][24]; float wts[2][8];
+        int n[2];
+        for (int i = 0; i < 2; i++) { an_update(w[i], dt); n[i] = an_marks(w[i], 8, ints[i], wts[i]); }
+        if (n[0] != n[1] || !same_bits(ints[0], ints[1], (size_t)n[0] * 3 * sizeof(int32_t)) || !same_bits(wts[0], wts[1], (size_t)n[0] * sizeof(float)))
+            same = 0;
+        if (n[0] > 0) any_marks++;
+        if (an_stat(w[1], 1) > 0) { posed_culled++; gap = 0; } else if (++gap > most_gap) most_gap = gap;
+    }
+    CHECK(any_marks > 5, "the script crosses marks");
+    CHECK(same, "a culled figure's marks fire on the same updates, with the same tags and weights, as a visible one's");
+    CHECK(an_stat(w[0], 1) == 2 && an_stat(w[0], 11) == 0, "with no view every figure is posed every update");
+    printf("  culled: posed on %d of %d updates, at most %d skipped in a row\n", posed_culled, CS_UPDATES, most_gap);
+    CHECK(posed_culled <= (CS_UPDATES + 3) / 4 + 1 && posed_culled >= CS_UPDATES / 4, "a culled figure poses 1 update in 4");
+    CHECK(most_gap == 3, "and skips at most three in a row");
+    an_close(w[0]); an_close(w[1]);
+}
+
+/* sockets, rays and boxes against two worlds, one with a view that sees none of it */
+static int answers_agree(AnWorld *a, AnWorld *b, int fa, int fb, int ca, int cb, int sock) {
+    int ok = 1;
+    float pa[3], qa[4], pb[3], qb[4];
+    int ra = an_socket(a, fa, sock, pa, qa), rb = an_socket(b, fb, sock, pb, qb);
+    if (ra != rb || !same_bits(pa, pb, sizeof pa) || !same_bits(qa, qb, sizeof qa)) ok = 0;
+    ra = an_socket(a, ca, sock, pa, qa); rb = an_socket(b, cb, sock, pb, qb);
+    if (ra != rb || !same_bits(pa, pb, sizeof pa) || !same_bits(qa, qb, sizeof qa)) ok = 0;
+    for (int r = 0; r < 24; r++) {
+        float o[3] = {-3 + 0.25f * r, 0.3f + 0.13f * r, 6}, d[3] = {0.1f, -0.05f, -1};
+        AnHit ha, hb;
+        memset(&ha, 0, sizeof ha); memset(&hb, 0, sizeof hb);
+        ra = an_hit_ray(a, o, d, 50, -1, &ha); rb = an_hit_ray(b, o, d, 50, -1, &hb);
+        if (ra != rb || (ra && !same_bits(&ha, &hb, sizeof ha))) ok = 0;
+    }
+    float bc[3] = {0, 1.5f, 0}, half[3] = {1, 1.5f, 1};
+    int32_t pa2[32], pb2[32];
+    int na = an_hit_box(a, bc, half, an_qid, -1, 16, pa2), nb = an_hit_box(b, bc, half, an_qid, -1, 16, pb2);
+    if (na != nb || !same_bits(pa2, pb2, (size_t)(na < 16 ? na : 16) * 2 * sizeof(int32_t))) ok = 0;
+    return ok;
+}
+static void test_cull_answers(void) {
+    int f[2], c[2], s[2];
+    AnWorld *w[2] = {cull_world(0, &f[0], &c[0], &s[0]), cull_world(1, &f[1], &c[1], &s[1])};
+    int agree = 1, stale_seen = 0;
+    float q[4];
+    for (int k = 0; k < 24; k++) {
+        for (int i = 0; i < 2; i++) an_update(w[i], 1.0f / 60);
+        if (an_stat(w[1], 2) > 0) stale_seen++;
+        if (k % 5 == 2) {   /* moved between updates: stale in both */
+            float at[3] = {0.1f * k, 0, -0.05f * k};
+            qz(7.0f * k, q);
+            for (int i = 0; i < 2; i++) an_place(w[i], f[i], at, q);
+        }
+        if (k % 2 == 1 && !answers_agree(w[0], w[1], f[0], f[1], c[0], c[1], s[0])) agree = 0;
+    }
+    CHECK(stale_seen > 10, "the culled figures are left stale by most updates");
+    CHECK(agree, "socket, ray and box answers for culled figures equal those with no view set, bit for bit");
+    an_close(w[0]); an_close(w[1]);
+}
+
+/* the culled script, with (or without) queries between its updates: the hash after the last update */
+static uint64_t cull_query_script(int query, int carry, int n) {
+    int f, c, s;
+    AnWorld *w = cull_world(1, &f, &c, &s);
+    float pos[3], q[4], o[3] = {0, 1, 6}, d[3] = {0, 0, -1};
+    AnHit h;
+    float into[3] = {100, 99.5f, 100};
+    for (int k = 0; k < n; k++) {
+        an_update(w, 1.0f / 60);
+        if (carry && k == 5) an_place(w, f, into, an_qid);   /* carried into view between updates */
+        if (query) { an_hit_ray(w, o, d, 50, -1, &h); an_socket(w, c, s, pos, q); }
+    }
+    uint64_t hash = an_hash(w);
+    an_close(w);
+    return hash;
+}
+static void test_cull_hash(void) {
+    CHECK(cull_query_script(0, 0, 10) == cull_query_script(0, 0, 10), "a culled run repeats: two runs hash the same");
+    CHECK(cull_query_script(0, 0, 10) == cull_query_script(1, 0, 10), "queries posing skipped figures leave no trace in the hash");
+    CHECK(cull_query_script(0, 0, 2) == cull_query_script(1, 0, 2), "nor in a spring not yet posed by an update");
+    CHECK(cull_query_script(0, 1, 10) == cull_query_script(1, 1, 10), "nor in which figures the view takes in");
+    /* the schedule is carried state: two worlds a different view apart hash differently */
+    int f, c, s;
+    AnWorld *a = cull_world(0, &f, &c, &s), *b = cull_world(1, &f, &c, &s);
+    for (int k = 0; k < 6; k++) { an_update(a, 1.0f / 60); an_update(b, 1.0f / 60); }
+    CHECK(an_hash(a) != an_hash(b), "the schedule is in the hash");
+    an_close(a); an_close(b);
+    /* a skipped figure's matrices are not hashed, so its layers are: two clip times, one hash each */
+    uint64_t ht[2];
+    for (int i = 0; i < 2; i++) {
+        AnWorld *v = cull_world(1, &f, &c, &s);
+        an_update(v, 1.0f / 60);
+        an_set(v, f, 0, 2, 0.3f + 0.2f * i, 0);
+        an_update(v, 1.0f / 60);
+        CHECK(an_stat(v, 1) == 0, "both updates skip the culled figures");
+        ht[i] = an_hash(v);
+        an_close(v);
+    }
+    CHECK(ht[0] != ht[1], "a skipped figure's clip time is in the hash");
+}
+
+static void test_far_springs(void) {
+    AnWorld *w = an_open(4);
+    int rig = tail(w);
+    int f = an_spawn(w, rig);
+    an_spring(w, f, 1, 40, 2);
+    float zero[3] = {0, 0, 0}, q[4], eye[3] = {0, 0, 0};
+    for (int i = 0; i < 20; i++) { qy(9.0f * i, q); an_place(w, f, zero, q); an_update(w, 1.0f / 60); }
+    AnProc *sp = an_proc_find(w, &w->figs[0], AN_K_SPRING, 1);
+    CHECK(sp && !sp->fresh && fabsf(sp->v[7]) > 0.01f, "the spring is moving");
+    float held[9];
+    memcpy(held, sp->v, sizeof held);
+    eye[0] = 500;
+    an_view(w, NULL, eye, 100);   /* no planes: everything in view; the figure 500 m away */
+    int posed = 0, held_still = 1, drawn_at_target = 1;
+    for (int i = 0; i < 20; i++) {
+        qy(180 + 9.0f * i, q);
+        an_place(w, f, zero, q);
+        an_update(w, 1.0f / 60);
+        if (an_stat(w, 1) > 0) {
+            posed++;
+            float pre[3], tip[3];
+            const float *m = an_matrices(w, f);
+            origin(m, 2, tip);
+            an_part_origin(w, f, 2, pre);
+            if (dist3(tip, pre) > 1e-5f) drawn_at_target = 0;
+        }
+        if (memcmp(held, sp->v, sizeof held) != 0) held_still = 0;
+    }
+    CHECK(posed == 10, "a far figure poses every other update");
+    CHECK(held_still, "its springs do not advance");
+    CHECK(drawn_at_target, "a frozen spring's part is drawn where the pose before springs puts it");
+    float pre[3];
+    an_view(w, NULL, NULL, 0);
+    an_update(w, 1.0f / 60);
+    an_part_origin(w, f, 2, pre);
+    float tip[3];
+    origin(an_matrices(w, f), 2, tip);
+    CHECK(dist3(tip, pre) < 1e-5f && !sp->fresh, "back near, the spring starts again at rest where it is drawn");
+    an_close(w);
+}
+
+static void test_two_poses(void) {
+    AnWorld *w = an_open(4);
+    int rig = chain(w, 0);
+    TK spin[2] = {{1, 1, 0, 0}, {1, 1, 1, 90}};
+    int c = turns(w, rig, 1, 0, 2, spin, 0, NULL, NULL);
+    int f = an_spawn(w, rig);
+    float at[3] = {5, 0, 0};
+    an_place(w, f, at, an_qid);
+    an_play(w, f, 0, c, 0, 1, 1, -1, 0);
+    an_update(w, 0.2f);
+    const float *d0 = an_draw_matrices(w, f, 0.5f);
+    CHECK(d0 && near(d0[9], 5, 1e-6f), "a figure's first update draws no slide from where it was spawned");
+    float p1[36], p2[36];
+    memcpy(p1, an_matrices(w, f), sizeof p1);
+    an_update(w, 0.4f);
+    memcpy(p2, an_matrices(w, f), sizeof p2);
+    CHECK(same_bits(an_draw_matrices(w, f, 0), p1, sizeof p1), "blend 0 draws the update before last's pose, bit for bit");
+    CHECK(same_bits(an_draw_matrices(w, f, 1), p2, sizeof p2), "blend 1 draws the last update's pose");
+    const float *m = an_draw_matrices(w, f, 0.5f);
+    float a1 = angle(p1, 1), a2 = angle(p2, 1), am = angle(m, 1);
+    printf("  arm %.3f then %.3f degrees; drawn at 0.5: %.3f\n", a1, a2, am);
+    CHECK(near(a1, 18, 1e-3f) && near(a2, 54, 1e-3f), "the two poses are 0.2 s and 0.6 s into the turn");
+    CHECK(near(am, 36, 1e-3f), "at 0.5 the arm is drawn halfway between (slerp)");
+    float cl = sqrtf(m[12] * m[12] + m[13] * m[13] + m[14] * m[14]);
+    CHECK(near(cl, 1, 1e-5f), "and its rotation is still a rotation (unit columns)");
+    float hm[3], h1[3], h2[3];
+    origin(m, 2, hm); origin(p1, 2, h1); origin(p2, 2, h2);
+    int between = 1;
+    for (int k = 0; k < 3; k++) if (!(hm[k] >= fminf(h1[k], h2[k]) - 1e-5f && hm[k] <= fmaxf(h1[k], h2[k]) + 1e-5f)) between = 0;
+    CHECK(between && dist3(hm, h1) > 0.05f && dist3(hm, h2) > 0.05f, "the hand's origin lies between its two places");
+    CHECK(an_draw_matrices(w, 999, 0.5f) == NULL, "no such figure draws nothing");
+    an_update(w, 0.1f);
+    CHECK(same_bits(an_draw_matrices(w, f, 0), p2, sizeof p2), "the next update keeps the last pose as the one before");
+    m = an_draw_matrices(w, f, 0.5f);
+
+    /* the draw list: every part with volume of every figure in view, interpolated alike */
+    const int32_t *rp, *fl;
+    const float *xf;
+    int n = an_draw_list(w, 0.5f, &rp, &xf, &fl);
+    int match = n == 3;
+    for (int i = 0; match && i < n; i++)
+        if (rp[i] != rig * AN_PARTS + i || fl[i] != (f << 8) || !same_bits(xf + i * 12, m + i * 12, 12 * sizeof(float))) match = 0;
+    CHECK(match, "the draw list holds the figure's three parts, its rig and part, its id, drawn as an_draw_matrices draws them");
+    far_view(w);
+    CHECK(an_draw_list(w, 0.5f, &rp, &xf, &fl) == 0, "a figure outside the view is not in the draw list");
+    an_always(w, f, 1);
+    CHECK(an_draw_list(w, 0.5f, &rp, &xf, &fl) == 3, "unless it is always posed");
+    for (int i = 0; i < 4; i++) { an_update(w, 0.01f); CHECK(an_stat(w, 1) == 1, "an always figure outside the view poses every update"); }
+    an_close(w);
+}
+
+/* a steady turn (85 degrees a second for 2 s), drawn at blend 0, 0.5 and 1 after each of 24 updates
+ * of 0.05 s: the angle never goes back and never jumps more than one update's turn (4.25 degrees).
+ * (a figure coming into view catches up at twice the rate: one update's turn a half step, no more).
+ * mode 0 far, 1 out of view, 2 out of view then into view at the 9th update, 3 in view and near */
+static int drawn_steady(int mode, float *most_jump, int *posed) {
+    AnWorld *w = an_open(4);
+    int rig = chain(w, 0);
+    TK spin[2] = {{1, 1, 0, 0}, {1, 1, 2, 170}};
+    int c = turns(w, rig, 2, 0, 2, spin, 0, NULL, NULL);
+    an_spawn(w, rig);   /* slot 0: a different stagger for the figure under test */
+    int f = an_spawn(w, rig);
+    an_play(w, f, 0, c, 0, 1, 1, -1, 0);
+    an_update(w, 0.05f);   /* posed once near: a new figure is drawn from its first pose, not slid into it */
+    float eye[3] = {500, 0, 0};
+    if (mode == 0) an_view(w, NULL, eye, 100);
+    if (mode == 1 || mode == 2) far_view(w);
+    float last = -1, jump = 0;
+    int ok = 1;
+    *posed = 0;
+    for (int k = 0; k < 24; k++) {
+        if (mode == 2 && k == 9) an_view(w, NULL, NULL, 0);
+        an_update(w, 0.05f);
+        for (int b = 0; b <= 2; b++) {
+            float a = angle(an_draw_matrices(w, f, 0.5f * b), 1);
+            if (last >= 0) {
+                if (a < last - 1e-3f) ok = 0;
+                if (a - last > jump) jump = a - last;
+            }
+            last = a;
+        }
+    }
+    *posed = (int)an_stat(w, 1);
+    *most_jump = jump;
+    an_close(w);
+    return ok && jump <= 4.25f + 1e-2f && last > 60;
+}
+static void test_drawn_steady(void) {
+    const char *name[4] = {"far", "out of view", "out of view, then in view", "near"};
+    for (int mode = 0; mode < 4; mode++) {
+        float jump; int posed;
+        int ok = drawn_steady(mode, &jump, &posed);
+        printf("  drawn %s: largest step %.3f degrees\n", name[mode], jump);
+        char what[160];
+        snprintf(what, sizeof what, "a %s figure's drawn turn never goes back nor jumps more than one update's turn", name[mode]);
+        CHECK(ok, what);
+    }
+}
+
+static void test_traced_cap(void) {
+    AnWorld *w = an_open(80);
+    int rig = chain(w, 0);
+    int figs[70];
+    for (int i = 0; i < 70; i++) { figs[i] = an_spawn(w, rig); an_traced(w, figs[i], 1); }
+    CHECK(an_stat(w, 9) == 6, "past 64 traced figures the rest are counted (stat 9)");
+    const int32_t *rp, *fl;
+    const float *xf;
+    int n = an_draw_list(w, 1, &rp, &xf, &fl), traced[70] = {0};
+    for (int i = 0; i < n; i++) if (fl[i] & 1) traced[fl[i] >> 8] = 1;
+    int first = 1, rest = 0;
+    for (int i = 0; i < 64; i++) if (!traced[figs[i]]) first = 0;
+    for (int i = 64; i < 70; i++) rest += traced[figs[i]];
+    CHECK(n == 210 && first && rest == 0, "the first 64 are drawn traced, the 65th and later plain");
+    an_traced(w, figs[3], 0);
+    CHECK(an_stat(w, 9) == 5, "one let go: a waiting figure takes its place");
+    n = an_draw_list(w, 1, &rp, &xf, &fl);
+    int t64 = 0, t3 = 0;
+    for (int i = 0; i < n; i++) { if ((fl[i] >> 8) == figs[64] && (fl[i] & 1)) t64 = 1; if ((fl[i] >> 8) == figs[3] && (fl[i] & 1)) t3 = 1; }
+    CHECK(t64 && !t3, "the 65th is traced now, the one let go plain");
+    an_remove(w, figs[0]);
+    CHECK(an_stat(w, 9) == 4, "removing a traced figure lets the next one in");
+    an_traced(w, figs[69], 0);
+    CHECK(an_stat(w, 9) == 3, "a waiting figure let go is no longer counted");
+    an_close(w);
+}
+
+static void test_draw_cap(void) {
+    AnWorld *w = an_open(2100);
+    int32_t parent[8] = {-1, 0, 1, 2, 3, 4, 5, 6};
+    float pivot[24] = {0};
+    int rig = rig_of(w, 8, parent, pivot);
+    for (int i = 0; i < 2100; i++) an_spawn(w, rig);
+    const int32_t *rp, *fl;
+    const float *xf;
+    int n = an_draw_list(w, 1, &rp, &xf, &fl);
+    CHECK(n == AN_DRAW_MAX && an_stat(w, 10) == 2100 * 8 - AN_DRAW_MAX, "past AN_DRAW_MAX parts the rest are left out of the draw list, counted in stat 10");
+    for (int i = 0; i < 60; i++) an_remove(w, i);
+    CHECK(an_draw_list(w, 1, &rp, &xf, &fl) == 2040 * 8 && an_stat(w, 10) == 0, "and the count is the last list's");
+    an_close(w);
+}
+
+static void test_view_refusals(void) {
+    AnWorld *w = an_open(4);
+    float p[24], lo[3] = {0, 0, 0}, hi[3] = {1, 1, 1}, eye[3] = {0, 0, 0};
+    box_planes(lo, hi, p);
+    p[5] = NAN;
+    double r = an_stat(w, 3);
+    an_view(w, p, eye, 10);
+    CHECK(an_stat(w, 3) == r + 1 && an_stat(w, 5) == AN_R_VALUE, "a plane not finite is refused");
+    box_planes(lo, hi, p);
+    p[4] = p[5] = p[6] = 0;
+    an_view(w, p, eye, 10);
+    CHECK(an_stat(w, 3) == r + 2, "a plane of no normal is refused");
+    an_view(w, NULL, eye, NAN);
+    CHECK(an_stat(w, 3) == r + 3, "a far distance not a number is refused");
+    an_always(w, 77, 1);
+    an_traced(w, 77, 1);
+    CHECK(an_stat(w, 3) == r + 5 && an_stat(w, 5) == AN_R_FIGURE, "always and traced on no such figure are refused");
+    an_close(w);
+}
+
 int main(void) {
     test_sampling();
     test_antipodal();
@@ -1381,6 +1734,15 @@ int main(void) {
     test_letgo_no_trace();
     test_clean_query();
     test_shape_refusals();
+    test_cull_marks();
+    test_cull_answers();
+    test_cull_hash();
+    test_far_springs();
+    test_two_poses();
+    test_drawn_steady();
+    test_traced_cap();
+    test_draw_cap();
+    test_view_refusals();
     if (fails == 0) printf("anim_test: ok\n");
     return fails == 0 ? 0 : 1;
 }

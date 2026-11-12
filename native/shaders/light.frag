@@ -24,7 +24,11 @@ void main() {
         o_lit = vec4(mode >= 1 && mode < 9 ? (submerged() ? water_haze() : sky_color(normalize(world_at(v_uv, 1.0) - u.eye.xyz))) : u.sky.rgb, 1.0);
         return;
     }
-    vec3 albedo = texture(gb_albedo, v_uv).rgb;
+    vec4 alb = texture(gb_albedo, v_uv);
+    vec3 albedo = alb.rgb;
+    // a figure's pixel: its albedo's alpha holds whether it moved and its emission (gbuffer.frag); the world's is 1
+    int fcode = int(alb.a * 255.0 + 0.5);
+    bool figure = fcode < 128;
     vec4 nm = texture(gb_nm, v_uv);
     int r8 = int(nm.r * 255.0 + 0.5);
     vec3 n = r8 < 16 ? NORMALS[min(r8, 5)] : oct_dec(vec2(float(r8 - 16) / 239.0, nm.g));
@@ -73,6 +77,8 @@ void main() {
     // so does a body moving near it: its own surface, and its shadow
     for (int m = 0; m < u.bodies.x && m < 16; m++)
         if (all(greaterThan(at, movers.boxes[2 * m].xyz)) && all(lessThan(at, movers.boxes[2 * m + 1].xyz))) settling = true;
+    // and a figure that moved since the last frame, on its own surface
+    if (figure && (fcode & 64) != 0) settling = true;
     if (settling) kept = min(kept, 2.0);
     bool sample_now = kept < 4.0 || settling || (((px.x >> 3) & 1) + 2 * ((px.y >> 3) & 1)) == (frame & 3);
     float sun_vis = old.a;
@@ -90,15 +96,19 @@ void main() {
     }
     o_hist = vec4(sky, sun_vis);
     o_meta = vec4(count, view_depth, float(face), 0.0);
+    // the plain figures' shadow, from this frame's map, the darker of it and the
+    // traced shadow; never remembered, so a moving figure's shadow leaves no trail
+    if (u.fshadow.x > 0.5 && ndl > 0.0) sun_vis = min(sun_vis, fig_shadow(world, n));
 
     // the pixel's light class: flat quads carry it; models and plants do not, and are looked up
-    uint cls = uint(nm.b * 255.0 + 0.5);
-    if (cls == 0u) cls = class_at(at - n * 0.01);
+    // a figure carries its roughness there instead, and its emission in the albedo's alpha
+    uint cls = figure ? 0u : uint(nm.b * 255.0 + 0.5);
+    if (cls == 0u && !figure) cls = class_at(at - n * 0.01);
     vec3 col = albedo * (u.sun_color.rgb * ndl * sun_vis * dim * ripple + sky * dim);
-    if (mode >= 4) col += albedo * class_emission(cls) * GLOW;
+    if (mode >= 4) col += figure ? albedo * (float(fcode & 63) / 63.0) * GLOW : albedo * class_emission(cls) * GLOW;
     if (mode >= 3) {
         // the sun's highlight on anything not fully rough; a mirror ray for what is smooth
-        float rough = cls == 0u ? 1.0 : float(class_roughness(cls)) / 255.0;
+        float rough = figure ? nm.b : (cls == 0u ? 1.0 : float(class_roughness(cls)) / 255.0);
         vec3 toward_eye = normalize(u.eye.xyz - world);
         if (rough < 0.25 && u.sun_color.w > 0.5) {
             float share = mirror_share(n, toward_eye, 0.12) * (1.0 - rough);

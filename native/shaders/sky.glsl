@@ -100,8 +100,8 @@ const float GLOW = 5.0;
 
 // Lamps near each cell of the light volume (strata_vk.c, lamps_to_frame):
 // per cell (first, count); each lamp a glowing voxel (x, y, z voxels, class).
-layout(std430, set = 0, binding = 28) readonly buffer LampCells { uvec2 cells[]; } lamp_cells;
-layout(std430, set = 0, binding = 29) readonly buffer LampList { ivec4 lamps[]; } lamp_list;
+layout(std430, set = 0, binding = 32) readonly buffer LampCells { uvec2 cells[]; } lamp_cells;
+layout(std430, set = 0, binding = 33) readonly buffer LampList { ivec4 lamps[]; } lamp_list;
 
 // What lamp [l] would give a point at [at] facing [n] if nothing stood
 // between, as sky_light counts light (cosine-weighted, over pi), and how far

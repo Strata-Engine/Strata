@@ -13,10 +13,10 @@ layout(location = 0) out vec4 o_color;
 // What water remembers between frames (see strata_vk.c, whist and wdist):
 // last frame's, read; this frame's, written. rgb the mirror colour, a the
 // sun's visibility; and the view depth of the surface they belong to.
-layout(set = 0, binding = 24, rgba16f) uniform readonly image2D wh_prev;
-layout(set = 0, binding = 25, r32f) uniform readonly image2D wd_prev;
-layout(set = 0, binding = 26, rgba16f) uniform writeonly image2D wh_now;
-layout(set = 0, binding = 27, r32f) uniform writeonly image2D wd_now;
+layout(set = 0, binding = 28, rgba16f) uniform readonly image2D wh_prev;
+layout(set = 0, binding = 29, r32f) uniform readonly image2D wd_prev;
+layout(set = 0, binding = 30, rgba16f) uniform writeonly image2D wh_now;
+layout(set = 0, binding = 31, r32f) uniform writeonly image2D wd_now;
 layout(std430, set = 0, binding = 21) readonly buffer Movers { vec4 boxes[]; } movers;
 
 void main() {
@@ -72,7 +72,10 @@ void main() {
         if (all(greaterThan(at, movers.boxes[2 * b].xyz)) && all(lessThan(at, movers.boxes[2 * b + 1].xyz))) settling = true;
     bool now = !have || settling || (((px.x >> 3) & 1) + 2 * ((px.y >> 3) & 1)) == (frame & 3);
     // one ray at the sun's centre
-    float sun_vis = u.light.x < 2.0 ? 1.0 : (now ? sun_visible(at, n, u.sun.xyz) : old.a);
+    float sun_mem = u.light.x < 2.0 ? 1.0 : (now ? sun_visible(at, n, u.sun.xyz) : old.a);
+    // figures move every frame: their shadow is never remembered
+    float sun_vis = sun_mem;
+    if (u.fshadow.x > 0.5 && sun_vis > 0.0) sun_vis = min(sun_vis, fig_shadow(v_world, n));
     vec3 col = base.rgb * (u.sun_color.rgb * max(dot(n, u.sun.xyz), 0.0) * sun_vis + sky_flat(n));
     float alpha = base.a;
     vec3 mirror = vec3(0.0);
@@ -98,6 +101,6 @@ void main() {
             alpha = mix(alpha, 1.0, share);
         }
     }
-    if (memory) { imageStore(wh_now, px, vec4(mirror, sun_vis)); imageStore(wd_now, px, vec4(view_depth)); }
+    if (memory) { imageStore(wh_now, px, vec4(mirror, sun_mem)); imageStore(wd_now, px, vec4(view_depth)); }
     o_color = vec4(tonemap(fogged(col, v_world)), alpha);
 }

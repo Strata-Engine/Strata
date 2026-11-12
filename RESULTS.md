@@ -634,6 +634,84 @@ runs, with a load average of 40 from another session building on the same
 machine (mean 8 to 11 ms). The frame-time limit is not judged: rerun
 `scripts/soak.sh` on a quiet machine. Every other soak check passed.
 
+# Animation plan
+
+## Task 5: cost control and two poses, measured headless
+
+`scripts/anim_check.sh` runs the scenes. `arena` runs 512 figures of a
+15-part humanoid with 3 layers, an aim on the spine and head, and both legs
+reaching for moving targets, at 1/60 s updates for 10 s. About half the
+crowd is outside the view. `ground128` runs `Strata.Anim.ground` for 128
+figures over hills. `hits` adds 10 000 rays in the arena after 60 updates.
+Update and ray times come from the monotonic clock in the C shim (C only).
+The ground time is March's millisecond clock over 120 frames, less the
+updates' C time.
+
+Load averages were 75-79 during the three runs below (31-48 in earlier runs),
+from other sessions building on the same machine. That is well over 8, so **no
+timing here is judged**. Each number is the range over three runs at 20:55.
+Rerun `ANIMCHECK_SCENE=arena|ground128|hits
+animcheck/.march/build/release/animcheck` on a quiet machine to judge them.
+
+| | target | measured | |
+|---|---|---|---|
+| `Strata.Anim.update`, arena, half out of view (C) | 1.0 ms | mean 0.86-0.95 ms; worst 24.8-38.5 ms (load) | not judged; mean under the target |
+| `Strata.Anim.ground`, 128 figures, 2 legs (March) | 0.5 ms | 0.94-1.28 ms a frame | not judged; above the target |
+| hit ray, arena, mean of 10 000 (C) | 10 µs | 0.5-0.6 µs (0.6-0.7 µs through `Strata.Anim`) | not judged; far under the target |
+
+- **Update.** With no view the same arena takes a mean of 1.07-1.50 ms.
+  About 182 of the 512 figures skip each update: the half out of view, three
+  updates in four. The worst update is load: the no-view worst was 1.19 ms in
+  the quietest run, and 21-38 ms in the others.
+- **The first query after an update** poses every figure that update skipped
+  (185 here), in 0.40-0.41 ms (0.81-0.88 ms at load 30). That keeps answers
+  independent of the camera. The cost is that a game asking one ray each
+  update gets the posing back in that query; only frames that ask nothing
+  save it.
+- **Ground.** `ground_targets` alone (the feet's animated origins and 256 rays
+  through `Strata.Query.raycast`) takes 0.60-0.68 ms a frame, more than the
+  whole target. The rest of `ground` (the knees' origins, the facing, the rig
+  lookup, the reach and drop calls) adds about 0.35-0.6 ms. The cause is
+  March's per-ray and per-call cost, measured, not chased. The design's
+  fallbacks are, in order, one ray per leg every other frame, then fewer
+  figures. 121 of the 128 figures stand with both soles within 0.03 m of the
+  hills.
+- **Rays.** These rays run from 0.2-2.6 m up in front of the crowd toward a
+  figure 0-2 m up, and 9 562 of 10 000 hit. Most stop at the first figure in
+  their way, which is why they are cheap.
+- **Memory** at 4 096 figures (sizeof, decimal MB), rigs excluded: 46.34 MB,
+  leaving 1.66 MB under 48 MB.
+  - Figures 7.90 (AnFig 1 928 B), matrices 12.58, previous matrices 12.58.
+  - Keys 5.51, clips 2.21, rigs 0.87, masks 0.07, marks 0.26, events 1.31.
+  - Ids 0.05, procedural pool 1.70, hit grid 0.38, draw list 0.92 (16 384
+    parts).
+  - Counting the rig data too (sockets 0.26, part grids 2.51) gives 49.11 MB.
+- **Drawing.** A figure posed every few updates is drawn with its blend
+  stretched over that period, one period behind its pose (review fix I1).
+
+# Entities
+
+Measured on the same M3 Max, release builds, headless (`entcheck`). The
+plan trusts a timing only under load 8; every figure here was taken while
+other sessions kept the load far above it, so none is judged.
+
+| scene | median | worst | target | verdict |
+|---|---|---|---|---|
+| storm: 20,000 flying bullets, all seen, one touch pair against 200 targets; `step` over ticks 200 to 600 | 2.47 ms (2.57 in the run before) | 40.2 ms (97.1) | 2 ms | not judged (load 20 to 35) |
+| 5,000 removed and 5,000 added between two ticks, then the step | 1.11 ms for the 10,000 calls from March; 2.76 ms the step after | one run | 1 ms | not judged (load 20 to 35) |
+
+The storm fires its bullets from four emitters 50 m from the centre in rings
+of 64 at 40 m/s; each falls to the floor or meets a target within about a
+second, and the game replaces every bullet named in a touch or a block hit
+(about 350 a tick; 228,518 fired in 601 ticks, 28,973 touches). Its touch
+events equal a brute-force count on ticks 150 (59) and 300 (60), and two runs
+end on one hash.
+
+Where the step goes, from a C bench of a like scene (best of 20 ticks, cc -O2,
+same machine, load about 50): 1.12 ms a tick, of which 0.87 ms is the 20,000
+bullets' rays through the voxel copy (0.25 ms with all unseen, so no rays),
+0.18 ms building the grid and 0.01 ms the touch pairs.
+
 # The fluid step in flat arrays
 
 On branch `cost`. The fluid step's bookkeeping moved from persistent maps
