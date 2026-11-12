@@ -489,6 +489,365 @@ static void test_dt_edges(void) {
     en_close(w);
 }
 
+/* ---- the grid: near, the entity ray, touches ---- */
+#pragma STDC FP_CONTRACT OFF   /* the brute forces compute as the kernel does, unfused */
+
+/* a kind of mover (0 placed, 1 flying), cube half extent h, lifetime (0 none), no gravity, seen at the cap */
+static int box_kind(EnWorld *w, int mover, float h, float lifetime) {
+    int32_t ki[9];
+    kind_ints(ki, mover, 1, 0, 0, 0);
+    float fl[7] = {h, h, h, 0, lifetime, 0, 0};
+    return en_kind(w, ki, fl);
+}
+static double urand(double lo, double hi) { return lo + (hi - lo) * (rng() % 1000000) / 1000000.0; }
+
+static int cmp_i64(const void *a, const void *b) {
+    int64_t x = *(const int64_t *)a, y = *(const int64_t *)b;
+    return x < y ? -1 : x > y;
+}
+/* every live id of the world, kind by kind */
+static int all_ids(EnWorld *w, int64_t *ids, int max) {
+    int n = 0;
+    for (int k = 0; k < w->nkinds; k++) n += en_each(w, k, max - n, ids + n);
+    return n;
+}
+
+static int64_t big_ids[200000], got_ids[200000], want_ids[200000];
+static int64_t ev_i[EN_EVENTS * 7]; static double ev_f[EN_EVENTS * 3];
+
+/* the ids within radius of p whose kind is in mask, sorted */
+static int brute_near(EnWorld *w, const double p[3], double radius, uint64_t mask, int64_t *out) {
+    int n = all_ids(w, big_ids, 200000), m = 0;
+    for (int i = 0; i < n; i++) {
+        if (!((mask >> en_kind_of(w, big_ids[i])) & 1)) continue;
+        double q[3]; en_get(w, big_ids[i], 0, q);
+        double dx = q[0] - p[0], dy = q[1] - p[1], dz = q[2] - p[2];
+        if (dx * dx + dy * dy + dz * dz <= radius * radius) out[m++] = big_ids[i];
+    }
+    qsort(out, (size_t)m, sizeof *out, cmp_i64);
+    return m;
+}
+
+static void test_near(void) {
+    EnWorld *w = en_open(8192, 4096, 128, 160.0, 3.2, 0.1);
+    for (int k = 0; k < 3; k++) box_kind(w, 0, 0.25f, 0);
+    rng_state = 777;
+    int64_t first = -1;
+    for (int i = 0; i < 5000; i++) {
+        int64_t id = en_add(w, i % 3, urand(-60, 60), urand(-60, 60), urand(-60, 60), 0);
+        if (i == 0) first = id;
+    }
+    en_tick(w, 0, NULL, 0);
+    static const double radii[3] = {0.5, 4, 37};
+    int same = 1, found = 0, empty = 0;
+    for (int q = 0; q < 100; q++) {
+        double p[3];
+        if (q == 0) { p[0] = -37.5; p[1] = -12.25; p[2] = -50.0; }
+        else if (q % 4 == 0) { static int64_t ids[2000]; en_each(w, q % 3, 2000, ids); en_get(w, ids[q * 7], 0, p); p[0] += 0.1; }
+        else { p[0] = urand(-70, 70); p[1] = urand(-70, 70); p[2] = urand(-70, 70); }
+        for (int r = 0; r < 3; r++) for (int m = 0; m < 2; m++) {
+            uint64_t mask = m == 0 ? 7 : 5;   /* every kind; all but kind 1 */
+            int nw = brute_near(w, p, radii[r], mask, want_ids);
+            int ng = en_near(w, p, radii[r], mask, 200000, got_ids);
+            if (ng != nw || memcmp(got_ids, want_ids, (size_t)nw * sizeof *got_ids) != 0) same = 0;
+            if (en_near(w, p, radii[r], mask, 0, NULL) != nw) same = 0;
+            found += nw; empty += nw == 0;
+        }
+    }
+    CHECK(same, "near equals a brute-force filter at 100 points, radii 0.5, 4 and 37, with and without kind 1");
+    CHECK(found > 5000 && empty > 100, "... over both found and empty answers");
+    double o[3] = {0, 0, 0};
+    CHECK(en_near(w, o, 1000000, 7, 0, NULL) == 5000, "a radius of 1,000 km finds all 5,000 (the walk over the kind's list)");
+    int nw = brute_near(w, o, 37, 7, want_ids);
+    CHECK(nw > 3 && en_near(w, o, 37, 7, 3, got_ids) == 3 && got_ids[0] == want_ids[0] && got_ids[2] == want_ids[2],
+          "near with max 3 writes the three lowest ids");
+    double p0[3]; en_get(w, first, 0, p0);
+    CHECK(en_near(w, p0, 0.01, 7, 16, got_ids) == 1 && got_ids[0] == first, "near finds an entity at its own position");
+    en_remove(w, first, 0);
+    int64_t late = en_add(w, 0, p0[0], p0[1], p0[2], 0);
+    CHECK(en_near(w, p0, 0.01, 7, 16, got_ids) == 0, "between ticks, near names neither the removed entity nor the one just added");
+    en_tick(w, 0, NULL, 0);
+    CHECK(en_near(w, p0, 0.01, 7, 16, got_ids) == 1 && got_ids[0] == late, "after the next tick it names the new one");
+    CHECK(en_near(w, p0, NAN, 7, 16, got_ids) == 0 && en_near(w, p0, -1, 7, 16, got_ids) == 0, "a NaN or negative radius finds nothing");
+    en_close(w);
+}
+
+/* the ray's distance into the box lo..hi from o along unit u within max; 0 if it misses */
+static int slab(const double o[3], const double u[3], double max, const double lo[3], const double hi[3], double *t) {
+    double tn = 0, tf = max;
+    for (int a = 0; a < 3; a++) {
+        if (u[a] == 0) { if (o[a] < lo[a] || o[a] > hi[a]) return 0; continue; }
+        double t1 = (lo[a] - o[a]) / u[a], t2 = (hi[a] - o[a]) / u[a];
+        if (t1 > t2) { double s = t1; t1 = t2; t2 = s; }
+        if (t1 > tn) tn = t1;
+        if (t2 < tf) tf = t2;
+    }
+    if (tn > tf) return 0;
+    *t = tn;
+    return 1;
+}
+
+static void test_ray_entities(void) {
+    EnWorld *w = en_open(4096, 4096, 128, 160.0, 3.2, 0.1);
+    static const float halves[3] = {0.25f, 0.5f, 1.0f};
+    for (int k = 0; k < 3; k++) box_kind(w, 0, halves[k], 0);
+    rng_state = 4242;
+    for (int i = 0; i < 2000; i++) en_add(w, i % 3, urand(-40, 40), urand(-10, 10), urand(-40, 40), 0);
+    en_tick(w, 0, NULL, 0);
+    int n = all_ids(w, big_ids, 200000), same = 1, hits = 0;
+    for (int q = 0; q < 500; q++) {
+        double o[3] = {urand(-50, 50), urand(-12, 12), urand(-50, 50)};
+        double d[3] = {urand(-1, 1), urand(-0.3, 0.3), urand(-1, 1)};
+        if (q % 50 == 0) { d[1] = 0; d[2] = 0; }   /* along an axis */
+        double max = urand(1, 150);
+        uint64_t mask = q % 2 ? 7 : 3;
+        double len = sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+        double u[3] = {d[0] / len, d[1] / len, d[2] / len};
+        int64_t want = -1; double wt = 0;
+        for (int i = 0; i < n; i++) {
+            int k = en_kind_of(w, big_ids[i]);
+            if (!((mask >> k) & 1)) continue;
+            double p[3], lo[3], hi[3], t;
+            en_get(w, big_ids[i], 0, p);
+            for (int a = 0; a < 3; a++) { lo[a] = p[a] - (double)halves[k]; hi[a] = p[a] + (double)halves[k]; }
+            if (slab(o, u, max, lo, hi, &t) && (want < 0 || t < wt || (t == wt && big_ids[i] < want))) { want = big_ids[i]; wt = t; }
+        }
+        double t = -9;
+        int64_t got = en_ray_entities(w, o, d, max, mask, &t);
+        if (got != want || (want >= 0 && t != wt)) same = 0;
+        hits += want >= 0;
+    }
+    CHECK(same, "the entity ray equals a brute-force nearest box hit for 500 rays");
+    CHECK(hits >= 100 && hits <= 450, "... of which some hit and some miss");
+    double o[3] = {0, 0, 0}, zero[3] = {0, 0, 0}, x[3] = {1, 0, 0}, t;
+    int64_t twin_a = en_add(w, 0, 0, 100, 5, 0), twin_b = en_add(w, 0, 0, 100, 5, 0);
+    en_tick(w, 0, NULL, 0);
+    double above[3] = {0, 100, 0}, along_z[3] = {0, 0, 1};
+    CHECK(en_ray_entities(w, above, along_z, 10, 7, &t) == (twin_a < twin_b ? twin_a : twin_b) && t == 4.75,
+          "two boxes met at the same distance: the lower id, 4.75 m");
+    CHECK(en_ray_entities(w, o, zero, 10, 7, &t) == -1, "a zero direction hits nothing");
+    CHECK(en_ray_entities(w, o, x, 10, 0, &t) == -1, "an empty mask hits nothing");
+    en_close(w);
+}
+
+static int cmp_pair(const void *a, const void *b) {
+    const int64_t *x = (const int64_t *)a, *y = (const int64_t *)b;
+    return x[0] != y[0] ? (x[0] < y[0] ? -1 : 1) : x[1] < y[1] ? -1 : x[1] > y[1];
+}
+/* the touch events of the last tick, as (a, b) pairs, sorted; how many */
+static int touch_pairs(EnWorld *w, int64_t *pairs) {
+    int n = en_events(w, EN_EVENTS, ev_i, ev_f), m = 0;
+    for (int e = 0; e < n; e++) if (ev_i[e * 7] == EN_E_TOUCH) { pairs[2 * m] = ev_i[e * 7 + 1]; pairs[2 * m + 1] = ev_i[e * 7 + 2]; m++; }
+    qsort(pairs, (size_t)m, 2 * sizeof *pairs, cmp_pair);
+    return m;
+}
+
+static int64_t t_ids[2000]; static double t_from[2000 * 3];
+/* the box an entity swept over the last tick: from t_from[i] to its position, grown by h */
+static void swept(EnWorld *w, int i, double h, double lo[3], double hi[3]) {
+    double p[3]; en_get(w, t_ids[i], 0, p);
+    for (int a = 0; a < 3; a++) {
+        double f = t_from[i * 3 + a];
+        lo[a] = (f < p[a] ? f : p[a]) - h; hi[a] = (f > p[a] ? f : p[a]) + h;
+    }
+}
+static int boxes_meet(const double alo[3], const double ahi[3], const double blo[3], const double bhi[3]) {
+    for (int a = 0; a < 3; a++) if (!(alo[a] < bhi[a] && blo[a] < ahi[a])) return 0;
+    return 1;
+}
+/* every touching pair among t_ids[0..n): kinds whose pair bit is set in pairs[k] (k <= j) */
+static int brute_touches(EnWorld *w, int n, const double *half, uint64_t declared[2], int64_t *out) {
+    int m = 0;
+    for (int i = 0; i < n; i++) for (int j = i + 1; j < n; j++) {
+        int ki = en_kind_of(w, t_ids[i]), kj = en_kind_of(w, t_ids[j]);
+        int lo_k = ki < kj ? ki : kj, hi_k = ki < kj ? kj : ki;
+        if (!((declared[lo_k] >> hi_k) & 1)) continue;
+        double alo[3], ahi[3], blo[3], bhi[3];
+        swept(w, i, half[ki], alo, ahi); swept(w, j, half[kj], blo, bhi);
+        if (!boxes_meet(alo, ahi, blo, bhi)) continue;
+        int64_t a = t_ids[i], b = t_ids[j];
+        if (ki > kj || (ki == kj && a > b)) { int64_t s = a; a = b; b = s; }
+        out[2 * m] = a; out[2 * m + 1] = b; m++;
+    }
+    qsort(out, (size_t)m, 2 * sizeof *out, cmp_pair);
+    return m;
+}
+
+static void test_touches(void) {
+    EnWorld *w = en_open(4096, 4096, 128, 160.0, 3.2, 0.1);
+    double half[2] = {0.25, 0.5};
+    box_kind(w, 1, 0.25f, 0); box_kind(w, 0, 0.5f, 0);
+    rng_state = 99;
+    for (int i = 0; i < 2000; i++) {
+        int k = i % 4 == 0 ? 1 : 0;
+        int64_t id = en_add(w, k, urand(-25, 25), urand(-6, 6), urand(-25, 25), 0);
+        if (k == 0) { double v[3] = {urand(-60, 60), urand(-10, 10), urand(-60, 60)}; en_set(w, id, 1, v); }
+    }
+    en_touching(w, 0, 1);
+    int n = all_ids(w, t_ids, 2000);
+    for (int i = 0; i < n; i++) en_get(w, t_ids[i], 0, t_from + i * 3);
+    en_tick(w, 0, NULL, 1.0 / 60);
+    uint64_t declared[2] = {2, 0};
+    int nw = brute_touches(w, n, half, declared, want_ids);
+    int ng = touch_pairs(w, got_ids);
+    CHECK(nw > 100, "the scattered 2,000 make over 100 touching pairs");
+    CHECK(ng == nw && memcmp(got_ids, want_ids, (size_t)nw * 2 * sizeof *got_ids) == 0,
+          "touches over 2,000 entities of two kinds equal a brute-force pair test of the swept boxes, a the flyer");
+    /* the pair again in the other order, and kind 1 against itself; a tick of dt 0 sweeps nothing */
+    en_touching(w, 1, 0); en_touching(w, 1, 1);
+    for (int i = 0; i < n; i++) en_get(w, t_ids[i], 0, t_from + i * 3);
+    en_tick(w, 0, NULL, 0);
+    declared[0] = 2; declared[1] = 2;
+    nw = brute_touches(w, n, half, declared, want_ids);
+    ng = touch_pairs(w, got_ids);
+    int same_kind = 0;
+    for (int i = 0; i < nw; i++) same_kind += en_kind_of(w, want_ids[2 * i]) == 1;
+    CHECK(same_kind > 10, "kind 1 touches itself in over 10 pairs");
+    CHECK(ng == nw && memcmp(got_ids, want_ids, (size_t)nw * 2 * sizeof *got_ids) == 0,
+          "with (0, 1) declared twice and (1, 1) added, each pair is reported once, a of the same kind the lower id");
+    double before = en_stat(w, 3);
+    en_touching(w, 0, 0);
+    CHECK(en_stat(w, 3) == before, "a pair of kinds is taken");
+    en_touching(w, 0, 2); en_touching(w, -1, 0);
+    CHECK(en_stat(w, 3) == before + 2 && en_stat(w, 6) == EN_R_KIND, "a pair naming no such kind is refused and counted");
+    en_close(w);
+}
+
+/* kind 0 a flyer of half 0.05 at the origin going east at speed, kind 1 a target of half 0.2 at x = 5 */
+static EnWorld *range_world(int64_t *flyer, int64_t *target, double speed, int declare) {
+    EnWorld *w = world(16);
+    box_kind(w, 1, 0.05f, 0); box_kind(w, 0, 0.2f, 0);
+    *flyer = en_add(w, 0, 0, 1, 0, 0);
+    *target = en_add(w, 1, 5, 1, 0, 0);
+    double v[3] = {speed, 0, 0};
+    en_set(w, *flyer, 1, v);
+    if (declare) en_touching(w, 0, 1);
+    return w;
+}
+
+static void test_fast_and_undeclared(void) {
+    int64_t f, g, pairs[16];
+    EnWorld *w = range_world(&f, &g, 600, 1);
+    en_tick(w, 0, NULL, 1.0 / 60);
+    CHECK(fabs(pos_axis(w, f, 0) - 10.0) < 1e-9, "a flyer at 600 m/s with dt 1/60 steps from x 0 to 10");
+    CHECK(touch_pairs(w, pairs) == 1 && pairs[0] == f && pairs[1] == g, "... and reports touching the 0.4 m target at x 5 it passed");
+    en_tick(w, 0, NULL, 1.0 / 60);
+    CHECK(touch_pairs(w, pairs) == 0, "the next step, past it, reports nothing");
+    en_close(w);
+    w = range_world(&f, &g, 600, 0);
+    en_tick(w, 0, NULL, 1.0 / 60);
+    CHECK(en_events(w, 0, NULL, NULL) == 0, "the same pass with the pair not declared reports nothing");
+    en_close(w);
+    w = range_world(&f, &g, 0, 0);
+    en_touching(w, 0, 1); en_touching(w, 1, 0); en_touching(w, 0, 1);
+    double at[3] = {5.1, 1, 0}; en_set(w, f, 0, at);
+    box_kind(w, 0, 0.5f, 0);   /* kind 2: two boxes whose faces meet at x 20.5, which is not a touch */
+    en_add(w, 2, 20, 1, 0, 0); en_add(w, 2, 21, 1, 0, 0);
+    en_add(w, 2, 31, 1, 0, 0); en_add(w, 2, 30, 1, 0, 0);   /* and with the lower id on the right */
+    en_touching(w, 2, 2);
+    int once = 1;
+    for (int t = 0; t < 3; t++) {
+        en_tick(w, 0, NULL, 1.0 / 60);
+        if (touch_pairs(w, pairs) != 1 || pairs[0] != f || pairs[1] != g) once = 0;
+    }
+    CHECK(once, "an overlapping pair declared three times reports once a tick, three ticks running; faces that only meet do not touch");
+    en_close(w);
+}
+
+/* Two flyers of one kind (half 0.2, pair (0, 0) declared), A at a going va and B at b going vb, one step of 1/60 s;
+ * how many touches, and in *pair the (a, b) of the first. Worked by hand, not by the brute force. */
+static int two_flyers(const double a[3], const double va[3], const double b[3], const double vb[3], int64_t ids[2], int64_t pair[2]) {
+    EnWorld *w = world(16);
+    box_kind(w, 1, 0.2f, 0);
+    ids[0] = en_add(w, 0, a[0], a[1], a[2], 0);
+    ids[1] = en_add(w, 0, b[0], b[1], b[2], 0);
+    en_set(w, ids[0], 1, va); en_set(w, ids[1], 1, vb);
+    en_touching(w, 0, 0);
+    en_tick(w, 0, NULL, 1.0 / 60);
+    int64_t pairs[16];
+    int n = touch_pairs(w, pairs);
+    if (n > 0) { pair[0] = pairs[0]; pair[1] = pairs[1]; }
+    en_close(w);
+    return n;
+}
+
+static void test_flyer_against_flyer(void) {
+    int64_t ids[2], pair[2] = {-1, -1};
+    /* A from (-5, 0, 0) to (5, 0, 0) and B from (0, 0, -5) to (0, 0, 5) in one step: they cross at the origin */
+    double a0[3] = {-5, 0, 0}, east[3] = {600, 0, 0}, b0[3] = {0, 0, -5}, north[3] = {0, 0, 600};
+    CHECK(two_flyers(a0, east, b0, north, ids, pair) == 1 && pair[0] == ids[0] && pair[1] == ids[1],
+          "two flyers crossing in one 10 m step report one touch, a the lower id");
+    /* parallel paths 0.3 m apart, both stepping 2 m east, B 1.5 m ahead: never nearer than 1.5 m, but each swept box
+     * (A x -0.2..2.2, B x 1.3..3.7; z -0.2..0.2 and 0.1..0.5) overlaps the other: the near miss the reading costs */
+    double p0[3] = {0, 0, 0}, slow[3] = {120, 0, 0}, q0[3] = {1.5, 0, 0.3};
+    CHECK(two_flyers(p0, slow, q0, slow, ids, pair) == 1, "parallel flyers 0.3 m apart, one 1.5 m ahead, report a near miss");
+    double r0[3] = {1.5, 0, 0.5};
+    CHECK(two_flyers(p0, slow, r0, slow, ids, pair) == 0, "the same pair 0.5 m apart reports none");
+}
+
+static void test_event_overflow(void) {
+    EnWorld *w = en_open(1 << 17, 4096, 128, 160.0, 3.2, 0.1);
+    box_kind(w, 0, 0.01f, 0); box_kind(w, 0, 100.0f, 0);
+    for (int i = 0; i < 70000; i++) en_add(w, 0, (i % 50) * 1.5 - 37, (i / 50 % 40) * 1.5 - 30, (i / 2000) * 1.5 - 26, 0);
+    en_add(w, 1, 0, 0, 0, 0);
+    en_touching(w, 0, 1);
+    en_tick(w, 0, NULL, 0);
+    int n = en_events(w, EN_EVENTS, ev_i, ev_f), all_touch = 1;
+    for (int e = 0; e < n; e++) if (ev_i[e * 7] != EN_E_TOUCH) all_touch = 0;
+    CHECK(n == 65536 && all_touch, "70,000 touching pairs in one tick give 65,536 touch events");
+    CHECK(en_stat(w, 5) == 4464, "... and stat 5 counts the 4,464 dropped");
+    en_close(w);
+}
+
+static void test_removal_in_loop(void) {
+    EnWorld *w = en_open(1024, 4096, 128, 160.0, 3.2, 0.1);
+    box_kind(w, 1, 0.5f, 0); box_kind(w, 0, 0.5f, 0);
+    for (int i = 0; i < 100; i++) { en_add(w, 0, i * 10.0, 0, 0, 0); en_add(w, 1, i * 10.0, 0, 0.25, 0); }
+    en_touching(w, 0, 1);
+    en_tick(w, 0, NULL, 1.0 / 60);
+    int64_t pairs[512], ids[100], removed[50], added[10];
+    CHECK(touch_pairs(w, pairs) == 100, "100 flyers each touch their target");
+    int n = en_each(w, 0, 100, ids), nr = 0, na = 0;
+    for (int i = 0; i < n; i++) {   /* walk the ids taken: remove every second, and add 10 while walking */
+        if (i % 2 == 1) { en_remove(w, ids[i], 0); removed[nr++] = ids[i]; }
+        if (i % 10 == 5) added[na++] = en_add(w, 0, (i + 0.5) * 10.0, 0, 0, 0);
+    }
+    for (int i = 0; i < na; i++) en_add(w, 1, (i * 10 + 5.5) * 10.0, 0, 0, 0);   /* a target for each new flyer */
+    int defaults = 1;
+    for (int i = 0; i < nr; i++) {
+        double p[3] = {9, 9, 9};
+        if (en_alive(w, removed[i]) || en_kind_of(w, removed[i]) != -1 || en_get(w, removed[i], 0, p) != 0 ||
+            p[0] != 0 || p[1] != 0 || p[2] != 0) defaults = 0;
+    }
+    CHECK(defaults, "every removed id reads the defaults");
+    double at[3] = {10, 0, 0};
+    CHECK(en_near(w, at, 0.1, 1, 8, got_ids) == 0, "near between ticks does not name removed flyer 1");
+    en_tick(w, 0, NULL, 1.0 / 60);
+    int nev = en_events(w, EN_EVENTS, ev_i, ev_f), named = 0, sixes = 0, touches = 0, new_touch = 0;
+    for (int e = 0; e < nev; e++) {
+        int64_t *v = ev_i + e * 7;
+        for (int i = 0; i < nr; i++) if (v[1] == removed[i] || v[2] == removed[i]) {
+            if (v[0] == EN_E_REMOVED && v[3] == 0) sixes++; else named++;
+        }
+        if (v[0] == EN_E_TOUCH) { touches++; for (int i = 0; i < na; i++) new_touch += v[1] == added[i]; }
+    }
+    CHECK(sixes == 50, "the next tick lists each removed id once, as event 6 reason 0");
+    CHECK(named == 0, "... and no other event names a removed id");
+    CHECK(touches == 60 && new_touch == 10, "the 50 left and the 10 added each touch their target");
+    en_close(w);
+
+    w = world(16);
+    box_kind(w, 1, 0.5f, 0.05f); box_kind(w, 0, 0.5f, 0);
+    int64_t dying = en_add(w, 0, 0, 0, 0, 0);
+    en_add(w, 1, 0.2, 0, 0, 0);
+    en_touching(w, 0, 1);
+    en_tick(w, 0, NULL, 0.1);
+    nev = en_events(w, EN_EVENTS, ev_i, ev_f);
+    CHECK(nev == 1 && ev_i[0] == EN_E_REMOVED && ev_i[1] == dying && ev_i[3] == 1,
+          "an entity whose lifetime ends on the tick it would touch gives event 6 and no event 1");
+    en_close(w);
+}
+
 int main(void) {
     test_kinds();
     test_add_and_read();
@@ -506,6 +865,13 @@ int main(void) {
     test_wall();
     test_lifetime_and_removal();
     test_dt_edges();
+    test_near();
+    test_ray_entities();
+    test_touches();
+    test_fast_and_undeclared();
+    test_flyer_against_flyer();
+    test_event_overflow();
+    test_removal_in_loop();
     if (fails == 0) printf("ent_test: ok\n");
     return fails == 0 ? 0 : 1;
 }

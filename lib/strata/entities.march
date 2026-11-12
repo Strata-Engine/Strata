@@ -22,7 +22,10 @@
 -- `Strata.Stream` loaded, edited and unloaded since the last call; call it
 -- once a frame after `Strata.Stream.tick`. `step` runs the kernel's tick:
 -- ages and lifetimes, and flying movement, seen flyers stopping at the first
--- block on their way. `events` reads what the last tick reported.
+-- block on their way. After movement the tick puts every live entity in a
+-- grid of 4 m cells, from which `near` and `raycast` answer until the next
+-- tick, and reports a touch for each overlapping pair of kinds declared with
+-- `touching`. `events` reads what the last tick reported.
 --
 -- A consumer lists native/strata_ent.c in its own [ffi] sources (GAPS S11).
 -- `spawn` is a March keyword, so an entity is made with `add` (GAPS S22).
@@ -289,13 +292,45 @@ mod Strata.Entities do
     end
   end
 
-  doc "The kernel's tick alone, [dt] seconds, with the [focus] points in metres (an entity within its kind's seen distance of one, measured horizontally, is seen; no focus, none is): ages and lifetimes, then movement (placed entities stay; flying ones move by their velocity, with gravity if the kind asks, and while seen stop at the first block in their way, reporting it). A negative dt is counted (stat 4) and moves nothing. No figures, bodies or voices: those come with `tick`."
+  doc "The kernel's tick alone, [dt] seconds, with the [focus] points in metres (an entity within its kind's seen distance of one, measured horizontally, is seen; no focus, none is): ages and lifetimes, then movement (placed entities stay; flying ones move by their velocity, with gravity if the kind asks, and while seen stop at the first block in their way, reporting it); then the grid `near` and `raycast` read, and a touch event for each overlapping pair of declared kinds. A negative dt is counted (stat 4) and moves nothing. No figures, bodies or voices: those come with `tick`."
   fn step(e : Entities, focus : List((Float, Float, Float)), dt : Float) : Entities do
     if !e.en_live do e
     else
       let n = List.length(focus)
       let written = Fen.tick(focus_go(NativeArray.make_float(3 * n, 0.0), focus, 0), dt)
       after(written, e)
+    end
+  end
+
+  -- ── Finding and touching ─────────────────────────────────────────────────
+  doc "Ask for a touch event (code 1) each tick for each pair of an entity of [kind_a] and one of [kind_b] whose boxes overlap. A moving entity is tested along its whole step (the box it swept), so a fast bullet does not pass through a thin target; when both move, both are swept, so two whose paths pass close at different moments of the step can report a near miss. Declaring a pair again, or in the other order, changes nothing. A pair naming no such kind is refused and counted."
+  fn touching(e : Entities, kind_a : Int, kind_b : Int) : Entities do
+    if e.en_live do after(Fen.touching(kind_a, kind_b), e) else e end
+  end
+
+  doc "The kind mask holding [kinds]: bit k for kind k. Numbers outside 0..61 are left out."
+  fn mask(kinds : List(Int)) : Int do
+    List.fold_left(kinds, 0, fn (m, k) -> if k >= 0 && k < 62 do int_or(m, int_shl(1, k)) else m end)
+  end
+
+  doc "The ids, sorted, of the entities within [radius] metres of (x, y, z) whose kind is in the mask [kinds] (see `mask`), as the last `step` left them: one added since is not found until the next step, one removed since is not found at all. Empty when not open."
+  fn near(e : Entities, x : Float, y : Float, z : Float, radius : Float, kinds : Int) : NativeIntArr do
+    let n = if e.en_live do Fen.near(x, y, z, radius, kinds, NativeArray.make_int(0, -1)) else 0 end
+    let out = NativeArray.make_int(n, -1)
+    if n == 0 do out
+    else
+      let written = Fen.near(x, y, z, radius, kinds, out)
+      if written == n do out else NativeArray.make_int(0, -1) end
+    end
+  end
+
+  doc "The first entity whose box the ray from (ox, oy, oz) along (dx, dy, dz) meets within [max] metres, of a kind in the mask [kinds], as the last `step` left them: (its id, the distance in metres), or (-1, -1.0) for none."
+  fn raycast(e : Entities, ox : Float, oy : Float, oz : Float, dx : Float, dy : Float, dz : Float, max : Float, kinds : Int) : (Int, Float) do
+    if !e.en_live do (-1, -1.0)
+    else
+      let t = NativeArray.make_float(1, -1.0)
+      let id = Fen.ray_entities(ox, oy, oz, dx, dy, dz, max, kinds, t)
+      if id >= 0 do (id, NativeArray.get_float(t, 0)) else (-1, -1.0) end
     end
   end
 
