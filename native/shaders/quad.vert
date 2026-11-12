@@ -19,7 +19,7 @@ layout(location = 0) out vec2 v_uv;           // in unit faces: 0..w, 0..h (corn
 layout(location = 4) out vec2 v_tex;          // texture coordinate: one tile per world voxel, image rows running downward
 layout(location = 1) out vec3 v_world;        // metres
 layout(location = 2) flat out uint v_w1;
-layout(location = 3) flat out uint v_face;
+layout(location = 3) flat out uint v_face;        // 0..5; plus 8 for a chunk above level 0, lit without rays
 layout(location = 5) flat out vec4 v_rot;        // the rotation of the body drawn; identity for the world
 
 void main() {
@@ -60,6 +60,6 @@ void main() {
     v_uv = vec2(du, dv);
     v_world = world;
     v_w1 = fluid ? (w1 | (255u << 16)) : w1;           // a fluid is not corner-shaded
-    v_face = face;
+    v_face = face | ((ol.w & 255) > 0 ? 8u : 0u);
     gl_Position = to_clip(u.vp * vec4(world, 1.0));
 }

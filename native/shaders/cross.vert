@@ -16,7 +16,7 @@ layout(push_constant) uniform PC { uint base; uint flags; } pc;
 layout(location = 0) out vec2 v_uv;
 layout(location = 1) out vec3 v_world;
 layout(location = 2) flat out uint v_w1;
-layout(location = 3) flat out uint v_face;
+layout(location = 3) flat out uint v_face;        // 0, plus 8 above level 0 (quad.vert)
 layout(location = 5) flat out vec4 v_rot;
 layout(location = 4) out vec2 v_tex;
 
@@ -38,12 +38,13 @@ void main() {
     Chunk ch = table.chunks[draw_slot.slot[pc.base + uint(gl_DrawID)]];
     ivec4 ol = ch.origin_level;
     bool body = (ol.w & 512) != 0;
-    vec3 world = body ? ch.pos.xyz + qrot(ch.rot, q * u.eye.w) : (vec3(ol.xyz) + q) * u.eye.w;
+    float lod = float(1 << (ol.w & 255));   // a level-L chunk's voxels are 2^L world voxels on a side
+    vec3 world = body ? ch.pos.xyz + qrot(ch.rot, q * u.eye.w) : (vec3(ol.xyz) + q * lod) * u.eye.w;
     v_rot = body ? ch.rot : vec4(0.0, 0.0, 0.0, 1.0);
     v_uv = vec2(0.5);                       // no corner shading on a plant
     v_tex = vec2(cu, 1.0 - cv);
     v_world = world;
     v_w1 = uint(blocks.rows[id].tex[2]) | (255u << 16);
-    v_face = 0u;                            // lit as an upward surface
+    v_face = (ol.w & 255) > 0 ? 8u : 0u;    // lit as an upward surface
     gl_Position = to_clip(u.vp * vec4(world, 1.0));
 }

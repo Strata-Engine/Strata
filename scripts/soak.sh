@@ -16,6 +16,11 @@
 # sound run must match within 0.5 ms (judged only on a quiet machine), and
 # one that holds the main thread 100 ms every 600 frames, which the mixer
 # must not notice. Nothing is played aloud. STRATA_SOAK_AUDIO=0 skips sound.
+#
+# The flight runs with the viewer's far field (four levels unless
+# STRATA_LEVELS says otherwise) and records it: the chunks loaded at the
+# start, level by level, the ticks and time they took to settle, and at the
+# end the chunks loaded, slots in use and meshes still retained.
 #   scripts/soak.sh            the default quad buffer
 #   scripts/soak.sh 200000     a quad buffer of that many quads, smaller than the
 #                              scene needs: uploads are refused and wait, and the
@@ -36,6 +41,8 @@ line=$(echo "$out" | grep '^soak:')
 echo "$line"
 # a field of the summary line by its whole name: the space keeps worst_ms from matching fluid_worst_ms
 get() { echo "$line" | sed -n "s/.* $1=\\([0-9.]*\\).*/\\1/p"; }
+echo "$out" | grep '^strata_viewer: far field' | sed 's/^strata_viewer: /at the start, /'
+echo "far field at the end: levels $(get levels), $(get loaded) chunks loaded, $(get slots) slots in use, $(get retained) retained, worst frame $(get worst_ms) ms (load average $(uptime | sed 's/.*load averages*: *\([0-9.]*\).*/\1/'))"
 fail=0
 # with the default buffer everything must fit; with a given one the run only has to survive
 if [ "$QUADS" = "0" ]; then

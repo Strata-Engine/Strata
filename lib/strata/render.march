@@ -101,10 +101,14 @@ mod Strata.Render do
   doc "Give the renderer every model's drawing geometry. Call before the first chunks are uploaded."
   fn upload_models(r : Strata.Blocks.Registry) : Bool do models_go(r, 0, true) end
 
+  pfn pow2(l : Int) : Int do if l <= 0 do 1 else 2 * pow2(l - 1) end end
+
   -- Upload a chunk whole. Every part is given, empty ones too, so a part
   -- that lost its last quad is cleared; the renderer takes all of it or none.
   pfn upload(slot : Int, k : Strata.Coord.Key, m : Strata.Mesh.Meshed) : Bool do
-    let b = Strata.Ffi.Vk.chunk_begin(slot, 32 * Strata.Coord.kx(k), 32 * Strata.Coord.ky(k), 32 * Strata.Coord.kz(k))
+    let l = Strata.Coord.level(k)
+    let side = 32 * pow2(l)
+    let b = Strata.Ffi.Vk.chunk_begin(slot, side * Strata.Coord.kx(k), side * Strata.Coord.ky(k), side * Strata.Coord.kz(k), l)
     let p0 = Strata.Ffi.Vk.chunk_part(0, Strata.Mesh.quads_at(m, 0), Strata.Mesh.quad_count_at(m, 0))
     let p1 = Strata.Ffi.Vk.chunk_part(1, Strata.Mesh.quads_at(m, 1), Strata.Mesh.quad_count_at(m, 1))
     let p2 = Strata.Ffi.Vk.chunk_part(2, Strata.Mesh.quads_at(m, 2), Strata.Mesh.quad_count_at(m, 2))
@@ -131,13 +135,16 @@ mod Strata.Render do
     match acts do
       Nil -> sl
       Cons(a, t) ->
-        if !Sr2.is_upload(a) do
+        if Sr2.is_free(a) do
           Strata.Ffi.Vk.chunk_free(Sr2.slot(a))
+          perform(sl, t, none)
+        else if Sr2.is_visibility(a) do
+          Strata.Ffi.Vk.chunk_show(Sr2.slot(a), Sr2.shown(a))
           perform(sl, t, none)
         else
           let ok = if Strata.Physics.is_part_key(Sr2.key(a)) do upload_part(Sr2.slot(a), Sr2.mesh_or(a, none)) else upload(Sr2.slot(a), Sr2.key(a), Sr2.mesh_or(a, none)) end
           perform(if ok do sl else Sr2.refused(sl, a) end, t, none)
-        end
+        end end
     end
   end
 
@@ -210,7 +217,7 @@ mod Strata.Render do
     match m do (id, k, mesh) -> (Strata.Physics.part_key(id, k), mesh) end
   end
 
-  doc "Bring the renderer up to date with the stream: upload its finished meshes, free its unloaded chunks, retry anything refused earlier."
+  doc "Bring the renderer up to date with the stream: upload its finished meshes, free its unloaded chunks, retry anything refused earlier. With levels (Strata.Stream.config_levels) it also applies Part F's which-chunk-draws rule (Strata.Slots): each region is drawn by one level, a coarse chunk's mesh is kept undrawn while its eight children draw, and an unloaded chunk keeps its slot, drawn, until the chunk above it holds a mesh, when its slot is freed."
   fn sync(r : Render, s : Strata.Stream.Stream) : (Render, Strata.Stream.Stream) do
     match Strata.Stream.take_meshes(s) do
       (s2, meshes) ->
@@ -218,13 +225,20 @@ mod Strata.Render do
           (s3, gone) ->
             match r do
               Render(sl, none, rg) ->
-                match Sr2.plan(sl, meshes, gone) do
+                let top = Strata.Stream.top_level(s3)
+                let sl1 = if Sr2.levels(sl) == top do sl else match Sr2.with_levels(sl, top) do (sl0, acts0) -> perform(sl0, acts0, none) end end
+                match Sr2.plan(sl1, meshes, gone) do
                   (sl2, acts) -> (Render(perform(sl2, acts, none), none, rg), s3)
                 end
             end
         end
     end
   end
+
+  doc "Chunks unloaded by the stream whose slots are kept, and drawn, until the chunk above each holds a mesh."
+  fn retained(r : Render) : Int do match r do Render(sl, _, _) -> Sr2.retained(sl) end end
+  doc "Is [k]'s mesh held and drawn (not kept undrawn by the which-chunk-draws rule)?"
+  fn drawn(r : Render, k : Strata.Coord.Key) : Bool do match r do Render(sl, _, _) -> Sr2.drawn(sl, k) end end
   -- ── Figures ────────────────────────────────────────────────────────────────
   -- a rig's palette as the renderer takes it: 256 x (red, green, blue, roughness, emission)
   pfn palette_go(out : NativeF32Arr, cs : List((Int, Float, Float, Float, Float, Float))) : NativeF32Arr do
