@@ -46,6 +46,11 @@ fi
 # the circuit keeps a steady view, so what the GPU holds must stay near what it started with
 [ "$(get live_quads)" -le 1500000 ] || { echo "FAIL: the quad buffer grew without bound"; fail=1; }
 awk "BEGIN { exit !($(get worst_ms) <= 20.0) }" || { echo "FAIL: a frame took over 20 ms"; fail=1; }
+# no figures: the animation is never updated, and the renderer's figure path (its draw list, culling
+# and shadow map) costs under 0.1 ms in the run's worst frame, CPU and GPU (the design's target)
+[ "$(get fig_updates)" = "0" ] || { echo "FAIL: figures were updated in a run with none"; fail=1; }
+echo "figures with none: worst preparation $(get fig_prep_us) us, worst shadow pass $(get fig_shadow_ms) ms"
+awk "BEGIN { exit !($(get fig_prep_us) < 100.0 && $(get fig_shadow_ms) < 0.1) }" || { echo "FAIL: with no figures the figure path took 0.1 ms or more in a frame"; fail=1; }
 # the lake breached at frame 300 must be draining, and water is never made
 echo "lake at the breach: ${lake_start:-?} voxels"
 [ -n "$lake_start" ] && [ "$lake_start" -gt 0 ] || { echo "FAIL: no lake to breach"; fail=1; }
