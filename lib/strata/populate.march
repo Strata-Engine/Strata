@@ -1,0 +1,386 @@
+-- Populate — a frozen population evaluated over the ground a game hands
+-- over. `Strata.Population` holds the declarations and `freeze`; this module
+-- runs them. It depends on `Strata.Population`, never the reverse.
+--
+-- A `Ground` is an n x n area of columns at one level: its corner in world
+-- voxels, the level's voxel size in metres, each column's ground top and
+-- water line, and the built-in fields (slots 0..9) the game can supply.
+--
+-- `fields` evaluates every field and zone of a `Frozen` over a Ground, once,
+-- into a `Table` the calling task owns, and compiles every layer's rule into
+-- a flat program beside them. From then on `density` and `in_zone` read
+-- arrays by index, with no name lookups and no list walks per column.
+--
+-- Placers (later tasks) are added below the field and rule section.
+mod Strata.Populate do
+
+  alias Strata.Population as Pn
+
+  -- An n x n area of columns whose corner is world voxel (x0, z0) at one
+  -- level: the voxel size, each column's ground top and water line (voxels),
+  -- and the built-in fields supplied, by slot.
+  type Ground = { pg_x0 : Int, pg_z0 : Int, pg_n : Int, pg_voxel : Float, pg_tops : NativeIntArr, pg_waters : NativeIntArr, pg_slots : List((Int, NativeF32Arr)) }
+
+  -- Every field and zone of a Frozen over one Ground, and its rules compiled.
+  --   pt_vals   field f at column c is pt_vals[f * nn + c]      (nf * nn)
+  --   pt_zones  zone z at column c is pt_zones[z * nn + c], 0/1 (nz * nn)
+  --   pt_prog   pt_prog[l] is where layer l's program starts in pt_prog; at
+  --             that place: nc, then nc triples (field, first point in pt_num,
+  --             point count), then ni and ni zones to be inside, then no and
+  --             no zones to be outside
+  --   pt_num    pt_num[l] is layer l's base density; after the nl bases, the
+  --             curves' points as x, factor pairs
+  -- (opaque to callers: read it with field_at, in_zone, density)
+  type Table = { pt_nn : Int, pt_names : List(String), pt_nl : Int, pt_nz : Int, pt_nf : Int, pt_vals : NativeF32Arr, pt_zones : NativeU8Arr, pt_prog : NativeI32Arr, pt_num : NativeFloatArr }
+
+  -- ── Ground ────────────────────────────────────────────────────────────────
+
+  doc "An n x n area of columns whose corner is world voxel (x0, z0) at this level's voxel size (scale * 2^level metres); tops: the ground top voxel per column; waters: the water line voxel per column, or a value below tops for none. Columns are numbered i + n * j, i along x."
+  fn ground(x0 : Int, z0 : Int, n : Int, scale : Float, level : Int, tops : NativeIntArr, waters : NativeIntArr) : Ground do
+    { pg_x0: x0, pg_z0: z0, pg_n: n, pg_voxel: scale *. Math.pow(2.0, int_to_float(level)), pg_tops: tops, pg_waters: waters, pg_slots: Nil }
+  end
+
+  doc "The Ground with built-in field `slot` (0..9) supplied over the same n x n area, values[i + n * j]; a slot supplied again replaces the earlier values; columns past the end of values read 0."
+  fn with_field(g : Ground, slot : Int, values : NativeF32Arr) : Ground do
+    { g with pg_slots: Cons((slot, values), g.pg_slots) }
+  end
+
+  pfn slot_values(slots : List((Int, NativeF32Arr)), s : Int) : Option(NativeF32Arr) do
+    match slots do
+      Nil -> None
+      Cons((k, a), rest) -> if k == s do Some(a) else slot_values(rest, s) end
+    end
+  end
+
+  -- ── Fields and rules: evaluation ──────────────────────────────────────────
+
+  pfn mem_int(xs : List(Int), x : Int) : Bool do List.any(xs, fn y -> y == x) end
+
+  -- the fields in an order where a curve field follows its source (freeze refused cycles)
+  pfn field_visit(f : Strata.Population.Frozen, i : Int, done_rev : List(Int)) : List(Int) do
+    if mem_int(done_rev, i) do done_rev
+    else
+      let after = if Pn.field_kind(f, i) == 2 do field_visit(f, Pn.field_source(f, i), done_rev) else done_rev end
+      Cons(i, after)
+    end
+  end
+  pfn field_order(f : Strata.Population.Frozen, i : Int, nf : Int, done_rev : List(Int)) : List(Int) do
+    if i >= nf do List.reverse(done_rev) else field_order(f, i + 1, nf, field_visit(f, i, done_rev)) end
+  end
+
+  -- the zones in an order where a zone follows the zones it is made of
+  pfn zone_visit(f : Strata.Population.Frozen, z : Int, done_rev : List(Int)) : List(Int) do
+    if mem_int(done_rev, z) do done_rev
+    else Cons(z, List.fold_left(Pn.zone_members(f, z), done_rev, fn (acc, m) -> zone_visit(f, m, acc)))
+    end
+  end
+  pfn zone_order(f : Strata.Population.Frozen, z : Int, nz : Int, done_rev : List(Int)) : List(Int) do
+    if z >= nz do List.reverse(done_rev) else zone_order(f, z + 1, nz, zone_visit(f, z, done_rev)) end
+  end
+
+  -- dst[off + k] = src[k] for k < cnt
+  pfn copy_into(dst : NativeF32Arr, off : Int, src : NativeF32Arr, k : Int, cnt : Int) : NativeF32Arr do
+    if k >= cnt do dst else copy_into(NativeArray.set_f32(dst, off + k, NativeArray.get_f32(src, k)), off, src, k + 1, cnt) end
+  end
+  -- dst[off + k] = 0.5 + 0.5 * src[k]: noise in [-1, 1] read as 0..1
+  pfn copy_unit(dst : NativeF32Arr, off : Int, src : NativeF32Arr, k : Int, cnt : Int) : NativeF32Arr do
+    if k >= cnt do dst else copy_unit(NativeArray.set_f32(dst, off + k, 0.5 +. 0.5 *. NativeArray.get_f32(src, k)), off, src, k + 1, cnt) end
+  end
+
+  -- points (x, factor) interleaved
+  pfn flat_points(pts : List((Float, Float))) : List(Float) do
+    List.flat_map(pts, fn p -> match p do (x, y) -> [x, y] end)
+  end
+
+  -- a curve of cnt points at num[off..]: piecewise linear, flat beyond the ends (as Pn.curve_at)
+  pfn curve_go(num : NativeFloatArr, off : Int, k : Int, cnt : Int, x : Float) : Float do
+    let yk = NativeArray.get_float(num, off + 2 * k + 1)
+    if k + 1 >= cnt do yk
+    else
+      let x1 = NativeArray.get_float(num, off + 2 * k + 2)
+      if x < x1 do
+        let xk = NativeArray.get_float(num, off + 2 * k)
+        let y1 = NativeArray.get_float(num, off + 2 * k + 3)
+        yk +. (y1 -. yk) *. (x -. xk) /. (x1 -. xk)
+      else curve_go(num, off, k + 1, cnt, x) end
+    end
+  end
+  pfn curve_eval(num : NativeFloatArr, off : Int, cnt : Int, x : Float) : Float do
+    if cnt <= 0 do 0.0
+    else if x < NativeArray.get_float(num, off) do NativeArray.get_float(num, off + 1)
+    else curve_go(num, off, 0, cnt, x) end end
+  end
+
+  -- vals[dst + k] = curve(vals[src + k])
+  pfn curve_into(vals : NativeF32Arr, dst : Int, src : Int, num : NativeFloatArr, cnt : Int, k : Int, nn : Int) : NativeF32Arr do
+    if k >= nn do vals
+    else curve_into(NativeArray.set_f32(vals, dst + k, curve_eval(num, 0, cnt, NativeArray.get_f32(vals, src + k))), dst, src, num, cnt, k + 1, nn) end
+  end
+
+  pfn eval_field(f : Strata.Population.Frozen, seed : Int, g : Ground, nn : Int, vals : NativeF32Arr, i : Int) : NativeF32Arr do
+    let kind = Pn.field_kind(f, i)
+    if kind == 0 do
+      match slot_values(g.pg_slots, Pn.field_slot(f, i)) do
+        Some(a) -> copy_into(vals, i * nn, a, 0, Math.min_int(nn, NativeArray.length_f32(a)))
+        None -> vals
+      end
+    else if kind == 1 do
+      -- lacunarity 2, gain 0.5, fBm, no warp, at 1 / period; sampled at column centres
+      let s = Strata.Noise.settings(Pn.field_noise_kind(f, i), Pn.field_octaves(f, i), 2.0, 0.5, 1, 0.0)
+      let v = g.pg_voxel
+      let out = NativeArray.make_f32(nn, 0.0)
+      let wrote = Strata.Noise.field2(s, Strata.Seed.mix(seed, Pn.field_salt(f, i)), 1.0 /. Pn.field_period(f, i), (int_to_float(g.pg_x0) +. 0.5) *. v, (int_to_float(g.pg_z0) +. 0.5) *. v, v, g.pg_n, g.pg_n, out)
+      if wrote == nn do copy_unit(vals, i * nn, out, 0, nn) else vals end
+    else if kind == 2 do
+      let pts = Pn.curve_points(Pn.field_source_curve(f, i))
+      curve_into(vals, i * nn, Pn.field_source(f, i) * nn, NativeArray.from_list_float(flat_points(pts)), List.length(pts), 0, nn)
+    else
+      -- COVER FIELDS (Task 6): a cover field reads 0 until the cover pass fills it here.
+      vals
+    end end end
+  end
+
+  pfn eval_fields(f : Strata.Population.Frozen, seed : Int, g : Ground, nn : Int, vals : NativeF32Arr, order : List(Int)) : NativeF32Arr do
+    match order do
+      Nil -> vals
+      Cons(i, rest) -> eval_fields(f, seed, g, nn, eval_field(f, seed, g, nn, vals, i), rest)
+    end
+  end
+
+  -- ── Zones ─────────────────────────────────────────────────────────────────
+
+  pfn b2u(b : Bool) : Int do if b do 1 else 0 end end
+
+  pfn has_id(ids : NativeIntArr, k : Int, cnt : Int, r : Int) : Bool do
+    if k >= cnt do false else if NativeArray.get_int(ids, k) == r do true else has_id(ids, k + 1, cnt, r) end end
+  end
+  -- region slot 7 rounded to the nearest integer is one of ids
+  pfn regions_go(zs : NativeU8Arr, off : Int, reg : NativeF32Arr, nreg : Int, ids : NativeIntArr, cnt : Int, k : Int, nn : Int) : NativeU8Arr do
+    if k >= nn do zs
+    else
+      let v = if k < nreg do NativeArray.get_f32(reg, k) else 0.0 end
+      let r = float_to_int(Math.floor(v +. 0.5))
+      regions_go(NativeArray.set_u8(zs, off + k, b2u(has_id(ids, 0, cnt, r))), off, reg, nreg, ids, cnt, k + 1, nn)
+    end
+  end
+
+  -- lo <= field < hi (a NaN is outside)
+  pfn band_go(zs : NativeU8Arr, off : Int, vals : NativeF32Arr, src : Int, lo : Float, hi : Float, k : Int, nn : Int) : NativeU8Arr do
+    if k >= nn do zs
+    else
+      let v = NativeArray.get_f32(vals, src + k)
+      let inside = if v >= lo do v < hi else false end
+      band_go(NativeArray.set_u8(zs, off + k, b2u(inside)), off, vals, src, lo, hi, k + 1, nn)
+    end
+  end
+
+  -- inner <= distance < outer from some site (sites as xm, zm pairs)
+  pfn near_site(xz : NativeFloatArr, s : Int, ns : Int, xm : Float, zm : Float, in2 : Float, out2 : Float) : Bool do
+    if s >= ns do false
+    else
+      let dx = xm -. NativeArray.get_float(xz, 2 * s)
+      let dz = zm -. NativeArray.get_float(xz, 2 * s + 1)
+      let d2 = dx *. dx +. dz *. dz
+      if d2 >= in2 do (if d2 < out2 do true else near_site(xz, s + 1, ns, xm, zm, in2, out2) end)
+      else near_site(xz, s + 1, ns, xm, zm, in2, out2) end
+    end
+  end
+  pfn ring_go(zs : NativeU8Arr, off : Int, g : Ground, xz : NativeFloatArr, ns : Int, in2 : Float, out2 : Float, k : Int, nn : Int) : NativeU8Arr do
+    if k >= nn do zs
+    else
+      let n = g.pg_n
+      let xm = (int_to_float(g.pg_x0 + k % n) +. 0.5) *. g.pg_voxel
+      let zm = (int_to_float(g.pg_z0 + k / n) +. 0.5) *. g.pg_voxel
+      ring_go(NativeArray.set_u8(zs, off + k, b2u(near_site(xz, 0, ns, xm, zm, in2, out2))), off, g, xz, ns, in2, out2, k + 1, nn)
+    end
+  end
+
+  -- all (want 1): every member holds; any (want 0): not every member fails
+  pfn every_is(zs : NativeU8Arr, ms : NativeIntArr, m : Int, cnt : Int, nn : Int, k : Int, want : Int) : Bool do
+    if m >= cnt do true
+    else if NativeArray.get_u8(zs, NativeArray.get_int(ms, m) * nn + k) == want do every_is(zs, ms, m + 1, cnt, nn, k, want)
+    else false end end
+  end
+  pfn combine_go(zs : NativeU8Arr, off : Int, ms : NativeIntArr, cnt : Int, any : Bool, k : Int, nn : Int) : NativeU8Arr do
+    if k >= nn do zs
+    else
+      let v = if any do b2u(!every_is(zs, ms, 0, cnt, nn, k, 0)) else b2u(every_is(zs, ms, 0, cnt, nn, k, 1)) end
+      combine_go(NativeArray.set_u8(zs, off + k, v), off, ms, cnt, any, k + 1, nn)
+    end
+  end
+  pfn not_go(zs : NativeU8Arr, off : Int, src : Int, k : Int, nn : Int) : NativeU8Arr do
+    if k >= nn do zs else not_go(NativeArray.set_u8(zs, off + k, 1 - NativeArray.get_u8(zs, src + k)), off, src, k + 1, nn) end
+  end
+
+  pfn site_pair(s : Strata.Population.PopSite) : List(Float) do [Pn.site_xm(s), Pn.site_zm(s)] end
+
+  pfn eval_zone(f : Strata.Population.Frozen, g : Ground, nn : Int, vals : NativeF32Arr, zs : NativeU8Arr, z : Int) : NativeU8Arr do
+    let kind = Pn.zone_kind(f, z)
+    let off = z * nn
+    if kind == 0 do
+      let ids = Pn.zone_ids(f, z)
+      let reg = match slot_values(g.pg_slots, 7) do
+        Some(a) -> a
+        None -> NativeArray.make_f32(1, 0.0)
+      end
+      let nreg = match slot_values(g.pg_slots, 7) do
+        Some(a) -> NativeArray.length_f32(a)
+        None -> 0
+      end
+      regions_go(zs, off, reg, nreg, NativeArray.from_list_int(ids), List.length(ids), 0, nn)
+    else if kind == 1 do band_go(zs, off, vals, Pn.zone_field(f, z) * nn, Pn.zone_lo(f, z), Pn.zone_hi(f, z), 0, nn)
+    else if kind == 2 do
+      let sites = Pn.zone_sites(f, z)
+      let inner = Pn.zone_inner(f, z)
+      let outer = Pn.zone_outer(f, z)
+      ring_go(zs, off, g, NativeArray.from_list_float(List.flat_map(sites, site_pair)), List.length(sites), inner *. inner, outer *. outer, 0, nn)
+    else if kind == 5 do
+      match Pn.zone_members(f, z) do
+        Cons(m, _) -> not_go(zs, off, m * nn, 0, nn)
+        Nil -> zs
+      end
+    else
+      let ms = Pn.zone_members(f, z)
+      combine_go(zs, off, NativeArray.from_list_int(ms), List.length(ms), kind == 4, 0, nn)
+    end end end end
+  end
+
+  pfn eval_zones(f : Strata.Population.Frozen, g : Ground, nn : Int, vals : NativeF32Arr, zs : NativeU8Arr, order : List(Int)) : NativeU8Arr do
+    match order do
+      Nil -> zs
+      Cons(z, rest) -> eval_zones(f, g, nn, vals, eval_zone(f, g, nn, vals, zs, z), rest)
+    end
+  end
+
+  -- ── Rules compiled ────────────────────────────────────────────────────────
+
+  -- (field, first point, count) triples for curves whose points start at num_at, and the points
+  pfn curves_code(cs : List((Int, Strata.Population.PopCurve)), num_at : Int) : (List(Int), List(Float)) do
+    match cs do
+      Nil -> (Nil, Nil)
+      Cons((fi, c), rest) ->
+        let pts = Pn.curve_points(c)
+        let flat = flat_points(pts)
+        match curves_code(rest, num_at + List.length(flat)) do
+          (code, nums) -> (Cons(fi, Cons(num_at, Cons(List.length(pts), code))), List.append(flat, nums))
+        end
+    end
+  end
+
+  -- layer l's program and points, its points starting at num_at in pt_num
+  pfn layer_code(f : Strata.Population.Frozen, l : Int, num_at : Int) : (List(Int), List(Float)) do
+    let cs = Pn.layer_curves(f, l)
+    let ins = Pn.layer_inside(f, l)
+    let outs = Pn.layer_outside(f, l)
+    match curves_code(cs, num_at) do
+      (code, nums) -> (Cons(List.length(cs), List.append(code, Cons(List.length(ins), List.append(ins, Cons(List.length(outs), outs))))), nums)
+    end
+  end
+
+  -- offsets, programs, points for layers l.. (code_at: where l's program starts in pt_prog)
+  pfn compile_rules(f : Strata.Population.Frozen, l : Int, nl : Int, code_at : Int, num_at : Int) : (List(Int), List(Int), List(Float)) do
+    if l >= nl do (Nil, Nil, Nil)
+    else
+      match layer_code(f, l, num_at) do
+        (code, nums) ->
+          match compile_rules(f, l + 1, nl, code_at + List.length(code), num_at + List.length(nums)) do
+            (offs, code2, nums2) -> (Cons(code_at, offs), List.append(code, code2), List.append(nums, nums2))
+          end
+      end
+    end
+  end
+
+  pfn layer_bases(f : Strata.Population.Frozen, l : Int, nl : Int) : List(Float) do
+    if l >= nl do Nil else Cons(Pn.layer_base(f, l), layer_bases(f, l + 1, nl)) end
+  end
+
+  doc "Every field and zone of f evaluated over g's columns, once, and every layer's rule compiled: ground fields are copied from g (0 where the slot was not supplied); a noise field is one Strata.Noise.field2 over the columns' centres, seeded by Strata.Seed.mix(seed, salt), at 1 / period cycles per metre, fBm with lacunarity 2 and gain 0.5, read as 0.5 + 0.5 * noise; a curve field maps its source; a cover field reads 0 (Task 6 fills it)."
+  fn fields(f : Strata.Population.Frozen, seed : Int, g : Ground) : Table do
+    let nn = g.pg_n * g.pg_n
+    let nf = Pn.field_count(f)
+    let nz = Pn.zone_count(f)
+    let nl = Pn.layer_count(f)
+    let vals = eval_fields(f, seed, g, nn, NativeArray.make_f32(Math.max_int(1, nf * nn), 0.0), field_order(f, 0, nf, Nil))
+    let zs = eval_zones(f, g, nn, vals, NativeArray.make_u8(Math.max_int(1, nz * nn), 0), zone_order(f, 0, nz, Nil))
+    -- one padding entry after the offsets and after the bases keeps both arrays non-empty
+    match compile_rules(f, 0, nl, nl + 1, nl + 1) do
+      (offs, code, nums) ->
+        let prog = NativeArray.from_list_i32(List.append(offs, Cons(0, code)))
+        let num = NativeArray.from_list_float(List.append(layer_bases(f, 0, nl), Cons(0.0, nums)))
+        { pt_nn: nn, pt_names: Pn.field_names(f), pt_nl: nl, pt_nz: nz, pt_nf: nf, pt_vals: vals, pt_zones: zs, pt_prog: prog, pt_num: num }
+    end
+  end
+
+  -- ── Reading a Table ───────────────────────────────────────────────────────
+
+  pfn col_ok(t : Table, col : Int) : Bool do if col < 0 do false else col < t.pt_nn end end
+
+  doc "Whether column col is inside zone zone_index (an index of Strata.Population.zone_index); false for an index or column out of range. An array read."
+  fn in_zone(t : Table, zone_index : Int, col : Int) : Bool do
+    if zone_index < 0 do false
+    else if zone_index >= t.pt_nz do false
+    else if col_ok(t, col) do NativeArray.get_u8(t.pt_zones, zone_index * t.pt_nn + col) == 1
+    else false end end end
+  end
+
+  -- every zone of the cnt at prog[at..] reads `want` at col
+  pfn zones_are(prog : NativeI32Arr, zs : NativeU8Arr, nn : Int, at : Int, cnt : Int, col : Int, want : Int) : Bool do
+    if cnt <= 0 do true
+    else if NativeArray.get_u8(zs, NativeArray.get_i32(prog, at) * nn + col) == want do zones_are(prog, zs, nn, at + 1, cnt - 1, col, want)
+    else false end end
+  end
+
+  pfn product_go(prog : NativeI32Arr, vals : NativeF32Arr, num : NativeFloatArr, nn : Int, at : Int, cnt : Int, col : Int, acc : Float) : Float do
+    if cnt <= 0 do acc
+    else
+      let x = NativeArray.get_f32(vals, NativeArray.get_i32(prog, at) * nn + col)
+      let c = curve_eval(num, NativeArray.get_i32(prog, at + 1), NativeArray.get_i32(prog, at + 2), x)
+      product_go(prog, vals, num, nn, at + 3, cnt - 1, col, acc *. c)
+    end
+  end
+
+  -- the Table's arrays are read once here and passed down (GAPS S15)
+  pfn rule_at(prog : NativeI32Arr, zs : NativeU8Arr, vals : NativeF32Arr, num : NativeFloatArr, nn : Int, l : Int, col : Int) : Float do
+    let at = NativeArray.get_i32(prog, l)
+    let nc = NativeArray.get_i32(prog, at)
+    let ins_at = at + 1 + 3 * nc
+    let ni = NativeArray.get_i32(prog, ins_at)
+    let outs_at = ins_at + 1 + ni
+    let no = NativeArray.get_i32(prog, outs_at)
+    if zones_are(prog, zs, nn, ins_at + 1, ni, col, 1) do
+      if zones_are(prog, zs, nn, outs_at + 1, no, col, 0) do
+        let p = product_go(prog, vals, num, nn, at + 1, nc, col, NativeArray.get_float(num, l))
+        if p > 0.0 do p else 0.0 end
+      else 0.0 end
+    else 0.0 end
+  end
+
+  doc "Layer layer_index's (run order) rule at column col: its base density per square metre times each curve of its field, 0 or above (a negative product or NaN reads 0); 0 outside an inside zone, inside an outside zone, for a site layer, or for an index or column out of range."
+  fn density(t : Table, layer_index : Int, col : Int) : Float do
+    if layer_index < 0 do 0.0
+    else if layer_index >= t.pt_nl do 0.0
+    else if col_ok(t, col) do rule_at(t.pt_prog, t.pt_zones, t.pt_vals, t.pt_num, t.pt_nn, layer_index, col)
+    else 0.0 end end end
+  end
+
+  pfn name_index(xs : List(String), n : String, i : Int) : Int do
+    match xs do
+      Nil -> -1
+      Cons(x, rest) -> if x == n do i else name_index(rest, n, i + 1) end
+    end
+  end
+
+  doc "The field named name at column col; 0 for an undeclared field or a column out of range. For tests and tools: it looks the name up."
+  fn field_at(t : Table, name : String, col : Int) : Float do
+    let i = name_index(t.pt_names, name, 0)
+    if i < 0 do 0.0
+    else if col_ok(t, col) do NativeArray.get_f32(t.pt_vals, i * t.pt_nn + col)
+    else 0.0 end end
+  end
+
+  doc "Whether column col is inside the zone named name; false for an undeclared zone. For tests and tools: per column, use in_zone."
+  fn zone_at(f : Strata.Population.Frozen, t : Table, name : String, col : Int) : Bool do in_zone(t, Pn.zone_index(f, name), col) end
+
+  doc "The layer named layer's rule at column col, as density; 0 for an undeclared layer. For tests and tools: per column, use density."
+  fn density_at(f : Strata.Population.Frozen, t : Table, layer : String, col : Int) : Float do density(t, Pn.layer_index(f, layer), col) end
+end
