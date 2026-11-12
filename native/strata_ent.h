@@ -8,9 +8,12 @@
  * Storage. An entity is a row in packed columns, one array per column, each
  * capacity long. A row keeps its index for its whole life; removing it raises
  * the row's generation and puts the row back on a free stack (the last freed
- * row is reused first). Each kind threads its live rows on a doubly linked
- * list in the order they were added, so walking a kind costs what the kind
- * holds and never touches dead rows or other kinds.
+ * row is reused first). Each kind keeps a dense array of its live rows' numbers
+ * (each row keeps its index in that array): an add appends, a remove moves the
+ * kind's last entry into the hole. Walking a kind is a sequential pass over
+ * that array, costing what the kind holds and never touching dead rows or
+ * other kinds. "Dense order" is add order until a removal, after which the
+ * kind's last entity takes the removed one's place.
  *
  * An id is ((int64_t)generation << EN_ROW_BITS) | row. Generations run
  * 1..EN_GEN_MAX and then wrap to 1, so every id is positive and an old id
@@ -61,7 +64,7 @@ enum { EN_K_HX, EN_K_HY, EN_K_HZ, EN_K_STEP, EN_K_LIFETIME, EN_K_SEEN, EN_K_GRAV
 typedef struct {
     int32_t ints[EN_K_INTS];
     float floats[EN_K_FLOATS];   /* the seen distance is stored resolved: <= 0 is kept as the seen cap */
-    int32_t head, tail, live;    /* the kind's live rows: first, last (-1 none), how many */
+    int32_t live;                /* the kind's live rows: dense[kind * capacity + 0 .. live-1] */
 } EnKind;
 
 struct EnWorld {
@@ -71,7 +74,7 @@ struct EnWorld {
     /* the columns, one entry a row */
     int16_t *kind;               /* -1: a free row */
     uint32_t *gen;
-    int32_t *next, *prev;        /* the kind's live list; on a free row, unused */
+    int32_t *dense_at;           /* the row's index in its kind's dense array; on a free row, unused */
     double *pos;                 /* 3 a row, metres */
     float *vel;                  /* 3 a row, metres a second */
     float *facing;               /* radians about the vertical */
@@ -79,6 +82,9 @@ struct EnWorld {
     float *fslot;                /* EN_SLOTS a row; the kind's first n are used */
     int64_t *islot;              /* EN_SLOTS a row */
     int64_t *part;               /* EN_PARTS a row; -1 none */
+    /* each kind's live rows, capacity entries a kind; calloc'd, so a kind's untouched
+     * pages stay unmapped and resident memory follows what the kinds hold */
+    int32_t *dense;
     int32_t *free_rows; int nfree;
     int live;
     double refused; int reason;
@@ -90,7 +96,7 @@ static inline int en_float_ok(double v) { return isfinite(v) && fabs(v) <= FLT_M
 
 static inline void en_close(EnWorld *w) {
     if (!w) return;
-    free(w->kind); free(w->gen); free(w->next); free(w->prev); free(w->pos); free(w->vel);
+    free(w->kind); free(w->gen); free(w->dense_at); free(w->dense); free(w->pos); free(w->vel);
     free(w->facing); free(w->age); free(w->fslot); free(w->islot); free(w->part); free(w->free_rows);
     free(w);
 }
@@ -111,8 +117,8 @@ static inline EnWorld *en_open(int capacity, int route_points, int bodies, doubl
     size_t n = (size_t)capacity;
     w->kind = (int16_t *)malloc(n * sizeof *w->kind);
     w->gen = (uint32_t *)malloc(n * sizeof *w->gen);
-    w->next = (int32_t *)malloc(n * sizeof *w->next);
-    w->prev = (int32_t *)malloc(n * sizeof *w->prev);
+    w->dense_at = (int32_t *)calloc(n, sizeof *w->dense_at);
+    w->dense = (int32_t *)calloc(n * EN_KINDS, sizeof *w->dense);
     w->pos = (double *)calloc(n * 3, sizeof *w->pos);
     w->vel = (float *)calloc(n * 3, sizeof *w->vel);
     w->facing = (float *)calloc(n, sizeof *w->facing);
@@ -121,10 +127,10 @@ static inline EnWorld *en_open(int capacity, int route_points, int bodies, doubl
     w->islot = (int64_t *)calloc(n * EN_SLOTS, sizeof *w->islot);
     w->part = (int64_t *)malloc(n * EN_PARTS * sizeof *w->part);
     w->free_rows = (int32_t *)malloc(n * sizeof *w->free_rows);
-    if (!w->kind || !w->gen || !w->next || !w->prev || !w->pos || !w->vel || !w->facing || !w->age ||
+    if (!w->kind || !w->gen || !w->dense_at || !w->dense || !w->pos || !w->vel || !w->facing || !w->age ||
         !w->fslot || !w->islot || !w->part || !w->free_rows) { en_close(w); return NULL; }
     for (int r = 0; r < capacity; r++) {
-        w->kind[r] = -1; w->gen[r] = 1; w->next[r] = w->prev[r] = -1;
+        w->kind[r] = -1; w->gen[r] = 1;
         w->free_rows[r] = capacity - 1 - r;   /* row 0 handed out first */
     }
     for (size_t i = 0; i < n * EN_PARTS; i++) w->part[i] = -1;
@@ -150,13 +156,13 @@ static inline int en_kind(EnWorld *w, const int32_t ints[9], const float floats[
     if ((ints[EN_K_BODY] == 1) != (ints[EN_K_MOVER] == 3)) return en_refuse(w, EN_R_BODY);
     for (int i = 0; i < EN_K_FLOATS; i++) if (!isfinite(floats[i])) return en_refuse(w, EN_R_VALUE);
     if (floats[EN_K_HX] < 0 || floats[EN_K_HY] < 0 || floats[EN_K_HZ] < 0 || floats[EN_K_STEP] < 0 ||
-        floats[EN_K_SEEN] > w->seen_cap) return en_refuse(w, EN_R_VALUE);
+        floats[EN_K_SEEN] > (float)w->seen_cap) return en_refuse(w, EN_R_VALUE);
     if (w->nkinds >= EN_KINDS) return en_refuse(w, EN_R_FULL);
     EnKind *k = &w->kinds[w->nkinds];
     memcpy(k->ints, ints, sizeof k->ints);
     memcpy(k->floats, floats, sizeof k->floats);
     if (k->floats[EN_K_SEEN] <= 0) k->floats[EN_K_SEEN] = (float)w->seen_cap;
-    k->head = k->tail = -1; k->live = 0;
+    k->live = 0;
     return w->nkinds++;
 }
 
@@ -189,9 +195,8 @@ static inline int64_t en_add(EnWorld *w, int kind, double x, double y, double z,
     int r = w->free_rows[--w->nfree];
     EnKind *k = &w->kinds[kind];
     w->kind[r] = (int16_t)kind;
-    w->prev[r] = k->tail; w->next[r] = -1;
-    if (k->tail >= 0) w->next[k->tail] = r; else k->head = r;
-    k->tail = r; k->live++;
+    w->dense[(size_t)kind * w->capacity + k->live] = r;
+    w->dense_at[r] = k->live++;
     w->pos[r * 3] = x; w->pos[r * 3 + 1] = y; w->pos[r * 3 + 2] = z;
     w->vel[r * 3] = w->vel[r * 3 + 1] = w->vel[r * 3 + 2] = 0;
     w->facing[r] = (float)facing;
@@ -209,11 +214,11 @@ static inline void en_remove(EnWorld *w, int64_t id, int reason) {
     if (r < 0) { en_refuse(w, EN_R_ENTITY); return; }
     if (reason < 0 || reason > 2) { en_refuse(w, EN_R_VALUE); return; }
     EnKind *k = &w->kinds[w->kind[r]];
-    if (w->prev[r] >= 0) w->next[w->prev[r]] = w->next[r]; else k->head = w->next[r];
-    if (w->next[r] >= 0) w->prev[w->next[r]] = w->prev[r]; else k->tail = w->prev[r];
-    k->live--;
+    int32_t *dense = w->dense + (size_t)w->kind[r] * w->capacity;
+    int last = dense[--k->live];   /* the kind's last entry fills the hole */
+    dense[w->dense_at[r]] = last;
+    w->dense_at[last] = w->dense_at[r];
     w->kind[r] = -1;
-    w->next[r] = w->prev[r] = -1;
     w->gen[r] = w->gen[r] >= EN_GEN_MAX ? 1 : w->gen[r] + 1;
     w->free_rows[w->nfree++] = r;
     w->live--;
@@ -305,11 +310,12 @@ static inline void en_set_part(EnWorld *w, int64_t id, int part, int64_t v) {
 }
 
 /* ---- each and columns ---- */
-/* the live ids of a kind in its row order (the order they were added), at most max; how many written */
+/* the live ids of a kind in dense order, at most max; how many written */
 static inline int en_each(const EnWorld *w, int kind, int max, int64_t *ids) {
     if (kind < 0 || kind >= w->nkinds || !ids) return 0;
     int n = 0;
-    for (int r = w->kinds[kind].head; r >= 0 && n < max; r = w->next[r]) ids[n++] = en_id(w, r);
+    const int32_t *dense = w->dense + (size_t)kind * w->capacity;
+    for (int live = w->kinds[kind].live; n < live && n < max; n++) ids[n] = en_id(w, dense[n]);
     return n;
 }
 
@@ -327,7 +333,9 @@ static inline int en_column(const EnWorld *w, int kind, int col, int max_rows, f
     int width = en_column_width(w, kind, col);
     if (width == 0) return 0;
     int n = 0;
-    for (int r = w->kinds[kind].head; r >= 0 && n < max_rows; r = w->next[r], n++) {
+    const int32_t *dense = w->dense + (size_t)kind * w->capacity;
+    for (int live = w->kinds[kind].live; n < live && n < max_rows; n++) {
+        int r = dense[n];
         float *o = out + (size_t)n * width;
         switch (col) {
         case 0: for (int i = 0; i < 3; i++) o[i] = (float)w->pos[r * 3 + i]; break;
@@ -347,8 +355,9 @@ static inline void en_set_column(EnWorld *w, int kind, int col, int rows, const 
     if (rows != w->kinds[kind].live) { en_refuse(w, EN_R_ROWS); return; }
     if (rows > 0 && !in) { en_refuse(w, EN_R_VALUE); return; }
     for (size_t i = 0; i < (size_t)rows * width; i++) if (!isfinite(in[i])) { en_refuse(w, EN_R_VALUE); return; }
-    int n = 0;
-    for (int r = w->kinds[kind].head; r >= 0; r = w->next[r], n++) {
+    const int32_t *dense = w->dense + (size_t)kind * w->capacity;
+    for (int n = 0; n < rows; n++) {
+        int r = dense[n];
         const float *v = in + (size_t)n * width;
         switch (col) {
         case 0: for (int i = 0; i < 3; i++) w->pos[r * 3 + i] = v[i]; break;
@@ -372,7 +381,9 @@ static inline uint64_t en_hash(const EnWorld *w) {
     uint64_t h = 1469598103934665603ull;
     for (int k = 0; k < w->nkinds; k++) {
         const EnKind *kd = &w->kinds[k];
-        for (int r = kd->head; r >= 0; r = w->next[r]) {
+        const int32_t *dense = w->dense + (size_t)k * w->capacity;
+        for (int i = 0; i < kd->live; i++) {
+            int r = dense[i];
             int64_t id = en_id(w, r);
             h = en_fnv(h, &id, sizeof id);
             h = en_fnv(h, &w->kind[r], sizeof w->kind[r]);

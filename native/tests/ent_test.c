@@ -188,7 +188,7 @@ static void test_each_and_columns(void) {
     }
     int64_t ids[8];
     CHECK(en_each(w, k1, 8, ids) == 3, "en_each finds the 3 of kind 1");
-    CHECK(ids[0] == of1[0] && ids[1] == of1[1] && ids[2] == of1[2], "... in row order");
+    CHECK(ids[0] == of1[0] && ids[1] == of1[1] && ids[2] == of1[2], "... in dense order (add order, nothing removed)");
     CHECK(en_each(w, k0, 8, ids) == 5, "en_each finds the 5 of kind 0");
     CHECK(en_each(w, k0, 2, ids) == 2, "en_each writes at most max");
     float col[24];
@@ -220,6 +220,35 @@ static void test_each_and_columns(void) {
     CHECK(en_float(w, of1[2], 0) == 2.5, "a float slot column writes each row's slot");
     en_remove(w, of1[1], 0);
     CHECK(en_each(w, k1, 8, ids) == 2 && ids[0] == of1[0] && ids[1] == of1[2], "a removed row drops out of en_each");
+    en_close(w);
+}
+
+static void test_order_after_removal(void) {
+    EnWorld *w = world(16);
+    int k = plain_kind(w, 0, 0);
+    int64_t a = en_add(w, k, 1, 0, 0, 0), b = en_add(w, k, 2, 0, 0, 0), c = en_add(w, k, 3, 0, 0, 0);
+    en_remove(w, a, 0);
+    int64_t ids[4];
+    CHECK(en_each(w, k, 4, ids) == 2 && ids[0] == c && ids[1] == b, "after removing A of A, B, C, en_each gives C, B");
+    int64_t d = en_add(w, k, 4, 0, 0, 0);
+    CHECK((d & EN_ROW_MASK) == (a & EN_ROW_MASK), "D reuses A's row");
+    CHECK(en_each(w, k, 4, ids) == 3 && ids[0] == c && ids[1] == b && ids[2] == d, "after adding D, en_each gives C, B, D");
+    float col[12];
+    CHECK(en_column(w, k, 0, 4, col) == 3 && col[0] == 3 && col[3] == 2 && col[6] == 4,
+          "the position column follows the same order");
+    en_close(w);
+}
+
+static void test_seen_cap(void) {
+    EnWorld *w = en_open(16, 4096, 128, 100.3, 3.2, 0.1);
+    int32_t ki[9];
+    kind_ints(ki, 1, 1, 0, 0, 0);
+    float fl[7];
+    memcpy(fl, kind_floats, sizeof fl);
+    fl[5] = 100.3f;
+    CHECK(en_kind(w, ki, fl) == 0, "a kind seen exactly at the cap is accepted");
+    fl[5] = nextafterf(100.3f, 1000.0f);
+    CHECK(en_kind(w, ki, fl) == -1 && en_stat(w, 6) == EN_R_VALUE, "a kind seen past the cap is refused");
     en_close(w);
 }
 
@@ -270,6 +299,8 @@ int main(void) {
     test_bad_numbers();
     test_full_world();
     test_each_and_columns();
+    test_order_after_removal();
+    test_seen_cap();
     test_hash();
     if (fails == 0) printf("ent_test: ok\n");
     return fails == 0 ? 0 : 1;
