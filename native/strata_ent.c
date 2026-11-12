@@ -16,7 +16,7 @@
  * (0, -1 for a kind or an id, 0.0). */
 /* Rewritten by stamp_ent.sh whenever strata_ent.h, strata_ent_grid.h, strata_ent_move.h, strata_ent_seen.h or strata_ent_snap.h
  * changes (GAPS S14). */
-#define STRATA_ENT_STAMP "1efbeb9438734136"
+#define STRATA_ENT_STAMP "4e3b81cc386426e3"
 #include <stdint.h>
 #include <time.h>
 #include "strata_ent.h"

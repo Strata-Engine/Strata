@@ -2,6 +2,15 @@
  * whole columns. Plain C: no Vulkan, no GLFW, no physics or audio, no
  * globals, so it is tested headless (native/tests/ent_test.c).
  *
+ * STOPGAP. The per-entity loops (movement, the ray and sweep against the
+ * blocks, the grid, touches, the seen switch, snapshots) are in C only
+ * because March cannot yet run them inside the design's budget: a shared
+ * value passed around a hot loop costs a reference-count update on every
+ * call (GAPS S15), and 20,000 entities must tick in 2 ms. They belong in
+ * March. When March can meet that budget, move them back, with a March
+ * reproducer of the slowness as the first step; Strata.Entities' interface
+ * need not change.
+ *
  * Threads: one. Every call on an EnWorld runs on the same thread, in order.
  * Nothing here allocates after en_open except the block masks: 4,096 bytes
  * for each held chunk that is neither all solid nor all clear, the chunk
