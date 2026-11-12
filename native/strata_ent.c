@@ -13,8 +13,8 @@
  *
  * With no world open every call does nothing and answers its default
  * (0, -1 for a kind or an id, 0.0). */
-/* Rewritten by stamp_ent.sh whenever strata_ent.h, strata_ent_grid.h or strata_ent_move.h changes (GAPS S14). */
-#define STRATA_ENT_STAMP "615104fe2dd1e552"
+/* Rewritten by stamp_ent.sh whenever strata_ent.h, strata_ent_grid.h, strata_ent_move.h or strata_ent_seen.h changes (GAPS S14). */
+#define STRATA_ENT_STAMP "fc3da581034d3fe3"
 #include <stdint.h>
 #include <time.h>
 #include "strata_ent.h"
@@ -226,6 +226,8 @@ int64_t en_x_follow(int64_t id, int64_t route, double speed, int64_t loops) {
     return 1;
 }
 int64_t en_x_grounded(int64_t id) { return g_w ? en_grounded(g_w, id) : 0; }
+/* 1 if the entity was seen at the end of the last tick */
+int64_t en_x_seen(int64_t id) { return g_w ? en_seen(g_w, id) : 0; }
 
 /* seconds on a monotonic clock, for timing scenes; the kernel never reads it (its time is the dt it is given) */
 double en_x_clock(void) {

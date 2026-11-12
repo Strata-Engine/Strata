@@ -1,7 +1,7 @@
 /* The entity kernel, headless: kinds and their refusals, adding and reading,
  * slots, stale ids, bad numbers, a full world, each and columns, the hash's
- * determinism, blocks and the ray, the tick, the grid, the sweep, walking
- * and routes. */
+ * determinism, blocks and the ray, the tick, the grid, the sweep, walking,
+ * routes, seen and unseen, and setting on the ground. */
 #include <stdio.h>
 #include <string.h>
 #include <math.h>
@@ -433,6 +433,7 @@ static void test_wall(void) {
     en_close(w);
 
     w = wall_world(&id, 100);
+    en_tick(w, 1, focus, 0);   /* a tick of dt 0 makes it seen: an entity becomes seen at the end of a tick */
     en_tick(w, 1, focus, 10.0);
     CHECK(fabs(pos_axis(w, id, 0) - 3.2) < 1e-6, "one dt of 10 s at 100 m/s still stops at the wall");
     CHECK(events(w, ints, floats) == 1 && ints[0] == 2, "... with one block hit");
@@ -852,16 +853,13 @@ static void test_removal_in_loop(void) {
 /* ---- the sweep, walking and routes ---- */
 static const uint8_t three_blocks[3] = {0, 1, 0};   /* 0 air, 1 stone, 2 a plant (a cross: the table says it passes) */
 
-/* stone below y 0 (chunk y -1) and air above (chunk y 0 to 2, to 9.6 m), chunks x and z from c0 to c1 */
+/* stone below y 0 (chunk y -6 to -1, from -19.2 m) and air above (chunk y 0 to 7, to 25.6 m), chunks x and z from c0
+ * to c1: deep and tall enough that a walker near the floor has every chunk its grounding reads held */
 static void flat_floor(EnWorld *w, int c0, int c1) {
     en_block_table(w, 3, three_blocks);
     for (int cx = c0; cx <= c1; cx++)
-        for (int cz = c0; cz <= c1; cz++) {
-            en_chunk_uniform(w, cx, -1, cz, 1);
-            en_chunk_uniform(w, cx, 0, cz, 0);
-            en_chunk_uniform(w, cx, 1, cz, 0);
-            en_chunk_uniform(w, cx, 2, cz, 0);
-        }
+        for (int cz = c0; cz <= c1; cz++)
+            for (int cy = -6; cy <= 7; cy++) en_chunk_uniform(w, cx, cy, cz, cy < 0 ? 1 : 0);
 }
 /* chunk (cx, 0, cz) of air with stone in local y below ly where local x is in x0..x1 */
 static void ledge_chunk(EnWorld *w, int cx, int cz, int x0, int x1, int ly) {
@@ -928,8 +926,13 @@ static void test_walking(void) {
     EnWorld *w = world(16);
     flat_floor(w, -1, 1);
     int k = walk_kind(w, 0.6f, 1);
-    int64_t id = en_add(w, k, 1.6, 5.9, 1.6, 0);
-    CHECK(en_grounded(w, id) == 0, "a walker added in the air is not grounded");
+    int64_t id = en_add(w, k, 1.6, 0.95, 1.6, 0);
+    CHECK(en_grounded(w, id) == 0, "a walker just added is not grounded");
+    seen_ticks(w, id, 2);
+    double up[3] = {1.6, 5.9, 1.6};
+    en_set(w, id, 0, up);
+    seen_ticks(w, id, 1);
+    CHECK(en_grounded(w, id) == 0, "a seen walker lifted 5 m is not grounded");
     seen_ticks(w, id, 120);
     CHECK(en_grounded(w, id) == 1, "a walker dropped 5 m lands grounded");
     CHECK(fabs(pos_axis(w, id, 1) - 0.9) < 0.02, "... within 0.02 m of the floor");
@@ -1170,6 +1173,269 @@ static void test_route_limits(void) {
     en_close(w);
 }
 
+
+/* ---- seen and unseen, setting on the ground ---- */
+/* a kind: mover, unseen rule, seen distance (0 the cap), lifetime; a box of 0.3 x 0.9 x 0.3, and for a walker step
+ * height 0.6 and gravity 9.8 */
+static int seen_kind(EnWorld *w, int mover, int rule, float seen, float lifetime) {
+    int32_t ki[9];
+    kind_ints(ki, mover, 1, 0, 0, 0);
+    ki[1] = rule; ki[5] = mover == 2;
+    float fl[7] = {0.3f, 0.9f, 0.3f, 0.6f, lifetime, seen, mover == 2 ? 9.8f : 0};
+    return en_kind(w, ki, fl);
+}
+static void tick_at(EnWorld *w, double x, double y, double z) { double f[3] = {x, y, z}; en_tick(w, 1, f, 1.0 / 60); }
+/* where a walker set on ground whose top is at metres top stands: 1e-4 voxels above it */
+static double stand_y(double top) { return top + 0.1 * 0.0001 + (double)0.9f; }
+
+static void test_hysteresis(void) {
+    EnWorld *w = world(16);
+    int k = seen_kind(w, 0, 0, 40, 0);   /* d 40 m; the chunk c is 3.2 m */
+    int64_t id = en_add(w, k, 0, 0, 0, 0);
+    CHECK(en_seen(w, id) == 0, "an entity just added is unseen");
+    tick_at(w, 39, 0, 0);
+    CHECK(en_seen(w, id) == 1 && en_stat(w, 1) == 1, "with a focus 39 m away it becomes seen");
+    CHECK(count_code(w, EN_E_ENTERED) == 1 && ev_i[1] == id && en_events(w, 0, NULL, NULL) == 1, "... with one event 3 naming it");
+    tick_at(w, 42, 0, 0);
+    CHECK(en_seen(w, id) == 1 && en_events(w, 0, NULL, NULL) == 0, "at 42 m (within d + c) it stays seen, with no event");
+    tick_at(w, 44, 0, 0);
+    CHECK(en_seen(w, id) == 0 && en_stat(w, 1) == 0, "at 44 m (past d + c = 43.2) it is unseen");
+    CHECK(count_code(w, EN_E_LEFT) == 1 && ev_i[1] == id && en_events(w, 0, NULL, NULL) == 1, "... with one event 4 naming it");
+    int quiet = 1;
+    for (int i = 0; i < 20; i++) { tick_at(w, i % 2 ? 41 : 42, 0, 0); quiet &= en_events(w, 0, NULL, NULL) == 0 && !en_seen(w, id); }
+    CHECK(quiet, "a focus pacing between 41 and 42 m leaves it unseen, with no event");
+    CHECK(en_seen(w, 12345) == 0 && en_seen(w, -1) == 0, "an unknown id is not seen");
+    en_close(w);
+
+    w = world(16);
+    k = seen_kind(w, 0, 0, 40, 0);
+    id = en_add(w, k, 0, 0, 0, 0);
+    tick_at(w, 39, 0, 0);
+    int events = en_events(w, 0, NULL, NULL);
+    for (int i = 0; i < 20; i++) { tick_at(w, i % 2 ? 41 : 42, 0, 0); events += en_events(w, 0, NULL, NULL); }
+    CHECK(events == 1 && en_seen(w, id), "seen at 39 m, a focus pacing between 41 and 42 m causes no event after the first");
+    en_close(w);
+}
+
+static void test_no_focus(void) {
+    EnWorld *w = world(16);
+    flat_floor(w, -1, 1);
+    int kw = seen_kind(w, 2, 0, 0, 0), kf = seen_kind(w, 1, 0, 0, 0), kp = seen_kind(w, 0, 0, 0, 0);
+    int64_t a = en_add(w, kw, 1.6, 0.95, 1.6, 0), b = en_add(w, kf, 1.6, 3, 1.6, 0), c = en_add(w, kp, 0, 0, 0, 0);
+    int quiet = 1;
+    for (int i = 0; i < 10; i++) { en_tick(w, 0, NULL, 1.0 / 60); quiet &= en_events(w, 0, NULL, NULL) == 0; }
+    CHECK(!en_seen(w, a) && !en_seen(w, b) && !en_seen(w, c) && en_stat(w, 1) == 0, "with no focus nothing is seen");
+    CHECK(quiet && en_stat(w, 2) == 0, "... nothing reported, nothing waiting for ground");
+    en_close(w);
+}
+
+/* chunk (cx, cy, cz) of stone with a pit cleared for local x and z 8..24 and local y from ly up */
+static void pit_chunk(EnWorld *w, int cx, int cy, int cz, int ly) {
+    static int32_t ids[32768];
+    for (int y = 0; y < 32; y++)
+        for (int z = 0; z < 32; z++)
+            for (int x = 0; x < 32; x++) ids[x + 32 * (z + 32 * y)] = (y >= ly && x >= 8 && x <= 24 && z >= 8 && z <= 24) ? 0 : 1;
+    en_chunk(w, cx, cy, cz, ids);
+}
+
+static void test_grounding(void) {
+    double p[3];
+    /* inside a hill whose top is 2.0 m: set on the top */
+    EnWorld *w = world(16);
+    flat_floor(w, -1, 1);
+    ledge_chunk(w, 0, 0, 0, 31, 20);
+    int k = seen_kind(w, 2, 0, 0, 0);
+    int64_t id = en_add(w, k, 1.6, 1.5, 1.6, 0);
+    tick_at(w, 1.6, 0, 1.6);
+    en_get(w, id, 0, p);
+    CHECK(en_seen(w, id) && en_grounded(w, id), "a walker inside a hill becomes seen, grounded");
+    CHECK(fabs(p[1] - stand_y(2.0)) < 1e-9 && p[0] == 1.6 && p[2] == 1.6, "... set on the hill's top (2.0 m), straight up");
+    CHECK(count_code(w, EN_E_ENTERED) == 1 && ev_i[1] == id && ev_f[1] == p[1], "... with event 3 at where it was set");
+    en_close(w);
+
+    /* above a pit 2 m deep: set on the pit's floor */
+    w = world(16);
+    flat_floor(w, -1, 1);
+    pit_chunk(w, 0, -1, 0, 12);
+    k = seen_kind(w, 2, 0, 0, 0);
+    id = en_add(w, k, 1.6, 0.9, 1.6, 0);
+    tick_at(w, 1.6, 0, 1.6);
+    CHECK(en_seen(w, id) && en_grounded(w, id) && fabs(pos_axis(w, id, 1) - stand_y(-2.0)) < 1e-9,
+          "a walker above a pit becomes seen on the pit's floor (-2.0 m)");
+    en_close(w);
+
+    /* over a column of air 54 m tall: stays unseen, waiting */
+    w = world(16);
+    en_block_table(w, 3, three_blocks);
+    for (int cy = -8; cy <= 8; cy++) en_chunk_uniform(w, 0, cy, 0, 0);
+    k = seen_kind(w, 2, 0, 0, 0);
+    id = en_add(w, k, 1.6, 1.6, 1.6, 0);
+    int quiet = 1;
+    for (int i = 0; i < 5; i++) { tick_at(w, 1.6, 0, 1.6); quiet &= en_events(w, 0, NULL, NULL) == 0; }
+    CHECK(!en_seen(w, id) && quiet, "a walker over 40 m of air stays unseen, reporting nothing");
+    CHECK(en_stat(w, 2) == 1, "... and stat 2 counts it waiting");
+    CHECK(pos_axis(w, id, 1) == 1.6, "... where it was");
+    en_close(w);
+
+    /* its box straddling a column 1 m taller than the one under its centre: set on the taller one's edge */
+    w = world(16);
+    flat_floor(w, -1, 1);
+    ledge_chunk(w, 0, 0, 0, 15, 10);   /* stone to 1.0 m for x below 1.6 m */
+    k = seen_kind(w, 2, 0, 0, 0);
+    id = en_add(w, k, 1.65, 0.95, 1.6, 0);   /* box x 1.35..1.95: its centre over the floor, its west side over the ledge */
+    tick_at(w, 1.65, 0, 1.6);
+    CHECK(en_seen(w, id) && en_grounded(w, id) && fabs(pos_axis(w, id, 1) - stand_y(1.0)) < 1e-9,
+          "a walker whose box straddles a taller column stands on it: ground under its box, not only under its centre");
+    en_close(w);
+
+    /* its chunks not yet held: waits, then is set down on the tick after they arrive */
+    w = world(16);
+    en_block_table(w, 3, three_blocks);
+    k = seen_kind(w, 2, 0, 0, 0);
+    id = en_add(w, k, 1.6, 0.95, 1.6, 0);
+    tick_at(w, 1.6, 0, 1.6);
+    tick_at(w, 1.6, 0, 1.6);
+    CHECK(!en_seen(w, id) && en_stat(w, 2) == 1, "a walker whose chunks are not held waits, unseen");
+    flat_floor(w, -1, 1);
+    tick_at(w, 1.6, 0, 1.6);
+    CHECK(en_seen(w, id) && en_grounded(w, id) && fabs(pos_axis(w, id, 1) - stand_y(0)) < 1e-9 && en_stat(w, 2) == 0,
+          "... and is set on the floor the tick after they arrive");
+    en_close(w);
+
+    /* flying and placed entities become seen at once, unmoved, even with no blocks held */
+    w = world(16);
+    int kf = seen_kind(w, 1, 0, 0, 0), kp = seen_kind(w, 0, 0, 0, 0);
+    int64_t f = en_add(w, kf, 1, 50, 1, 0), q = en_add(w, kp, 2, -7, 2, 0);
+    tick_at(w, 0, 0, 0);
+    CHECK(en_seen(w, f) && en_seen(w, q) && pos_axis(w, f, 1) == 50 && pos_axis(w, q, 1) == -7,
+          "a flyer and a placed entity become seen at once, unmoved");
+    CHECK(count_code(w, EN_E_ENTERED) == 2, "... each with event 3");
+    en_close(w);
+}
+
+static void test_unseen_rules(void) {
+    EnWorld *w = world(16);
+    int kl = seen_kind(w, 1, 0, 0, 0), kz = seen_kind(w, 1, 1, 0, 1.0f), kr = seen_kind(w, 1, 2, 0, 0);
+    int64_t live = en_add(w, kl, 0, 0, 0, 0), frozen = en_add(w, kz, 0, 0, 5, 0), gone = en_add(w, kr, 0, 0, 10, 0);
+    double v[3] = {1, 0, 0};
+    en_set(w, live, 1, v); en_set(w, frozen, 1, v); en_set(w, gone, 1, v);
+    tick_at(w, 0, 0, 0);
+    CHECK(en_seen(w, live) && en_seen(w, frozen) && en_seen(w, gone), "three flyers near the focus are seen");
+    tick_at(w, 1000, 0, 0);
+    int n = en_events(w, EN_EVENTS, ev_i, ev_f), lefts = 0, at4 = -1, at6 = -1;
+    for (int e = 0; e < n; e++) {
+        if (ev_i[e * 7] == EN_E_LEFT) lefts++;
+        if (ev_i[e * 7] == EN_E_LEFT && ev_i[e * 7 + 1] == gone) at4 = e;
+        if (ev_i[e * 7] == EN_E_REMOVED && ev_i[e * 7 + 1] == gone && ev_i[e * 7 + 3] == 2) at6 = e;
+    }
+    CHECK(lefts == 3 && n == 4, "the focus jumps away: three events 4 and one event 6");
+    CHECK(at4 >= 0 && at6 == at4 + 1, "... the removed kind's event 4, then its event 6 reason 2");
+    CHECK(!en_alive(w, gone), "... and it is removed at once");
+    double lx = pos_axis(w, live, 0), fp[3], fa[3], fa2[3], fp2[3];
+    en_get(w, frozen, 0, fp); en_get(w, frozen, 3, fa);
+    for (int i = 0; i < 120; i++) tick_at(w, 1000, 0, 0);
+    en_get(w, frozen, 0, fp2); en_get(w, frozen, 3, fa2);
+    CHECK(fabs(pos_axis(w, live, 0) - lx - 2.0) < 1e-6, "unseen, the live one flies on (2 m in 2 s)");
+    CHECK(en_alive(w, frozen) && fa2[0] == fa[0] && fp2[0] == fp[0], "the frozen one neither moves nor ages, outliving its 1 s lifetime");
+    CHECK(en_near(w, fp, 0.01, 1u << kz, 0, NULL) == 1, "... and is still in the grid");
+    tick_at(w, fp[0], 0, fp[2]);
+    int named = 0, n3 = en_events(w, EN_EVENTS, ev_i, ev_f);
+    for (int e = 0; e < n3; e++) named += ev_i[e * 7] == EN_E_ENTERED && ev_i[e * 7 + 1] == frozen;
+    CHECK(en_seen(w, frozen) && named == 1, "seen again, it reports event 3 (the live one, near too, also does)");
+    tick_at(w, fp[0], 0, fp[2]);
+    CHECK(pos_axis(w, frozen, 0) > fp[0], "... and moves again");
+    int ticks = 0;
+    while (en_alive(w, frozen) && ticks < 200) { tick_at(w, fp[0], 0, fp[2]); ticks++; }
+    CHECK(ticks > 50 && ticks < 62, "... and ages again: its lifetime ends about 1 s after it was added, counting only seen time");
+    en_close(w);
+}
+
+static void test_ground_goes(void) {
+    /* the chunk under a seen walker dropped: held in place; it walks again when the chunk returns */
+    EnWorld *w = world(16);
+    flat_floor(w, -1, 1);
+    int k = seen_kind(w, 2, 0, 0, 0);
+    int64_t id = en_add(w, k, 1.6, 0.95, 1.6, 0);
+    seen_ticks(w, id, 5);
+    double go[3] = {1, 0, 0}, p0[3], p1[3];
+    en_set(w, id, 1, go);
+    seen_ticks(w, id, 1);
+    en_chunk_drop(w, 0, -1, 0);
+    en_get(w, id, 0, p0);
+    seen_ticks(w, id, 30);
+    en_get(w, id, 0, p1);
+    CHECK(en_seen(w, id) && p1[0] == p0[0] && p1[1] == p0[1] && p1[2] == p0[2], "a seen walker whose floor chunk is dropped is held in place");
+    en_chunk_uniform(w, 0, -1, 0, 1);
+    seen_ticks(w, id, 30);
+    CHECK(pos_axis(w, id, 0) > p0[0] + 0.45 && en_grounded(w, id), "... and walks on when the chunk returns");
+    en_close(w);
+
+    /* a walker far below everything never becomes seen, and stays where it is */
+    w = world(16);
+    flat_floor(w, -1, 1);
+    k = seen_kind(w, 2, 0, 0, 0);
+    double line[6] = {1.6, -1000000, 1.6, 30, -1000000, 1.6};
+    int r = en_route(w, 2, line);
+    id = en_add(w, k, 1.6, -1000000, 1.6, 0);
+    en_follow(w, id, r, 2.0, 0);
+    tick_at(w, 1.6, 0, 1.6);
+    double x1 = pos_axis(w, id, 0);
+    int never = 1, still = 1;
+    for (int i = 1; i < 600; i++) {
+        tick_at(w, 1.6, 0, 1.6);
+        never &= !en_seen(w, id);
+        still &= pos_axis(w, id, 1) == -1000000 && pos_axis(w, id, 0) == x1;
+    }
+    CHECK(never && pos_axis(w, id, 1) == -1000000, "a walker at y -1,000,000 never becomes seen and its y never changes in 600 ticks");
+    CHECK(still && en_stat(w, 2) == 1, "... held in place while it waits, counted in stat 2");
+    en_close(w);
+
+    /* a seen walker's floor cleared by a new chunk: it falls and lands on the next floor down */
+    w = world(16);
+    flat_floor(w, -1, 1);
+    k = seen_kind(w, 2, 0, 0, 0);
+    id = en_add(w, k, 1.6, 0.95, 1.6, 0);
+    seen_ticks(w, id, 5);
+    static int32_t ids[32768];
+    for (int i = 0; i < 32768; i++) ids[i] = i < 20 * 1024 ? 1 : 0;   /* stone in local y 0..19: top at -1.2 m */
+    en_chunk(w, 0, -1, 0, ids);
+    int fell = 0;
+    for (int i = 0; i < 120; i++) { seen_ticks(w, id, 1); fell |= !en_grounded(w, id); }
+    CHECK(fell && en_grounded(w, id) && fabs(pos_axis(w, id, 1) - stand_y(-1.2)) < 1e-6,
+          "a seen walker whose floor voxels are cleared falls and lands on the next floor down (-1.2 m)");
+    en_close(w);
+}
+
+/* a seen walker held by a chunk not held changes nothing that tick: not even its route progress or facing */
+static void test_held_walker(void) {
+    EnWorld *w = world(16);
+    flat_floor(w, 0, 0);   /* chunks x 0 only: x 0..3.2 m */
+    int k = seen_kind(w, 2, 0, 0, 0);
+    int64_t id = en_add(w, k, 2.88, 0.95, 1.6, 1.0);
+    seen_ticks(w, id, 1);
+    CHECK(en_seen(w, id) && en_grounded(w, id), "a walker near the edge of the held chunks is seen, grounded");
+    double route[6] = {2.9, 0.9, 1.6, 6.0, 0.9, 1.6};   /* its first point within 0.25 m: passed on its next seen step */
+    int r = en_route(w, 2, route);
+    en_follow(w, id, r, 6.0, 0);
+    int row = (int)(id & EN_ROW_MASK);
+    double p0[3], v0[3], p1[3], v1[3];
+    en_get(w, id, 0, p0); en_get(w, id, 1, v0);
+    int32_t next0 = w->rt_next[row]; float face0 = w->facing[row], best0 = w->rt_best[row], stall0 = w->rt_stall[row];
+    uint8_t flags0 = w->flags[row];
+    seen_ticks(w, id, 1);   /* a step of 0.1 m east would reach x 3.28: chunk (1, 0, 0), not held */
+    en_get(w, id, 0, p1); en_get(w, id, 1, v1);
+    CHECK(p1[0] == p0[0] && p1[1] == p0[1] && p1[2] == p0[2] && v1[0] == v0[0] && v1[1] == v0[1] && v1[2] == v0[2],
+          "a seen walker that would step into a chunk not held keeps its position and velocity");
+    CHECK(w->rt_next[row] == next0 && w->facing[row] == face0 && w->rt_best[row] == best0 && w->rt_stall[row] == stall0,
+          "... its route progress and facing");
+    CHECK(w->flags[row] == flags0 && en_events(w, 0, NULL, NULL) == 0, "... its grounded flag, and reports nothing");
+    for (int cy = -6; cy <= 7; cy++) en_chunk_uniform(w, 1, cy, 0, cy < 0 ? 1 : 0);
+    seen_ticks(w, id, 1);
+    CHECK(pos_axis(w, id, 0) > p0[0] && w->rt_next[row] == 1 && fabs(w->facing[row] - 1.5707963) < 1e-5,
+          "with the chunk held it walks: past its first point, facing east");
+    en_close(w);
+}
+
 int main(void) {
     test_kinds();
     test_add_and_read();
@@ -1199,6 +1465,12 @@ int main(void) {
     test_routes();
     test_divisor();
     test_route_limits();
+    test_hysteresis();
+    test_no_focus();
+    test_grounding();
+    test_unseen_rules();
+    test_ground_goes();
+    test_held_walker();
     if (fails == 0) printf("ent_test: ok\n");
     return fails == 0 ? 0 : 1;
 }

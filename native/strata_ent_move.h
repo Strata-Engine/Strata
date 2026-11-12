@@ -19,8 +19,8 @@
  * horizontal axis blocked while grounded tried again raised by the step height and, if that goes farther, set down
  * again; landing grounds it, its vertical velocity 0. A waypoint is reached within 0.25 m horizontally. A follower
  * making less than 0.1 m of progress toward its waypoint for 1 s writes event 8 once, and again only after it has
- * made that progress and stalled again; it keeps pushing. A sweep that would enter a chunk not held moves nothing
- * that tick (no fall either).
+ * made that progress and stalled again; it keeps pushing. A sweep that would enter a chunk not held changes nothing
+ * that tick: no move, no fall, no waypoint passed, no turn, no event.
  *
  * Walking, unseen (en_walk_unseen): a follower moves at its speed, measured horizontally, along straight lines to
  * each waypoint in turn (y along with it), touching no blocks; one with no route stays. At the end of a route:
@@ -260,23 +260,33 @@ static inline double en_flat_moved(const double *p, const double *a) {
     return dx * dx + dz * dz;
 }
 
-/* One seen walking step of row r over dt (> 0). */
+/* One seen walking step of row r over dt (> 0). The waypoints it passes and the way it turns are worked out first
+ * without changing anything, and made so only once the sweep has answered: a walker whose sweep would enter a chunk
+ * not held changes nothing that tick (position, velocity, route progress, facing, grounded, events). */
 static inline void en_walk(EnWorld *w, int r, const EnKind *kd, double dt) {
     float *v = w->vel + r * 3;
     double *p = w->pos + r * 3;
     double vx = v[0], vz = v[2];
+    int passes = 0, turns = 0;
+    float face = 0;
     if (w->rt_route[r] >= 0) {
-        int stopped = 0;
-        for (int guard = 0; guard <= w->routes[w->rt_route[r]].n && en_flat_dist(p, en_waypoint(w, r)) <= EN_REACH; guard++)
-            if ((stopped = en_next_waypoint(w, r))) break;
-        if (stopped) vx = vz = 0;
+        const EnRoute *rt = &w->routes[w->rt_route[r]];
+        const double *pts = w->rpts + (size_t)rt->start * 3;
+        int nx = w->rt_next[r], stops = 0;
+        for (int guard = 0; guard <= rt->n && en_flat_dist(p, pts + (size_t)nx * 3) <= EN_REACH; guard++) {
+            passes++;   /* as en_next_waypoint will, once the step is taken */
+            if (nx + 1 < rt->n) nx++;
+            else if (w->flags[r] & EN_F_LOOPS) nx = 0;
+            else { stops = 1; break; }
+        }
+        if (stops) vx = vz = 0;
         else {
-            const double *q = en_waypoint(w, r);
+            const double *q = pts + (size_t)nx * 3;
             double dx = q[0] - p[0], dz = q[2] - p[2], dh = sqrt(dx * dx + dz * dz), s = w->rt_speed[r];
             if (dh > 0) {
                 if (s * dt > dh) s = dh / dt;   /* no farther than the waypoint */
                 vx = dx / dh * s; vz = dz / dh * s;
-                w->facing[r] = (float)atan2(dx, dz);
+                face = (float)atan2(dx, dz); turns = 1;
             } else vx = vz = 0;
         }
     }
@@ -286,7 +296,9 @@ static inline void en_walk(EnWorld *w, int r, const EnKind *kd, double dt) {
     double h[3] = {kd->floats[EN_K_HX], kd->floats[EN_K_HY], kd->floats[EN_K_HZ]};
     double d[3] = {vx * dt, vy * dt, vz * dt}, out[3];
     int b[3];
-    if (en_sweep(w, p, h, d, out, b) < 0) return;   /* it would enter a chunk not held: held where it is */
+    if (en_sweep(w, p, h, d, out, b) < 0) return;   /* it would enter a chunk not held: held where it is, unchanged */
+    for (int i = 0; i < passes; i++) if (en_next_waypoint(w, r)) break;   /* the last of them stops it, if it does */
+    if (turns) w->facing[r] = face;
     double step = kd->floats[EN_K_STEP];
     if ((w->flags[r] & EN_F_GROUNDED) && (b[0] || b[2]) && step > 0) {
         double up[3] = {0, step, 0}, raised[3], across[3], down[3];

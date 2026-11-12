@@ -29,7 +29,8 @@
  * stats; blocks (the kernel's one-bit-a-voxel copy of the loaded chunks);
  * the ray; events; the grid, near, the entity ray and touch pairs (in
  * strata_ent_grid.h, included here); the sweep, walking and routes (in
- * strata_ent_move.h, included here); the tick. */
+ * strata_ent_move.h, included here); seen and unseen, and setting on the
+ * ground (in strata_ent_seen.h, included here); the tick. */
 #ifndef STRATA_ENT_H
 #define STRATA_ENT_H
 #include <stdint.h>
@@ -59,9 +60,10 @@
 #define EN_ROUTE_MAX 256           /* points a route at most */
 
 /* a row's flags */
-/* seen this tick; a flyer that hit a block, still until the game moves it; a walker standing on something; a follower
- * whose route loops; a follower that has reported event 8 for its present stall */
-enum { EN_F_SEEN = 1, EN_F_STUCK = 2, EN_F_GROUNDED = 4, EN_F_LOOPS = 8, EN_F_BLOCKED = 16 };
+/* seen (strata_ent_seen.h); a flyer that hit a block, still until the game moves it; a walker standing on something; a
+ * follower whose route loops; a follower that has reported event 8 for its present stall; an unseen walker waiting to
+ * be set on the ground; an unseen entity frozen by its kind's rule */
+enum { EN_F_SEEN = 1, EN_F_STUCK = 2, EN_F_GROUNDED = 4, EN_F_LOOPS = 8, EN_F_BLOCKED = 16, EN_F_WAITING = 32, EN_F_FROZEN = 64 };
 /* event codes */
 enum { EN_E_TOUCH = 1, EN_E_BLOCK = 2, EN_E_ENTERED = 3, EN_E_LEFT = 4, EN_E_ROUTE = 5, EN_E_REMOVED = 6, EN_E_BODY_LOST = 7, EN_E_BLOCKED = 8 };
 
@@ -145,7 +147,7 @@ struct EnWorld {
     int nev;
     EnRemoval *removed; int nremoved;
     int in_tick;
-    double bad_dt, dropped; int seen;
+    double bad_dt, dropped; int seen, waiting;   /* seen and waiting for ground at the end of the last tick */
     /* the grid (strata_ent_grid.h) */
     double *from;                /* 3 a row: the position the tick's step began at */
     EnGridEnt *g_ent;            /* capacity: the last tick's live entities, bucket by bucket */
@@ -551,14 +553,15 @@ static inline uint64_t en_hash(const EnWorld *w) {
     return h;
 }
 
-/* 0 live, 1 seen in the last tick, 2 waiting for ground, 3 refused calls, 4 ticks given a dt negative or not
- * finite, 5 events dropped (past EN_EVENTS in a tick, or removals queued between ticks), 6 last refusal reason
- * (EN_R_*), 7 entities over the body budget, 8 route points held, 9 routes held (a freed route still followed is
- * held). Grounding and bodies come in later tasks; until then 2 and 7 read 0. */
+/* 0 live, 1 seen at the end of the last tick, 2 walkers waiting there to be set on the ground (strata_ent_seen.h),
+ * 3 refused calls, 4 ticks given a dt negative or not finite, 5 events dropped (past EN_EVENTS in a tick, or removals
+ * queued between ticks), 6 last refusal reason (EN_R_*), 7 entities over the body budget, 8 route points held, 9 routes
+ * held (a freed route still followed is held). Bodies come in a later task; until then 7 reads 0. */
 static inline double en_stat(const EnWorld *w, int which) {
     switch (which) {
     case 0: return w->live;
     case 1: return w->seen;
+    case 2: return w->waiting;
     case 3: return w->refused;
     case 4: return w->bad_dt;
     case 5: return w->dropped;
@@ -756,18 +759,9 @@ static inline int en_events(const EnWorld *w, int max, int64_t *ints, double *fl
 
 #include "strata_ent_grid.h"
 #include "strata_ent_move.h"
+#include "strata_ent_seen.h"
 
 /* ---- the tick ---- */
-/* seen: within the kind's seen distance of any focus, measured horizontally (x and z) */
-static inline int en_seen_by(const double *p, double dist, int nfocus, const double *focus) {
-    double dd = dist * dist;
-    for (int f = 0; f < nfocus; f++) {
-        double dx = p[0] - focus[f * 3], dz = p[2] - focus[f * 3 + 2];
-        if (dx * dx + dz * dz <= dd) return 1;
-    }
-    return 0;
-}
-
 /* one flying step of row r over dt (> 0): gravity into the velocity, then the position by the velocity; while
  * seen, a ray along the step, and on a hit the entity stops at the hit point, still, with event 2 */
 static inline void en_fly(EnWorld *w, int r, const EnKind *kd, double dt) {
@@ -794,17 +788,19 @@ static inline void en_fly(EnWorld *w, int r, const EnKind *kd, double dt) {
 
 /* One step of dt seconds, in passes over each kind's dense array, kind by kind:
  *  1. the last tick's events cleared and the removals queued since written (event 6); each entity's age advances
- *     by dt and one whose age passes its kind's lifetime is removed (reason 1, event 6); the seen flag is set from
- *     the focus points (nfocus of them, 3 doubles each; none: all unseen);
+ *     by dt (not a frozen one's) and one whose age passes its kind's lifetime is removed (reason 1, event 6);
  *  2. seen movement: flyers (en_fly; one stopped by a block stays until the game sets its position or velocity) and
  *     walkers (en_walk); placed entities do not move;
  *  3. unseen movement due this tick: an unseen entity of a kind with divisor n steps on the ticks where
  *     (ticks begun before + its row) % n == 0, by n * dt, so a kind's entities are spread across the n ticks;
- *     flyers fly on through everything, walkers follow their routes (en_walk_unseen);
- *  4. the grid is rebuilt from the rows still live (en_grid_build) and the declared touch pairs tested on it
+ *     flyers fly on through everything, walkers follow their routes (en_walk_unseen); frozen entities and walkers
+ *     waiting to be set on the ground stay;
+ *  4. the seen and unseen switch from the focus points (nfocus of them, 3 doubles each; none: nothing is seen), on
+ *     the positions movement left (en_switch, strata_ent_seen.h): events 3 and 4, the unseen rules, grounding;
+ *  5. the grid is rebuilt from the rows still live (en_grid_build) and the declared touch pairs tested on it
  *     (en_touches): an entity removed in the tick is in neither.
- * dt negative or not finite is counted (en_stat(4)) and taken as 0, which moves nothing. Entities added between
- * ticks take part from the next tick: every live entity does. */
+ * dt negative or not finite is counted (en_stat(4)) and taken as 0, which moves nothing; the switch still runs. An
+ * entity added between ticks is unseen and takes part from the next tick, becoming seen at its end if it is near. */
 static inline void en_tick(EnWorld *w, int nfocus, const double *focus, double dt) {
     if (!isfinite(dt) || dt < 0) { w->bad_dt += 1; dt = 0; }
     if (nfocus < 0 || !focus) nfocus = 0;
@@ -815,23 +811,20 @@ static inline void en_tick(EnWorld *w, int nfocus, const double *focus, double d
     }
     w->nremoved = 0;
     w->in_tick = 1;
-    int seen = 0;
     for (int k = 0; k < w->nkinds; k++) {
         const EnKind *kd = &w->kinds[k];
         const int32_t *dense = w->dense + (size_t)k * w->capacity;
         double life = kd->floats[EN_K_LIFETIME];
         for (int i = 0; i < kd->live;) {   /* a removal moves the kind's last entry into i: look at i again */
             int r = dense[i];
-            w->age[r] += dt;
-            if (life > 0 && w->age[r] > life) { en_remove(w, en_id(w, r), 1); continue; }
+            if (!(w->flags[r] & EN_F_FROZEN)) {
+                w->age[r] += dt;
+                if (life > 0 && w->age[r] > life) { en_remove(w, en_id(w, r), 1); continue; }
+            }
             memcpy(w->from + r * 3, w->pos + r * 3, 3 * sizeof *w->pos);
-            int s = en_seen_by(w->pos + r * 3, kd->floats[EN_K_SEEN], nfocus, focus);
-            w->flags[r] = (uint8_t)((w->flags[r] & ~EN_F_SEEN) | (s ? EN_F_SEEN : 0));
-            seen += s;
             i++;
         }
     }
-    w->seen = seen;
     if (dt > 0) {
         for (int k = 0; k < w->nkinds; k++) {   /* seen movement */
             const EnKind *kd = &w->kinds[k];
@@ -853,13 +846,14 @@ static inline void en_tick(EnWorld *w, int nfocus, const double *focus, double d
             int due = (int)(w->tick_count % n);
             for (int i = 0; i < kd->live; i++) {
                 int r = dense[i];
-                if ((w->flags[r] & EN_F_SEEN) || (due + r % n) % n != 0) continue;
+                if ((w->flags[r] & (EN_F_SEEN | EN_F_FROZEN | EN_F_WAITING)) || (due + r % n) % n != 0) continue;
                 if (mover == 2) en_walk_unseen(w, r, n * dt);
                 else if (!(w->flags[r] & EN_F_STUCK)) en_fly(w, r, kd, n * dt);
             }
         }
     }
     w->tick_count++;
+    en_switch(w, nfocus, focus);
     en_grid_build(w);
     en_touches(w);
     w->in_tick = 0;

@@ -717,7 +717,17 @@ mod Entcheck do
     let w1 = Strata.Edit.world(Strata.Edit.fill_box(w0, -64, -32, -64, 63, -1, 63, 1))
     let w2 = Strata.Edit.world(Strata.Edit.fill_box(w1, -20, 0, -30, 9, 4, 30, 1))
     let w3 = Strata.Edit.world(Strata.Edit.fill_box(w2, -10, 5, -30, -1, 7, 30, 2))
-    Strata.Edit.world(Strata.Edit.fill_box(w3, 26, 0, -5, 29, 29, 4, 1))
+    tall_go(Strata.Edit.world(Strata.Edit.fill_box(w3, 26, 0, -5, 29, 29, 4, 1)), 0)
+  end
+  -- chunks x -2..1, z -2..1 of stone at y -6..-2 and of air at y 2..6, so a walker near the floor has every chunk
+  -- its setting on the ground reads (16 m up and down) held
+  pfn tall_go(w : Strata.World.World, i : Int) : Strata.World.World do
+    if i >= 160 do w
+    else
+      let cy = (i / 16) % 10
+      let y = if cy < 5 do cy - 6 else cy - 3 end
+      tall_go(Strata.World.insert(w, Strata.Coord.key(i % 4 - 2, y, (i / 4) % 4 - 2), Strata.Chunk.uniform(if y < 0 do 1 else 0 end)), i + 1)
+    end
   end
   -- the route: up the steps, down off them, round the pillar
   pfn walk_route() : List((Float, Float, Float)) do
@@ -780,6 +790,180 @@ mod Entcheck do
       + check(h1 == h2, "two runs give one hash"))
   end
 
+  -- ── Seen and unseen: the camera jump ─────────────────────────────────────
+  -- A hilly world of 1 m voxels (chunks 32 m on a side) from noise, streamed headless around one focus as demo does:
+  -- stone below the ground's height, air above.
+  pfn jump_noise() : Strata.Noise.Settings do Strata.Noise.settings(0, 3, 2.0, 0.5, 1, 0.0) end
+  pfn jump_height(xm : Float, zm : Float) : Float do
+    40.0 +. 14.0 *. Strata.Noise.sample2(jump_noise(), 77, 0.008, xm, zm) +. 5.0 *. Strata.Noise.sample2(jump_noise(), 78, 0.03, xm, zm)
+  end
+  -- column (wx, wz) is stone for voxel y below this: the ground's top, in metres
+  pfn jump_top(wx : Int, wz : Int) : Int do float_to_int(Math.floor(jump_height(int_to_float(wx) +. 0.5, int_to_float(wz) +. 0.5))) end
+  pfn jump_tops(hs : NativeIntArr, x0 : Int, z0 : Int, i : Int) : NativeIntArr do
+    if i >= 1024 do hs else jump_tops(NativeArray.set_int(hs, i, jump_top(x0 + i % 32, z0 + i / 32)), x0, z0, i + 1) end
+  end
+  pfn jump_span(hs : NativeIntArr, i : Int, lo : Int, hi : Int) : (Int, Int) do
+    if i >= 1024 do (lo, hi)
+    else
+      let h = NativeArray.get_int(hs, i)
+      jump_span(hs, i + 1, if h < lo do h else lo end, if h > hi do h else hi end)
+    end
+  end
+  pfn jump_fill(a : NativeI32Arr, y0 : Int, hs : NativeIntArr, i : Int) : NativeI32Arr do
+    if i >= 32768 do a
+    else
+      let below = y0 + i / 1024 < NativeArray.get_int(hs, i % 32 + 32 * ((i / 32) % 32))
+      jump_fill(if below do NativeArray.set_i32(a, i, 1) else a end, y0, hs, i + 1)
+    end
+  end
+  pfn jump_chunk(k : Strata.Coord.Key) : Strata.Chunk.Chunk do
+    let y0 = 32 * Strata.Coord.ky(k)
+    let hs = jump_tops(NativeArray.make_int(1024, 0), 32 * Strata.Coord.kx(k), 32 * Strata.Coord.kz(k), 0)
+    let (lo, hi) = jump_span(hs, 0, 1000000, -1000000)
+    if y0 >= hi do Strata.Chunk.uniform(0)
+    else if y0 + 32 <= lo do Strata.Chunk.uniform(1)
+    else Strata.Chunk.from_flat(jump_fill(NativeArray.make_i32(32768, 0), y0, hs, 0)) end end
+  end
+
+  -- walker i's route: a 4 m square from a point within 45 m of (300, 0), each corner at the ground's height plus an
+  -- offset: 5 m above it, 2.5 m inside the hill, or 0.3 m above (the box's centre 0.9 m higher still)
+  pfn jump_offset(i : Int) : Float do if i % 3 == 0 do 5.0 else if i % 3 == 1 do -2.5 else 0.3 end end end
+  pfn jump_corner(x : Float, z : Float, off : Float) : (Float, Float, Float) do
+    (x, int_to_float(jump_top(float_to_int(Math.floor(x)), float_to_int(Math.floor(z)))) +. 0.9 +. off, z)
+  end
+  pfn jump_route(i : Int) : List((Float, Float, Float)) do
+    let h1 = Strata.Seed.cell(47, 6, i, 0, 0)
+    let h2 = Strata.Seed.next(h1)
+    let r = 45.0 *. Math.sqrt(Strata.Seed.unit(h1))
+    let a = 6.283185307179586 *. Strata.Seed.unit(h2)
+    let x = 300.0 +. r *. Math.cos(a)
+    let z = r *. Math.sin(a)
+    let off = jump_offset(i)
+    [jump_corner(x, z, off), jump_corner(x +. 4.0, z, off), jump_corner(x +. 4.0, z +. 4.0, off), jump_corner(x, z +. 4.0, off)]
+  end
+  pfn jump_walkers(e : Strata.Entities.Entities, i : Int) : Strata.Entities.Entities do
+    if i >= 500 do e
+    else
+      let pts = jump_route(i)
+      let (e1, route) = En.route(e, pts)
+      let (x, y, z) = match pts do
+        Cons(p, _) -> p
+        Nil -> (0.0, 0.0, 0.0)
+      end
+      let (e2, id) = En.add(e1, 0, x, y, z, 0.0)
+      jump_walkers(En.follow(e2, id, route, 1.5, true), i + 1)
+    end
+  end
+
+  -- one frame as a game runs it: the stream ticked, the kernel's blocks brought up to date, the meshes taken (and
+  -- dropped: nothing draws), one step; (stream, world, the step's seconds)
+  pfn jump_frame(s : Strata.Stream.Stream, e : Strata.Entities.Entities, focus : (Float, Float, Float)) : (Strata.Stream.Stream, Strata.Entities.Entities, Float) do
+    let s1 = Strata.Stream.tick(s)
+    let (e1, s2) = En.blocks(e, s1)
+    let (s3, _meshes) = Strata.Stream.take_meshes(s2)
+    let t0 = Ech.clock()
+    let e2 = En.step(e1, [focus], 1.0 /. 60.0)
+    (s3, e2, Ech.clock() -. t0)
+  end
+  pfn jump_settle(s : Strata.Stream.Stream, e : Strata.Entities.Entities, focus : (Float, Float, Float), n : Int) : (Strata.Stream.Stream, Strata.Entities.Entities, Int) do
+    if n >= 20000 do (s, e, n)
+    else
+      let (s1, e1, _t) = jump_frame(s, e, focus)
+      if Strata.Stream.settled(s1) do (s1, e1, n + 1) else jump_settle(s1, e1, focus, n + 1) end
+    end
+  end
+
+  pfn fl(v : Float) : Int do float_to_int(Math.floor(v)) end
+  -- every voxel the walker's box (half 0.3, 0.9, 0.3) at (x, y, z) overlaps is clear in the kernel's copy
+  pfn box_clear(x : Float, y : Float, z : Float, i : Int) : Bool do
+    let x0 = fl(x -. 0.3)
+    let y0 = fl(y -. 0.9)
+    let z0 = fl(z -. 0.3)
+    let nx = fl(x +. 0.3) - x0 + 1
+    let ny = fl(y +. 0.9) - y0 + 1
+    let nz = fl(z +. 0.3) - z0 + 1
+    if i >= nx * ny * nz do true
+    else if Ech.solid(x0 + i % nx, y0 + (i / nx) % ny, z0 + i / (nx * ny)) != 0 do false
+    else box_clear(x, y, z, i + 1) end end
+  end
+  -- a voxel under the walker's feet (the layer under its box, across the box's width) is solid in the kernel's copy
+  pfn feet_solid(x : Float, y : Float, z : Float, i : Int) : Bool do
+    let x0 = fl(x -. 0.3)
+    let z0 = fl(z -. 0.3)
+    let nx = fl(x +. 0.3) - x0 + 1
+    let nz = fl(z +. 0.3) - z0 + 1
+    if i >= nx * nz do false
+    else if Ech.solid(x0 + i % nx, fl(y -. 0.9 -. 0.5), z0 + i / nx) == 1 do true
+    else feet_solid(x, y, z, i + 1) end end
+  end
+  -- each event 3 (entered view): (entered, entered but not grounded, solid under its feet and clear in its box)
+  pfn jump_entered(e : Strata.Entities.Entities, evs : List(Strata.Entities.Event), n : Int, bad : Int) : (Int, Int) do
+    match evs do
+      Nil -> (n, bad)
+      Cons(v, t) ->
+        if En.ev_code(v) != 3 do jump_entered(e, t, n, bad)
+        else
+          let id = En.ev_a(v)
+          let (x, y, z) = En.position(e, id)
+          let ok = if !En.seen(e, id) do false else if !En.grounded(e, id) do false else if !feet_solid(x, y, z, 0) do false else box_clear(x, y, z, 0) end end end
+          if ok do jump_entered(e, t, n + 1, bad) else jump_entered(e, t, n + 1, bad + fail("  walker " ++ int_to_string(id) ++ " entered view at (" ++ float_to_string(x) ++ ", " ++ float_to_string(y) ++ ", " ++ float_to_string(z) ++ ") not seen, grounded, on solid and clear")) end
+        end
+    end
+  end
+  -- after the jump: frames until 30 past the stream settling; (stream, world, frames, settled at, worst step, total
+  -- step seconds, entered, bad entries)
+  pfn jump_go(s : Strata.Stream.Stream, e : Strata.Entities.Entities, focus : (Float, Float, Float), n : Int, at : Int, worst : Float, total : Float, entered : Int, bad : Int) : (Strata.Stream.Stream, Strata.Entities.Entities, Int, Int, Float, Float, Int, Int) do
+    if n >= 20000 do (s, e, n, at, worst, total, entered, bad)
+    else if at >= 0 && n >= at + 30 do (s, e, n, at, worst, total, entered, bad)
+    else
+      let (s1, e1, secs) = jump_frame(s, e, focus)
+      let (got, wrong) = jump_entered(e1, En.events(e1, Strata.Stream.world(s1)), entered, bad)
+      let at1 = if at < 0 do (if Strata.Stream.settled(s1) do n + 1 else -1 end) else at end
+      jump_go(s1, e1, focus, n + 1, at1, if secs > worst do secs else worst end, total +. secs, got, wrong)
+    end end
+  end
+  -- (within seen distance of the focus, seen, seen with a clear box, grounded)
+  pfn jump_count(e : Strata.Entities.Entities, ids : NativeIntArr, fx : Float, fz : Float, i : Int, acc : (Int, Int, Int, Int)) : (Int, Int, Int, Int) do
+    if i >= NativeArray.length_int(ids) do acc
+    else
+      let id = NativeArray.get_int(ids, i)
+      let (x, y, z) = En.position(e, id)
+      let (a, b, c, d) = acc
+      let near = Math.sqrt((x -. fx) *. (x -. fx) +. (z -. fz) *. (z -. fz)) <= 64.0
+      let seen = En.seen(e, id)
+      let clear = if seen do box_clear(x, y, z, 0) else false end
+      jump_count(e, ids, fx, fz, i + 1, (if near do a + 1 else a end, if seen do b + 1 else b end, if clear do c + 1 else c end, if En.grounded(e, id) do d + 1 else d end))
+    end
+  end
+
+  -- jump: 500 walkers on routes 300 m from the focus, unseen; the focus jumps to them, and within 30 frames of the
+  -- stream settling every one within seen distance is seen, each set down grounded on solid with its box clear
+  pfn jump_scene() : Int do
+    let start = (0.5, int_to_float(jump_top(0, 0)) +. 1.7, 0.5)
+    let w = Strata.World.new(registry(), Strata.Terrain.gen(fn (k, seed) -> jump_chunk(k)), 47, 1.0)
+    let s0 = Strata.Stream.set_focus(Strata.Stream.start(w, Strata.Stream.config(4, 2, 32, 4)), [start])
+    let e0 = jump_walkers(En.open([En.with_mover(En.kind(), En.walking(), 0.3, 0.9, 0.3, 1.1, 9.8)], 1024, 128, 4, 32.0, 1.0), 0)
+    let (s1, e1, n1) = jump_settle(s0, e0, start, 0)
+    let before = match En.stats(e1) do (_, sn, _, _) -> sn end
+    let (fx, fz) = (300.0, 0.0)
+    let focus = (fx, int_to_float(jump_top(300, 0)) +. 1.7, fz)
+    let (s2, e2, n2, at, worst, total, entered, bad) = jump_go(Strata.Stream.set_focus(s1, [focus]), e1, focus, 0, -1, 0.0, 0.0, 0, 0)
+    let (near, seen, clear, grounded) = jump_count(e2, En.each(e2, 0), fx, fz, 0, (0, 0, 0, 0))
+    let load = Env.get_int("ENTCHECK_LOAD", 99)
+    println("  settled round the start in " ++ int_to_string(n1) ++ " frames, " ++ int_to_string(before) ++ " seen; after the jump the stream settled on frame " ++ int_to_string(at) ++ " of " ++ int_to_string(n2))
+    println("  " ++ int_to_string(entered) ++ " entered view; at the end " ++ int_to_string(seen) ++ " of " ++ int_to_string(near) ++ " within seen distance seen, " ++ int_to_string(clear) ++ " with a clear box, " ++ int_to_string(grounded) ++ " grounded")
+    println("  step: worst " ++ ms(worst) ++ " ms, mean " ++ ms(total /. int_to_float(if n2 < 1 do 1 else n2 end)) ++ " ms over " ++ int_to_string(n2) ++ " frames; 8 ms check " ++ (if load < 8 do (if worst <= 0.008 do "met" else "MISSED" end) else "not judged (load " ++ int_to_string(load) ++ ")" end))
+    let timed = if load < 8 do check(worst <= 0.008, "no step over 8 ms") else 0 end
+    Strata.Stream.stop(s2)
+    report("jump", bad + timed + check(before == 0, "the walkers 300 m away are unseen before the jump")
+      + check(at >= 0, "the stream settles after the jump")
+      + check(near == 500, "all 500 walkers are within seen distance of the new focus")
+      + check(seen == near, "within 30 frames of the stream settling every one within seen distance is seen")
+      + check(entered == seen, "each reported event 3 once, set down seen, grounded, on solid with its box clear")
+      + check(clear == seen, "every seen walker's box is clear at the end")
+      + check(!En.is_open(En.close(e2)), "closed"))
+  end
+
   fn main(_cap : Cap(IO)) : Unit do
     let name = Env.get("ENTCHECK_SCENE", "")
     if name == "basics" do process_exit(basics_scene())
@@ -791,9 +975,10 @@ mod Entcheck do
     else if name == "storm" do process_exit(storm_scene())
     else if name == "sweep" do process_exit(sweep_scene())
     else if name == "walk" do process_exit(walk_scene())
+    else if name == "jump" do process_exit(jump_scene())
     else
-      println("entcheck: no scene named '" ++ name ++ "' (basics, columns, determinism, closed, ray, bullets, storm, sweep, walk)")
+      println("entcheck: no scene named '" ++ name ++ "' (basics, columns, determinism, closed, ray, bullets, storm, sweep, walk, jump)")
       process_exit(2)
-    end end end end end end end end end
+    end end end end end end end end end end
   end
 end
