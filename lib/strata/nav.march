@@ -1,0 +1,429 @@
+-- Nav: where a walker can stand in a voxel world, and the way from one such
+-- place to another.
+--
+-- Everything is in voxels: a place is the cell a walker's feet are in. A
+-- walker is a footprint ((2 radius + 1) cells square), a height in cells, the
+-- step it climbs and the drop it takes; one that swims may also float in the
+-- top cell of a body of fluid. Nothing here knows what a walker is in a game:
+-- a fighter, a villager and a cart are three walkers.
+--
+--   * `standing` says whether a cell holds a walker, and how (on a floor, or
+--     afloat); `foot` finds the standable cell nearest a place in its column.
+--   * `find` is an A* search from one standable cell to another through the
+--     loaded world as it now stands (an edit is seen by the next search). It
+--     works inside a window about the two places and expands at most `budget`
+--     cells; when it cannot arrive it answers the way to the cell it reached
+--     that is nearest the goal, marked not `arrived`.
+--   * `nearest` is the same search without a goal: the cheapest way to any
+--     cell a game's own test accepts (cover, dry land, a cell out of sight).
+--   * `straight` says whether the walker can go from one cell directly to
+--     another, and `smooth` uses it to drop the corners a grid path does not
+--     need.
+--   * `points` turns a path into metres for a mover, and `advance` drops the
+--     points already reached.
+--
+-- An unloaded chunk reads as air, so nothing stands in it and no path
+-- crosses it. A search reads each cell once (it keeps what it read for its
+-- own length), so its cost is its budget, not the distance.
+mod Strata.Nav do
+
+  alias Strata.World as Wn
+  alias Strata.Blocks as Bn
+
+  -- radius, height, step up, drop, swims (all in voxels)
+  type Walker = NvWalker(Int, Int, Int, Int, Bool)
+
+  -- cells from the first to the last, arrived, cells expanded
+  type Path = NvPath(List((Int, Int, Int)), Bool, Int)
+
+  pfn at_least(v : Int, lo : Int) : Int do if v < lo do lo else v end end
+
+  doc "A walker one cell wide and [height] cells tall that climbs [step] cells and drops [drop], and does not swim."
+  fn walker(height : Int, step : Int, drop : Int) : Walker do NvWalker(0, at_least(height, 1), at_least(step, 0), at_least(drop, 0), false) end
+
+  doc "The walker with a footprint of 2 [radius] + 1 cells square."
+  fn with_radius(k : Walker, radius : Int) : Walker do match k do NvWalker(_, h, s, d, sw) -> NvWalker(at_least(radius, 0), h, s, d, sw) end end
+
+  doc "The walker, able or not to float in the top cell of a fluid."
+  fn with_swim(k : Walker, yes : Bool) : Walker do match k do NvWalker(r, h, s, d, _) -> NvWalker(r, h, s, d, yes) end end
+
+  doc "The walker for a box of [half_width] by [height] metres that climbs [step] metres and drops [drop], in a world of [scale] metres a voxel: the footprint and height are rounded up, the step and drop down."
+  fn walker_of(scale : Float, half_width : Float, height : Float, step : Float, drop : Float) : Walker do
+    let across = float_to_int(Math.ceil(2.0 *. half_width /. scale -. 0.0001))
+    NvWalker(at_least(across, 1) / 2, at_least(float_to_int(Math.ceil(height /. scale -. 0.0001)), 1), at_least(float_to_int(Math.floor(step /. scale +. 0.0001)), 0), at_least(float_to_int(Math.floor(drop /. scale +. 0.0001)), 0), false)
+  end
+
+  fn radius(k : Walker) : Int do match k do NvWalker(r, _, _, _, _) -> r end end
+  fn height(k : Walker) : Int do match k do NvWalker(_, h, _, _, _) -> h end end
+  fn step(k : Walker) : Int do match k do NvWalker(_, _, s, _, _) -> s end end
+  fn drop(k : Walker) : Int do match k do NvWalker(_, _, _, d, _) -> d end end
+  fn swims(k : Walker) : Bool do match k do NvWalker(_, _, _, _, sw) -> sw end end
+
+  doc "The path's cells, from where it starts to where it ends (both included); empty when the start holds no walker."
+  fn cells(p : Path) : List((Int, Int, Int)) do match p do NvPath(cs, _, _) -> cs end end
+  doc "Does the path end at its goal? When not, it ends at the cell the search reached that is nearest it."
+  fn arrived(p : Path) : Bool do match p do NvPath(_, a, _) -> a end end
+  doc "How many cells the search expanded."
+  fn expanded(p : Path) : Int do match p do NvPath(_, _, n) -> n end end
+  doc "How many cells the path has."
+  fn length(p : Path) : Int do match p do NvPath(cs, _, _) -> List.length(cs) end end
+
+  -- ── Reading the world directly ───────────────────────────────────────────
+  -- A cell's class: 1 open, 2 solid, 3 fluid. (0 is "not read yet" and 4
+  -- "outside the window" in a search's own table, below.)
+  pfn class_of(w : Strata.World.World, x : Int, y : Int, z : Int) : Int do
+    let id = Wn.get_block(w, x, y, z)
+    if id == 0 do 1
+    else
+      let r = Wn.registry(w)
+      if Bn.collides(r, id) do 2 else if Bn.is_fluid(r, id) do 3 else 1 end end
+    end
+  end
+
+  -- every cell of the footprint about (x, z) from y0 to y1 is not solid
+  pfn clear_w(w : Strata.World.World, rad : Int, x : Int, z : Int, y0 : Int, y1 : Int, i : Int) : Bool do
+    let side = 2 * rad + 1
+    let n = side * side * (y1 - y0 + 1)
+    if y1 < y0 || i >= n do true
+    else if class_of(w, x - rad + i % side, y0 + i / (side * side), z - rad + (i / side) % side) == 2 do false
+    else clear_w(w, rad, x, z, y0, y1, i + 1) end end
+  end
+
+  -- 0 no, 1 on a floor, 2 afloat: from the classes of the cell under the feet, at the feet, above them and at the head, with the body's cells clear
+  pfn how(swim : Bool, clear : Bool, under : Int, feet : Int, above : Int, head : Int) : Int do
+    if !clear do 0
+    else if under == 2 && head != 3 do 1
+    else if swim && feet == 3 && above != 3 do 2
+    else 0 end end end
+  end
+
+  doc "Does the cell hold the walker? 0 no; 1 standing: its cells are free of solid blocks, the block under its middle is solid and its head is out of any fluid; 2 afloat (a walker that swims): the cell is the top one of a fluid."
+  fn standing(w : Strata.World.World, k : Walker, x : Int, y : Int, z : Int) : Int do
+    match k do
+      NvWalker(r, h, _, _, sw) ->
+        how(sw, clear_w(w, r, x, z, y, y + h - 1, 0), class_of(w, x, y - 1, z), class_of(w, x, y, z), class_of(w, x, y + 1, z), class_of(w, x, y + h - 1, z))
+    end
+  end
+
+  pfn foot_go(w : Strata.World.World, k : Walker, x : Int, y : Int, z : Int, i : Int, reach : Int) : Option((Int, Int, Int)) do
+    -- 0, -1, +1, -2, +2 ...: the nearest first, below before above
+    let off = if i % 2 == 1 do 0 - (i + 1) / 2 else i / 2 end
+    if i > 2 * reach do None
+    else if standing(w, k, x, y + off, z) != 0 do Some((x, y + off, z))
+    else foot_go(w, k, x, y, z, i + 1, reach) end end
+  end
+
+  doc "The cell of column (x, z) nearest height y, within [reach] cells of it, that holds the walker (the lower of two equally near); None when there is none."
+  fn foot(w : Strata.World.World, k : Walker, x : Int, y : Int, z : Int, reach : Int) : Option((Int, Int, Int)) do foot_go(w, k, x, y, z, 0, reach) end
+
+  -- ── A search's window ────────────────────────────────────────────────────
+  -- A search works in a box of cells and keeps, for each, its class as first
+  -- read. Everything a search knows about the world is in that table, so one
+  -- search sees one world even if it is long.
+  type Cx = { nc_w : Strata.World.World, nc_reg : Strata.Blocks.Registry, nc_x0 : Int, nc_y0 : Int, nc_z0 : Int, nc_nx : Int, nc_ny : Int, nc_nz : Int,
+              nc_r : Int, nc_h : Int, nc_step : Int, nc_drop : Int, nc_swim : Bool }
+
+  pfn idx(c : Cx, x : Int, y : Int, z : Int) : Int do
+    let lx = x - c.nc_x0
+    let ly = y - c.nc_y0
+    let lz = z - c.nc_z0
+    if lx < 0 do -1 else if lx >= c.nc_nx do -1 else if ly < 0 do -1 else if ly >= c.nc_ny do -1 else if lz < 0 do -1 else if lz >= c.nc_nz do -1
+    else lx + c.nc_nx * (lz + c.nc_nz * ly) end end end end end end
+  end
+  pfn x_of(c : Cx, i : Int) : Int do c.nc_x0 + i % c.nc_nx end
+  pfn z_of(c : Cx, i : Int) : Int do c.nc_z0 + (i / c.nc_nx) % c.nc_nz end
+  pfn y_of(c : Cx, i : Int) : Int do c.nc_y0 + i / (c.nc_nx * c.nc_nz) end
+
+  -- the table with the cells of the box (xa..xb, ya..yb, za..zb) read
+  pfn know(st : NativeU8Arr, c : Cx, xa : Int, xb : Int, ya : Int, yb : Int, za : Int, zb : Int, x : Int, y : Int, z : Int) : NativeU8Arr do
+    if y > yb do st
+    else if z > zb do know(st, c, xa, xb, ya, yb, za, zb, xa, y + 1, za)
+    else if x > xb do know(st, c, xa, xb, ya, yb, za, zb, xa, y, z + 1)
+    else
+      let i = idx(c, x, y, z)
+      if i < 0 do know(st, c, xa, xb, ya, yb, za, zb, x + 1, y, z)
+      else if NativeArray.get_u8(st, i) != 0 do know(st, c, xa, xb, ya, yb, za, zb, x + 1, y, z)
+      else know(NativeArray.set_u8(st, i, class_of(c.nc_w, x, y, z)), c, xa, xb, ya, yb, za, zb, x + 1, y, z) end end
+    end end end
+  end
+
+  -- a cell's class from the table; 4 outside the window
+  pfn code(st : NativeU8Arr, c : Cx, x : Int, y : Int, z : Int) : Int do
+    let i = idx(c, x, y, z)
+    if i < 0 do 4 else NativeArray.get_u8(st, i) end
+  end
+
+  -- every cell of the footprint about (x, z) from y0 to y1 is open or fluid (and inside the window)
+  pfn clear(st : NativeU8Arr, c : Cx, x : Int, z : Int, y0 : Int, y1 : Int, i : Int) : Bool do
+    let side = 2 * c.nc_r + 1
+    let n = side * side * (y1 - y0 + 1)
+    if y1 < y0 || i >= n do true
+    else
+      let k = code(st, c, x - c.nc_r + i % side, y0 + i / (side * side), z - c.nc_r + (i / side) % side)
+      if k == 1 || k == 3 do clear(st, c, x, z, y0, y1, i + 1) else false end
+    end
+  end
+
+  -- `standing`, from the table
+  pfn stand(st : NativeU8Arr, c : Cx, x : Int, y : Int, z : Int) : Int do
+    how(c.nc_swim, clear(st, c, x, z, y, y + c.nc_h - 1, 0), code(st, c, x, y - 1, z), code(st, c, x, y, z), code(st, c, x, y + 1, z), code(st, c, x, y + c.nc_h - 1, z))
+  end
+
+  -- The eight ways on: four straight, then four diagonal.
+  pfn dir_x(d : Int) : Int do if d == 0 do 1 else if d == 1 do -1 else if d == 2 do 0 else if d == 3 do 0 else if d == 4 do 1 else if d == 5 do 1 else -1 end end end end end end end
+  pfn dir_z(d : Int) : Int do if d == 0 do 0 else if d == 1 do 0 else if d == 2 do 1 else if d == 3 do -1 else if d == 4 do 1 else if d == 5 do -1 else if d == 6 do 1 else -1 end end end end end end end end
+
+  -- May the walker go from (x, y, z), where it stands, to (x + dx, y2, z + dz)? 0 no, else how it stands there.
+  -- Up: the cells over its head where it is are free for the rise. Down: the cells over its head where it lands are free for the fall.
+  -- Diagonally: at one level only, and both cells it passes between are free, so no corner is cut.
+  pfn move(st : NativeU8Arr, c : Cx, x : Int, y : Int, z : Int, dx : Int, dz : Int, y2 : Int) : Int do
+    let s = stand(st, c, x + dx, y2, z + dz)
+    if s == 0 do 0
+    else if y2 > y do (if clear(st, c, x, z, y + c.nc_h, y2 + c.nc_h - 1, 0) do s else 0 end)
+    else if y2 < y do (if clear(st, c, x + dx, z + dz, y2 + c.nc_h, y + c.nc_h - 1, 0) do s else 0 end)
+    else if dx != 0 && dz != 0 do (if clear(st, c, x + dx, z, y, y + c.nc_h - 1, 0) && clear(st, c, x, z + dz, y, y + c.nc_h - 1, 0) do s else 0 end)
+    else s end end end end
+  end
+
+  -- What a move costs: 10 straight, 14 diagonal, 5 more for each cell climbed, 1 for each dropped; three times as much into water.
+  pfn cost(dx : Int, dz : Int, dy : Int, s : Int) : Int do
+    let base = (if dx != 0 && dz != 0 do 14 else 10 end) + (if dy > 0 do 5 * dy else 0 - dy end)
+    if s == 2 do 3 * base else base end
+  end
+
+  pfn absi(v : Int) : Int do if v < 0 do 0 - v else v end end
+  -- the least a way from (x, z) to (gx, gz) can cost
+  pfn octile(x : Int, z : Int, gx : Int, gz : Int) : Int do
+    let ax = absi(gx - x)
+    let az = absi(gz - z)
+    if ax > az do 10 * ax + 4 * az else 10 * az + 4 * ax end
+  end
+
+  -- ── The open cells: a binary heap of f * 4194304 + cell ──────────────────
+  pfn up(hp : NativeIntArr, i : Int, key : Int) : NativeIntArr do
+    if i == 0 do NativeArray.set_int(hp, 0, key)
+    else
+      let p = (i - 1) / 2
+      let pk = NativeArray.get_int(hp, p)
+      if pk <= key do NativeArray.set_int(hp, i, key) else up(NativeArray.set_int(hp, i, pk), p, key) end
+    end
+  end
+  pfn down(hp : NativeIntArr, i : Int, key : Int, n : Int) : NativeIntArr do
+    let l = 2 * i + 1
+    if l >= n do NativeArray.set_int(hp, i, key)
+    else
+      let lk = NativeArray.get_int(hp, l)
+      let r = l + 1
+      let rk = if r < n do NativeArray.get_int(hp, r) else lk end
+      let m = if rk < lk do r else l end
+      let mk = if rk < lk do rk else lk end
+      if mk < key do down(NativeArray.set_int(hp, i, mk), m, key, n) else NativeArray.set_int(hp, i, key) end
+    end
+  end
+  pfn cell_bits() : Int do 4194304 end
+
+  -- came-from table, last cell (-1 none), arrived, expanded
+  type Res = NvRes(NativeI32Arr, Int, Bool, Int)
+
+  -- The search. [cur] < 0: take the cheapest open cell (a stale entry is skipped); it is the end if it is the goal ([gi], or one [want]
+  -- accepts when [gi] is -2). Else the cell [cur] is being expanded: direction [dir], landing height [y2], counting down.
+  -- [best] is the expanded cell nearest the goal so far and [bh] its distance.
+  pfn go(c : Cx, st : NativeU8Arr, hp : NativeIntArr, hn : Int, cap : Int, g : NativeI32Arr, par : NativeI32Arr, gx : Int, gz : Int, gi : Int, want : Int -> Int -> Int -> Bool,
+         cur : Int, dir : Int, y2 : Int, left : Int, used : Int, best : Int, bh : Int) : Res do
+    if cur < 0 do
+      if hn == 0 do NvRes(par, best, false, used)
+      else
+        let key = NativeArray.get_int(hp, 0)
+        let i = int_and(key, cell_bits() - 1)
+        let hp2 = down(hp, 0, NativeArray.get_int(hp, hn - 1), hn - 1)
+        let x = x_of(c, i)
+        let y = y_of(c, i)
+        let z = z_of(c, i)
+        let hh = if gi == -2 do 0 else octile(x, z, gx, gz) end
+        if key / cell_bits() - hh > NativeArray.get_i32(g, i) do go(c, st, hp2, hn - 1, cap, g, par, gx, gz, gi, want, -1, 0, 0, left, used, best, bh)
+        else if i == gi do NvRes(par, i, true, used)
+        else if gi == -2 && want(x, y, z) do NvRes(par, i, true, used)
+        else if left <= 0 do NvRes(par, best, false, used)
+        else
+          let st2 = know(st, c, x - 1 - c.nc_r, x + 1 + c.nc_r, y - c.nc_drop - 1, y + c.nc_step + c.nc_h, z - 1 - c.nc_r, z + 1 + c.nc_r, x - 1 - c.nc_r, y - c.nc_drop - 1, z - 1 - c.nc_r)
+          let nearer = gi != -2 && hh < bh
+          go(c, st2, hp2, hn - 1, cap, g, par, gx, gz, gi, want, i, 0, y + c.nc_step, left - 1, used + 1, if nearer do i else best end, if nearer do hh else bh end)
+        end end end end
+      end
+    else if dir >= 8 do go(c, st, hp, hn, cap, g, par, gx, gz, gi, want, -1, 0, 0, left, used, best, bh)
+    else
+      let x = x_of(c, cur)
+      let y = y_of(c, cur)
+      let z = z_of(c, cur)
+      let low = if dir >= 4 do y else y - c.nc_drop end
+      if y2 < low do go(c, st, hp, hn, cap, g, par, gx, gz, gi, want, cur, dir + 1, if dir + 1 >= 4 do y else y + c.nc_step end, left, used, best, bh)
+      else
+        let dx = dir_x(dir)
+        let dz = dir_z(dir)
+        let s = move(st, c, x, y, z, dx, dz, y2)
+        if s == 0 do go(c, st, hp, hn, cap, g, par, gx, gz, gi, want, cur, dir, y2 - 1, left, used, best, bh)
+        else
+          let j = idx(c, x + dx, y2, z + dz)
+          let ng = NativeArray.get_i32(g, cur) + cost(dx, dz, y2 - y, s)
+          if j < 0 || hn >= cap do go(c, st, hp, hn, cap, g, par, gx, gz, gi, want, cur, dir, y2 - 1, left, used, best, bh)
+          else if ng >= NativeArray.get_i32(g, j) do go(c, st, hp, hn, cap, g, par, gx, gz, gi, want, cur, dir, y2 - 1, left, used, best, bh)
+          else
+            let f = ng + (if gi == -2 do 0 else octile(x + dx, z + dz, gx, gz) end)
+            go(c, st, up(hp, hn, f * cell_bits() + j), hn + 1, cap, NativeArray.set_i32(g, j, ng), NativeArray.set_i32(par, j, cur), gx, gz, gi, want, cur, dir, y2 - 1, left, used, best, bh)
+          end end
+        end
+      end
+    end end
+  end
+
+  pfn trace(c : Cx, par : NativeI32Arr, i : Int, acc : List((Int, Int, Int))) : List((Int, Int, Int)) do
+    if i < 0 do acc else trace(c, par, NativeArray.get_i32(par, i), Cons((x_of(c, i), y_of(c, i), z_of(c, i)), acc)) end
+  end
+
+  pfn lo(a : Int, b : Int) : Int do if a < b do a else b end end
+  pfn hi(a : Int, b : Int) : Int do if a > b do a else b end end
+  -- the window's low edge and size on one axis: the two places and [margin] about them, at most [cap] cells, kept about the start when that is too many
+  pfn span(s : Int, g : Int, margin : Int, cap : Int) : (Int, Int) do
+    let a = lo(s, g) - margin
+    let b = hi(s, g) + margin
+    if b - a + 1 <= cap do (a, b - a + 1)
+    else if g >= s do (s - margin, cap)
+    else (s + margin - cap + 1, cap) end end
+  end
+
+  pfn run(w : Strata.World.World, k : Walker, sx : Int, sy : Int, sz : Int, gx : Int, gy : Int, gz : Int, goal : Bool, want : Int -> Int -> Int -> Bool, budget : Int) : Path do
+    match k do
+      NvWalker(r, h, stp, drp, sw) ->
+        match span(sx, gx, 12 + r, 96) do
+          (x0, nx) ->
+            match span(sz, gz, 12 + r, 96) do
+              (z0, nz) ->
+                match span(sy, gy, 8 + h, 40) do
+                  (y0, ny) ->
+                    let c = { nc_w: w, nc_reg: Wn.registry(w), nc_x0: x0, nc_y0: y0, nc_z0: z0, nc_nx: nx, nc_ny: ny, nc_nz: nz, nc_r: r, nc_h: h, nc_step: stp, nc_drop: drp, nc_swim: sw }
+                    let n = nx * ny * nz
+                    let si = idx(c, sx, sy, sz)
+                    let st = know(NativeArray.make_u8(n, 0), c, sx - r, sx + r, sy - 1, sy + h, sz - r, sz + r, sx - r, sy - 1, sz - r)
+                    if si < 0 || budget <= 0 do NvPath(Nil, false, 0)
+                    else if stand(st, c, sx, sy, sz) == 0 do NvPath(Nil, false, 0)
+                    else
+                      let cap = 12 * budget + 16
+                      let gi = if goal do idx(c, gx, gy, gz) else -2 end
+                      let g0 = NativeArray.set_i32(NativeArray.make_i32(n, 1000000000), si, 0)
+                      let h0 = if goal do octile(sx, sz, gx, gz) else 0 end
+                      let hp = NativeArray.set_int(NativeArray.make_int(cap, 0), 0, h0 * cell_bits() + si)
+                      match go(c, st, hp, 1, cap, g0, NativeArray.make_i32(n, -1), gx, gz, gi, want, -1, 0, 0, budget, 0, si, 1000000000) do
+                        NvRes(par, last, ok, used) -> NvPath(trace(c, par, last, Nil), ok, used)
+                      end
+                    end end
+                end
+            end
+        end
+    end
+  end
+
+  doc "The way for the walker from the cell (sx, sy, sz) to (gx, gy, gz), both cells that hold it (see `foot`), through the world as loaded now: an A* search that expands at most [budget] cells, inside a window of at most 96 by 40 by 96 cells about the two. The path is arrived when it ends at the goal; else it ends at the cell reached that is nearest the goal over the ground (which may be the start), and a game walks it and asks again. Empty when the start does not hold the walker. A straight step costs 10, a diagonal 14, a cell climbed 5 more, a cell dropped 1 more, and a move into water three times as much."
+  fn find(w : Strata.World.World, k : Walker, sx : Int, sy : Int, sz : Int, gx : Int, gy : Int, gz : Int, budget : Int) : Path do
+    run(w, k, sx, sy, sz, gx, gy, gz, true, fn (_x, _y, _z) -> false, budget)
+  end
+
+  doc "The cheapest way for the walker from (sx, sy, sz) to any cell [want] accepts (the start itself, if it does), expanding at most [budget] cells outward from the start, never farther than 12 cells across or 8 up or down. Arrived when such a cell was found; else the path is the start alone. Empty when the start does not hold the walker."
+  fn nearest(w : Strata.World.World, k : Walker, sx : Int, sy : Int, sz : Int, want : Int -> Int -> Int -> Bool, budget : Int) : Path do
+    run(w, k, sx, sy, sz, sx, sy, sz, false, want, budget)
+  end
+
+  -- ── Straight lines ───────────────────────────────────────────────────────
+  -- the height the walker stands at after one straight step from (x, y, z): the same level first, then up, then down; -1000000 when it cannot take it
+  pfn step_w(w : Strata.World.World, k : Walker, x : Int, y : Int, z : Int, dx : Int, dz : Int, i : Int) : Int do
+    match k do
+      NvWalker(r, h, stp, drp, _) ->
+        -- i: 0 level, 1..stp up, then 1..drp down
+        if i > stp + drp do -1000000
+        else
+          let y2 = if i == 0 do y else if i <= stp do y + i else y - (i - stp) end end
+          let ok = if standing(w, k, x + dx, y2, z + dz) == 0 do false
+            else if y2 > y do clear_w(w, r, x, z, y + h, y2 + h - 1, 0)
+            else if y2 < y do clear_w(w, r, x + dx, z + dz, y2 + h, y + h - 1, 0)
+            else true end end end
+          if ok do y2 else step_w(w, k, x, y, z, dx, dz, i + 1) end
+        end
+    end
+  end
+
+  -- Walk the cells the line from (ax, az) to (bx, bz) passes through, one straight step at a time. [e] is the line's error term in
+  -- units of the two spans: each step is along the axis the line is further behind on.
+  pfn line(w : Strata.World.World, k : Walker, x : Int, y : Int, z : Int, bx : Int, by0 : Int, bz : Int, sx : Int, sz : Int, nx : Int, nz : Int, ix : Int, iz : Int) : Bool do
+    if ix >= nx && iz >= nz do y == by0
+    else
+      -- the next crossing: x when (1 + 2 ix) * nz < (1 + 2 iz) * nx
+      let along_x = if ix >= nx do false else if iz >= nz do true else (1 + 2 * ix) * nz < (1 + 2 * iz) * nx end end
+      let dx = if along_x do sx else 0 end
+      let dz = if along_x do 0 else sz end
+      let y2 = step_w(w, k, x, y, z, dx, dz, 0)
+      if y2 < -999999 do false
+      else line(w, k, x + dx, y2, z + dz, bx, by0, bz, sx, sz, nx, nz, if along_x do ix + 1 else ix end, if along_x do iz else iz + 1 end) end
+    end
+  end
+
+  doc "Can the walker go straight from cell (ax, ay, az), where it stands, to (bx, by, bz)? True when every cell the line between their columns passes through holds it, each reached from the last by a step it can take (level, up within its step, down within its drop), and the walk ends at height by. The line is walked a straight step at a time, so it squeezes between no two blocks that touch at a corner."
+  fn straight(w : Strata.World.World, k : Walker, ax : Int, ay : Int, az : Int, bx : Int, by0 : Int, bz : Int) : Bool do
+    if standing(w, k, ax, ay, az) == 0 do false
+    else line(w, k, ax, ay, az, bx, by0, bz, if bx >= ax do 1 else -1 end, if bz >= az do 1 else -1 end, absi(bx - ax), absi(bz - az), 0, 0) end
+  end
+
+  -- from anchor [a], the last of the next [look] cells it can walk straight to, and what follows it; the first is always taken
+  pfn reach_go(w : Strata.World.World, k : Walker, a : (Int, Int, Int), rest : List((Int, Int, Int)), look : Int, best : (Int, Int, Int), after : List((Int, Int, Int))) : ((Int, Int, Int), List((Int, Int, Int))) do
+    match rest do
+      Nil -> (best, after)
+      Cons(p, t) ->
+        if look <= 0 do (best, after)
+        else
+          match a do
+            (ax, ay, az) ->
+              match p do
+                (px, py, pz) -> if straight(w, k, ax, ay, az, px, py, pz) do reach_go(w, k, a, t, look - 1, p, t) else reach_go(w, k, a, t, look - 1, best, after) end
+              end
+          end
+        end
+    end
+  end
+  pfn smooth_go(w : Strata.World.World, k : Walker, a : (Int, Int, Int), rest : List((Int, Int, Int)), look : Int, acc : List((Int, Int, Int))) : List((Int, Int, Int)) do
+    match rest do
+      Nil -> List.reverse(acc)
+      Cons(p, t) ->
+        match reach_go(w, k, a, t, look - 1, p, t) do
+          (b, after) -> smooth_go(w, k, b, after, look, Cons(b, acc))
+        end
+    end
+  end
+
+  doc "The path's corners: its cells with every one dropped that the walker need not visit, because it can walk straight (`straight`) from the corner before to a later cell. Each corner looks at most [look] cells ahead. The first and last cells are kept; a path of fewer than three cells is returned as it is."
+  fn smooth(w : Strata.World.World, k : Walker, cs : List((Int, Int, Int)), look : Int) : List((Int, Int, Int)) do
+    match cs do
+      Nil -> Nil
+      Cons(a, rest) -> smooth_go(w, k, a, rest, at_least(look, 1), Cons(a, Nil))
+    end
+  end
+
+  -- ── For a mover ──────────────────────────────────────────────────────────
+  doc "The cells as points in metres at [scale] metres a voxel: the middle of each cell's floor."
+  fn points(cs : List((Int, Int, Int)), scale : Float) : List((Float, Float, Float)) do
+    List.map(cs, fn p -> match p do (x, y, z) -> ((int_to_float(x) +. 0.5) *. scale, int_to_float(y) *. scale, (int_to_float(z) +. 0.5) *. scale) end)
+  end
+
+  doc "The points still ahead of a mover at (x, z): the leading points within [reach] metres of it over the ground are dropped, the last point never."
+  fn advance(ps : List((Float, Float, Float)), x : Float, z : Float, reach : Float) : List((Float, Float, Float)) do
+    match ps do
+      Nil -> Nil
+      Cons((px, _, pz), rest) ->
+        if List.is_empty(rest) do ps
+        else if (px -. x) *. (px -. x) +. (pz -. z) *. (pz -. z) <= reach *. reach do advance(rest, x, z, reach)
+        else ps end end
+    end
+  end
+
+  doc "The cell holding the point (x, y, z) in metres at [scale] metres a voxel."
+  fn cell_of(scale : Float, x : Float, y : Float, z : Float) : (Int, Int, Int) do
+    (float_to_int(Math.floor(x /. scale)), float_to_int(Math.floor(y /. scale +. 0.0001)), float_to_int(Math.floor(z /. scale)))
+  end
+end

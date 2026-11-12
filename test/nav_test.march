@@ -1,0 +1,317 @@
+-- Nav: where a walker stands, and the way between two such places. Worlds
+-- are stone below y = 0 and air above; block ids: 1 stone, 2..9 water (one
+-- eighth .. full), 10 stone again.
+mod Strata.Test.Nav do
+
+  needs IO.Clock      -- charged to every test module once any uses Check.all (GAPS S3)
+  needs IO.Process
+  import Test
+  alias Strata.Nav as Nv
+  alias Strata.World as Wv
+  alias Strata.Edit as Ev
+  alias Strata.Coord as Cv
+  alias Strata.Chunk as Chv
+  alias Strata.Blocks as Bv
+
+  pfn flat() : Strata.Terrain.Gen do
+    Strata.Terrain.gen(fn (k, seed) -> if Cv.ky(k) < 0 do Chv.uniform(1) else Chv.uniform(0) end)
+  end
+  pfn reg() : Strata.Blocks.Registry do
+    match Bv.register(Bv.empty(), Bv.def()) do
+      Ok((r1, _)) ->
+        match Bv.register_fluid(r1, Bv.with_collide(Bv.with_layer(Bv.with_opacity(Bv.def(), Strata.Blocks.SeeThrough), Strata.Blocks.Translucent), false)) do
+          Ok((r2, _)) ->
+            match Bv.register(r2, Bv.def()) do
+              Ok((r3, _)) -> r3
+              Err(_) -> r2
+            end
+          Err(_) -> r1
+        end
+      Err(_) -> Bv.empty()
+    end
+  end
+  pfn load(w : Strata.World.World, cx : Int, cy : Int, cz : Int) : Strata.World.World do
+    let k = Cv.key(cx, cy, cz)
+    Wv.insert(w, k, Strata.Terrain.run(Wv.terrain(w), k, Wv.seed(w)))
+  end
+  -- the 4 x 2 x 4 box of chunks -2..1 across and -1..0 up: voxels -64..63 across, -32..31 up
+  pfn load_box(w : Strata.World.World, i : Int) : Strata.World.World do
+    if i >= 32 do w else load_box(load(w, i % 4 - 2, (i / 4) % 2 - 1, i / 8 - 2), i + 1) end
+  end
+  pfn ground() : Strata.World.World do load_box(Wv.new(reg(), flat(), 7, 1.0), 0) end
+  pfn box(w : Strata.World.World, x0 : Int, y0 : Int, z0 : Int, x1 : Int, y1 : Int, z1 : Int, id : Int) : Strata.World.World do
+    Ev.world(Ev.fill_box(w, x0, y0, z0, x1, y1, z1, id))
+  end
+  -- a fighter: one cell wide, two tall, climbs one, drops three
+  pfn man() : Strata.Nav.Walker do Nv.walker(2, 1, 3) end
+
+  pfn first(cs : List((Int, Int, Int))) : (Int, Int, Int) do
+    match cs do
+      Cons(p, _) -> p
+      Nil -> (-999, -999, -999)
+    end
+  end
+  pfn is_at(o : Option((Int, Int, Int)), x : Int, y : Int, z : Int) : Bool do
+    match o do
+      Some(p) -> same(p, x, y, z)
+      None -> false
+    end
+  end
+  pfn point_is(ps : List((Float, Float, Float)), x : Float, y : Float, z : Float) : Bool do
+    match ps do
+      Cons((px, py, pz), _) -> px == x && py == y && pz == z
+      Nil -> false
+    end
+  end
+  pfn last(cs : List((Int, Int, Int))) : (Int, Int, Int) do
+    match cs do
+      Nil -> (-999, -999, -999)
+      Cons(p, Nil) -> p
+      Cons(_, t) -> last(t)
+    end
+  end
+  pfn same(a : (Int, Int, Int), x : Int, y : Int, z : Int) : Bool do match a do (ax, ay, az) -> ax == x && ay == y && az == z end end
+  pfn absi(v : Int) : Int do if v < 0 do 0 - v else v end end
+
+  -- every cell holds the walker, and each is one move from the last: a neighbour (a diagonal only at one level), no higher than the step, no lower than the drop
+  pfn legal(w : Strata.World.World, k : Strata.Nav.Walker, cs : List((Int, Int, Int))) : Bool do
+    match cs do
+      Nil -> true
+      Cons((x, y, z), Nil) -> Nv.standing(w, k, x, y, z) != 0
+      Cons((x, y, z), Cons((x2, y2, z2), t)) ->
+        let dx = absi(x2 - x)
+        let dz = absi(z2 - z)
+        let near = dx <= 1 && dz <= 1 && dx + dz >= 1
+        let level = if dx + dz == 2 do y2 == y else y2 - y <= Nv.step(k) && y - y2 <= Nv.drop(k) end
+        if Nv.standing(w, k, x, y, z) != 0 && near && level do legal(w, k, Cons((x2, y2, z2), t)) else false end
+    end
+  end
+  pfn any_at_x(cs : List((Int, Int, Int)), wx : Int) : Bool do
+    match cs do
+      Nil -> false
+      Cons((x, _, _), t) -> if x == wx do true else any_at_x(t, wx) end
+    end
+  end
+  pfn afloat(w : Strata.World.World, k : Strata.Nav.Walker, cs : List((Int, Int, Int)), n : Int) : Int do
+    match cs do
+      Nil -> n
+      Cons((x, y, z), t) -> afloat(w, k, t, if Nv.standing(w, k, x, y, z) == 2 do n + 1 else n end)
+    end
+  end
+  -- each corner can be walked straight to from the one before
+  pfn joined(w : Strata.World.World, k : Strata.Nav.Walker, cs : List((Int, Int, Int))) : Bool do
+    match cs do
+      Cons((x, y, z), Cons((x2, y2, z2), t)) -> if Nv.straight(w, k, x, y, z, x2, y2, z2) do joined(w, k, Cons((x2, y2, z2), t)) else false end
+      _ -> true
+    end
+  end
+
+  pfn lcg(s : Int) : Int do int_and(s * 1103515245 + 12345, 2147483647) end
+  -- [n] stone blocks, one or two high, strewn over -10..10 (never on the two corners a walk goes between)
+  pfn strew(w : Strata.World.World, s : Int, n : Int) : Strata.World.World do
+    if n <= 0 do w
+    else
+      let a = lcg(s)
+      let b = lcg(a)
+      let c = lcg(b)
+      let x = a / 64 % 21 - 10
+      let z = b / 64 % 21 - 10
+      let on_corner = (x == -10 && z == -10) || (x == 10 && z == 10)
+      strew(if on_corner do w else box(w, x, 0, z, x, c / 64 % 2, z, 1) end, c, n - 1)
+    end
+  end
+  pfn walks_ok(seed : Int, n : Int) : Bool do
+    if n <= 0 do true
+    else
+      let w = strew(ground(), seed, 120)
+      let p = Nv.find(w, man(), -10, 0, -10, 10, 0, 10, 4000)
+      let cs = Nv.cells(p)
+      let good = legal(w, man(), cs) && same(first(cs), -10, 0, -10) && (!Nv.arrived(p) || same(last(cs), 10, 0, 10)) && joined(w, man(), Nv.smooth(w, man(), cs, 16))
+      if good do walks_ok(lcg(seed + n), n - 1) else false end
+    end
+  end
+
+  describe "Nav.standing and foot" do
+    test "a walker stands on a floor with its body free, and nowhere else" do
+      let w = ground()
+      Test.assert_eq_int(Nv.standing(w, man(), 0, 0, 0), 1, "on the ground")
+      Test.assert_eq_int(Nv.standing(w, man(), 0, 1, 0), 0, "not in the air")
+      Test.assert_eq_int(Nv.standing(w, man(), 0, -1, 0), 0, "not in the stone")
+      Test.assert_eq_int(Nv.standing(box(w, 0, 1, 0, 0, 1, 0, 1), man(), 0, 0, 0), 0, "not with a block at its head")
+      Test.assert_eq_int(Nv.standing(box(w, 0, 2, 0, 0, 2, 0, 1), man(), 0, 0, 0), 1, "a block over its head is no matter")
+      Test.assert_eq_int(Nv.standing(w, man(), 0, 40, 0), 0, "nothing stands in a chunk not loaded")
+    end
+
+    test "a wide walker needs its whole footprint free" do
+      let w = box(ground(), 1, 0, 0, 1, 0, 0, 1)
+      let wide = Nv.with_radius(man(), 1)
+      Test.assert_eq_int(Nv.standing(w, man(), 0, 0, 0), 1, "one cell wide stands beside the block")
+      Test.assert_eq_int(Nv.standing(w, wide, 0, 0, 0), 0, "three cells wide does not")
+      Test.assert_eq_int(Nv.standing(w, wide, -1, 0, 0), 1, "but does a cell away")
+    end
+
+    test "a walker made from metres rounds its box up and its step down" do
+      let k = Nv.walker_of(1.0, 0.3, 1.8, 1.05, 3.5)
+      Test.assert_eq_int(Nv.radius(k), 0, "0.6 m across is one cell at 1 m")
+      Test.assert_eq_int(Nv.height(k), 2, "1.8 m is two cells")
+      Test.assert_eq_int(Nv.step(k), 1, "1.05 m climbs one")
+      Test.assert_eq_int(Nv.drop(k), 3, "3.5 m drops three")
+      let q = Nv.walker_of(0.25, 0.3, 1.8, 0.55, 3.0)
+      Test.assert_eq_int(Nv.radius(q), 1, "0.6 m across is three cells at 0.25 m")
+      Test.assert_eq_int(Nv.height(q), 8, "1.8 m is eight cells")
+      Test.assert_eq_int(Nv.step(q), 2, "0.55 m climbs two")
+    end
+
+    test "foot finds the nearest standable cell of a column" do
+      let w = ground()
+      Test.assert_true(is_at(Nv.foot(w, man(), 2, 3, 2, 4), 2, 0, 2), "the ground under a place in the air")
+      Test.assert_true(Option.is_none(Nv.foot(w, man(), 2, 3, 2, 2)), "none within two cells")
+      Test.assert_true(is_at(Nv.foot(box(w, 2, 0, 2, 2, 0, 2, 1), man(), 2, 0, 2, 2), 2, 1, 2), "the top of a block from inside it")
+    end
+  end
+
+  describe "Nav.find" do
+    test "over open ground the way is the shortest, start and goal included" do
+      let w = ground()
+      let p = Nv.find(w, man(), 0, 0, 0, 5, 0, 3, 500)
+      Test.assert_true(Nv.arrived(p), "arrived")
+      Test.assert_eq_int(Nv.length(p), 6, "five moves, three of them diagonal")
+      Test.assert_true(same(first(Nv.cells(p)), 0, 0, 0), "from the start")
+      Test.assert_true(same(last(Nv.cells(p)), 5, 0, 3), "to the goal")
+      Test.assert_true(legal(w, man(), Nv.cells(p)), "every move is one a walker makes")
+      Test.assert_eq_int(Nv.length(Nv.find(w, man(), 4, 0, 4, 4, 0, 4, 500)), 1, "to where it stands is the one cell")
+    end
+
+    test "round a wall too tall to climb" do
+      let w = box(ground(), 3, 0, -5, 3, 2, 5, 1)
+      let p = Nv.find(w, man(), 0, 0, 0, 6, 0, 0, 2000)
+      Test.assert_true(Nv.arrived(p), "arrived")
+      Test.assert_true(legal(w, man(), Nv.cells(p)), "by legal moves")
+      Test.assert_true(Nv.length(p) > 12, "the long way: past an end of the wall")
+      Test.assert_true(same(last(Nv.cells(p)), 6, 0, 0), "to the goal")
+    end
+
+    test "over a wall one cell high, and not over one two high" do
+      let low = box(ground(), 3, 0, -40, 3, 0, 40, 1)
+      let p = Nv.find(low, man(), 0, 0, 0, 6, 0, 0, 2000)
+      Test.assert_true(Nv.arrived(p), "one high: arrived")
+      Test.assert_eq_int(Nv.length(p), 7, "straight over it")
+      Test.assert_true(any_at_x(Nv.cells(p), 3), "by its top")
+      let high = box(ground(), 3, 0, -40, 3, 1, 40, 1)
+      let q = Nv.find(high, man(), 0, 0, 0, 6, 0, 0, 2000)
+      Test.assert_true(!Nv.arrived(q), "two high and longer than the window: no way")
+      Test.assert_true(match last(Nv.cells(q)) do (x, _, _) -> x == 2 end, "the path ends against the wall, as near as it got")
+      Test.assert_true(legal(high, man(), Nv.cells(q)), "and is legal as far as it goes")
+    end
+
+    test "a low roof stops a climb, and two blocks touching at a corner are not squeezed between" do
+      -- a step up at x = 2 with a roof over where the walker would rise from
+      let roofed = box(box(ground(), 2, 0, -40, 2, 0, 40, 1), 1, 2, -40, 1, 2, 40, 1)
+      Test.assert_true(!Nv.arrived(Nv.find(roofed, man(), 0, 0, 0, 4, 0, 0, 2000)), "no rise under a roof")
+      -- blocks at (1, 0) and (0, 1): the diagonal from (0, 0) to (1, 1) is shut, and so are both straight ways
+      let pinch = box(box(ground(), 1, 0, 0, 1, 2, 0, 1), 0, 0, 1, 0, 2, 1, 1)
+      let p = Nv.find(pinch, man(), 0, 0, 0, 1, 0, 1, 2000)
+      Test.assert_true(Nv.arrived(p), "it arrives")
+      Test.assert_true(Nv.length(p) > 2, "but not by the diagonal")
+      Test.assert_true(legal(pinch, man(), Nv.cells(p)), "by legal moves")
+    end
+
+    test "into a pit within its drop, and not out of one deeper than its step" do
+      let w = box(ground(), 4, -3, 4, 6, -1, 6, 0)
+      let p = Nv.find(w, man(), 0, 0, 0, 5, -3, 5, 2000)
+      Test.assert_true(Nv.arrived(p), "down three")
+      Test.assert_true(legal(w, man(), Nv.cells(p)), "by legal moves")
+      let q = Nv.find(w, man(), 5, -3, 5, 0, 0, 0, 2000)
+      Test.assert_true(!Nv.arrived(q), "and no way back up")
+      Test.assert_true(Nv.expanded(q) <= 9, "having looked at the pit's nine cells and no more")
+      -- a stair of one-cell steps out of it
+      let stair = box(box(w, 4, -3, 4, 4, -3, 4, 1), 4, -3, 5, 4, -2, 5, 1)
+      Test.assert_true(Nv.arrived(Nv.find(stair, man(), 5, -3, 5, 0, 0, 0, 2000)), "out by a stair")
+    end
+
+    test "the budget bounds the work, and the path then ends nearer the goal" do
+      let w = ground()
+      let p = Nv.find(w, man(), 0, 0, 0, 30, 0, 0, 8)
+      Test.assert_true(!Nv.arrived(p), "not arrived on eight cells")
+      Test.assert_true(Nv.expanded(p) <= 8, "eight expanded at most")
+      Test.assert_true(match last(Nv.cells(p)) do (x, _, _) -> x >= 5 end, "but well on the way")
+      Test.assert_eq_int(Nv.length(Nv.find(w, man(), 0, 3, 0, 5, 0, 0, 500)), 0, "from a cell that holds no walker there is no path")
+    end
+
+    test "a goal past the window or in a chunk not loaded is walked toward" do
+      let w = ground()
+      let p = Nv.find(w, man(), 0, 0, 0, 200, 0, 0, 20000)
+      Test.assert_true(!Nv.arrived(p), "200 cells off is not reached")
+      Test.assert_true(match last(Nv.cells(p)) do (x, _, _) -> x >= 60 end, "the path runs to the edge of the loaded ground")
+    end
+
+    test "water: a walker that does not swim goes no deeper than its chest; one that does floats across" do
+      -- a channel 4 wide and 2 deep, full of water, from one edge of the window to the other
+      let w = box(box(ground(), 3, -2, -60, 6, -1, 60, 0), 3, -2, -60, 6, -1, 60, 9)
+      Test.assert_true(!Nv.arrived(Nv.find(w, man(), 0, 0, 0, 9, 0, 0, 20000)), "no way for a walker")
+      let swimmer = Nv.with_swim(man(), true)
+      let p = Nv.find(w, swimmer, 0, 0, 0, 9, 0, 0, 20000)
+      Test.assert_true(Nv.arrived(p), "a swimmer arrives")
+      Test.assert_eq_int(afloat(w, swimmer, Nv.cells(p), 0), 4, "afloat for the channel's four cells")
+      Test.assert_true(legal(w, swimmer, Nv.cells(p)), "by legal moves")
+      -- a ford one deep beside it is walked, though longer
+      let ford = box(w, 3, -2, 2, 6, -2, 3, 1)
+      let q = Nv.find(ford, swimmer, 0, 0, 0, 9, 0, 0, 20000)
+      Test.assert_true(Nv.arrived(q), "with a ford: arrived")
+      Test.assert_eq_int(afloat(ford, swimmer, Nv.cells(q), 0), 0, "the swimmer wades the ford rather than swim")
+      Test.assert_true(Nv.arrived(Nv.find(ford, man(), 0, 0, 0, 9, 0, 0, 20000)), "and the walker crosses by it")
+    end
+
+    test "any strewn field: the path is legal, starts at the start, and its corners join" do
+      Test.assert_true(walks_ok(11, 12), "twelve fields of 120 blocks")
+    end
+  end
+
+  describe "Nav.nearest" do
+    test "the cheapest way to a cell the game accepts" do
+      let w = box(ground(), 2, 0, -3, 2, 2, 3, 1)
+      let p = Nv.nearest(w, man(), 0, 0, 0, fn (x, _y, _z) -> x >= 4, 2000)
+      Test.assert_true(Nv.arrived(p), "found")
+      Test.assert_true(match last(Nv.cells(p)) do (x, _, _) -> x == 4 end, "the first such cell, past the wall")
+      Test.assert_true(legal(w, man(), Nv.cells(p)), "by legal moves")
+      Test.assert_eq_int(Nv.length(Nv.nearest(w, man(), 0, 0, 0, fn (_x, _y, _z) -> true, 2000)), 1, "the start, when it will do")
+      let q = Nv.nearest(w, man(), 0, 0, 0, fn (_x, _y, _z) -> false, 50)
+      Test.assert_true(!Nv.arrived(q) && Nv.length(q) == 1, "none accepted: not arrived, and the start alone")
+    end
+  end
+
+  describe "Nav.straight, smooth, points and advance" do
+    test "straight over open ground and steps, not through a wall or off a cliff too deep" do
+      let w = ground()
+      Test.assert_true(Nv.straight(w, man(), 0, 0, 0, 7, 0, 3), "open ground")
+      Test.assert_true(!Nv.straight(box(w, 3, 0, -5, 3, 2, 5, 1), man(), 0, 0, 0, 7, 0, 3), "not through a wall")
+      Test.assert_true(Nv.straight(box(w, 3, 0, -5, 9, 0, 5, 1), man(), 0, 0, 0, 7, 1, 3), "up a step onto a terrace")
+      Test.assert_true(!Nv.straight(box(w, 3, 0, -5, 9, 0, 5, 1), man(), 0, 0, 0, 7, 0, 3), "which is not the ground it covers")
+      Test.assert_true(!Nv.straight(box(w, 3, -4, -5, 9, -1, 5, 0), man(), 0, 0, 0, 7, -4, 3), "not down four")
+      Test.assert_true(!Nv.straight(w, man(), 0, 1, 0, 7, 0, 3), "not from a cell that holds no walker")
+    end
+
+    test "smooth leaves the corners: two over open ground, more round a wall" do
+      let w = ground()
+      let open = Nv.smooth(w, man(), Nv.cells(Nv.find(w, man(), 0, 0, 0, 9, 0, 4, 2000)), 32)
+      Test.assert_eq_int(List.length(open), 2, "start and goal")
+      let walled = box(ground(), 3, 0, -5, 3, 2, 5, 1)
+      let cs = Nv.cells(Nv.find(walled, man(), 0, 0, 0, 6, 0, 0, 2000))
+      let sm = Nv.smooth(walled, man(), cs, 32)
+      Test.assert_true(List.length(sm) >= 3 && List.length(sm) <= 6, "a few corners at the wall's end")
+      Test.assert_true(same(first(sm), 0, 0, 0) && same(last(sm), 6, 0, 0), "start and goal kept")
+      Test.assert_true(joined(walled, man(), sm), "each corner straight from the last")
+      Test.assert_eq_int(List.length(Nv.smooth(w, man(), Nil, 8)), 0, "nothing of nothing")
+    end
+
+    test "points are the middles of the cells' floors in metres; advance drops those reached" do
+      let ps = Nv.points(Cons((0, 0, 0), Cons((4, 1, -2), Cons((8, 1, -2), Nil))), 0.5)
+      Test.assert_true(point_is(ps, 0.25, 0.0, 0.25), "the first")
+      Test.assert_true(point_is(List.drop(ps, 1), 2.25, 0.5, -0.75), "the second")
+      Test.assert_eq_int(List.length(Nv.advance(ps, 0.3, 0.3, 0.4)), 2, "at the first: two left")
+      Test.assert_eq_int(List.length(Nv.advance(ps, 1.0, 1.0, 0.4)), 3, "short of it: all three")
+      Test.assert_eq_int(List.length(Nv.advance(List.drop(ps, 2), 4.25, -0.75, 0.4)), 1, "the last point is never dropped")
+      Test.assert_true(match Nv.cell_of(0.5, 2.25, 0.5, -0.75) do (x, y, z) -> x == 4 && y == 1 && z == -2 end, "and a point's cell")
+    end
+  end
+end
