@@ -1,0 +1,984 @@
+-- entcheck — Strata's entity checks, run against the entity kernel through
+-- Strata.Entities, headless (no window, no GPU).
+--
+--   ENTCHECK_SCENE=name ./entcheck
+--
+-- prints "scene name: ok", or the failure and exits 1. scripts/ent_check.sh
+-- builds it and runs every scene.
+mod Entcheck do
+
+  needs IO
+  needs IO.Process
+  needs IO.Foreign
+  needs Ent
+
+  alias Strata.Entities as En
+  alias Strata.Ffi.Ent as Ech
+
+  pfn fail(msg : String) : Int do
+    println(msg)
+    1
+  end
+  pfn report(name : String, failures : Int) : Int do
+    if failures == 0 do
+      println("scene " ++ name ++ ": ok")
+      0
+    else
+      println("scene " ++ name ++ ": FAILED")
+      1
+    end
+  end
+  pfn check(ok : Bool, msg : String) : Int do if ok do 0 else fail("  not so: " ++ msg) end end
+
+  pfn refused(e : Strata.Entities.Entities) : Int do match En.stats(e) do (_, _, _, r) -> r end end
+  pfn live(e : Strata.Entities.Entities) : Int do match En.stats(e) do (n, _, _, _) -> n end end
+  pfn reason(e : Strata.Entities.Entities) : Int do float_to_int(En.stat(e, 6)) end
+  pfn row_of(id : Int) : Int do int_and(id, 1048575) end
+
+  -- the Task 1 kind: a flyer with 3 float and 2 int slots (or as given)
+  pfn flyer(fslots : Int, islots : Int) : Strata.Entities.Kind do
+    En.with_slots(En.with_mover(En.kind(), En.flying(), 0.25, 0.5, 0.25, 0.5, 9.8), fslots, islots)
+  end
+  -- a world of [capacity] with the stream radius 52 chunks of 3.2 m: a seen cap of 160 m
+  pfn world(kinds : List(Strata.Entities.Kind), capacity : Int) : Strata.Entities.Entities do En.open(kinds, capacity, 128, 52, 3.2, 0.1) end
+
+  pfn slots_zero(e : Strata.Entities.Entities, id : Int, n : Int) : Bool do
+    if n >= 8 do true
+    else if En.float(e, id, n) != 0.0 do false
+    else if En.int(e, id, n) != 0 do false
+    else slots_zero(e, id, n + 1) end end end
+  end
+
+  -- add and read: a new entity's position, facing, velocity, age, kind and slots
+  pfn add_and_read(e0 : Strata.Entities.Entities) : (Strata.Entities.Entities, Int) do
+    let (e, id) = En.add(e0, 0, 1.5, 2.5, 3.5, 0.25)
+    let bad = check(id >= 0, "an entity is added")
+      + check(En.alive(e, id), "it is alive")
+      + check(live(e) == 1, "one is live")
+      + check(En.position(e, id) == (1.5, 2.5, 3.5), "its position reads (1.5, 2.5, 3.5)")
+      + check(En.facing(e, id) == 0.25, "its facing reads 0.25")
+      + check(En.velocity(e, id) == (0.0, 0.0, 0.0), "its velocity reads 0")
+      + check(En.age(e, id) == 0.0, "its age reads 0")
+      + check(En.kind_of(e, id) == 0, "its kind is 0")
+      + check(slots_zero(e, id, 0), "every slot reads 0")
+    (En.remove(e, id), bad)
+  end
+
+  -- slots: set and read within the kind's counts; past them refused and read 0
+  pfn slots(e0 : Strata.Entities.Entities) : (Strata.Entities.Entities, Int) do
+    let (e1, id) = En.add(e0, 0, 0.0, 0.0, 0.0, 0.0)
+    let e2 = En.set_float(e1, id, 2, 7.5)
+    let r0 = refused(e2)
+    let e3 = En.set_float(e2, id, 3, 1.0)
+    let bad = check(En.float(e3, id, 2) == 7.5, "float slot 2 set to 7.5 reads 7.5")
+      + check(refused(e3) == r0 + 1 && reason(e3) == 8, "float slot 3 on a 3-slot kind is refused")
+      + check(En.float(e3, id, 3) == 0.0, "... and reads 0")
+    let e4 = En.set_int(e3, id, 1, -42)
+    let e5 = En.set_int(e4, id, 2, 5)
+    let bad2 = check(En.int(e5, id, 1) == -42, "int slot 1 set to -42 reads -42")
+      + check(En.int(e5, id, 2) == 0 && reason(e5) == 8, "int slot 2 on a 2-slot kind is refused and reads 0")
+    let e6 = En.set_facing(En.set_velocity(e5, id, 1.0, -2.0, 0.5), id, 1.25)
+    let r1 = refused(e6)
+    let e7 = En.set_position(e6, id, 1.0, float_nan(), 3.0)
+    let bad3 = check(En.velocity(e7, id) == (1.0, -2.0, 0.5), "a velocity set reads back")
+      + check(En.facing(e7, id) == 1.25, "a facing set reads back")
+      + check(refused(e7) == r1 + 1 && reason(e7) == 3, "a NaN position is refused, for its value")
+      + check(En.position(e7, id) == (0.0, 0.0, 0.0), "... and the position is unchanged")
+    (En.remove(e7, id), bad + bad2 + bad3)
+  end
+
+  -- stale ids: A removed, B takes its row; A reads defaults and every write through it is counted
+  pfn stale(e0 : Strata.Entities.Entities) : (Strata.Entities.Entities, Int) do
+    let (e1, a) = En.add(e0, 0, 1.0, 2.0, 3.0, 0.5)
+    let e2 = En.remove(En.set_int(En.set_float(e1, a, 0, 4.0), a, 0, 9), a)
+    let (e3, b) = En.add(e2, 0, 10.0, 20.0, 30.0, 0.0)
+    let bad = check(b >= 0 && b != a, "B is added with a new id")
+      + check(row_of(b) == row_of(a), "B takes A's row")
+      + check(!En.alive(e3, a), "A is not alive")
+      + check(En.alive(e3, b), "B is alive")
+    let r0 = refused(e3)
+    let e4 = En.set_position(e3, a, 7.0, 7.0, 7.0)
+    let bad2 = check(En.position(e4, b) == (10.0, 20.0, 30.0), "a set through A leaves B's position unchanged")
+      + check(refused(e4) == r0 + 1, "... and is counted once")
+      + check(reason(e4) == 2, "... for a dead id")
+      + check(En.position(e4, a) == (0.0, 0.0, 0.0), "A's position reads 0")
+      + check(En.facing(e4, a) == 0.0, "A's facing reads 0")
+      + check(En.kind_of(e4, a) == -1, "A's kind reads -1")
+      + check(En.float(e4, a, 0) == 0.0 && En.int(e4, a, 0) == 0, "A's slots read 0")
+    let r1 = refused(e4)
+    let e5 = En.remove(En.set_velocity(En.set_int(En.set_float(e4, a, 0, 1.0), a, 0, 1), a, 1.0, 1.0, 1.0), a)
+    let bad3 = check(refused(e5) == r1 + 4, "slot, velocity and remove calls through A are each counted")
+      + check(slots_zero(e5, b, 0), "B starts with A's slots cleared")
+      + check(!En.alive(e5, -1) && !En.alive(e5, 0) && !En.alive(e5, int_shl(1, 61)), "made-up ids are not alive")
+    (En.remove(e5, b), bad + bad2 + bad3)
+  end
+
+  -- basics: open, add and read, slots, stale ids, refused kinds, close
+  pfn basics_scene() : Int do
+    let e = world([flyer(3, 2)], 16)
+    let ok = check(En.is_open(e), "a world of one valid kind opens")
+    let (e1, b1) = add_and_read(e)
+    let (e2, b2) = slots(e1)
+    let (e3, b3) = stale(e2)
+    let b4 = check(live(e3) == 0, "everything added was removed")
+      + check(!En.is_open(En.close(e3)), "closed")
+    let nine = world([flyer(3, 2), En.with_slots(En.kind(), 9, 0)], 16)
+    let b5 = check(!En.is_open(nine), "a world with a 9-slot kind is not open")
+    let flat = world([En.with_mover(En.kind(), En.walking(), 0.3, 0.0, 0.3, 0.5, 9.8)], 16)
+    let b6 = check(!En.is_open(flat), "a world with a walker of no height is not open")
+    let far = world([En.with_seen_distance(flyer(0, 0), 161.0)], 16)
+    let b7 = check(!En.is_open(far), "a world with a kind seen past the seen cap (160 m) is not open")
+    let near = world([En.with_seen_distance(flyer(0, 0), 160.0)], 16)
+    let b8 = check(En.is_open(near), "a kind seen at the seen cap is accepted")
+      + check(!En.is_open(En.close(near)), "closed")
+    report("basics", ok + b1 + b2 + b3 + b4 + b5 + b6 + b7 + b8)
+  end
+
+  pfn add_go(e : Strata.Entities.Entities, i : Int, n : Int) : Strata.Entities.Entities do
+    if i >= n do e
+    else
+      let (e1, _id) = En.add(e, 0, int_to_float(i), 0.5, 0.0 -. int_to_float(i), 0.0)
+      add_go(e1, i + 1, n)
+    end
+  end
+  pfn vel_of(i : Int, axis : Int) : Float do
+    if axis == 0 do int_to_float(i) *. 0.5 else if axis == 1 do 0.0 -. int_to_float(i % 17) *. 0.25 else 1.0 end end
+  end
+  pfn vel_fill(a : NativeF32Arr, i : Int, n : Int) : NativeF32Arr do
+    if i >= 3 * n do a else vel_fill(NativeArray.set_f32(a, i, vel_of(i / 3, i % 3)), i + 1, n) end
+  end
+  pfn same_f32(a : NativeF32Arr, b : NativeF32Arr, i : Int) : Bool do
+    if i >= NativeArray.length_f32(a) do NativeArray.length_f32(a) == NativeArray.length_f32(b)
+    else if i >= NativeArray.length_f32(b) do false
+    else if NativeArray.get_f32(a, i) != NativeArray.get_f32(b, i) do false
+    else same_f32(a, b, i + 1) end end end
+  end
+  -- every entity's own velocity read equals its row of the column
+  pfn each_vel(e : Strata.Entities.Entities, ids : NativeIntArr, want : NativeF32Arr, i : Int) : Bool do
+    if i >= NativeArray.length_int(ids) do true
+    else
+      let (x, y, z) = En.velocity(e, NativeArray.get_int(ids, i))
+      if x == NativeArray.get_f32(want, 3 * i) && y == NativeArray.get_f32(want, 3 * i + 1) && z == NativeArray.get_f32(want, 3 * i + 2) do each_vel(e, ids, want, i + 1) else false end
+    end
+  end
+  pfn pos_ok(p : NativeF32Arr, i : Int, n : Int) : Bool do
+    if i >= n do true
+    else if NativeArray.get_f32(p, 3 * i) != int_to_float(i) || NativeArray.get_f32(p, 3 * i + 1) != 0.5 || NativeArray.get_f32(p, 3 * i + 2) != 0.0 -. int_to_float(i) do false
+    else pos_ok(p, i + 1, n) end end
+  end
+
+  -- columns: 1,000 entities of one kind, the velocity column written in one call and read back equal
+  pfn columns_scene() : Int do
+    let e = add_go(world([flyer(1, 0)], 2048), 0, 1000)
+    let ids = En.each(e, 0)
+    let p = En.column(e, 0, En.col_position())
+    let bad = check(En.is_open(e), "open")
+      + check(NativeArray.length_int(ids) == 1000, "each gives 1,000 ids")
+      + check(NativeArray.length_f32(p) == 3000, "the position column holds 3,000 floats")
+      + check(pos_ok(p, 0, 1000), "... each entity's position, in add order")
+    let v = vel_fill(NativeArray.make_f32(3000, 0.0), 0, 1000)
+    let e1 = En.set_column(e, 0, En.col_velocity(), v)
+    let back = En.column(e1, 0, En.col_velocity())
+    let bad2 = check(same_f32(v, back, 0), "the velocity column reads back equal")
+      + check(each_vel(e1, ids, v, 0), "each entity's velocity is its row of the column")
+      + check(refused(e1) == 0, "nothing refused")
+    let e2 = En.set_column(e1, 0, En.col_velocity(), NativeArray.make_f32(2997, 9.0))
+    let e3 = En.set_column(e2, 0, En.col_facing(), NativeArray.make_f32(1000, 0.75))
+    let bad3 = check(refused(e2) == 1 && reason(e2) == 12, "a column of 999 rows is refused, for its rows")
+      + check(same_f32(v, En.column(e2, 0, En.col_velocity()), 0), "... and writes nothing")
+      + check(En.facing(e3, NativeArray.get_int(ids, 999)) == 0.75, "the facing column writes each row's facing")
+      + check(NativeArray.length_f32(En.column(e3, 0, En.col_float(0))) == 1000, "the float slot 0 column has a float a row")
+      + check(NativeArray.length_f32(En.column(e3, 0, En.col_float(1))) == 0, "a slot past the kind's is no column")
+      + check(NativeArray.length_int(En.each(e3, 1)) == 0, "each of a kind not registered is empty")
+    report("columns", bad + bad2 + bad3 + check(!En.is_open(En.close(e3)), "closed"))
+  end
+
+  -- the Task 1 script's generator: a 32-bit LCG, the top 24 bits
+  pfn rng(s : Int) : Int do int_and(s * 1664525 + 1013904223, 4294967295) end
+  pfn top(s : Int) : Int do s / 256 end
+
+  -- one step of the Task 1 script; state is (world, ids, n, rng state)
+  pfn script_go(e : Strata.Entities.Entities, ids : NativeIntArr, n : Int, s : Int, step : Int) : (Strata.Entities.Entities, Int) do
+    if step >= 1000 do (e, n)
+    else
+      let s1 = rng(s)
+      let r = top(s1) % 10
+      if r < 5 || n == 0 do
+        let s2 = rng(s1)
+        let s3 = rng(s2)
+        let s4 = rng(s3)
+        let s5 = rng(s4)
+        let s6 = rng(s5)
+        let k = if int_and(top(s2), 1) == 1 do 1 else 0 end
+        let (e1, id) = En.add(e, k, int_to_float(top(s3) % 1000) *. 0.1, int_to_float(top(s4) % 100) *. 0.1, int_to_float(top(s5) % 1000) *. 0.1, 0.01 *. int_to_float(top(s6) % 628))
+        if id >= 0 do script_go(e1, NativeArray.set_int(ids, n, id), n + 1, s6, step + 1) else script_go(e1, ids, n, s6, step + 1) end
+      else if r < 8 do
+        let s2 = rng(s1)
+        let s3 = rng(s2)
+        let s4 = rng(s3)
+        let s5 = rng(s4)
+        let s6 = rng(s5)
+        let s7 = rng(s6)
+        let id = NativeArray.get_int(ids, top(s2) % n)
+        let x = int_to_float(top(s3) % 50) *. 0.5
+        let z = 0.25 *. int_to_float(top(s4) % 8)
+        let which = top(s5) % 3
+        let e1 = if which == 0 do En.set_position(e, id, x, -1.0, z) else if which == 1 do En.set_velocity(e, id, x, -1.0, z) else En.set_facing(e, id, x) end end
+        let e2 = En.set_int(En.set_float(e1, id, 0, int_to_float(top(s6) % 100) *. 0.01), id, 0, top(s7) % 1000)
+        script_go(e2, ids, n, s7, step + 1)
+      else
+        let s2 = rng(s1)
+        let i = top(s2) % n
+        let e1 = En.remove(e, NativeArray.get_int(ids, i))
+        script_go(e1, NativeArray.set_int(ids, i, NativeArray.get_int(ids, n - 1)), n - 1, s2, step + 1)
+      end end
+    end
+  end
+
+  -- one run of the script through open and close: (hash, live, refused, hash after one slot changed, live once closed).
+  -- Adds outnumber removes, so the 256 rows fill and later adds are refused, as in the C test.
+  pfn determinism_run() : (Int, Int, Int, Int, Int) do
+    let e0 = world([flyer(3, 2), flyer(1, 1)], 256)
+    let (e1, _n) = script_go(e0, NativeArray.make_int(256, -1), 0, 12345, 0)
+    let h = En.hash(e1)
+    let n = live(e1)
+    let r = refused(e1)
+    let first = NativeArray.get_int(En.each(e1, 0), 0)
+    let e2 = En.set_float(e1, first, 1, En.float(e1, first, 1) +. 1.0)
+    let changed = En.hash(e2)
+    let after = live(En.close(e2))
+    (h, n, r, changed, after)
+  end
+  -- determinism: the Task 1 scripted run twice in one process gives one hash
+  pfn determinism_scene() : Int do
+    let (h1, n1, r1, c1, after1) = determinism_run()
+    let (h2, n2, r2, _c2, after2) = determinism_run()
+    println("  hash " ++ int_to_string(h1) ++ " and " ++ int_to_string(h2) ++ "; " ++ int_to_string(n1) ++ " live, " ++ int_to_string(r1) ++ " adds refused once full")
+    report("determinism", check(h1 == h2, "two runs give one hash")
+      + check(h1 != 0, "the hash is not 0")
+      + check(n1 > 0 && n1 == n2, "the script leaves the same entities live")
+      + check(r1 == r2, "the same calls refused in both runs (adds once the 256 rows are full)")
+      + check(c1 != h1, "changing one slot changes the hash")
+      + check(after1 == 0 && after2 == 0, "none live once closed"))
+  end
+
+  -- every call on world c, which is closed: ignored, or the defaults
+  pfn closed_calls(c : Strata.Entities.Entities, id : Int) : Int do
+    let (c1, id2) = En.add(c, 0, 1.0, 2.0, 3.0, 0.0)
+    let c2 = En.set_facing(En.set_velocity(En.set_position(c1, id, 5.0, 5.0, 5.0), id, 1.0, 1.0, 1.0), id, 1.0)
+    let c3 = En.remove(En.set_int(En.set_float(c2, id, 0, 2.0), id, 0, 3), id)
+    let c4 = En.set_column(c3, 0, En.col_position(), NativeArray.make_f32(3, 1.0))
+    check(!En.is_open(c4), "not open")
+      + check(id2 == -1, "add gives -1")
+      + check(!En.alive(c4, id), "nothing is alive")
+      + check(En.kind_of(c4, id) == -1, "kind_of gives -1")
+      + check(En.position(c4, id) == (0.0, 0.0, 0.0) && En.velocity(c4, id) == (0.0, 0.0, 0.0), "position and velocity read 0")
+      + check(En.facing(c4, id) == 0.0 && En.age(c4, id) == 0.0, "facing and age read 0")
+      + check(En.float(c4, id, 0) == 0.0 && En.int(c4, id, 0) == 0, "slots read 0")
+      + check(NativeArray.length_int(En.each(c4, 0)) == 0, "each is empty")
+      + check(NativeArray.length_f32(En.column(c4, 0, En.col_position())) == 0, "a column is empty")
+      + check(En.hash(c4) == 0, "the hash is 0")
+      + check(En.stats(c4) == (0, 0, 0, 0) && En.stat(c4, 0) == 0.0, "the stats are 0")
+  end
+
+  -- closed: every call on a closed world is ignored or gives the defaults, even with another world open
+  pfn closed_scene() : Int do
+    let (e, id) = En.add(world([flyer(1, 1)], 16), 0, 1.0, 2.0, 3.0, 0.0)
+    let c = En.close(e)
+    let bad = closed_calls(c, id)
+    let (o, oid) = En.add(world([flyer(1, 1)], 16), 0, 4.0, 5.0, 6.0, 0.0)
+    let h = En.hash(o)
+    let bad2 = closed_calls(c, oid)
+      + check(En.alive(o, oid) && En.position(o, oid) == (4.0, 5.0, 6.0), "the open world's entity is untouched by calls on the closed one")
+      + check(live(o) == 1 && refused(o) == 0 && En.hash(o) == h, "... its count, refusals and hash too")
+    let oc = En.close(o)
+    let huge = En.open([flyer(0, 0)], 2000000, 128, 52, 3.2, 0.1)
+    let bad3 = closed_calls(huge, 0) + check(!En.is_open(huge), "a world over 1,048,576 is not open")
+    let dflt = En.open([flyer(0, 0)], 0, 0, 52, 3.2, 0.1)
+    let bad4 = check(En.is_open(dflt), "capacity and bodies 0 take the defaults and open")
+      + check(!En.is_open(En.close(dflt)), "closed")
+      + check(!En.is_open(oc), "the second world closed")
+    report("closed", bad + bad2 + bad3 + bad4)
+  end
+
+  -- ── Blocks: a world built with Strata.Edit ───────────────────────────────
+  -- ids: 1 stone, 2 glass (stops, see-through), 3 a plant (cross: never stops), 4 a ghost (collides false)
+  pfn reg_add(r : Strata.Blocks.Registry, d : Strata.Blocks.Def) : Strata.Blocks.Registry do
+    match Strata.Blocks.register(r, d) do
+      Ok((r2, _)) -> r2
+      Err(_) -> r
+    end
+  end
+  pfn registry() : Strata.Blocks.Registry do
+    let r1 = reg_add(Strata.Blocks.empty(), Strata.Blocks.def())
+    let r2 = reg_add(r1, Strata.Blocks.with_opacity(Strata.Blocks.def(), Strata.Blocks.SeeThrough))
+    let r3 = reg_add(r2, Strata.Blocks.with_style(Strata.Blocks.with_opacity(Strata.Blocks.def(), Strata.Blocks.Clear), Strata.Blocks.Cross))
+    reg_add(r3, Strata.Blocks.with_collide(Strata.Blocks.def(), false))
+  end
+  -- what Strata.Query must stop at to agree with the kernel: collides, and not a cross
+  pfn stops(r : Strata.Blocks.Registry) : Int -> Bool do
+    fn id -> if Strata.Blocks.collides(r, id) do Strata.Blocks.style_index(r, id) != 1 else false end
+  end
+
+  -- chunks x -2..1, y -1..1, z -2..1 of air, loaded, at 0.1 m a voxel: a box 12.8 x 9.6 x 12.8 m
+  pfn air_go(w : Strata.World.World, i : Int) : Strata.World.World do
+    if i >= 48 do w
+    else air_go(Strata.World.insert(w, Strata.Coord.key(i % 4 - 2, (i / 4) % 3 - 1, i / 12 - 2), Strata.Chunk.uniform(0)), i + 1) end
+  end
+  pfn pillars_go(w : Strata.World.World, i : Int) : Strata.World.World do
+    if i >= 40 do w
+    else
+      let h = Strata.Seed.cell(41, 1, i, 0, 0)
+      let px = h % 120 - 60
+      let pz = (h / 128) % 120 - 60
+      let top = (h / 16384) % 50 + 3
+      let id = (h / 1048576) % 4 + 1
+      pillars_go(Strata.Edit.world(Strata.Edit.fill_box(w, px, 0, pz, px + 2, top, pz + 2, id)), i + 1)
+    end
+  end
+  -- flat stone ground under y = 0 (the whole lowest layer, and one voxel more), with 40 pillars of the four blocks
+  pfn ground_world() : Strata.World.World do
+    let w0 = air_go(Strata.World.new(registry(), Strata.Terrain.gen(fn (k, seed) -> Strata.Chunk.uniform(0)), 41, 0.1), 0)
+    let w1 = Strata.Edit.world(Strata.Edit.fill_box(w0, -64, -32, -64, 63, -1, 63, 1))
+    pillars_go(w1, 0)
+  end
+
+  -- one ray: (1 if the two disagree, a hit, a hit on a pillar (voxel y >= 0), a miss, a ray that left the held chunks)
+  pfn ray_one(w : Strata.World.World, stop : Int -> Bool, out : NativeI32Arr, i : Int) : (Int, Int, Int, Int, Int) do
+    let h1 = Strata.Seed.cell(41, 2, i, 0, 0)
+    let h2 = Strata.Seed.next(h1)
+    let h3 = Strata.Seed.next(h2)
+    let h4 = Strata.Seed.next(h3)
+    let h5 = Strata.Seed.next(h4)
+    let h6 = Strata.Seed.next(h5)
+    let h7 = Strata.Seed.next(h6)
+    let ox = 12.0 *. Strata.Seed.unit(h1) -. 6.0
+    let oy = 5.0 *. Strata.Seed.unit(h2) +. 0.05
+    let oz = 12.0 *. Strata.Seed.unit(h3) -. 6.0
+    let dx = 2.0 *. Strata.Seed.unit(h4) -. 1.0
+    let dy = 2.0 *. Strata.Seed.unit(h5) -. 1.0
+    let dz = 2.0 *. Strata.Seed.unit(h6) -. 1.0
+    let max = 15.0 *. Strata.Seed.unit(h7) +. 0.5
+    let want = Strata.Query.raycast(w, ox, oy, oz, dx, dy, dz, max, stop)
+    let got = Ech.ray(ox, oy, oz, dx, dy, dz, max, out)
+    if Strata.Query.is_hit(want) do
+      let same = got >= 0.0 && NativeArray.get_i32(out, 0) == Strata.Query.hit_x(want) && NativeArray.get_i32(out, 1) == Strata.Query.hit_y(want)
+        && NativeArray.get_i32(out, 2) == Strata.Query.hit_z(want) && NativeArray.get_i32(out, 3) == Strata.Query.hit_face(want)
+        && Math.abs(got -. Strata.Query.hit_dist(want)) < 0.0001
+      if same do (0, 1, if Strata.Query.hit_y(want) >= 0 do 1 else 0 end, 0, 0)
+      else (fail("  ray " ++ int_to_string(i) ++ ": Strata.Query hits (" ++ int_to_string(Strata.Query.hit_x(want)) ++ ", " ++ int_to_string(Strata.Query.hit_y(want)) ++ ", " ++ int_to_string(Strata.Query.hit_z(want)) ++ ") face " ++ int_to_string(Strata.Query.hit_face(want)) ++ " at " ++ float_to_string(Strata.Query.hit_dist(want)) ++ "; the kernel answers " ++ float_to_string(got) ++ " (" ++ int_to_string(NativeArray.get_i32(out, 0)) ++ ", " ++ int_to_string(NativeArray.get_i32(out, 1)) ++ ", " ++ int_to_string(NativeArray.get_i32(out, 2)) ++ ") face " ++ int_to_string(NativeArray.get_i32(out, 3))), 0, 0, 0, 0) end
+    else if got == -1.0 do (0, 0, 0, 1, 0)
+    else if got == -2.0 do (0, 0, 0, 0, 1)
+    else (fail("  ray " ++ int_to_string(i) ++ ": Strata.Query misses; the kernel answers " ++ float_to_string(got)), 0, 0, 0, 0) end end end
+  end
+  pfn rays_go(w : Strata.World.World, stop : Int -> Bool, out : NativeI32Arr, i : Int, n : Int, acc : (Int, Int, Int, Int, Int)) : (Int, Int, Int, Int, Int) do
+    if i >= n do acc
+    else
+      let (b, h, p, m, l) = ray_one(w, stop, out, i)
+      let (b0, h0, p0, m0, l0) = acc
+      rays_go(w, stop, out, i + 1, n, (b0 + b, h0 + h, p0 + p, m0 + m, l0 + l))
+    end
+  end
+
+  -- ray: 2,000 seeded rays through flat ground with pillars; the kernel and Strata.Query agree on every one
+  pfn ray_scene() : Int do
+    let w = ground_world()
+    let e = En.blocks_world(world([flyer(0, 0)], 16), w)
+    let (bad, hits, pillar, misses, left) = rays_go(w, stops(Strata.World.registry(w)), NativeArray.make_i32(4, 0), 0, 2000, (0, 0, 0, 0, 0))
+    println("  " ++ int_to_string(hits) ++ " hits (" ++ int_to_string(pillar) ++ " on pillars), " ++ int_to_string(misses) ++ " misses, " ++ int_to_string(left) ++ " left the held chunks")
+    report("ray", bad + check(hits >= 500, "at least 500 of the rays hit")
+      + check(pillar >= 50, "at least 50 of them on a pillar")
+      + check(misses + left >= 100, "at least 100 miss")
+      + check(!En.is_open(En.close(e)), "closed"))
+  end
+
+  -- a glass wall 0.4 m thick, its near face at x = 4.0 m, across the whole box
+  pfn wall_world() : Strata.World.World do
+    let w0 = air_go(Strata.World.new(registry(), Strata.Terrain.gen(fn (k, seed) -> Strata.Chunk.uniform(0)), 41, 0.1), 0)
+    Strata.Edit.world(Strata.Edit.fill_box(w0, 40, -32, -64, 43, 63, 63, 2))
+  end
+  -- 1,000 bullets on a 40 x 25 grid at x = -5 m, each going east at 50 m/s
+  pfn fire_go(e : Strata.Entities.Entities, i : Int) : Strata.Entities.Entities do
+    if i >= 1000 do e
+    else
+      let (e1, id) = En.add(e, 0, -5.0, 0.15 +. int_to_float(i / 40) *. 0.25, -6.0 +. int_to_float(i % 40) *. 0.3, 0.0)
+      fire_go(En.set_velocity(e1, id, 50.0, 0.0, 0.0), i + 1)
+    end
+  end
+  -- (block hits, hits whose block is not the wall's or whose point is not on its face); each hit's
+  -- entity is marked in [seen] (a byte a row), so a second hit by one bullet is counted as wrong too
+  pfn hits_go(evs : List(Strata.Entities.Event), seen : NativeU8Arr, n : Int, wrong : Int) : (NativeU8Arr, Int, Int) do
+    match evs do
+      Nil -> (seen, n, wrong)
+      Cons(v, t) ->
+        if En.ev_code(v) != 2 do hits_go(t, seen, n, wrong)
+        else
+          let (px, _py, _pz) = En.ev_point(v)
+          let (vx, _vy, _vz) = En.ev_voxel(v)
+          let row = row_of(En.ev_a(v))
+          let first = if row < 2048 do NativeArray.get_u8(seen, row) == 0 else false end
+          let ok = first && En.ev_block(v) == 2 && En.ev_face(v) == 3 && vx == 40 && Math.abs(px -. 4.0) < 0.0001
+          let seen2 = if first do NativeArray.set_u8(seen, row, 1) else seen end
+          hits_go(t, seen2, n + 1, if ok do wrong else wrong + 1 end)
+        end
+    end
+  end
+  pfn count_u8(a : NativeU8Arr, i : Int, n : Int) : Int do
+    if i >= NativeArray.length_u8(a) do n else count_u8(a, i + 1, n + NativeArray.get_u8(a, i)) end
+  end
+  pfn volley_go(e : Strata.Entities.Entities, w : Strata.World.World, seen : NativeU8Arr, tick : Int, n : Int, wrong : Int) : (Strata.Entities.Entities, Int, Int, Int) do
+    if tick >= 30 do (e, n, wrong, count_u8(seen, 0, 0))
+    else
+      let e1 = En.step(e, [(0.0, 1.0, 0.0)], 1.0 /. 60.0)
+      let (seen1, n1, w1) = hits_go(En.events(e1, w), seen, n, wrong)
+      volley_go(e1, w, seen1, tick + 1, n1, w1)
+    end
+  end
+  -- every bullet's position, from the position column, on the wall's face (x = 4.0)
+  pfn at_wall(p : NativeF32Arr, i : Int) : Bool do
+    if i >= NativeArray.length_f32(p) / 3 do true
+    else if Math.abs(NativeArray.get_f32(p, 3 * i) -. 4.0) > 0.0001 do false
+    else at_wall(p, i + 1) end end
+  end
+
+  -- bullets: 1,000 flyers fired at a glass wall each report one block hit, of the wall's block
+  pfn bullets_scene() : Int do
+    let w = wall_world()
+    let e0 = En.blocks_world(world([En.with_mover(En.kind(), En.flying(), 0.05, 0.05, 0.05, 0.0, 0.0)], 2048), w)
+    let e1 = fire_go(e0, 0)
+    let (e2, hits, wrong, distinct) = volley_go(e1, w, NativeArray.make_u8(2048, 0), 0, 0, 0)
+    let first = NativeArray.get_int(En.each(e2, 0), 0)
+    let (fx, _fy, _fz) = En.position(e2, first)
+    println("  " ++ int_to_string(hits) ++ " block hits in 30 ticks")
+    report("bullets", check(hits == 1000, "1,000 block hits")
+      + check(distinct == 1000, "from 1,000 different bullets: one hit each")
+      + check(at_wall(En.column(e2, 0, En.col_position()), 0), "every row of the position column is on the wall")
+      + check(wrong == 0, "each of the wall's block (glass, id 2), at voxel x 40, face 3, on x = 4.0 m")
+      + check(Math.abs(fx -. 4.0) < 0.0001 && En.velocity(e2, first) == (0.0, 0.0, 0.0), "a bullet rests on the wall")
+      + check(live(e2) == 1000 && refused(e2) == 0, "all still live, nothing refused")
+      + check(!En.is_open(En.close(e2)), "closed"))
+  end
+
+  -- ── The bullet storm ──────────────────────────────────────────────────────
+  -- An open floor 204.8 m across (chunks x and z -32..31 of 3.2 m: stone at chunk y -1, air at 0 and 1),
+  -- 200 placed targets (kind 1, half 0.5 m) round four emitters 50 m from the centre, and 20,000
+  -- bullets (kind 0, half 0.0625 m, gravity 9.8) fired from them in rings of 64 at 40 m/s.
+  pfn storm_floor(i : Int, n : Int) : Int do
+    if i >= 4096 do n
+    else
+      let cx = i % 64 - 32
+      let cz = i / 64 - 32
+      storm_floor(i + 1, n + Ech.chunk_uniform(cx, -1, cz, 1) + Ech.chunk_uniform(cx, 0, cz, 0) + Ech.chunk_uniform(cx, 1, cz, 0))
+    end
+  end
+  pfn emitter_x(j : Int) : Float do if j == 0 do 50.0 else if j == 1 do -50.0 else 0.0 end end end
+  pfn emitter_z(j : Int) : Float do if j == 2 do 50.0 else if j == 3 do -50.0 else 0.0 end end end
+  -- target i: round emitter i % 4, 4 to 28 m out, 1 m up
+  pfn target_at(i : Int) : (Float, Float, Float) do
+    let h1 = Strata.Seed.cell(43, 3, i, 0, 0)
+    let h2 = Strata.Seed.next(h1)
+    let a = 6.283185307179586 *. Strata.Seed.unit(h1)
+    let r = 4.0 +. 24.0 *. Strata.Seed.unit(h2)
+    (emitter_x(i % 4) +. r *. Math.cos(a), 1.0, emitter_z(i % 4) +. r *. Math.sin(a))
+  end
+  pfn targets_go(e : Strata.Entities.Entities, at : NativeFloatArr, i : Int) : (Strata.Entities.Entities, NativeFloatArr) do
+    if i >= 200 do (e, at)
+    else
+      let (x, y, z) = target_at(i)
+      let (e1, _id) = En.add(e, 1, x, y, z, 0.0)
+      targets_go(e1, NativeArray.set_float(NativeArray.set_float(NativeArray.set_float(at, 3 * i, x), 3 * i + 1, y), 3 * i + 2, z), i + 1)
+    end
+  end
+  -- bullet c: from emitter c % 4, the (c / 4 % 64)th of a ring of 64, each ring turned a little, rising at 1 to 3 m/s
+  pfn bullet_angle(c : Int) : Float do 6.283185307179586 *. int_to_float(c / 4 % 64) /. 64.0 +. 0.37 *. int_to_float(c / 256) end
+  pfn bullet_vel(c : Int, axis : Int) : Float do
+    if axis == 0 do 40.0 *. Math.cos(bullet_angle(c))
+    else if axis == 1 do 1.0 +. 0.5 *. int_to_float(c / 4 % 5)
+    else 40.0 *. Math.sin(bullet_angle(c)) end end
+  end
+  pfn fire_storm(e : Strata.Entities.Entities, c : Int, n : Int) : Strata.Entities.Entities do
+    if n <= 0 do e
+    else
+      let (e1, _id) = En.add(e, 0, emitter_x(c % 4), 2.0, emitter_z(c % 4), 0.0)
+      fire_storm(e1, c + 1, n - 1)
+    end
+  end
+  -- the velocity column with the last n rows (the bullets just added, in add order, from bullet c) set
+  pfn aim_go(v : NativeF32Arr, row : Int, c : Int, n : Int) : NativeF32Arr do
+    if n <= 0 do v
+    else aim_go(NativeArray.set_f32(NativeArray.set_f32(NativeArray.set_f32(v, 3 * row, bullet_vel(c, 0)), 3 * row + 1, bullet_vel(c, 1)), 3 * row + 2, bullet_vel(c, 2)), row + 1, c + 1, n - 1) end
+  end
+  pfn aim(e : Strata.Entities.Entities, c : Int, n : Int) : Strata.Entities.Entities do
+    if n == 0 do e
+    else
+      let v = En.column(e, 0, En.col_velocity())
+      let rows = NativeArray.length_f32(v) / 3
+      En.set_column(e, 0, En.col_velocity(), aim_go(v, rows - n, c, n))
+    end
+  end
+  -- the game's side of a tick: each bullet named in a touch or a block hit removed (once); (world, removed, touches)
+  pfn storm_events(e : Strata.Entities.Entities, evs : List(Strata.Entities.Event), gone : Int, touches : Int) : (Strata.Entities.Entities, Int, Int) do
+    match evs do
+      Nil -> (e, gone, touches)
+      Cons(v, t) ->
+        let code = En.ev_code(v)
+        let t1 = if code == 1 do touches + 1 else touches end
+        if code == 1 || code == 2 do
+          if En.alive(e, En.ev_a(v)) do storm_events(En.remove(e, En.ev_a(v)), t, gone + 1, t1) else storm_events(e, t, gone, t1) end
+        else storm_events(e, t, gone, t1) end
+    end
+  end
+  -- every bullet's position, 3 doubles each, in the order of ids
+  pfn positions_go(e : Strata.Entities.Entities, ids : NativeIntArr, a : NativeFloatArr, i : Int) : NativeFloatArr do
+    if i >= NativeArray.length_int(ids) do a
+    else
+      let (x, y, z) = En.position(e, NativeArray.get_int(ids, i))
+      positions_go(e, ids, NativeArray.set_float(NativeArray.set_float(NativeArray.set_float(a, 3 * i, x), 3 * i + 1, y), 3 * i + 2, z), i + 1)
+    end
+  end
+  pfn lo_of(a : Float, b : Float) : Float do if a < b do a else b end end
+  pfn hi_of(a : Float, b : Float) : Float do if a > b do a else b end end
+  -- does the box bullet i swept over the tick (from [from] to [to], half 0.0625) overlap target j's (half 0.5)?
+  pfn axis_meets(from : NativeFloatArr, to : NativeFloatArr, at : NativeFloatArr, i : Int, j : Int, k : Int) : Bool do
+    let f = NativeArray.get_float(from, 3 * i + k)
+    let p = NativeArray.get_float(to, 3 * i + k)
+    let q = NativeArray.get_float(at, 3 * j + k)
+    if lo_of(f, p) -. 0.0625 < q +. 0.5 do q -. 0.5 < hi_of(f, p) +. 0.0625 else false end
+  end
+  pfn targets_hit(from : NativeFloatArr, to : NativeFloatArr, at : NativeFloatArr, i : Int, j : Int, n : Int) : Int do
+    if j >= 200 do n
+    else
+      let meets = if !axis_meets(from, to, at, i, j, 0) do false else if !axis_meets(from, to, at, i, j, 1) do false else axis_meets(from, to, at, i, j, 2) end end
+      targets_hit(from, to, at, i, j + 1, if meets do n + 1 else n end)
+    end
+  end
+  pfn brute_touches(from : NativeFloatArr, to : NativeFloatArr, at : NativeFloatArr, i : Int, n : Int, acc : Int) : Int do
+    if i >= n do acc else brute_touches(from, to, at, i + 1, n, acc + targets_hit(from, to, at, i, 0, 0)) end
+  end
+  pfn touches_of(evs : List(Strata.Entities.Event), n : Int) : Int do
+    match evs do
+      Nil -> n
+      Cons(v, t) -> touches_of(t, if En.ev_code(v) == 1 do n + 1 else n end)
+    end
+  end
+
+  -- one storm step, timed: (world, bad, seconds)
+  pfn storm_step(e : Strata.Entities.Entities) : (Strata.Entities.Entities, Int, Float) do
+    let t0 = Ech.clock()
+    let e1 = En.step(e, [(0.0, 1.0, 0.0)], 1.0 /. 60.0)
+    (e1, 0, Ech.clock() -. t0)
+  end
+  -- one storm step, timed, its touches checked against a brute force: (world, bad, seconds)
+  pfn storm_checked(e : Strata.Entities.Entities, w : Strata.World.World, at : NativeFloatArr, tick : Int) : (Strata.Entities.Entities, Int, Float) do
+    let ids = En.each(e, 0)
+    let n = NativeArray.length_int(ids)
+    let from = positions_go(e, ids, NativeArray.make_float(3 * n, 0.0), 0)
+    let (e1, _b, secs) = storm_step(e)
+    let to = positions_go(e1, ids, NativeArray.make_float(3 * n, 0.0), 0)
+    let want = brute_touches(from, to, at, 0, n, 0)
+    let got = touches_of(En.events(e1, w), 0)
+    println("  tick " ++ int_to_string(tick) ++ ": " ++ int_to_string(got) ++ " touches, brute force " ++ int_to_string(want) ++ "; " ++ int_to_string(match En.stats(e1) do (_, s, _, _) -> s end) ++ " seen")
+    (e1, check(got == want, "the touch events of tick " ++ int_to_string(tick) ++ " number the brute force's")
+      + check(want > 0, "tick " ++ int_to_string(tick) ++ " has touches")
+      + check(match En.stats(e1) do (l, s, _, _) -> s == l end, "every entity is seen"), secs)
+  end
+
+  -- ticks tick..599: (world, bullets fired, bad, step times in seconds for ticks 200..600, touches in all)
+  pfn storm_go(e : Strata.Entities.Entities, w : Strata.World.World, at : NativeFloatArr, tick : Int, c : Int, bad : Int, times : List(Float), touches : Int) : (Strata.Entities.Entities, Int, Int, List(Float), Int) do
+    if tick > 600 do (e, c, bad, times, touches)
+    else
+      let (e1, bad1, secs) = if tick == 150 || tick == 300 do storm_checked(e, w, at, tick) else storm_step(e) end
+      let (e2, gone, hits) = storm_events(e1, En.events(e1, w), 0, 0)
+      let more = gone + (if tick < 100 do 200 else 0 end)
+      let e3 = aim(fire_storm(e2, c, more), c, more)
+      let bad2 = if tick >= 99 do check(live(e3) == 20200, "20,000 bullets and 200 targets live on tick " ++ int_to_string(tick)) else 0 end
+      let times1 = if tick >= 200 do Cons(secs, times) else times end
+      storm_go(e3, w, at, tick + 1, c + more, bad + bad1 + bad2, times1, touches + hits)
+    end
+  end
+  pfn pick(xs : List(Float), i : Int) : Float do
+    match xs do
+      Nil -> 0.0
+      Cons(h, t) -> if i <= 0 do h else pick(t, i - 1) end
+    end
+  end
+  pfn ms(s : Float) : String do float_to_string(int_to_float(float_round(s *. 100000.0)) /. 100.0) end
+
+  -- one storm: (world, bad, hash after tick 600, median step, worst step, bullets fired, touches)
+  pfn storm_run() : (Strata.Entities.Entities, Int, Int, Float, Float, Int, Int) do
+    let e0 = world([En.with_mover(En.kind(), En.flying(), 0.0625, 0.0625, 0.0625, 0.0, 9.8), En.with_mover(En.kind(), En.placed(), 0.5, 0.5, 0.5, 0.0, 0.0)], 32768)
+    let held = if Ech.block_table(NativeArray.set_u8(NativeArray.make_u8(2, 0), 1, 1)) == 2 do storm_floor(0, 0) else 0 end
+    let (e1, at) = targets_go(En.touching(e0, 0, 1), NativeArray.make_float(600, 0.0), 0)
+    let w = Strata.World.new(registry(), Strata.Terrain.gen(fn (k, seed) -> Strata.Chunk.uniform(0)), 41, 0.1)
+    let (e2, fired, bad, times, touches) = storm_go(e1, w, at, 0, 0, 0, Nil, 0)
+    let sorted = List.sort_by(times, fn (a, b) -> a <= b)
+    let n = List.length(sorted)
+    (e2, bad + check(held == 12288, "the 12,288 floor chunks are held"), En.hash(e2), pick(sorted, n / 2), pick(sorted, n - 1), fired, touches)
+  end
+  pfn remove_go(e : Strata.Entities.Entities, ids : NativeIntArr, i : Int, n : Int) : Strata.Entities.Entities do
+    if i >= n do e else remove_go(En.remove(e, NativeArray.get_int(ids, i)), ids, i + 1, n) end
+  end
+
+  -- storm: 20,000 bullets fired at 200 targets, each touch or block hit replaced; timed over ticks 200 to 600
+  pfn storm_scene() : Int do
+    let (r1, bad1, h1, med1, worst1, fired1, touches1) = storm_run()
+    let c1 = En.close(r1)
+    let (e, bad2, h2, med2, worst2, _fired2, _touches2) = storm_run()
+    println("  run 1: step median " ++ ms(med1) ++ " ms, worst " ++ ms(worst1) ++ " ms over ticks 200 to 600; " ++ int_to_string(fired1) ++ " bullets fired, " ++ int_to_string(touches1) ++ " touches")
+    println("  run 2: step median " ++ ms(med2) ++ " ms, worst " ++ ms(worst2) ++ " ms")
+    let target = NativeArray.get_int(En.each(e, 1), 0)
+    let (tx, ty, tz) = target_at(0)
+    let found = En.near(e, tx, ty, tz, 0.01, En.mask([1]))
+    let (hit, dist) = En.raycast(e, tx, 5.0, tz, 0.0, -1.0, 0.0, 10.0, En.mask([1, 99]))
+    let (miss, _d) = En.raycast(e, tx, 5.0, tz, 0.0, 1.0, 0.0, 10.0, En.mask([1]))
+    let bad3 = check(En.mask([0, 1]) == 3 && En.mask([61]) == int_shl(1, 61) && En.mask([62, -1]) == 0, "mask sets bit k for kind k, 0..61")
+      + check(NativeArray.length_int(found) == 1 && NativeArray.get_int(found, 0) == target, "near at the first target's position names it")
+      + check(hit == target && Math.abs(dist -. 3.5) < 0.000001, "a ray down onto it, bullets masked out, meets its top 3.5 m below")
+      + check(miss == -1, "a ray up from there meets nothing")
+      + check(NativeArray.length_int(En.near(e, 0.0, 1.0, 0.0, 1000.0, En.mask([1]))) == 200, "near with 1 km finds the 200 targets")
+    let ids = En.each(e, 0)
+    let t0 = Ech.clock()
+    let e1 = fire_storm(remove_go(e, ids, 0, 5000), 0, 5000)
+    let t1 = Ech.clock()
+    let e2 = En.step(e1, [(0.0, 1.0, 0.0)], 1.0 /. 60.0)
+    let t2 = Ech.clock()
+    println("  5,000 removed and 5,000 added in " ++ ms(t1 -. t0) ++ " ms; the step after them " ++ ms(t2 -. t1) ++ " ms")
+    report("storm", bad1 + bad2 + bad3 + check(h1 == h2, "two runs give one hash")
+      + check(live(e2) == 20200, "still 20,200 live after the swap")
+      + check(!En.is_open(c1), "the first run closed")
+      + check(!En.is_open(En.close(e2)), "closed"))
+  end
+
+  -- ── The sweep and walking ────────────────────────────────────────────────
+  -- box i of the sweep scene: its size (one of three) and seeded place and move, all inside the held chunks
+  pfn sweep_half(i : Int) : (Float, Float, Float) do
+    if i % 3 == 0 do (0.3, 0.9, 0.3) else if i % 3 == 1 do (0.05, 0.05, 0.05) else (0.45, 0.25, 0.35) end end
+  end
+  pfn bool_f(b : Bool) : Float do if b do 1.0 else 0.0 end end
+  -- one box: (1 if the two disagree by more than 1e-4 voxels (1e-5 m) or on a blocked axis, 1 if they end at the very
+  -- same place, blocked on x, on y, on z)
+  pfn sweep_one(w : Strata.World.World, out : NativeFloatArr, i : Int) : (Int, Int, Int, Int, Int) do
+    let h1 = Strata.Seed.cell(41, 4, i, 0, 0)
+    let h2 = Strata.Seed.next(h1)
+    let h3 = Strata.Seed.next(h2)
+    let h4 = Strata.Seed.next(h3)
+    let h5 = Strata.Seed.next(h4)
+    let h6 = Strata.Seed.next(h5)
+    let x = 8.0 *. Strata.Seed.unit(h1) -. 4.0
+    let y = 3.45 *. Strata.Seed.unit(h2) +. 0.05
+    let z = 8.0 *. Strata.Seed.unit(h3) -. 4.0
+    let dx = 3.0 *. Strata.Seed.unit(h4) -. 1.5
+    let dy = 3.0 *. Strata.Seed.unit(h5) -. 1.5
+    let dz = 3.0 *. Strata.Seed.unit(h6) -. 1.5
+    let (hx, hy, hz) = sweep_half(i)
+    let want = Strata.Query.sweep(w, x, y, z, hx, hy, hz, dx, dy, dz)
+    let got = Ech.sweep(x, y, z, hx, hy, hz, dx, dy, dz, out)
+    let near = Math.abs(NativeArray.get_float(out, 0) -. Strata.Query.swept_x(want)) < 0.00001
+      && Math.abs(NativeArray.get_float(out, 1) -. Strata.Query.swept_y(want)) < 0.00001
+      && Math.abs(NativeArray.get_float(out, 2) -. Strata.Query.swept_z(want)) < 0.00001
+    let exact = NativeArray.get_float(out, 0) == Strata.Query.swept_x(want) && NativeArray.get_float(out, 1) == Strata.Query.swept_y(want)
+      && NativeArray.get_float(out, 2) == Strata.Query.swept_z(want)
+    let bx = bool_f(Strata.Query.blocked_x(want))
+    let by_ = bool_f(Strata.Query.blocked_y(want))
+    let bz = bool_f(Strata.Query.blocked_z(want))
+    let axes = NativeArray.get_float(out, 3) == bx && NativeArray.get_float(out, 4) == by_ && NativeArray.get_float(out, 5) == bz
+    let cx = float_to_int(bx)
+    let cy = float_to_int(by_)
+    let cz = float_to_int(bz)
+    let same = if exact do 1 else 0 end
+    if got == 0 && near && axes do (0, same, cx, cy, cz)
+    else (fail("  box " ++ int_to_string(i) ++ ": Strata.Query ends at (" ++ float_to_string(Strata.Query.swept_x(want)) ++ ", " ++ float_to_string(Strata.Query.swept_y(want)) ++ ", " ++ float_to_string(Strata.Query.swept_z(want)) ++ ") blocked " ++ float_to_string(bx) ++ float_to_string(by_) ++ float_to_string(bz) ++ "; the kernel answers " ++ int_to_string(got) ++ " at (" ++ float_to_string(NativeArray.get_float(out, 0)) ++ ", " ++ float_to_string(NativeArray.get_float(out, 1)) ++ ", " ++ float_to_string(NativeArray.get_float(out, 2)) ++ ") blocked " ++ float_to_string(NativeArray.get_float(out, 3)) ++ float_to_string(NativeArray.get_float(out, 4)) ++ float_to_string(NativeArray.get_float(out, 5))), same, cx, cy, cz) end
+  end
+  pfn sweeps_go(w : Strata.World.World, out : NativeFloatArr, i : Int, n : Int, acc : (Int, Int, Int, Int, Int)) : (Int, Int, Int, Int, Int) do
+    if i >= n do acc
+    else
+      let (b, e, x, y, z) = sweep_one(w, out, i)
+      let (b0, e0, x0, y0, z0) = acc
+      sweeps_go(w, out, i + 1, n, (b0 + b, e0 + e, x0 + x, y0 + y, z0 + z))
+    end
+  end
+
+  -- sweep: 2,000 seeded boxes of three sizes moved through the ray scene's world; the kernel and Strata.Query agree on
+  -- each within 1e-4 voxels and on every blocked axis
+  pfn sweep_scene() : Int do
+    let w = ground_world()
+    let e = En.blocks_world(world([flyer(0, 0)], 16), w)
+    let (bad, same, bx, by_, bz) = sweeps_go(w, NativeArray.make_float(6, 0.0), 0, 2000, (0, 0, 0, 0, 0))
+    println("  blocked on x " ++ int_to_string(bx) ++ ", on y " ++ int_to_string(by_) ++ ", on z " ++ int_to_string(bz) ++ " of 2,000 boxes; " ++ int_to_string(same) ++ " end at the very same place")
+    report("sweep", bad + check(by_ >= 300, "at least 300 boxes stopped on y")
+      + check(bx >= 50 && bz >= 50, "at least 50 each on x and on z")
+      + check(!En.is_open(En.close(e)), "closed"))
+  end
+
+  -- the walk scene's ground: a step 0.5 m high for x -2.0..1.0 m, on it one 0.3 m higher for x -1.0..0.0 m, and a
+  -- pillar 3 m tall at x 2.6..3.0 m, z -0.5..0.5 m, on the flat stone of the ray scene's box
+  pfn walk_world() : Strata.World.World do
+    let w0 = air_go(Strata.World.new(registry(), Strata.Terrain.gen(fn (k, seed) -> Strata.Chunk.uniform(0)), 41, 0.1), 0)
+    let w1 = Strata.Edit.world(Strata.Edit.fill_box(w0, -64, -32, -64, 63, -1, 63, 1))
+    let w2 = Strata.Edit.world(Strata.Edit.fill_box(w1, -20, 0, -30, 9, 4, 30, 1))
+    let w3 = Strata.Edit.world(Strata.Edit.fill_box(w2, -10, 5, -30, -1, 7, 30, 2))
+    tall_go(Strata.Edit.world(Strata.Edit.fill_box(w3, 26, 0, -5, 29, 29, 4, 1)), 0)
+  end
+  -- chunks x -2..1, z -2..1 of stone at y -6..-2 and of air at y 2..6, so a walker near the floor has every chunk
+  -- its setting on the ground reads (16 m up and down) held
+  pfn tall_go(w : Strata.World.World, i : Int) : Strata.World.World do
+    if i >= 160 do w
+    else
+      let cy = (i / 16) % 10
+      let y = if cy < 5 do cy - 6 else cy - 3 end
+      tall_go(Strata.World.insert(w, Strata.Coord.key(i % 4 - 2, y, (i / 4) % 4 - 2), Strata.Chunk.uniform(if y < 0 do 1 else 0 end)), i + 1)
+    end
+  end
+  -- the route: up the steps, down off them, round the pillar
+  pfn walk_route() : List((Float, Float, Float)) do
+    [(-5.0, 0.9, 0.0), (1.8, 0.9, 0.0), (1.8, 0.9, 1.4), (3.8, 0.9, 1.4), (3.8, 0.9, 0.0), (5.0, 0.9, 0.0)]
+  end
+  pfn walkers_go(e : Strata.Entities.Entities, route : Int, i : Int) : Strata.Entities.Entities do
+    if i >= 50 do e
+    else
+      let (e1, id) = En.add(e, 0, -5.6 +. int_to_float(i % 5) *. 0.2, 1.0, -0.8 +. int_to_float(i / 5) *. 0.16, 0.0)
+      walkers_go(En.follow(e1, id, route, 2.0, false), route, i + 1)
+    end
+  end
+  pfn code_count(evs : List(Strata.Entities.Event), code : Int, n : Int) : Int do
+    match evs do
+      Nil -> n
+      Cons(v, t) -> code_count(t, code, if En.ev_code(v) == code do n + 1 else n end)
+    end
+  end
+  -- ticks: (world, route finished events, blocked events)
+  pfn walk_go(e : Strata.Entities.Entities, w : Strata.World.World, tick : Int, fives : Int, eights : Int) : (Strata.Entities.Entities, Int, Int) do
+    if tick >= 900 do (e, fives, eights)
+    else
+      let e1 = En.step(e, [(0.0, 1.0, 0.0)], 1.0 /. 60.0)
+      let evs = En.events(e1, w)
+      walk_go(e1, w, tick + 1, code_count(evs, 5, fives), code_count(evs, 8, eights))
+    end
+  end
+  -- how many walkers stand within 0.3 m of the route's end, grounded
+  pfn arrived(e : Strata.Entities.Entities, ids : NativeIntArr, i : Int, n : Int) : Int do
+    if i >= NativeArray.length_int(ids) do n
+    else
+      let id = NativeArray.get_int(ids, i)
+      let (x, _y, z) = En.position(e, id)
+      let there = Math.sqrt((x -. 5.0) *. (x -. 5.0) +. z *. z) < 0.3 && En.grounded(e, id)
+      arrived(e, ids, i + 1, if there do n + 1 else n end)
+    end
+  end
+  -- one walk: (bad, hash, route finished events, blocked events, arrived)
+  pfn walk_run(w : Strata.World.World) : (Int, Int, Int, Int, Int) do
+    let e0 = En.blocks_world(world([En.with_mover(En.kind(), En.walking(), 0.3, 0.9, 0.3, 0.6, 9.8)], 64), w)
+    let (e1, route) = En.route(e0, walk_route())
+    let e2 = walkers_go(e1, route, 0)
+    let (e3, fives, eights) = walk_go(e2, w, 0, 0, 0)
+    let n = arrived(e3, En.each(e3, 0), 0, 0)
+    let h = En.hash(e3)
+    let bad = check(route >= 0, "the route is made") + check(refused(e3) == 0, "nothing refused")
+      + check(!En.is_open(En.close(e3)), "closed")
+    (bad, h, fives, eights, n)
+  end
+
+  -- walk: 50 walkers follow a route up two steps, off a ledge and round a pillar; all arrive, twice alike
+  pfn walk_scene() : Int do
+    let w = walk_world()
+    let (bad1, h1, fives1, eights1, n1) = walk_run(w)
+    let (bad2, h2, _fives2, _eights2, _n2) = walk_run(w)
+    println("  " ++ int_to_string(n1) ++ " of 50 arrived; " ++ int_to_string(fives1) ++ " route finished, " ++ int_to_string(eights1) ++ " blocked; hash " ++ int_to_string(h1))
+    report("walk", bad1 + bad2 + check(n1 == 50, "all 50 walkers stand at the route's end, grounded")
+      + check(fives1 == 50, "each reports the route finished once")
+      + check(eights1 == 0, "none is blocked on the way")
+      + check(h1 == h2, "two runs give one hash"))
+  end
+
+  -- ── Seen and unseen: the camera jump ─────────────────────────────────────
+  -- A hilly world of 1 m voxels (chunks 32 m on a side) from noise, streamed headless around one focus as demo does:
+  -- stone below the ground's height, air above.
+  pfn jump_noise() : Strata.Noise.Settings do Strata.Noise.settings(0, 3, 2.0, 0.5, 1, 0.0) end
+  pfn jump_height(xm : Float, zm : Float) : Float do
+    40.0 +. 14.0 *. Strata.Noise.sample2(jump_noise(), 77, 0.008, xm, zm) +. 5.0 *. Strata.Noise.sample2(jump_noise(), 78, 0.03, xm, zm)
+  end
+  -- column (wx, wz) is stone for voxel y below this: the ground's top, in metres
+  pfn jump_top(wx : Int, wz : Int) : Int do float_to_int(Math.floor(jump_height(int_to_float(wx) +. 0.5, int_to_float(wz) +. 0.5))) end
+  pfn jump_tops(hs : NativeIntArr, x0 : Int, z0 : Int, i : Int) : NativeIntArr do
+    if i >= 1024 do hs else jump_tops(NativeArray.set_int(hs, i, jump_top(x0 + i % 32, z0 + i / 32)), x0, z0, i + 1) end
+  end
+  pfn jump_span(hs : NativeIntArr, i : Int, lo : Int, hi : Int) : (Int, Int) do
+    if i >= 1024 do (lo, hi)
+    else
+      let h = NativeArray.get_int(hs, i)
+      jump_span(hs, i + 1, if h < lo do h else lo end, if h > hi do h else hi end)
+    end
+  end
+  pfn jump_fill(a : NativeI32Arr, y0 : Int, hs : NativeIntArr, i : Int) : NativeI32Arr do
+    if i >= 32768 do a
+    else
+      let below = y0 + i / 1024 < NativeArray.get_int(hs, i % 32 + 32 * ((i / 32) % 32))
+      jump_fill(if below do NativeArray.set_i32(a, i, 1) else a end, y0, hs, i + 1)
+    end
+  end
+  pfn jump_chunk(k : Strata.Coord.Key) : Strata.Chunk.Chunk do
+    let y0 = 32 * Strata.Coord.ky(k)
+    let hs = jump_tops(NativeArray.make_int(1024, 0), 32 * Strata.Coord.kx(k), 32 * Strata.Coord.kz(k), 0)
+    let (lo, hi) = jump_span(hs, 0, 1000000, -1000000)
+    if y0 >= hi do Strata.Chunk.uniform(0)
+    else if y0 + 32 <= lo do Strata.Chunk.uniform(1)
+    else Strata.Chunk.from_flat(jump_fill(NativeArray.make_i32(32768, 0), y0, hs, 0)) end end
+  end
+
+  -- walker i's route: a 4 m square from a point within 45 m of (300, 0), each corner at the ground's height plus an
+  -- offset: 5 m above it, 2.5 m inside the hill, or 0.3 m above (the box's centre 0.9 m higher still)
+  pfn jump_offset(i : Int) : Float do if i % 3 == 0 do 5.0 else if i % 3 == 1 do -2.5 else 0.3 end end end
+  pfn jump_corner(x : Float, z : Float, off : Float) : (Float, Float, Float) do
+    (x, int_to_float(jump_top(float_to_int(Math.floor(x)), float_to_int(Math.floor(z)))) +. 0.9 +. off, z)
+  end
+  pfn jump_route(i : Int) : List((Float, Float, Float)) do
+    let h1 = Strata.Seed.cell(47, 6, i, 0, 0)
+    let h2 = Strata.Seed.next(h1)
+    let r = 45.0 *. Math.sqrt(Strata.Seed.unit(h1))
+    let a = 6.283185307179586 *. Strata.Seed.unit(h2)
+    let x = 300.0 +. r *. Math.cos(a)
+    let z = r *. Math.sin(a)
+    let off = jump_offset(i)
+    [jump_corner(x, z, off), jump_corner(x +. 4.0, z, off), jump_corner(x +. 4.0, z +. 4.0, off), jump_corner(x, z +. 4.0, off)]
+  end
+  pfn jump_walkers(e : Strata.Entities.Entities, i : Int) : Strata.Entities.Entities do
+    if i >= 500 do e
+    else
+      let pts = jump_route(i)
+      let (e1, route) = En.route(e, pts)
+      let (x, y, z) = match pts do
+        Cons(p, _) -> p
+        Nil -> (0.0, 0.0, 0.0)
+      end
+      let (e2, id) = En.add(e1, 0, x, y, z, 0.0)
+      jump_walkers(En.follow(e2, id, route, 1.5, true), i + 1)
+    end
+  end
+
+  -- one frame as a game runs it: the stream ticked, the kernel's blocks brought up to date, the meshes taken (and
+  -- dropped: nothing draws), one step; (stream, world, the step's seconds)
+  pfn jump_frame(s : Strata.Stream.Stream, e : Strata.Entities.Entities, focus : (Float, Float, Float)) : (Strata.Stream.Stream, Strata.Entities.Entities, Float) do
+    let s1 = Strata.Stream.tick(s)
+    let (e1, s2) = En.blocks(e, s1)
+    let (s3, _meshes) = Strata.Stream.take_meshes(s2)
+    let t0 = Ech.clock()
+    let e2 = En.step(e1, [focus], 1.0 /. 60.0)
+    (s3, e2, Ech.clock() -. t0)
+  end
+  pfn jump_settle(s : Strata.Stream.Stream, e : Strata.Entities.Entities, focus : (Float, Float, Float), n : Int) : (Strata.Stream.Stream, Strata.Entities.Entities, Int) do
+    if n >= 20000 do (s, e, n)
+    else
+      let (s1, e1, _t) = jump_frame(s, e, focus)
+      if Strata.Stream.settled(s1) do (s1, e1, n + 1) else jump_settle(s1, e1, focus, n + 1) end
+    end
+  end
+
+  pfn fl(v : Float) : Int do float_to_int(Math.floor(v)) end
+  -- every voxel the walker's box (half 0.3, 0.9, 0.3) at (x, y, z) overlaps is clear in the kernel's copy
+  pfn box_clear(x : Float, y : Float, z : Float, i : Int) : Bool do
+    let x0 = fl(x -. 0.3)
+    let y0 = fl(y -. 0.9)
+    let z0 = fl(z -. 0.3)
+    let nx = fl(x +. 0.3) - x0 + 1
+    let ny = fl(y +. 0.9) - y0 + 1
+    let nz = fl(z +. 0.3) - z0 + 1
+    if i >= nx * ny * nz do true
+    else if Ech.solid(x0 + i % nx, y0 + (i / nx) % ny, z0 + i / (nx * ny)) != 0 do false
+    else box_clear(x, y, z, i + 1) end end
+  end
+  -- a voxel under the walker's feet (the layer under its box, across the box's width) is solid in the kernel's copy
+  pfn feet_solid(x : Float, y : Float, z : Float, i : Int) : Bool do
+    let x0 = fl(x -. 0.3)
+    let z0 = fl(z -. 0.3)
+    let nx = fl(x +. 0.3) - x0 + 1
+    let nz = fl(z +. 0.3) - z0 + 1
+    if i >= nx * nz do false
+    else if Ech.solid(x0 + i % nx, fl(y -. 0.9 -. 0.5), z0 + i / nx) == 1 do true
+    else feet_solid(x, y, z, i + 1) end end
+  end
+  -- each event 3 (entered view): (entered, entered but not grounded, solid under its feet and clear in its box)
+  pfn jump_entered(e : Strata.Entities.Entities, evs : List(Strata.Entities.Event), n : Int, bad : Int) : (Int, Int) do
+    match evs do
+      Nil -> (n, bad)
+      Cons(v, t) ->
+        if En.ev_code(v) != 3 do jump_entered(e, t, n, bad)
+        else
+          let id = En.ev_a(v)
+          let (x, y, z) = En.position(e, id)
+          let ok = if !En.seen(e, id) do false else if !En.grounded(e, id) do false else if !feet_solid(x, y, z, 0) do false else box_clear(x, y, z, 0) end end end
+          if ok do jump_entered(e, t, n + 1, bad) else jump_entered(e, t, n + 1, bad + fail("  walker " ++ int_to_string(id) ++ " entered view at (" ++ float_to_string(x) ++ ", " ++ float_to_string(y) ++ ", " ++ float_to_string(z) ++ ") not seen, grounded, on solid and clear")) end
+        end
+    end
+  end
+  -- after the jump: frames until 30 past the stream settling; (stream, world, frames, settled at, worst step, total
+  -- step seconds, entered, bad entries)
+  pfn jump_go(s : Strata.Stream.Stream, e : Strata.Entities.Entities, focus : (Float, Float, Float), n : Int, at : Int, worst : Float, total : Float, entered : Int, bad : Int) : (Strata.Stream.Stream, Strata.Entities.Entities, Int, Int, Float, Float, Int, Int) do
+    if n >= 20000 do (s, e, n, at, worst, total, entered, bad)
+    else if at >= 0 && n >= at + 30 do (s, e, n, at, worst, total, entered, bad)
+    else
+      let (s1, e1, secs) = jump_frame(s, e, focus)
+      let (got, wrong) = jump_entered(e1, En.events(e1, Strata.Stream.world(s1)), entered, bad)
+      let at1 = if at < 0 do (if Strata.Stream.settled(s1) do n + 1 else -1 end) else at end
+      jump_go(s1, e1, focus, n + 1, at1, if secs > worst do secs else worst end, total +. secs, got, wrong)
+    end end
+  end
+  -- (within seen distance of the focus, seen, seen with a clear box, grounded)
+  pfn jump_count(e : Strata.Entities.Entities, ids : NativeIntArr, fx : Float, fz : Float, i : Int, acc : (Int, Int, Int, Int)) : (Int, Int, Int, Int) do
+    if i >= NativeArray.length_int(ids) do acc
+    else
+      let id = NativeArray.get_int(ids, i)
+      let (x, y, z) = En.position(e, id)
+      let (a, b, c, d) = acc
+      let near = Math.sqrt((x -. fx) *. (x -. fx) +. (z -. fz) *. (z -. fz)) <= 64.0
+      let seen = En.seen(e, id)
+      let clear = if seen do box_clear(x, y, z, 0) else false end
+      jump_count(e, ids, fx, fz, i + 1, (if near do a + 1 else a end, if seen do b + 1 else b end, if clear do c + 1 else c end, if En.grounded(e, id) do d + 1 else d end))
+    end
+  end
+
+  -- jump: 500 walkers on routes 300 m from the focus, unseen; the focus jumps to them, and within 30 frames of the
+  -- stream settling every one within seen distance is seen, each set down grounded on solid with its box clear
+  pfn jump_scene() : Int do
+    let start = (0.5, int_to_float(jump_top(0, 0)) +. 1.7, 0.5)
+    let w = Strata.World.new(registry(), Strata.Terrain.gen(fn (k, seed) -> jump_chunk(k)), 47, 1.0)
+    let s0 = Strata.Stream.set_focus(Strata.Stream.start(w, Strata.Stream.config(4, 2, 32, 4)), [start])
+    let e0 = jump_walkers(En.open([En.with_mover(En.kind(), En.walking(), 0.3, 0.9, 0.3, 1.1, 9.8)], 1024, 128, 4, 32.0, 1.0), 0)
+    let (s1, e1, n1) = jump_settle(s0, e0, start, 0)
+    let before = match En.stats(e1) do (_, sn, _, _) -> sn end
+    let (fx, fz) = (300.0, 0.0)
+    let focus = (fx, int_to_float(jump_top(300, 0)) +. 1.7, fz)
+    let (s2, e2, n2, at, worst, total, entered, bad) = jump_go(Strata.Stream.set_focus(s1, [focus]), e1, focus, 0, -1, 0.0, 0.0, 0, 0)
+    let (near, seen, clear, grounded) = jump_count(e2, En.each(e2, 0), fx, fz, 0, (0, 0, 0, 0))
+    let load = Env.get_int("ENTCHECK_LOAD", 99)
+    println("  settled round the start in " ++ int_to_string(n1) ++ " frames, " ++ int_to_string(before) ++ " seen; after the jump the stream settled on frame " ++ int_to_string(at) ++ " of " ++ int_to_string(n2))
+    println("  " ++ int_to_string(entered) ++ " entered view; at the end " ++ int_to_string(seen) ++ " of " ++ int_to_string(near) ++ " within seen distance seen, " ++ int_to_string(clear) ++ " with a clear box, " ++ int_to_string(grounded) ++ " grounded")
+    println("  step: worst " ++ ms(worst) ++ " ms, mean " ++ ms(total /. int_to_float(if n2 < 1 do 1 else n2 end)) ++ " ms over " ++ int_to_string(n2) ++ " frames; 8 ms check " ++ (if load < 8 do (if worst <= 0.008 do "met" else "MISSED" end) else "not judged (load " ++ int_to_string(load) ++ ")" end))
+    let timed = if load < 8 do check(worst <= 0.008, "no step over 8 ms") else 0 end
+    Strata.Stream.stop(s2)
+    report("jump", bad + timed + check(before == 0, "the walkers 300 m away are unseen before the jump")
+      + check(at >= 0, "the stream settles after the jump")
+      + check(near == 500, "all 500 walkers are within seen distance of the new focus")
+      + check(seen == near, "within 30 frames of the stream settling every one within seen distance is seen")
+      + check(entered == seen, "each reported event 3 once, set down seen, grounded, on solid with its box clear")
+      + check(clear == seen, "every seen walker's box is clear at the end")
+      + check(!En.is_open(En.close(e2)), "closed"))
+  end
+
+  fn main(_cap : Cap(IO)) : Unit do
+    let name = Env.get("ENTCHECK_SCENE", "")
+    if name == "basics" do process_exit(basics_scene())
+    else if name == "columns" do process_exit(columns_scene())
+    else if name == "determinism" do process_exit(determinism_scene())
+    else if name == "closed" do process_exit(closed_scene())
+    else if name == "ray" do process_exit(ray_scene())
+    else if name == "bullets" do process_exit(bullets_scene())
+    else if name == "storm" do process_exit(storm_scene())
+    else if name == "sweep" do process_exit(sweep_scene())
+    else if name == "walk" do process_exit(walk_scene())
+    else if name == "jump" do process_exit(jump_scene())
+    else
+      println("entcheck: no scene named '" ++ name ++ "' (basics, columns, determinism, closed, ray, bullets, storm, sweep, walk, jump)")
+      process_exit(2)
+    end end end end end end end end end end
+  end
+end

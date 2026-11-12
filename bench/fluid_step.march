@@ -1,0 +1,69 @@
+-- How long fluid steps take with thousands of cells active, built as a
+-- release program by `forge bench`. Prints microseconds a cell-step.
+mod FluidStep do
+  needs IO
+  alias Strata.World as Wc
+  alias Strata.Edit as Ec
+  alias Strata.Coord as Cc
+  alias Strata.Chunk as Chc
+  alias Strata.Blocks as Bc
+  alias Strata.Fluid as Fc
+
+  pfn flat() : Strata.Terrain.Gen do
+    Strata.Terrain.gen(fn (k, seed) -> if Cc.ky(k) < 0 do Chc.uniform(1) else Chc.uniform(0) end)
+  end
+  pfn reg() : Strata.Blocks.Registry do
+    match Bc.register(Bc.empty(), Bc.def()) do
+      Ok((r1, _)) ->
+        match Bc.register_fluid(r1, Bc.with_collide(Bc.with_layer(Bc.with_opacity(Bc.def(), Strata.Blocks.SeeThrough), Strata.Blocks.Translucent), false)) do
+          Ok((r2, _)) -> r2
+          Err(_) -> r1
+        end
+      Err(_) -> Bc.empty()
+    end
+  end
+  pfn load(w : Strata.World.World, i : Int) : Strata.World.World do
+    if i >= 64 do w
+    else
+      let k = Cc.key(i % 4 - 2, (i / 4) % 4 - 2, i / 16 - 2)
+      load(Wc.insert(w, k, Strata.Terrain.run(Wc.terrain(w), k, Wc.seed(w))), i + 1)
+    end
+  end
+  -- water at uneven levels over a 48 x 48 floor: every cell has somewhere to go for many steps
+  -- the floor runs -h..h-1 on x and z
+  pfn uneven(h : Int, x : Int, z : Int, acc : List((Int, Int, Int, Int))) : List((Int, Int, Int, Int)) do
+    if z >= h do acc
+    else if x >= h do uneven(h, 0 - h, z + 1, acc)
+    else uneven(h, x + 1, z, Cons((x, 0, z, 1 + ((x * 3 + z * 5) % 8 + 8) % 8), acc)) end end
+  end
+  pfn wake(f : Strata.Fluid.Fluid, h : Int, x : Int, z : Int) : Strata.Fluid.Fluid do
+    if z >= h do f else if x >= h do wake(f, h, 0 - h, z + 1) else wake(Fc.wake_cell(f, x, 0, z), h, x + 1, z) end end
+  end
+  pfn run(f : Strata.Fluid.Fluid, w : Strata.World.World, n : Int, cells : Int) : Int do
+    if n <= 0 do cells
+    else
+      match Fc.step_world(f, w, Nil) do
+        (f2, o) -> run(f2, Ec.world(o), n - 1, cells + Fc.active_count(f))
+      end
+    end
+  end
+
+  pfn again(f : Strata.Fluid.Fluid, w : Strata.World.World, n : Int, acc : Int) : Int do
+    if n <= 0 do acc else again(f, w, n - 1, acc + run(f, w, 30, 0)) end
+  end
+
+  fn main(_cap : Cap(IO)) : Unit do
+    let w0 = load(Wc.new(reg(), flat(), 7, 1.0), 0)
+    -- FLUID_HALF: half the floor's side; 32 gives 64 x 64 = 4096 cells, the default cap
+    let h = Env.get_int("FLUID_HALF", 24)
+    let walled = Ec.world(Ec.fill_box(w0, 0 - h - 1, 0, 0 - h - 1, h, 2, h, 1))
+    let floor = Ec.world(Ec.fill_box(walled, 0 - h, 0, 0 - h, h - 1, 2, h - 1, 0))
+    let w = Ec.world(Ec.set_many(floor, uneven(h, 0 - h, 0 - h, Nil)))
+    let f = wake(Fc.with_limits(Fc.new(reg(), Cons((2, Fc.flowing()), Nil)), 100000, 16, 4), h, 0 - h, 0 - h)
+    let t0 = System.monotonic_time()
+    let reps = Env.get_int("FLUID_REPS", 1)
+    let cells = again(f, w, reps, 0)
+    let ms = System.monotonic_time() - t0
+    println("fluid step: 30 steps, " ++ int_to_string(cells) ++ " active cell-steps, " ++ int_to_string(ms) ++ " ms, " ++ float_to_string(int_to_float(ms) *. 1000.0 /. int_to_float(if cells > 0 do cells else 1 end)) ++ " us a cell-step")
+  end
+end

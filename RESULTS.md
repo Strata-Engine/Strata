@@ -688,3 +688,65 @@ animcheck/.march/build/release/animcheck` on a quiet machine to judge them.
   - Counting the rig data too (sockets 0.26, part grids 2.51) gives 49.11 MB.
 - **Drawing.** A figure posed every few updates is drawn with its blend
   stretched over that period, one period behind its pose (review fix I1).
+
+# Entities
+
+Measured on the same M3 Max, release builds, headless (`entcheck`). The
+plan trusts a timing only under load 8; every figure here was taken while
+other sessions kept the load far above it, so none is judged.
+
+| scene | median | worst | target | verdict |
+|---|---|---|---|---|
+| storm: 20,000 flying bullets, all seen, one touch pair against 200 targets; `step` over ticks 200 to 600 | 2.47 ms (2.57 in the run before) | 40.2 ms (97.1) | 2 ms | not judged (load 20 to 35) |
+| 5,000 removed and 5,000 added between two ticks, then the step | 1.11 ms for the 10,000 calls from March; 2.76 ms the step after | one run | 1 ms | not judged (load 20 to 35) |
+
+The storm fires its bullets from four emitters 50 m from the centre in rings
+of 64 at 40 m/s; each falls to the floor or meets a target within about a
+second, and the game replaces every bullet named in a touch or a block hit
+(about 350 a tick; 228,518 fired in 601 ticks, 28,973 touches). Its touch
+events equal a brute-force count on ticks 150 (59) and 300 (60), and two runs
+end on one hash.
+
+Where the step goes, from a C bench of a like scene (best of 20 ticks, cc -O2,
+same machine, load about 50): 1.12 ms a tick, of which 0.87 ms is the 20,000
+bullets' rays through the voxel copy (0.25 ms with all unseen, so no rays),
+0.18 ms building the grid and 0.01 ms the touch pairs.
+
+# The fluid step in flat arrays
+
+On branch `cost`. The fluid step's bookkeeping moved from persistent maps
+and lists to native arrays, in March. The rules a cell follows (`decide`,
+`scan`, `share` and the rest) are unchanged.
+
+- The cells a step touches sit in one native array, 12 ints a cell, found
+  by a hash of their position (`Strata.Fluid.Tab`). Offers are chained per
+  target in a second array and settled target by target.
+- The chunks round a step's cells are fetched from the world once a step
+  (`Strata.Fluid.Reader`); every block read went through the world's chunk
+  map before.
+- The cells left active travel between steps as a flat array
+  (`Strata.Fluid.Cells`), not a map.
+- A version in C was written first and measured, then dropped: the user
+  chose to keep the engine in March.
+
+Time per active cell per step, `forge bench fluid`, old and new run in
+turn on a machine with a load average near 30:
+
+| version | 48 x 48 water | 64 x 64 water |
+|---|---|---|
+| maps and lists (before) | 5.6 to 5.9 µs | 6.0 to 6.2 µs |
+| flat arrays (now) | 2.4 to 2.7 µs | 2.5 to 2.7 µs |
+| flat arrays, scans with SIMD | about 3.5 µs | about 3.5 µs |
+| C, measured earlier | 0.8 to 1.0 µs | 0.8 to 1.0 µs |
+
+SIMD was tried on the four sideways scans, one lane a direction. March has
+no gather, so the blocks are still read one at a time; packing the lanes
+cost more than the shared comparisons saved, and it was taken out.
+
+What is left of a step's time is spread: block type lookups, reference
+counting, the planning views. The compiler costs found on the way (array
+reads that are calls, `||` that does not short-circuit) are GAPS S26 to S28;
+a fix to the March compiler is under way apart from this branch.
+
+The viewer steps fluids 30 times a second (`STRATA_FLUID_HZ`), up from
+10, so a dug-out lake drains three times sooner.

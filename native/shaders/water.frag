@@ -10,6 +10,15 @@ layout(location = 5) flat in vec4 v_rot;
 
 layout(location = 0) out vec4 o_color;
 
+// What water remembers between frames (see strata_vk.c, whist and wdist):
+// last frame's, read; this frame's, written. rgb the mirror colour, a the
+// sun's visibility; and the view depth of the surface they belong to.
+layout(set = 0, binding = 28, rgba16f) uniform readonly image2D wh_prev;
+layout(set = 0, binding = 29, r32f) uniform readonly image2D wd_prev;
+layout(set = 0, binding = 30, rgba16f) uniform writeonly image2D wh_now;
+layout(set = 0, binding = 31, r32f) uniform writeonly image2D wd_now;
+layout(std430, set = 0, binding = 21) readonly buffer Movers { vec4 boxes[]; } movers;
+
 void main() {
     uint tex = v_w1 & 65535u;
     if (tex >= uint(u.misc.z)) tex = 0u;
@@ -37,11 +46,40 @@ void main() {
         o_color = vec4(tonemap(fogged(seen, v_world)), 0.95);
         return;
     }
-    // one ray at the sun's centre: translucent surfaces keep no memory between frames
-    float sun_vis = u.light.x >= 2.0 ? sun_visible(v_world / u.eye.w, n, u.sun.xyz) : 1.0;
+    // What this surface point had last frame, if it was on screen and is the
+    // same surface (the same distance from that frame's eye). A pixel with a
+    // memory traces one frame in four, in 8-pixel blocks that take turns, as
+    // the light pass does; one without traces now. An edit or a moving body
+    // near it makes it trace every frame until things settle.
+    bool memory = u.water2.y > 0.5;
+    ivec2 px = ivec2(gl_FragCoord.xy);
+    int frame = int(u.light.z);
+    vec3 at = v_world / u.eye.w;
+    float view_depth = (u.vp * vec4(v_world, 1.0)).w;
+    bool have = false;
+    vec4 old = vec4(0.0);
+    if (memory && u.vol.w > 0) {
+        vec4 pc = u.prev_vp * vec4(v_world, 1.0);
+        ivec2 size = imageSize(wd_prev);
+        ivec2 pp = ivec2(vec2(pc.x / pc.w * 0.5 + 0.5, 0.5 - pc.y / pc.w * 0.5) * vec2(size));
+        if (pc.w > 0.0 && all(greaterThanEqual(pp, ivec2(0))) && all(lessThan(pp, size))) {
+            float od = imageLoad(wd_prev, pp).r;
+            if (od > 0.0 && abs(od - pc.w) < 0.02 * pc.w + 0.05) { have = true; old = imageLoad(wh_prev, pp); }
+        }
+    }
+    bool settling = u.vol.w <= 2 || u.edit_lo.w > 0.5 && all(greaterThan(at, u.edit_lo.xyz - 32.0)) && all(lessThan(at, u.edit_hi.xyz + 32.0));
+    // the moving bodies' boxes, then the traced figures' (shadow and glow): any of them unsettles the remembered sun and mirror
+    for (int b = 0; b < u.bodies.x && b < 144; b++)
+        if (all(greaterThan(at, movers.boxes[2 * b].xyz)) && all(lessThan(at, movers.boxes[2 * b + 1].xyz))) settling = true;
+    bool now = !have || settling || (((px.x >> 3) & 1) + 2 * ((px.y >> 3) & 1)) == (frame & 3);
+    // one ray at the sun's centre
+    float sun_mem = u.light.x < 2.0 ? 1.0 : (now ? sun_visible(at, n, u.sun.xyz) : old.a);
+    // figures move every frame: their shadow is never remembered
+    float sun_vis = sun_mem;
     if (u.fshadow.x > 0.5 && sun_vis > 0.0) sun_vis = min(sun_vis, fig_shadow(v_world, n));
     vec3 col = base.rgb * (u.sun_color.rgb * max(dot(n, u.sun.xyz), 0.0) * sun_vis + sky_flat(n));
     float alpha = base.a;
+    vec3 mirror = vec3(0.0);
     if (u.light.x >= 3.0) {
         uint cls = (v_w1 >> 24) & 255u;
         float rough = float(class_roughness(cls)) / 255.0;
@@ -56,10 +94,14 @@ void main() {
                 m = normalize(m + 0.010 * vec3(sin(q.x * 2.3 + t * 1.3) + sin(q.y * 1.1 - t * 0.9), 0.0, sin(q.y * 2.9 + t * 1.6) + sin(q.x * 0.7 + t * 1.1)));
             }
             float share = mirror_share(m, toward_eye, 0.03) * (1.0 - rough);
-            if (u.sun_color.w > 0.5) col = mix(col, reflected(v_world / u.eye.w + sign(dot(n, toward_eye)) * n * 0.02, mirror_dir(toward_eye, m, sign(dot(n, toward_eye)) * n), int(floor(v_world.y / u.eye.w - 0.001))), share);
+            if (u.sun_color.w > 0.5) {
+                mirror = now ? reflected(at + sign(dot(n, toward_eye)) * n * 0.02, mirror_dir(toward_eye, m, sign(dot(n, toward_eye)) * n), int(floor(at.y - 0.001))) : old.rgb;
+                col = mix(col, mirror, share);
+            }
             col += sun_highlight(m, toward_eye, rough, sun_vis);
             alpha = mix(alpha, 1.0, share);
         }
     }
+    if (memory) { imageStore(wh_now, px, vec4(mirror, sun_mem)); imageStore(wd_now, px, vec4(view_depth)); }
     o_color = vec4(tonemap(fogged(col, v_world)), alpha);
 }

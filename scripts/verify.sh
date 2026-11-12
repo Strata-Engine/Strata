@@ -9,7 +9,7 @@ run() { # dir, command...
     echo "FAIL: ($d) $*"; tail -40 .verify.log; exit 1
   fi
 }
-for d in . demo viewer soundcheck animcheck; do
+for d in . demo viewer soundcheck animcheck entcheck; do
   [ -f "$d/forge.toml" ] || continue
   run "$d" forge check
   run "$d" forge build --release
@@ -18,17 +18,21 @@ for d in . demo viewer soundcheck animcheck; do
 done
 # C tests, the audio goldens, then the golden images; all need a compiler, the last a GPU
 mkdir -p native/tests/bin
-for t in native/tests/*_test.c; do
+# (*_test.cpp: tests of native/strata_vox.cpp, C++ because ogt_vox.h is;
+# -fno-exceptions keeps them free of the C++ runtime, as in the forge builds)
+for t in native/tests/*_test.c native/tests/*_test.cpp; do
   [ -f "$t" ] || continue
-  b="native/tests/bin/$(basename "$t" .c)"
+  b="native/tests/bin/$(basename "${t%.*}")"
   # the text test links the text module and what it stands on
   extra=""; [ "$(basename "$t")" = "text_test.c" ] && extra="native/strata_text.c -Inative/sheenbidi/Headers -I/opt/homebrew/include/freetype2 -I/opt/homebrew/include/harfbuzz -L/opt/homebrew/lib -lfreetype -lharfbuzz"
-  if ! cc -O1 -Wall -Wextra -Inative -o "$b" "$t" $extra > .verify.log 2>&1 || ! "$b" >> .verify.log 2>&1; then
+  if ! cc -O1 -Wall -Wextra -fno-exceptions -Inative -o "$b" "$t" $extra > .verify.log 2>&1 || ! "$b" >> .verify.log 2>&1; then
     echo "FAIL: $t"; tail -20 .verify.log; exit 1
   fi
 done
 # the animation scenes: figures posed by the C kernel through Strata.Anim, headless
 if ! scripts/anim_check.sh > .verify.log 2>&1; then echo "FAIL: scripts/anim_check.sh"; tail -20 .verify.log; exit 1; fi
+# the entity scenes: entities added, read and written by the C kernel through Strata.Entities, headless
+if ! scripts/ent_check.sh > .verify.log 2>&1; then echo "FAIL: scripts/ent_check.sh"; tail -20 .verify.log; exit 1; fi
 # the audio goldens: rendered in game time, no device opened, nothing played aloud
 if ! scripts/audio_golden.sh > .verify.log 2>&1; then echo "FAIL: scripts/audio_golden.sh"; tail -20 .verify.log; exit 1; fi
 if [ "${STRATA_NO_GPU:-0}" != "1" ]; then
