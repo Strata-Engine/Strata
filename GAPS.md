@@ -298,3 +298,11 @@ assignment `A="1 B=2"`. Three scripted viewer runs lost STRATA_HIDDEN that
 way and opened a window. Workaround: a shell function that lists the
 settings and takes the rest as "$@" (`scripts/combat_check.sh`'s `run`).
 
+## S35: a match with two arms on one line does not parse
+
+`fn slot(o : Option(Int)) : Int do match o do Some(s) -> s _ -> -1 end end`
+is "parse error: I was expecting `end` to close the match here" at the
+second arm (met writing `Strata.Population`'s readers). The same match
+with each arm on its own line parses. A one-line match with one arm
+(`match a do (x, _) -> x end`) is fine. Workaround: put each arm on its own
+line.
