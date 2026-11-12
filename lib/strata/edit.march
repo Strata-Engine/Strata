@@ -237,36 +237,116 @@ mod Strata.Edit do
   end
 
   -- ── Blasts ───────────────────────────────────────────────────────────────
-  -- A crater is a sphere whose radius varies with direction: a voxel at
+  -- A crater is a sphere whose radius varies with direction only: a voxel at
   -- offset (dx, dy, dz) and distance d from the centre is carved when d is
-  -- within the radius times a factor in [0.7, 1.3], hashed from the seed,
-  -- the offset's octant and its ring (floor d), salt 30. So the surface is
-  -- ragged by octant and by ring, never past 1.3 times the radius, and the
-  -- same seed gives the same crater wherever it is.
+  -- within the radius times the direction's factor, in [0.7, 1.3]. The
+  -- factor is hashed (salt 30) per band of the unit direction, 8 bands of
+  -- longitude by 4 of latitude (so each band lies in one octant), and
+  -- blended bilinearly between band centres, so it varies smoothly round
+  -- the crater and never with distance. A crater is star-shaped: a voxel is
+  -- carved only if every voxel on its integer segment to the centre is
+  -- (`blast_segment`), so no shell is left standing between carved voxels.
+  -- Never past 1.3 times the radius; the same seed gives the same crater
+  -- wherever it is.
 
-  doc "The factor in [0.7, 1.3] a blast of [seed] scales its radius by at offset (dx, dy, dz) from its centre."
-  fn blast_factor(seed : Int, dx : Int, dy : Int, dz : Int) : Float do
-    let oct = (if dx >= 0 do 1 else 0 end) + (if dy >= 0 do 2 else 0 end) + (if dz >= 0 do 4 else 0 end)
-    let ring = float_to_int(Math.floor(Math.sqrt(int_to_float(dx * dx + dy * dy + dz * dz))))
-    0.7 +. 0.6 *. Strata.Seed.unit(Strata.Seed.cell(seed, 30, oct, ring, 0))
+  pfn fdiv2(a : Int, b : Int) : Int do if a >= 0 do a / b else 0 - ((b - 1 - a) / b) end end
+
+  doc "Voxel k of the integer segment from a blast's centre to offset (dx, dy, dz), k from 0 (the centre) to n = max(|dx|, |dy|, |dz|) (the offset): each coordinate k / n of the offset's, rounded half up. The segment a crater is star-shaped along."
+  fn blast_segment(dx : Int, dy : Int, dz : Int, k : Int) : (Int, Int, Int) do
+    let n = maxn(dx, dy, dz)
+    if n == 0 do (0, 0, 0)
+    else (fdiv2(2 * k * dx + n, 2 * n), fdiv2(2 * k * dy + n, 2 * n), fdiv2(2 * k * dz + n, 2 * n)) end
+  end
+  pfn absi(v : Int) : Int do if v < 0 do 0 - v else v end end
+  pfn maxn(dx : Int, dy : Int, dz : Int) : Int do hi(absi(dx), hi(absi(dy), absi(dz))) end
+
+  -- band (i, j)'s factor: i longitude 0..7 (wrapping), j latitude 0..3
+  pfn band(seed : Int, i : Int, j : Int) : Float do
+    0.7 +. 0.6 *. Strata.Seed.unit(Strata.Seed.cell(seed, 30, ((i % 8) + 8) % 8, j, 0))
   end
 
-  pfn blast_cells(cx : Int, cy : Int, cz : Int, radius : Int, reach : Int, seed : Int, id : Int, i : Int, acc : List((Int, Int, Int, Int))) : List((Int, Int, Int, Int)) do
+  doc "The factor in [0.7, 1.3] a blast of [seed] scales its radius by in the direction of offset (dx, dy, dz) from its centre: band factors (8 of longitude by 4 of latitude) blended bilinearly between band centres. 1 at the centre itself."
+  fn blast_factor(seed : Int, dx : Int, dy : Int, dz : Int) : Float do
+    let d = Math.sqrt(int_to_float(dx * dx + dy * dy + dz * dz))
+    if d <= 0.0 do 1.0
+    else
+      let lon = Math.atan2(int_to_float(dz), int_to_float(dx)) +. 3.141592653589793
+      let lat = Math.asin(int_to_float(dy) /. d) +. 1.5707963267948966
+      let u = lon /. 6.283185307179586 *. 8.0 -. 0.5
+      let v0 = lat /. 3.141592653589793 *. 4.0 -. 0.5
+      let v = if v0 < 0.0 do 0.0 else if v0 > 3.0 do 3.0 else v0 end end
+      let i = float_to_int(Math.floor(u))
+      let j = lo(float_to_int(Math.floor(v)), 2)
+      let tu = u -. int_to_float(i)
+      let tv = v -. int_to_float(j)
+      let a0 = band(seed, i, j) *. (1.0 -. tu) +. band(seed, i + 1, j) *. tu
+      let a1 = band(seed, i, j + 1) *. (1.0 -. tu) +. band(seed, i + 1, j + 1) *. tu
+      a0 *. (1.0 -. tv) +. a1 *. tv
+    end
+  end
+
+  -- whether offset (dx, dy, dz) lies within the radius times its direction's factor
+  pfn blast_within(seed : Int, radius : Int, dx : Int, dy : Int, dz : Int) : Bool do
+    let r = int_to_float(radius) *. blast_factor(seed, dx, dy, dz)
+    int_to_float(dx * dx + dy * dy + dz * dz) <= r *. r
+  end
+
+  -- the cube's index of offset (dx, dy, dz)
+  pfn cube_i(reach : Int, dx : Int, dy : Int, dz : Int) : Int do
+    let side = 2 * reach + 1
+    (dx + reach) + side * ((dy + reach) + side * (dz + reach))
+  end
+
+  -- every voxel k = 1 .. n - 1 of the segment to (dx, dy, dz) is kept
+  pfn seg_kept(kept : NativeIntArr, reach : Int, dx : Int, dy : Int, dz : Int, k : Int, n : Int) : Bool do
+    if k >= n do true
+    else
+      match blast_segment(dx, dy, dz, k) do
+        (x, y, z) -> if NativeArray.get_int(kept, cube_i(reach, x, y, z)) == 0 do false else seg_kept(kept, reach, dx, dy, dz, k + 1, n) end
+      end
+    end
+  end
+
+  -- Shell n (offsets whose largest coordinate is n), the shells inside it
+  -- settled: an offset is kept when it is within the crater and its whole
+  -- segment to the centre is kept (its segment's voxels lie in inner shells).
+  pfn shell(seed : Int, radius : Int, reach : Int, n : Int, kept : NativeIntArr, i : Int) : NativeIntArr do
+    let side = 2 * reach + 1
+    if i >= side * side * side do kept
+    else
+      let dx = i % side - reach
+      let dy = (i / side) % side - reach
+      let dz = i / (side * side) - reach
+      if maxn(dx, dy, dz) != n do shell(seed, radius, reach, n, kept, i + 1)
+      else
+        let keep = if !blast_within(seed, radius, dx, dy, dz) do false else seg_kept(kept, reach, dx, dy, dz, 1, n) end
+        shell(seed, radius, reach, n, if keep do NativeArray.set_int(kept, i, 1) else kept end, i + 1)
+      end
+    end
+  end
+  pfn shells(seed : Int, radius : Int, reach : Int, n : Int, kept : NativeIntArr) : NativeIntArr do
+    if n > reach do kept else shells(seed, radius, reach, n + 1, shell(seed, radius, reach, n, kept, 0)) end
+  end
+
+  pfn blast_cells(cx : Int, cy : Int, cz : Int, reach : Int, kept : NativeIntArr, id : Int, i : Int, acc : List((Int, Int, Int, Int))) : List((Int, Int, Int, Int)) do
     let side = 2 * reach + 1
     if i >= side * side * side do acc
     else
       let dx = i % side - reach
       let dy = (i / side) % side - reach
       let dz = i / (side * side) - reach
-      let d2 = int_to_float(dx * dx + dy * dy + dz * dz)
-      let r = int_to_float(radius) *. blast_factor(seed, dx, dy, dz)
-      blast_cells(cx, cy, cz, radius, reach, seed, id, i + 1, if d2 <= r *. r do Cons((cx + dx, cy + dy, cz + dz, id), acc) else acc end)
+      blast_cells(cx, cy, cz, reach, kept, id, i + 1, if NativeArray.get_int(kept, i) != 0 do Cons((cx + dx, cy + dy, cz + dz, id), acc) else acc end)
     end
   end
 
-  doc "A crater: every voxel within [radius] of (cx, cy, cz) times the direction's factor (`blast_factor`, 0.7 to 1.3) set to [id]. One Cell change per voxel that changed or was queued; the dirty chunks are those the changed voxels touch. A negative radius is no edit."
+  doc "A crater: every voxel within [radius] of (cx, cy, cz) times its direction's factor (`blast_factor`, 0.7 to 1.3) whose segment to the centre is all within it too, set to [id]: star-shaped, never past 1.3 radii. One Cell change per voxel that changed or was queued; the dirty chunks are those the changed voxels touch. A negative radius is no edit."
   fn blast(w : Strata.World.World, cx : Int, cy : Int, cz : Int, radius : Int, seed : Int, id : Int) : Outcome do
     if radius < 0 do Outcome(w, Nil, Nil, Nil)
-    else set_many(w, blast_cells(cx, cy, cz, radius, (13 * radius + 9) / 10, seed, id, 0, Nil)) end
+    else
+      let reach = (13 * radius + 9) / 10
+      let side = 2 * reach + 1
+      let kept = shells(seed, radius, reach, 0, NativeArray.make_int(side * side * side, 0))
+      set_many(w, blast_cells(cx, cy, cz, reach, kept, id, 0, Nil))
+    end
   end
 end

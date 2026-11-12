@@ -77,7 +77,7 @@ island-cliff:STRATA_SCENE=24 STRATA_LIGHT=4
 island-cave:STRATA_SCENE=25 STRATA_LIGHT=4
 forest-border:STRATA_SCENE=26 STRATA_LIGHT=4
 ruin-slope:STRATA_SCENE=27 STRATA_LIGHT=4
-crater-ruin:STRATA_SCENE=28 STRATA_LIGHT=4 DRAWS=6
+crater-ruin:STRATA_SCENE=28 STRATA_LIGHT=4 STRATA_FRAMES=120
 overview-regenerated:STRATA_SCENE=1 STRATA_REGEN=1 GOLDEN_AS=overview
 '
 # indirect draw calls a frame must issue, whatever the scene holds; a scene

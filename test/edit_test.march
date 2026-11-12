@@ -61,6 +61,41 @@ mod Strata.Test.Edit do
     end
   end
 
+  -- voxel k of the integer segment from the centre to (dx, dy, dz): k / n of each coordinate rounded half up, n the largest |coordinate|
+  pfn fdv(a : Int, b : Int) : Int do if a >= 0 do a / b else 0 - ((b - 1 - a) / b) end end
+  pfn seg_at(dx : Int, dy : Int, dz : Int, k : Int, n : Int) : (Int, Int, Int) do (fdv(2 * k * dx + n, 2 * n), fdv(2 * k * dy + n, 2 * n), fdv(2 * k * dz + n, 2 * n)) end
+  pfn absv(v : Int) : Int do if v < 0 do 0 - v else v end end
+  -- carved voxels in the cube of half-side m about (cx, cy, cz) one of whose segment voxels toward the centre is not carved
+  pfn holes(w : Strata.World.World, cx : Int, cy : Int, cz : Int, m : Int, i : Int, bad : Int) : Int do
+    let side = 2 * m + 1
+    if i >= side * side * side do bad
+    else
+      let dx = i % side - m
+      let dy = (i / side) % side - m
+      let dz = i / (side * side) - m
+      if Wd.get_block(w, cx + dx, cy + dy, cz + dz) != 0 do holes(w, cx, cy, cz, m, i + 1, bad)
+      else
+        let n = if absv(dx) > absv(dy) do (if absv(dx) > absv(dz) do absv(dx) else absv(dz) end) else (if absv(dy) > absv(dz) do absv(dy) else absv(dz) end) end
+        let ok = List.all(List.range(0, n), fn k -> match seg_at(dx, dy, dz, k, n) do (x, y, z) -> Wd.get_block(w, cx + x, cy + y, cz + z) == 0 end)
+        holes(w, cx, cy, cz, m, i + 1, if ok do bad else bad + 1 end)
+      end
+    end
+  end
+  -- the chunks the cells of a blast touch, a cell on a chunk face reaching across it: what its dirty set must be
+  pfn touched(w : Strata.World.World, cx : Int, cy : Int, cz : Int, m : Int) : List(Strata.Coord.Key) do
+    let side = 2 * m + 1
+    List.fold_left(List.range(0, side * side * side), Nil, fn (acc, i) -> touch_one(w, cx + i % side - m, cy + (i / side) % side - m, cz + i / (side * side) - m, acc))
+  end
+  pfn touch_one(w : Strata.World.World, x : Int, y : Int, z : Int, acc : List(Strata.Coord.Key)) : List(Strata.Coord.Key) do
+    if Wd.get_block(w, x, y, z) != 0 do acc
+    else List.fold_left(List.range(0, 27), acc, fn (a2, j) -> add_key(a2, Cd.key_of_voxel(x + j % 3 - 1, y + (j / 3) % 3 - 1, z + j / 9 - 1)))
+  end
+  end
+  pfn add_key(l : List(Strata.Coord.Key), k : Strata.Coord.Key) : List(Strata.Coord.Key) do if has_key(l, k) do l else Cons(k, l) end end
+  pfn same_keys(a : List(Strata.Coord.Key), b : List(Strata.Coord.Key)) : Bool do
+    if List.length(a) != List.length(b) do false else List.all(a, fn k -> has_key(b, k)) end
+  end
+
   describe "Edit.blast" do
     test "a blast on a chunk border dirties exactly the two chunks it touches" do
       let o = Ed.blast(load_box(solid(), 0), 0, 16, 16, 4, 11, 0)
@@ -92,6 +127,23 @@ mod Strata.Test.Edit do
       let ball = carved(Ed.world(Ed.fill_sphere(w, 0, 0, 0, 7, 0)), 0, 0, 0, 12, 0, 0, 0)
       let crater = carved(Ed.world(Ed.blast(w, 0, 0, 0, 7, 11, 0)), 0, 0, 0, 12, 0, 0, 0)
       Test.assert_true(match (ball, crater) do ((n1, _), (n2, _)) -> n1 != n2 end, "a different set of voxels from the sphere")
+    end
+    test "50 craters are star-shaped, within 1.3 radii, and dirty exactly the chunks they touch" do
+      let w = load_box(solid(), 0)
+      let rs = List.map(List.range(0, 50), fn s ->
+        let r = 3 + s % 6
+        let cx = (s * 7) % 23 - 11
+        let cy = (s * 5) % 19 - 9
+        let cz = (s * 3) % 17 - 8
+        let o = Ed.blast(w, cx, cy, cz, r, 100 + s, 0)
+        let w2 = Ed.world(o)
+        let m = (13 * r + 9) / 10 + 1
+        match carved(w2, cx, cy, cz, m, 0, 0, 0) do
+          (cnt, far) -> (holes(w2, cx, cy, cz, m, 0, 0), if cnt > 0 do far * 100 <= r * r * 169 else false end, same_keys(Ed.dirty(o), touched(w2, cx, cy, cz, m)))
+        end)
+      Test.assert_eq_int(List.fold_left(rs, 0, fn (a, t) -> match t do (h, _, _) -> a + h end), 0, "every voxel on a carved voxel's segment to the centre is carved")
+      Test.assert_true(List.all(rs, fn t -> match t do (_, ok, _) -> ok end), "every crater carves something, none past 1.3 radii")
+      Test.assert_true(List.all(rs, fn t -> match t do (_, _, ok) -> ok end), "the dirty set is exactly the chunks the carved voxels touch")
     end
     test "a negative radius is no edit" do
       let o = Ed.blast(load_box(solid(), 0), 0, 0, 0, -1, 11, 0)
