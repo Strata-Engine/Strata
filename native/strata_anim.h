@@ -261,10 +261,15 @@ struct AnWorld {
     int grid_dirty;                                              /* a figure was posed or removed since the grid was built */
     uint32_t *stamp; uint32_t stamp_now;                         /* a figure seen by this query */
     float *scratch;                                              /* AN_PARTS x 12: a pose rebuilt for a query */
+    int32_t *cand;                                               /* capacity: a box query's candidate slots */
+    int nstale;                                                  /* live figures marked dirty: a query with none poses nothing */
+    double scans;                                                /* passes a query made over the figures to pose stale ones (stat 8) */
 };
 typedef struct AnWorld AnWorld;
 
 static inline int an_refuse(AnWorld *w, int reason) { w->refused += 1; w->reason = reason; return -1; }
+/* figure f is stale: changed since its last pose (counted, so a query on a clean world does nothing first) */
+static inline void an_mark(AnWorld *w, AnFig *f) { if (!f->dirty) { f->dirty = 1; w->nstale++; } }
 
 static inline void an_close(AnWorld *w) {
     if (!w) return;
@@ -273,7 +278,7 @@ static inline void an_close(AnWorld *w) {
     free(w->ids); free(w->free_slots); free(w->events); free(w->events_tmp);
     free(w->procs); free(w->proc_free);
     free(w->sockets); free(w->shapes); free(w->shape_of); free(w->brick_index); free(w->bricks);
-    free(w->grid_head); free(w->grid_next); free(w->grid_slot); free(w->big); free(w->stamp); free(w->scratch);
+    free(w->grid_head); free(w->grid_next); free(w->grid_slot); free(w->big); free(w->stamp); free(w->scratch); free(w->cand);
     free(w);
 }
 
@@ -315,10 +320,11 @@ static inline AnWorld *an_open(int capacity) {
     w->big = (int32_t *)malloc((size_t)capacity * sizeof *w->big);
     w->stamp = (uint32_t *)calloc((size_t)capacity, sizeof *w->stamp);
     w->scratch = (float *)calloc(AN_PARTS * 12, sizeof *w->scratch);
+    w->cand = (int32_t *)malloc((size_t)capacity * sizeof *w->cand);
     if (!w->rigs || !w->masks || !w->clips || !w->keys || !w->key_interp || !w->mark_t || !w->mark_tag || !w->figs ||
         !w->mats || !w->ids || !w->free_slots || !w->events || !w->events_tmp || !w->procs || !w->proc_free ||
         !w->sockets || !w->shapes || !w->shape_of || !w->brick_index || !w->bricks || !w->grid_head || !w->grid_next ||
-        !w->grid_slot || !w->big || !w->stamp || !w->scratch) { an_close(w); return NULL; }
+        !w->grid_slot || !w->big || !w->stamp || !w->scratch || !w->cand) { an_close(w); return NULL; }
     for (int i = 0; i < AN_RIGS * AN_PARTS; i++) w->shape_of[i] = -1;
     for (uint32_t i = 0; i < gn; i++) w->grid_head[i] = -1;
     for (int i = 0; i < w->nprocs; i++) w->proc_free[i] = w->nprocs - 1 - i;   /* record 0 handed out first */
@@ -492,21 +498,30 @@ static inline int an_spawn(AnWorld *w, int rig) {
 }
 
 static inline void an_recount(AnWorld *w);
+static inline void an_attach_place(AnWorld *w, AnFig *f);
 static inline void an_unhang(AnFig *f) {   /* no longer attached; it keeps its placement */
     f->att = -1; f->att_socket = 0;
     memset(f->att_pos, 0, sizeof f->att_pos);
     f->att_q[0] = f->att_q[1] = f->att_q[2] = 0; f->att_q[3] = 1;
 }
 
-/* a removed figure's children are detached where they stand */
+/* a removed figure's children are detached at its socket as it stands now
+ * (whether or not a query posed them since the last update) */
 static inline void an_remove(AnWorld *w, int fig) {
     AnFig *f = an_fig(w, fig);
     if (!f) { an_refuse(w, AN_R_FIGURE); return; }
     int slot = (int)(f - w->figs);
     if (w->nattached) {
-        for (int s = 0; s < w->capacity; s++) if (w->figs[s].id >= 0 && w->figs[s].att == slot) an_unhang(&w->figs[s]);
+        for (int s = 0; s < w->capacity; s++) {
+            AnFig *c = &w->figs[s];
+            if (c->id < 0 || c->att != slot) continue;
+            an_attach_place(w, c);
+            an_mark(w, c);
+            an_unhang(c);
+        }
         an_unhang(f);
     }
+    if (f->dirty) { f->dirty = 0; w->nstale--; }
     w->grid_dirty = 1;
     an_id_erase(w, fig);
     for (int i = f->proc; i >= 0; i = w->procs[i].next) w->proc_free[w->nproc_free++] = i;
@@ -524,7 +539,7 @@ static inline void an_place(AnWorld *w, int fig, const float pos[3], const float
     if (!an_finite(pos, 3) || !an_finite(q, 4) || !an_qnorm(n)) { an_refuse(w, AN_R_VALUE); return; }
     memcpy(f->pos, pos, sizeof f->pos);
     memcpy(f->q, n, sizeof f->q);
-    f->dirty = 1;
+    an_mark(w, f);
 }
 
 /* the checks an_play and an_blend share; the layer, or NULL if refused */
@@ -575,7 +590,7 @@ static inline void an_play(AnWorld *w, int fig, int layer, int clip, float fade,
     s.additive = additive != 0;
     s.mask = (int16_t)(mask < 0 ? -1 : mask);
     an_push(L, &s, fade, weight);
-    f->dirty = 1;
+    an_mark(w, f);
 }
 
 static inline void an_blend(AnWorld *w, int fig, int layer, int n, const int32_t *clips, const float *positions,
@@ -596,7 +611,7 @@ static inline void an_blend(AnWorld *w, int fig, int layer, int n, const int32_t
     s.value.from = s.value.to = value;
     s.mask = (int16_t)(mask < 0 ? -1 : mask);
     an_push(L, &s, fade, weight);
-    f->dirty = 1;
+    an_mark(w, f);
 }
 
 static inline void an_set(AnWorld *w, int fig, int layer, int what, float v, float fade) {
@@ -605,7 +620,7 @@ static inline void an_set(AnWorld *w, int fig, int layer, int what, float v, flo
     if (layer < 0 || layer >= AN_LAYERS) { an_refuse(w, AN_R_LAYER); return; }
     if (!isfinite(v) || !isfinite(fade)) { an_refuse(w, AN_R_VALUE); return; }
     AnLayer *L = &f->layer[layer];
-    if (what == 1) { an_ramp_to(&L->weight, v < 0 ? 0 : (v > 1 ? 1 : v), fade); f->dirty = 1; return; }
+    if (what == 1) { an_ramp_to(&L->weight, v < 0 ? 0 : (v > 1 ? 1 : v), fade); an_mark(w, f); return; }
     if (what < 0 || what > 4 || L->nsrc == 0) { an_refuse(w, AN_R_WHAT); return; }
     AnSource *s = &L->src[L->nsrc - 1];
     if (what == 0) s->rate = v;
@@ -619,7 +634,7 @@ static inline void an_set(AnWorld *w, int fig, int layer, int what, float v, flo
         if (!s->blend) { an_refuse(w, AN_R_WHAT); return; }
         an_ramp_to(&s->value, v, fade);
     } else s->paused = v != 0 ? 1 : 0;
-    f->dirty = 1;
+    an_mark(w, f);
 }
 
 /* ---- time and marks ---- */
@@ -1071,7 +1086,7 @@ static inline void an_pose(AnWorld *w, AnFig *f, float dt) {
         }
         an_write_mat(b.wq[p], b.wp[p], out + p * 12);
     }
-    f->dirty = 0;
+    if (f->dirty) { f->dirty = 0; w->nstale--; }
 }
 
 /* ---- attachments ---- */
@@ -1244,7 +1259,7 @@ static inline void an_override(AnWorld *w, int fig, int part, const float q[4], 
     if (!f) { an_refuse(w, AN_R_FIGURE); return; }
     if (part < 0 || part >= w->rigs[f->rig].nparts) { an_refuse(w, AN_R_PART); return; }
     if (!isfinite(weight)) { an_refuse(w, AN_R_VALUE); return; }
-    if (weight <= 0) { an_proc_clear(w, f, AN_K_OVERRIDE, part); f->dirty = 1; return; }
+    if (weight <= 0) { an_proc_clear(w, f, AN_K_OVERRIDE, part); an_mark(w, f); return; }
     float n[4];
     if (!q || !an_finite(q, 4) || (move && !an_finite(move, 3))) { an_refuse(w, AN_R_VALUE); return; }
     memcpy(n, q, sizeof n);
@@ -1256,7 +1271,7 @@ static inline void an_override(AnWorld *w, int fig, int part, const float q[4], 
     for (int i = 0; i < 3; i++) p->v[4 + i] = move ? move[i] : 0;
     p->n = move != NULL;
     p->v[7] = weight > 1 ? 1 : weight;
-    f->dirty = 1;
+    an_mark(w, f);
 }
 
 /* slot 0..3: the chain's last part turns its axis (in its own frame) toward
@@ -1268,7 +1283,7 @@ static inline void an_aim(AnWorld *w, int fig, int slot, int n, const int32_t *c
     if (!f) { an_refuse(w, AN_R_FIGURE); return; }
     if (slot < 0 || slot >= AN_AIMS) { an_refuse(w, AN_R_PART); return; }
     if (!isfinite(weight)) { an_refuse(w, AN_R_VALUE); return; }
-    if (weight <= 0) { an_proc_clear(w, f, AN_K_AIM, slot); f->dirty = 1; return; }
+    if (weight <= 0) { an_proc_clear(w, f, AN_K_AIM, slot); an_mark(w, f); return; }
     if (n < 1 || n > 4 || !chain || !an_chain_ok(&w->rigs[f->rig], n, chain)) { an_refuse(w, AN_R_PART); return; }
     if (!axis || !target || !an_finite(axis, 3) || !an_finite(target, 3) || !isfinite(limit_deg) || limit_deg < 0 ||
         !(an_len(axis) > 1e-9f)) { an_refuse(w, AN_R_VALUE); return; }
@@ -1281,7 +1296,7 @@ static inline void an_aim(AnWorld *w, int fig, int slot, int n, const int32_t *c
     for (int i = 0; i < 3; i++) { p->v[i] = axis[i] / al; p->v[3 + i] = target[i]; }
     p->v[6] = limit_deg * 3.14159265f / 180.0f;
     p->v[7] = weight > 1 ? 1 : weight;
-    f->dirty = 1;
+    an_mark(w, f);
 }
 
 /* slot 0..7: the chain (upper, lower, end) places the end at target, bending
@@ -1301,7 +1316,7 @@ static inline void an_reach_to(AnWorld *w, int fig, int slot, const int32_t chai
     }
     AnProc *p = an_proc_find(w, f, AN_K_REACH, slot);
     if (!chain && !p) return;
-    if (seconds <= 0 && goal <= 0) { an_proc_clear(w, f, AN_K_REACH, slot); f->dirty = 1; return; }
+    if (seconds <= 0 && goal <= 0) { an_proc_clear(w, f, AN_K_REACH, slot); an_mark(w, f); return; }
     if (!p) {
         int made;
         p = an_proc_get(w, f, AN_K_REACH, slot, &made);
@@ -1316,7 +1331,7 @@ static inline void an_reach_to(AnWorld *w, int fig, int slot, const int32_t chai
     p->v[7] = goal;
     if (seconds > 0) p->v[8] = 1.0f / seconds;
     else { p->v[6] = goal; p->v[8] = 0; }
-    f->dirty = 1;
+    an_mark(w, f);
 }
 static inline void an_reach(AnWorld *w, int fig, int slot, const int32_t chain[3], const float target[3], const float pole[3], float weight) {
     if (!chain) { an_refuse(w, AN_R_PART); return; }
@@ -1330,13 +1345,13 @@ static inline void an_spring(AnWorld *w, int fig, int part, float stiffness, flo
     if (!f) { an_refuse(w, AN_R_FIGURE); return; }
     if (part < 0 || part >= w->rigs[f->rig].nparts) { an_refuse(w, AN_R_PART); return; }
     if (!isfinite(stiffness) || !isfinite(damping) || stiffness < 0 || damping < 0) { an_refuse(w, AN_R_VALUE); return; }
-    if (stiffness == 0) { an_proc_clear(w, f, AN_K_SPRING, part); f->dirty = 1; return; }
+    if (stiffness == 0) { an_proc_clear(w, f, AN_K_SPRING, part); an_mark(w, f); return; }
     int made;
     AnProc *p = an_proc_get(w, f, AN_K_SPRING, part, &made);
     if (!p) return;
     if (made) { p->fresh = 1; p->v[5] = 1; }
     p->v[0] = stiffness; p->v[1] = damping;
-    f->dirty = 1;
+    an_mark(w, f);
 }
 
 /* the root lowered by metres (world -y) after the layers, for foot placement */
@@ -1346,7 +1361,7 @@ static inline void an_drop(AnWorld *w, int fig, float metres) {
     if (!isfinite(metres)) { an_refuse(w, AN_R_VALUE); return; }
     f->drop = f->drop_goal = metres;
     f->drop_rate = 0;
-    f->dirty = 1;
+    an_mark(w, f);
 }
 /* the drop moving toward metres at speed metres a second through the
  * updates (speed 0 or less: at once) */
@@ -1522,15 +1537,18 @@ static inline int an_attach(AnWorld *w, int child, int parent, int socket, const
     c->att = ps; c->att_socket = (int16_t)socket;
     memcpy(c->att_pos, pos, sizeof c->att_pos);
     memcpy(c->att_q, n, sizeof c->att_q);
-    c->dirty = 1;
+    an_mark(w, c);
     an_recount(w);
     return 1;
 }
-/* child no longer hangs; it stays where it was last placed */
+/* child no longer hangs; it is left at its parent's socket as the parent
+ * stands now (whether or not a query posed it since the last update) */
 static inline void an_detach(AnWorld *w, int child) {
     AnFig *c = an_fig(w, child);
     if (!c) { an_refuse(w, AN_R_FIGURE); return; }
     if (c->att < 0) return;
+    an_attach_place(w, c);
+    an_mark(w, c);
     an_unhang(c);
     an_recount(w);
 }
@@ -1543,7 +1561,7 @@ static inline void an_pose_now(AnWorld *w, AnFig *g) {
     an_pose(w, g, 0);
     if (w->nattached) {
         int gs = (int)(g - w->figs);
-        for (int s = 0; s < w->capacity; s++) if (w->figs[s].id >= 0 && w->figs[s].att == gs) w->figs[s].dirty = 1;
+        for (int s = 0; s < w->capacity; s++) if (w->figs[s].id >= 0 && w->figs[s].att == gs) an_mark(w, &w->figs[s]);
     }
 }
 /* f and the figures it hangs from: from the highest stale one down, posed */
@@ -1552,14 +1570,17 @@ static inline void an_freshen_one(AnWorld *w, AnFig *f) {
     int n = 0, top = -1;
     for (AnFig *g = f; n < AN_DEPTH + 2; g = &w->figs[g->att]) { chain[n++] = g; if (g->att < 0) break; }
     for (int i = n - 1; i >= 0 && top < 0; i--) if (chain[i]->dirty) top = i;
+    if (top >= 0) w->scans += 1;
     for (int i = top; i >= 0; i--) an_pose_now(w, chain[i]);
 }
 /* every stale figure, and every figure hanging from one, posed; the grid rebuilt if anything moved */
 static inline void an_freshen_all(AnWorld *w) {
+    if (w->nstale == 0) { if (w->grid_dirty) an_grid_build(w); return; }
+    w->scans += 1;
     for (int d = 1; d <= w->max_depth; d++)
         for (int s = 0; s < w->capacity; s++) {
             AnFig *f = &w->figs[s];
-            if (f->id >= 0 && f->depth == d && w->figs[f->att].dirty) f->dirty = 1;
+            if (f->id >= 0 && f->depth == d && w->figs[f->att].dirty) an_mark(w, f);
         }
     for (int d = 0; d <= w->max_depth; d++)
         for (int s = 0; s < w->capacity; s++) {
@@ -1782,23 +1803,35 @@ static inline int an_hit_box(AnWorld *w, const float c[3], const float half[3], 
     int ign = ignore >= 0 ? an_slot(w, ignore) : -1;
     an_freshen_all(w);
     an_stamp_next(w);
-    for (int i = 0; i < w->nbig; i++) w->stamp[w->big[i]] = w->stamp_now;
+    /* the candidates: the big list and the figures in the cells the box's bounds touch, in slot order */
+    int nc = 0;
+    for (int i = 0; i < w->nbig; i++) { w->stamp[w->big[i]] = w->stamp_now; w->cand[nc++] = w->big[i]; }
     int c0[3], c1[3];
     double cells = 1;
     for (int k = 0; k < 3; k++) { c0[k] = an_cell_of(lo[k]); c1[k] = an_cell_of(hi[k]); cells *= (double)c1[k] - c0[k] + 1; }
     if (cells > 64 && cells > w->live) {
-        for (int s = 0; s < w->capacity; s++) if (w->figs[s].id >= 0) w->stamp[s] = w->stamp_now;
+        nc = 0;
+        for (int s = 0; s < w->capacity; s++) if (w->figs[s].id >= 0) w->cand[nc++] = s;
     } else {
         for (int z = c0[2]; z <= c1[2]; z++)
             for (int y = c0[1]; y <= c1[1]; y++)
                 for (int x = c0[0]; x <= c1[0]; x++)
-                    for (int e = w->grid_head[an_cell_hash(x, y, z) & w->grid_mask]; e >= 0; e = w->grid_next[e])
-                        w->stamp[w->grid_slot[e]] = w->stamp_now;
+                    for (int e = w->grid_head[an_cell_hash(x, y, z) & w->grid_mask]; e >= 0; e = w->grid_next[e]) {
+                        int s = w->grid_slot[e];
+                        if (w->stamp[s] != w->stamp_now) { w->stamp[s] = w->stamp_now; w->cand[nc++] = s; }
+                    }
+        for (int i = 1; i < nc; i++) {                  /* few candidates: insertion sort */
+            int32_t v = w->cand[i];
+            int j = i;
+            for (; j > 0 && w->cand[j - 1] > v; j--) w->cand[j] = w->cand[j - 1];
+            w->cand[j] = v;
+        }
     }
     int n = 0;
-    for (int s = 0; s < w->capacity; s++) {
+    for (int ci = 0; ci < nc; ci++) {
+        int s = w->cand[ci];
         const AnFig *f = &w->figs[s];
-        if (w->stamp[s] != w->stamp_now || f->id < 0 || an_ignored(w, s, ign)) continue;
+        if (f->id < 0 || an_ignored(w, s, ign)) continue;
         if (!(f->bmin[0] <= f->bmax[0]) || f->bmin[0] > hi[0] || f->bmin[1] > hi[1] || f->bmin[2] > hi[2] ||
             f->bmax[0] < lo[0] || f->bmax[1] < lo[1] || f->bmax[2] < lo[2]) continue;
         const AnRig *r = &w->rigs[f->rig];
@@ -1818,21 +1851,18 @@ static inline int an_hit_box(AnWorld *w, const float c[3], const float half[3], 
 }
 
 /* 0 figures, 1 posed, 2 stale, 3 refused calls, 4 negative dt, 5 last refusal reason, 6 marks dropped,
- * 7 procedural records in use */
+ * 7 procedural records in use, 8 passes queries made over the figures to pose stale ones */
 static inline double an_stat(const AnWorld *w, int which) {
     switch (which) {
     case 0: return w->live;
     case 1: return w->posed;
-    case 2: {
-        int n = 0;
-        for (int s = 0; s < w->capacity; s++) if (w->figs[s].id >= 0 && w->figs[s].dirty) n++;
-        return n;
-    }
+    case 2: return w->nstale;
     case 3: return w->refused;
     case 4: return w->negative_dt;
     case 5: return w->reason;
     case 6: return w->dropped;
     case 7: return w->nprocs - w->nproc_free;
+    case 8: return w->scans;
     default: return 0;
     }
 }

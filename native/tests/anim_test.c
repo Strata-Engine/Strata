@@ -1253,6 +1253,76 @@ static void test_query_no_trace(void) {
     CHECK(query_script(0) == query_script(1), "posing stale figures for a query changes nothing the next update carries");
 }
 
+/* a parent moved after an update, then (or not) a query, then its child let go (mode 0 detach, 1 remove the parent) */
+static uint64_t letgo_script(int query, int mode) {
+    AnWorld *w = an_open(4);
+    int rig = chain(w, 0);
+    shape_chain(w, rig);
+    float sp[3] = {0, 0.5f, 0};
+    int s = an_socket_def(w, rig, 2, sp, an_qid);
+    int f = an_spawn(w, rig), c = an_spawn(w, rig), g = an_spawn(w, rig);
+    float off[3] = {0, 0, 0.3f}, at[3] = {4, 1, -2}, q90[4], pos[3], q[4];
+    an_attach(w, c, f, s, off, an_qid);
+    an_attach(w, g, c, s, off, an_qid);
+    an_update(w, 1.0f / 60);
+    qz(90, q90);
+    an_place(w, f, at, q90);
+    if (query == 1) { AnHit h; float o[3] = {4, 1.5f, 5}, d[3] = {0, 0, -1}; an_hit_ray(w, o, d, 100, -1, &h); }
+    if (query == 2) an_socket(w, c, s, pos, q);
+    if (mode == 0) an_detach(w, c); else an_remove(w, f);
+    an_update(w, 1.0f / 60);
+    uint64_t hash = an_hash(w);
+    an_close(w);
+    return hash;
+}
+static void test_letgo_no_trace(void) {
+    uint64_t d = letgo_script(0, 0), r = letgo_script(0, 1);
+    CHECK(d == letgo_script(1, 0) && d == letgo_script(2, 0), "a hit or socket query before a detach leaves the next update's hash unchanged");
+    CHECK(r == letgo_script(1, 1) && r == letgo_script(2, 1), "and before removing the parent");
+    AnWorld *w = an_open(4);
+    int rig = chain(w, 0);
+    float sp[3] = {0, 0.5f, 0};
+    int s = an_socket_def(w, rig, 2, sp, an_qid);
+    int f = an_spawn(w, rig), c = an_spawn(w, rig);
+    float off[3] = {0, 0, 0}, at[3] = {4, 0, 0};
+    an_attach(w, c, f, s, off, an_qid);
+    an_update(w, 1.0f / 60);
+    an_place(w, f, at, an_qid);
+    an_detach(w, c);
+    an_update(w, 1.0f / 60);
+    const float *m = an_matrices(w, c);
+    CHECK(near(m[9], 4, 1e-5f) && near(m[10], 2.5f, 1e-5f), "a detached child is left at its parent's socket as the parent stands at the detach");
+    an_close(w);
+}
+
+static void test_clean_query(void) {
+    AnWorld *w = an_open(64);
+    int rig = chain(w, 0);
+    shape_chain(w, rig);
+    for (int i = 0; i < 40; i++) { int f = an_spawn(w, rig); float at[3] = {(float)i, 0, 0}; an_place(w, f, at, an_qid); }
+    an_update(w, 1.0f / 60);
+    CHECK(an_stat(w, 2) == 0, "after an update nothing is stale");
+    double scans = an_stat(w, 8);
+    AnHit h;
+    float o[3] = {3, 0.5f, 5}, d[3] = {0, 0, -1}, c[3] = {3, 0.5f, 0}, half[3] = {0.5f, 0.5f, 0.5f}, pos[3], q[4];
+    int32_t pairs[16];
+    for (int i = 0; i < 10; i++) { an_hit_ray(w, o, d, 100, -1, &h); an_hit_box(w, c, half, an_qid, -1, 8, pairs); }
+    CHECK(an_stat(w, 8) == scans, "queries on a clean world make no pass over the figures");
+    float at[3] = {3, 0, 1};
+    an_place(w, 3, at, an_qid);
+    CHECK(an_stat(w, 2) == 1, "a placed figure is counted stale");
+    CHECK(an_hit_ray(w, o, d, 100, -1, &h) == 1 && h.fig == 3 && near(h.dist, 3.9f, 1e-5f), "and posed by the next query");
+    CHECK(an_stat(w, 8) == scans + 1 && an_stat(w, 2) == 0, "in one pass, after which nothing is stale");
+    an_socket_def(w, rig, 0, an_qid, an_qid);
+    an_socket(w, 5, 0, pos, q);
+    CHECK(an_stat(w, 8) == scans + 1, "a socket query on a clean figure poses nothing");
+    an_remove(w, 3);
+    an_place(w, 4, at, an_qid);
+    an_remove(w, 4);
+    CHECK(an_stat(w, 2) == 0, "removing a stale figure takes it off the count");
+    an_close(w);
+}
+
 static void test_shape_refusals(void) {
     AnWorld *w = an_open(4);
     int rig = chain(w, 0);
@@ -1301,6 +1371,8 @@ int main(void) {
     test_presprings();
     test_attach_hash();
     test_query_no_trace();
+    test_letgo_no_trace();
+    test_clean_query();
     test_shape_refusals();
     if (fails == 0) printf("anim_test: ok\n");
     return fails == 0 ? 0 : 1;
