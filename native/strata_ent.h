@@ -28,7 +28,9 @@
  * Sections: kinds; rows and ids; slots and parts; each and columns; hash and
  * stats; blocks (the kernel's one-bit-a-voxel copy of the loaded chunks);
  * the ray; events; the grid, near, the entity ray and touch pairs (in
- * strata_ent_grid.h, included here); the tick. */
+ * strata_ent_grid.h, included here); the sweep, walking and routes (in
+ * strata_ent_move.h, included here); seen and unseen, and setting on the
+ * ground (in strata_ent_seen.h, included here); the tick. */
 #ifndef STRATA_ENT_H
 #define STRATA_ENT_H
 #include <stdint.h>
@@ -55,9 +57,13 @@
 #define EN_CHUNK_COORD_MAX (1 << 25) /* |chunk coordinate| at most: its voxels fit an int */
 #define EN_CELL 4.0                /* the grid's cell, metres */
 #define EN_CELL_MAX 1000000000.0   /* |grid cell coordinate| at most; farther positions share the last cell */
+#define EN_ROUTE_MAX 256           /* points a route at most */
 
 /* a row's flags */
-enum { EN_F_SEEN = 1, EN_F_STUCK = 2 };   /* seen this tick; a flyer that hit a block, still until the game moves it */
+/* seen (strata_ent_seen.h); a flyer that hit a block, still until the game moves it; a walker standing on something; a
+ * follower whose route loops; a follower that has reported event 8 for its present stall; an unseen walker waiting to
+ * be set on the ground; an unseen entity frozen by its kind's rule */
+enum { EN_F_SEEN = 1, EN_F_STUCK = 2, EN_F_GROUNDED = 4, EN_F_LOOPS = 8, EN_F_BLOCKED = 16, EN_F_WAITING = 32, EN_F_FROZEN = 64 };
 /* event codes */
 enum { EN_E_TOUCH = 1, EN_E_BLOCK = 2, EN_E_ENTERED = 3, EN_E_LEFT = 4, EN_E_ROUTE = 5, EN_E_REMOVED = 6, EN_E_BODY_LOST = 7, EN_E_BLOCKED = 8 };
 
@@ -75,7 +81,8 @@ enum {
     EN_R_BODY = 9,      /* a body on a mover other than Body, or a Body mover without one */
     EN_R_PART = 10,     /* a part outside 0..3, a flag not 0/1, too many voices, or a part the kind lacks */
     EN_R_WHICH = 11,    /* en_set or a column: no such field, or one a game may not set (age) */
-    EN_R_ROWS = 12      /* en_set_column: rows not the kind's live count */
+    EN_R_ROWS = 12,     /* en_set_column: rows not the kind's live count */
+    EN_R_ROUTE = 13     /* no such route, or one freed (strata_ent_move.h) */
 };
 
 /* kind ints, in en_kind's order */
@@ -96,6 +103,9 @@ typedef struct {
     double lo[3], hi[3];         /* touch box: the box swept over the tick's step */
     int32_t cell[3], kind;
 } EnGridEnt;
+
+/* a route: its points are pool[start .. start + n); state 0 a free slot, 1 held, 2 freed but still followed */
+typedef struct { int32_t start, n, users, state; } EnRoute;
 
 /* a removal made between ticks, written as event 6 at the start of the next tick */
 typedef struct { int64_t id; int32_t reason; double pos[3]; } EnRemoval;
@@ -137,7 +147,7 @@ struct EnWorld {
     int nev;
     EnRemoval *removed; int nremoved;
     int in_tick;
-    double bad_dt, dropped; int seen;
+    double bad_dt, dropped; int seen, waiting;   /* seen and waiting for ground at the end of the last tick */
     /* the grid (strata_ent_grid.h) */
     double *from;                /* 3 a row: the position the tick's step began at */
     EnGridEnt *g_ent;            /* capacity: the last tick's live entities, bucket by bucket */
@@ -148,6 +158,17 @@ struct EnWorld {
     double g_reach[EN_KINDS][3]; /* how far any of the kind's touch boxes reaches from its position, a side */
     int g_n, g_nb, g_nbmax;      /* entries, buckets this tick (a power of 2), buckets at most */
     uint64_t pairs[EN_KINDS];    /* bit j of pairs[i], i <= j: touches between kinds i and j are asked for */
+    /* routes and walking (strata_ent_move.h) */
+    double *rpts;                /* route_points x 3: the point pool */
+    EnRoute *routes;             /* route_points: the route table (a route holds a point, so never more) */
+    int32_t *route_free; int nroute_free, routes_hw;   /* freed route ids, a stack; ids handed out so far */
+    int32_t *fx_start, *fx_len; int nfx;   /* the pool's free blocks, in order of start (route_points + 1) */
+    int route_pts_held, routes_held;
+    int32_t *rt_route;           /* a row: the route it follows, -1 none */
+    int32_t *rt_next;            /* a row: the index of its next waypoint */
+    float *rt_speed;             /* a row: metres a second along its route */
+    float *rt_best, *rt_stall;   /* a row: distance to the waypoint at the last progress, seconds since */
+    int64_t tick_count;          /* ticks begun; spreads divisor stepping across ticks */
 };
 typedef struct EnWorld EnWorld;
 
@@ -160,14 +181,15 @@ static inline void en_close(EnWorld *w) {
     free(w->facing); free(w->age); free(w->fslot); free(w->islot); free(w->part); free(w->free_rows);
     free(w->flags); free(w->stops); free(w->ev_ints); free(w->ev_floats); free(w->removed);
     free(w->from); free(w->g_ent); free(w->g_start); free(w->g_bucket); free(w->g_byk);
+    free(w->rpts); free(w->routes); free(w->route_free); free(w->fx_start); free(w->fx_len);
+    free(w->rt_route); free(w->rt_next); free(w->rt_speed); free(w->rt_best); free(w->rt_stall);
     if (w->chunks) for (int i = 0; i < w->chunk_cap; i++) free(w->chunks[i].mask);
     free(w->chunks);
     free(w);
 }
 
-/* route_points, bodies, seen_cap, chunk_metres and voxel_metres are checked
- * and kept for the movers, routes and seen test that come later. NULL if
- * any is out of range or memory runs out. */
+/* capacity rows, a pool of route_points route points, a body budget, the seen cap and the chunk and voxel sizes in
+ * metres (bodies, seen_cap and chunk_metres are kept for later tasks). NULL if any is out of range or memory runs out. */
 static inline EnWorld *en_open(int capacity, int route_points, int bodies, double seen_cap,
                                double chunk_metres, double voxel_metres) {
     if (capacity < 1 || capacity > EN_CAPACITY_MAX || route_points < 1 || route_points > EN_CAPACITY_MAX ||
@@ -205,12 +227,25 @@ static inline EnWorld *en_open(int capacity, int route_points, int bodies, doubl
     w->g_start = (int32_t *)calloc((size_t)w->g_nbmax + 1, sizeof *w->g_start);
     w->g_bucket = (int32_t *)malloc(n * sizeof *w->g_bucket);
     w->g_byk = (int32_t *)malloc(n * sizeof *w->g_byk);
+    size_t rp = (size_t)route_points;
+    w->rpts = (double *)calloc(rp * 3, sizeof *w->rpts);
+    w->routes = (EnRoute *)calloc(rp, sizeof *w->routes);
+    w->route_free = (int32_t *)malloc(rp * sizeof *w->route_free);
+    w->fx_start = (int32_t *)malloc((rp + 1) * sizeof *w->fx_start);
+    w->fx_len = (int32_t *)malloc((rp + 1) * sizeof *w->fx_len);
+    w->rt_route = (int32_t *)malloc(n * sizeof *w->rt_route);
+    w->rt_next = (int32_t *)calloc(n, sizeof *w->rt_next);
+    w->rt_speed = (float *)calloc(n, sizeof *w->rt_speed);
+    w->rt_best = (float *)calloc(n, sizeof *w->rt_best);
+    w->rt_stall = (float *)calloc(n, sizeof *w->rt_stall);
     if (!w->kind || !w->gen || !w->dense_at || !w->dense || !w->pos || !w->vel || !w->facing || !w->age ||
         !w->fslot || !w->islot || !w->part || !w->free_rows || !w->flags || !w->stops || !w->chunks ||
         !w->ev_ints || !w->ev_floats || !w->removed || !w->from || !w->g_ent || !w->g_start || !w->g_bucket ||
-        !w->g_byk) { en_close(w); return NULL; }
+        !w->g_byk || !w->rpts || !w->routes || !w->route_free || !w->fx_start || !w->fx_len || !w->rt_route ||
+        !w->rt_next || !w->rt_speed || !w->rt_best || !w->rt_stall) { en_close(w); return NULL; }
+    w->fx_start[0] = 0; w->fx_len[0] = route_points; w->nfx = 1;
     for (int r = 0; r < capacity; r++) {
-        w->kind[r] = -1; w->gen[r] = 1;
+        w->kind[r] = -1; w->gen[r] = 1; w->rt_route[r] = -1;
         w->free_rows[r] = capacity - 1 - r;   /* row 0 handed out first */
     }
     for (size_t i = 0; i < n * EN_PARTS; i++) w->part[i] = -1;
@@ -291,10 +326,12 @@ static inline int64_t en_add(EnWorld *w, int kind, double x, double y, double z,
 
 static inline void en_event(EnWorld *w, int code, int64_t a, int64_t b, int64_t i0, int64_t i1, int64_t i2, int64_t i3,
                             double x, double y, double z);
+static inline void en_unfollow(EnWorld *w, int r);
 
 /* reason: 0 the game, 1 lifetime, 2 the unseen rule. Each removal is reported as event 6 (i0 the reason, the
  * point its last position): one made inside en_tick in that tick's events; one made between ticks is queued
- * (the id and position copied, so the row can be reused at once) and written first by the next en_tick. */
+ * (the id and position copied, so the row can be reused at once) and written first by the next en_tick.
+ * A follower stops following its route (strata_ent_move.h). */
 static inline void en_remove(EnWorld *w, int64_t id, int reason) {
     int r = en_row(w, id);
     if (r < 0) { en_refuse(w, EN_R_ENTITY); return; }
@@ -306,6 +343,7 @@ static inline void en_remove(EnWorld *w, int64_t id, int reason) {
         EnRemoval *q = &w->removed[w->nremoved++];
         q->id = id; q->reason = reason; q->pos[0] = p[0]; q->pos[1] = p[1]; q->pos[2] = p[2];
     }
+    en_unfollow(w, r);
     EnKind *k = &w->kinds[w->kind[r]];
     int32_t *dense = w->dense + (size_t)w->kind[r] * w->capacity;
     int last = dense[--k->live];   /* the kind's last entry fills the hole */
@@ -474,7 +512,8 @@ static inline uint64_t en_fnv(uint64_t h, const void *data, size_t len) {
 }
 
 /* FNV-1a over each live row, kind by kind in en_each order: id, kind, position, velocity, facing, age,
- * the kind's slots, the parts and whether a block has stopped it. Routes join it when routes exist. */
+ * the kind's slots, the parts, whether a block has stopped it, whether it is grounded, and its route, waypoint,
+ * speed, looping and stall; then each held route in id order: id, state, followers and points. */
 static inline uint64_t en_hash(const EnWorld *w) {
     uint64_t h = 1469598103934665603ull;
     for (int k = 0; k < w->nkinds; k++) {
@@ -492,24 +531,43 @@ static inline uint64_t en_hash(const EnWorld *w) {
             h = en_fnv(h, w->fslot + (size_t)r * EN_SLOTS, (size_t)kd->ints[EN_K_FSLOTS] * sizeof *w->fslot);
             h = en_fnv(h, w->islot + (size_t)r * EN_SLOTS, (size_t)kd->ints[EN_K_ISLOTS] * sizeof *w->islot);
             h = en_fnv(h, w->part + (size_t)r * EN_PARTS, EN_PARTS * sizeof *w->part);
-            uint8_t stuck = w->flags[r] & EN_F_STUCK;
-            h = en_fnv(h, &stuck, 1);
+            uint8_t kept = w->flags[r] & (EN_F_STUCK | EN_F_GROUNDED | EN_F_LOOPS | EN_F_BLOCKED);
+            h = en_fnv(h, &kept, 1);
+            h = en_fnv(h, w->rt_route + r, sizeof *w->rt_route);
+            if (w->rt_route[r] >= 0) {
+                h = en_fnv(h, w->rt_next + r, sizeof *w->rt_next);
+                h = en_fnv(h, w->rt_speed + r, sizeof *w->rt_speed);
+                h = en_fnv(h, w->rt_best + r, sizeof *w->rt_best);
+                h = en_fnv(h, w->rt_stall + r, sizeof *w->rt_stall);
+            }
         }
+    }
+    for (int i = 0; i < w->routes_hw; i++) {
+        const EnRoute *rt = &w->routes[i];
+        if (rt->state == 0) continue;
+        h = en_fnv(h, &i, sizeof i);
+        h = en_fnv(h, &rt->state, sizeof rt->state);
+        h = en_fnv(h, &rt->users, sizeof rt->users);
+        h = en_fnv(h, w->rpts + (size_t)rt->start * 3, (size_t)rt->n * 3 * sizeof *w->rpts);
     }
     return h;
 }
 
-/* 0 live, 1 seen in the last tick, 2 waiting for ground, 3 refused calls, 4 ticks given a dt negative or not
- * finite, 5 events dropped (past EN_EVENTS in a tick, or removals queued between ticks), 6 last refusal reason
- * (EN_R_*), 7 entities over the body budget. Grounding and bodies come in later tasks; until then 2 and 7 read 0. */
+/* 0 live, 1 seen at the end of the last tick, 2 walkers waiting there to be set on the ground (strata_ent_seen.h),
+ * 3 refused calls, 4 ticks given a dt negative or not finite, 5 events dropped (past EN_EVENTS in a tick, or removals
+ * queued between ticks), 6 last refusal reason (EN_R_*), 7 entities over the body budget, 8 route points held, 9 routes
+ * held (a freed route still followed is held). Bodies come in a later task; until then 7 reads 0. */
 static inline double en_stat(const EnWorld *w, int which) {
     switch (which) {
     case 0: return w->live;
     case 1: return w->seen;
+    case 2: return w->waiting;
     case 3: return w->refused;
     case 4: return w->bad_dt;
     case 5: return w->dropped;
     case 6: return w->reason;
+    case 8: return w->route_pts_held;
+    case 9: return w->routes_held;
     default: return 0;
     }
 }
@@ -700,18 +758,10 @@ static inline int en_events(const EnWorld *w, int max, int64_t *ints, double *fl
 }
 
 #include "strata_ent_grid.h"
+#include "strata_ent_move.h"
+#include "strata_ent_seen.h"
 
 /* ---- the tick ---- */
-/* seen: within the kind's seen distance of any focus, measured horizontally (x and z) */
-static inline int en_seen_by(const double *p, double dist, int nfocus, const double *focus) {
-    double dd = dist * dist;
-    for (int f = 0; f < nfocus; f++) {
-        double dx = p[0] - focus[f * 3], dz = p[2] - focus[f * 3 + 2];
-        if (dx * dx + dz * dz <= dd) return 1;
-    }
-    return 0;
-}
-
 /* one flying step of row r over dt (> 0): gravity into the velocity, then the position by the velocity; while
  * seen, a ray along the step, and on a hit the entity stops at the hit point, still, with event 2 */
 static inline void en_fly(EnWorld *w, int r, const EnKind *kd, double dt) {
@@ -736,14 +786,21 @@ static inline void en_fly(EnWorld *w, int r, const EnKind *kd, double dt) {
     if (isfinite(q[0]) && isfinite(q[1]) && isfinite(q[2])) { p[0] = q[0]; p[1] = q[1]; p[2] = q[2]; }
 }
 
-/* One step of dt seconds. Clears the last tick's events, writes the removals queued since, then walks each
- * kind's dense array: the age advances by dt; an entity whose age passes its kind's lifetime is removed
- * (reason 1, event 6); the seen flag is set from the focus points (nfocus of them, 3 doubles each; none: all
- * unseen); flying entities move (en_fly), placed ones do not. A flyer stopped by a block stays until the game
- * sets its position or velocity. dt negative or not finite is counted (en_stat(4)) and taken as 0. Entities
- * added between ticks take part from the next tick: every live entity does. Last, the grid is rebuilt from the
- * rows still live (en_grid_build) and the declared touch pairs tested on it (en_touches): an entity removed in
- * the tick is in neither. */
+/* One step of dt seconds, in passes over each kind's dense array, kind by kind:
+ *  1. the last tick's events cleared and the removals queued since written (event 6); each entity's age advances
+ *     by dt (not a frozen one's) and one whose age passes its kind's lifetime is removed (reason 1, event 6);
+ *  2. seen movement: flyers (en_fly; one stopped by a block stays until the game sets its position or velocity) and
+ *     walkers (en_walk); placed entities do not move;
+ *  3. unseen movement due this tick: an unseen entity of a kind with divisor n steps on the ticks where
+ *     (ticks begun before + its row) % n == 0, by n * dt, so a kind's entities are spread across the n ticks;
+ *     flyers fly on through everything, walkers follow their routes (en_walk_unseen); frozen entities and walkers
+ *     waiting to be set on the ground stay;
+ *  4. the seen and unseen switch from the focus points (nfocus of them, 3 doubles each; none: nothing is seen), on
+ *     the positions movement left (en_switch, strata_ent_seen.h): events 3 and 4, the unseen rules, grounding;
+ *  5. the grid is rebuilt from the rows still live (en_grid_build) and the declared touch pairs tested on it
+ *     (en_touches): an entity removed in the tick is in neither.
+ * dt negative or not finite is counted (en_stat(4)) and taken as 0, which moves nothing; the switch still runs. An
+ * entity added between ticks is unseen and takes part from the next tick, becoming seen at its end if it is near. */
 static inline void en_tick(EnWorld *w, int nfocus, const double *focus, double dt) {
     if (!isfinite(dt) || dt < 0) { w->bad_dt += 1; dt = 0; }
     if (nfocus < 0 || !focus) nfocus = 0;
@@ -754,24 +811,49 @@ static inline void en_tick(EnWorld *w, int nfocus, const double *focus, double d
     }
     w->nremoved = 0;
     w->in_tick = 1;
-    int seen = 0;
     for (int k = 0; k < w->nkinds; k++) {
         const EnKind *kd = &w->kinds[k];
         const int32_t *dense = w->dense + (size_t)k * w->capacity;
         double life = kd->floats[EN_K_LIFETIME];
         for (int i = 0; i < kd->live;) {   /* a removal moves the kind's last entry into i: look at i again */
             int r = dense[i];
-            w->age[r] += dt;
-            if (life > 0 && w->age[r] > life) { en_remove(w, en_id(w, r), 1); continue; }
+            if (!(w->flags[r] & EN_F_FROZEN)) {
+                w->age[r] += dt;
+                if (life > 0 && w->age[r] > life) { en_remove(w, en_id(w, r), 1); continue; }
+            }
             memcpy(w->from + r * 3, w->pos + r * 3, 3 * sizeof *w->pos);
-            int s = en_seen_by(w->pos + r * 3, kd->floats[EN_K_SEEN], nfocus, focus);
-            w->flags[r] = (uint8_t)((w->flags[r] & ~EN_F_SEEN) | (s ? EN_F_SEEN : 0));
-            seen += s;
-            if (kd->ints[EN_K_MOVER] == 1 && dt > 0 && !(w->flags[r] & EN_F_STUCK)) en_fly(w, r, kd, dt);
             i++;
         }
     }
-    w->seen = seen;
+    if (dt > 0) {
+        for (int k = 0; k < w->nkinds; k++) {   /* seen movement */
+            const EnKind *kd = &w->kinds[k];
+            int mover = kd->ints[EN_K_MOVER];
+            if (mover != 1 && mover != 2) continue;
+            const int32_t *dense = w->dense + (size_t)k * w->capacity;
+            for (int i = 0; i < kd->live; i++) {
+                int r = dense[i];
+                if (!(w->flags[r] & EN_F_SEEN)) continue;
+                if (mover == 2) en_walk(w, r, kd, dt);
+                else if (!(w->flags[r] & EN_F_STUCK)) en_fly(w, r, kd, dt);
+            }
+        }
+        for (int k = 0; k < w->nkinds; k++) {   /* unseen movement due this tick */
+            const EnKind *kd = &w->kinds[k];
+            int mover = kd->ints[EN_K_MOVER], n = kd->ints[EN_K_DIVISOR];
+            if (mover != 1 && mover != 2) continue;
+            const int32_t *dense = w->dense + (size_t)k * w->capacity;
+            int due = (int)(w->tick_count % n);
+            for (int i = 0; i < kd->live; i++) {
+                int r = dense[i];
+                if ((w->flags[r] & (EN_F_SEEN | EN_F_FROZEN | EN_F_WAITING)) || (due + r % n) % n != 0) continue;
+                if (mover == 2) en_walk_unseen(w, r, n * dt);
+                else if (!(w->flags[r] & EN_F_STUCK)) en_fly(w, r, kd, n * dt);
+            }
+        }
+    }
+    w->tick_count++;
+    en_switch(w, nfocus, focus);
     en_grid_build(w);
     en_touches(w);
     w->in_tick = 0;

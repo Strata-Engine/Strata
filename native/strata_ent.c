@@ -5,16 +5,16 @@
  * March values: a NativeArray arrives as its heap pointer, element count at
  * +16, data at +32 (8 bytes an element for NativeIntArr and NativeFloatArr,
  * 4 for NativeI32Arr and NativeF32Arr, 1 for NativeU8Arr). Inputs are only
- * read; en_x_each, en_x_column, en_x_ray, en_x_events, en_x_near and
- * en_x_ray_entities fill a caller-owned
+ * read; en_x_each, en_x_column, en_x_ray, en_x_events, en_x_near,
+ * en_x_ray_entities and en_x_sweep fill a caller-owned
  * array, as strata_anim.c's matrices do. Reads of three numbers come back one
  * number a call (en_x_get's k). Calls March makes only for their effect
  * answer an Int it can use (GAPS S9).
  *
  * With no world open every call does nothing and answers its default
  * (0, -1 for a kind or an id, 0.0). */
-/* Rewritten by stamp_ent.sh whenever strata_ent.h or strata_ent_grid.h changes (GAPS S14). */
-#define STRATA_ENT_STAMP "171342a3b810f7ab"
+/* Rewritten by stamp_ent.sh whenever strata_ent.h, strata_ent_grid.h, strata_ent_move.h or strata_ent_seen.h changes (GAPS S14). */
+#define STRATA_ENT_STAMP "fc3da581034d3fe3"
 #include <stdint.h>
 #include <time.h>
 #include "strata_ent.h"
@@ -198,6 +198,37 @@ int64_t en_x_ray_entities(double ox, double oy, double oz, double dx, double dy,
     if (id >= 0) en_x_f64(out)[0] = t;
     return id;
 }
+/* ---- the sweep, routes and walking ---- */
+/* en_sweep: 0, or -1 (a chunk not held on the way, or a number refused: nothing moved); out (a NativeFloatArr of at
+ * least 6) gets the end x, y, z and 1.0 or 0.0 for each axis blocked (x, y, z) */
+int64_t en_x_sweep(double px, double py, double pz, double hx, double hy, double hz, double dx, double dy, double dz, void *out) {
+    if (!g_w || en_x_len(out) < 6) return -1;
+    double p[3] = {px, py, pz}, h[3] = {hx, hy, hz}, d[3] = {dx, dy, dz}, q[3];
+    int b[3];
+    int r = en_sweep(g_w, p, h, d, q, b);
+    double *o = en_x_f64(out);
+    for (int a = 0; a < 3; a++) { o[a] = q[a]; o[3 + a] = b[a] ? 1.0 : 0.0; }
+    return r;
+}
+/* a route from a NativeFloatArr of 3 doubles a point: its id, or -1 */
+int64_t en_x_route(void *points) {
+    if (!g_w) return -1;
+    int64_t len = en_x_len(points);
+    if (len % 3 != 0 || len / 3 > EN_ROUTE_MAX) return en_refuse(g_w, EN_R_VALUE);
+    return en_route(g_w, (int)(len / 3), en_x_f64(points));
+}
+static int en_x_route_id(int64_t route) { return route < -1 || route > EN_CAPACITY_MAX ? -2 : (int)route; }
+/* answers 1 */
+int64_t en_x_route_free(int64_t route) { if (g_w) en_route_free(g_w, en_x_route_id(route)); return 1; }
+/* answers 1 */
+int64_t en_x_follow(int64_t id, int64_t route, double speed, int64_t loops) {
+    if (g_w) en_follow(g_w, id, en_x_route_id(route), speed, loops == 0 || loops == 1 ? (int)loops : 2);
+    return 1;
+}
+int64_t en_x_grounded(int64_t id) { return g_w ? en_grounded(g_w, id) : 0; }
+/* 1 if the entity was seen at the end of the last tick */
+int64_t en_x_seen(int64_t id) { return g_w ? en_seen(g_w, id) : 0; }
+
 /* seconds on a monotonic clock, for timing scenes; the kernel never reads it (its time is the dt it is given) */
 double en_x_clock(void) {
     struct timespec t;
