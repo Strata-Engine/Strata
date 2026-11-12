@@ -275,3 +275,12 @@ linear congruential generator in the test) asserted with `Test.assert_*`;
 `test/slots_test.march` does this for the which-chunk-draws rule. The
 existing properties (chunk, slots under random traffic, and others) are
 left as they are, and are worth rewriting the same way.
+
+## S32: a match with two arms on one line does not parse
+
+`fn slot(o : Option(Int)) : Int do match o do Some(s) -> s _ -> -1 end end`
+is "parse error: I was expecting `end` to close the match here" at the
+second arm (met writing `Strata.Population`'s readers). The same match
+with each arm on its own line parses. A one-line match with one arm
+(`match a do (x, _) -> x end`) is fine. Workaround: put each arm on its own
+line.
