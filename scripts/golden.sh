@@ -98,6 +98,8 @@ text-styles:STRATA_SCENE=1 STRATA_LIGHT=4 STRATA_UI=1 STRATA_UI_SHOW=4 DRAWS=6 S
 text-scripts:STRATA_SCENE=1 STRATA_UI=1 STRATA_UI_SHOW=7 DRAWS=6 STRICT=1
 island-cliff:STRATA_SCENE=24 STRATA_ISLAND=1 STRATA_LIGHT=4
 island-cave:STRATA_SCENE=29 STRATA_ISLAND=1 STRATA_LIGHT=4
+forest-border:STRATA_SCENE=128 STRATA_ISLAND=1 STRATA_LIGHT=4
+ruin-slope:STRATA_SCENE=129 STRATA_ISLAND=1 STRATA_LIGHT=4
 '
 # indirect draw calls a frame must issue, whatever the scene holds; a scene
 # with a kind of geometry nowhere in it says DRAWS=n. STRICT=1 holds a scene
