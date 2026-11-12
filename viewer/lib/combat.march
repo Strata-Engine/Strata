@@ -429,4 +429,142 @@ mod StrataViewer.Combat do
     else if slot == 7 do 2 + 10
     else 2 + 13 end end end end end end end end
   end
+
+  -- ── Fire that takes seconds ──────────────────────────────────────────────
+  -- A fireball's burst schedules the cells `fire_changes` names: each catches
+  -- after a delay that grows with its distance from the point and burns for a
+  -- time set by its block, jittered by a hash of the cell. While it burns the
+  -- match shows it as StrataViewer.Fx.embers_for its block (tall grass and ice
+  -- as they are), with flame and smoke; at its end it becomes what fire leaves.
+
+  -- a cell, its block when scheduled, what fire leaves of it, when it catches and goes out (the schedule's clock), whether it has caught
+  type CbBurn = { bn_x : Int, bn_y : Int, bn_z : Int, bn_was : Int, bn_left : Int, bn_catch : Float, bn_end : Float, bn_lit : Bool }
+  -- the cells burning or waiting to, and the schedule's clock (seconds)
+  type CbFire = { cf_burns : List(CbBurn), cf_clock : Float }
+  -- a cell catches, goes out, or (past the cap) burns at once
+  type CbFireEvent = CbCatch(CbBurn) | CbOut(CbBurn) | CbNow(CbBurn)
+
+  doc "No fire."
+  fn fire_none() : CbFire do { cf_burns: Nil, cf_clock: 0.0 } end
+  doc "The most cells burning or waiting to at once; past it a burst's cells burn at once, as before."
+  fn burn_most() : Int do 256 end
+  doc "How long a cell of [block] burns, [h] in 0..1 its jitter: tall grass 11 and ice 13 0.5 to 1 s, grass 3 1 to 2 s, leaves 8 2 to 3 s, wood 7 4 to 6 s; anything else 1 s."
+  fn burn_seconds(block : Int, h : Float) : Float do
+    if block == 11 || block == 13 do 0.5 +. 0.5 *. h
+    else if block == 3 do 1.0 +. h
+    else if block == 8 do 2.0 +. h
+    else if block == 7 do 4.0 +. 2.0 *. h
+    else 1.0 end end end end
+  end
+  doc "How long a cell [metres] from where a fireball burst waits to catch: a quarter second a metre."
+  fn catch_delay(metres : Float) : Float do 0.25 *. metres end
+  doc "How many cells are burning or waiting to."
+  fn burning(f : CbFire) : Int do List.length(f.cf_burns) end
+  doc "The schedule's clock, seconds."
+  fn fire_clock(f : CbFire) : Float do f.cf_clock end
+  doc "When each scheduled cell goes out, in the schedule's order."
+  fn fire_ends(f : CbFire) : List(Float) do List.map(f.cf_burns, fn b -> b.bn_end) end
+  doc "Every scheduled cell as (x, y, z, was, left, lit)."
+  fn fire_cells(f : CbFire) : List((Int, Int, Int, Int, Int, Bool)) do List.map(f.cf_burns, fn b -> (b.bn_x, b.bn_y, b.bn_z, b.bn_was, b.bn_left, b.bn_lit)) end
+
+  doc "An event's kind: 0 a cell catches, 1 it goes out, 2 it burns at once."
+  fn ev_kind(e : CbFireEvent) : Int do
+    match e do
+      CbCatch(_) -> 0
+      CbOut(_) -> 1
+      CbNow(_) -> 2
+    end
+  end
+  pfn ev_burn(e : CbFireEvent) : CbBurn do
+    match e do
+      CbCatch(b) -> b
+      CbOut(b) -> b
+      CbNow(b) -> b
+    end
+  end
+  doc "An event's cell, x."
+  fn ev_x(e : CbFireEvent) : Int do
+    let b = ev_burn(e)
+    b.bn_x
+  end
+  doc "An event's cell, y."
+  fn ev_y(e : CbFireEvent) : Int do
+    let b = ev_burn(e)
+    b.bn_y
+  end
+  doc "An event's cell, z."
+  fn ev_z(e : CbFireEvent) : Int do
+    let b = ev_burn(e)
+    b.bn_z
+  end
+  doc "The block an event's cell held when it was scheduled."
+  fn ev_was(e : CbFireEvent) : Int do
+    let b = ev_burn(e)
+    b.bn_was
+  end
+  doc "What fire leaves of an event's cell."
+  fn ev_left(e : CbFireEvent) : Int do
+    let b = ev_burn(e)
+    b.bn_left
+  end
+
+  pfn scheduled(bs : List(CbBurn), x : Int, y : Int, z : Int) : Bool do List.any(bs, fn b -> b.bn_x == x && b.bn_y == y && b.bn_z == z) end
+  pfn schedule_go(f : CbFire, cs : List((Int, Int, Int, Int)), read : Int -> Int -> Int -> Int, x : Float, y : Float, z : Float, seed : Int, now : List(CbFireEvent)) : (CbFire, List(CbFireEvent)) do
+    match cs do
+      Nil -> (f, List.reverse(now))
+      Cons((cx, cy, cz, left), rest) ->
+        if scheduled(f.cf_burns, cx, cy, cz) do schedule_go(f, rest, read, x, y, z, seed, now)
+        else
+          let was = read(cx, cy, cz)
+          let dx = int_to_float(cx) +. 0.5 -. x
+          let dy = int_to_float(cy) +. 0.5 -. y
+          let dz = int_to_float(cz) +. 0.5 -. z
+          let at = f.cf_clock +. catch_delay(Math.sqrt(dx *. dx +. dy *. dy +. dz *. dz))
+          let h = int_to_float(int_and(Strata.Seed.cell(seed, 33, cx, cy, cz), 1023)) /. 1023.0
+          let b = { bn_x: cx, bn_y: cy, bn_z: cz, bn_was: was, bn_left: left, bn_catch: at, bn_end: at +. burn_seconds(was, h), bn_lit: false }
+          if burning(f) >= burn_most() do schedule_go(f, rest, read, x, y, z, seed, Cons(CbNow(b), now))
+          else schedule_go({ f with cf_burns: List.append(f.cf_burns, [b]) }, rest, read, x, y, z, seed, now) end
+        end
+    end
+  end
+  doc "A fireball bursts at (x, y, z): every cell `fire_changes` names that is not already scheduled is, to catch by its distance and burn by its block. Answers the schedule and the cells past `burn_most` (CbNow: set them to what fire leaves at once). [seed] decides the jitter."
+  fn schedule(f : CbFire, read : Int -> Int -> Int -> Int, x : Float, y : Float, z : Float, seed : Int) : (CbFire, List(CbFireEvent)) do
+    -- nearest first, so the cap keeps the middle of a burst
+    let cs = List.sort_by(fire_changes(read, x, y, z), fn (a, b) -> match (a, b) do
+        ((ax, ay, az, _), (qx, qy, qz, _)) -> d2(ax, ay, az, x, y, z) <= d2(qx, qy, qz, x, y, z)
+      end)
+    schedule_go(f, cs, read, x, y, z, seed, Nil)
+  end
+  pfn d2(cx : Int, cy : Int, cz : Int, x : Float, y : Float, z : Float) : Float do
+    let dx = int_to_float(cx) +. 0.5 -. x
+    let dy = int_to_float(cy) +. 0.5 -. y
+    let dz = int_to_float(cz) +. 0.5 -. z
+    dx *. dx +. dy *. dy +. dz *. dz
+  end
+
+  -- what a burning cell holds: its embers block, or itself where it is not swapped
+  pfn burning_block(was : Int) : Int do
+    let e = StrataViewer.Fx.embers_for(was)
+    if e < 0 do was else e end
+  end
+  pfn step_go(bs : List(CbBurn), read : Int -> Int -> Int -> Int, clock : Float, keep : List(CbBurn), evs : List(CbFireEvent)) : (List(CbBurn), List(CbFireEvent)) do
+    match bs do
+      Nil -> (List.reverse(keep), List.reverse(evs))
+      Cons(b, rest) ->
+        let here = read(b.bn_x, b.bn_y, b.bn_z)
+        if !b.bn_lit do
+          -- changed before it caught (dug, built over): left alone
+          if here != b.bn_was do step_go(rest, read, clock, keep, evs)
+          else if clock >= b.bn_catch do step_go(rest, read, clock, Cons({ b with bn_lit: true }, keep), Cons(CbCatch(b), evs))
+          else step_go(rest, read, clock, Cons(b, keep), evs) end end
+        else if here != burning_block(b.bn_was) do step_go(rest, read, clock, keep, evs)
+        else if clock >= b.bn_end do step_go(rest, read, clock, keep, Cons(CbOut(b), evs))
+        else step_go(rest, read, clock, Cons(b, keep), evs) end end end
+    end
+  end
+  doc "The schedule [dt] seconds on: the cells that catch now (CbCatch: show them burning) and those that go out (CbOut: set them to what fire leaves). A cell no longer holding what it held (before it caught) or its burning block (after) has been changed by something else and leaves the schedule silently. [read] answers a cell's block."
+  fn fire_step(f : CbFire, read : Int -> Int -> Int -> Int, dt : Float) : (CbFire, List(CbFireEvent)) do
+    let clock = f.cf_clock +. dt
+    match step_go(f.cf_burns, read, clock, Nil, Nil) do (bs, evs) -> ({ cf_burns: bs, cf_clock: clock }, evs) end
+  end
 end

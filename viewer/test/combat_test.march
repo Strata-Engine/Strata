@@ -426,4 +426,84 @@ mod StrataViewer.Test.Combat do
       Test.assert_true(Cb.muzzle_reach(18.0, 0.016667) < 1.0, "no further than a fireball goes in a frame, and a little")
     end
   end
+
+  -- ── the burn schedule ──
+  pfn wood_everywhere() : Int -> Int -> Int -> Int do fn (_x, _y, _z) -> 7 end
+  -- the schedule's events for one step, by kind (0 catch, 1 out, 2 now)
+  pfn kinds(evs : List(StrataViewer.Combat.CbFireEvent), k : Int) : Int do List.length(List.filter(evs, fn e -> Cb.ev_kind(e) == k)) end
+  pfn at_cell(evs : List(StrataViewer.Combat.CbFireEvent), x : Int, y : Int, z : Int, k : Int) : Bool do
+    List.any(evs, fn e -> Cb.ev_kind(e) == k && Cb.ev_x(e) == x && Cb.ev_y(e) == y && Cb.ev_z(e) == z)
+  end
+  -- step [f] by [dt] until [k] happens to the cell, answering the clock then (or -1 after [n] steps) and the schedule
+  pfn until_cell(f : StrataViewer.Combat.CbFire, read : Int -> Int -> Int -> Int, dt : Float, x : Int, y : Int, z : Int, k : Int, n : Int) : (Float, StrataViewer.Combat.CbFire) do
+    if n <= 0 do (-1.0, f)
+    else match Cb.fire_step(f, read, dt) do
+      (f2, evs) -> if at_cell(evs, x, y, z, k) do (Cb.fire_clock(f2), f2) else until_cell(f2, read, dt, x, y, z, k, n - 1) end
+    end end
+  end
+  pfn when_cell(f : StrataViewer.Combat.CbFire, read : Int -> Int -> Int -> Int, dt : Float, x : Int, y : Int, z : Int, k : Int, n : Int) : Float do
+    match until_cell(f, read, dt, x, y, z, k, n) do (t, _) -> t end
+  end
+  pfn many(f : StrataViewer.Combat.CbFire, i : Int, nows : Int) : (StrataViewer.Combat.CbFire, Int) do
+    if i >= 10 do (f, nows)
+    else match Cb.schedule(f, wood_everywhere(), 10.5 +. 10.0 *. int_to_float(i), 20.5, 10.5, 5) do (f2, evs) -> many(f2, i + 1, nows + kinds(evs, 2)) end end
+  end
+
+  describe "the burn schedule" do
+    test "how long each block burns, at the ends of its jitter" do
+      Test.assert_true(Cb.burn_seconds(11, 0.0) == 0.5 && Cb.burn_seconds(11, 1.0) == 1.0, "tall grass 0.5 to 1 s")
+      Test.assert_true(Cb.burn_seconds(3, 0.0) == 1.0 && Cb.burn_seconds(3, 1.0) == 2.0, "grass 1 to 2 s")
+      Test.assert_true(Cb.burn_seconds(8, 0.0) == 2.0 && Cb.burn_seconds(8, 1.0) == 3.0, "leaves 2 to 3 s")
+      Test.assert_true(Cb.burn_seconds(7, 0.0) == 4.0 && Cb.burn_seconds(7, 1.0) == 6.0, "wood 4 to 6 s")
+      Test.assert_true(Cb.burn_seconds(13, 0.0) == 0.5 && Cb.burn_seconds(13, 1.0) == 1.0, "ice 0.5 to 1 s")
+      Test.assert_true(Cb.catch_delay(2.0) == 0.5, "0.5 s to catch at 2 m")
+    end
+    test "the centre cell catches on the first step" do
+      match Cb.schedule(Cb.fire_none(), wood_everywhere(), 10.5, 20.5, 10.5, 5) do
+        (f, now) ->
+          Test.assert_eq_int(List.length(now), 0, "nothing burns at once")
+          match Cb.fire_step(f, wood_everywhere(), 1.0 /. 60.0) do (_, evs) -> Test.assert_true(at_cell(evs, 10, 20, 10, 0), "the cell holding the point catches") end
+      end
+    end
+    test "a wood cell 1 m out catches after 0.25 s and goes out between 4.25 and 6.25 s" do
+      match Cb.schedule(Cb.fire_none(), wood_everywhere(), 10.5, 20.5, 10.5, 5) do
+        (f, _) ->
+          let (caught, f1) = until_cell(f, wood_everywhere(), 1.0 /. 60.0, 11, 20, 10, 0, 600)
+          Test.assert_true(caught >= 0.24 && caught <= 0.27, "catches at about 0.25 s")
+          -- it is burning wood once caught: the read answers 22 there from then on
+          let lit = fn (x, y, z) -> if x == 11 && y == 20 && z == 10 do 22 else 7 end
+          let out = when_cell(f1, lit, 1.0 /. 60.0, 11, 20, 10, 1, 600)
+          Test.assert_true(out >= 4.25 && out <= 6.27, "goes out 4 to 6 s after it caught")
+      end
+    end
+    test "a cell already burning is not scheduled again" do
+      match Cb.schedule(Cb.fire_none(), wood_everywhere(), 10.5, 20.5, 10.5, 5) do
+        (f, _) -> match Cb.schedule(f, wood_everywhere(), 10.5, 20.5, 10.5, 5) do
+          (f2, _) -> Test.assert_eq_int(Cb.burning(f2), Cb.burning(f), "the same cells")
+        end
+      end
+    end
+    test "a cell changed while burning is left alone" do
+      match Cb.schedule(Cb.fire_none(), wood_everywhere(), 10.5, 20.5, 10.5, 5) do
+        (f, _) ->
+          -- dug out once it has caught: the read answers 0 there from then on
+          let dug = fn (x, y, z) -> if x == 10 && y == 20 && z == 10 do 0 else 22 end
+          match Cb.fire_step(f, wood_everywhere(), 1.0 /. 60.0) do
+            (f1, _) -> Test.assert_true(when_cell(f1, dug, 1.0 /. 60.0, 10, 20, 10, 1, 600) < 0.0, "never put out: it is not set to what fire leaves")
+          end
+      end
+    end
+    test "past 256 cells the rest burn now" do
+      match many(Cb.fire_none(), 0, 0) do
+        (f, nows) ->
+          Test.assert_eq_int(Cb.burning(f), Cb.burn_most(), "256 burning")
+          Test.assert_true(nows > 0, "the rest burn at once")
+      end
+    end
+    test "the same seed gives the same times" do
+      match (Cb.schedule(Cb.fire_none(), wood_everywhere(), 10.5, 20.5, 10.5, 5), Cb.schedule(Cb.fire_none(), wood_everywhere(), 10.5, 20.5, 10.5, 5)) do
+        ((a, _), (b, _)) -> Test.assert_true(Cb.fire_ends(a) == Cb.fire_ends(b), "equal")
+      end
+    end
+  end
 end
