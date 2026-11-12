@@ -215,3 +215,13 @@ would catch it, with short, long and built strings.
 The text bindings met S17 again (two private externs named `x_stat`, in the
 renderer's and the text module's bindings): the text module's glyph counts
 came back as the renderer's draw-call count. Its externs are prefixed `xt_`.
+
+## S26: a March function cannot fill an array the caller passed in
+
+Native arrays are copy-on-write values: `NativeArray.set_f32(out, i, v)`
+on an array the caller still holds writes a fresh copy, so a March
+`fill(samples, out) : Int` returned 32768 and left the caller's `out` all
+zeros (met in `Strata.Lattice`). Only a C write through the FFI lands in the
+caller's array, which is how `Strata.Noise.field2` and `field3` work.
+Workaround: return the array, or, where an out-parameter API is wanted,
+write the loop in C (`sl_fill` in `native/strata_noise.c`).

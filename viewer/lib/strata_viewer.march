@@ -27,7 +27,7 @@
 -- STRATA_SPRAY=0      no spray from falling water;  STRATA_FOUNTAIN=n  n spray particles a frame ahead of the camera
 -- STRATA_ISLAND=0    the old noise terrain instead of the atlas island (default 1: the island)
 -- STRATA_ATLAS_DIR=d  where the island's atlas is cached (default .march/atlas)
--- STRATA_CHUNK_TIMES=1  time 200 surface chunks of the land in use, print the median and worst, then run as usual
+-- STRATA_CHUNK_TIMES=1  time 200 surface chunks of the land in use, print the median and worst and the air and stone early-outs, then run as usual
 -- STRATA_BREACH=f     scenes 18 and 19: breach the test lake's rim at frame f
 -- STRATA_DRAIN=f      open a shaft in the test lake's floor at frame f
 -- STRATA_SUN2=deg, STRATA_SUN2_AT=f   move the sun to that height at that frame
@@ -138,6 +138,7 @@ mod StrataViewer do
   -- finely that shape is cut into voxels; the viewer runs at 1 m a voxel.
   --
   -- Seeds: Strata.Seed.mix(seed, 1) the base, 2 the hills, 3 the ridges, 4 the island's detail.
+  -- 5 to 10 the island underground: density, tunnels (6, 7), caverns, entrance, rock strength.
   -- Salts for Strata.Seed.cell: 21 trees, 22 / 23 / 24 a lake's centre x, centre z
   -- and radius, 25 lantern posts, 26 tall grass. Salt 27 seeds the snow-patch noise.
   pfn fbm_s() : Strata.Noise.Settings do Ns.settings(0, 3, 2.0, 0.5, 1, 0.0) end
@@ -351,7 +352,7 @@ mod StrataViewer do
   -- sample is lake holds the lake fluid, full voxels from its sandy bed (the
   -- atlas bed) to the atlas level. The sea is sink water up to 40 m.
   --
-  -- Two clamps keep water from standing beside air: land within 3 m of a lake
+  -- Two clamps keep water from standing beside air: land within 4 m of a lake
   -- column stands at least one metre over its level, and beside a river
   -- (damp below 1) the detail only raises the ground.
 
@@ -445,21 +446,21 @@ mod StrataViewer do
   end
 
   -- the highest lake level among the samples whose water can come within
-  -- 3 m of a position: those within 3 m + half a diagonal step of it (a lake
-  -- column's nearest sample is at most that far off), in the 4 x 4 samples
+  -- 4 m of a position: those within 4 m + half a diagonal step of it (a lake
+  -- column's nearest sample is at most that far off), in the 6 x 6 samples
   -- around it; -1 if none is lake
   pfn win_rim(wn : Win, xm : Float, zm : Float) : Float do
     match wn do
       Win(i0, j0, side, st, nn, _, ls, _, _, wet) ->
         if !wet do 0.0 -. 1.0
-        else rim_go(ls, i0, j0, side, st, nn, float_to_int(Math.floor(xm /. st)) + nn / 2, float_to_int(Math.floor(zm /. st)) + nn / 2, xm, zm, 3.0 +. st *. 0.70711, 0, 0.0 -. 1.0) end
+        else rim_go(ls, i0, j0, side, st, nn, float_to_int(Math.floor(xm /. st)) + nn / 2, float_to_int(Math.floor(zm /. st)) + nn / 2, xm, zm, 4.0 +. st *. 0.70711, 0, 0.0 -. 1.0) end
     end
   end
   pfn rim_go(ls : NativeF32Arr, i0 : Int, j0 : Int, side : Int, st : Float, nn : Int, gi : Int, gj : Int, xm : Float, zm : Float, reach : Float, t : Int, best : Float) : Float do
-    if t >= 16 do best
+    if t >= 36 do best
     else
-      let i = gi + t % 4 - 1
-      let j = gj + t / 4 - 1
+      let i = gi + t % 6 - 2
+      let j = gj + t / 6 - 2
       let dx = int_to_float(i - nn / 2) *. st -. xm
       let dz = int_to_float(j - nn / 2) *. st -. zm
       let v = if dx *. dx +. dz *. dz > reach *. reach do 0.0 -. 1.0 else NativeArray.get_f32(ls, (i - i0) + side * (j - j0)) end
@@ -506,25 +507,38 @@ mod StrataViewer do
   end
 
   -- A column at (xm, zm) of a world of [scale] metres a voxel: (ground, lake
-  -- water line, river water line) in voxels; a line is 0 where that water is not.
-  pfn island_col(wn : Win, xm : Float, zm : Float, seed : Int, scale : Float) : (Int, Int, Int) do
+  -- water line, river water line) in voxels, a line 0 where that water is
+  -- not; then the ground in metres before it is cut into voxels, and how
+  -- calm the column must stay: 0 on a lake or river column and within the
+  -- lake rim's reach, else the river damp (1 far from rivers).
+  pfn island_cell(wn : Win, xm : Float, zm : Float, seed : Int, scale : Float) : (Int, Int, Int, Float, Float) do
     match wn do
-      Win(_, _, _, _, _, hs, _, ws, _, _) ->
+      Win(_, _, _, _, _, hs, _, ws, rs, _) ->
         let h = win_bilinear(wn, hs, xm, zm)
         let lake = win_lake(wn, xm, zm)
         let w = win_bilinear(wn, ws, xm, zm)
-        if lake >= 0.0 do (vox(h, scale), vox(lake, scale), 0)
+        if lake >= 0.0 do (vox(h, scale), vox(lake, scale), 0, int_to_float(vox(h, scale)) *. scale, 0.0)
         else if w >= 1.0 do
-          let top = match wn do Win(_, _, _, _, _, _, _, _, rs, _) -> river_surface(rs, xm, zm, 1000000.0, h) end
+          let top = river_surface(rs, xm, zm, 1000000.0, h)
           let line = vox(top, scale)
           let bed = vox(top -. fmin(1.5, w /. 6.0), scale)
-          (if bed < line do bed else line - 1 end, 0, line)
+          let g = if bed < line do bed else line - 1 end
+          (g, 0, line, int_to_float(g) *. scale, 0.0)
         else
           let rim = win_rim(wn, xm, zm)
-          let hm = h +. damped(wn, xm, zm, seed)
-          (vox(if rim >= 0.0 && hm < rim +. 1.0 do rim +. 1.0 else hm end, scale), 0, 0)
+          -- as `damped`, off a lake: detail times the river damp, never negative beside a river
+          let dm = river_damp(rs, xm, zm, 1.0)
+          let v = detail_raw(xm, zm, seed) *. dm
+          let hm = h +. (if dm < 1.0 && v < 0.0 do 0.0 else v end)
+          let top = if rim >= 0.0 && hm < rim +. 1.0 do rim +. 1.0 else hm end
+          (vox(top, scale), 0, 0, top, if rim >= 0.0 do 0.0 else dm end)
         end end
     end
+  end
+
+  -- the column's (ground, lake line, river line) in voxels
+  pfn island_col(wn : Win, xm : Float, zm : Float, seed : Int, scale : Float) : (Int, Int, Int) do
+    match island_cell(wn, xm, zm, seed, scale) do (g, l, r, _, _) -> (g, l, r) end
   end
 
   doc "The island column at whole-voxel column (wx, wz) of a world of [scale] metres a voxel: (ground, lake water line, river water line) in voxels, a line 0 where there is no such water."
@@ -534,48 +548,474 @@ mod StrataViewer do
     island_col(island_window(a, xm, zm, xm, zm), xm, zm, seed, scale)
   end
 
-  pfn island_go(wn : Win, hs : NativeIntArr, ws : NativeIntArr, vs : NativeIntArr, x0 : Int, z0 : Int, seed : Int, scale : Float, i : Int) : (NativeIntArr, NativeIntArr, NativeIntArr) do
-    if i >= 1024 do (hs, ws, vs)
-    else
-      match island_col(wn, int_to_float(x0 + i % 32) *. scale, int_to_float(z0 + i / 32) *. scale, seed, scale) do
-        (h, lake, river) -> island_go(wn, NativeArray.set_int(hs, i, h), NativeArray.set_int(ws, i, lake), NativeArray.set_int(vs, i, river), x0, z0, seed, scale, i + 1)
-      end
-    end
-  end
-
   -- channel water (sink) over a sandy bed, a lake column as before, else the noise terrain's blocks
   pfn island_block(wx : Int, wy : Int, wz : Int, h : Int, lake : Int, river : Int, sv : Int, scale : Float, seed : Int) : Int do
     if river > 0 do (if wy > h do (if wy <= river || wy <= sv do 5 else 0 end) else if wy >= h - 3 do 4 else 1 end end)
     else block_at(wx, wy, wz, h, lake, sv, scale, seed) end
   end
 
-  pfn island_fill(a : NativeI32Arr, hs : NativeIntArr, ws : NativeIntArr, vs : NativeIntArr, x0 : Int, y0 : Int, z0 : Int, sv : Int, scale : Float, seed : Int, i : Int) : NativeI32Arr do
-    if i >= 32768 do a
-    else island_fill(NativeArray.set_i32(a, i, island_block(x0 + i % 32, y0 + i / 1024, z0 + (i / 32) % 32, NativeArray.get_int(hs, i % 1024), NativeArray.get_int(ws, i % 1024), NativeArray.get_int(vs, i % 1024), sv, scale, seed)), hs, ws, vs, x0, y0, z0, sv, scale, seed, i + 1) end
+  -- ── Under the island: density, caves, cliffs, the surface ───────────────
+  -- A land column's 2D height H (the column above, before voxels) is first
+  -- relaxed thermally: 4 passes over the chunk and a halo of 8 columns (twice
+  -- the passes, so every chunk relaxes a column alike), talus 25 to 55
+  -- degrees from a rock-strength noise (Seed.mix(seed, 10), 1/80 cycles per
+  -- metre), so the steepest slopes shed scree and strong rock keeps its
+  -- cliffs. The density is then
+  --
+  --   (H - y) * squash + A * calm * n'(x, y, z)      squash 1, A 12 m
+  --
+  -- n the fBm of Seed.mix(seed, 5) at 1/60 cycles per metre (3 octaves),
+  -- stretched 4 times upright, on the Strata.Lattice samples, filled, so the
+  -- density only falls going up a column; n' is n shaped (`shaped`): only
+  -- raising where calm is under 1 (beside water) or H - A is under the sea,
+  -- and a positive n quartered above H. calm is 1 far from water and the
+  -- river damp nearer it. Caves carve where min(tunnel, cavern) < 0 per voxel, from
+  -- three filled fields: tunnel = max(|a|, |b|) - 0.08 f (a, b the
+  -- OpenSimplex2S of Seed.mix(seed, 6) and 7 at 1/25), cavern = (1 - 0.45 f)
+  -- - c (c of Seed.mix(seed, 8) at 1/90), f the region's cave factor (0 in
+  -- the sea), bilinear per column. Caves stay under a 6 m roof of density
+  -- except where the entrance noise (Seed.mix(seed, 9), 1/120, per column)
+  -- passes 0.6, where they are cut up through the surface; they keep
+  -- above the sea (so it never fills them) and within A + 40 m of H (so the
+  -- stone early-out is exact), and are only cut where calm is 1. Lake and
+  -- river columns (and land within 4 m of a lake, calm 0) are as before: no
+  -- noise, no caves, their fill exactly Task 6's. In a chunk where a cave
+  -- was cut, solid not joined through solid to the chunk's faces (slivers
+  -- where the cave fields cross) is turned to air (`drop_islands`).
+  --
+  -- Strata.Surface scans the density: depth 0 is grass (sand under 42 m or
+  -- under the sea's line, snow over 95 m), 1 to 3 dirt (sand where the top
+  -- would be sand), deeper and ceilings stone; air at or under the sea is
+  -- sea water. Tall grass and posts stand on grass inside the chunk, trees
+  -- on the column's density surface, found from the same lattice noise.
+  -- A chunk wholly above the highest H + A (and the water, and 8 m for
+  -- trees) is air and one wholly below the lowest H - A - 40 m is stone,
+  -- decided from the atlas samples alone before any column is made.
+
+  pfn amp() : Float do 12.0 end
+  pfn squash() : Float do 1.0 end
+  pfn dens_s() : Strata.Noise.Settings do Ns.settings(0, 3, 2.0, 0.5, 1, 0.0) end
+  pfn tunnel_s() : Strata.Noise.Settings do Ns.settings(1, 1, 2.0, 0.5, 0, 0.0) end
+  pfn single_s() : Strata.Noise.Settings do Ns.settings(0, 1, 2.0, 0.5, 0, 0.0) end
+  pfn rock_s() : Strata.Noise.Settings do Ns.settings(0, 2, 2.0, 0.5, 1, 0.0) end
+
+  doc "The cave factor of each of the island's regions, by region id: it scales the cave thresholds (0 none, 1 the default). All 1.0 for now."
+  fn cave_factors(region_count : Int) : List(Float) do List.repeat(1.0, region_count) end
+
+  pfn region_factor(fs : List(Float), r : Int) : Float do
+    if r < 0 do 0.0
+    else match List.nth_opt(fs, r) do
+        Some(f) -> f
+        None -> 1.0
+      end end
   end
 
-  -- 1 where a column holds lake or river water, so no tree stands there
-  pfn wet_go(ws : NativeIntArr, vs : NativeIntArr, i : Int, out : NativeIntArr) : NativeIntArr do
-    if i >= 1024 do out else wet_go(ws, vs, i + 1, NativeArray.set_int(out, i, NativeArray.get_int(ws, i) + NativeArray.get_int(vs, i))) end
+  -- a lattice field: 9 x 5 x 9 samples (4, 8, 4) voxels apart from the chunk's corner
+  pfn lattice_field(s : Strata.Noise.Settings, seed : Int, freq : Float, x0m : Float, y0m : Float, z0m : Float, scale : Float) : NativeF32Arr do
+    let out = NativeArray.make_f32(405, 0.0)
+    if Ns.field3(s, seed, freq, x0m, y0m, z0m, 4.0 *. scale, 8.0 *. scale, 4.0 *. scale, 9, 5, 9, out) == 405 do out else out end
+  end
+
+  -- The density noise's lattice samples. Its y is a quarter of the world's
+  -- (the noise is stretched 4 times upright): A times its steepest slope up
+  -- a column, 12 x 0.25 / 4 = 0.75 a metre, stays under squash, so the
+  -- density only falls going up a column and no solid hangs over air from
+  -- the noise alone (overhangs come from the caves).
+  pfn dens_field(seed : Int, x0m : Float, y0m : Float, z0m : Float, scale : Float) : NativeF32Arr do
+    let out = NativeArray.make_f32(405, 0.0)
+    if Ns.field3(dens_s(), Strata.Seed.mix(seed, 5), 1.0 /. 60.0, x0m, 0.25 *. y0m, z0m, 4.0 *. scale, 2.0 *. scale, 4.0 *. scale, 9, 5, 9, out) == 405 do out else out end
+  end
+
+  -- lattice samples filled to the chunk's 32768 voxels
+  pfn lattice_fill(s : NativeF32Arr) : NativeF32Arr do
+    let out = NativeArray.make_f32(32768, 0.0)
+    if Strata.Lattice.fill(s, out) == 32768 do out else out end
+  end
+
+  -- the cave factors of the 9 x 9 sample columns
+  pfn factors_go(a : Strata.Atlas.Atlas, fs : List(Float), x0m : Float, z0m : Float, scale : Float, out : NativeF32Arr, q : Int) : NativeF32Arr do
+    if q >= 81 do out
+    else factors_go(a, fs, x0m, z0m, scale, NativeArray.set_f32(out, q, region_factor(fs, Strata.Atlas.region_at(a, x0m +. int_to_float(4 * (q % 9)) *. scale, z0m +. int_to_float(4 * (q / 9)) *. scale))), q + 1) end
+  end
+
+  -- a column's cave factor: bilinear between the 9 x 9 sample columns' factors
+  pfn factor_at(fac : NativeF32Arr, x : Int, z : Int) : Float do
+    let i = x / 4
+    let k = z / 4
+    let tx = int_to_float(x % 4) *. 0.25
+    let tz = int_to_float(z % 4) *. 0.25
+    let a0 = NativeArray.get_f32(fac, i + 9 * k) *. (1.0 -. tx) +. NativeArray.get_f32(fac, i + 1 + 9 * k) *. tx
+    let a1 = NativeArray.get_f32(fac, i + 9 * (k + 1)) *. (1.0 -. tx) +. NativeArray.get_f32(fac, i + 1 + 9 * (k + 1)) *. tx
+    a0 *. (1.0 -. tz) +. a1 *. tz
+  end
+  pfn factor_cols(fac : NativeF32Arr, out : NativeF32Arr, c : Int) : NativeF32Arr do
+    if c >= 1024 do out else factor_cols(fac, NativeArray.set_f32(out, c, factor_at(fac, c % 32, c / 32)), c + 1) end
+  end
+
+  -- a lattice field at the row just above the chunk (local y 32, the samples' top layer), bilinear
+  pfn top_at(s : NativeF32Arr, x : Int, z : Int) : Float do
+    let i = x / 4
+    let k = z / 4
+    let tx = int_to_float(x % 4) *. 0.25
+    let tz = int_to_float(z % 4) *. 0.25
+    let a0 = NativeArray.get_f32(s, i + 9 * (4 + 5 * k)) *. (1.0 -. tx) +. NativeArray.get_f32(s, i + 1 + 9 * (4 + 5 * k)) *. tx
+    let a1 = NativeArray.get_f32(s, i + 9 * (4 + 5 * (k + 1))) *. (1.0 -. tx) +. NativeArray.get_f32(s, i + 1 + 9 * (4 + 5 * (k + 1))) *. tx
+    a0 *. (1.0 -. tz) +. a1 *. tz
+  end
+
+  -- The density noise as it applies at height ym over a column (H, calm):
+  -- only raising where calm is under 1 or where H - A is under the sea (so
+  -- no pit fills with sea inland), and above H a positive value quartered,
+  -- so A / 4 times its steepest slope (0.25 a metre on the lattice) stays
+  -- under squash and the density never grows going up above H: no solid
+  -- floats over the hill.
+  pfn shaped(n : Float, h : Float, cm : Float, ym : Float) : Float do
+    let low = h -. amp() < int_to_float(sea())
+    let n1 = if n >= 0.0 do n else if cm < 1.0 do 0.0 else if low do 0.0 else n end end end
+    if ym > h && n1 > 0.0 do 0.25 *. n1 else n1 end
+  end
+
+  -- the density of one voxel at height ym from its column (H, calm, entrance,
+  -- cave factor f) and its filled noise n and cave fields a, b, c; -1 where a cave is cut
+  pfn voxel_density(h : Float, cm : Float, en : Float, f : Float, n : Float, ta : Float, tb : Float, cav : Float, ym : Float, seam : Float) : Float do
+    let d = (h -. ym) *. squash() +. amp() *. cm *. shaped(n, h, cm, ym)
+    let carve = fmin(fmax(Math.abs(ta), Math.abs(tb)) -. 0.08 *. f, (1.0 -. 0.45 *. f) -. cav)
+    if carve >= 0.0 do d
+    else if cm < 1.0 do d
+    else if ym <= seam do d
+    else if ym < h -. amp() -. 40.0 do d
+    else if d > 6.0 do 0.0 -. 1.0
+    -- where the entrance noise passes 0.6 the whole cave volume is cut, up
+    -- through the surface: a cut stopped 2 m under H leaves roofs a voxel
+    -- thick that break into free pieces (17 voxels round the cave scene, 4
+    -- still after drop_islands, where they touch a chunk's face)
+    else if en > 0.6 do 0.0 -. 1.0
+    else d end end end end end end
+  end
+
+  -- the chunk's per-column values (H, calm, entrance, cave factor) and its filled fields
+  type Fields = Fields(NativeF32Arr, NativeF32Arr, NativeF32Arr, NativeF32Arr, NativeF32Arr, NativeF32Arr, NativeF32Arr, NativeF32Arr)
+
+  pfn dens_go(fl : Fields, out : NativeF32Arr, y0m : Float, scale : Float, seam : Float) : NativeF32Arr do
+    match fl do
+      Fields(hs, cms, ens, fs, dn, da, db, dc) -> dens_loop(hs, cms, ens, fs, dn, da, db, dc, out, y0m, scale, seam, 0)
+    end
+  end
+  pfn dens_loop(hs : NativeF32Arr, cms : NativeF32Arr, ens : NativeF32Arr, fs : NativeF32Arr, dn : NativeF32Arr, da : NativeF32Arr, db : NativeF32Arr, dc : NativeF32Arr, out : NativeF32Arr, y0m : Float, scale : Float, seam : Float, i : Int) : NativeF32Arr do
+    if i >= 32768 do out
+    else
+      let c = i % 1024
+      let d = voxel_density(NativeArray.get_f32(hs, c), NativeArray.get_f32(cms, c), NativeArray.get_f32(ens, c), NativeArray.get_f32(fs, c), NativeArray.get_f32(dn, i), NativeArray.get_f32(da, i), NativeArray.get_f32(db, i), NativeArray.get_f32(dc, i), y0m +. int_to_float(i / 1024) *. scale, seam)
+      dens_loop(hs, cms, ens, fs, dn, da, db, dc, NativeArray.set_f32(out, i, d), y0m, scale, seam, i + 1)
+    end
+  end
+
+  -- the density of the row just above the chunk, from the samples' top layer
+  pfn above_go(hs : NativeF32Arr, cms : NativeF32Arr, ens : NativeF32Arr, fs : NativeF32Arr, ns : NativeF32Arr, ta : NativeF32Arr, tb : NativeF32Arr, cav : NativeF32Arr, out : NativeF32Arr, ym : Float, seam : Float, c : Int) : NativeF32Arr do
+    if c >= 1024 do out
+    else
+      let x = c % 32
+      let z = c / 32
+      let d = voxel_density(NativeArray.get_f32(hs, c), NativeArray.get_f32(cms, c), NativeArray.get_f32(ens, c), NativeArray.get_f32(fs, c), top_at(ns, x, z), top_at(ta, x, z), top_at(tb, x, z), top_at(cav, x, z), ym, seam)
+      above_go(hs, cms, ens, fs, ns, ta, tb, cav, NativeArray.set_f32(out, c, d), ym, seam, c + 1)
+    end
+  end
+
+  -- Cave islands: where the cave fields cross, the solid they leave can be a
+  -- voxel or two held by nothing but an edge. A flood from every solid voxel
+  -- on the chunk's faces (what lies beyond is unknown, so a face counts as
+  -- held) through 6-connected solid; what it does not reach is turned to
+  -- air. Only run on a chunk where a cave was cut. The flood is one
+  -- self-recursive loop: neighbour d (0..5) of voxel i a call, the next
+  -- voxel popped at d = 6.
+  pfn isle_seed(d : NativeF32Arr, seen : NativeIntArr, st : NativeIntArr, sp : Int, i : Int) : (NativeIntArr, NativeIntArr, Int) do
+    if i >= 32768 do (seen, st, sp)
+    else
+      let x = i % 32
+      let z = (i / 32) % 32
+      let y = i / 1024
+      let face = x == 0 || x == 31 || z == 0 || z == 31 || y == 0 || y == 31
+      let take = if !face do false else NativeArray.get_f32(d, i) >= 0.0 end
+      if take do isle_seed(d, NativeArray.set_int(seen, i, 1), NativeArray.set_int(st, sp, i), sp + 1, i + 1)
+      else isle_seed(d, seen, st, sp, i + 1) end
+    end
+  end
+  pfn isle_flood(d : NativeF32Arr, seen : NativeIntArr, st : NativeIntArr, sp : Int, i : Int, k : Int) : NativeIntArr do
+    if k >= 6 do
+      if sp <= 0 do seen else isle_flood(d, seen, st, sp - 1, NativeArray.get_int(st, sp - 1), 0) end
+    else
+      let x = i % 32
+      let z = (i / 32) % 32
+      let y = i / 1024
+      let ok = if k == 0 do x > 0 else if k == 1 do x < 31 else if k == 2 do z > 0 else if k == 3 do z < 31 else if k == 4 do y > 0 else y < 31 end end end end end
+      let q = if k == 0 do i - 1 else if k == 1 do i + 1 else if k == 2 do i - 32 else if k == 3 do i + 32 else if k == 4 do i - 1024 else i + 1024 end end end end end
+      let take = if !ok do false else if NativeArray.get_f32(d, q) < 0.0 do false else NativeArray.get_int(seen, q) == 0 end end
+      if take do isle_flood(d, NativeArray.set_int(seen, q, 1), NativeArray.set_int(st, sp, q), sp + 1, i, k + 1)
+      else isle_flood(d, seen, st, sp, i, k + 1) end
+    end
+  end
+  pfn isle_drop(d : NativeF32Arr, seen : NativeIntArr, i : Int) : NativeF32Arr do
+    if i >= 32768 do d
+    else
+      let drop = if NativeArray.get_f32(d, i) < 0.0 do false else NativeArray.get_int(seen, i) == 0 end
+      isle_drop(if drop do NativeArray.set_f32(d, i, 0.0 -. 1.0) else d end, seen, i + 1)
+    end
+  end
+  pfn drop_islands(d : NativeF32Arr) : NativeF32Arr do
+    match isle_seed(d, NativeArray.make_int(32768, 0), NativeArray.make_int(32768, 0), 0, 0) do
+      (seen, st, sp) -> isle_drop(d, isle_flood(d, seen, st, sp, 0, 6), 0)
+    end
+  end
+  -- whether any voxel of the chunk was cut by a cave (voxel_density gives exactly -1 there)
+  pfn any_cut(d : NativeF32Arr, i : Int) : Bool do
+    if i >= 32768 do false else if NativeArray.get_f32(d, i) == 0.0 -. 1.0 do true else any_cut(d, i + 1) end end
+  end
+
+  -- a voxel's block from its depth under the surface (Strata.Surface), its world y and the sea
+  pfn material(depth : Int, wy : Int, sv : Int, scale : Float, wet : Bool) : Int do
+    if depth < 0 do (if wy <= sv do 5 else 0 end)
+    else
+      let ym = int_to_float(wy) *. scale
+      let sandy = if wet do true else ym < 42.0 end
+      if depth == 0 do (if sandy do 4 else if ym > 95.0 do 6 else 3 end end)
+      else if depth <= 3 do (if sandy do 4 else 2 end)
+      else 1 end end
+    end
+  end
+
+  -- The thermal patch reaches past the chunk by twice the pass count: a
+  -- pass moves material between neighbours, so what a column holds after it
+  -- depends on columns two away, and after 4 passes on columns 8 away. With
+  -- that halo a column's relaxed height is the same whichever patch it is
+  -- relaxed in, so chunks agree along their seams.
+  pfn passes() : Int do 4 end
+  pfn halo() : Int do 2 * passes() end
+
+  -- The columns of an area 32 x 32 from (x0, z0) and its halo, side = 32 + 2 halo:
+  -- H in metres and calm; and for the area's own 32 x 32, ground, lake and river lines.
+  type Cols3 = Cols3(NativeF32Arr, NativeF32Arr, NativeIntArr, NativeIntArr, NativeIntArr)
+  pfn cols3_go(wn : Win, x0 : Int, z0 : Int, seed : Int, scale : Float, t : Int, hm : NativeF32Arr, cm : NativeF32Arr, gs : NativeIntArr, ls : NativeIntArr, rs : NativeIntArr) : Cols3 do
+    let side = 32 + 2 * halo()
+    if t >= side * side do Cols3(hm, cm, gs, ls, rs)
+    else
+      let x = t % side - halo()
+      let z = t / side - halo()
+      match island_cell(wn, int_to_float(x0 + x) *. scale, int_to_float(z0 + z) *. scale, seed, scale) do
+        (g, l, r, h, c) ->
+          let hm2 = NativeArray.set_f32(hm, t, h)
+          let cm2 = NativeArray.set_f32(cm, t, c)
+          if x >= 0 && x <= 31 && z >= 0 && z <= 31 do
+            let k = x + 32 * z
+            cols3_go(wn, x0, z0, seed, scale, t + 1, hm2, cm2, NativeArray.set_int(gs, k, g), NativeArray.set_int(ls, k, l), NativeArray.set_int(rs, k, r))
+          else cols3_go(wn, x0, z0, seed, scale, t + 1, hm2, cm2, gs, ls, rs) end
+      end
+    end
+  end
+
+  -- talus angles in degrees, 25 to 55, from the rock-strength noise in [-1, 1]
+  pfn talus_go(a : NativeF32Arr, k : Int, cnt : Int) : NativeF32Arr do
+    if k >= cnt do a else talus_go(NativeArray.set_f32(a, k, 40.0 +. 15.0 *. NativeArray.get_f32(a, k)), k + 1, cnt) end
+  end
+
+  pfn span_go(a : NativeF32Arr, k : Int, cnt : Int, lo : Float, hi : Float) : (Float, Float) do
+    if k >= cnt do (lo, hi)
+    else
+      let v = NativeArray.get_f32(a, k)
+      span_go(a, k + 1, cnt, fmin(v, lo), fmax(v, hi))
+    end
+  end
+
+  -- the area's own H and calm (32 x 32): the relaxed heights, then kept within
+  -- the halo patch's range (a pass can overshoot into a one-column pit); calm-0 columns as they were
+  pfn inner_go(hm : NativeF32Arr, hr : NativeF32Arr, cm : NativeF32Arr, lo : Float, hi : Float, hs : NativeF32Arr, cs : NativeF32Arr, c : Int) : (NativeF32Arr, NativeF32Arr) do
+    if c >= 1024 do (hs, cs)
+    else
+      let t = (c % 32 + halo()) + (32 + 2 * halo()) * (c / 32 + halo())
+      let calm = NativeArray.get_f32(cm, t)
+      let h = if calm <= 0.0 do NativeArray.get_f32(hm, t) else fmin(hi, fmax(lo, NativeArray.get_f32(hr, t))) end
+      inner_go(hm, hr, cm, lo, hi, NativeArray.set_f32(hs, c, h), NativeArray.set_f32(cs, c, calm), c + 1)
+    end
+  end
+
+  -- The area 32 x 32 from whole-voxel column (x0, z0): its relaxed H and calm,
+  -- and its ground, lake and river lines (voxels).
+  type Area = Area(NativeF32Arr, NativeF32Arr, NativeIntArr, NativeIntArr, NativeIntArr)
+  pfn area(a : Strata.Atlas.Atlas, scale : Float, x0 : Int, z0 : Int, seed : Int) : Area do
+    let side = 32 + 2 * halo()
+    let cnt = side * side
+    let x0m = int_to_float(x0) *. scale
+    let z0m = int_to_float(z0) *. scale
+    let hw = int_to_float(halo()) *. scale
+    let wn = island_window(a, x0m -. hw, z0m -. hw, x0m +. 31.0 *. scale +. hw, z0m +. 31.0 *. scale +. hw)
+    match cols3_go(wn, x0, z0, seed, scale, 0, NativeArray.make_f32(cnt, 0.0), NativeArray.make_f32(cnt, 0.0), NativeArray.make_int(1024, 0), NativeArray.make_int(1024, 0), NativeArray.make_int(1024, 0)) do
+      Cols3(hm, cm, gs, ls, rs) ->
+        let tal = NativeArray.make_f32(cnt, 0.0)
+        let tal2 = if Ns.field2(rock_s(), Strata.Seed.mix(seed, 10), 1.0 /. 80.0, x0m -. hw, z0m -. hw, scale, side, side, tal) == cnt do talus_go(tal, 0, cnt) else tal end
+        let hr = Strata.Thermal.relax(hm, side, scale, tal2, passes())
+        match span_go(hm, 0, cnt, 1000000.0, 0.0 -. 1000000.0) do
+          (lo, hi) ->
+            match inner_go(hm, hr, cm, lo, hi, NativeArray.make_f32(1024, 0.0), NativeArray.make_f32(1024, 0.0), 0) do
+              (hs, cms) -> Area(hs, cms, gs, ls, rs)
+            end
+        end
+    end
+  end
+
+  doc "The island's thermally relaxed 2D heights H (metres) of the 32 x 32 columns from whole-voxel column (x0, z0), index x + 32 * z: what the density is built on. Any (x0, z0), not only a chunk's corner."
+  fn relaxed_heights(a : Strata.Atlas.Atlas, scale : Float, x0 : Int, z0 : Int, seed : Int) : NativeF32Arr do
+    match area(a, scale, x0, z0, seed) do Area(hs, _, _, _, _) -> hs end
+  end
+
+  -- the lattice noise on the rows of one column, rows r0..r0 + cnt - 1 (8 voxels apart), bilinear between its four sample columns
+  pfn rows_go(seed : Int, gx : Int, gz : Int, tx : Float, tz : Float, r0 : Int, scale : Float, out : NativeF32Arr, k : Int, cnt : Int) : NativeF32Arr do
+    if k >= cnt do out
+    else
+      -- the density noise is stretched 4 times upright (dens_field)
+      let ym = 0.25 *. int_to_float(8 * (r0 + k)) *. scale
+      let s = Strata.Seed.mix(seed, 5)
+      let x0 = int_to_float(gx) *. scale
+      let x1 = int_to_float(gx + 4) *. scale
+      let z0 = int_to_float(gz) *. scale
+      let z1 = int_to_float(gz + 4) *. scale
+      let a0 = Ns.sample3(dens_s(), s, 1.0 /. 60.0, x0, ym, z0) *. (1.0 -. tx) +. Ns.sample3(dens_s(), s, 1.0 /. 60.0, x1, ym, z0) *. tx
+      let a1 = Ns.sample3(dens_s(), s, 1.0 /. 60.0, x0, ym, z1) *. (1.0 -. tx) +. Ns.sample3(dens_s(), s, 1.0 /. 60.0, x1, ym, z1) *. tx
+      rows_go(seed, gx, gz, tx, tz, r0, scale, NativeArray.set_f32(out, k, a0 *. (1.0 -. tz) +. a1 *. tz), k + 1, cnt)
+    end
+  end
+  pfn top_go(rows : NativeF32Arr, r0 : Int, h : Float, cm : Float, scale : Float, y : Int, low : Int) : Int do
+    if y < low do low
+    else
+      let r = fdiv(y, 8)
+      let t = int_to_float(y - 8 * r) *. 0.125
+      let n0 = NativeArray.get_f32(rows, r - r0)
+      let n = n0 +. (NativeArray.get_f32(rows, r - r0 + 1) -. n0) *. t
+      let ym = int_to_float(y) *. scale
+      if (h -. ym) *. squash() +. amp() *. cm *. shaped(n, h, cm, ym) >= 0.0 do y else top_go(rows, r0, h, cm, scale, y - 1, low) end
+    end
+  end
+
+  doc "The highest solid voxel of an island column's density (caves aside), at whole-voxel column (wx, wz) with 2D height h metres and calm cm: where a tree stands."
+  fn density_top(seed : Int, wx : Int, wz : Int, h : Float, cm : Float, scale : Float) : Int do
+    let gx = fdiv(wx, 4) * 4
+    let gz = fdiv(wz, 4) * 4
+    let hi = vox(h +. amp(), scale) + 1
+    let low = vox(h -. amp(), scale) - 1
+    let r0 = fdiv(low, 8)
+    let cnt = fdiv(hi, 8) - r0 + 2
+    let rows = rows_go(seed, gx, gz, int_to_float(wx - gx) *. 0.25, int_to_float(wz - gz) *. 0.25, r0, scale, NativeArray.make_f32(cnt, 0.0), 0, cnt)
+    top_go(rows, r0, h, cm, scale, hi, low)
+  end
+
+  -- where trees may stand: the density top of each tree column, else far below
+  pfn bases_go(hs : NativeF32Arr, cms : NativeF32Arr, ens : NativeF32Arr, ls : NativeIntArr, rs : NativeIntArr, x0 : Int, z0 : Int, seed : Int, scale : Float, out : NativeIntArr, c : Int) : NativeIntArr do
+    if c >= 1024 do out
+    else
+      let x = c % 32
+      let z = c / 32
+      let inside = x >= 2 && x <= 29 && z >= 2 && z <= 29
+      let ok = if !inside do false
+        else if NativeArray.get_int(ls, c) + NativeArray.get_int(rs, c) > 0 do false
+        else if NativeArray.get_f32(ens, c) > 0.6 do false
+        else roll(x0 + x, z0 + z, seed, 21) > 0.988 end end end
+      let b = if ok do density_top(seed, x0 + x, z0 + z, NativeArray.get_f32(hs, c), NativeArray.get_f32(cms, c), scale) else 0 - 100000 end
+      bases_go(hs, cms, ens, ls, rs, x0, z0, seed, scale, NativeArray.set_int(out, c, b), c + 1)
+    end
+  end
+
+  -- lake and river columns get Task 6's fill; tall grass and posts on grass
+  pfn finish_go(m : NativeI32Arr, gs : NativeIntArr, ls : NativeIntArr, rs : NativeIntArr, x0 : Int, y0 : Int, z0 : Int, sv : Int, scale : Float, seed : Int, i : Int) : NativeI32Arr do
+    if i >= 32768 do m
+    else
+      let c = i % 1024
+      let wx = x0 + c % 32
+      let wz = z0 + c / 32
+      let wy = y0 + i / 1024
+      let l = NativeArray.get_int(ls, c)
+      let r = NativeArray.get_int(rs, c)
+      if l > 0 || r > 0 do
+        finish_go(NativeArray.set_i32(m, i, island_block(wx, wy, wz, NativeArray.get_int(gs, c), l, r, sv, scale, seed)), gs, ls, rs, x0, y0, z0, sv, scale, seed, i + 1)
+      else if i < 1024 do finish_go(m, gs, ls, rs, x0, y0, z0, sv, scale, seed, i + 1)
+      else if NativeArray.get_i32(m, i) != 0 do finish_go(m, gs, ls, rs, x0, y0, z0, sv, scale, seed, i + 1)
+      else if NativeArray.get_i32(m, i - 1024) != 3 do finish_go(m, gs, ls, rs, x0, y0, z0, sv, scale, seed, i + 1)
+      else
+        let hm = int_to_float(wy - 1) *. scale
+        let deco = if has_post(wx, wz, hm, seed) do 12 else if grassy(hm) && roll(wx, wz, seed, 26) > 0.86 do 11 else 0 end end
+        finish_go(if deco > 0 do NativeArray.set_i32(m, i, deco) else m end, gs, ls, rs, x0, y0, z0, sv, scale, seed, i + 1)
+      end end end end
+    end
+  end
+
+  -- the early-out bounds from the atlas samples over a chunk's footprint, its
+  -- thermal halo and one sample beyond: (lowest H, highest H, highest water),
+  -- metres. Every column of the thermal patch lies within 6 m of detail (and
+  -- 2.5 m of channel) of these samples and the rim clamp within a metre of
+  -- the highest lake level; relaxed heights are clamped to the patch's range.
+  pfn quick_bounds(a : Strata.Atlas.Atlas, x0m : Float, z0m : Float, scale : Float) : (Float, Float, Float) do
+    let st = Strata.Atlas.step(a)
+    let nn = Strata.Atlas.n(a)
+    -- the thermal halo's columns, and one sample beyond them
+    let m = float_to_int(Math.ceil(int_to_float(halo()) *. scale /. st)) + 1
+    let i0 = float_to_int(Math.floor(x0m /. st)) + nn / 2 - m
+    let j0 = float_to_int(Math.floor(z0m /. st)) + nn / 2 - m
+    let side = float_to_int(Math.ceil(32.0 *. scale /. st)) + 1 + 2 * m
+    match span_go(Strata.Atlas.window(a, 0, i0, j0, side), 0, side * side, 1000000.0, 0.0 -. 1000000.0) do
+      (lo, hi) ->
+        match span_go(Strata.Atlas.window(a, 2, i0, j0, side), 0, side * side, 1000000.0, 0.0 -. 1000000.0) do
+          (_, lake) -> (lo -. 8.0, fmax(hi +. 6.0, lake +. 1.0), fmax(lake, int_to_float(sea())))
+        end
+    end
+  end
+
+  pfn island_full(a : Strata.Atlas.Atlas, scale : Float, cx : Int, cy : Int, cz : Int, seed : Int) : Strata.Chunk.Chunk do
+    let x0 = cx * 32
+    let y0 = cy * 32
+    let z0 = cz * 32
+    let sv = sea_v(scale)
+    let x0m = int_to_float(x0) *. scale
+    let y0m = int_to_float(y0) *. scale
+    let z0m = int_to_float(z0) *. scale
+    match area(a, scale, x0, z0, seed) do
+      Area(hs, cms, gs, ls, rs) ->
+        let ens0 = NativeArray.make_f32(1024, 0.0)
+        let ens = if Ns.field2(single_s(), Strata.Seed.mix(seed, 9), 1.0 /. 120.0, x0m, z0m, scale, 32, 32, ens0) == 1024 do ens0 else ens0 end
+        let ns = dens_field(seed, x0m, y0m, z0m, scale)
+        let ta = lattice_field(tunnel_s(), Strata.Seed.mix(seed, 6), 1.0 /. 25.0, x0m, y0m, z0m, scale)
+        let tb = lattice_field(tunnel_s(), Strata.Seed.mix(seed, 7), 1.0 /. 25.0, x0m, y0m, z0m, scale)
+        let cav = lattice_field(single_s(), Strata.Seed.mix(seed, 8), 1.0 /. 90.0, x0m, y0m, z0m, scale)
+        let fac = factors_go(a, cave_factors(Strata.Atlas.d_region_count(Strata.Atlas.def_of(a))), x0m, z0m, scale, NativeArray.make_f32(81, 0.0), 0)
+        let fs = factor_cols(fac, NativeArray.make_f32(1024, 0.0), 0)
+        let seam = int_to_float(sea()) +. 1.0
+        let fl = Fields(hs, cms, ens, fs, lattice_fill(ns), lattice_fill(ta), lattice_fill(tb), lattice_fill(cav))
+        let dens0 = dens_go(fl, NativeArray.make_f32(32768, 0.0), y0m, scale, seam)
+        let dens = if any_cut(dens0, 0) do drop_islands(dens0) else dens0 end
+        let above = above_go(hs, cms, ens, fs, ns, ta, tb, cav, NativeArray.make_f32(1024, 0.0), y0m +. 32.0 *. scale, seam, 0)
+        let mats = Strata.Surface.scan_wet(dens, above, NativeArray.make_int(1024, sv - y0), fn (depth, yl, wet) -> material(depth, y0 + yl, sv, scale, wet))
+        let done = finish_go(mats, gs, ls, rs, x0, y0, z0, sv, scale, seed, 0)
+        let bases = bases_go(hs, cms, ens, ls, rs, x0, z0, seed, scale, NativeArray.make_int(1024, 0), 0)
+        Ch.from_flat(trees_go(done, bases, NativeArray.make_int(1024, 0), x0, y0, z0, scale, seed, 0))
+    end
+  end
+
+  doc "The island chunk's early-out at chunk coordinates (cx, cy, cz), decided from the atlas alone: 0 wholly air, 1 wholly stone, -1 when the chunk must be generated in full."
+  fn island_early(a : Strata.Atlas.Atlas, scale : Float, cx : Int, cy : Int, cz : Int) : Int do
+    let y0m = int_to_float(cy * 32) *. scale
+    match quick_bounds(a, int_to_float(cx * 32) *. scale, int_to_float(cz * 32) *. scale, scale) do
+      (lo, hi, wet) ->
+        if y0m > fmax(hi +. amp() /. squash(), wet) +. 8.0 do 0
+        else if y0m +. 31.0 *. scale < lo -. amp() /. squash() -. 40.0 do 1
+        else 0 - 1 end end
+    end
+  end
+
+  doc "The island chunk at chunk coordinates (cx, cy, cz) generated in full, without the early-outs (for checking them)."
+  fn island_full_chunk(a : Strata.Atlas.Atlas, scale : Float, cx : Int, cy : Int, cz : Int, seed : Int) : Strata.Chunk.Chunk do
+    island_full(a, scale, cx, cy, cz, seed)
   end
 
   doc "The island chunk at chunk coordinates (cx, cy, cz) for [seed], read from atlas [a], in a world of [scale] metres a voxel. Pure."
   fn island_terrain(a : Strata.Atlas.Atlas, scale : Float, cx : Int, cy : Int, cz : Int, seed : Int) : Strata.Chunk.Chunk do
-    let y0 = cy * 32
-    let sv = sea_v(scale)
-    let x0m = int_to_float(cx * 32) *. scale
-    let z0m = int_to_float(cz * 32) *. scale
-    let wn = island_window(a, x0m, z0m, x0m +. 31.0 *. scale, z0m +. 31.0 *. scale)
-    match island_go(wn, NativeArray.make_int(1024, 0), NativeArray.make_int(1024, 0), NativeArray.make_int(1024, 0), cx * 32, cz * 32, seed, scale, 0) do
-      (hs, ws, vs) ->
-        let lo = min_go(hs, 0, 100000)
-        let hi = max_go(hs, 0, -100000)
-        let wet = max_go(vs, 0, max_go(ws, 0, sv))
-        let roof = (if hi > wet do hi else wet end) + 8
-        if y0 > roof do Ch.uniform(0)
-        else if y0 + 31 < lo - 3 do Ch.uniform(1)
-        else Ch.from_flat(trees_go(island_fill(NativeArray.make_i32(32768, 0), hs, ws, vs, cx * 32, y0, cz * 32, sv, scale, seed, 0), hs, wet_go(ws, vs, 0, NativeArray.make_int(1024, 0)), cx * 32, y0, cz * 32, scale, seed, 0)) end end
-    end
+    let e = island_early(a, scale, cx, cy, cz)
+    if e >= 0 do Ch.uniform(e) else island_full(a, scale, cx, cy, cz, seed) end
   end
 
   doc "The chunk of the viewer's land at key k for seed, in 1 m voxels."
@@ -1330,6 +1770,16 @@ mod StrataViewer do
   end
 
   -- scene 22: 60 m out to sea from that mouth, 18 m over the water, looking back at it
+  -- A camera [dist] m from the column (tx, tz) along direction d (see dir_x),
+  -- [up] m over the ground there, looking back at the ground of the column.
+  pfn facing(land : Land, seed : Int, tx : Int, tz : Int, dist : Int, up : Int, d : Int) : (Float, Float, Float, Float, Float) do
+    let cx = at_x(tx, d, dist)
+    let cz = at_z(tz, d, dist)
+    let ty = int_to_float(land_height(land, tx, tz, seed))
+    let ey = int_to_float(land_height(land, cx, cz, seed) + up)
+    (int_to_float(cx) +. 0.5, ey, int_to_float(cz) +. 0.5, int_to_float((d + 8) % 16) *. 0.39269908, 0.0 -. Math.atan2(ey -. ty, int_to_float(dist)))
+  end
+
   pfn mouth_pose(land : Land, seed : Int) : (Float, Float, Float, Float, Float) do
     match land do
       Noise -> (-70.0, int_to_float(height(0, 0, seed)) +. 46.0, 96.0, 0.62, -0.42)
@@ -1401,6 +1851,11 @@ mod StrataViewer do
     else if scene == 5 do (-42.0, int_to_float(land_height(land, -35, 53, seed)) +. 7.0, 44.0, 2.5, -0.25)
     else if scene == 3 do (-45.0, int_to_float(land_height(land, -45, 40, seed)) +. 2.6, 40.0, 2.5, -0.05)
     else if scene == 22 do mouth_pose(land, seed)
+    -- the steepest island slope found (a 6.6 m drop over 3 m at (-180, -200)) and a cavern
+    -- the caves open on a snowy hill (its floor at 64 m under ground near 80 m, at (44, 78)):
+    -- found by a scripted search of the island at seed 7
+    else if scene == 24 do facing(land, seed, -180, -200, 45, 14, 2)
+    else if scene == 29 do facing(land, seed, 44, 78, 20, 8, 8)
     else if scene == 23 do
       -- the test lake from its bank opposite the outlet, looking across the water to the river leaving it
       match tl do
@@ -1410,7 +1865,7 @@ mod StrataViewer do
           let ey = int_to_float(land_height(land, bx, bz, seed)) +. 5.0
           (int_to_float(bx) +. 0.5, ey, int_to_float(bz) +. 0.5, int_to_float(d) *. 0.39269908, 0.0 -. Math.atan2(ey -. int_to_float(line), int_to_float(2 * rad + 8)))
       end
-    else (-70.0, int_to_float(land_height(land, 0, 0, seed)) +. 46.0, 96.0, 0.62, -0.42) end end end end end end end end end end end end end end end end end end end end end end
+    else (-70.0, int_to_float(land_height(land, 0, 0, seed)) +. 46.0, 96.0, 0.62, -0.42) end end end end end end end end end end end end end end end end end end end end end end end
   end
 
   -- The land for STRATA_ISLAND: the island's atlas from the cache in
@@ -1447,6 +1902,21 @@ mod StrataViewer do
   pfn gen_n(land : Land, key : Strata.Coord.Key, seed : Int, left : Int, acc : Int) : Int do
     if left <= 0 do acc else gen_n(land, key, seed, left - 1, acc + Ch.form(land_chunk(land, key, seed))) end
   end
+  -- the early-outs: each of the 200 columns' chunk 7 over (air) or 7 under
+  -- (stone) the ground chunk, made 100 times; (total ms, the forms seen summed)
+  pfn early_go(land : Land, seed : Int, dy : Int, k : Int, ms : Int, forms : Int) : (Int, Int) do
+    if k >= 200 do (ms, forms)
+    else
+      let cx = k % 10 - 5
+      let cz = k / 10 - 10
+      let cy = Strata.Coord.chunk_of(land_height(land, cx * 32 + 16, cz * 32 + 16, seed)) + dy
+      let t0 = unix_time_ms()
+      let f = gen_n(land, Strata.Coord.key(cx, cy, cz), seed, 100, 0)
+      early_go(land, seed, dy, k + 1, ms + unix_time_ms() - t0, forms + f)
+    end
+  end
+  -- 20000 chunks in ms is twentieths of a microsecond each: as microseconds with two places
+  pfn early_us(ms : Int) : String do hundredths(ms * 5) end
   pfn hundredths(v : Int) : String do int_to_string(v / 100) ++ "." ++ String.pad_left(int_to_string(v % 100), 2, "0") end
   pfn chunk_times(land : Land, seed : Int) : Unit do
     let ts = List.sort_by(time_go(land, seed, 0, Nil), fn (p, q) -> p < q)
@@ -1454,6 +1924,12 @@ mod StrataViewer do
         Noise -> "noise"
         Island(_) -> "island"
       end) ++ " chunks: median " ++ hundredths(unwrap_or(List.nth_opt(ts, 100), 0)) ++ " ms, worst " ++ hundredths(unwrap_or(List.nth_opt(ts, 199), 0)) ++ " ms over 200 surface chunks, 10 runs each on one task")
+    match early_go(land, seed, 7, 0, 0, 0) do
+      (ms, forms) -> println("strata_viewer: air early-out " ++ early_us(ms) ++ " us a chunk over 200 chunks 7 over the ground, 100 runs each (" ++ int_to_string(forms) ++ " not uniform)")
+    end
+    match early_go(land, seed, 0 - 7, 0, 0, 0) do
+      (ms, forms) -> println("strata_viewer: stone early-out " ++ early_us(ms) ++ " us a chunk over 200 chunks 7 under the ground, 100 runs each (" ++ int_to_string(forms) ++ " not uniform)")
+    end
   end
 
   -- the 10 cm world's poses: 27 the overview (tower, wall and cliff); anything else stands near the middle

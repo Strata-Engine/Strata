@@ -206,6 +206,397 @@ mod StrataViewer.Test.Lakes do
     end
   end
 
+  -- ── Density, caves and the early-outs (Task 7) ───────────────────────────
+  -- the viewer's own island, read from its cache (built once if missing)
+  pfn island() : Strata.Atlas.Atlas do Strata.Atlas.load_or_build(".march/atlas", Vw.island_def(), 7) end
+
+  pfn full_same(a : Strata.Chunk.Chunk, b : Strata.Chunk.Chunk, i : Int) : Bool do
+    if i >= 32768 do true else if Chl2.get_or(a, i % 32, i / 1024, (i / 32) % 32, -1) != Chl2.get_or(b, i % 32, i / 1024, (i / 32) % 32, -1) do false else full_same(a, b, i + 1) end end
+  end
+
+  -- Lake columns 3 m apart over 60 m about each lake's centre: for each, the
+  -- voxels from 4 m under the bed up to it must be solid ground (not air,
+  -- not water). (columns checked, bad voxels, distinct chunks seen as a list of keys)
+  pfn under_lakes(a : Strata.Atlas.Atlas, ls : List((Float, Float, Float)), cols : Int, bad : Int, seen : List(Int)) : (Int, Int, List(Int)) do
+    match ls do
+      Nil -> (cols, bad, seen)
+      Cons((x, z, lv), rest) ->
+        if lv < 0.0 do under_lakes(a, rest, cols, bad, seen)
+        else
+          match lake_cols(a, whole(x), whole(z), 0, cols, bad, seen) do
+            (c2, b2, s2) -> under_lakes(a, rest, c2, b2, s2)
+          end
+        end
+    end
+  end
+  pfn lake_cols(a : Strata.Atlas.Atlas, cx : Int, cz : Int, t : Int, cols : Int, bad : Int, seen : List(Int)) : (Int, Int, List(Int)) do
+    if t >= 441 do (cols, bad, seen)
+    else
+      let wx = cx - 30 + 3 * (t % 21)
+      let wz = cz - 30 + 3 * (t / 21)
+      let c = Vw.island_column(a, wx, wz, 7, 1.0)
+      if col_lake(c) == 0 do lake_cols(a, cx, cz, t + 1, cols, bad, seen)
+      else
+        let h = col_h(c)
+        let k1 = chunk_tag(wx, h, wz)
+        let k2 = chunk_tag(wx, h - 4, wz)
+        let s1 = if List.member(seen, k1) do seen else Cons(k1, seen) end
+        let s2 = if List.member(s1, k2) do s1 else Cons(k2, s1) end
+        lake_cols(a, cx, cz, t + 1, cols + 1, bad + soft_go(a, wx, wz, h - 4, h, 0), s2)
+      end
+    end
+  end
+  pfn chunk_tag(x : Int, y : Int, z : Int) : Int do (Cl2.chunk_of(x) + 512) + 1024 * ((Cl2.chunk_of(y) + 512) + 1024 * (Cl2.chunk_of(z) + 512)) end
+  -- voxels from y to top that are air or water
+  pfn soft_go(a : Strata.Atlas.Atlas, x : Int, z : Int, y : Int, top : Int, n : Int) : Int do
+    if y > top do n
+    else
+      let b = island_block(a, x, y, z)
+      let isoft = soft(b)
+      soft_go(a, x, z, y + 1, top, if isoft do n + 1 else n end)
+    end
+  end
+
+  -- air voxels well under the ground (20 m below the column's height less the
+  -- 12 m of density noise) in the chunks of a 4 x 4 chunk area at the origin's ground
+  pfn caves_go(a : Strata.Atlas.Atlas, k : Int, n : Int) : Int do
+    if k >= 16 * 8 do n
+    else
+      let cx = k % 4 - 2
+      let cz = (k / 4) % 4 - 2
+      let x = cx * 32 + 16
+      let z = cz * 32 + 16
+      let g = col_h(Vw.island_column(a, x, z, 7, 1.0))
+      let cy = Cl2.chunk_of(g) - k / 16
+      let ch = Vw.island_terrain(a, 1.0, cx, cy, cz, 7)
+      caves_go(a, k + 1, n + deep_air(a, ch, cx, cy, cz, 0, 0))
+    end
+  end
+  pfn deep_air(a : Strata.Atlas.Atlas, ch : Strata.Chunk.Chunk, cx : Int, cy : Int, cz : Int, i : Int, n : Int) : Int do
+    if i >= 32768 do n
+    else
+      let x = i % 32
+      let z = (i / 32) % 32
+      let y = i / 1024
+      let deep = if Chl2.get_or(ch, x, y, z, -1) != 0 do false
+        else int_to_float(cy * 32 + y) < Vw.island_height_m(a, int_to_float(cx * 32 + x), int_to_float(cz * 32 + z), 7) -. 32.0 end
+      deep_air(a, ch, cx, cy, cz, i + 37, if deep do n + 1 else n end)
+    end
+  end
+
+
+  -- ── Fix round 1 ──────────────────────────────────────────────────────────
+  -- chunks generated once and looked up by world voxel
+  type Cache = Cache(List((Int, Strata.Chunk.Chunk)))
+  pfn ckey(cx : Int, cy : Int, cz : Int) : Int do (cx + 512) + 1024 * ((cy + 512) + 1024 * (cz + 512)) end
+  pfn cache_find(cs : List((Int, Strata.Chunk.Chunk)), k : Int) : Option(Strata.Chunk.Chunk) do
+    match cs do
+      Nil -> None
+      Cons((k2, c), rest) -> if k2 == k do Some(c) else cache_find(rest, k) end
+    end
+  end
+  -- the block at (x, y, z) and the cache, grown by the chunk if it was not there
+  pfn cblock(a : Strata.Atlas.Atlas, ca : Cache, x : Int, y : Int, z : Int) : (Int, Cache) do
+    let cx = Cl2.chunk_of(x)
+    let cy = Cl2.chunk_of(y)
+    let cz = Cl2.chunk_of(z)
+    match ca do
+      Cache(cs) ->
+        match cache_find(cs, ckey(cx, cy, cz)) do
+          Some(c) -> (Chl2.get_or(c, x - 32 * cx, y - 32 * cy, z - 32 * cz, -1), ca)
+          None ->
+            let c = Vw.island_terrain(a, 1.0, cx, cy, cz, 7)
+            (Chl2.get_or(c, x - 32 * cx, y - 32 * cy, z - 32 * cz, -1), Cache(Cons((ckey(cx, cy, cz), c), cs)))
+        end
+    end
+  end
+  -- air, sea or lake water (the lake family's ids, not Bl2.is_fluid: building the registry for every voxel cost gigabytes)
+  pfn soft(b : Int) : Bool do if b == 0 do true else if b == 5 do true else if b < Vw.lake_base() do false else b <= Vw.lake_base() + 7 end end end end
+
+  -- Connectivity: every solid voxel (not air, sea or lake water) of a chunk
+  -- is reached by a 6-connected flood from the solid voxels of its faces
+  -- that rest on solid across the face: its bottom row on the chunk below's
+  -- top row, its four sides on the side neighbours' facing rows (solid can
+  -- rest on the ground through a side wall). The top face seeds nothing.
+  pfn solid_arr(c : Strata.Chunk.Chunk, out : NativeIntArr, i : Int) : NativeIntArr do
+    if i >= 32768 do out else solid_arr(c, NativeArray.set_int(out, i, if soft(Chl2.get_or(c, i % 32, i / 1024, (i / 32) % 32, 0)) do 0 else 1 end), i + 1) end
+  end
+  -- face voxel i (local x, y, z) rests on solid in its neighbour across face f (0 below, 1 -x, 2 +x, 3 -z, 4 +z)
+  pfn rests(nb : Strata.Chunk.Chunk, f : Int, x : Int, y : Int, z : Int) : Bool do
+    let b = if f == 0 do Chl2.get_or(nb, x, 31, z, 0)
+      else if f == 1 do Chl2.get_or(nb, 31, y, z, 0)
+      else if f == 2 do Chl2.get_or(nb, 0, y, z, 0)
+      else if f == 3 do Chl2.get_or(nb, x, y, 31, 0)
+      else Chl2.get_or(nb, x, y, 0, 0) end end end end
+    !soft(b)
+  end
+  -- seeds on face f: its 1024 voxels, k = a + 32 b over the face
+  pfn face_go(sol : NativeIntArr, nb : Strata.Chunk.Chunk, f : Int, seen : NativeIntArr, st : NativeIntArr, sp : Int, k : Int) : (NativeIntArr, NativeIntArr, Int) do
+    if k >= 1024 do (seen, st, sp)
+    else
+      let u = k % 32
+      let v = k / 32
+      -- (x, y, z) of the face voxel
+      let x = if f == 1 do 0 else if f == 2 do 31 else u end end
+      let y = if f == 0 do 0 else v end
+      let z = if f == 0 do v else if f == 3 do 0 else if f == 4 do 31 else u end end end
+      let i = x + 32 * (z + 32 * y)
+      let take = if NativeArray.get_int(sol, i) == 0 do false else if NativeArray.get_int(seen, i) == 1 do false else rests(nb, f, x, y, z) end end
+      if take do face_go(sol, nb, f, NativeArray.set_int(seen, i, 1), NativeArray.set_int(st, sp, i), sp + 1, k + 1)
+      else face_go(sol, nb, f, seen, st, sp, k + 1) end
+    end
+  end
+  -- the flood, one neighbour (d 0..5) of voxel i a call, popping the next voxel at d = 6:
+  -- one self-recursive loop
+  pfn flood(sol : NativeIntArr, seen : NativeIntArr, st : NativeIntArr, sp : Int, i : Int, d : Int) : NativeIntArr do
+    if d >= 6 do
+      if sp <= 0 do seen else flood(sol, seen, st, sp - 1, NativeArray.get_int(st, sp - 1), 0) end
+    else
+      let x = i % 32
+      let z = (i / 32) % 32
+      let y = i / 1024
+      let ok = if d == 0 do x > 0 else if d == 1 do x < 31 else if d == 2 do z > 0 else if d == 3 do z < 31 else if d == 4 do y > 0 else y < 31 end end end end end
+      let q = if d == 0 do i - 1 else if d == 1 do i + 1 else if d == 2 do i - 32 else if d == 3 do i + 32 else if d == 4 do i - 1024 else i + 1024 end end end end end
+      let take = if !ok do false else if NativeArray.get_int(sol, q) == 0 do false else NativeArray.get_int(seen, q) == 0 end end
+      if take do flood(sol, NativeArray.set_int(seen, q, 1), NativeArray.set_int(st, sp, q), sp + 1, i, d + 1)
+      else flood(sol, seen, st, sp, i, d + 1) end
+    end
+  end
+  pfn unreached(sol : NativeIntArr, seen : NativeIntArr, i : Int, n : Int) : Int do
+    if i >= 32768 do n
+    else
+      let u = if NativeArray.get_int(sol, i) == 0 do false else NativeArray.get_int(seen, i) == 0 end
+      unreached(sol, seen, i + 1, if u do n + 1 else n end)
+    end
+  end
+  pfn floating(a : Strata.Atlas.Atlas, cx : Int, cy : Int, cz : Int) : Int do
+    let sol = solid_arr(Vw.island_terrain(a, 1.0, cx, cy, cz, 7), NativeArray.make_int(32768, 0), 0)
+    let st0 = (NativeArray.make_int(32768, 0), NativeArray.make_int(32768, 0), 0)
+    let s0 = match st0 do (se, st, sp) -> face_go(sol, Vw.island_terrain(a, 1.0, cx, cy - 1, cz, 7), 0, se, st, sp, 0) end
+    let s1 = match s0 do (se, st, sp) -> face_go(sol, Vw.island_terrain(a, 1.0, cx - 1, cy, cz, 7), 1, se, st, sp, 0) end
+    let s2 = match s1 do (se, st, sp) -> face_go(sol, Vw.island_terrain(a, 1.0, cx + 1, cy, cz, 7), 2, se, st, sp, 0) end
+    let s3 = match s2 do (se, st, sp) -> face_go(sol, Vw.island_terrain(a, 1.0, cx, cy, cz - 1, 7), 3, se, st, sp, 0) end
+    let s4 = match s3 do (se, st, sp) -> face_go(sol, Vw.island_terrain(a, 1.0, cx, cy, cz + 1, 7), 4, se, st, sp, 0) end
+    match s4 do (se, st, sp) -> unreached(sol, flood(sol, se, st, sp, 0, 6), 0, 0) end
+  end
+  -- the chunk columns round (kx, kz) (all 9, or the 8 round it), the ground's chunk and the one above: unreached voxels
+  pfn float_go(a : Strata.Atlas.Atlas, kx : Int, kz : Int, mid : Bool, k : Int, n : Int) : Int do
+    if k >= 9 do n
+    else if k == 4 && !mid do float_go(a, kx, kz, mid, k + 1, n)
+    else
+      let cx = kx + k % 3 - 1
+      let cz = kz + k / 3 - 1
+      let cy = Cl2.chunk_of(col_h(Vw.island_column(a, cx * 32 + 16, cz * 32 + 16, 7, 1.0)))
+      float_go(a, kx, kz, mid, k + 1, n + floating(a, cx, cy, cz) + floating(a, cx, cy + 1, cz))
+    end end
+  end
+
+  -- Thermal seams: chunk pairs (cx, cz) | (cx + 1, cz) whose shared border is
+  -- steep (the island height changes over 3 m by more than 3 m somewhere along
+  -- it, every 4 m); for each, the worst disagreement of the two border
+  -- columns' relaxed H between each chunk and a patch centred on the border.
+  pfn steep_border(a : Strata.Atlas.Atlas, bx : Int, z0 : Int, t : Int) : Bool do
+    if t >= 8 do false
+    else
+      let z = int_to_float(z0 + 4 * t)
+      let d = Math.abs(Vw.island_height_m(a, int_to_float(bx - 1), z, 7) -. Vw.island_height_m(a, int_to_float(bx + 2), z, 7))
+      if d > 3.0 do true else steep_border(a, bx, z0, t + 1) end
+    end
+  end
+  pfn seam_err(l : NativeF32Arr, r : NativeF32Arr, mid : NativeF32Arr, z : Int, worst : Float) : Float do
+    if z >= 32 do worst
+    else
+      let e1 = Math.abs(NativeArray.get_f32(l, 31 + 32 * z) -. NativeArray.get_f32(mid, 15 + 32 * z))
+      let e2 = Math.abs(NativeArray.get_f32(r, 32 * z) -. NativeArray.get_f32(mid, 16 + 32 * z))
+      seam_err(l, r, mid, z + 1, fmax3(worst, e1, e2))
+    end
+  end
+  pfn fmax3(p : Float, q : Float, s : Float) : Float do if p >= q && p >= s do p else if q >= s do q else s end end end
+  -- (pairs checked, worst error)
+  pfn seams_go(a : Strata.Atlas.Atlas, k : Int, n : Int, worst : Float) : (Int, Float) do
+    if n >= 20 do (n, worst)
+    else if k >= 400 do (n, worst)
+    else
+      let cx = k % 20 - 10
+      let cz = k / 20 - 10
+      let bx = cx * 32 + 31
+      if !steep_border(a, bx, cz * 32, 0) do seams_go(a, k + 1, n, worst)
+      else
+        let l = Vw.relaxed_heights(a, 1.0, cx * 32, cz * 32, 7)
+        let r = Vw.relaxed_heights(a, 1.0, cx * 32 + 32, cz * 32, 7)
+        let mid = Vw.relaxed_heights(a, 1.0, cx * 32 + 16, cz * 32, 7)
+        seams_go(a, k + 1, n + 1, seam_err(l, r, mid, 0, worst))
+      end
+    end end
+  end
+
+  -- Tunnels: along lines of 64 m through the cave scene's chunks, at every
+  -- height, the longest run of air lying more than 6 m under the island height
+  -- air that only a tunnel cut: its column's entrance noise at or under 0.6
+  -- and the cavern noise there under its 0.55 threshold (by 0.05, as the
+  -- voxel's value is filled from the lattice); the viewer's settings and seeds
+  pfn tunnel_only(x : Int, y : Int, z : Int) : Bool do
+    let one = Strata.Noise.settings(0, 1, 2.0, 0.5, 0, 0.0)
+    let en = Strata.Noise.sample2(one, Strata.Seed.mix(7, 9), 1.0 /. 120.0, int_to_float(x), int_to_float(z))
+    if en > 0.6 do false
+    else Strata.Noise.sample3(one, Strata.Seed.mix(7, 8), 1.0 /. 90.0, int_to_float(x), int_to_float(y), int_to_float(z)) < 0.5 end
+  end
+  -- x runs from 0 to 63 (chunks 0 and 1), z in chunk 2 (64..95), y from 42 to 98; h0 and h1 the two chunks' relaxed heights
+  -- the relaxed H of the 96 x 96 columns from (0, 32), x + 96 z: chunks x 0..2, z 1..3
+  pfn area_h(a : Strata.Atlas.Atlas, out : NativeF32Arr, k : Int) : NativeF32Arr do
+    if k >= 9 do out
+    else area_h(a, put_h(Vw.relaxed_heights(a, 1.0, 32 * (k % 3), 32 + 32 * (k / 3), 7), out, 32 * (k % 3), 32 * (k / 3), 0), k + 1) end
+  end
+  pfn put_h(hs : NativeF32Arr, out : NativeF32Arr, ox : Int, oz : Int, c : Int) : NativeF32Arr do
+    if c >= 1024 do out else put_h(hs, NativeArray.set_f32(out, (ox + c % 32) + 96 * (oz + c / 32), NativeArray.get_f32(hs, c)), ox, oz, c + 1) end
+  end
+  -- lines along x (dir 0) at every other z, and along z (dir 1) at every other x, for y 42..110:
+  -- the longest run of tunnel air 6 m or more under H
+  pfn tunnel_go(a : Strata.Atlas.Atlas, ca : Cache, hs : NativeF32Arr, dir : Int, w : Int, y : Int, best : Int) : Int do
+    if dir >= 2 do best
+    else if w >= 96 do tunnel_go(a, ca, hs, dir + 1, 0, 42, best)
+    else if y > 110 do tunnel_go(a, ca, hs, dir, w + 2, 42, best)
+    else
+      match run_line(a, ca, hs, dir, w, y, 0, 0, 0) do
+        (r, ca2) -> tunnel_go(a, ca2, hs, dir, w, y + 1, if r > best do r else best end)
+      end
+    end end end
+  end
+  pfn run_line(a : Strata.Atlas.Atlas, ca : Cache, hs : NativeF32Arr, dir : Int, w : Int, y : Int, t : Int, run : Int, best : Int) : (Int, Cache) do
+    if t >= 96 do (if run > best do run else best end, ca)
+    else
+      let x = if dir == 0 do t else w end
+      let z = if dir == 0 do w else t end
+      match cblock(a, ca, x, y, z + 32) do
+        (b, ca2) ->
+          let deep = int_to_float(y) < NativeArray.get_f32(hs, x + 96 * z) -. 6.0
+          let air = if b != 0 do false else if !deep do false else tunnel_only(x, y, z + 32) end end
+          if air do run_line(a, ca2, hs, dir, w, y, t + 1, run + 1, best)
+          else run_line(a, ca2, hs, dir, w, y, t + 1, 0, if run > best do run else best end) end
+      end
+    end
+  end
+
+  -- The lake rim: around each lake, every land column within 4 m of a lake
+  -- column has no air or water from 4 m under the nearby bed up to the line.
+  -- (columns checked, bad voxels)
+  pfn near4(b : Box, k : Int, t : Int, line : Int, bed : Int) : (Int, Int) do
+    if t >= 81 do (line, bed)
+    else
+      match b do
+        Box(_, _, half, hs, ls, _) ->
+          let side = 2 * half + 1
+          let dx = t % 9 - 4
+          let dz = t / 9 - 4
+          let x = k % side + dx
+          let z = k / side + dz
+          let inside = if x < 0 || z < 0 || x >= side || z >= side do false else dx * dx + dz * dz <= 16 end
+          let l = if inside do NativeArray.get_int(ls, x + side * z) else 0 end
+          if l > 0 do near4(b, k, t + 1, if l > line do l else line end, if NativeArray.get_int(hs, x + side * z) < bed do NativeArray.get_int(hs, x + side * z) else bed end)
+          else near4(b, k, t + 1, line, bed) end
+      end
+    end
+  end
+  pfn rim4_go(a : Strata.Atlas.Atlas, ca : Cache, b : Box, k : Int, cols : Int, bad : Int) : (Int, Int, Cache) do
+    match b do
+      Box(x0, z0, half, _, ls, rs) ->
+        let side = 2 * half + 1
+        if k >= side * side do (cols, bad, ca)
+        else if NativeArray.get_int(ls, k) > 0 || NativeArray.get_int(rs, k) > 0 do rim4_go(a, ca, b, k + 1, cols, bad)
+        else
+          match near4(b, k, 0, 0, 100000) do
+            (line, bed) ->
+              if line == 0 do rim4_go(a, ca, b, k + 1, cols, bad)
+              else
+                match soft_count(a, ca, x0 - half + k % side, z0 - half + k / side, bed - 4, line, 0) do
+                  (n, ca2) -> rim4_go(a, ca2, b, k + 1, cols + 1, bad + n)
+                end
+              end
+          end
+        end end
+    end
+  end
+  pfn soft_count(a : Strata.Atlas.Atlas, ca : Cache, x : Int, z : Int, y : Int, top : Int, n : Int) : (Int, Cache) do
+    if y > top do (n, ca)
+    else
+      match cblock(a, ca, x, y, z) do
+        (blk, ca2) -> soft_count(a, ca2, x, z, y + 1, top, if soft(blk) do n + 1 else n end)
+      end
+    end
+  end
+  pfn rims_go(a : Strata.Atlas.Atlas, ls : List((Float, Float, Float)), cols : Int, bad : Int) : (Int, Int) do
+    match ls do
+      Nil -> (cols, bad)
+      Cons((x, z, lv), rest) ->
+        if lv < 0.0 do rims_go(a, rest, cols, bad)
+        else
+          match rim4_go(a, Cache(Nil), box(a, whole(x), whole(z), 40), 0, 0, 0) do
+            (c2, b2, _) -> rims_go(a, rest, cols + c2, bad + b2)
+          end
+        end
+    end
+  end
+
+  -- Sea pockets: land columns standing over the sea but within A (12 m) of
+  -- it, along the coast east of the origin: (columns checked, sea-water or
+  -- air voxels from 10 m under the sea line up to it)
+  pfn coast_go(a : Strata.Atlas.Atlas, ca : Cache, cx : Int, cz : Int, hs : NativeF32Arr, c : Int, cols : Int, bad : Int) : (Int, Int, Cache) do
+    if c >= 1024 do (cols, bad, ca)
+    else
+      let x = cx * 32 + c % 32
+      let z = cz * 32 + c / 32
+      let h = NativeArray.get_f32(hs, c)
+      let col = Vw.island_column(a, x, z, 7, 1.0)
+      let ok = if h < 41.5 do false else if h > 51.5 do false else col_lake(col) + col_river(col) == 0 end end
+      if !ok do coast_go(a, ca, cx, cz, hs, c + 1, cols, bad)
+      else
+        match soft_count(a, ca, x, z, 30, 40, 0) do
+          (n, ca2) -> coast_go(a, ca2, cx, cz, hs, c + 1, cols + 1, bad + n)
+        end
+      end
+    end
+  end
+  pfn coasts_go(a : Strata.Atlas.Atlas, k : Int, cols : Int, bad : Int) : (Int, Int) do
+    if k >= 40 do (cols, bad)
+    else
+      let cx = k % 20 + 5
+      let cz = 2 * (k / 20) - 1
+      match coast_go(a, Cache(Nil), cx, cz, Vw.relaxed_heights(a, 1.0, cx * 32, cz * 32, 7), 0, 0, 0) do
+        (c2, b2, _) -> coasts_go(a, k + 1, cols + c2, bad + b2)
+      end
+    end
+  end
+
+  -- Early-outs: the decision from the atlas against full generation. Keys:
+  -- 300 drawn from the island's box (chunk x and z -32..31, y 0..5), and for
+  -- 30 drawn columns the chunks one under and one over the surface chunk.
+  -- (keys checked, declared uniform but not so in full, missed: uniform in full but not declared)
+  pfn early_check(a : Strata.Atlas.Atlas, cx : Int, cy : Int, cz : Int) : (Int, Int) do
+    let e = Vw.island_early(a, 1.0, cx, cy, cz)
+    let u = Chl2.uniform_id(Vw.island_full_chunk(a, 1.0, cx, cy, cz, 7))
+    let bad = if e < 0 do 0 else if u == e do 0 else 1 end end
+    let missed = if e >= 0 do 0 else if u == 0 || u == 1 do 1 else 0 end end
+    (bad, missed)
+  end
+  pfn early_go(a : Strata.Atlas.Atlas, k : Int, n : Int, bad : Int, missed : Int) : (Int, Int, Int) do
+    if k >= 390 do (n, bad, missed)
+    else
+      let h = if k < 300 do Strata.Seed.cell(7, 77, k, 0, 0) else Strata.Seed.cell(7, 78, (k - 300) / 3, 0, 0) end
+      let cx = int_abs(h) % 64 - 32
+      let cz = int_abs(h / 64) % 64 - 32
+      let key = if k < 300 do (cx, int_abs(h / 4096) % 6, cz)
+        else
+          let g = col_h(Vw.island_column(a, cx * 32 + 16, cz * 32 + 16, 7, 1.0))
+          (cx, Cl2.chunk_of(g) + (k - 300) % 3 - 1, cz)
+        end
+      match key do
+        (x, y, z) ->
+          match early_check(a, x, y, z) do
+            (b, m) -> early_go(a, k + 1, n + 1, bad + b, missed + m)
+          end
+      end
+    end
+  end
 
   describe "Viewer lakes" do
     test "terrain with lakes is still a pure function" do
@@ -322,6 +713,90 @@ mod StrataViewer.Test.Lakes do
           Test.assert_true(same_go(Vw.island_terrain(a, 1.0, kx, ky, kz, 7), Vw.island_terrain(a, 1.0, kx, ky, kz, 7), 0), "the lake's chunk")
           Test.assert_true(same_go(Vw.island_terrain(a, 1.0, 0, 1, 0, 7), Vw.island_terrain(a, 1.0, 0, 1, 0, 7), 0), "the origin's")
       end
+    end
+    test "no cave voxel within 4 m under a lake bed, and caves elsewhere" do
+      let a = island()
+      match under_lakes(a, Strata.Atlas.lakes(a), 0, 0, Nil) do
+        (cols, bad, seen) ->
+          println("lakes: " ++ int_to_string(cols) ++ " lake columns in " ++ int_to_string(List.length(seen)) ++ " chunks checked")
+          Test.assert_true(List.length(seen) >= 20, "20 chunks or more under the lakes")
+          Test.assert_eq_int(bad, 0, "no air or water from 4 m under a lake bed to the bed")
+      end
+      Test.assert_true(caves_go(a, 0, 0) > 0, "the island has caves: air 32 m under the ground")
+    end
+    test "no solid voxel floats: every one is reached from the ground below (round the test lake and the cave scene)" do
+      let a = island()
+      match Vw.scene_lake(StrataViewer.Island(a), 7) do
+        (cx, cz, rad, _, _, _, _) ->
+          Test.assert_true(rad > 0, "the island has a test lake")
+          let n = float_go(a, Cl2.chunk_of(cx), Cl2.chunk_of(cz), false, 0, 0)
+          println("connectivity: " ++ int_to_string(n) ++ " solid voxels unreached in 16 chunks round the test lake")
+          Test.assert_eq_int(n, 0, "none unreached round the lake")
+          -- the cave scene looks at (44, 78), chunk (1, 2), on a hill of 80 to 120 m
+          let m = float_go(a, 1, 2, true, 0, 0)
+          println("connectivity: " ++ int_to_string(m) ++ " solid voxels unreached in 18 chunks round the cave scene")
+          Test.assert_eq_int(m, 0, "none unreached round the cave scene")
+      end
+    end
+    test "chunks agree on the relaxed heights along their seams" do
+      match seams_go(island(), 0, 0, 0.0) do
+        (n, worst) ->
+          println("seams: " ++ int_to_string(n) ++ " steep chunk pairs, worst " ++ float_to_string(worst) ++ " m")
+          Test.assert_eq_int(n, 20, "20 steep chunk pairs")
+          Test.assert_true(worst <= 0.01, "within 0.01 m of a patch centred on the border")
+      end
+    end
+    test "a tunnel crosses the cave scene's chunks: a run over 8 m of tunnel air, 6 m or more under the ground" do
+      let a = island()
+      let best = tunnel_go(a, Cache(Nil), area_h(a, NativeArray.make_f32(9216, 0.0), 0), 0, 0, 42, 0)
+      println("tunnels: longest run of tunnel air " ++ int_to_string(best) ++ " m")
+      Test.assert_true(best > 8, "a run longer than 8 m")
+    end
+    test "land within 4 m of a lake column holds no air or water from 4 m under the bed to the line" do
+      let a = island()
+      match rims_go(a, Strata.Atlas.lakes(a), 0, 0) do
+        (cols, bad) ->
+          println("lake rims: " ++ int_to_string(cols) ++ " land columns within 4 m of a lake checked")
+          Test.assert_true(cols > 100, "over 100 such columns")
+          Test.assert_eq_int(bad, 0, "no air or water in them")
+      end
+    end
+    test "coastal land within 12 m of the sea holds no sea pocket" do
+      match coasts_go(island(), 0, 0, 0) do
+        (cols, bad) ->
+          println("coast: " ++ int_to_string(cols) ++ " land columns 1.5 to 11.5 m over the sea checked")
+          Test.assert_true(cols > 100, "over 100 such columns")
+          Test.assert_eq_int(bad, 0, "no sea water or air from 30 m to the sea line under them")
+      end
+    end
+    test "the early-out agrees with full generation on 390 chunk keys" do
+      match early_go(island(), 0, 0, 0, 0) do
+        (n, bad, missed) ->
+          println("early-outs: " ++ int_to_string(n) ++ " keys, " ++ int_to_string(bad) ++ " declared uniform but not, " ++ int_to_string(missed) ++ " uniform in full but generated")
+          Test.assert_eq_int(n, 390, "390 keys")
+          Test.assert_eq_int(bad, 0, "every chunk declared uniform is that uniform chunk in full")
+      end
+    end
+    test "a chunk 200 m over the ground is uniform air, and one 200 m under it uniform stone" do
+      let a = island()
+      let g = col_h(Vw.island_column(a, 16, 16, 7, 1.0))
+      let up = Vw.island_terrain(a, 1.0, 0, Cl2.chunk_of(g + 200), 0, 7)
+      let down = Vw.island_terrain(a, 1.0, 0, Cl2.chunk_of(g - 200), 0, 7)
+      Test.assert_eq_int(Chl2.uniform_id(up), 0, "uniform(0)")
+      Test.assert_eq_int(Chl2.uniform_id(down), 1, "uniform(1)")
+    end
+    test "a chunk generated alone equals one generated after its neighbours" do
+      let a = island()
+      let g = col_h(Vw.island_column(a, 40, -70, 7, 1.0))
+      let cy = Cl2.chunk_of(g)
+      let alone = Vw.island_terrain(a, 1.0, 1, cy, -3, 7)
+      let n1 = Vw.island_terrain(a, 1.0, 0, cy, -3, 7)
+      let n2 = Vw.island_terrain(a, 1.0, 2, cy, -3, 7)
+      let n3 = Vw.island_terrain(a, 1.0, 1, cy + 1, -3, 7)
+      let n4 = Vw.island_terrain(a, 1.0, 1, cy, -2, 7)
+      let after = Vw.island_terrain(a, 1.0, 1, cy, -3, 7)
+      Test.assert_true(Chl2.form(n1) + Chl2.form(n2) + Chl2.form(n3) + Chl2.form(n4) >= 0, "the neighbours were made")
+      Test.assert_true(full_same(alone, after, 0), "every voxel the same")
     end
     test "the sea is not a fluid, and lake water is" do
       Test.assert_false(Bl2.is_fluid(Vw.registry(), 5), "the sea never moves")
