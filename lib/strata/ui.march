@@ -1,0 +1,175 @@
+-- Ui: the display drawn over the finished 3D frame.
+--
+-- A game builds its whole display afresh each frame: `begin`, then one call
+-- per element, then `Strata.Render.draw_ui`. Nothing is kept between frames.
+-- The result is a list of quads, drawn in call order (later over earlier) in
+-- one draw call.
+--
+-- Coordinates are INTERFACE PIXELS. At scale 1 an interface pixel is one
+-- point of the window: two device pixels on a retina display, one on an
+-- ordinary one, so a display is the same physical size on both. A larger
+-- scale makes everything larger. Every edge is snapped to a device pixel.
+--
+-- An element is placed by an ANCHOR, one of nine points of the screen, and an
+-- offset from it, positive right and down. The element's own matching point
+-- sits there: a `bottom()` element is placed by the middle of its bottom
+-- edge, a `centre()` element by its centre.
+--
+-- A quad is 16 floats: the rectangle x0 y0 x1 y1 in device pixels, the
+-- texture rectangle u0 v0 u1 v1, the colour r g b a (sRGB, straight alpha),
+-- then kind, layer and two numbers the kind uses. Kinds: 0 a plain colour,
+-- 1 a block texture layer, 2 a region of the interface atlas (in its
+-- pixels), 3 a glyph of the glyph atlas (in its pixels; layer is the page).
+mod Strata.Ui do
+
+  -- quads, how many, the screen in interface pixels (w, h), device pixels per interface pixel
+  type Ui = Ui(NativeF32Arr, Int, Float, Float, Float)
+
+  -- A region of the interface atlas is (x, y, width, height) in its pixels.
+
+  fn top_left() : Int do 0 end
+  fn top() : Int do 1 end
+  fn top_right() : Int do 2 end
+  fn left() : Int do 3 end
+  fn centre() : Int do 4 end
+  fn right() : Int do 5 end
+  fn bottom_left() : Int do 6 end
+  fn bottom() : Int do 7 end
+  fn bottom_right() : Int do 8 end
+
+  doc "Floats a quad."
+  fn quad_floats() : Int do 16 end
+
+  doc "Start a frame's display on a window of [width_pt] x [height_pt] points. [scale] is the game's own (1 is one interface pixel a point; it may be fractional); [device_scale] is device pixels a point (2 on a retina display)."
+  fn begin(width_pt : Float, height_pt : Float, scale : Float, device_scale : Float) : Ui do
+    let s = if scale > 0.01 do scale else 1.0 end
+    let d = if device_scale > 0.01 do device_scale else 1.0 end
+    Ui(NativeArray.make_f32(Strata.Size.of(16 * 64), 0.0), 0, width_pt /. s, height_pt /. s, s *. d)
+  end
+
+  doc "How many quads the display holds."
+  fn quad_count(u : Ui) : Int do match u do Ui(_, n, _, _, _) -> n end end
+
+  doc "The quads, 16 floats each. The array may be longer than the count."
+  fn quads(u : Ui) : NativeF32Arr do match u do Ui(a, _, _, _, _) -> a end end
+
+  doc "The screen's width in interface pixels."
+  fn width(u : Ui) : Float do match u do Ui(_, _, w, _, _) -> w end end
+  doc "The screen's height in interface pixels."
+  fn height(u : Ui) : Float do match u do Ui(_, _, _, h, _) -> h end end
+  doc "Device pixels per interface pixel."
+  fn pixel_ratio(u : Ui) : Float do match u do Ui(_, _, _, _, k) -> k end end
+
+  pfn copy(dst : NativeF32Arr, src : NativeF32Arr, i : Int, n : Int) : NativeF32Arr do
+    if i >= n do dst else copy(NativeArray.set_f32(dst, i, NativeArray.get_f32(src, i)), src, i + 1, n) end
+  end
+
+  pfn put4(a : NativeF32Arr, o : Int, p : Float, q : Float, r : Float, s : Float) : NativeF32Arr do
+    NativeArray.set_f32(NativeArray.set_f32(NativeArray.set_f32(NativeArray.set_f32(a, o, p), o + 1, q), o + 2, r), o + 3, s)
+  end
+
+  pfn snap(v : Float) : Float do Math.floor(v +. 0.5) end
+
+  doc "Where an anchor's point is, in interface pixels."
+  fn anchor_x(u : Ui, anchor : Int) : Float do width(u) *. int_to_float(anchor % 3) *. 0.5 end
+  fn anchor_y(u : Ui, anchor : Int) : Float do height(u) *. int_to_float(anchor / 3) *. 0.5 end
+
+  doc "The left edge, in interface pixels, of an element [w] wide placed at offset [x] from [anchor]."
+  fn left_of(u : Ui, anchor : Int, x : Float, w : Float) : Float do anchor_x(u, anchor) +. x -. w *. int_to_float(anchor % 3) *. 0.5 end
+  doc "The top edge, in interface pixels, of an element [h] high placed at offset [y] from [anchor]."
+  fn top_of(u : Ui, anchor : Int, y : Float, h : Float) : Float do anchor_y(u, anchor) +. y -. h *. int_to_float(anchor / 3) *. 0.5 end
+
+  doc "Make room for [extra] more quads. For code that writes quads into the array itself (Strata.Text)."
+  fn reserve(u : Ui, extra : Int) : Ui do
+    match u do
+      Ui(a, n, w, h, k) ->
+        if NativeArray.length_f32(a) >= 16 * (n + extra) do Ui(a, n, w, h, k)
+        else Ui(copy(NativeArray.make_f32(Strata.Size.of(16 * (2 * n + extra)), 0.0), a, 0, 16 * n), n, w, h, k) end
+    end
+  end
+
+  doc "Make the display's array this value's own before foreign code writes past its end: if another display shares the array, this one gets a copy (the runtime copies a shared array when it is set). Needs room for at least one more quad."
+  fn own(u : Ui) : Ui do
+    match u do
+      Ui(a, n, w, h, k) -> if NativeArray.length_f32(a) > 16 * n do Ui(NativeArray.set_f32(a, 16 * n, 0.0), n, w, h, k) else Ui(a, n, w, h, k) end
+    end
+  end
+
+  doc "Count [extra] quads already written past the end of the list."
+  fn added(u : Ui, extra : Int) : Ui do
+    match u do
+      Ui(a, n, w, h, k) -> if extra > 0 && NativeArray.length_f32(a) >= 16 * (n + extra) do Ui(a, n + extra, w, h, k) else Ui(a, n, w, h, k) end
+    end
+  end
+
+  doc "Add a quad given in DEVICE pixels, as it will be drawn. For kinds this module has no call for."
+  fn raw(u : Ui, x0 : Float, y0 : Float, x1 : Float, y1 : Float, u0 : Float, v0 : Float, u1 : Float, v1 : Float, rgba : (Float, Float, Float, Float), kind : Int, layer : Int, p0 : Float, p1 : Float) : Ui do
+    match u do
+      Ui(a, n, w, h, k) ->
+        let room = if NativeArray.length_f32(a) >= 16 * (n + 1) do a else copy(NativeArray.make_f32(Strata.Size.of(32 * (n + 1)), 0.0), a, 0, 16 * n) end
+        let o = 16 * n
+        match rgba do
+          (r, g, b, al) ->
+            Ui(put4(put4(put4(put4(room, o, x0, y0, x1, y1), o + 4, u0, v0, u1, v1), o + 8, r, g, b, al), o + 12, int_to_float(kind), int_to_float(layer), p0, p1), n + 1, w, h, k)
+        end
+    end
+  end
+
+  -- an element's rectangle in device pixels, edges snapped
+  pfn placed(u : Ui, anchor : Int, x : Float, y : Float, w : Float, h : Float, u0 : Float, v0 : Float, u1 : Float, v1 : Float, rgba : (Float, Float, Float, Float), kind : Int, layer : Int) : Ui do
+    let k = pixel_ratio(u)
+    let l = left_of(u, anchor, x, w)
+    let t = top_of(u, anchor, y, h)
+    raw(u, snap(l *. k), snap(t *. k), snap((l +. w) *. k), snap((t +. h) *. k), u0, v0, u1, v1, rgba, kind, layer, 0.0, 0.0)
+  end
+
+  doc "A rectangle of one colour."
+  fn rect(u : Ui, anchor : Int, x : Float, y : Float, w : Float, h : Float, rgba : (Float, Float, Float, Float)) : Ui do
+    placed(u, anchor, x, y, w, h, 0.0, 0.0, 1.0, 1.0, rgba, 0, 0)
+  end
+
+  doc "A block texture drawn flat, [size] interface pixels square: an icon for a block."
+  fn icon(u : Ui, anchor : Int, x : Float, y : Float, size : Float, block_texture : Int) : Ui do
+    placed(u, anchor, x, y, size, size, 0.0, 0.0, 1.0, 1.0, (1.0, 1.0, 1.0, 1.0), 1, block_texture)
+  end
+
+  doc "A region of the interface atlas (Strata.Render.ui_atlas), stretched to [w] x [h] and multiplied by [rgba]."
+  fn image(u : Ui, anchor : Int, x : Float, y : Float, w : Float, h : Float, region : (Int, Int, Int, Int), rgba : (Float, Float, Float, Float)) : Ui do
+    match region do
+      (rx, ry, rw, rh) -> placed(u, anchor, x, y, w, h, int_to_float(rx), int_to_float(ry), int_to_float(rx + rw), int_to_float(ry + rh), rgba, 2, 0)
+    end
+  end
+
+  -- cut i (0..3) along one axis of a nine-slice: in interface pixels from the element's low edge
+  pfn cut(i : Int, size : Float, b : Float) : Float do
+    if i == 0 do 0.0 else if i == 1 do b else if i == 2 do size -. b else size end end end
+  end
+  -- the same cut in the region's pixels
+  pfn tcut(i : Int, r0 : Int, rsize : Int, border : Int) : Float do
+    let b = if 2 * border > rsize do rsize / 2 else border end
+    int_to_float(if i == 0 do r0 else if i == 1 do r0 + b else if i == 2 do r0 + rsize - b else r0 + rsize end end end)
+  end
+
+  pfn frame_go(u : Ui, i : Int, l : Float, t : Float, w : Float, h : Float, b : Float, region : (Int, Int, Int, Int), border : Int, rgba : (Float, Float, Float, Float)) : Ui do
+    if i >= 9 do u
+    else
+      let k = pixel_ratio(u)
+      let cx = i % 3
+      let cy = i / 3
+      match region do
+        (rx, ry, rw, rh) ->
+          frame_go(raw(u, snap((l +. cut(cx, w, b)) *. k), snap((t +. cut(cy, h, b)) *. k), snap((l +. cut(cx + 1, w, b)) *. k), snap((t +. cut(cy + 1, h, b)) *. k),
+                       tcut(cx, rx, rw, border), tcut(cy, ry, rh, border), tcut(cx + 1, rx, rw, border), tcut(cy + 1, ry, rh, border), rgba, 2, 0, 0.0, 0.0),
+                   i + 1, l, t, w, h, b, region, border, rgba)
+      end
+    end
+  end
+
+  doc "A frame from a region of the interface atlas, nine-sliced: the region's outer [border] pixels keep their size at the corners and stretch along the edges, and its middle stretches to fill. Nine quads. A frame smaller than twice its border shrinks the border to fit."
+  fn frame(u : Ui, anchor : Int, x : Float, y : Float, w : Float, h : Float, region : (Int, Int, Int, Int), border : Int, rgba : (Float, Float, Float, Float)) : Ui do
+    let half = (if w < h do w else h end) *. 0.5
+    let b0 = int_to_float(if border < 0 do 0 else border end)
+    let b = if b0 > half do (if half > 0.0 do half else 0.0 end) else b0 end
+    frame_go(u, 0, left_of(u, anchor, x, w), top_of(u, anchor, y, h), if w > 0.0 do w else 0.0 end, if h > 0.0 do h else 0.0 end, b, region, border, rgba)
+  end
+end

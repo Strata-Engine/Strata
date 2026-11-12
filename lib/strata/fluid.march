@@ -12,6 +12,15 @@
 -- state, so the result does not depend on the order cells are visited in:
 --
 --   * Sink.   A cell above or beside a sink block loses all it holds.
+--   * Sea.    A sea block is a body that is never used up. A cell above
+--             one loses all it holds, as over a sink. An empty cell
+--             beside or under one becomes sea if it has something to
+--             stand on, so a hole dug in the sea or at the shore closes
+--             with sea, up to the sea's level and no higher. Over a drop
+--             the sea pours the first flowing family instead, which
+--             falls: a cave under the sea floods from above. Water of
+--             that family standing against the sea is topped up. A sea
+--             block is never removed by a step.
 --   * Fall.   Else, with room below, it offers all it holds to the lowest
 --             cell it can reach straight down, at most `fall` cells away.
 --   * Seek.   Else, a surface cell looks `reach` cells along each of the
@@ -21,11 +30,12 @@
 --             the edge to where it would land this step: a stream runs
 --             to a drop instead of spreading, and the lip of a lake pours.
 --   * Level.  Else (and that includes every cell of a lake but its lip)
---             it gives an eighth at a time to the lowest cell it can
---             reach through fluid in each direction, while that one stands
+--             it gives an eighth at a time, two a step at most, to the
+--             lowest cell it can reach through fluid in each direction, while that one stands
 --             two or more below. A cell with the same fluid on top of it
---             instead pours all it can into its lowest side neighbour:
---             the weight above it pushes water out through an opening. So a surface settles to within an
+--             instead pours into its lowest side neighbour: all of it
+--             into an empty cell, half the difference into one that holds
+--             some. The weight above it pushes water out through an opening. So a surface settles to within an
 --             eighth and a lone eighth stays put.
 --
 -- A cell takes offers until it holds eight eighths: from above first, then
@@ -69,6 +79,37 @@ mod Strata.Fluid do
   fn flowing() : Int do 0 end
   doc "The kind of a block that swallows flowing fluid that reaches it and never changes."
   fn sink() : Int do 1 end
+  doc "The kind of a block that is a body of liquid never used up: it swallows fluid that falls onto it, and takes over empty cells beside and under it that have something to stand on, so a hole dug in it or beside it closes with the same block, up to its level and no higher. Over a drop it pours the first flowing family, which falls. An edit that touches it must be passed to `wake`."
+  fn sea() : Int do 2 end
+
+  doc "The same simulation with a top to its seas: a `sea` block above height [y] (in voxels) is a `sink` instead. For a world whose rivers are made of the sea's block: the sea floods what is dug beside it, and a river above it only swallows, so a lake breached into the river still drains."
+  fn with_sea_top(f : Fluid, y : Int) : Fluid do
+    match f do
+      Fluid(r, fl, sk, cap, reach, fall, a, d, ev, wt, nw, st) -> Fluid(r, fl, Cons(0 - 2000000 - y, drop_top(sk)), cap, reach, fall, a, d, ev, wt, nw, st)
+    end
+  end
+  -- the top is kept in the sink list too, as -(2 000 000 + y); none: no top
+  pfn drop_top(sk : List(Int)) : List(Int) do
+    match sk do
+      Nil -> Nil
+      Cons(h, t) -> if h <= -1000000 do drop_top(t) else Cons(h, drop_top(t)) end
+    end
+  end
+  pfn sea_top(sk : List(Int)) : Int do
+    match sk do
+      Nil -> 1000000
+      Cons(h, t) -> if h <= -1000000 do 0 - 2000000 - h else sea_top(t) end
+    end
+  end
+
+  -- seas are kept in the sink list as -(base + 1)
+  pfn sea_code(base : Int) : Int do 0 - base - 1 end
+  pfn sea_codes(l : List(Int)) : List(Int) do
+    match l do
+      Nil -> Nil
+      Cons(b, t) -> Cons(sea_code(b), sea_codes(t))
+    end
+  end
 
   pfn bases(fams : List((Int, Int)), kind : Int) : List(Int) do
     match fams do
@@ -77,9 +118,9 @@ mod Strata.Fluid do
     end
   end
 
-  doc "A fluid simulation over [r]'s blocks. [families] lists (base id, kind): a `flowing` family must be one registered with `Strata.Blocks.register_fluid`; a `sink` is any block. Nothing is active until something wakes it."
+  doc "A fluid simulation over [r]'s blocks. [families] lists (base id, kind): a `flowing` family must be one registered with `Strata.Blocks.register_fluid`; a `sink` or a `sea` is any block. Nothing is active until something wakes it."
   fn new(r : Strata.Blocks.Registry, families : List((Int, Int))) : Fluid do
-    Fluid(r, bases(families, 0), bases(families, 1), 4096, 16, 4, Sq.empty(-1), Sq.empty(-1), Nil, 0, Nil, 0)
+    Fluid(r, bases(families, 0), List.append(bases(families, 1), sea_codes(bases(families, 2))), 4096, 16, 4, Sq.empty(-1), Sq.empty(-1), Nil, 0, Nil, 0)
   end
 
   doc "The same simulation with other limits: at most [cap] active cells handled a step, a way down sought within [reach] cells, a fall of at most [fall] cells a step. The defaults are 4096, 16 and 4."
@@ -152,15 +193,16 @@ mod Strata.Fluid do
 
   -- What the cell is to fluid of family [base]: -2 its chunk is not loaded;
   -- -1 blocked; 0 empty (air or something fluid washes away); 1..8 the same
-  -- fluid at that level; 9 a sink.
+  -- fluid at that level; 9 a sink; 10 a sea.
   pfn look(r : Strata.Blocks.Registry, sk : List(Int), v : View, base : Int, x : Int, y : Int, z : Int) : Int do
     let id = peek(v, x, y, z)
     if id < 0 do -2
     else if id == 0 do 0
     else if Bq.is_fluid(r, id) do (if Bq.fluid_base(r, id) == base do Bq.fill(r, id) else -1 end)
     else if has_int(sk, Bq.base_of(r, id)) do 9
+    else if has_int(sk, sea_code(Bq.base_of(r, id))) do (if y <= sea_top(sk) do 10 else 9 end)
     else if Bq.collides(r, id) do -1
-    else 0 end end end end end
+    else 0 end end end end end end
   end
 
   -- One move on offer: target, the order its target hears it in (0 from
@@ -179,7 +221,8 @@ mod Strata.Fluid do
 
   -- Scan down from (x, y, z): k is the cell being looked at, last the lowest
   -- empty one so far. Answers (cells down to the target, what stopped it):
-  -- 0 the target is empty, 1 it is this fluid with room, 2 a sink is there.
+  -- 0 the target is empty, 1 it is this fluid with room, 2 a sink is there,
+  -- 3 a sea is there (the fluid lands on it, in the cell above).
   pfn fall_scan(r : Strata.Blocks.Registry, sk : List(Int), v : View, base : Int, x : Int, y : Int, z : Int, k : Int, last : Int, limit : Int) : (Int, Int) do
     if k > limit do (last, 0)
     else
@@ -187,7 +230,8 @@ mod Strata.Fluid do
       if c == 0 do fall_scan(r, sk, v, base, x, y, z, k + 1, k, limit)
       else if c >= 1 && c <= 7 do (k, 1)
       else if c == 9 do (k, 2)
-      else (last, 0) end end end
+      else if c == 10 do (k, 3)
+      else (last, 0) end end end end
     end
   end
 
@@ -203,10 +247,11 @@ mod Strata.Fluid do
     else
       let c = look(r, sk, v, base, x + i * dx, y, z + i * dz)
       if c == 9 do (if i == 1 do (0, 0, low, lowi) else (i, if gap > 0 do gap else i - 1 end, low, lowi) end)
-      else if c < 0 do (0, 0, low, lowi)
+      else if c < 0 || c == 10 do (0, 0, low, lowi)      -- a sea beside the line is a wall that fluid stands against
       else if c == 0 do
         let under = look(r, sk, v, base, x + i * dx, y - 1, z + i * dz)
-        if under == 0 || under == 9 || (under >= 1 && under <= 7) do (i, if gap > 0 do gap else i end, low, lowi)
+        -- a cell over a sea is a way down too: water runs to the sea's edge and out onto it, where it is swallowed
+        if under == 0 || under == 9 || under == 10 || (under >= 1 && under <= 7) do (i, if gap > 0 do gap else i end, low, lowi)
         else if gap == 0 do scan(r, sk, v, base, x, y, z, dx, dz, i + 1, reach, i, 0, i)
         else scan(r, sk, v, base, x, y, z, dx, dz, i + 1, reach, gap, low, lowi) end end
       else if gap == 0 && c < low do scan(r, sk, v, base, x, y, z, dx, dz, i + 1, reach, gap, c, i)
@@ -231,11 +276,13 @@ mod Strata.Fluid do
     let ob = open_to(l, nb) && b >= 0
     let oc = open_to(l, nc) && c >= 0
     let od = open_to(l, nd) && d >= 0
-    if oa && (!ob || na <= nb) && (!oc || na <= nc) && (!od || na <= nd) do share(l - 1, a, b, c, d, ga + 1, gb, gc, gd)
+    -- no more than two eighths leave a cell in a step: a surface lowers evenly, cell by cell, not in pits
+    if ga + gb + gc + gd >= 2 do (ga, gb, gc, gd)
+    else if oa && (!ob || na <= nb) && (!oc || na <= nc) && (!od || na <= nd) do share(l - 1, a, b, c, d, ga + 1, gb, gc, gd)
     else if ob && (!oc || nb <= nc) && (!od || nb <= nd) do share(l - 1, a, b, c, d, ga, gb + 1, gc, gd)
     else if oc && (!od || nc <= nd) do share(l - 1, a, b, c, d, ga, gb, gc + 1, gd)
     else if od do share(l - 1, a, b, c, d, ga, gb, gc, gd + 1)
-    else (ga, gb, gc, gd) end end end end
+    else (ga, gb, gc, gd) end end end end end
   end
   pfn gift(p : Plan, base : Int, x : Int, y : Int, z : Int, tx : Int, tz : Int, order : Int, n : Int) : Plan do
     if n > 0 do bid(p, Offer(tx, y, tz, order, n, x, y, z, base, 0, false)) else p end
@@ -251,11 +298,15 @@ mod Strata.Fluid do
       match fall_scan(r, sk, v, base, tx, y, tz, 1, 0, fall) do
         (k, what) ->
           if what == 2 do drain(p, x, y, z, l, tx, y - k, tz)
-          else if k == 0 do gift(p, base, x, y, z, tx, tz, order, l)
-          else bid(p, Offer(tx, y - k, tz, 0, l, x, y, z, base, k, what == 1 || look(r, sk, v, base, tx, y - k - 1, tz) != 0)) end end
+          else if k == 0 || (what == 3 && k == 1) do gift(p, base, x, y, z, tx, tz, order, l)
+          else if what == 3 do bid(p, Offer(tx, y - k + 1, tz, 0, l, x, y, z, base, k - 1, true))
+          else bid(p, Offer(tx, y - k, tz, 0, l, x, y, z, base, k, what == 1 || look(r, sk, v, base, tx, y - k - 1, tz) != 0)) end end end
       end
     end
   end
+
+  -- How much a cell holding l pours into a side neighbour holding n < l.
+  pfn pour(l : Int, n : Int) : Int do if n == 0 do l else min2((l - n) / 2, 2) end end
 
   -- What the fluid cell at (x, y, z), holding [l] eighths of family [base],
   -- wants to do.
@@ -267,7 +318,16 @@ mod Strata.Fluid do
     let nzp = look(r, sk, v, base, x, y, z + 1)
     -- a cell that touches a chunk that is not loaded is remembered, so the chunk's arrival wakes it
     let p1 = if below == -2 || nxm == -2 || nxp == -2 || nzm == -2 || nzp == -2 do edge(p, x, y, z, fell) else p end
-    if below == 9 do drain(p1, x, y, z, l, x, y - 1, z)
+    -- Water lying on a sea is swallowed, unless it is part of the sea's own
+    -- body: with sea beside it, or water on top of it. Then it rests on the
+    -- sea as on ground, and joins it when the sea takes it. Water that has
+    -- run out over the open surface of the sea has neither, and is gone.
+    let above0 = look(r, sk, v, base, x, y + 1, z)
+    let by_sea = nxm == 10 || nxp == 10 || nzm == 10 || nzp == 10
+    let afloat = below == 10 && (by_sea || (above0 >= 1 && above0 <= 8))
+    if below == 9 || (below == 10 && !afloat) do drain(p1, x, y, z, l, x, y - 1, z)
+    -- a full cell beside the sea, standing on something, with no water on it, is about to join the sea: it keeps still so the sea can take it
+    else if l == 8 && by_sea && (below == -1 || below == 10 || below == 8) && !(above0 >= 1 && above0 <= 8) do p1
     else if nxm == 9 do drain(p1, x, y, z, l, x - 1, y, z)
     else if nxp == 9 do drain(p1, x, y, z, l, x + 1, y, z)
     else if nzm == 9 do drain(p1, x, y, z, l, x, y, z - 1)
@@ -276,8 +336,9 @@ mod Strata.Fluid do
       match fall_scan(r, sk, v, base, x, y, z, 1, 0, fall) do
         (k, what) ->
           if what == 2 do drain(p1, x, y, z, l, x, y - k, z)
+          else if what == 3 do bid(p1, Offer(x, y - k + 1, z, 0, l, x, y, z, base, fell + k - 1, true))
           else if what == 1 do bid(p1, Offer(x, y - k, z, 0, l, x, y, z, base, fell + k, true))
-          else bid(p1, Offer(x, y - k, z, 0, l, x, y, z, base, fell + k, look(r, sk, v, base, x, y - k - 1, z) != 0)) end end
+          else bid(p1, Offer(x, y - k, z, 0, l, x, y, z, base, fell + k, look(r, sk, v, base, x, y - k - 1, z) != 0)) end end end
       end
     else if below >= 1 && below <= 7 do bid(p1, Offer(x, y - 1, z, 0, l, x, y, z, base, fell + 1, true))
     else
@@ -285,15 +346,18 @@ mod Strata.Fluid do
       -- with the cells beside it; fluid at the surface looks further.
       let above = look(r, sk, v, base, x, y + 1, z)
       if above >= 1 && above <= 8 do
-        -- under the weight of the fluid above, it pours all it can into its lowest side neighbour
+        -- under the weight of the fluid above, it pours into its lowest side
+        -- neighbour: all of it into an empty cell (an opening), half the
+        -- difference into one that already holds some, so that a surface
+        -- standing in this layer evens out instead of trading pits
         let ma = if nxm >= 0 && nxm < l do nxm else 9 end
         let mb = if nxp >= 0 && nxp < l do nxp else 9 end
         let mc = if nzm >= 0 && nzm < l do nzm else 9 end
         let md = if nzp >= 0 && nzp < l do nzp else 9 end
-        if ma < 9 && ma <= mb && ma <= mc && ma <= md do gift(p1, base, x, y, z, x - 1, z, 2, min2(l, 8 - ma))
-        else if mb < 9 && mb <= mc && mb <= md do gift(p1, base, x, y, z, x + 1, z, 1, min2(l, 8 - mb))
-        else if mc < 9 && mc <= md do gift(p1, base, x, y, z, x, z - 1, 4, min2(l, 8 - mc))
-        else if md < 9 do gift(p1, base, x, y, z, x, z + 1, 3, min2(l, 8 - md))
+        if ma < 9 && ma <= mb && ma <= mc && ma <= md do gift(p1, base, x, y, z, x - 1, z, 2, pour(l, ma))
+        else if mb < 9 && mb <= mc && mb <= md do gift(p1, base, x, y, z, x + 1, z, 1, pour(l, mb))
+        else if mc < 9 && mc <= md do gift(p1, base, x, y, z, x, z - 1, 4, pour(l, mc))
+        else if md < 9 do gift(p1, base, x, y, z, x, z + 1, 3, pour(l, md))
         else p1 end end end end
       else
         match scan(r, sk, v, base, x, y, z, -1, 0, 1, reach, 0, 99, 0) do
@@ -333,17 +397,75 @@ mod Strata.Fluid do
             end
         end
       end
-    end end end end end end end
+    end end end end end end end end
   end
 
-  -- The plan for one active cell, if it holds a flowing fluid.
+  -- What a sea cell does for a cell beside or under it, at (tx, ty, tz):
+  --   * empty, with something to stand on (ground, sea, or a full cell of
+  --     the family): it becomes sea. Order 6; the "family" carries the sea's
+  --     block id. So a hole dug in or beside the sea closes with sea, up to
+  --     the sea's own level and no higher: the sea never spreads upward.
+  --   * empty over a drop: it is filled with the flowing family, which
+  --     falls (order 5); unless this sea cell has sea under it, when the
+  --     room below is the lower cell's to fill first.
+  --   * holding some of the family: it is topped up. Order 5.
+  --   * full of the family, with something to stand on: it becomes sea too
+  --     (order 7), so water that has run into a hole in the sea ends as
+  --     sea and not as a second kind of water beside it.
+  -- Both orders are heard after every other giver, and the sea gives
+  -- nothing up.
+  pfn sea_mark(id : Int) : Int do 0 - 1000 - id end
+  pfn feed(r : Strata.Blocks.Registry, sk : List(Int), v : View, p : Plan, base : Int, sea_id : Int, x : Int, y : Int, z : Int, tx : Int, ty : Int, tz : Int) : Plan do
+    let c = look(r, sk, v, base, tx, ty, tz)
+    if c >= 1 && c <= 7 do bid(p, Offer(tx, ty, tz, 5, 8 - c, x, y, z, base, 0, true))
+    else if c == 8 do
+      -- a full cell of the family, standing on something: it joins the sea (order 7)
+      -- ... and with none of the family on top of it: water resting on a sea cell is swallowed, so a body of water joins the sea from its top down
+      let under = look(r, sk, v, base, tx, ty - 1, tz)
+      let over = look(r, sk, v, base, tx, ty + 1, tz)
+      if (under == -1 || under == 10 || under == 8) && !(over >= 1 && over <= 8) do bid(p, Offer(tx, ty, tz, 7, 0, x, y, z, sea_mark(sea_id), 0, true)) else p end
+    else if c == 0 do
+      let under = look(r, sk, v, base, tx, ty - 1, tz)
+      if under == -1 || under == 10 || under == 8 do bid(p, Offer(tx, ty, tz, 6, 8, x, y, z, sea_mark(sea_id), 0, true))
+      else if under == -2 do p
+      -- beside the sea, over room that the sea cell below this one is about to deal with: wait for it (an offer of nothing keeps this cell active), so a hole fills from the bottom with sea and not with loose water poured in from the top
+      else if ty == y && look(r, sk, v, base, x, y - 1, z) == 10 do bid(p, Offer(tx, ty, tz, 5, 0, x, y, z, base, 0, true))
+      else bid(p, Offer(tx, ty, tz, 5, 8, x, y, z, base, 0, true)) end end end
+    else p end end end
+  end
+
+  -- A sea cell looks along (dx, dz) past full cells of the family, at most
+  -- [reach] cells, and tops up the first one with room: water standing
+  -- against the sea ends level with it, not an eighth lower with every cell
+  -- from the shore.
+  pfn feed_line(r : Strata.Blocks.Registry, sk : List(Int), v : View, p : Plan, base : Int, x : Int, y : Int, z : Int, dx : Int, dz : Int, i : Int, reach : Int) : Plan do
+    if i > reach do p
+    else
+      let c = look(r, sk, v, base, x + i * dx, y, z + i * dz)
+      if c == 8 do feed_line(r, sk, v, p, base, x, y, z, dx, dz, i + 1, reach)
+      else if c >= 1 && c <= 7 do bid(p, Offer(x + i * dx, y, z + i * dz, 5, 8 - c, x, y, z, base, 0, true))
+      else p end end
+    end
+  end
+
+  pfn feed_side(r : Strata.Blocks.Registry, sk : List(Int), v : View, p : Plan, base : Int, sea_id : Int, x : Int, y : Int, z : Int, dx : Int, dz : Int, reach : Int) : Plan do
+    feed_line(r, sk, v, feed(r, sk, v, p, base, sea_id, x, y, z, x + dx, y, z + dz), base, x, y, z, dx, dz, 2, reach)
+  end
+
+  -- The plan for one active cell: a flowing fluid decides its move; a sea
+  -- cell fills the room beside and under it (see `feed`).
   pfn consider(r : Strata.Blocks.Registry, fl : List(Int), sk : List(Int), v : View, reach : Int, fall : Int, p : Plan, x : Int, y : Int, z : Int, fell : Int) : Plan do
     let id = peek(v, x, y, z)
     if id < 0 do edge(p, x, y, z, fell)
+    else if id != 0 && y <= sea_top(sk) && has_int(sk, sea_code(Bq.base_of(r, id))) do
+      match fl do
+        Nil -> p
+        Cons(base, _) -> feed_side(r, sk, v, feed_side(r, sk, v, feed_side(r, sk, v, feed_side(r, sk, v, feed(r, sk, v, p, base, id, x, y, z, x, y - 1, z), base, id, x, y, z, -1, 0, reach), base, id, x, y, z, 1, 0, reach), base, id, x, y, z, 0, -1, reach), base, id, x, y, z, 0, 1, reach)
+      end
     else
       let base = Bq.fluid_base(r, id)
       if base < 0 || !has_int(fl, base) do p else decide(r, sk, v, reach, fall, p, base, Bq.fill(r, id), x, y, z, fell) end
-    end
+    end end
   end
 
   -- ── Settling the offers ──────────────────────────────────────────────────
@@ -386,7 +508,8 @@ mod Strata.Fluid do
   -- fallen; events.
   -- ... and the givers whose offer was refused or cut short: they still
   -- hold fluid that wants to move, so they stay active.
-  type Settled = Settled(Strata.Store.Store(Int), Strata.Store.Store(Int), Strata.Store.Store(Int), List(Event), List((Int, Int, Int)))
+  -- ... and the full cells a sea would take over (x, y, z, the sea's block id).
+  type Settled = Settled(Strata.Store.Store(Int), Strata.Store.Store(Int), Strata.Store.Store(Int), List(Event), List((Int, Int, Int)), List((Int, Int, Int, Int)))
 
   pfn add_delta(m : Strata.Store.Store(Int), k : Strata.Coord.Key, d : Int) : Strata.Store.Store(Int) do Sq.put(m, k, Sq.get(m, k) + d) end
 
@@ -400,18 +523,21 @@ mod Strata.Fluid do
           Offer(tx, ty, tz, ord, n, sx, sy, sz, base, fell, landed) ->
             let got = if fam >= 0 && fam != base do 0 else min2(n, room) end
             match s do
-              Settled(delta, fams, fells, evs, short) ->
-                let short2 = if got < n do Cons((sx, sy, sz), short) else short end
-                if got <= 0 do take(Settled(delta, fams, fells, evs, short2), t, room, fam)
+              Settled(delta, fams, fells, evs, short, claims) ->
+                -- a sea (orders 5 and 6) gives without losing; it stays active for as long as it finds room to offer to, near or along its line
+                let short2 = if got < n || ord >= 5 do Cons((sx, sy, sz), short) else short end
+                -- order 7: a sea asks for a full cell of the family beside or under it; granted after everything else is settled, if the cell took no part in the step
+                let claims2 = if ord == 7 do Cons((tx, ty, tz, 0 - 1000 - base), claims) else claims end
+                if got <= 0 do take(Settled(delta, fams, fells, evs, short2, claims2), t, room, fam)
                 else
                   let tk = Kq.key(tx, ty, tz)
                   let sk = Kq.key(sx, sy, sz)
-                  let d2 = add_delta(add_delta(delta, tk, got), sk, 0 - got)
-                  let f2 = Sq.put(Sq.put(fams, tk, base), sk, base)
+                  let d2 = if ord >= 5 do add_delta(delta, tk, got) else add_delta(add_delta(delta, tk, got), sk, 0 - got) end
+                  let f2 = if ord >= 5 do Sq.put(fams, tk, base) else Sq.put(Sq.put(fams, tk, base), sk, base) end
                   let arrived = if landed do 0 else min2(fell, 4095) end
                   let fe2 = if ord == 0 do Sq.put(fells, tk, max2(Sq.get(fells, tk), arrived)) else fells end
                   let ev2 = if ord == 0 do Cons(Event(tx, ty, tz, got, fell, landed), evs) else evs end
-                  take(Settled(d2, f2, fe2, ev2, short2), t, room - got, base)
+                  take(Settled(d2, f2, fe2, ev2, short2, claims2), t, room - got, base)
                 end
             end
         end
@@ -423,11 +549,11 @@ mod Strata.Fluid do
       Nil -> s
       Cons((x, y, z, n), t) ->
         match s do
-          Settled(delta, fams, fells, evs, short) ->
+          Settled(delta, fams, fells, evs, short, claims) ->
             let k = Kq.key(x, y, z)
             -- water a sink swallows lands there: an event, so it is heard and sprays
             let fell = max2(0, Sq.get(active, k)) % 4096
-            drains(Settled(add_delta(delta, k, 0 - n), Sq.put(fams, k, Bq.fluid_base(r, Wq.get_block(w, x, y, z))), fells, Cons(Event(x, y, z, n, fell, true), evs), short), r, w, t, active)
+            drains(Settled(add_delta(delta, k, 0 - n), Sq.put(fams, k, Bq.fluid_base(r, Wq.get_block(w, x, y, z))), fells, Cons(Event(x, y, z, n, fell, true), evs), short, claims), r, w, t, active)
         end
     end
   end
@@ -443,10 +569,18 @@ mod Strata.Fluid do
     let b = Bq.fluid_base(r, Wq.get_block(w, x, y, z))
     b >= 0 && has_int(fl, b)
   end
+  pfn is_sea(r : Strata.Blocks.Registry, sk : List(Int), w : Strata.World.World, x : Int, y : Int, z : Int) : Bool do
+    let id = Wq.get_block(w, x, y, z)
+    id != 0 && y <= sea_top(sk) && has_int(sk, sea_code(Bq.base_of(r, id)))
+  end
+  -- does the cell hold something a step acts for: flowing fluid, or a sea?
+  pfn acts(r : Strata.Blocks.Registry, fl : List(Int), sk : List(Int), w : Strata.World.World, x : Int, y : Int, z : Int) : Bool do
+    is_flowing(r, fl, w, x, y, z) || is_sea(r, sk, w, x, y, z)
+  end
 
-  -- A cell of the new world joins the active set if it holds flowing fluid.
-  pfn join(a : Strata.Store.Store(Int), old : Strata.Store.Store(Int), fells : Strata.Store.Store(Int), r : Strata.Blocks.Registry, fl : List(Int), w : Strata.World.World, x : Int, y : Int, z : Int) : Strata.Store.Store(Int) do
-    if !is_flowing(r, fl, w, x, y, z) do a
+  -- A cell of the new world joins the active set if it holds flowing fluid or is a sea.
+  pfn join(a : Strata.Store.Store(Int), old : Strata.Store.Store(Int), fells : Strata.Store.Store(Int), r : Strata.Blocks.Registry, fl : List(Int), sk : List(Int), w : Strata.World.World, x : Int, y : Int, z : Int) : Strata.Store.Store(Int) do
+    if !acts(r, fl, sk, w, x, y, z) do a
     else
       let k = Kq.key(x, y, z)
       if Sq.has(a, k) do a
@@ -455,11 +589,60 @@ mod Strata.Fluid do
     end
   end
 
-  pfn join_around(a : Strata.Store.Store(Int), old : Strata.Store.Store(Int), fells : Strata.Store.Store(Int), r : Strata.Blocks.Registry, fl : List(Int), w : Strata.World.World, k : Strata.Coord.Key) : Strata.Store.Store(Int) do
+  pfn join_around(a : Strata.Store.Store(Int), old : Strata.Store.Store(Int), fells : Strata.Store.Store(Int), r : Strata.Blocks.Registry, fl : List(Int), sk : List(Int), w : Strata.World.World, k : Strata.Coord.Key) : Strata.Store.Store(Int) do
     let x = Kq.kx(k)
     let y = Kq.ky(k)
     let z = Kq.kz(k)
-    join(join(join(join(join(join(join(a, old, fells, r, fl, w, x, y, z), old, fells, r, fl, w, x - 1, y, z), old, fells, r, fl, w, x + 1, y, z), old, fells, r, fl, w, x, y - 1, z), old, fells, r, fl, w, x, y + 1, z), old, fells, r, fl, w, x, y, z - 1), old, fells, r, fl, w, x, y, z + 1)
+    join(join(join(join(join(join(join(a, old, fells, r, fl, sk, w, x, y, z), old, fells, r, fl, sk, w, x - 1, y, z), old, fells, r, fl, sk, w, x + 1, y, z), old, fells, r, fl, sk, w, x, y - 1, z), old, fells, r, fl, sk, w, x, y + 1, z), old, fells, r, fl, sk, w, x, y, z - 1), old, fells, r, fl, sk, w, x, y, z + 1)
+  end
+
+  -- The claims that stand: one per cell, and only for a cell nothing else
+  -- moved into or out of this step.
+  pfn grant(claims : List((Int, Int, Int, Int)), delta : Strata.Store.Store(Int), seen : Strata.Store.Store(Bool), acc : List((Int, Int, Int, Int))) : List((Int, Int, Int, Int)) do
+    match claims do
+      Nil -> acc
+      Cons((x, y, z, id), t) ->
+        let k = Kq.key(x, y, z)
+        if Sq.get(delta, k) != 0 || Sq.get(seen, k) do grant(t, delta, seen, acc)
+        else grant(t, delta, Sq.put(seen, k, true), Cons((x, y, z, id), acc)) end
+    end
+  end
+  pfn join_granted(a : Strata.Store.Store(Int), old : Strata.Store.Store(Int), fells : Strata.Store.Store(Int), r : Strata.Blocks.Registry, fl : List(Int), sk : List(Int), w : Strata.World.World, l : List((Int, Int, Int, Int))) : Strata.Store.Store(Int) do
+    match l do
+      Nil -> a
+      Cons((x, y, z, _), t) -> join_granted(join_around(a, old, fells, r, fl, sk, w, Kq.key(x, y, z)), old, fells, r, fl, sk, w, t)
+    end
+  end
+
+  pfn any_sea(sk : List(Int)) : Bool do
+    match sk do
+      Nil -> false
+      Cons(h, t) -> h < 0 || any_sea(t)
+    end
+  end
+
+  -- A cell that changed may have made room a sea can fill from along its
+  -- line: walk from it through full cells of its family each way, and wake
+  -- the sea cell the walk ends at, if it ends at one.
+  pfn sea_along(a : Strata.Store.Store(Int), r : Strata.Blocks.Registry, sk : List(Int), w : Strata.World.World, base : Int, x : Int, y : Int, z : Int, dx : Int, dz : Int, i : Int, reach : Int) : Strata.Store.Store(Int) do
+    if i > reach do a
+    else
+      let id = Wq.get_block(w, x + i * dx, y, z + i * dz)
+      if id == 0 do a
+      else if y <= sea_top(sk) && has_int(sk, sea_code(Bq.base_of(r, id))) do (if Sq.has(a, Kq.key(x + i * dx, y, z + i * dz)) do a else Sq.put(a, Kq.key(x + i * dx, y, z + i * dz), 0) end)
+      else if Bq.fluid_base(r, id) == base && Bq.fill(r, id) == 8 do sea_along(a, r, sk, w, base, x, y, z, dx, dz, i + 1, reach)
+      else a end end end
+    end
+  end
+  pfn seas_for(a : Strata.Store.Store(Int), r : Strata.Blocks.Registry, sk : List(Int), w : Strata.World.World, k : Strata.Coord.Key, reach : Int) : Strata.Store.Store(Int) do
+    let x = Kq.kx(k)
+    let y = Kq.ky(k)
+    let z = Kq.kz(k)
+    let id = Wq.get_block(w, x, y, z)
+    let base = Bq.fluid_base(r, id)
+    -- only a cell of fluid with room in it can be topped up
+    if base < 0 || Bq.fill(r, id) >= 8 do a
+    else sea_along(sea_along(sea_along(sea_along(a, r, sk, w, base, x, y, z, -1, 0, 1, reach), r, sk, w, base, x, y, z, 1, 0, 1, reach), r, sk, w, base, x, y, z, 0, -1, 1, reach), r, sk, w, base, x, y, z, 0, 1, 1, reach) end
   end
 
   pfn settle_target(s : Settled, r : Strata.Blocks.Registry, w : Strata.World.World, k : Strata.Coord.Key, offers : List(Offer)) : Settled do
@@ -477,8 +660,12 @@ mod Strata.Fluid do
     if d == 0 do acc
     else
       let base = Sq.get(fams, k)
-      let now = held(r, w, base, k) + d
-      Cons((Kq.kx(k), Kq.ky(k), Kq.kz(k), if now <= 0 do 0 else base + min2(now, 8) - 1 end), acc)
+      -- a cell the sea took over: the mark carries the sea's block id
+      if base <= -1000 do (if d > 0 do Cons((Kq.kx(k), Kq.ky(k), Kq.kz(k), 0 - 1000 - base), acc) else acc end)
+      else
+        let now = held(r, w, base, k) + d
+        Cons((Kq.kx(k), Kq.ky(k), Kq.kz(k), if now <= 0 do 0 else base + min2(now, 8) - 1 end), acc)
+      end
     end
   end
 
@@ -580,14 +767,14 @@ mod Strata.Fluid do
   end
 
   -- Does an active cell have anything to do: flowing fluid, or a chunk that is not loaded (it is set aside)?
-  pfn holds(r : Strata.Blocks.Registry, fl : List(Int), w : Strata.World.World, k : Strata.Coord.Key) : Bool do
-    !Wq.is_loaded(w, Kq.key_of_voxel(Kq.kx(k), Kq.ky(k), Kq.kz(k))) || is_flowing(r, fl, w, Kq.kx(k), Kq.ky(k), Kq.kz(k))
+  pfn holds(r : Strata.Blocks.Registry, fl : List(Int), sk : List(Int), w : Strata.World.World, k : Strata.Coord.Key) : Bool do
+    !Wq.is_loaded(w, Kq.key_of_voxel(Kq.kx(k), Kq.ky(k), Kq.kz(k))) || acts(r, fl, sk, w, Kq.kx(k), Kq.ky(k), Kq.kz(k))
   end
 
-  pfn join_short(a : Strata.Store.Store(Int), old : Strata.Store.Store(Int), fells : Strata.Store.Store(Int), r : Strata.Blocks.Registry, fl : List(Int), w : Strata.World.World, l : List((Int, Int, Int))) : Strata.Store.Store(Int) do
+  pfn join_short(a : Strata.Store.Store(Int), old : Strata.Store.Store(Int), fells : Strata.Store.Store(Int), r : Strata.Blocks.Registry, fl : List(Int), sk : List(Int), w : Strata.World.World, l : List((Int, Int, Int))) : Strata.Store.Store(Int) do
     match l do
       Nil -> a
-      Cons((x, y, z), t) -> join_short(join(a, old, fells, r, fl, w, x, y, z), old, fells, r, fl, w, t)
+      Cons((x, y, z), t) -> join_short(join(a, old, fells, r, fl, sk, w, x, y, z), old, fells, r, fl, sk, w, t)
     end
   end
 
@@ -598,20 +785,22 @@ mod Strata.Fluid do
         match revive(w, active0, dormant0) do
           Revived(active, dormant) ->
             -- a woken cell that holds no flowing fluid has nothing to do and takes no place under the cap
-            let all = Sq.fold(active, Nil, fn (acc, k, v) -> if holds(r, fl, w, k) do Cons((urgency(dist2(focus, Kq.kx(k), Kq.ky(k), Kq.kz(k), -1.0), v / 4096), Kq.kx(k), Kq.ky(k), Kq.kz(k), v), acc) else acc end)
+            let all = Sq.fold(active, Nil, fn (acc, k, v) -> if holds(r, fl, sk, w, k) do Cons((urgency(dist2(focus, Kq.kx(k), Kq.ky(k), Kq.kz(k), -1.0), v / 4096), Kq.kx(k), Kq.ky(k), Kq.kz(k), v), acc) else acc end)
             let ordered = if List.length(all) > cap do List.sort_by(all, fn (a, b) -> nearer_cell(a, b)) else all end
             match split_at(ordered, cap, Nil) do
               (now, later) ->
                 match Sq.fold(by_chunk(now, Sq.empty(Nil)), Plan(Nil, Nil, Nil, Nil), fn (p, k, cells) -> plan_cells(r, fl, sk, view_of(w, k), reach, fall, p, cells)) do
                   Plan(os, ds, es, sinks) ->
-                    let taken = Sq.fold(by_target(os, Sq.empty(Nil)), Settled(Sq.empty(0), Sq.empty(-1), Sq.empty(0), Nil, Nil), fn (s, k, offers) -> settle_target(s, r, w, k, offers))
+                    let taken = Sq.fold(by_target(os, Sq.empty(Nil)), Settled(Sq.empty(0), Sq.empty(-1), Sq.empty(0), Nil, Nil, Nil), fn (s, k, offers) -> settle_target(s, r, w, k, offers))
                     match drains(taken, r, w, ds, active) do
-                      Settled(delta, fams, fells, evs, short) ->
-                        let o = Eq.set_many(w, Sq.fold(delta, Nil, fn (acc, k, d) -> cell_after(acc, r, w, fams, k, d)))
+                      Settled(delta, fams, fells, evs, short, claims) ->
+                        let granted = grant(claims, delta, Sq.empty(false), Nil)
+                        let o = Eq.set_many(w, List.append(granted, Sq.fold(delta, Nil, fn (acc, k, d) -> cell_after(acc, r, w, fams, k, d))))
                         let w2 = Eq.world(o)
-                        let moved = Sq.fold(delta, Sq.empty(-1), fn (a, k, d) -> if d == 0 do a else join_around(a, active, fells, r, fl, w2, k) end)
+                        let seas = any_sea(sk)
+                        let moved = Sq.fold(delta, Sq.empty(-1), fn (a, k, d) -> if d == 0 do a else if seas do seas_for(join_around(a, active, fells, r, fl, sk, w2, k), r, sk, w2, k, reach) else join_around(a, active, fells, r, fl, sk, w2, k) end end)
                         -- a giver that could not give all it offered stays active: its target was taken by another
-                        match keep_waiting(join_short(moved, active, fells, r, fl, w2, short), later, 0) do
+                        match keep_waiting(join_short(join_granted(moved, active, fells, r, fl, sk, w2, granted), active, fells, r, fl, sk, w2, short), later, 0) do
                           (active2, waiting) -> (Fluid(r, fl, sk, cap, reach, fall, active2, set_aside(dormant, es), evs, waiting, Nil, st + 1), o, sinks)
                         end
                     end
@@ -631,7 +820,7 @@ mod Strata.Fluid do
   -- ── Waking from an edit ──────────────────────────────────────────────────
   pfn wake_if(f : Fluid, w : Strata.World.World, x : Int, y : Int, z : Int) : Fluid do
     match f do
-      Fluid(r, fl, _, _, _, _, _, _, _, _, _, _) -> if is_flowing(r, fl, w, x, y, z) do wake_cell(f, x, y, z) else f end
+      Fluid(r, fl, sk, _, _, _, _, _, _, _, _, _) -> if acts(r, fl, sk, w, x, y, z) do wake_cell(f, x, y, z) else f end
     end
   end
 
@@ -729,7 +918,7 @@ mod Strata.Fluid do
       Nil -> true
       Cons((x, y, z), t) ->
         match f do
-          Fluid(r, _, sk, _, _, _, _, _, _, _, _, _) -> if has_int(sk, Bq.base_of(r, Wq.get_block(w, x, y, z))) do still_sinks(f, w, t) else false end
+          Fluid(r, _, sk, _, _, _, _, _, _, _, _, _) -> if has_int(sk, Bq.base_of(r, Wq.get_block(w, x, y, z))) || has_int(sk, sea_code(Bq.base_of(r, Wq.get_block(w, x, y, z)))) do still_sinks(f, w, t) else false end
         end
     end
   end
@@ -786,6 +975,110 @@ mod Strata.Fluid do
   fn step(f : Fluid, s : Strata.Stream.Stream, focus : List((Float, Float, Float))) : (Fluid, Strata.Stream.Stream) do
     match step_world(f, Strata.Stream.world(s), focus) do
       (f2, o) -> (f2, Strata.Stream.apply(s, o))
+    end
+  end
+
+  -- ── Questions a game asks ────────────────────────────────────────────────
+  -- A body that swims needs to know how deep it stands in liquid and which
+  -- way the liquid is moving. Both are read straight from the world: the
+  -- fluid keeps no record of flow. Coordinates are in voxels.
+
+  -- How high the liquid in a cell stands above the cell's floor, in eighths:
+  -- a flowing fluid's fill (8 with the same fluid above it), 8 for a sink,
+  -- 0 for anything else.
+  pfn liquid(f : Fluid, w : Strata.World.World, x : Int, y : Int, z : Int) : Int do
+    match f do
+      Fluid(r, fl, sk, _, _, _, _, _, _, _, _, _) ->
+        let id = Wq.get_block(w, x, y, z)
+        if id == 0 do 0
+        else if has_int(sk, Bq.base_of(r, id)) || has_int(sk, sea_code(Bq.base_of(r, id))) do 8
+        else
+          let base = Bq.fluid_base(r, id)
+          if base < 0 || !has_int(fl, base) do 0
+          else if Bq.fluid_base(r, Wq.get_block(w, x, y + 1, z)) == base do 8
+          else Bq.fill(r, id) end end
+        end end
+    end
+  end
+
+  pfn overlap(a0 : Float, a1 : Float, b0 : Float, b1 : Float) : Float do
+    let lo = if a0 > b0 do a0 else b0 end
+    let hi = if a1 < b1 do a1 else b1 end
+    if hi > lo do hi -. lo else 0.0 end
+  end
+
+  pfn under_go(f : Fluid, w : Strata.World.World, x0 : Float, y0 : Float, z0 : Float, x1 : Float, y1 : Float, z1 : Float, cx0 : Int, cz0 : Int, cx1 : Int, cy1 : Int, cz1 : Int, x : Int, y : Int, z : Int, acc : Float) : Float do
+    if y > cy1 do acc
+    else if z > cz1 do under_go(f, w, x0, y0, z0, x1, y1, z1, cx0, cz0, cx1, cy1, cz1, cx0, y + 1, cz0, acc)
+    else if x > cx1 do under_go(f, w, x0, y0, z0, x1, y1, z1, cx0, cz0, cx1, cy1, cz1, cx0, y, z + 1, acc)
+    else
+      let l = liquid(f, w, x, y, z)
+      let part = if l == 0 do 0.0
+        else overlap(x0, x1, int_to_float(x), int_to_float(x + 1)) *. overlap(z0, z1, int_to_float(z), int_to_float(z + 1)) *. overlap(y0, y1, int_to_float(y), int_to_float(y) +. int_to_float(l) /. 8.0) end
+      under_go(f, w, x0, y0, z0, x1, y1, z1, cx0, cz0, cx1, cy1, cz1, x + 1, y, z, acc +. part)
+    end end end
+  end
+
+  doc "How much of the box with corners (x0, y0, z0) and (x1, y1, z1), in voxels, is under liquid: 0 for none of it, 1 for all. Flowing fluids count by how full each cell is; a sink (a sea) counts as full."
+  fn depth_in(f : Fluid, w : Strata.World.World, x0 : Float, y0 : Float, z0 : Float, x1 : Float, y1 : Float, z1 : Float) : Float do
+    let vol = (x1 -. x0) *. (y1 -. y0) *. (z1 -. z0)
+    if vol <= 0.0 do 0.0
+    else
+      let cx0 = float_to_int(Math.floor(x0))
+      let cz0 = float_to_int(Math.floor(z0))
+      under_go(f, w, x0, y0, z0, x1, y1, z1, cx0, cz0, float_to_int(Math.floor(x1 -. 0.00001)), float_to_int(Math.floor(y1 -. 0.00001)), float_to_int(Math.floor(z1 -. 0.00001)), cx0, float_to_int(Math.floor(y0)), cz0, 0.0) /. vol
+    end
+  end
+
+  pfn surface_go(f : Fluid, w : Strata.World.World, x : Int, y : Int, z : Int, n : Int) : Float do
+    let l = liquid(f, w, x, y, z)
+    if l == 0 do int_to_float(y)
+    else if l < 8 || n <= 0 do int_to_float(y) +. int_to_float(l) /. 8.0
+    else surface_go(f, w, x, y + 1, z, n - 1) end end
+  end
+
+  doc "The height, in voxels, of the liquid surface over the cell (x, y, z): the top of the column of liquid the cell is in, looking up at most 64 cells. Far below zero (-1000000) when the cell holds no liquid."
+  fn surface(f : Fluid, w : Strata.World.World, x : Int, y : Int, z : Int) : Float do
+    if liquid(f, w, x, y, z) == 0 do -1000000.0 else surface_go(f, w, x, y, z, 64) end
+  end
+
+  -- The pull toward a side neighbour, for a cell of family [base] standing
+  -- [l] eighths high: 2 toward a drop (an empty cell with room under it) or a sink,
+  -- the difference in eighths toward lower fluid or empty ground, less than
+  -- nothing toward higher fluid, nothing toward a wall.
+  pfn pull(f : Fluid, w : Strata.World.World, base : Int, l : Int, x : Int, y : Int, z : Int) : Float do
+    match f do
+      Fluid(r, _, sk, _, _, _, _, _, _, _, _, _) ->
+        let id = Wq.get_block(w, x, y, z)
+        if !Wq.is_loaded(w, Kq.key_of_voxel(x, y, z)) do 0.0
+        else if Bq.fluid_base(r, id) == base do int_to_float(l - liquid(f, w, x, y, z)) /. 8.0
+        else if has_int(sk, Bq.base_of(r, id)) do 2.0
+        else if id != 0 && y <= sea_top(sk) && has_int(sk, sea_code(Bq.base_of(r, id))) do 0.0      -- water stands against a sea
+        else if id != 0 && has_int(sk, sea_code(Bq.base_of(r, id))) do 2.0      -- above the seas' top it swallows, like a sink
+        else if id != 0 && Bq.collides(r, id) do 0.0
+        else
+          let under = Wq.get_block(w, x, y - 1, z)
+          if under == 0 || has_int(sk, Bq.base_of(r, under)) || has_int(sk, sea_code(Bq.base_of(r, under))) || (Bq.fluid_base(r, under) == base && Bq.fill(r, under) < 8) do 2.0
+          else int_to_float(l) /. 8.0 end
+        end end end end end end
+    end
+  end
+
+  doc "Which way, and how strongly, the fluid in cell (x, y, z) is moving, as a vector: toward lower fluid and, twice as hard, toward drops; each component about -2 to 2, and (0, -1, 0) for fluid that is falling. Zero for still water, for a sink, and for a cell with no flowing fluid. A game multiplies it by how hard its water should push."
+  fn flow(f : Fluid, w : Strata.World.World, x : Int, y : Int, z : Int) : (Float, Float, Float) do
+    match f do
+      Fluid(r, fl, sk, _, _, _, _, _, _, _, _, _) ->
+        let id = Wq.get_block(w, x, y, z)
+        let base = Bq.fluid_base(r, id)
+        if base < 0 || !has_int(fl, base) do (0.0, 0.0, 0.0)
+        else
+          let under = Wq.get_block(w, x, y - 1, z)
+          if Wq.is_loaded(w, Kq.key_of_voxel(x, y - 1, z)) && (under == 0 || has_int(sk, Bq.base_of(r, under)) || has_int(sk, sea_code(Bq.base_of(r, under))) || (Bq.fluid_base(r, under) == base && Bq.fill(r, under) < 8) || (under != 0 && !Bq.is_fluid(r, under) && !Bq.collides(r, under))) do (0.0, -1.0, 0.0)
+          else
+            let l = liquid(f, w, x, y, z)
+            (pull(f, w, base, l, x + 1, y, z) -. pull(f, w, base, l, x - 1, y, z), 0.0, pull(f, w, base, l, x, y, z + 1) -. pull(f, w, base, l, x, y, z - 1))
+          end
+        end
     end
   end
 

@@ -10,9 +10,13 @@
  * Masks: March numbers a rig's masks 0, 1, ... in the order Strata.Rig made
  * them. an_x_masks uploads them all at once, right after the rig, so the
  * world's ids are contiguous and an_x_play / an_x_blend translate a rig's
- * mask number to the world's id. -1 means every part. */
+ * mask number to the world's id. -1 means every part.
+ *
+ * Hits come back through caller-owned arrays: a ray's ints and floats, a
+ * box's pairs (an_x_hit_box answers how many there are, so a caller whose
+ * array was short can ask again with a longer one). */
 /* Rewritten by stamp_anim.sh whenever strata_anim.h changes (GAPS S14). */
-#define STRATA_ANIM_STAMP "39a6e2726d0946ad"
+#define STRATA_ANIM_STAMP "a6ae6b6ecf7c2942"
 #include <stdint.h>
 #include "strata_anim.h"
 
@@ -186,6 +190,54 @@ int64_t an_x_facing(int64_t fig, void *out_f32) {
     if (!f) return 0;
     memcpy((char *)out_f32 + 32, f->q, 4 * sizeof(float));
     return 1;
+}
+
+/* ---- sockets, part grids, attachments, hit tests ---- */
+/* a socket on rig's part at (x, y, z) metres in the part's frame turned by q; its id within the rig, or -1 */
+int64_t an_x_socket_def(int64_t rig, int64_t part, double x, double y, double z, double qx, double qy, double qz, double qw) {
+    if (!g_w) return -1;
+    float pos[3] = {(float)x, (float)y, (float)z}, q[4] = {(float)qx, (float)qy, (float)qz, (float)qw};
+    return an_socket_def(g_w, (int)rig, (int)part, pos, q);
+}
+/* rig's part's grid: sx x sy x sz palette indices (x fastest) in a NativeU8Arr; its shape number, or -1 */
+int64_t an_x_shape(int64_t rig, int64_t part, int64_t sx, int64_t sy, int64_t sz, double voxel, void *pal) {
+    if (!g_w) return -1;
+    if (sx < 0 || sy < 0 || sz < 0 || sx > AN_SIDE || sy > AN_SIDE || sz > AN_SIDE || an_x_len(pal) < sx * sy * sz)
+        return an_refuse(g_w, AN_R_VALUE);
+    return an_shape(g_w, (int)rig, (int)part, (int)sx, (int)sy, (int)sz, (float)voxel, pal ? (const uint8_t *)((char *)pal + 32) : NULL);
+}
+/* 1 attached, 0 refused */
+int64_t an_x_attach(int64_t child, int64_t parent, int64_t socket, double x, double y, double z, double qx, double qy, double qz, double qw) {
+    if (!g_w) return 0;
+    float pos[3] = {(float)x, (float)y, (float)z}, q[4] = {(float)qx, (float)qy, (float)qz, (float)qw};
+    return an_attach(g_w, (int)child, (int)parent, (int)socket, pos, q);
+}
+void an_x_detach(int64_t child) { if (g_w) an_detach(g_w, (int)child); }
+/* socket's world position and rotation (x, y, z, qx, qy, qz, qw) into a NativeF32Arr of 7; 1, or 0 */
+int64_t an_x_socket(int64_t fig, int64_t socket, void *out_f32) {
+    if (!g_w || an_x_len(out_f32) < 7) return 0;
+    float *o = (float *)((char *)out_f32 + 32);
+    return an_socket(g_w, (int)fig, (int)socket, o, o + 3);
+}
+/* 1 hit: ints (fig, part, x, y, z, colour) into a NativeI32Arr of 6, floats (dist, nx, ny, nz) into a NativeF32Arr of 4; 0 a miss */
+int64_t an_x_hit_ray(double ox, double oy, double oz, double dx, double dy, double dz, double max, int64_t ignore, void *ints, void *floats) {
+    if (!g_w || an_x_len(ints) < 6 || an_x_len(floats) < 4) return 0;
+    float o[3] = {(float)ox, (float)oy, (float)oz}, d[3] = {(float)dx, (float)dy, (float)dz};
+    AnHit h;
+    if (!an_hit_ray(g_w, o, d, (float)max, (int)ignore, &h)) return 0;
+    int32_t *i = (int32_t *)((char *)ints + 32);
+    float *f = (float *)((char *)floats + 32);
+    i[0] = h.fig; i[1] = h.part; i[2] = h.x; i[3] = h.y; i[4] = h.z; i[5] = h.colour;
+    f[0] = h.dist; f[1] = h.nx; f[2] = h.ny; f[3] = h.nz;
+    return 1;
+}
+/* (figure, part) pairs into a NativeI32Arr (two ints a pair, as many as fit); answers how many there are */
+int64_t an_x_hit_box(double cx, double cy, double cz, double hx, double hy, double hz, double qx, double qy, double qz, double qw,
+                     int64_t ignore, void *out) {
+    if (!g_w) return 0;
+    float c[3] = {(float)cx, (float)cy, (float)cz}, h[3] = {(float)hx, (float)hy, (float)hz}, q[4] = {(float)qx, (float)qy, (float)qz, (float)qw};
+    int64_t room = an_x_len(out) / 2;
+    return an_hit_box(g_w, c, h, q, (int)ignore, (int)(room > (1 << 30) ? (1 << 30) : room), room > 0 ? (int32_t *)((char *)out + 32) : NULL);
 }
 
 int64_t an_x_mark_count(void) { return g_w ? g_w->nevents : 0; }

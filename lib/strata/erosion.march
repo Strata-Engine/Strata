@@ -101,7 +101,7 @@ mod Strata.Erosion do
   end
 
   pfn rcv_rows(h : NativeF32Arr, n : Int, r0 : Int, r1 : Int, sea_out : Bool) : NativeIntArr do
-    rcv_go(h, n, r0 * n, r1 * n, r0 * n, sea_out, NativeArray.make_int((r1 - r0) * n, 0 - 1))
+    rcv_go(h, n, r0 * n, r1 * n, r0 * n, sea_out, NativeArray.make_int(Strata.Size.of((r1 - r0) * n), 0 - 1))
   end
 
   -- ── Rows across workers ──────────────────────────────────────────────────
@@ -131,31 +131,38 @@ mod Strata.Erosion do
     end
   end
 
-  pfn fold_int(ts : List(Task(NativeIntArr)), n : Int, w : Int, b : Int, out : NativeIntArr, pass : String) : NativeIntArr do
+  pfn fold_int(f : Int -> Int -> NativeIntArr, ts : List(Task(NativeIntArr)), n : Int, w : Int, b : Int, out : NativeIntArr) : NativeIntArr do
     match ts do
       Nil -> out
       Cons(t, rest) ->
         let at = band(n, w, b) * n
         let cnt = (band(n, w, b + 1) - band(n, w, b)) * n
-        let part = Result.expect(task_await(t), "Strata.Erosion: the " ++ pass ++ " task for rows " ++ int_to_string(band(n, w, b)) ++ ".." ++ int_to_string(band(n, w, b + 1)) ++ " failed")
-        fold_int(rest, n, w, b + 1, put_int_go(out, part, at, 0, cnt), pass)
+        -- a band whose task failed is worked out here instead: a band left at zero would be a silently wrong atlas
+        let part = match task_await(t) do
+            Ok(p) -> p
+            Err(_) -> f(band(n, w, b), band(n, w, b + 1))
+          end
+        fold_int(f, rest, n, w, b + 1, put_int_go(out, part, at, 0, cnt))
     end
   end
-  pfn fold_f32(ts : List(Task(NativeF32Arr)), n : Int, w : Int, b : Int, out : NativeF32Arr, pass : String) : NativeF32Arr do
+  pfn fold_f32(f : Int -> Int -> NativeF32Arr, ts : List(Task(NativeF32Arr)), n : Int, w : Int, b : Int, out : NativeF32Arr) : NativeF32Arr do
     match ts do
       Nil -> out
       Cons(t, rest) ->
         let at = band(n, w, b) * n
         let cnt = (band(n, w, b + 1) - band(n, w, b)) * n
-        let part = Result.expect(task_await(t), "Strata.Erosion: the " ++ pass ++ " task for rows " ++ int_to_string(band(n, w, b)) ++ ".." ++ int_to_string(band(n, w, b + 1)) ++ " failed")
-        fold_f32(rest, n, w, b + 1, put_f32_go(out, part, at, 0, cnt), pass)
+        -- a band whose task failed is worked out here instead: a band left at zero would be a silently wrong atlas
+        let part = match task_await(t) do
+            Ok(p) -> p
+            Err(_) -> f(band(n, w, b), band(n, w, b + 1))
+          end
+        fold_f32(f, rest, n, w, b + 1, put_f32_go(out, part, at, 0, cnt))
     end
   end
 
   -- f(r0, r1) fills rows r0 until r1; run over all n rows on w workers
-  -- A failed band stops the program (Result.expect: the lint forbids a bare
-  -- panic in a library), naming the pass: a band left at zero would be a
-  -- silently wrong atlas.
+  -- A band whose task fails is worked out again on the calling task: a band
+  -- left at zero would be a silently wrong atlas.
   --
   -- GAPS S15: each task copies what it reads (its rows and a halo, via `own`,
   -- and its own Params, via `own_params`) instead of sharing one value across
@@ -164,15 +171,15 @@ mod Strata.Erosion do
   -- copies, 1 worker 5.5 s, 4 workers 3.3 to 3.7 s (1.5 to 1.6x), 8 workers
   -- 3.1 to 3.2 s. About 2.1 s of a run is the lake, tree and update passes,
   -- which run on one task.
-  pfn rows_int(n : Int, w : Int, pass : String, f : Int -> Int -> NativeIntArr) : NativeIntArr do
-    if w <= 1 do f(0, n) else fold_int(spawn_int(f, n, w, w - 1, Nil), n, w, 0, NativeArray.make_int(n * n, 0), pass) end
+  pfn rows_int(n : Int, w : Int, _pass : String, f : Int -> Int -> NativeIntArr) : NativeIntArr do
+    if w <= 1 do f(0, n) else fold_int(f, spawn_int(f, n, w, w - 1, Nil), n, w, 0, NativeArray.make_int(Strata.Size.of(n * n), 0)) end
   end
-  pfn rows_f32(n : Int, w : Int, pass : String, f : Int -> Int -> NativeF32Arr) : NativeF32Arr do
-    if w <= 1 do f(0, n) else fold_f32(spawn_f32(f, n, w, w - 1, Nil), n, w, 0, NativeArray.make_f32(n * n, 0.0), pass) end
+  pfn rows_f32(n : Int, w : Int, _pass : String, f : Int -> Int -> NativeF32Arr) : NativeF32Arr do
+    if w <= 1 do f(0, n) else fold_f32(f, spawn_f32(f, n, w, w - 1, Nil), n, w, 0, NativeArray.make_f32(Strata.Size.of(n * n), 0.0)) end
   end
 
   doc "Each sample's receiver: the index of the lowest of its 8 neighbours when that is lower than the sample, else -1 (a pit, or the grid's edge)."
-  fn receivers(n : Int, step : Float, height : NativeF32Arr) : NativeIntArr do rcv_rows(height, n, 0, n, false) end
+  fn receivers(n : Int, _step : Float, height : NativeF32Arr) : NativeIntArr do rcv_rows(height, n, 0, n, false) end
 
   -- ── The receiver tree ────────────────────────────────────────────────────
   -- children of each sample as offsets into one array (counts, then starts)
@@ -224,10 +231,10 @@ mod Strata.Erosion do
   doc "Every sample of an n x n grid once, each after its receiver: the roots (receiver -1) in index order, then breadth first down the receiver tree. A sample on a cycle is left out (receivers from Strata.Flood or lake_receivers have none)."
   fn order(n : Int, rcv : NativeIntArr) : NativeIntArr do
     let cnt = n * n
-    let starts = prefix_go(count_go(rcv, 0, cnt, NativeArray.make_int(cnt + 1, 0)), 1, cnt + 1)
-    match place_go(rcv, 0, cnt, copy_int_go(starts, 0, cnt + 1, NativeArray.make_int(cnt + 1, 0)), NativeArray.make_int(cnt, 0)) do
+    let starts = prefix_go(count_go(rcv, 0, cnt, NativeArray.make_int(Strata.Size.of(cnt + 1), 0)), 1, cnt + 1)
+    match place_go(rcv, 0, cnt, copy_int_go(starts, 0, cnt + 1, NativeArray.make_int(Strata.Size.of(cnt + 1), 0)), NativeArray.make_int(Strata.Size.of(cnt), 0)) do
       (_, kids) ->
-        match roots_go(rcv, 0, cnt, NativeArray.make_int(cnt, 0 - 1), 0) do
+        match roots_go(rcv, 0, cnt, NativeArray.make_int(Strata.Size.of(cnt), 0 - 1), 0) do
           (o, l) -> match bfs_go(starts, kids, 0, o, l) do (o2, _) -> o2 end
         end
     end
@@ -360,30 +367,30 @@ mod Strata.Erosion do
 
   -- receivers with every pit routed over its lake's lowest pass
   pfn route(n : Int, h : NativeF32Arr, rcv : NativeIntArr) : NativeIntArr do
-    let ok = Option.expect(if n > 1448 do None else Some(n) end, "Strata.Erosion: n is " ++ int_to_string(n) ++ ", above the limit of 1448 (a pass number must fit 23 bits)")
-    route_ok(ok, h, rcv)
+    -- above 1448 samples a side a pass number no longer fits its 23 bits: the pits are left unrouted (Strata.Atlas.def holds n to the limit)
+    if n > 1448 do rcv else route_ok(n, h, rcv) end
   end
 
   pfn route_ok(n : Int, h : NativeF32Arr, rcv : NativeIntArr) : NativeIntArr do
     let cnt = n * n
-    let bs = basin_go(n, h, rcv, order(n, rcv), 0, cnt, NativeArray.make_int(cnt, 0))
+    let bs = basin_go(n, h, rcv, order(n, rcv), 0, cnt, NativeArray.make_int(Strata.Size.of(cnt), 0))
     let m = pass_count_go(n, bs, 0, 4 * cnt, 0)
     if m == 0 do rcv
     else
-      let keys = NativeArray.sort_int(pass_fill_go(n, h, bs, 0, 4 * cnt, 0, NativeArray.make_int(m, 0)))
-      let uf = ident_go(NativeArray.make_int(cnt + 1, 0), 0, cnt + 1)
-      match kruskal_go(n, bs, keys, 0, m, uf, NativeArray.make_int(cnt + 1, 1), NativeArray.make_int(m, 0), 0) do
+      let keys = NativeArray.sort_int(pass_fill_go(n, h, bs, 0, 4 * cnt, 0, NativeArray.make_int(Strata.Size.of(m), 0)))
+      let uf = ident_go(NativeArray.make_int(Strata.Size.of(cnt + 1), 0), 0, cnt + 1)
+      match kruskal_go(n, bs, keys, 0, m, uf, NativeArray.make_int(Strata.Size.of(cnt + 1), 1), NativeArray.make_int(Strata.Size.of(m), 0), 0) do
         (tree, got) ->
-          let starts = prefix_go(edge_count_go(n, bs, tree, 0, got, NativeArray.make_int(cnt + 2, 0)), 1, cnt + 2)
-          let adj = edge_place_go(n, bs, tree, 0, got, copy_int_go(starts, 0, cnt + 2, NativeArray.make_int(cnt + 2, 0)), NativeArray.make_int(2 * got + 1, 0))
-          let seen = NativeArray.set_int(NativeArray.make_int(cnt + 1, 0), cnt, 1)
-          walk_go(n, bs, starts, adj, 0, seen, NativeArray.set_int(NativeArray.make_int(cnt + 1, 0), 0, cnt), 1, rcv)
+          let starts = prefix_go(edge_count_go(n, bs, tree, 0, got, NativeArray.make_int(Strata.Size.of(cnt + 2), 0)), 1, cnt + 2)
+          let adj = edge_place_go(n, bs, tree, 0, got, copy_int_go(starts, 0, cnt + 2, NativeArray.make_int(Strata.Size.of(cnt + 2), 0)), NativeArray.make_int(Strata.Size.of(2 * got + 1), 0))
+          let seen = NativeArray.set_int(NativeArray.make_int(Strata.Size.of(cnt + 1), 0), cnt, 1)
+          walk_go(n, bs, starts, adj, 0, seen, NativeArray.set_int(NativeArray.make_int(Strata.Size.of(cnt + 1), 0), 0, cnt), 1, rcv)
       end
     end
   end
 
   doc "The receivers erosion uses: as `receivers`, but the sea (height at or below 0) is an outlet too, and every pit drains over its basin's lowest pass to the sample across it, so following receivers from anywhere reaches the edge or the sea."
-  fn lake_receivers(n : Int, step : Float, height : NativeF32Arr) : NativeIntArr do route(n, height, rcv_rows(height, n, 0, n, true)) end
+  fn lake_receivers(n : Int, _step : Float, height : NativeF32Arr) : NativeIntArr do route(n, height, rcv_rows(height, n, 0, n, true)) end
 
   -- ── Drainage and the implicit update ─────────────────────────────────────
   pfn area_go(rcv : NativeIntArr, ord : NativeIntArr, t : Int, a : NativeFloatArr) : NativeFloatArr do
@@ -456,7 +463,7 @@ mod Strata.Erosion do
     if i >= stop do out else target_go(h, n, base, stop, i + 1, NativeArray.set_int(out, i - base, target(h, n, i))) end
   end
   pfn target_rows(h : NativeF32Arr, n : Int, r0 : Int, r1 : Int) : NativeIntArr do
-    target_go(h, n, r0 * n, r1 * n, r0 * n, NativeArray.make_int((r1 - r0) * n, 0 - 1))
+    target_go(h, n, r0 * n, r1 * n, r0 * n, NativeArray.make_int(Strata.Size.of((r1 - r0) * n), 0 - 1))
   end
 
   pfn amount_go(p : Params, n : Int, step : Float, h : NativeF32Arr, h0 : NativeF32Arr, mask : NativeF32Arr, strength : NativeF32Arr, tk : NativeIntArr, up : Float, base : Int, stop : Int, i : Int, out : NativeF32Arr) : NativeF32Arr do
@@ -467,7 +474,7 @@ mod Strata.Erosion do
     end
   end
   pfn amount_rows(p : Params, n : Int, step : Float, h : NativeF32Arr, h0 : NativeF32Arr, mask : NativeF32Arr, strength : NativeF32Arr, tk : NativeIntArr, up : Float, r0 : Int, r1 : Int) : NativeF32Arr do
-    amount_go(p, n, step, h, h0, mask, strength, tk, up, r0 * n, r1 * n, r0 * n, NativeArray.make_f32((r1 - r0) * n, 0.0))
+    amount_go(p, n, step, h, h0, mask, strength, tk, up, r0 * n, r1 * n, r0 * n, NativeArray.make_f32(Strata.Size.of((r1 - r0) * n), 0.0))
   end
 
   -- what the neighbours of i give it
@@ -491,7 +498,7 @@ mod Strata.Erosion do
     end
   end
   pfn apply_rows(h : NativeF32Arr, tk : NativeIntArr, tt : NativeF32Arr, n : Int, r0 : Int, r1 : Int) : NativeF32Arr do
-    apply_go(h, tk, tt, n, r0 * n, r1 * n, r0 * n, NativeArray.make_f32((r1 - r0) * n, 0.0))
+    apply_go(h, tk, tt, n, r0 * n, r1 * n, r0 * n, NativeArray.make_f32(Strata.Size.of((r1 - r0) * n), 0.0))
   end
 
   -- ── Running ──────────────────────────────────────────────────────────────
@@ -505,7 +512,7 @@ mod Strata.Erosion do
   pfn own_int(src : NativeIntArr, n : Int, lo : Int, hi : Int) : NativeIntArr do
     let a = if lo < 0 do 0 else lo end
     let b = if hi > n do n else hi end
-    own_int_go(src, a * n, b * n, NativeArray.make_int(n * n, 0 - 1))
+    own_int_go(src, a * n, b * n, NativeArray.make_int(Strata.Size.of(n * n), 0 - 1))
   end
 
   -- GAPS S15: a task's own copy of rows lo until hi of src (clamped to the
@@ -513,7 +520,7 @@ mod Strata.Erosion do
   pfn own(src : NativeF32Arr, n : Int, lo : Int, hi : Int) : NativeF32Arr do
     let a = if lo < 0 do 0 else lo end
     let b = if hi > n do n else hi end
-    own_go(src, a * n, b * n, NativeArray.make_f32(n * n, 0.0))
+    own_go(src, a * n, b * n, NativeArray.make_f32(Strata.Size.of(n * n), 0.0))
   end
 
   -- GAPS S15: a task's own Params, so the per-sample calls do not share one
@@ -527,7 +534,7 @@ mod Strata.Erosion do
       let r0 = rows_int(n, workers, "receiver", fn (a, b) -> rcv_rows(own(h, n, a - 1, b + 1), n, a, b, true))
       let rcv = route(n, h, r0)
       let ord = order(n, rcv)
-      let area = area_go(rcv, ord, cnt - 1, NativeArray.make_float(cnt, step *. step))
+      let area = area_go(rcv, ord, cnt - 1, NativeArray.make_float(Strata.Size.of(cnt), step *. step))
       let h1 = implicit_go(p, n, step, mask, rcv, ord, area, 0, cnt, h)
       let up = int_to_float(it + 1) *. p_dt(p) *. p_uplift(p)
       let tk = rows_int(n, workers, "thermal target", fn (a, b) -> target_rows(own(h1, n, a - 1, b + 1), n, a, b))

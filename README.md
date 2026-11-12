@@ -113,6 +113,15 @@ millisecond. `Strata.Fluid.step` does one at once instead, for tools and
 tests. `Strata.Render.spray` draws particles that fly on the clock; the
 viewer feeds it from the fluid's events.
 
+A family is one of three kinds. `flowing` water moves and is finite. A
+`sink` swallows what reaches it and never changes. A `sea` is a body that is
+never used up: it swallows water that runs out over it, and it floods any
+hole dug in it or beside it, up to its own level and no higher. Over a drop
+it pours flowing water, so a cave under the seabed floods from above. An
+edit that touches a sea must be passed to `Strata.Fluid.wake`, as for any
+water. A cave flooded through its roof keeps some air under the roof.
+
+![A hole dug in the sea closes](docs/fluid-sea-closes.png)
 ![A breached lake draining](docs/fluid-lake.png)
 ![The same breach from below](docs/fluid-waterfall.png)
 
@@ -232,6 +241,93 @@ Carve into a hillside (left click), walk into the tunnel and click again:
 the strike rings, and the wind drops. Build a wall between yourself and the
 waterfall (right click) and it dulls.
 
+### In the water
+
+A game asks the fluid three things, and tells the renderer one.
+
+    Strata.Fluid.depth_in(f, w, x0, y0, z0, x1, y1, z1)   -- how much of a box is under liquid, 0 to 1
+    Strata.Fluid.flow(f, w, x, y, z)                      -- which way the liquid at a cell moves, and how hard
+    Strata.Fluid.surface(f, w, x, y, z)                   -- the height of the top of the liquid over a cell
+    Strata.Render.set_underwater(surface_y, r, g, b, density)
+    Strata.Render.clear_underwater()
+
+Strata has no player. The viewer's body (`viewer/lib/walker.march`,
+`step_in`) shows one way to use the answers: it floats with its head out,
+swims up while jump is held, moves slower in water than on land, climbs out
+at a bank, and is carried by flowing water toward a drop or a sink.
+
+While the eye is under liquid the renderer shows the world through it:
+distance fades into the liquid's colour, light dims and turns blue with
+depth, the sun ripples on what it reaches, the surface overhead is a bright
+window onto the sky with a mirror beyond it, and the view sways. This needs
+light mode 1 or higher. There are no bubbles, no drifting specks and no
+sound.
+
+## Interface and text
+
+A 2D layer drawn over the finished frame, for a display during play: a
+crosshair, a hotbar, bars, numbers, labels. A game builds its whole display
+afresh each frame; nothing is kept between frames.
+
+```
+let u0 = Strata.Render.ui_begin(1.0)                       -- this frame's display, at the game's scale
+let u1 = Strata.Ui.rect(u0, Strata.Ui.centre(), 0.0, 0.0, 2.0, 16.0, (1.0, 1.0, 1.0, 0.9))
+let u2 = Strata.Ui.icon(u1, Strata.Ui.bottom(), 0.0, -18.0, 32.0, stone_texture)
+let u3 = Strata.Ui.frame(u2, Strata.Ui.bottom(), 0.0, -12.0, 44.0, 44.0, (0, 0, 24, 24), 4, (1.0, 1.0, 1.0, 1.0))
+let u4 = Strata.Text.text(u3, Strata.Ui.top_left(), 10.0, 8.0, Strata.Text.default_font(), 14.0, (1.0, 1.0, 1.0, 1.0), "60 fps")
+Strata.Render.draw_ui(u4)                                  -- one draw call, in the order built
+```
+
+- **Interface pixels.** At scale 1 one interface pixel is one point of the
+  window: the display is the same physical size on a retina display and an
+  ordinary one, and sharp on both. A larger scale, whole or fractional,
+  makes everything larger. Every edge is snapped to a device pixel.
+- **Anchors.** An element is placed by one of nine points of the screen and
+  an offset; its own matching point sits there. A `bottom()` element is
+  placed by the middle of its bottom edge.
+- **Images.** `icon` draws a block texture. `Strata.Render.ui_atlas` takes
+  one image of a game's own art; `image` draws a region of it and `frame`
+  nine-slices one.
+- **Text.** `Strata.Text.font` loads a TrueType or OpenType file;
+  `default_font()` is built in (Noto Sans, Latin). A glyph is drawn into an
+  atlas the first time it is used, as a distance field, and serves every
+  size from there. `styled` takes a `TextStyle`: wrap width, alignment,
+  outline, shadow. `runs` sets several fonts, sizes or colours on one
+  baseline. `measure` gives a string's size before it is drawn.
+- **Scripts.** Text is put in reading order (the Unicode bidirectional
+  algorithm, by SheenBidi) and shaped by HarfBuzz: kerning, ligatures,
+  joined Arabic, Indic conjuncts. A number in a right-to-left line reads
+  left to right. A font takes a list of fallback fonts for the characters
+  it lacks; a character no font has is drawn as the missing-glyph box.
+- **New glyphs are spread over frames.** A frame spends at most 1 ms drawing
+  glyphs it has not seen (`Strata.Text.set_raster_budget`); the rest appear
+  a frame or two later. A glyph takes about 45 microseconds.
+
+Limits:
+
+- No widgets: nothing a pointer acts on, no text entry, no layout engine.
+- The whole display is rebuilt each frame. The layer holds 16 384 quads;
+  more are dropped from the end and `Strata.Render.ui_dropped` says how many.
+- Lines break at spaces and between Chinese, Japanese and Korean
+  characters. There is no hyphenation and no dictionary breaking, so Thai
+  does not wrap well.
+- An outline can be about a sixth of the text's size at most.
+- Small text is not hinted. It is readable at 8 pixels and softer than the
+  system's.
+- There is no language tag. Where Chinese and Japanese share a character,
+  it is drawn from whichever font comes first in the fallback list; give
+  each language's text its own font to get its own forms.
+- The script lines were checked by eye for joining, direction and number
+  order, not by a native reader and not against another renderer.
+- A consumer's `forge.toml` lists `native/strata_text.c` beside the shim
+  and links FreeType and HarfBuzz, both from Homebrew (see
+  `viewer/forge.toml`). SheenBidi is in `native/sheenbidi` and is compiled
+  into that file.
+
+![The viewer's display](docs/ui-display.png)
+![Text from 8 to 200 pixels](docs/ui-text-sheet.png)
+![Wrapping, alignment, outline, shadow, mixed runs](docs/ui-text-styles.png)
+![Six scripts, mixed direction, kerning and ligatures](docs/ui-text-scripts.png)
 ## Animation
 
 Jointed voxel figures (people, creatures, vehicles) built and animated in

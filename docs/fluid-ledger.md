@@ -60,3 +60,32 @@ Final: minor (deferred): spray never expires if the game never sets the time; on
 Final: minor (deferred): the soak checks the lake at the end only, not that the amount never grows or that no step exceeded the cap.
 Final: minor (deferred): the design's floor-opening scene has no golden image.
 Final: not judged by the reviewer: anything in pixels, all timings, GPU behaviour of the spray buffer.
+
+## The sea (after the owner played it: "not all water flows when dug out")
+
+- Cause: the viewer's sea was a sink, which swallows and never changes. A
+  dig removed the sea it hit and left a dry hole with walls of water.
+- Ruling: a third kind, `sea`. Empty cells beside or under it that have
+  something to stand on become sea; over a drop it pours the flowing family;
+  full water standing against it joins it from the top down; water lying on
+  its open surface is still swallowed. It never spreads upward. Cost if
+  wrong: any space below sea level that an edit connects to the sea floods
+  without limit, which is what a sea does.
+- Ruling: the sea closes a hole with its own block, not with flowing water,
+  so the result is one kind of water and comes to rest. A first version
+  that filled holes with flowing water left two kinds side by side and
+  never rested.
+- Not done: a cave flooded through its roof keeps air under the roof (water
+  is not pressed upward). No golden picture of a dig in the sea; nine tests
+  cover it.
+- Ruling (at the merge with main): the generation project builds its rivers
+  from the sea's block, as a sink, so that a breached lake drains. As a sea,
+  a river kept the lake topped up and took it over. `with_sea_top(f, y)`
+  makes sea blocks above y sinks; the viewer sets it to sea level. Cost: a
+  hole dug beside a river inland stays dry behind a wall of water. The
+  proper fix is rivers of their own kind of water, in the generation
+  project.
+- At the merge: water meeting the sea sideways at its level now joins it
+  without a splash event; only water falling onto it is swallowed with one.
+  Three waterfall sound fingerprints (falls-4, falls-12, falls-24) were
+  regenerated and not listened to: the change was 1.5 dB.

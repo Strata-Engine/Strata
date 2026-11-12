@@ -199,3 +199,19 @@ written, failed with "Unknown module `Strata.Anim`. [unbound_variable]",
 though `Strata.Anim` exists and compiles. The message names the module, not
 the missing function. Workaround: read it as "no such function in that
 module" and check the name.
+
+## S25: a String reaches a C extern as the runtime's own value
+
+An `extern` parameter of type `String` arrives in C as the runtime's string
+value: a pointer to a counted heap string (`march_string`: 16 bytes of
+header, an 8-byte length, then the bytes), or, for strings of seven bytes or
+fewer, the bytes packed into the pointer word itself (top bit set, low bit
+clear). There is no documented C-side accessor outside `march_runtime.h`,
+which a consumer's C does not include. Workaround: `native/strata_text.c`
+carries its own copy of the decoding (`mstr`). It breaks if the runtime's
+string layout changes; `viewer/test/text_test.march` ("Strings reach C")
+would catch it, with short, long and built strings.
+
+The text bindings met S17 again (two private externs named `x_stat`, in the
+renderer's and the text module's bindings): the text module's glyph counts
+came back as the renderer's draw-call count. Its externs are prefixed `xt_`.
