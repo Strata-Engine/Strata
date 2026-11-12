@@ -96,6 +96,9 @@ void main() {
     }
     o_hist = vec4(sky, sun_vis);
     o_meta = vec4(count, view_depth, float(face), 0.0);
+    // the plain figures' shadow, from this frame's map, the darker of it and the
+    // traced shadow; never remembered, so a moving figure's shadow leaves no trail
+    if (u.fshadow.x > 0.5 && ndl > 0.0) sun_vis = min(sun_vis, fig_shadow(world, n));
 
     // the pixel's light class: flat quads carry it; models and plants do not, and are looked up
     // a figure carries its roughness there instead, and its emission in the albedo's alpha
