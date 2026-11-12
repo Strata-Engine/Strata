@@ -1,0 +1,520 @@
+-- Trees — procedural trees baked into voxel templates: a trunk that leans
+-- and wobbles, up to three levels of tapering branches that droop, and leaf
+-- blobs at the tips and along the last third of the branches. A port of the
+-- owner's Python spike (.superpowers/sdd/2026-11-11-generation-plan/tree-spike.py);
+-- every length is in metres, so a tree is the same shape at any voxel size.
+--
+-- Species: 0 oak, 1 birch, 2 pine (whorls of branches up a straight
+-- trunk, no sub-branches), 3 willow (a small blob at each leaf point with
+-- three columns of leaves hanging from it). The random draws are hashes of
+-- the seed (Strata.Seed), each element of the tree drawing from a stream of
+-- its own, so the same (species, seed, voxel size) always builds the same
+-- template.
+--
+-- Rasterising: leaves fill the blobs (ellipsoids with two spherical holes,
+-- a hole under half a voxel skipped; the voxel holding the centre always) with
+-- a keep probability falling from the core to the rim, raised toward 1 as
+-- voxels grow (unchanged at 0.25 m, 1 at 1 m and over, so a coarse canopy
+-- stays dense); no leaf is lower than the species' leafmin share of the
+-- trunk. Then wood over the leaves along each branch: the voxel holding
+-- every point (0.1 m apart), joined face to face to the last, and a sphere
+-- of its radius every half voxel and at its end, so a drawn branch is never
+-- under one voxel across and the wood is one 6-connected piece. As in the spike, at
+-- voxels coarser than 0.25 m a branch point (not the trunk's) under 0.2 m in
+-- radius is not drawn: the leaf blobs cover those places, and the thin inner
+-- branches do not merge into a wooden disc under the canopy.
+--
+-- The template is square and odd: the trunk's base is the centre of the
+-- bottom row's middle voxel (half, 0, half), half = (sx - 1) / 2, so any
+-- quarter turn of `Strata.Template.blit` leaves the base where it was; a
+-- caller puts the base column at (wx, wz) on ground top y with
+-- blit(..., wx - half, y + 1, wz - half, rot, stream).
+mod StrataViewer.Trees do
+
+  pfn wood() : Int do 7 end
+  pfn leaf() : Int do 8 end
+
+  -- ── Species parameters (metres, degrees) ────────────────────────────────
+  -- trunk height, trunk base radius
+  pfn h_lo(sp : Int) : Float do if sp == 0 do 6.0 else if sp == 1 do 8.0 else if sp == 2 do 9.0 else 8.0 end end end end
+  pfn h_hi(sp : Int) : Float do if sp == 0 do 9.0 else if sp == 1 do 11.0 else if sp == 2 do 13.0 else 11.0 end end end end
+  pfn r0_lo(sp : Int) : Float do if sp == 0 do 0.45 else if sp == 1 do 0.30 else if sp == 2 do 0.35 else 0.45 end end end end
+  pfn r0_hi(sp : Int) : Float do if sp == 0 do 0.6 else if sp == 1 do 0.35 else if sp == 2 do 0.5 else 0.55 end end end end
+  -- primary branches (oak, birch, willow): how many, where they start up the trunk, their angle off it, length factor, droop
+  pfn np_lo(sp : Int) : Int do if sp == 0 do 5 else if sp == 1 do 3 else 5 end end end
+  pfn np_hi(sp : Int) : Int do if sp == 0 do 5 else if sp == 1 do 4 else 6 end end end
+  pfn start(sp : Int) : Float do if sp == 0 do 0.45 else if sp == 1 do 0.5 else 0.55 end end end
+  pfn ang_lo(sp : Int) : Float do if sp == 1 do 25.0 else 30.0 end end
+  pfn ang_hi(sp : Int) : Float do if sp == 1 do 40.0 else 55.0 end end
+  pfn lf_lo(sp : Int) : Float do if sp == 1 do 0.35 else 0.40 end end
+  pfn lf_hi(_sp : Int) : Float do 0.60 end
+  pfn ls(sp : Int) : Float do if sp == 0 do 2.0 else if sp == 1 do 1.7 else 1.9 end end end
+  pfn droop(sp : Int) : Float do if sp == 0 do 0.025 else if sp == 1 do 0.01 else if sp == 2 do 0.015 else 0.22 end end end end
+  pfn levels(sp : Int) : Int do if sp == 2 do 1 else 3 end end
+  -- leaf blobs: width range, spacing along a branch, the lowest leaf as a share of the trunk height
+  pfn bw_lo(sp : Int) : Float do if sp == 0 do 1.8 else if sp == 1 do 1.5 else if sp == 2 do 1.3 else 0.9 end end end end
+  pfn bw_hi(sp : Int) : Float do if sp == 0 do 2.4 else if sp == 1 do 2.1 else if sp == 2 do 1.9 else 1.2 end end end end
+  pfn spacing(sp : Int) : Float do if sp == 0 do 1.0 else if sp == 1 do 0.8 else if sp == 2 do 0.5 else 0.6 end end end end
+  pfn leafmin(sp : Int) : Float do if sp == 1 do 0.55 else 0.4 end end
+  -- the pine's whorls: every metre from wstart up, 5 or 6 branches 60 to 80 degrees off the trunk, the lowest lmax long
+  pfn whorled(sp : Int) : Bool do sp == 2 end
+  pfn wstart() : Float do 0.4 end
+  pfn lmax() : Float do 2.7 end
+  -- the willow's hanging columns: length range (the spike's 2.5..4.5, longer so the trunk shows under smaller blobs)
+  pfn stranded(sp : Int) : Bool do sp == 3 end
+  pfn strand_lo() : Float do 3.5 end
+  pfn strand_hi() : Float do 5.5 end
+
+  -- ── Draws: element k of stream s ────────────────────────────────────────
+  pfn u01(s : Int, k : Int) : Float do Strata.Seed.unit(Strata.Seed.mix(s, k)) end
+  pfn uni(s : Int, k : Int, lo : Float, hi : Float) : Float do lo +. (hi -. lo) *. u01(s, k) end
+  pfn rint(s : Int, k : Int, lo : Int, hi : Int) : Int do
+    let v = lo + float_to_int(Math.floor(u01(s, k) *. int_to_float(hi - lo + 1)))
+    if v > hi do hi else v end
+  end
+  -- a standard normal (Box-Muller) from draws k and k + 1
+  pfn gauss(s : Int, k : Int) : Float do
+    let a = u01(s, k) +. 0.0000001
+    Math.sqrt(0.0 -. 2.0 *. Math.log(a)) *. Math.cos(6.2831853 *. u01(s, k + 1))
+  end
+  pfn sub(s : Int, k : Int) : Int do Strata.Seed.mix(s, 100000 + k) end
+  pfn rad(deg : Float) : Float do deg *. 0.017453293 end
+  pfn tau() : Float do 6.2831853 end
+
+  -- ── Vectors ─────────────────────────────────────────────────────────────
+  pfn vadd(a : (Float, Float, Float), b : (Float, Float, Float)) : (Float, Float, Float) do
+    match (a, b) do ((ax, ay, az), (bx, by_, bz)) -> (ax +. bx, ay +. by_, az +. bz) end
+  end
+  pfn vmul(a : (Float, Float, Float), k : Float) : (Float, Float, Float) do match a do (x, y, z) -> (x *. k, y *. k, z *. k) end end
+  pfn vunit(a : (Float, Float, Float)) : (Float, Float, Float) do
+    match a do
+      (x, y, z) ->
+        let n = Math.sqrt(x *. x +. y *. y +. z *. z)
+        if n <= 0.0 do (0.0, 1.0, 0.0) else (x /. n, y /. n, z /. n) end
+    end
+  end
+  pfn cross(a : (Float, Float, Float), b : (Float, Float, Float)) : (Float, Float, Float) do
+    match (a, b) do ((ax, ay, az), (bx, by_, bz)) -> (ay *. bz -. az *. by_, az *. bx -. ax *. bz, ax *. by_ -. ay *. bx) end
+  end
+  pfn vy(a : (Float, Float, Float)) : Float do match a do (_, y, _) -> y end end
+
+  -- ── Curves ──────────────────────────────────────────────────────────────
+  -- points (x, y, z) every 0.1 m, directions, radii, the count of steps n
+  -- (n + 1 points), the length, and the whorl factor of a pine branch (-1: none)
+  type Curve = Curve(NativeF32Arr, NativeF32Arr, NativeF32Arr, Int, Float, Float)
+  pfn c_n(c : Curve) : Int do match c do Curve(_, _, _, v, _, _) -> v end end
+  pfn c_len(c : Curve) : Float do match c do Curve(_, _, _, _, v, _) -> v end end
+  pfn c_wf(c : Curve) : Float do match c do Curve(_, _, _, _, _, v) -> v end end
+  pfn c_rad(c : Curve, i : Int) : Float do match c do Curve(_, _, r, _, _, _) -> NativeArray.get_f32(r, i) end end
+  pfn c_pt(c : Curve, i : Int) : (Float, Float, Float) do
+    match c do Curve(p, _, _, _, _, _) -> (NativeArray.get_f32(p, 3 * i), NativeArray.get_f32(p, 3 * i + 1), NativeArray.get_f32(p, 3 * i + 2)) end
+  end
+  pfn c_dir(c : Curve, i : Int) : (Float, Float, Float) do
+    match c do Curve(_, d, _, _, _, _) -> (NativeArray.get_f32(d, 3 * i), NativeArray.get_f32(d, 3 * i + 1), NativeArray.get_f32(d, 3 * i + 2)) end
+  end
+  pfn with_wf(c : Curve, wf : Float) : Curve do match c do Curve(p, d, r, n, l, _) -> Curve(p, d, r, n, l, wf) end end
+
+  pfn put3(a : NativeF32Arr, i : Int, v : (Float, Float, Float)) : NativeF32Arr do
+    match v do (x, y, z) -> NativeArray.set_f32(NativeArray.set_f32(NativeArray.set_f32(a, 3 * i, x), 3 * i + 1, y), 3 * i + 2, z) end
+  end
+
+  pfn curve_go(s : Int, ps : NativeF32Arr, ds : NativeF32Arr, p : (Float, Float, Float), d : (Float, Float, Float), len : Float, dr : Float, wob : Float, i : Int, n : Int) : (NativeF32Arr, NativeF32Arr) do
+    if i >= n do (ps, ds)
+    else
+      let step = 0.1
+      let d2 = match d do (x, y, z) -> vunit((x +. gauss(s, 4 * i) *. wob *. step, y -. dr *. len *. step, z +. gauss(s, 4 * i + 2) *. wob *. step)) end
+      let p2 = vadd(p, vmul(d2, step))
+      curve_go(s, put3(ps, i + 1, p2), put3(ds, i + 1, d2), p2, d2, len, dr, wob, i + 1, n)
+    end
+  end
+  pfn radii_go(a : NativeF32Arr, r0 : Float, r1 : Float, i : Int, n : Int) : NativeF32Arr do
+    if i > n do a else radii_go(NativeArray.set_f32(a, i, r0 +. (r1 -. r0) *. int_to_float(i) /. int_to_float(n)), r0, r1, i + 1, n) end
+  end
+  -- a curve from p0 along d0 of length len, radius r0 tapering to r1, drooping and wobbling as it goes
+  pfn curve(s : Int, p0 : (Float, Float, Float), d0 : (Float, Float, Float), len : Float, r0 : Float, r1 : Float, dr : Float, wob : Float) : Curve do
+    let n0 = float_to_int(len /. 0.1)
+    let n = if n0 < 3 do 3 else n0 end
+    let d = vunit(d0)
+    match curve_go(s, put3(NativeArray.make_f32(3 * (n + 1), 0.0), 0, p0), put3(NativeArray.make_f32(3 * (n + 1), 0.0), 0, d), p0, d, len, dr, wob, 0, n) do
+      (ps, ds) -> Curve(ps, ds, radii_go(NativeArray.make_f32(n + 1, 0.0), r0, r1, 0, n), n, len, 0.0 -. 1.0)
+    end
+  end
+
+  -- a child of curve cv at point idx: len long, turned ang degrees off it toward azimuth az, base radius rr
+  pfn child(sp : Int, s : Int, cv : Curve, idx : Int, len : Float, az : Float, ang : Float, rr : Float) : Curve do
+    let d = c_dir(cv, idx)
+    let t = if Math.abs(vy(d)) > 0.9 do (1.0, 0.0, 0.0) else (0.0, 1.0, 0.0) end
+    let u = vunit(cross(d, t))
+    let v = cross(d, u)
+    let a = rad(ang)
+    let nd = vadd(vmul(d, Math.cos(a)), vmul(vadd(vmul(u, Math.cos(az)), vmul(v, Math.sin(az))), Math.sin(a)))
+    let rs = if rr < 0.06 do 0.06 else rr end
+    let r1 = if rs *. 0.45 < 0.04 do 0.04 else rs *. 0.45 end
+    curve(s, c_pt(cv, idx), nd, len, rs, r1, droop(sp), rad(4.0) *. 0.8)
+  end
+
+  -- ── The skeleton: branches (curve, level, stream) ───────────────────────
+  type Branch = Branch(Curve, Int, Int)
+
+  -- grow k children from the middle of cv, each growing on to the species' levels
+  pfn grow(sp : Int, s : Int, cv : Curve, level : Int, acc : List(Branch)) : List(Branch) do
+    if level >= levels(sp) do acc
+    else
+      let k = rint(s, 1, 1, 3)
+      let base = uni(s, 2, 0.0, tau())
+      let idx = (c_n(cv) + 1) / 2
+      grow_go(sp, s, cv, level, k, base, idx, 0, acc)
+    end
+  end
+  pfn grow_go(sp : Int, s : Int, cv : Curve, level : Int, k : Int, base : Float, idx : Int, j : Int, acc : List(Branch)) : List(Branch) do
+    if j >= k do acc
+    else
+      let cs = sub(s, j)
+      let len = c_len(cv) *. 0.5 *. uni(cs, 1, lf_lo(sp), lf_hi(sp))
+      let az = base +. int_to_float(j) *. tau() /. int_to_float(k) +. uni(cs, 2, -0.4, 0.4)
+      let c = child(sp, sub(cs, 7), cv, idx, len, az, uni(cs, 3, ang_lo(sp), ang_hi(sp)), c_rad(cv, idx) *. 0.6)
+      grow_go(sp, s, cv, level, k, base, idx, j + 1, grow(sp, sub(cs, 8), c, level + 1, Cons(Branch(c, level + 1, cs), acc)))
+    end
+  end
+
+  -- the trunk point whose height is nearest y
+  pfn nearest(trunk : Curve, y : Float, i : Int, best : Int, bd : Float) : Int do
+    if i > c_n(trunk) do best
+    else
+      let dd = Math.abs(vy(c_pt(trunk, i)) -. y)
+      if dd < bd do nearest(trunk, y, i + 1, i, dd) else nearest(trunk, y, i + 1, best, bd) end
+    end
+  end
+
+  -- oak, birch, willow: n primaries spread up the trunk from start * h to 0.92 h
+  pfn primaries(sp : Int, s : Int, trunk : Curve, h : Float, n : Int, base : Float, i : Int, acc : List(Branch)) : List(Branch) do
+    if i >= n do acc
+    else
+      let cs = sub(s, 200 + i)
+      let y0 = start(sp) *. h
+      let at = y0 +. (h *. 0.92 -. y0) *. (int_to_float(i) +. uni(cs, 1, 0.0, 0.8)) /. int_to_float(n)
+      let idx = nearest(trunk, at, 0, 0, 1000000.0)
+      let len = (h -. y0) *. ls(sp) *. uni(cs, 2, lf_lo(sp), lf_hi(sp))
+      let az = base +. int_to_float(i) *. tau() /. int_to_float(n) +. uni(cs, 3, -0.3, 0.3)
+      let c = child(sp, sub(cs, 7), trunk, idx, len, az, uni(cs, 4, ang_lo(sp), ang_hi(sp)), c_rad(trunk, idx) *. 0.6)
+      primaries(sp, s, trunk, h, n, base, i + 1, grow(sp, sub(cs, 8), c, 1, Cons(Branch(c, 1, cs), acc)))
+    end
+  end
+
+  -- the pine: a whorl every metre from wstart * h to 0.6 m under the top, shorter going up
+  pfn whorls(sp : Int, s : Int, trunk : Curve, h : Float, y : Float, w : Int, acc : List(Branch)) : List(Branch) do
+    if y >= h -. 0.6 do acc
+    else
+      let ws = sub(s, 300 + w)
+      let idx = nearest(trunk, y, 0, 0, 1000000.0)
+      let n = rint(ws, 1, 5, 6)
+      let base = uni(ws, 2, 0.0, tau())
+      let f = 1.0 -. (y -. wstart() *. h) /. (h *. (1.0 -. wstart()))
+      whorls(sp, s, trunk, h, y +. 1.0, w + 1, whorl_go(sp, ws, trunk, idx, n, base, f, 0, acc))
+    end
+  end
+  pfn whorl_go(sp : Int, ws : Int, trunk : Curve, idx : Int, n : Int, base : Float, f : Float, i : Int, acc : List(Branch)) : List(Branch) do
+    if i >= n do acc
+    else
+      let cs = sub(ws, i)
+      let l0 = lmax() *. (0.15 +. 0.85 *. f)
+      let len = (if l0 < 0.5 do 0.5 else l0 end) *. uni(cs, 1, 0.85, 1.1)
+      let az = base +. int_to_float(i) *. tau() /. int_to_float(n) +. uni(cs, 2, -0.25, 0.25)
+      let c = with_wf(child(sp, sub(cs, 7), trunk, idx, len, az, uni(cs, 3, 60.0, 80.0), c_rad(trunk, idx) *. 0.35), f)
+      whorl_go(sp, ws, trunk, idx, n, base, f, i + 1, Cons(Branch(c, 1, cs), acc))
+    end
+  end
+
+  -- ── Leaves: blobs (centre, radii, two holes, a hanging column or not) ───
+  type Blob = Blob((Float, Float, Float), (Float, Float, Float), List(((Float, Float, Float), Float)), Bool)
+
+  pfn add_blob(sp : Int, s : Int, p : (Float, Float, Float), scale : Float, tall : Bool, acc : List(Blob)) : List(Blob) do
+    let rx = uni(s, 1, bw_lo(sp), bw_hi(sp)) *. scale /. 2.0
+    let c = vadd(p, (uni(s, 2, -0.2, 0.2), uni(s, 3, 0.0, 0.2), uni(s, 4, -0.2, 0.2)))
+    if stranded(sp) do strands(s, c, 0, Cons(Blob(c, (rx *. 0.8, rx *. 0.56, rx *. 0.8), Nil, false), acc))
+    else
+      let ry = if tall do rx *. 1.6 else rx *. 0.7 end
+      let rh = if tall do rx *. 0.6 else rx end
+      let holes = Cons(hole(sub(s, 1), rh, ry), Cons(hole(sub(s, 2), rh, ry), Nil))
+      Cons(Blob(c, (rh, ry, rh), holes, false), acc)
+    end
+  end
+  pfn hole(s : Int, rx : Float, ry : Float) : ((Float, Float, Float), Float) do
+    ((uni(s, 1, -0.6, 0.6) *. rx, uni(s, 2, -0.6, 0.6) *. ry, uni(s, 3, -0.6, 0.6) *. rx), uni(s, 4, 0.2, 0.4))
+  end
+  -- the willow's three hanging columns under a blob centred at c
+  pfn strands(s : Int, c : (Float, Float, Float), i : Int, acc : List(Blob)) : List(Blob) do
+    if i >= 3 do acc
+    else
+      let ss = sub(s, 10 + i)
+      let ln = uni(ss, 1, strand_lo(), strand_hi())
+      let sr = uni(ss, 2, 0.25, 0.45)
+      let cc = vadd(c, (uni(ss, 3, -0.5, 0.5), 0.0 -. ln /. 2.0 *. 0.9, uni(ss, 4, -0.5, 0.5)))
+      strands(s, c, i + 1, Cons(Blob(cc, (sr, ln /. 2.0, sr), Nil, true), acc))
+    end
+  end
+
+  -- a branch's blobs: points from its end back to 2/3 of the way (0.4 for a pine branch), every `spacing` metres
+  pfn along(sp : Int, s : Int, cv : Curve, i : Int, i0 : Int, stride : Int, scale : Float, acc : List(Blob)) : List(Blob) do
+    if i < i0 do acc else along(sp, s, cv, i - stride, i0, stride, scale, add_blob(sp, sub(s, 400 + i), c_pt(cv, i), scale, false, acc)) end
+  end
+  pfn blobs_go(sp : Int, bs : List(Branch), acc : List(Blob)) : List(Blob) do
+    match bs do
+      Nil -> acc
+      Cons(Branch(cv, level, s), rest) ->
+        if level == 0 do blobs_go(sp, rest, add_blob(sp, sub(s, 399), c_pt(cv, c_n(cv)), if whorled(sp) do 0.7 else 1.15 end, whorled(sp), acc))
+        else
+          let n = c_n(cv) + 1
+          let wf = c_wf(cv)
+          let pine = wf >= 0.0
+          let scale = if pine do 0.4 +. 0.6 *. wf else if level < 3 do 1.0 else 0.85 end end
+          let i0 = if pine do float_to_int(int_to_float(n) *. 0.4) else (n * 2) / 3 end
+          let st0 = float_to_int(spacing(sp) /. 0.1)
+          blobs_go(sp, rest, along(sp, s, cv, n - 1, i0, if st0 < 1 do 1 else st0 end, scale, acc))
+        end
+    end
+  end
+
+  -- ── The tree ────────────────────────────────────────────────────────────
+  -- the trunk height, the branches and the blobs
+  type Shape = Shape(Float, List(Branch), List(Blob))
+
+  pfn shape(sp : Int, seed : Int) : Shape do
+    let s = Strata.Seed.mix(seed, 7000 + sp)
+    let h = uni(s, 1, h_lo(sp), h_hi(sp))
+    let r0 = uni(s, 2, r0_lo(sp), r0_hi(sp))
+    let tilt = rad(uni(s, 3, 2.0, 5.0))
+    let az = uni(s, 4, 0.0, tau())
+    let d0 = (Math.sin(tilt) *. Math.cos(az), Math.cos(tilt), Math.sin(tilt) *. Math.sin(az))
+    let trunk = curve(sub(s, 1), (0.0, 0.0, 0.0), d0, h, r0, 0.15, 0.0, rad(4.0))
+    let first = Cons(Branch(trunk, 0, sub(s, 2)), Nil)
+    let bs = if whorled(sp) do whorls(sp, sub(s, 3), trunk, h, wstart() *. h, 0, first)
+      else primaries(sp, sub(s, 4), trunk, h, rint(s, 5, np_lo(sp), np_hi(sp)), uni(s, 6, 0.0, tau()), 0, first) end
+    Shape(h, bs, blobs_go(sp, bs, Nil))
+  end
+
+  -- how far the tree reaches from its base along x or z, and how high, in metres
+  pfn reach_curve(cv : Curve, i : Int, ext : (Float, Float)) : (Float, Float) do
+    if i > c_n(cv) do ext
+    else
+      match (c_pt(cv, i), ext) do
+        ((x, y, z), (e, top)) ->
+          let r = c_rad(cv, i)
+          let e2 = fmax(e, fmax(Math.abs(x), Math.abs(z)) +. r)
+          reach_curve(cv, i + 1, (e2, fmax(top, y +. r)))
+      end
+    end
+  end
+  pfn reach_go(bs : List(Branch), ls : List(Blob), ext : (Float, Float)) : (Float, Float) do
+    match bs do
+      Cons(Branch(cv, _, _), rest) -> reach_go(rest, ls, reach_curve(cv, 0, ext))
+      Nil ->
+        match ls do
+          Nil -> ext
+          Cons(Blob((x, y, z), (rx, ry, rz), _, _), rest) ->
+            match ext do (e, top) -> reach_go(Nil, rest, (fmax(e, fmax(Math.abs(x) +. rx, Math.abs(z) +. rz)), fmax(top, y +. ry))) end
+        end
+    end
+  end
+  pfn fmax(a : Float, b : Float) : Float do if a > b do a else b end end
+
+  -- ── Voxels ──────────────────────────────────────────────────────────────
+  -- The grid: voxel (ix, iy, iz) has its centre at (ix vs, (iy + 0.5) vs, iz vs)
+  -- metres from the trunk's base, ix and iz in -half..half, iy in 0..sy - 1;
+  -- template index (ix + half) + side * (iy + sy * (iz + half)).
+  type TreeGrid = TreeGrid(NativeI32Arr, Int, Int, Float)
+  pfn g_ids(g : TreeGrid) : NativeI32Arr do match g do TreeGrid(v, _, _, _) -> v end end
+  pfn g_half(g : TreeGrid) : Int do match g do TreeGrid(_, v, _, _) -> v end end
+  pfn g_sy(g : TreeGrid) : Int do match g do TreeGrid(_, _, v, _) -> v end end
+  pfn g_vs(g : TreeGrid) : Float do match g do TreeGrid(_, _, _, v) -> v end end
+  pfn g_side(g : TreeGrid) : Int do 2 * g_half(g) + 1 end
+
+  pfn g_index(g : TreeGrid, ix : Int, iy : Int, iz : Int) : Int do
+    let h = g_half(g)
+    if ix < 0 - h do 0 - 1 else if ix > h do 0 - 1
+    else if iz < 0 - h do 0 - 1 else if iz > h do 0 - 1
+    else if iy < 0 do 0 - 1 else if iy >= g_sy(g) do 0 - 1
+    else (ix + h) + g_side(g) * (iy + g_sy(g) * (iz + h)) end end end end end end
+  end
+  pfn g_set(g : TreeGrid, ix : Int, iy : Int, iz : Int, id : Int) : TreeGrid do
+    let i = g_index(g, ix, iy, iz)
+    if i < 0 do g else match g do TreeGrid(a, h, sy, vs) -> TreeGrid(NativeArray.set_i32(a, i, id), h, sy, vs) end end
+  end
+  -- the voxel holding a point
+  pfn hx(g : TreeGrid, x : Float) : Int do float_to_int(Math.floor(x /. g_vs(g) +. 0.5)) end
+  pfn hy(g : TreeGrid, y : Float) : Int do float_to_int(Math.floor(y /. g_vs(g))) end
+
+  -- wood: a sphere of radius r at p (and the voxel holding p)
+  pfn sphere_go(g : TreeGrid, p : (Float, Float, Float), r : Float, ix0 : Int, ix1 : Int, iz0 : Int, iz1 : Int, ix : Int, iy : Int, iy1 : Int, iz : Int) : TreeGrid do
+    if iy > iy1 do g
+    else if iz > iz1 do sphere_go(g, p, r, ix0, ix1, iz0, iz1, ix0, iy + 1, iy1, iz0)
+    else if ix > ix1 do sphere_go(g, p, r, ix0, ix1, iz0, iz1, ix0, iy, iy1, iz + 1)
+    else
+      let vs = g_vs(g)
+      match p do
+        (x, y, z) ->
+          let dx = int_to_float(ix) *. vs -. x
+          let dy = (int_to_float(iy) +. 0.5) *. vs -. y
+          let dz = int_to_float(iz) *. vs -. z
+          let g2 = if dx *. dx +. dy *. dy +. dz *. dz <= r *. r do g_set(g, ix, iy, iz, wood()) else g end
+          sphere_go(g2, p, r, ix0, ix1, iz0, iz1, ix + 1, iy, iy1, iz)
+      end
+    end end end
+  end
+  -- a branch point: a sphere of wood of its radius over anything, and the voxel holding the point
+  pfn wood_pt(g : TreeGrid, p : (Float, Float, Float), r : Float) : TreeGrid do
+    match p do
+      (x, y, z) ->
+        let g1 = g_set(g, hx(g, x), hy(g, y), hx(g, z), wood())
+        sphere_go(g1, p, r, hx(g, x -. r), hx(g, x +. r), hx(g, z -. r), hx(g, z +. r), hx(g, x -. r), hy(g, y -. r), hy(g, y +. r), hx(g, z -. r))
+    end
+  end
+  -- wood from voxel (ax, ay, az) to (bx, by, bz) one axis at a time (x, then y, then z), so
+  -- consecutive voxels of a curve always share a face
+  pfn link(g : TreeGrid, ax : Int, ay : Int, az : Int, bx : Int, by_ : Int, bz : Int) : TreeGrid do
+    if ax != bx do
+      let nx = if bx > ax do ax + 1 else ax - 1 end
+      link(g_set(g, nx, ay, az, wood()), nx, ay, az, bx, by_, bz)
+    else if ay != by_ do
+      let ny = if by_ > ay do ay + 1 else ay - 1 end
+      link(g_set(g, ax, ny, az, wood()), ax, ny, az, bx, by_, bz)
+    else if az != bz do
+      let nz = if bz > az do az + 1 else az - 1 end
+      link(g_set(g, ax, ay, nz, wood()), ax, ay, nz, bx, by_, bz)
+    else g end end end
+  end
+
+  -- The spike's rule: at voxels coarser than 0.25 m a branch point under 0.2 m in radius is not
+  -- drawn (the leaves cover where it was); the trunk (level 0) is always drawn. Every drawn
+  -- point (0.1 m apart) puts wood in the voxel holding it, joined face to face to the last drawn
+  -- one; every stride-th point and the curve's last also a sphere of its radius. A child starts
+  -- at a point of its parent, whose voxel is wood, so the tree's wood is one 6-connected piece.
+  pfn wood_curve(g : TreeGrid, cv : Curve, level : Int, i : Int, stride : Int, prev : Option((Int, Int, Int))) : TreeGrid do
+    if i > c_n(cv) do g
+    else
+      let r = c_rad(cv, i)
+      let drawn = if level == 0 do true else if g_vs(g) <= 0.25 do true else r >= 0.2 end end
+      if !drawn do wood_curve(g, cv, level, i + 1, stride, None)
+      else
+        match c_pt(cv, i) do
+          (x, y, z) ->
+            let vx = hx(g, x)
+            let vy = hy(g, y)
+            let vz = hx(g, z)
+            let g1 = match prev do
+                Some((px, py, pz)) -> link(g, px, py, pz, vx, vy, vz)
+                None -> g_set(g, vx, vy, vz, wood())
+              end
+            let g2 = if i % stride == 0 || i == c_n(cv) do wood_pt(g1, (x, y, z), r) else g1 end
+            wood_curve(g2, cv, level, i + 1, stride, Some((vx, vy, vz)))
+        end
+      end
+    end
+  end
+  pfn wood_go(g : TreeGrid, bs : List(Branch), stride : Int) : TreeGrid do
+    match bs do
+      Nil -> g
+      Cons(Branch(cv, level, _), rest) -> wood_go(wood_curve(g, cv, level, 0, stride, None), rest, stride)
+    end
+  end
+
+  -- leaves: voxel centres inside the blob, kept with probability core - (core - rim) d (d the
+  -- ellipsoid distance 0..1) raised by `dense` toward 1, outside its holes, from row ymin up
+  pfn in_hole(hs : List(((Float, Float, Float), Float)), vs : Float, dx : Float, dy : Float, dz : Float) : Bool do
+    match hs do
+      Nil -> false
+      Cons(((ox, oy, oz), hr), rest) ->
+        let ex = dx -. ox
+        let ey = dy -. oy
+        let ez = dz -. oz
+        -- a hole under half a voxel across would only punch out single voxels of a coarse blob
+        if hr < 0.5 *. vs do in_hole(rest, vs, dx, dy, dz)
+        else if ex *. ex +. ey *. ey +. ez *. ez <= hr *. hr do true else in_hole(rest, vs, dx, dy, dz) end end
+    end
+  end
+  pfn blob_go(g : TreeGrid, b : Blob, s : Int, dense : Float, ymin : Int, ix0 : Int, ix1 : Int, iz0 : Int, iz1 : Int, ix : Int, iy : Int, iy1 : Int, iz : Int) : TreeGrid do
+    if iy > iy1 do g
+    else if iz > iz1 do blob_go(g, b, s, dense, ymin, ix0, ix1, iz0, iz1, ix0, iy + 1, iy1, iz0)
+    else if ix > ix1 do blob_go(g, b, s, dense, ymin, ix0, ix1, iz0, iz1, ix0, iy, iy1, iz + 1)
+    else if iy < ymin do blob_go(g, b, s, dense, ymin, ix0, ix1, iz0, iz1, ix + 1, iy, iy1, iz)
+    else
+      let vs = g_vs(g)
+      match b do
+        Blob((cx, cy, cz), (rx, ry, rz), hs, strand) ->
+          let dx = int_to_float(ix) *. vs -. cx
+          let dy = (int_to_float(iy) +. 0.5) *. vs -. cy
+          let dz = int_to_float(iz) *. vs -. cz
+          let d = Math.sqrt((dx /. rx) *. (dx /. rx) +. (dy /. ry) *. (dy /. ry) +. (dz /. rz) *. (dz /. rz))
+          let core = if strand do 0.8 else 0.85 end
+          let p0 = core -. (core -. 0.4) *. d
+          let p = p0 +. (1.0 -. p0) *. dense
+          -- the voxel holding the centre always takes a leaf, so a blob is never lost between voxel centres
+          let centre = if ix == hx(g, cx) do (if iy == hy(g, cy) do iz == hx(g, cz) else false end) else false end
+          let keep = if centre do true
+            else if d > 1.0 do false
+            else if Strata.Seed.unit(Strata.Seed.cell(s, 0, ix, iy, iz)) >= p do false
+            else !in_hole(hs, vs, dx, dy, dz) end end end
+          blob_go(if keep do g_set(g, ix, iy, iz, leaf()) else g end, b, s, dense, ymin, ix0, ix1, iz0, iz1, ix + 1, iy, iy1, iz)
+      end
+    end end end end
+  end
+  pfn leaves_go(g : TreeGrid, ls : List(Blob), s : Int, k : Int, dense : Float, ymin : Int) : TreeGrid do
+    match ls do
+      Nil -> g
+      Cons(b, rest) ->
+        match b do
+          Blob((cx, cy, cz), (rx, ry, rz), _, _) ->
+            let g2 = blob_go(g, b, Strata.Seed.mix(s, k), dense, ymin, hx(g, cx -. rx), hx(g, cx +. rx), hx(g, cz -. rz), hx(g, cz +. rz), hx(g, cx -. rx), hy(g, cy -. ry), hy(g, cy +. ry), hx(g, cz -. rz))
+            leaves_go(g2, rest, s, k + 1, dense, ymin)
+        end
+    end
+  end
+
+  doc "How much a leaf's keep probability is raised toward 1 at voxel_size metres: 0 at 0.25 m and under (the spike's canopy), 1 at 1 m and over."
+  fn density_lift(voxel_size : Float) : Float do
+    let t = (voxel_size -. 0.25) /. 0.75
+    if t < 0.0 do 0.0 else if t > 1.0 do 1.0 else t end end
+  end
+
+  doc "A tree of species (0 oak, 1 birch, 2 pine, 3 willow) from seed, at voxel_size metres a voxel: wood id 7, leaves id 8, holes 0; square and odd, the trunk's base at the middle of the bottom row (half, 0, half), half = (sx - 1) / 2. Its outermost column on every side is empty (half is one more than the tree's reach in voxels), so nothing of it lies further than (half - 0.5) voxels from its base column's centre."
+  fn build(species : Int, seed : Int, voxel_size : Float) : Strata.Template.Template do
+    let sp = if species < 0 do 0 else if species > 3 do 3 else species end end
+    match shape(sp, seed) do
+      Shape(h, bs, ls) ->
+        match reach_go(bs, ls, (0.0, 0.0)) do
+          (ext, top) ->
+            let half = float_to_int(Math.ceil(ext /. voxel_size)) + 1
+            let sy = float_to_int(Math.ceil(top /. voxel_size)) + 1
+            let side = 2 * half + 1
+            let g0 = TreeGrid(NativeArray.make_i32(side * sy * side, 0), half, sy, voxel_size)
+            let ymin = float_to_int(Math.ceil(leafmin(sp) *. h /. voxel_size))
+            let g1 = leaves_go(g0, ls, Strata.Seed.mix(seed, 9100 + sp), 0, density_lift(voxel_size), ymin)
+            -- a point every half voxel along each branch (points are 0.1 m apart)
+            let st = float_to_int(voxel_size *. 0.5 /. 0.1)
+            let stride = if st < 1 do 1 else st end
+            let g2 = wood_go(g1, bs, stride)
+            Strata.Template.make(side, sy, side, g_ids(g2), voxel_size)
+        end
+    end
+  end
+
+  doc "The template voxel (x, y, z) holding the top of a tree's trunk, for build(species, seed, voxel_size)."
+  fn trunk_tip(species : Int, seed : Int, voxel_size : Float) : (Int, Int, Int) do
+    let sp = if species < 0 do 0 else if species > 3 do 3 else species end end
+    let t = build(sp, seed, voxel_size)
+    let half = base_offset(t)
+    match shape(sp, seed) do
+      Shape(_, bs, _) ->
+        match List.find(bs, fn b -> match b do Branch(_, level, _) -> level == 0 end) do
+          Some(Branch(cv, _, _)) ->
+            match c_pt(cv, c_n(cv)) do
+              (x, y, z) -> (float_to_int(Math.floor(x /. voxel_size +. 0.5)) + half, float_to_int(Math.floor(y /. voxel_size)), float_to_int(Math.floor(z /. voxel_size +. 0.5)) + half)
+            end
+          None -> (half, 0, half)
+        end
+    end
+  end
+
+  doc "The middle of a tree template's footprint, where its trunk's base stands: (sx - 1) / 2."
+  fn base_offset(t : Strata.Template.Template) : Int do (Strata.Template.t_sx(t) - 1) / 2 end
+end

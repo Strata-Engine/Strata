@@ -1,0 +1,163 @@
+-- Template — a small block of voxels a generator stamps into chunks: a
+-- tree, a ruin. Index x + sx * (y + sy * z), y up.
+--
+-- Id 0 is a hole: it is never written, so what was there stays. Each voxel
+-- has a probability (0..255) and each y row another; a voxel is written
+-- when both pass, decided base_y the blit's stream, so one placement always
+-- comes out the same and another placement differs:
+--
+--   Seed.unit(Seed.cell(stream, 0, x, y, z)) * 255 < prob(x, y, z)
+--   Seed.unit(Seed.cell(stream, 1, 0, y, 0)) * 255 < yslice(y)
+--
+-- in template coordinates, so a voxel's fate does not depend on where or
+-- which way round the template is put. 255 always passes, 0 never does.
+--
+-- A blit turns the template rot quarter turns about Y around its origin
+-- corner and puts that corner at world voxel (ox, oy, oz): template voxel
+-- (x, y, z) goes to (ox + rx, oy + y, oz + rz), where (rx, rz) is
+--   rot 0: (x, z)    rot 1: (sz - 1 - z, x)
+--   rot 2: (sx - 1 - x, sz - 1 - z)    rot 3: (z, sx - 1 - x)
+-- (rot taken mod 4). It writes into one chunk, the part of the template
+-- inside it, so a template over several chunks is blitted into each.
+--
+-- from_vox reads a MagicaVoxel file through Strata.Ffi.Vox, its scene
+-- flattened (Y up) in C, and maps palette indices to block ids.
+mod Strata.Template do
+
+  needs IO.Foreign -- from_vox reads the file through native/strata_vox.cpp
+
+  type Template = Template(Int, Int, Int, NativeI32Arr, NativeU8Arr, NativeU8Arr, Float)
+
+  doc "A template sx x sy x sz of block ids (x + sx * (y + sy * z); 0 a hole), every voxel and row at probability 255; voxel_size is the size of one of its voxels in metres, for the caller."
+  fn make(sx : Int, sy : Int, sz : Int, ids : NativeI32Arr, voxel_size : Float) : Template do
+    Template(sx, sy, sz, ids, NativeArray.make_u8(sx * sy * sz, 255), NativeArray.make_u8(sy, 255), voxel_size)
+  end
+
+  fn t_sx(t : Template) : Int do match t do Template(v, _, _, _, _, _, _) -> v end end
+  fn t_sy(t : Template) : Int do match t do Template(_, v, _, _, _, _, _) -> v end end
+  fn t_sz(t : Template) : Int do match t do Template(_, _, v, _, _, _, _) -> v end end
+  fn t_ids(t : Template) : NativeI32Arr do match t do Template(_, _, _, v, _, _, _) -> v end end
+  fn t_prob(t : Template) : NativeU8Arr do match t do Template(_, _, _, _, v, _, _) -> v end end
+  fn t_yslice(t : Template) : NativeU8Arr do match t do Template(_, _, _, _, _, v, _) -> v end end
+  fn t_voxel_size(t : Template) : Float do match t do Template(_, _, _, _, _, _, v) -> v end end
+
+  pfn byte(p : Int) : Int do if p < 0 do 0 else if p > 255 do 255 else p end end end
+
+  doc "The template with voxel i's probability p (0 never written .. 255 always), clamped to 0..255; an i outside the template changes nothing."
+  fn with_prob(t : Template, i : Int, p : Int) : Template do
+    match t do
+      Template(sx, sy, sz, ids, pr, ys, vs) ->
+        if i < 0 do t
+        else if i >= NativeArray.length_u8(pr) do t
+        else Template(sx, sy, sz, ids, NativeArray.set_u8(pr, i, byte(p)), ys, vs) end end
+    end
+  end
+
+  doc "The template with row y's probability p (0 the row is never written .. 255 always), clamped to 0..255; a y outside the template changes nothing."
+  fn with_yslice(t : Template, y : Int, p : Int) : Template do
+    match t do
+      Template(sx, sy, sz, ids, pr, ys, vs) ->
+        if y < 0 do t
+        else if y >= NativeArray.length_u8(ys) do t
+        else Template(sx, sy, sz, ids, pr, NativeArray.set_u8(ys, y, byte(p)), vs) end end
+    end
+  end
+
+  pfn quarter(rot : Int) : Int do int_and(rot, 3) end
+
+  -- the footprint after rotation: (along x, along z)
+  pfn footprint(t : Template, rot : Int) : (Int, Int) do
+    if int_and(rot, 1) == 0 do (t_sx(t), t_sz(t)) else (t_sz(t), t_sx(t)) end
+  end
+
+  doc "The inclusive world box (x0, y0, z0, x1, y1, z1) the template covers blitted at (ox, oy, oz) with rot."
+  fn bounds(t : Template, ox : Int, oy : Int, oz : Int, rot : Int) : (Int, Int, Int, Int, Int, Int) do
+    let (w, d) = footprint(t, rot)
+    (ox, oy, oz, ox + w - 1, oy + t_sy(t) - 1, oz + d - 1)
+  end
+
+  -- template (x, z) of the rotated footprint cell (rx, rz): the inverse turn
+  pfn unturn(t : Template, rot : Int, rx : Int, rz : Int) : (Int, Int) do
+    let r = quarter(rot)
+    if r == 0 do (rx, rz)
+    else if r == 1 do (rz, t_sz(t) - 1 - rx)
+    else if r == 2 do (t_sx(t) - 1 - rx, t_sz(t) - 1 - rz)
+    else (t_sx(t) - 1 - rz, rx) end end end
+  end
+
+  pfn passes(h : Int, p : Int) : Bool do Strata.Seed.unit(h) *. 255.0 < int_to_float(p) end
+
+  -- the id template voxel (x, y, z) writes under stream, or 0 (hole or a failed draw)
+  pfn drawn(t : Template, x : Int, y : Int, z : Int, stream : Int) : Int do
+    let i = x + t_sx(t) * (y + t_sy(t) * z)
+    let id = NativeArray.get_i32(t_ids(t), i)
+    -- nested ifs, not `&&`: each draw runs only when the one before passed (GAPS S16)
+    if id == 0 do 0
+    else if passes(Strata.Seed.cell(stream, 0, x, y, z), NativeArray.get_u8(t_prob(t), i)) do
+      if passes(Strata.Seed.cell(stream, 1, 0, y, 0), NativeArray.get_u8(t_yslice(t), y)) do id else 0 end
+    else 0 end end
+  end
+
+  -- world cells (wx, wy, wz) for wx in x..x1 of one row; (base_x, base_y, base_z) the chunk's first voxel
+  pfn blit_x(c : Strata.Chunk.Chunk, t : Template, ox : Int, oy : Int, oz : Int, rot : Int, stream : Int, base_x : Int, base_y : Int, base_z : Int, x : Int, x1 : Int, y : Int, z : Int) : Strata.Chunk.Chunk do
+    if x > x1 do c
+    else
+      let (tx, tz) = unturn(t, rot, x - ox, z - oz)
+      let id = drawn(t, tx, y - oy, tz, stream)
+      let i = (x - base_x) + 32 * ((z - base_z) + 32 * (y - base_y))
+      let c2 = if id == 0 do c else if i < 0 || i >= 32768 do c else Strata.Chunk.set_idx(c, i, id) end end
+      blit_x(c2, t, ox, oy, oz, rot, stream, base_x, base_y, base_z, x + 1, x1, y, z)
+    end
+  end
+
+  pfn blit_z(c : Strata.Chunk.Chunk, t : Template, ox : Int, oy : Int, oz : Int, rot : Int, stream : Int, base_x : Int, base_y : Int, base_z : Int, x0 : Int, x1 : Int, y : Int, z : Int, z1 : Int) : Strata.Chunk.Chunk do
+    if z > z1 do c
+    else blit_z(blit_x(c, t, ox, oy, oz, rot, stream, base_x, base_y, base_z, x0, x1, y, z), t, ox, oy, oz, rot, stream, base_x, base_y, base_z, x0, x1, y, z + 1, z1) end
+  end
+
+  pfn blit_y(c : Strata.Chunk.Chunk, t : Template, ox : Int, oy : Int, oz : Int, rot : Int, stream : Int, base_x : Int, base_y : Int, base_z : Int, x0 : Int, x1 : Int, y : Int, y1 : Int, z0 : Int, z1 : Int) : Strata.Chunk.Chunk do
+    if y > y1 do c
+    else blit_y(blit_z(c, t, ox, oy, oz, rot, stream, base_x, base_y, base_z, x0, x1, y, z0, z1), t, ox, oy, oz, rot, stream, base_x, base_y, base_z, x0, x1, y + 1, y1, z0, z1) end
+  end
+
+  pfn max_i(a : Int, b : Int) : Int do if a > b do a else b end end
+  pfn min_i(a : Int, b : Int) : Int do if a < b do a else b end end
+
+  doc "Chunk c (at key k) with the template blitted at world voxel (ox, oy, oz), turned rot quarter turns about Y, its probabilities drawn from stream: only non-hole voxels that pass and lie inside the chunk are written; everything else is as it was."
+  fn blit(c : Strata.Chunk.Chunk, k : Strata.Coord.Key, t : Template, ox : Int, oy : Int, oz : Int, rot : Int, stream : Int) : Strata.Chunk.Chunk do
+    let base_x = Strata.Coord.kx(k) * 32
+    let base_y = Strata.Coord.ky(k) * 32
+    let base_z = Strata.Coord.kz(k) * 32
+    let (x0, y0, z0, x1, y1, z1) = bounds(t, ox, oy, oz, rot)
+    blit_y(c, t, ox, oy, oz, rot, stream, base_x, base_y, base_z,
+      max_i(x0, base_x), min_i(x1, base_x + 31), max_i(y0, base_y), min_i(y1, base_y + 31), max_i(z0, base_z), min_i(z1, base_z + 31))
+  end
+
+  pfn map_go(pal : NativeU8Arr, to_id : NativeI32Arr, m : Int, ids : NativeI32Arr, i : Int, n : Int) : NativeI32Arr do
+    if i >= n do ids
+    else
+      let p = NativeArray.get_u8(pal, i)
+      let id = if p == 0 do 0 else if p >= m do 0 else NativeArray.get_i32(to_id, p) end end
+      map_go(pal, to_id, m, if id == 0 do ids else NativeArray.set_i32(ids, i, id) end, i + 1, n)
+    end
+  end
+
+  doc "The template in a MagicaVoxel file's bytes: the whole scene flattened through its nTRN/nGRP/nShp graph, Y up, each palette index mapped through palette_to_id (256 entries; 0, or an index past its end, is a hole). None when the bytes are not a .vox or the scene is empty or over 1023 a side."
+  fn from_vox(bytes : NativeU8Arr, palette_to_id : NativeI32Arr, voxel_size : Float) : Option(Template) do
+    let n = NativeArray.length_u8(bytes)
+    let packed = Strata.Ffi.Vox.vox_size(bytes, n)
+    if packed == 0 do None
+    else
+      let sx = int_and(packed, 1023)
+      let sy = int_and(int_shr(packed, 10), 1023)
+      let sz = int_and(int_shr(packed, 20), 1023)
+      let vol = sx * sy * sz
+      let pal = NativeArray.make_u8(vol, 0)
+      if Strata.Ffi.Vox.vox_fill(bytes, n, pal, vol) != vol do None
+      else
+        let m = min_i(NativeArray.length_i32(palette_to_id), 256)
+        Some(make(sx, sy, sz, map_go(pal, palette_to_id, m, NativeArray.make_i32(vol, 0), 0, vol), voxel_size))
+      end
+    end
+  end
+end

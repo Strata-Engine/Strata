@@ -34,7 +34,13 @@ rim of a lake in the hills and it drains. `L` steps
 through the light modes and `[` and `]` lower and raise the sun.
 
 The world is an island 2 km across, read from `Strata.Atlas`: rivers run
-to the sea in their channels and lakes stand at their spill level. Its atlas
+to the sea in their channels and lakes stand at their spill level. Under
+its surface the land is a 3D density (`Strata.Lattice`) with overhangs and
+caves that open here and there, its steepest slopes relaxed to scree
+(`Strata.Thermal`), grass over dirt over stone laid by `Strata.Surface`.
+Trees, grown at start-up by a procedural branching generator (oak, birch,
+pine, willow) and scattered by `Strata.Feature`, stand across chunk borders;
+ruins stand on the atlas's sites with the ground pulled up to them. Its atlas
 takes about 4 s to build and is cached in `.march/atlas` (read in about
 30 ms after that); `STRATA_ISLAND=0` brings back the older noise terrain.
 
@@ -469,6 +475,8 @@ let s4 = Strata.Stream.apply(s3, Strata.Edit.fill_sphere(Strata.Stream.world(s3)
 | `Strata.Model` | a model block's drawing geometry |
 | `Strata.Rig`, `Strata.Clip` | a jointed figure's description and part meshes; its animations |
 | `Strata.Anim`, `Strata.Ffi.Anim` | figures posed by the C kernel in `native/strata_anim.h` |
+| `Strata.Feature` | scattering features by hashed cells: the same placements however an area is cut |
+| `Strata.Template`, `Strata.Ffi.Vox` | voxel templates (holes, probabilities, turns) blitted into chunks; MagicaVoxel `.vox` import (`native/strata_vox.cpp`, link with `-fno-exceptions`) |
 | `Strata.Entities`, `Strata.Ffi.Ent` | entity kinds, and entities kept as rows by the C kernel in `native/strata_ent.h` |
 | `Strata.Ffi.Vk` | window, input and the Vulkan renderer |
 | `Strata.Math.*`, `Strata.Noise`, `Strata.Tree` | vectors, matrices, noise, a persistent tree |

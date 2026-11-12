@@ -103,6 +103,10 @@ figure-walk-lit-4s:STRATA_SCENE=32 STRATA_LIGHT=4 STRATA_FRAMES=243 STRATA_FIG_S
 figure-shadow:STRATA_SCENE=33 STRATA_LIGHT=4 STRATA_SUN=18 DRAWS=35
 figure-shadow-walk-2s:STRATA_SCENE=33 STRATA_LIGHT=4 STRATA_SUN=18 STRATA_FRAMES=123 DRAWS=35
 figure-shadow-walk-4s:STRATA_SCENE=33 STRATA_LIGHT=4 STRATA_SUN=18 STRATA_FRAMES=243 DRAWS=35
+island-cliff:STRATA_SCENE=24 STRATA_ISLAND=1 STRATA_LIGHT=4
+island-cave:STRATA_SCENE=29 STRATA_ISLAND=1 STRATA_LIGHT=4
+forest-border:STRATA_SCENE=128 STRATA_ISLAND=1 STRATA_LIGHT=4
+ruin-slope:STRATA_SCENE=129 STRATA_ISLAND=1 STRATA_LIGHT=4
 '
 # indirect draw calls a frame must issue, whatever the scene holds; a scene
 # with a kind of geometry nowhere in it says DRAWS=n (a figure scene adds one
