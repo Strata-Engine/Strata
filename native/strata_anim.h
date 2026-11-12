@@ -16,7 +16,14 @@
  * The procedural stage (after the layers, in this order): the drop, the
  * overrides, aim, reach, then springs within the hierarchy pass. Its
  * settings live in one pool of records shared by every figure (AN_PROC_PER_FIG
- * a figure of capacity); a full pool refuses with AN_R_FULL. */
+ * a figure of capacity); a full pool refuses with AN_R_FULL.
+ *
+ * Attachments: a figure may hang from another's socket, up to AN_DEPTH links
+ * deep; an update poses parents before children. Sockets and hit tests read
+ * the pose before springs, and pose a stale figure (placed, played or changed
+ * since its last pose, or hanging from one) before they answer; posing for a
+ * query changes nothing an update carries forward. Hits find figures through
+ * a coarse grid of their bounds (cells AN_CELL metres), rebuilt each update. */
 #ifndef STRATA_ANIM_H
 #define STRATA_ANIM_H
 #include <stdint.h>
@@ -42,6 +49,14 @@
 #define AN_REACHES 8               /* reach slots a figure */
 #define AN_SPRING_STEP (1.0f / 120)   /* springs are sub-stepped at this */
 #define AN_SPRING_SNAP 0.5f        /* an update longer than this settles every spring at once */
+#define AN_DEPTH 4                 /* links from a free figure down to the deepest one hanging from it */
+#define AN_SOCKETS 32              /* sockets a rig */
+#define AN_SIDE 128                /* a part's grid, voxels a side at most */
+#define AN_SHAPES 4096             /* part grids over every rig */
+#define AN_BRICKS 4096             /* occupied 8x8x8 bricks of part voxels over every rig (2 MB) */
+#define AN_BRICK_INDEX (1 << 16)   /* brick table entries over every part grid */
+#define AN_CELL 4.0f               /* the hit grid's cells, metres a side */
+#define AN_CELLS_PER_FIG 8         /* a figure covering more cells is kept in a list every query tests */
 
 /* why the last refused call was refused: an_stat(5) */
 enum {
@@ -58,7 +73,9 @@ enum {
     AN_R_KEY = 10,      /* a key's part, channel or interpolation out of range */
     AN_R_BLEND = 11,    /* a blend of 0 or more than AN_BLEND clips, or positions not increasing */
     AN_R_WHAT = 12,     /* an_set: no such setting, or nothing playing on the layer */
-    AN_R_PART = 13      /* the procedural stage: a part outside the rig, a slot outside its range, or a chain not running down the rig */
+    AN_R_PART = 13,     /* the procedural stage: a part outside the rig, a slot outside its range, or a chain not running down the rig */
+    AN_R_SOCKET = 14,   /* no such socket on the rig */
+    AN_R_ATTACH = 15    /* an attachment deeper than AN_DEPTH, or a cycle */
 };
 
 /* ---- small quaternion and vector arithmetic (xyzw, Hamilton product) ---- */
@@ -184,6 +201,11 @@ typedef struct {
     int32_t proc;                /* the first of its procedural records, -1 for none */
     float drop;                  /* metres the root is lowered after the layers */
     float drop_goal, drop_rate;  /* where the drop is moving and how fast (metres a second; 0 holds) */
+    int32_t att;                 /* the slot of the figure it hangs from, -1 for none */
+    int16_t att_socket;          /* that figure's socket */
+    uint8_t depth, pad;          /* links above it */
+    float att_pos[3], att_q[4];  /* its placement in the socket's frame */
+    float bmin[3], bmax[3];      /* world bounds of its part boxes before springs; bmin > bmax: none */
     AnLayer layer[AN_LAYERS];
 } AnFig;
 typedef struct { float u; int32_t fig, layer, tag; float weight; } AnEvent;   /* u: how far through the update */
@@ -202,6 +224,15 @@ typedef struct {
     float v[9];
 } AnProc;
 
+/* a socket: a frame in a part's frame (metres from its origin) */
+typedef struct { int32_t part; float pos[3], q[4]; } AnSocket;
+/* a part's grid for hits: its voxels in occupied 8x8x8 bricks; the grid's
+ * low corner sits at the part's box minimum in the part's frame */
+typedef struct { int16_t sx, sy, sz, nbx, nby, nbz; int32_t index; float voxel; } AnShape;
+/* a ray's answer: the figure's id, the part, the voxel in the part's grid, its
+ * palette index, the distance in metres and the struck face's world normal */
+typedef struct { int32_t fig, part, x, y, z, colour; float dist, nx, ny, nz; } AnHit;
+
 struct AnWorld {
     int capacity;
     AnRig *rigs; int nrigs;
@@ -218,6 +249,18 @@ struct AnWorld {
     int live, posed;
     double refused, negative_dt, dropped; int reason;
     AnProc *procs; int32_t *proc_free; int nprocs, nproc_free;   /* the procedural pool and its free stack */
+    AnSocket *sockets; int32_t nsockets[AN_RIGS];                /* AN_SOCKETS a rig */
+    AnShape *shapes; int nshapes; int32_t *shape_of;             /* shape_of[rig * AN_PARTS + part]: a shape, -1 none */
+    int32_t *brick_index; int nbrick_index;                      /* each grid's bricks: a brick, -1 empty */
+    uint8_t *bricks; int nbricks;                                /* 512 palette indices a brick */
+    int nattached, max_depth;
+    int32_t *grid_head; uint32_t grid_mask;                      /* the hit grid: cell hash -> entries */
+    int32_t *grid_next, *grid_slot; int ngrid;                   /* capacity x AN_CELLS_PER_FIG entries */
+    int32_t *big; int nbig;                                      /* figures over more than AN_CELLS_PER_FIG cells */
+    float ubmin[3], ubmax[3];                                    /* the union of the grid's figures' bounds */
+    int grid_dirty;                                              /* a figure was posed or removed since the grid was built */
+    uint32_t *stamp; uint32_t stamp_now;                         /* a figure seen by this query */
+    float *scratch;                                              /* AN_PARTS x 12: a pose rebuilt for a query */
 };
 typedef struct AnWorld AnWorld;
 
@@ -229,6 +272,8 @@ static inline void an_close(AnWorld *w) {
     free(w->mark_t); free(w->mark_tag); free(w->figs); free(w->mats);
     free(w->ids); free(w->free_slots); free(w->events); free(w->events_tmp);
     free(w->procs); free(w->proc_free);
+    free(w->sockets); free(w->shapes); free(w->shape_of); free(w->brick_index); free(w->bricks);
+    free(w->grid_head); free(w->grid_next); free(w->grid_slot); free(w->big); free(w->stamp); free(w->scratch);
     free(w);
 }
 
@@ -256,8 +301,26 @@ static inline AnWorld *an_open(int capacity) {
     w->nprocs = capacity * AN_PROC_PER_FIG;
     w->procs = (AnProc *)calloc((size_t)w->nprocs, sizeof *w->procs);
     w->proc_free = (int32_t *)malloc((size_t)w->nprocs * sizeof *w->proc_free);
+    w->sockets = (AnSocket *)calloc((size_t)AN_RIGS * AN_SOCKETS, sizeof *w->sockets);
+    w->shapes = (AnShape *)calloc(AN_SHAPES, sizeof *w->shapes);
+    w->shape_of = (int32_t *)malloc((size_t)AN_RIGS * AN_PARTS * sizeof *w->shape_of);
+    w->brick_index = (int32_t *)malloc(AN_BRICK_INDEX * sizeof *w->brick_index);
+    w->bricks = (uint8_t *)calloc((size_t)AN_BRICKS * 512, 1);
+    uint32_t gn = 2;
+    while (gn < 4u * (uint32_t)capacity) gn *= 2;
+    w->grid_mask = gn - 1;
+    w->grid_head = (int32_t *)malloc(gn * sizeof *w->grid_head);
+    w->grid_next = (int32_t *)malloc((size_t)capacity * AN_CELLS_PER_FIG * sizeof *w->grid_next);
+    w->grid_slot = (int32_t *)malloc((size_t)capacity * AN_CELLS_PER_FIG * sizeof *w->grid_slot);
+    w->big = (int32_t *)malloc((size_t)capacity * sizeof *w->big);
+    w->stamp = (uint32_t *)calloc((size_t)capacity, sizeof *w->stamp);
+    w->scratch = (float *)calloc(AN_PARTS * 12, sizeof *w->scratch);
     if (!w->rigs || !w->masks || !w->clips || !w->keys || !w->key_interp || !w->mark_t || !w->mark_tag || !w->figs ||
-        !w->mats || !w->ids || !w->free_slots || !w->events || !w->events_tmp || !w->procs || !w->proc_free) { an_close(w); return NULL; }
+        !w->mats || !w->ids || !w->free_slots || !w->events || !w->events_tmp || !w->procs || !w->proc_free ||
+        !w->sockets || !w->shapes || !w->shape_of || !w->brick_index || !w->bricks || !w->grid_head || !w->grid_next ||
+        !w->grid_slot || !w->big || !w->stamp || !w->scratch) { an_close(w); return NULL; }
+    for (int i = 0; i < AN_RIGS * AN_PARTS; i++) w->shape_of[i] = -1;
+    for (uint32_t i = 0; i < gn; i++) w->grid_head[i] = -1;
     for (int i = 0; i < w->nprocs; i++) w->proc_free[i] = w->nprocs - 1 - i;   /* record 0 handed out first */
     w->nproc_free = w->nprocs;
     for (uint32_t i = 0; i < hn; i++) w->ids[i] = -1;
@@ -421,21 +484,37 @@ static inline int an_spawn(AnWorld *w, int rig) {
     AnFig *f = &w->figs[s];
     memset(f, 0, sizeof *f);
     f->id = id; f->rig = rig; f->q[3] = 1; f->proc = -1;
+    f->att = -1; f->att_q[3] = 1;
     an_id_insert(w, id, s);
     w->live++;
     an_pose(w, f, 0);                          /* the rest pose, at the origin */
     return id;
 }
 
+static inline void an_recount(AnWorld *w);
+static inline void an_unhang(AnFig *f) {   /* no longer attached; it keeps its placement */
+    f->att = -1; f->att_socket = 0;
+    memset(f->att_pos, 0, sizeof f->att_pos);
+    f->att_q[0] = f->att_q[1] = f->att_q[2] = 0; f->att_q[3] = 1;
+}
+
+/* a removed figure's children are detached where they stand */
 static inline void an_remove(AnWorld *w, int fig) {
     AnFig *f = an_fig(w, fig);
     if (!f) { an_refuse(w, AN_R_FIGURE); return; }
+    int slot = (int)(f - w->figs);
+    if (w->nattached) {
+        for (int s = 0; s < w->capacity; s++) if (w->figs[s].id >= 0 && w->figs[s].att == slot) an_unhang(&w->figs[s]);
+        an_unhang(f);
+    }
+    w->grid_dirty = 1;
     an_id_erase(w, fig);
     for (int i = f->proc; i >= 0; i = w->procs[i].next) w->proc_free[w->nproc_free++] = i;
     f->proc = -1;
     f->id = -1;
     w->free_slots[w->nfree++] = (int32_t)(f - w->figs);
     w->live--;
+    if (w->nattached) an_recount(w);
 }
 
 static inline void an_place(AnWorld *w, int fig, const float pos[3], const float q[4]) {
@@ -897,7 +976,8 @@ static inline void an_build(const AnWorld *w, const AnFig *f, AnBody *b, int sta
 static inline void an_spring_step(AnProc *s, const float target[4], float dt) {
     float *q = s->v + 2, *om = s->v + 6;
     if (s->fresh || dt > AN_SPRING_SNAP) {
-        memcpy(q, target, 4 * sizeof(float)); om[0] = om[1] = om[2] = 0; s->fresh = 0;
+        memcpy(q, target, 4 * sizeof(float)); om[0] = om[1] = om[2] = 0;
+        if (dt > 0) s->fresh = 0;              /* a pose without time (for a query) leaves it fresh */
         return;
     }
     if (!(dt > 0)) return;
@@ -922,12 +1002,52 @@ static inline void an_spring_step(AnProc *s, const float target[4], float dt) {
     }
 }
 
+/* a rotation's 3x3, column-major: o[0..2] is where it takes x */
+static inline void an_qmat(const float q[4], float o[9]) {
+    const float x = q[0], y = q[1], z = q[2], sw = q[3];
+    o[0] = 1 - 2 * (y * y + z * z); o[1] = 2 * (x * y + sw * z);     o[2] = 2 * (x * z - sw * y);
+    o[3] = 2 * (x * y - sw * z);     o[4] = 1 - 2 * (x * x + z * z); o[5] = 2 * (y * z + sw * x);
+    o[6] = 2 * (x * z + sw * y);     o[7] = 2 * (y * z - sw * x);     o[8] = 1 - 2 * (x * x + y * y);
+}
+/* a part's 3x4: its rotation's columns, then its origin */
+static inline void an_write_mat(const float q[4], const float p[3], float *o) {
+    an_qmat(q, o);
+    o[9] = p[0]; o[10] = p[1]; o[11] = p[2];
+}
+/* does part p's box hold any volume? (a pure joint's does not) */
+static inline int an_has_box(const AnRig *r, int p) {
+    const float *bx = r->box[p];
+    return bx[3] > bx[0] && bx[4] > bx[1] && bx[5] > bx[2];
+}
+/* the figure's world bounds: every part box with volume, as the pose before springs places it */
+static inline void an_bounds(const AnRig *r, const AnBody *b, AnFig *f) {
+    float lo[3] = {INFINITY, INFINITY, INFINITY}, hi[3] = {-INFINITY, -INFINITY, -INFINITY};
+    for (int p = 0; p < r->nparts; p++) {
+        if (!an_has_box(r, p)) continue;
+        const float *bx = r->box[p];
+        float m[9], c[3], e[3];
+        an_qmat(b->wq[p], m);
+        for (int k = 0; k < 3; k++) { c[k] = (bx[k] + bx[3 + k]) * 0.5f; e[k] = (bx[3 + k] - bx[k]) * 0.5f; }
+        for (int i = 0; i < 3; i++) {
+            float wc = b->wp[p][i] + m[i] * c[0] + m[3 + i] * c[1] + m[6 + i] * c[2];
+            float we = fabsf(m[i]) * e[0] + fabsf(m[3 + i]) * e[1] + fabsf(m[6 + i]) * e[2];
+            if (wc - we < lo[i]) lo[i] = wc - we;
+            if (wc + we > hi[i]) hi[i] = wc + we;
+        }
+    }
+    if (lo[0] > hi[0]) { lo[0] = lo[1] = lo[2] = 1; hi[0] = hi[1] = hi[2] = 0; }
+    memcpy(f->bmin, lo, sizeof lo); memcpy(f->bmax, hi, sizeof hi);
+}
+
 /* poses figure f: the pose up to the springs, then the hierarchy with the
- * springs advanced by dt (0 holds them), into its matrices */
+ * springs advanced by dt (0 holds them), into its matrices; its bounds come
+ * from the pose before springs */
 static inline void an_pose(AnWorld *w, AnFig *f, float dt) {
     const AnRig *r = &w->rigs[f->rig];
     AnBody b;
     an_build(w, f, &b, 1);
+    an_bounds(r, &b, f);
+    w->grid_dirty = 1;
     int16_t spring[AN_PARTS];
     int any = 0;
     for (int p = 0; p < r->nparts; p++) spring[p] = -1;
@@ -949,14 +1069,79 @@ static inline void an_pose(AnWorld *w, AnFig *f, float dt) {
                 memcpy(b.wq[p], s->v + 2, sizeof b.wq[p]);
             }
         }
-        const float x = b.wq[p][0], y = b.wq[p][1], z = b.wq[p][2], sw = b.wq[p][3];
-        float *o = out + p * 12;
-        o[0] = 1 - 2 * (y * y + z * z); o[1] = 2 * (x * y + sw * z);     o[2] = 2 * (x * z - sw * y);
-        o[3] = 2 * (x * y - sw * z);     o[4] = 1 - 2 * (x * x + z * z); o[5] = 2 * (y * z + sw * x);
-        o[6] = 2 * (x * z + sw * y);     o[7] = 2 * (y * z - sw * x);     o[8] = 1 - 2 * (x * x + y * y);
-        o[9] = b.wp[p][0]; o[10] = b.wp[p][1]; o[11] = b.wp[p][2];
+        an_write_mat(b.wq[p], b.wp[p], out + p * 12);
     }
     f->dirty = 0;
+}
+
+/* ---- attachments ---- */
+
+/* socket s of figure f in world space, from the pose before springs (rebuilt
+ * from the figure as it stands: the last pose's unless it changed since) */
+static inline void an_socket_frame(const AnWorld *w, const AnFig *f, const AnSocket *s, float q[4], float p[3]) {
+    AnBody b;
+    float ro[3];
+    an_build(w, f, &b, 1);
+    an_qrot(b.wq[s->part], s->pos, ro);
+    for (int i = 0; i < 3; i++) p[i] = b.wp[s->part][i] + ro[i];
+    an_qmul(b.wq[s->part], s->q, q);
+    an_qnorm(q);
+}
+/* an attached figure's placement: its parent's socket, then its offset */
+static inline void an_attach_place(AnWorld *w, AnFig *f) {
+    const AnFig *pf = &w->figs[f->att];
+    float sq[4], sp[3], ro[3];
+    an_socket_frame(w, pf, &w->sockets[pf->rig * AN_SOCKETS + f->att_socket], sq, sp);
+    an_qrot(sq, f->att_pos, ro);
+    for (int i = 0; i < 3; i++) f->pos[i] = sp[i] + ro[i];
+    an_qmul(sq, f->att_q, f->q);
+    an_qnorm(f->q);
+}
+/* every figure's depth (links above it), the deepest, and how many hang */
+static inline void an_recount(AnWorld *w) {
+    w->nattached = 0; w->max_depth = 0;
+    for (int s = 0; s < w->capacity; s++) {
+        AnFig *f = &w->figs[s];
+        if (f->id < 0) continue;
+        int d = 0;
+        for (const AnFig *g = f; g->att >= 0 && d <= AN_DEPTH; g = &w->figs[g->att]) d++;
+        f->depth = (uint8_t)d;
+        if (f->att >= 0) w->nattached++;
+        if (d > w->max_depth) w->max_depth = d;
+    }
+}
+
+/* ---- the hit grid ---- */
+static inline uint32_t an_cell_hash(int x, int y, int z) { return (uint32_t)x * 73856093u ^ (uint32_t)y * 19349663u ^ (uint32_t)z * 83492791u; }
+static inline int an_cell_of(float v) {
+    float c = floorf(v / AN_CELL);
+    return c < -1e9f ? -1000000000 : (c > 1e9f ? 1000000000 : (int)c);
+}
+/* each figure with bounds goes into every cell its bounds touch (at most
+ * AN_CELLS_PER_FIG; past that into the list every query tests) */
+static inline void an_grid_build(AnWorld *w) {
+    for (uint32_t i = 0; i <= w->grid_mask; i++) w->grid_head[i] = -1;
+    w->ngrid = 0; w->nbig = 0;
+    for (int k = 0; k < 3; k++) { w->ubmin[k] = INFINITY; w->ubmax[k] = -INFINITY; }
+    for (int s = 0; s < w->capacity; s++) {
+        const AnFig *f = &w->figs[s];
+        if (f->id < 0 || !(f->bmin[0] <= f->bmax[0])) continue;
+        int c0[3], c1[3];
+        double n = 1;
+        for (int k = 0; k < 3; k++) { c0[k] = an_cell_of(f->bmin[k]); c1[k] = an_cell_of(f->bmax[k]); n *= (double)c1[k] - c0[k] + 1; }
+        if (n > AN_CELLS_PER_FIG) { w->big[w->nbig++] = s; continue; }
+        for (int k = 0; k < 3; k++) {
+            if (f->bmin[k] < w->ubmin[k]) w->ubmin[k] = f->bmin[k];
+            if (f->bmax[k] > w->ubmax[k]) w->ubmax[k] = f->bmax[k];
+        }
+        for (int z = c0[2]; z <= c1[2]; z++)
+            for (int y = c0[1]; y <= c1[1]; y++)
+                for (int x = c0[0]; x <= c1[0]; x++) {
+                    uint32_t h = an_cell_hash(x, y, z) & w->grid_mask;
+                    w->grid_slot[w->ngrid] = s; w->grid_next[w->ngrid] = w->grid_head[h]; w->grid_head[h] = w->ngrid++;
+                }
+    }
+    w->grid_dirty = 0;
 }
 
 /* events in the order they happened within the update; ties keep the order
@@ -977,17 +1162,23 @@ static inline void an_sort_events(AnWorld *w) {
     if (a != w->events) memcpy(w->events, a, (size_t)n * sizeof *a);
 }
 
+/* advances every figure (marks in slot order), then poses them parents
+ * first: depth 0, then 1, ... each attached figure placed at its parent's
+ * socket; then rebuilds the hit grid */
 static inline void an_update(AnWorld *w, float dt) {
     if (!(dt >= 0) || !isfinite(dt)) { w->negative_dt += 1; return; }
     w->nevents = 0;
     w->posed = 0;
-    for (int s = 0; s < w->capacity; s++) {
-        AnFig *f = &w->figs[s];
-        if (f->id < 0) continue;
-        an_advance(w, f, dt);
-        an_pose(w, f, dt);
-        w->posed++;
-    }
+    for (int s = 0; s < w->capacity; s++) if (w->figs[s].id >= 0) an_advance(w, &w->figs[s], dt);
+    for (int d = 0; d <= w->max_depth; d++)
+        for (int s = 0; s < w->capacity; s++) {
+            AnFig *f = &w->figs[s];
+            if (f->id < 0 || f->depth != d) continue;
+            if (f->att >= 0) an_attach_place(w, f);
+            an_pose(w, f, dt);
+            w->posed++;
+        }
+    an_grid_build(w);
     an_sort_events(w);
 }
 
@@ -1217,8 +1408,413 @@ static inline uint64_t an_hash(const AnWorld *w) {
             p = (const unsigned char *)q->v;
             for (size_t k = 0; k < sizeof q->v; k++) { h ^= p[k]; h *= 1099511628211ull; }
         }
+        /* the attachment: the parent's id (-1 for none), the socket and the offset */
+        int32_t link[2] = {f->att >= 0 ? w->figs[f->att].id : -1, f->att_socket};
+        p = (const unsigned char *)link;
+        for (size_t i = 0; i < sizeof link; i++) { h ^= p[i]; h *= 1099511628211ull; }
+        float off[7] = {f->att_pos[0], f->att_pos[1], f->att_pos[2], f->att_q[0], f->att_q[1], f->att_q[2], f->att_q[3]};
+        p = (const unsigned char *)off;
+        for (size_t i = 0; i < sizeof off; i++) { h ^= p[i]; h *= 1099511628211ull; }
     }
     return h;
+}
+
+/* ---- sockets, part grids, attachments ---- */
+
+/* a socket on rig's part at pos (metres in the part's frame) turned by q; its
+ * id within the rig (0, 1, ...), or -1 */
+static inline int an_socket_def(AnWorld *w, int rig, int part, const float pos[3], const float q[4]) {
+    if (rig < 0 || rig >= w->nrigs) return an_refuse(w, AN_R_RIG);
+    if (part < 0 || part >= w->rigs[rig].nparts) return an_refuse(w, AN_R_PART);
+    float n[4];
+    if (!pos || !q || !an_finite(pos, 3) || !an_finite(q, 4)) return an_refuse(w, AN_R_VALUE);
+    memcpy(n, q, sizeof n);
+    if (!an_qnorm(n)) return an_refuse(w, AN_R_VALUE);
+    if (w->nsockets[rig] >= AN_SOCKETS) return an_refuse(w, AN_R_FULL);
+    AnSocket *k = &w->sockets[rig * AN_SOCKETS + w->nsockets[rig]];
+    k->part = part;
+    memcpy(k->pos, pos, sizeof k->pos);
+    memcpy(k->q, n, sizeof k->q);
+    return w->nsockets[rig]++;
+}
+
+/* rig's part's grid for hits: sx x sy x sz voxels of voxel metres, palette
+ * indices at x + sx (y + sy z), 0 empty. The grid must fill the part's box
+ * (its low corner is the box's minimum, so it lands on the drawn voxels).
+ * Set once a part. Its shape number, or -1. */
+static inline int an_shape(AnWorld *w, int rig, int part, int sx, int sy, int sz, float voxel, const uint8_t *palette_idx) {
+    if (rig < 0 || rig >= w->nrigs) return an_refuse(w, AN_R_RIG);
+    const AnRig *r = &w->rigs[rig];
+    if (part < 0 || part >= r->nparts) return an_refuse(w, AN_R_PART);
+    int sz3[3] = {sx, sy, sz};
+    if (!isfinite(voxel) || !(voxel > 0)) return an_refuse(w, AN_R_VALUE);
+    for (int k = 0; k < 3; k++) {
+        if (sz3[k] < 0 || sz3[k] > AN_SIDE) return an_refuse(w, AN_R_VALUE);
+        float want = sz3[k] * voxel, have = r->box[part][3 + k] - r->box[part][k];
+        if (fabsf(have - want) > 1e-4f * (1 + want)) return an_refuse(w, AN_R_VALUE);
+    }
+    if (w->shape_of[rig * AN_PARTS + part] >= 0) return an_refuse(w, AN_R_VALUE);
+    int n = sx * sy * sz;
+    if (n > 0 && !palette_idx) return an_refuse(w, AN_R_VALUE);
+    int nbx = (sx + 7) / 8, nby = (sy + 7) / 8, nbz = (sz + 7) / 8, nb = nbx * nby * nbz, used = 0;
+    for (int bz = 0; bz < nbz; bz++)
+        for (int by = 0; by < nby; by++)
+            for (int bx = 0; bx < nbx; bx++) {
+                int any = 0;
+                for (int z = bz * 8; z < bz * 8 + 8 && z < sz && !any; z++)
+                    for (int y = by * 8; y < by * 8 + 8 && y < sy && !any; y++)
+                        for (int x = bx * 8; x < bx * 8 + 8 && x < sx; x++)
+                            if (palette_idx[x + sx * (y + sy * z)]) { any = 1; break; }
+                used += any;
+            }
+    if (w->nshapes >= AN_SHAPES || w->nbrick_index + nb > AN_BRICK_INDEX || w->nbricks + used > AN_BRICKS) return an_refuse(w, AN_R_FULL);
+    AnShape *sh = &w->shapes[w->nshapes];
+    sh->sx = (int16_t)sx; sh->sy = (int16_t)sy; sh->sz = (int16_t)sz;
+    sh->nbx = (int16_t)nbx; sh->nby = (int16_t)nby; sh->nbz = (int16_t)nbz;
+    sh->index = w->nbrick_index; sh->voxel = voxel;
+    for (int bz = 0, i = 0; bz < nbz; bz++)
+        for (int by = 0; by < nby; by++)
+            for (int bx = 0; bx < nbx; bx++, i++) {
+                int b = -1;
+                for (int z = bz * 8; z < bz * 8 + 8 && z < sz; z++)
+                    for (int y = by * 8; y < by * 8 + 8 && y < sy; y++)
+                        for (int x = bx * 8; x < bx * 8 + 8 && x < sx; x++) {
+                            uint8_t c = palette_idx[x + sx * (y + sy * z)];
+                            if (!c) continue;
+                            if (b < 0) { b = w->nbricks++; memset(w->bricks + (size_t)b * 512, 0, 512); }
+                            w->bricks[(size_t)b * 512 + (x & 7) + 8 * ((y & 7) + 8 * (z & 7))] = c;
+                        }
+                w->brick_index[sh->index + i] = b;
+            }
+    w->nbrick_index += nb;
+    w->shape_of[rig * AN_PARTS + part] = w->nshapes;
+    return w->nshapes++;
+}
+static inline int an_voxel(const AnWorld *w, const AnShape *sh, int x, int y, int z) {
+    int b = w->brick_index[sh->index + (x >> 3) + sh->nbx * ((y >> 3) + sh->nby * (z >> 3))];
+    return b < 0 ? 0 : w->bricks[(size_t)b * 512 + (x & 7) + 8 * ((y & 7) + 8 * (z & 7))];
+}
+
+/* hang child from parent's socket at pos, q in the socket's frame; posed after
+ * the parent from the next update (or query). 1, or 0 refused: no such figure
+ * or socket, a value not finite, a cycle, or the deepest figure hanging from
+ * child landing more than AN_DEPTH links down. A child already hanging is moved. */
+static inline int an_attach(AnWorld *w, int child, int parent, int socket, const float pos[3], const float q[4]) {
+    AnFig *c = an_fig(w, child), *p = an_fig(w, parent);
+    if (!c || !p) { an_refuse(w, AN_R_FIGURE); return 0; }
+    if (socket < 0 || socket >= w->nsockets[p->rig]) { an_refuse(w, AN_R_SOCKET); return 0; }
+    float n[4];
+    if (!pos || !q || !an_finite(pos, 3) || !an_finite(q, 4)) { an_refuse(w, AN_R_VALUE); return 0; }
+    memcpy(n, q, sizeof n);
+    if (!an_qnorm(n)) { an_refuse(w, AN_R_VALUE); return 0; }
+    int cs = (int)(c - w->figs), ps = (int)(p - w->figs), dp = 0;
+    for (int g = ps; g >= 0; g = w->figs[g].att, dp++)
+        if (g == cs) { an_refuse(w, AN_R_ATTACH); return 0; }   /* the parent is the child or hangs from it */
+    dp--;                                      /* links above the parent */
+    int below = 0;                             /* links from child down to the deepest figure hanging from it */
+    for (int s = 0; s < w->capacity && w->nattached; s++) {
+        if (w->figs[s].id < 0) continue;
+        int k = 0;
+        for (int g = s; g >= 0 && k <= AN_DEPTH + 1; g = w->figs[g].att, k++)
+            if (g == cs) { if (k > below) below = k; break; }
+    }
+    if (dp + 1 + below > AN_DEPTH) { an_refuse(w, AN_R_ATTACH); return 0; }
+    c->att = ps; c->att_socket = (int16_t)socket;
+    memcpy(c->att_pos, pos, sizeof c->att_pos);
+    memcpy(c->att_q, n, sizeof c->att_q);
+    c->dirty = 1;
+    an_recount(w);
+    return 1;
+}
+/* child no longer hangs; it stays where it was last placed */
+static inline void an_detach(AnWorld *w, int child) {
+    AnFig *c = an_fig(w, child);
+    if (!c) { an_refuse(w, AN_R_FIGURE); return; }
+    if (c->att < 0) return;
+    an_unhang(c);
+    an_recount(w);
+}
+
+/* ---- queries: the pose before springs, stale figures posed first ---- */
+
+/* pose g at its place (dt 0: springs held, nothing carried changes) and mark what hangs from it stale */
+static inline void an_pose_now(AnWorld *w, AnFig *g) {
+    if (g->att >= 0) an_attach_place(w, g);
+    an_pose(w, g, 0);
+    if (w->nattached) {
+        int gs = (int)(g - w->figs);
+        for (int s = 0; s < w->capacity; s++) if (w->figs[s].id >= 0 && w->figs[s].att == gs) w->figs[s].dirty = 1;
+    }
+}
+/* f and the figures it hangs from: from the highest stale one down, posed */
+static inline void an_freshen_one(AnWorld *w, AnFig *f) {
+    AnFig *chain[AN_DEPTH + 2];
+    int n = 0, top = -1;
+    for (AnFig *g = f; n < AN_DEPTH + 2; g = &w->figs[g->att]) { chain[n++] = g; if (g->att < 0) break; }
+    for (int i = n - 1; i >= 0 && top < 0; i--) if (chain[i]->dirty) top = i;
+    for (int i = top; i >= 0; i--) an_pose_now(w, chain[i]);
+}
+/* every stale figure, and every figure hanging from one, posed; the grid rebuilt if anything moved */
+static inline void an_freshen_all(AnWorld *w) {
+    for (int d = 1; d <= w->max_depth; d++)
+        for (int s = 0; s < w->capacity; s++) {
+            AnFig *f = &w->figs[s];
+            if (f->id >= 0 && f->depth == d && w->figs[f->att].dirty) f->dirty = 1;
+        }
+    for (int d = 0; d <= w->max_depth; d++)
+        for (int s = 0; s < w->capacity; s++) {
+            AnFig *f = &w->figs[s];
+            if (f->id < 0 || f->depth != d || !f->dirty) continue;
+            if (f->att >= 0) an_attach_place(w, f);
+            an_pose(w, f, 0);
+        }
+    if (w->grid_dirty) an_grid_build(w);
+}
+
+/* socket of figure fig in world space, from the pose before springs, posing
+ * it first if it is stale. 1, or 0 if there is no such figure or socket. */
+static inline int an_socket(AnWorld *w, int fig, int socket, float out_pos[3], float out_q[4]) {
+    AnFig *f = an_fig(w, fig);
+    if (!f) return 0;
+    if (socket < 0 || socket >= w->nsockets[f->rig]) { an_refuse(w, AN_R_SOCKET); return 0; }
+    an_freshen_one(w, f);
+    float q[4], p[3];
+    an_socket_frame(w, f, &w->sockets[f->rig * AN_SOCKETS + socket], q, p);
+    if (out_pos) memcpy(out_pos, p, sizeof p);
+    if (out_q) memcpy(out_q, q, sizeof q);
+    return 1;
+}
+
+static inline int an_has_springs(const AnWorld *w, const AnFig *f) {
+    for (int i = f->proc; i >= 0; i = w->procs[i].next) if (w->procs[i].kind == AN_K_SPRING) return 1;
+    return 0;
+}
+/* f's pose before springs, 12 floats a part: its matrices when it has no
+ * springs (they are that pose), else rebuilt into the world's scratch */
+static inline const float *an_query_mats(AnWorld *w, const AnFig *f) {
+    if (!an_has_springs(w, f)) return an_fig_mats(w, f);
+    AnBody b;
+    an_build(w, f, &b, 1);
+    for (int p = 0; p < w->rigs[f->rig].nparts; p++) an_write_mat(b.wq[p], b.wp[p], w->scratch + p * 12);
+    return w->scratch;
+}
+/* is slot s the ignored slot or hanging from it? */
+static inline int an_ignored(const AnWorld *w, int s, int ign) {
+    if (ign < 0) return 0;
+    for (int k = 0; s >= 0 && k <= AN_DEPTH + 1; s = w->figs[s].att, k++) if (s == ign) return 1;
+    return 0;
+}
+static inline void an_stamp_next(AnWorld *w) {
+    if (++w->stamp_now == 0) { memset(w->stamp, 0, (size_t)w->capacity * sizeof *w->stamp); w->stamp_now = 1; }
+}
+/* the ray o + t d against the box lo..hi: entry tn (on axis), exit tf; 0 if the line misses it */
+static inline int an_slab(const float o[3], const float d[3], const float lo[3], const float hi[3], float *tn, float *tf, int *axis) {
+    float a = -INFINITY, b = INFINITY;
+    int ax = -1;
+    for (int k = 0; k < 3; k++) {
+        if (d[k] == 0) { if (o[k] < lo[k] || o[k] > hi[k]) return 0; continue; }
+        float t1 = (lo[k] - o[k]) / d[k], t2 = (hi[k] - o[k]) / d[k];
+        if (t1 > t2) { float t = t1; t1 = t2; t2 = t; }
+        if (t1 > a) { a = t1; ax = k; }
+        if (t2 < b) b = t2;
+    }
+    *tn = a; *tf = b; *axis = ax;
+    return b >= a;
+}
+
+typedef struct { float o[3], u[3], best; int found, ign; AnHit hit; } AnRay;
+
+/* one part's grid: the box in the part's frame, then a 3D DDA voxel by voxel */
+static inline void an_ray_part(const AnWorld *w, AnRay *R, int fig, int part, const AnShape *sh, const float *box, const float *m) {
+    float rel[3] = {R->o[0] - m[9], R->o[1] - m[10], R->o[2] - m[11]}, g0[3], dg[3];
+    int size[3] = {sh->sx, sh->sy, sh->sz};
+    if (size[0] == 0 || size[1] == 0 || size[2] == 0) return;
+    for (int k = 0; k < 3; k++) {
+        g0[k] = (an_dot(m + 3 * k, rel) - box[k]) / sh->voxel;   /* in voxels from the grid's low corner */
+        dg[k] = an_dot(m + 3 * k, R->u) / sh->voxel;              /* voxels a metre */
+    }
+    float zero[3] = {0, 0, 0}, hi[3] = {(float)size[0], (float)size[1], (float)size[2]}, tn, tf;
+    int ax;
+    if (!an_slab(g0, dg, zero, hi, &tn, &tf, &ax)) return;
+    float t = tn > 0 ? tn : 0;
+    if (tf < t || t > R->best) return;
+    int i[3], step[3];
+    float tmax[3], tdel[3];
+    for (int k = 0; k < 3; k++) {
+        int v = (int)floorf(g0[k] + dg[k] * t);
+        i[k] = v < 0 ? 0 : (v >= size[k] ? size[k] - 1 : v);
+        if (dg[k] > 0) { step[k] = 1; tmax[k] = (i[k] + 1 - g0[k]) / dg[k]; tdel[k] = 1 / dg[k]; }
+        else if (dg[k] < 0) { step[k] = -1; tmax[k] = (i[k] - g0[k]) / dg[k]; tdel[k] = -1 / dg[k]; }
+        else { step[k] = 0; tmax[k] = INFINITY; tdel[k] = INFINITY; }
+    }
+    for (int n = size[0] + size[1] + size[2] + 3; n > 0; n--) {
+        int c = an_voxel(w, sh, i[0], i[1], i[2]);
+        float vlo[3] = {(float)i[0], (float)i[1], (float)i[2]}, vhi[3] = {vlo[0] + 1, vlo[1] + 1, vlo[2] + 1}, vn, vf;
+        int va;
+        if (c && an_slab(g0, dg, vlo, vhi, &vn, &vf, &va) && vf >= 0) {
+            /* the first filled voxel along the ray: its exact entry */
+            float d = vn > 0 ? vn : 0;
+            if (d <= R->best) {
+                int a = va;
+                if (!(vn > 0) || a < 0) {                       /* starting inside it: the face against the ray's main axis */
+                    a = 0;
+                    for (int k = 1; k < 3; k++) if (fabsf(dg[k]) > fabsf(dg[a])) a = k;
+                }
+                float sg = dg[a] > 0 ? -1.0f : 1.0f;
+                R->best = d; R->found = 1;
+                R->hit.fig = fig; R->hit.part = part; R->hit.x = i[0]; R->hit.y = i[1]; R->hit.z = i[2];
+                R->hit.colour = c; R->hit.dist = d;
+                R->hit.nx = m[3 * a] * sg; R->hit.ny = m[3 * a + 1] * sg; R->hit.nz = m[3 * a + 2] * sg;
+            }
+            return;
+        }
+        int a = tmax[0] < tmax[1] ? (tmax[0] < tmax[2] ? 0 : 2) : (tmax[1] < tmax[2] ? 1 : 2);
+        if (tmax[a] > tf || tmax[a] > R->best) return;
+        i[a] += step[a];
+        if (i[a] < 0 || i[a] >= size[a]) return;
+        tmax[a] += tdel[a];
+    }
+}
+/* one figure: its bounds, then each part that has a grid */
+static inline void an_ray_fig(AnWorld *w, AnRay *R, int s) {
+    const AnFig *f = &w->figs[s];
+    if (f->id < 0 || an_ignored(w, s, R->ign) || !(f->bmin[0] <= f->bmax[0])) return;
+    float tn, tf;
+    int ax;
+    if (!an_slab(R->o, R->u, f->bmin, f->bmax, &tn, &tf, &ax) || tf < 0 || tn > R->best) return;
+    const AnRig *r = &w->rigs[f->rig];
+    const float *M = an_query_mats(w, f);
+    for (int p = 0; p < r->nparts; p++) {
+        int si = w->shape_of[f->rig * AN_PARTS + p];
+        if (si >= 0) an_ray_part(w, R, f->id, p, &w->shapes[si], r->box[p], M + p * 12);
+    }
+}
+static inline void an_ray_visit(AnWorld *w, AnRay *R, int s) {
+    if (w->stamp[s] == w->stamp_now) return;
+    w->stamp[s] = w->stamp_now;
+    an_ray_fig(w, R, s);
+}
+
+/* the nearest voxel of any figure's parts along o + t d (d normalised; t in
+ * metres) for t in [0, max], skipping figure ignore (-1 none) and every figure
+ * hanging from it. 1 and *out, or 0 for a miss (or a refused call). */
+static inline int an_hit_ray(AnWorld *w, const float o[3], const float d[3], float max, int ignore, AnHit *out) {
+    if (!o || !d || !out || !an_finite(o, 3) || !an_finite(d, 3) || isnan(max) || max < 0) { an_refuse(w, AN_R_VALUE); return 0; }
+    float dl = an_len(d);
+    if (!(dl > 0) || !isfinite(dl)) { an_refuse(w, AN_R_VALUE); return 0; }
+    AnRay R;
+    memset(&R, 0, sizeof R);
+    for (int k = 0; k < 3; k++) { R.o[k] = o[k]; R.u[k] = d[k] / dl; }
+    R.best = max; R.ign = ignore >= 0 ? an_slot(w, ignore) : -1;
+    an_freshen_all(w);
+    an_stamp_next(w);
+    for (int i = 0; i < w->nbig; i++) an_ray_visit(w, &R, w->big[i]);
+    float tn, tf;
+    int ax;
+    if (w->ngrid > 0 && an_slab(R.o, R.u, w->ubmin, w->ubmax, &tn, &tf, &ax) && tf >= 0) {
+        float t0 = tn > 0 ? tn : 0, t1 = tf < R.best ? tf : R.best;
+        if (t0 <= t1) {
+            float cells = (fabsf(R.u[0]) + fabsf(R.u[1]) + fabsf(R.u[2])) * (t1 - t0) / AN_CELL + 3;
+            if (!(cells <= 4.0f * w->live + 64)) {          /* a long walk: every figure costs less */
+                for (int s = 0; s < w->capacity; s++) if (w->figs[s].id >= 0) an_ray_visit(w, &R, s);
+            } else {
+                /* the cells along the ray, nearest first, until past the best hit */
+                int c[3], step[3];
+                float tmax[3], tdel[3];
+                for (int k = 0; k < 3; k++) {
+                    float p = R.o[k] + R.u[k] * t0;
+                    c[k] = an_cell_of(p);
+                    if (R.u[k] > 0) { step[k] = 1; tmax[k] = ((c[k] + 1) * AN_CELL - R.o[k]) / R.u[k]; tdel[k] = AN_CELL / R.u[k]; }
+                    else if (R.u[k] < 0) { step[k] = -1; tmax[k] = (c[k] * AN_CELL - R.o[k]) / R.u[k]; tdel[k] = -AN_CELL / R.u[k]; }
+                    else { step[k] = 0; tmax[k] = INFINITY; tdel[k] = INFINITY; }
+                }
+                for (int n = (int)cells + 3; n > 0; n--) {
+                    for (int e = w->grid_head[an_cell_hash(c[0], c[1], c[2]) & w->grid_mask]; e >= 0; e = w->grid_next[e])
+                        an_ray_visit(w, &R, w->grid_slot[e]);
+                    int a = tmax[0] < tmax[1] ? (tmax[0] < tmax[2] ? 0 : 2) : (tmax[1] < tmax[2] ? 1 : 2);
+                    if (tmax[a] > t1 || tmax[a] > R.best) break;
+                    c[a] += step[a];
+                    tmax[a] += tdel[a];
+                }
+            }
+        }
+    }
+    if (R.found) *out = R.hit;
+    return R.found;
+}
+
+/* do two boxes overlap? centres, axes (three columns, unit) and half sizes; separating axes */
+static inline int an_obb_overlap(const float ca[3], const float *A, const float a[3], const float cb[3], const float *B, const float b[3]) {
+    float R[3][3], AR[3][3], t[3], d[3] = {cb[0] - ca[0], cb[1] - ca[1], cb[2] - ca[2]};
+    for (int i = 0; i < 3; i++) {
+        for (int j = 0; j < 3; j++) { R[i][j] = an_dot(A + 3 * i, B + 3 * j); AR[i][j] = fabsf(R[i][j]) + 1e-6f; }
+        t[i] = an_dot(d, A + 3 * i);
+    }
+    for (int i = 0; i < 3; i++)
+        if (fabsf(t[i]) > a[i] + b[0] * AR[i][0] + b[1] * AR[i][1] + b[2] * AR[i][2]) return 0;
+    for (int j = 0; j < 3; j++)
+        if (fabsf(t[0] * R[0][j] + t[1] * R[1][j] + t[2] * R[2][j]) > a[0] * AR[0][j] + a[1] * AR[1][j] + a[2] * AR[2][j] + b[j]) return 0;
+    for (int i = 0; i < 3; i++) {
+        int i1 = (i + 1) % 3, i2 = (i + 2) % 3;
+        for (int j = 0; j < 3; j++) {
+            int j1 = (j + 1) % 3, j2 = (j + 2) % 3;
+            float ra = a[i1] * AR[i2][j] + a[i2] * AR[i1][j], rb = b[j1] * AR[i][j2] + b[j2] * AR[i][j1];
+            if (fabsf(t[i2] * R[i1][j] - t[i1] * R[i2][j]) > ra + rb) return 0;
+        }
+    }
+    return 1;
+}
+
+/* every (figure id, part) whose part box (parts with volume) overlaps the box
+ * at c of half sizes half turned by q, skipping figure ignore and what hangs
+ * from it; in slot order, then part order. Writes at most max pairs into
+ * figs_parts and answers how many there are (0 if refused). */
+static inline int an_hit_box(AnWorld *w, const float c[3], const float half[3], const float q[4], int ignore, int max, int32_t *figs_parts) {
+    if (!c || !half || !q || !an_finite(c, 3) || !an_finite(half, 3) || !an_finite(q, 4) || half[0] < 0 || half[1] < 0 || half[2] < 0 ||
+        max < 0 || (max > 0 && !figs_parts)) { an_refuse(w, AN_R_VALUE); return 0; }
+    float qn[4] = {q[0], q[1], q[2], q[3]}, Q[9], lo[3], hi[3];
+    if (!an_qnorm(qn)) { an_refuse(w, AN_R_VALUE); return 0; }
+    an_qmat(qn, Q);
+    for (int i = 0; i < 3; i++) {
+        float e = fabsf(Q[i]) * half[0] + fabsf(Q[3 + i]) * half[1] + fabsf(Q[6 + i]) * half[2];
+        lo[i] = c[i] - e; hi[i] = c[i] + e;
+    }
+    int ign = ignore >= 0 ? an_slot(w, ignore) : -1;
+    an_freshen_all(w);
+    an_stamp_next(w);
+    for (int i = 0; i < w->nbig; i++) w->stamp[w->big[i]] = w->stamp_now;
+    int c0[3], c1[3];
+    double cells = 1;
+    for (int k = 0; k < 3; k++) { c0[k] = an_cell_of(lo[k]); c1[k] = an_cell_of(hi[k]); cells *= (double)c1[k] - c0[k] + 1; }
+    if (cells > 64 && cells > w->live) {
+        for (int s = 0; s < w->capacity; s++) if (w->figs[s].id >= 0) w->stamp[s] = w->stamp_now;
+    } else {
+        for (int z = c0[2]; z <= c1[2]; z++)
+            for (int y = c0[1]; y <= c1[1]; y++)
+                for (int x = c0[0]; x <= c1[0]; x++)
+                    for (int e = w->grid_head[an_cell_hash(x, y, z) & w->grid_mask]; e >= 0; e = w->grid_next[e])
+                        w->stamp[w->grid_slot[e]] = w->stamp_now;
+    }
+    int n = 0;
+    for (int s = 0; s < w->capacity; s++) {
+        const AnFig *f = &w->figs[s];
+        if (w->stamp[s] != w->stamp_now || f->id < 0 || an_ignored(w, s, ign)) continue;
+        if (!(f->bmin[0] <= f->bmax[0]) || f->bmin[0] > hi[0] || f->bmin[1] > hi[1] || f->bmin[2] > hi[2] ||
+            f->bmax[0] < lo[0] || f->bmax[1] < lo[1] || f->bmax[2] < lo[2]) continue;
+        const AnRig *r = &w->rigs[f->rig];
+        const float *M = an_query_mats(w, f);
+        for (int p = 0; p < r->nparts; p++) {
+            if (!an_has_box(r, p)) continue;
+            const float *m = M + p * 12, *bx = r->box[p];
+            float lc[3], h[3], wc[3];
+            for (int k = 0; k < 3; k++) { lc[k] = (bx[k] + bx[3 + k]) * 0.5f; h[k] = (bx[3 + k] - bx[k]) * 0.5f; }
+            for (int k = 0; k < 3; k++) wc[k] = m[9 + k] + m[k] * lc[0] + m[3 + k] * lc[1] + m[6 + k] * lc[2];
+            if (!an_obb_overlap(c, Q, half, wc, m, h)) continue;
+            if (n < max) { figs_parts[n * 2] = f->id; figs_parts[n * 2 + 1] = p; }
+            n++;
+        }
+    }
+    return n;
 }
 
 /* 0 figures, 1 posed, 2 stale, 3 refused calls, 4 negative dt, 5 last refusal reason, 6 marks dropped,
