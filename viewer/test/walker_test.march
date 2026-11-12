@@ -5,6 +5,7 @@ mod StrataViewer.Test.Walker do
   needs IO.Console
   needs IO.Process
   needs IO.Spawn
+  needs IO.FileSystem -- the island's atlas cache and the ruins' .vox files
   import Test
   alias StrataViewer.Walker as Wk
   alias Strata.World as Wd
@@ -44,6 +45,174 @@ mod StrataViewer.Test.Walker do
       peak(w, b2, n - 1, if Wk.eye_y(b2) > best do Wk.eye_y(b2) else best end, jump_at)
     end
   end
+
+
+  -- ── Trees and ruins on the island ──────────────────────────────────────
+  pfn island() : Strata.Atlas.Atlas do Strata.Atlas.load_or_build(".march/atlas", StrataViewer.island_def(), 7) end
+
+  -- a world box (x0, y0, z0, x1, y1, z1)
+  pfn tree_box(t : (Strata.Template.Template, Strata.Feature.Placed, Int, Int, Int)) : (Int, Int, Int, Int, Int, Int) do
+    match t do
+      (tp, p, wx, y, wz) ->
+        match StrataViewer.tree_origin(tp, wx, y, wz) do
+          (ox, oy, oz) -> Strata.Template.bounds(tp, ox, oy, oz, Strata.Feature.p_rot(p))
+        end
+    end
+  end
+  pfn overlap(a : (Int, Int, Int, Int, Int, Int), b : (Int, Int, Int, Int, Int, Int)) : Bool do
+    match (a, b) do
+      ((ax0, ay0, az0, ax1, ay1, az1), (bx0, by0, bz0, bx1, by1, bz1)) ->
+        if ax1 < bx0 do false else if bx1 < ax0 do false
+        else if ay1 < by0 do false else if by1 < ay0 do false
+        else if az1 < bz0 do false else bz1 >= az0 end end end end end
+    end
+  end
+  -- how many trees of ts other than the one at (wx, wz) overlap box b
+  pfn others(ts : List((Strata.Template.Template, Strata.Feature.Placed, Int, Int, Int)), b : (Int, Int, Int, Int, Int, Int), wx : Int, wz : Int, n : Int) : Int do
+    match ts do
+      Nil -> n
+      Cons((tp, p, x, y, z), rest) ->
+        if x == wx && z == wz do others(rest, b, wx, wz, n)
+        else others(rest, b, wx, wz, if overlap(tree_box((tp, p, x, y, z)), b) do n + 1 else n end) end
+    end
+  end
+  -- the template blitted alone into the empty chunk at key (kx, ky, kz): what the world should hold there, made once per key
+  pfn want_at(tp : Strata.Template.Template, ox : Int, oy : Int, oz : Int, rot : Int, stream : Int, cache : List((Int, Int, Int, Strata.Chunk.Chunk)), kx : Int, ky : Int, kz : Int) : (Strata.Chunk.Chunk, List((Int, Int, Int, Strata.Chunk.Chunk))) do
+    match List.find(cache, fn e -> match e do (x, y, z, _) -> if x != kx do false else if y != ky do false else z == kz end end end) do
+      Some((_, _, _, c)) -> (c, cache)
+      None ->
+        let c = Strata.Template.blit(C.uniform(0), Cd.key(kx, ky, kz), tp, ox, oy, oz, rot, stream)
+        (c, Cons((kx, ky, kz, c), cache))
+    end
+  end
+  pfn tree_want(t : (Strata.Template.Template, Strata.Feature.Placed, Int, Int, Int), cache : List((Int, Int, Int, Strata.Chunk.Chunk)), x : Int, y : Int, z : Int) : (Int, List((Int, Int, Int, Strata.Chunk.Chunk))) do
+    match t do
+      (tp, p, wx, ty, wz) ->
+        match StrataViewer.tree_origin(tp, wx, ty, wz) do
+          (ox, oy, oz) ->
+            let kx = Cd.chunk_of(x)
+            let ky = Cd.chunk_of(y)
+            let kz = Cd.chunk_of(z)
+            match want_at(tp, ox, oy, oz, Strata.Feature.p_rot(p), Strata.Feature.p_stream(p), cache, kx, ky, kz) do
+              (c, c2) -> (C.get_or(c, x - 32 * kx, y - 32 * ky, z - 32 * kz, -1), c2)
+            end
+        end
+    end
+  end
+  -- how many of a tree's voxels fall in another chunk column than its base's
+  pfn across_go(t : (Strata.Template.Template, Strata.Feature.Placed, Int, Int, Int), b : (Int, Int, Int, Int, Int, Int), x : Int, y : Int, z : Int, cache : List((Int, Int, Int, Strata.Chunk.Chunk)), n : Int) : Int do
+    match (b, t) do
+      ((x0, _, z0, x1, y1, z1), (_, _, wx, _, wz)) ->
+        if y > y1 do n
+        else if z > z1 do across_go(t, b, x0, y + 1, z0, cache, n)
+        else if x > x1 do across_go(t, b, x0, y, z + 1, cache, n)
+        else
+          match tree_want(t, cache, x, y, z) do
+            (w, c2) ->
+              let other = if Cd.chunk_of(x) != Cd.chunk_of(wx) do true else Cd.chunk_of(z) != Cd.chunk_of(wz) end
+              across_go(t, b, x + 1, y, z, c2, if w > 0 && other do n + 1 else n end)
+          end
+        end end end
+    end
+  end
+  pfn across(t : (Strata.Template.Template, Strata.Feature.Placed, Int, Int, Int)) : Int do
+    match tree_box(t) do (x0, y0, z0, x1, y1, z1) -> across_go(t, (x0, y0, z0, x1, y1, z1), x0, y0, z0, Nil, 0) end
+  end
+
+  -- the first tree turned rot of chunk columns (cx, cz), walking cx then cz over -4..3, with voxels in
+  -- another chunk column than its base's, overlapping no other tree that can reach it
+  pfn find_tree(a : Strata.Atlas.Atlas, d : StrataViewer.Decor, rot : Int, i : Int) : Option((Strata.Template.Template, Strata.Feature.Placed, Int, Int, Int)) do
+    if i >= 64 do None
+    else
+      let cx = i % 8 - 4
+      let cz = i / 8 - 4
+      let ts = StrataViewer.island_chunk_trees(a, d, 1.0, cx, cz, 7)
+      -- the trees whose base is in this chunk column, turned rot
+      let own = List.filter(ts, fn t -> match t do (_, p, wx, _, wz) -> if Strata.Feature.p_rot(p) != rot do false else if Cd.chunk_of(wx) != cx do false else Cd.chunk_of(wz) == cz end end end)
+      let crossing = List.filter(own, fn t -> across(t) >= 3)
+      -- every tree reaching the 3 x 3 chunk columns round it: all that can reach its box
+      let near = if is_nil(crossing) do Nil else List.flat_map(List.range(0, 9), fn j -> StrataViewer.island_chunk_trees(a, d, 1.0, cx + j % 3 - 1, cz + j / 3 - 1, 7)) end
+      match List.find(crossing, fn t -> match t do (_, _, wx, _, wz) -> others(near, tree_box(t), wx, wz, 0) == 0 end) do
+        Some(t) -> Some(t)
+        None -> find_tree(a, d, rot, i + 1)
+      end
+    end
+  end
+
+  -- the block at a world voxel, from the generated chunk holding it (generated once per key in cache)
+  type Cache = Cache(List((Int, Int, Int, Strata.Chunk.Chunk)))
+  pfn chunk_at(a : Strata.Atlas.Atlas, d : StrataViewer.Decor, cache : List((Int, Int, Int, Strata.Chunk.Chunk)), kx : Int, ky : Int, kz : Int) : (Strata.Chunk.Chunk, List((Int, Int, Int, Strata.Chunk.Chunk))) do
+    match List.find(cache, fn e -> match e do (x, y, z, _) -> if x != kx do false else if y != ky do false else z == kz end end end) do
+      Some((_, _, _, c)) -> (c, cache)
+      None ->
+        let c = StrataViewer.island_decorated(a, d, 1.0, kx, ky, kz, 7)
+        (c, Cons((kx, ky, kz, c), cache))
+    end
+  end
+
+  -- (missing, stray, held): over the tree's box, voxels the template puts (as blitted alone into
+  -- empty chunks) that the generated world lacks; tree voxels (7, 8) where it puts none; voxels held
+  pfn compare_go(a : Strata.Atlas.Atlas, d : StrataViewer.Decor, t : (Strata.Template.Template, Strata.Feature.Placed, Int, Int, Int), b : (Int, Int, Int, Int, Int, Int), x : Int, y : Int, z : Int, wants : List((Int, Int, Int, Strata.Chunk.Chunk)), cache : List((Int, Int, Int, Strata.Chunk.Chunk)), acc : (Int, Int, Int)) : (Int, Int, Int) do
+    match b do
+      (x0, _, z0, x1, y1, z1) ->
+        if y > y1 do acc
+        else if z > z1 do compare_go(a, d, t, b, x0, y + 1, z0, wants, cache, acc)
+        else if x > x1 do compare_go(a, d, t, b, x0, y, z + 1, wants, cache, acc)
+        else
+          match (tree_want(t, wants, x, y, z), block(a, d, cache, x, y, z)) do
+            ((want, w2), (got, c2)) ->
+              match acc do
+                (miss, stray, held) ->
+                  let acc2 = if want != 0 do (if got == want do (miss, stray, held + 1) else (miss + 1, stray, held) end)
+                    else if got == 7 || got == 8 do (miss, stray + 1, held) else acc end end
+                  compare_go(a, d, t, b, x + 1, y, z, w2, c2, acc2)
+              end
+          end
+        end end end
+    end
+  end
+
+  -- per footprint column: (columns, without solid ground under the floor row, with ground or a missing ruin voxel above it)
+  pfn ground_go(a : Strata.Atlas.Atlas, d : StrataViewer.Decor, tp : Strata.Template.Template, ox : Int, oy : Int, oz : Int, rot : Int, x0 : Int, x1 : Int, z0 : Int, z1 : Int, x : Int, z : Int, cache : List((Int, Int, Int, Strata.Chunk.Chunk)), acc : (Int, Int, Int)) : (Int, Int, Int) do
+    if z > z1 do acc
+    else if x > x1 do ground_go(a, d, tp, ox, oy, oz, rot, x0, x1, z0, z1, x0, z + 1, cache, acc)
+    else
+      match block(a, d, cache, x, oy - 1, z) do
+        (under, c1) ->
+          let ground = if under == 1 || under == 2 || under == 3 do true else under == 4 || under == 6 end
+          match column_go(a, d, tp, ox, oy, oz, rot, x, oy, z, oy + Strata.Template.t_sy(tp) - 1, c1, true) do
+            (ok, c2) ->
+              match acc do
+                (n, bu, bo) -> ground_go(a, d, tp, ox, oy, oz, rot, x0, x1, z0, z1, x + 1, z, c2, (n + 1, if ground do bu else bu + 1 end, if ok do bo else bo + 1 end))
+              end
+          end
+      end
+    end end
+  end
+  pfn block(a : Strata.Atlas.Atlas, d : StrataViewer.Decor, cache : List((Int, Int, Int, Strata.Chunk.Chunk)), x : Int, y : Int, z : Int) : (Int, List((Int, Int, Int, Strata.Chunk.Chunk))) do
+    let kx = Cd.chunk_of(x)
+    let ky = Cd.chunk_of(y)
+    let kz = Cd.chunk_of(z)
+    match chunk_at(a, d, cache, kx, ky, kz) do (c, c2) -> (C.get_or(c, x - 32 * kx, y - 32 * ky, z - 32 * kz, -1), c2) end
+  end
+  -- up a footprint column from the floor row: the ruin's voxel where it has one, else air or a plant
+  pfn column_go(a : Strata.Atlas.Atlas, d : StrataViewer.Decor, tp : Strata.Template.Template, ox : Int, oy : Int, oz : Int, rot : Int, x : Int, y : Int, z : Int, y1 : Int, cache : List((Int, Int, Int, Strata.Chunk.Chunk)), ok : Bool) : (Bool, List((Int, Int, Int, Strata.Chunk.Chunk))) do
+    if y > y1 do (ok, cache)
+    else
+      let kx = Cd.chunk_of(x)
+      let ky = Cd.chunk_of(y)
+      let kz = Cd.chunk_of(z)
+      let want = C.get_or(Strata.Template.blit(C.uniform(0), Cd.key(kx, ky, kz), tp, ox, oy, oz, rot, 0), x - 32 * kx, y - 32 * ky, z - 32 * kz, -1)
+      match block(a, d, cache, x, y, z) do
+        (got, c2) ->
+          let fine = if want != 0 do got == want else if got == 0 do true else got == 11 || got == 12 end end
+          column_go(a, d, tp, ox, oy, oz, rot, x, y + 1, z, y1, c2, if fine do ok else false end)
+      end
+    end
+  end
+
+  -- the site whose ground falls furthest within 30 m: a ruin on a slope
+  pfn slope_site(a : Strata.Atlas.Atlas) : Option(Strata.Atlas.Site) do StrataViewer.slope_site(a) end
 
   describe "Walker" do
     test "a dropped body comes to rest standing on the ground" do
@@ -101,6 +270,68 @@ mod StrataViewer.Test.Walker do
       let b = Wk.step(w, Wk.step(w, Wk.step(w, Wk.body(0.5, 4.6, 0.5), 0.0, 0.0, false, 1.0), 0.0, 0.0, false, 1.0), 0.0, 0.0, false, 1.0)
       let rest = run(w, b, 0.0, 0.0, 300)
       Test.assert_true(Wk.eye_y(rest) > 1.59, "still above the ground")
+    end
+  end
+
+  describe "Trees and ruins" do
+    test "the tree library: 12 templates of wood and leaves, each under the early-outs' room, the trunk at the middle" do
+      let d = StrataViewer.decor(1.0, 7)
+      let ts = StrataViewer.decor_trees(d)
+      Test.assert_eq_int(List.length(ts), 12, "12 trees")
+      println("tree library: tallest " ++ int_to_string(List.fold_left(ts, 0, fn (m, t) -> if Strata.Template.t_sy(t) > m do Strata.Template.t_sy(t) else m end)) ++ " voxels, widest half " ++ int_to_string(List.fold_left(ts, 0, fn (m, t) -> if StrataViewer.Trees.base_offset(t) > m do StrataViewer.Trees.base_offset(t) else m end)) ++ " voxels; heights " ++ String.join(List.map(ts, fn t -> int_to_string(Strata.Template.t_sy(t))), " "))
+      Test.assert_eq_int(List.length(StrataViewer.decor_ruins(d)), 3, "3 ruins")
+      Test.assert_true(List.all(ts, fn t -> int_to_float(Strata.Template.t_sy(t) + 1) <= StrataViewer.feature_top()), "every tree under feature_top over its ground")
+      Test.assert_true(List.all(ts, fn t -> int_to_float(StrataViewer.Trees.base_offset(t)) +. 0.5 <= StrataViewer.max_reach()), "every tree within max_reach of its base")
+      Test.assert_true(List.all(StrataViewer.decor_ruins(d), fn t -> int_to_float(Strata.Template.t_sy(t) + 1) <= StrataViewer.feature_top()), "every ruin under feature_top")
+      Test.assert_true(List.all(ts, fn t -> NativeArray.get_i32(Strata.Template.t_ids(t), StrataViewer.Trees.base_offset(t) * (1 + Strata.Template.t_sx(t) * Strata.Template.t_sy(t))) == 7), "wood at the base")
+      Test.assert_true(List.all(ts, fn t -> Strata.Template.t_sx(t) == Strata.Template.t_sz(t)), "square")
+    end
+    test "a tree whose canopy straddles a chunk border: the chunks hold its voxels, none missing and none doubled, at each of the four rotations" do
+      let a = island()
+      let d = StrataViewer.decor(1.0, 7)
+      let found = List.map(List.range(0, 4), fn r -> find_tree(a, d, r, 0))
+      Test.assert_true(List.all(found, fn f -> Option.is_some(f)), "a border tree at every rotation")
+      let results = List.map(found, fn f -> match f do
+          None -> (1, 0, 0)
+          Some(t) ->
+            match tree_box(t) do
+              (x0, y0, z0, x1, y1, z1) -> compare_go(a, d, t, (x0, y0, z0, x1, y1, z1), x0, y0, z0, Nil, Nil, (0, 0, 0))
+            end
+        end)
+      List.map(List.zip(found, results), fn fr -> match fr do
+          (f, (m, st, h)) ->
+            let ac = match f do
+                Some(t) -> across(t)
+                None -> 0
+              end
+            println("border tree: " ++ int_to_string(h) ++ " voxels held (" ++ int_to_string(ac) ++ " in another chunk column than its base), " ++ int_to_string(m) ++ " missing, " ++ int_to_string(st) ++ " stray")
+        end)
+      Test.assert_true(List.all(results, fn r -> match r do (m, _, h) -> if m != 0 do false else h > 20 end end), "every voxel of each tree is in the world")
+      Test.assert_true(List.all(results, fn r -> match r do (_, st, _) -> st == 0 end), "and no other tree voxel in its box")
+    end
+    test "a site's chunk has the ruin's floor row at the site floor and the ground meets it at every column of the footprint" do
+      let a = island()
+      let d = StrataViewer.decor(1.0, 7)
+      match slope_site(a) do
+        None -> Test.fail("the island has sites")
+        Some(s) ->
+          match StrataViewer.site_ruin(d, s, 1.0, 7) do
+            None -> Test.fail("the ruins load")
+            Some((tp, ox, oy, oz, rot)) ->
+              Test.assert_eq_int(oy, float_to_int(Math.floor(Strata.Atlas.s_floor(s))) + 1, "the bottom row on the ground at the site floor")
+              match Strata.Template.bounds(tp, ox, oy, oz, rot) do
+                (x0, y0, z0, x1, y1, z1) ->
+                  match ground_go(a, d, tp, ox, oy, oz, rot, x0, x1, z0, z1, x0, z0, Nil, (0, 0, 0)) do
+                    (cols, bad_under, bad_over) ->
+                      println("ruin: " ++ int_to_string(cols) ++ " footprint columns, " ++ int_to_string(bad_under) ++ " not on ground, " ++ int_to_string(bad_over) ++ " with ground or a gap above the floor")
+                      Test.assert_eq_int(cols, (x1 - x0 + 1) * (z1 - z0 + 1), "every footprint column")
+                      Test.assert_eq_int(bad_under, 0, "solid ground under the bottom row everywhere")
+                      Test.assert_eq_int(bad_over, 0, "the ruin's voxels in place and no ground inside it")
+                  end
+                  Test.assert_true(y1 > y0, "a ruin of more than one row")
+              end
+          end
+      end
     end
   end
 end

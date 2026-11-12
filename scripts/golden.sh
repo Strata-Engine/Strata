@@ -75,6 +75,8 @@ island-mouth:STRATA_SCENE=22 STRATA_ISLAND=1 STRATA_LIGHT=4
 island-lake:STRATA_SCENE=23 STRATA_ISLAND=1 STRATA_LIGHT=4
 island-cliff:STRATA_SCENE=24 STRATA_ISLAND=1 STRATA_LIGHT=4
 island-cave:STRATA_SCENE=25 STRATA_ISLAND=1 STRATA_LIGHT=4
+forest-border:STRATA_SCENE=26 STRATA_ISLAND=1 STRATA_LIGHT=4
+ruin-slope:STRATA_SCENE=27 STRATA_ISLAND=1 STRATA_LIGHT=4
 '
 # indirect draw calls a frame must issue, whatever the scene holds; a scene
 # with a kind of geometry nowhere in it says DRAWS=n

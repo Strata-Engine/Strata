@@ -1,0 +1,78 @@
+-- Features: hashed cells give the same placements however an area is cut,
+-- negative cells are their own, jitter stays in the cell, chance scales.
+mod Strata.Test.Feature do
+
+  import Test
+  alias Strata.Feature as Ft
+
+  pfn kind() : Strata.Feature.Kind do Ft.kind(6.0, 4.0, 0.6, 21, 0.35) end
+  pfn every(cell : Float, radius : Float) : Strata.Feature.Kind do Ft.kind(cell, radius, 0.6, 21, 1.0) end
+  pfn one(_xm : Float, _zm : Float) : Float do 1.0 end
+
+  pfn same(p : Strata.Feature.Placed, q : Strata.Feature.Placed) : Bool do
+    if Ft.p_xm(p) != Ft.p_xm(q) do false
+    else if Ft.p_zm(p) != Ft.p_zm(q) do false
+    else if Ft.p_index(p) != Ft.p_index(q) do false
+    else if Ft.p_rot(p) != Ft.p_rot(q) do false
+    else Ft.p_stream(p) == Ft.p_stream(q) end end end end
+  end
+
+  pfn has(ps : List(Strata.Feature.Placed), p : Strata.Feature.Placed) : Bool do List.any(ps, fn q -> same(p, q)) end
+  -- every placement of xs is in ys
+  pfn within_all(xs : List(Strata.Feature.Placed), ys : List(Strata.Feature.Placed)) : Bool do List.all(xs, fn p -> has(ys, p)) end
+
+  pfn frac(v : Float, cell : Float) : Float do v /. cell -. Math.floor(v /. cell) end
+  pfn cell_of(v : Float, cell : Float) : Int do float_to_int(Math.floor(v /. cell)) end
+
+  describe "Feature" do
+    test "a box's candidates are the union of its two halves' (same cells, same values)" do
+      let whole = Ft.candidates(kind(), 7, -40.0, -30.0, 40.0, 50.0, one)
+      let left = Ft.candidates(kind(), 7, -40.0, -30.0, 0.0, 50.0, one)
+      let right = Ft.candidates(kind(), 7, 0.0, -30.0, 40.0, 50.0, one)
+      Test.assert_true(List.length(whole) > 20, "the box holds placements")
+      Test.assert_true(within_all(left, whole), "every placement of the left half is the whole's")
+      Test.assert_true(within_all(right, whole), "every placement of the right half is the whole's")
+      Test.assert_true(List.all(whole, fn p -> if has(left, p) do true else has(right, p) end), "every placement of the whole is in a half")
+    end
+    test "a cell at negative coordinates is its own, not the mirror of the positive one" do
+      let k = every(6.0, 0.0)
+      -- a box inside cell (-1, -1) only: floor, not truncation, keys it
+      let neg = Ft.candidates(k, 7, -5.0, -5.0, -1.0, -1.0, one)
+      let pos = Ft.candidates(k, 7, 1.0, 1.0, 5.0, 5.0, one)
+      Test.assert_eq_int(List.length(neg), 1, "one cell")
+      Test.assert_eq_int(List.length(pos), 1, "one cell")
+      match (neg, pos) do
+        (Cons(n, _), Cons(p, _)) ->
+          Test.assert_eq_int(cell_of(Ft.p_xm(n), 6.0), -1, "in cell -1 along x")
+          Test.assert_eq_int(cell_of(Ft.p_zm(n), 6.0), -1, "in cell -1 along z")
+          Test.assert_true(Ft.p_index(n) != Ft.p_index(p), "its own index")
+          Test.assert_true(Math.abs(frac(Ft.p_xm(n), 6.0) -. (1.0 -. frac(Ft.p_xm(p), 6.0))) > 0.000001, "x not mirrored")
+          Test.assert_true(Math.abs(frac(Ft.p_xm(n), 6.0) -. frac(Ft.p_xm(p), 6.0)) > 0.000001, "x not copied")
+        _ -> Test.fail("no placements")
+      end
+    end
+    test "jitter keeps every placement inside its cell, within the jitter's share of it" do
+      let ps = Ft.candidates(every(6.0, 4.0), 11, -100.0, -100.0, 100.0, 100.0, one)
+      Test.assert_true(List.all(ps, fn p -> Math.abs(frac(Ft.p_xm(p), 6.0) -. 0.5) <= 0.3), "x within 0.3 of a cell either side of its centre")
+      Test.assert_true(List.all(ps, fn p -> Math.abs(frac(Ft.p_zm(p), 6.0) -. 0.5) <= 0.3), "z too")
+      Test.assert_true(List.all(ps, fn p -> if Ft.p_rot(p) < 0 do false else Ft.p_rot(p) <= 3 end), "rot 0..3")
+    end
+    test "chance 0 gives none; chance 1 one per cell of the box grown by the radius" do
+      Test.assert_eq_int(List.length(Ft.candidates(Ft.kind(6.0, 4.0, 0.6, 21, 0.0), 7, 0.0, 0.0, 30.0, 30.0, one)), 0, "none")
+      Test.assert_eq_int(List.length(Ft.candidates(kind(), 7, 0.0, 0.0, 30.0, 30.0, fn (_x, _z) -> 0.0)), 0, "density 0 gives none")
+      let ps = Ft.candidates(every(6.0, 4.0), 7, 0.0, 0.0, 30.0, 30.0, one)
+      -- the box grown by 4 m is -4..34: cells -1..5 on each axis
+      Test.assert_eq_int(List.length(ps), 49, "7 x 7 cells")
+      let keys = List.map(ps, fn p -> cell_of(Ft.p_xm(p), 6.0) * 1000 + cell_of(Ft.p_zm(p), 6.0))
+      Test.assert_eq_int(List.length(List.dedup(List.sort_by(keys, fn (a, b) -> a < b))), 49, "one in each")
+    end
+    test "the same seed gives the same list, another seed another" do
+      let a = Ft.candidates(kind(), 7, -50.0, -50.0, 50.0, 50.0, one)
+      let b = Ft.candidates(kind(), 7, -50.0, -50.0, 50.0, 50.0, one)
+      let c = Ft.candidates(kind(), 8, -50.0, -50.0, 50.0, 50.0, one)
+      Test.assert_eq_int(List.length(a), List.length(b), "as many")
+      Test.assert_true(within_all(a, b), "the same placements")
+      Test.assert_false(within_all(a, c), "another seed differs")
+    end
+  end
+end

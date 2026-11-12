@@ -127,8 +127,9 @@ mod StrataViewer do
   --
   -- Seeds: Strata.Seed.mix(seed, 1) the base, 2 the hills, 3 the ridges, 4 the island's detail.
   -- 5 to 10 the island underground: density, tunnels (6, 7), caverns, entrance, rock strength.
-  -- Salts for Strata.Seed.cell: 21 trees, 22 / 23 / 24 a lake's centre x, centre z
-  -- and radius, 25 lantern posts, 26 tall grass. Salt 27 seeds the snow-patch noise.
+  -- Salts for Strata.Seed.cell: 21 the tree kind's cells, 22 / 23 / 24 a lake's centre x, centre z
+  -- and radius, 25 lantern posts, 26 tall grass, 28 / 29 a ruin's turn and stream. Salt 27 seeds
+  -- the snow-patch noise; Strata.Seed.mix(seed, 600 + i) the tree templates.
   pfn fbm_s() : Strata.Noise.Settings do Ns.settings(0, 3, 2.0, 0.5, 1, 0.0) end
   pfn ridge_s() : Strata.Noise.Settings do Ns.settings(1, 3, 2.0, 0.5, 2, 0.0) end
   pfn clamp01(v : Float) : Float do if v < 0.0 do 0.0 else if v > 1.0 do 1.0 else v end end end
@@ -260,54 +261,211 @@ mod StrataViewer do
     else ground_go(NativeArray.set_i32(a, i, block_at(x0 + i % 32, y0 + i / 1024, z0 + (i / 32) % 32, NativeArray.get_int(hs, i % 1024), NativeArray.get_int(ws, i % 1024), sv, scale, seed)), hs, ws, x0, y0, z0, sv, scale, seed, i + 1) end
   end
 
-  -- A tree stands on a grass column well inside the chunk's footprint, so
-  -- its canopy never crosses a chunk's sides; it may cross the top, and each
-  -- chunk in the column draws the part of it that falls in its own y range.
-  pfn has_tree(wx : Int, wz : Int, hm : Float, seed : Int) : Bool do
-    grassy(hm) && roll(wx, wz, seed, 21) > 0.988
-  end
+  -- ── Features: trees and ruins ────────────────────────────────────────────
+  -- Trees are Strata.Feature placements of a tree kind: cells 6 m on a side,
+  -- jitter 0.6, salt 21, chance 0.35 times the region's density, its radius
+  -- the largest tree template's half-width (at least 4 m). Each tree is one
+  -- of a library of 12 templates built at start-up by StrataViewer.Trees at
+  -- the world's voxel size, 3 of each species with seeds
+  -- Strata.Seed.mix(seed, 600 + i); a placement's index picks the species by
+  -- its region's mix, then one of the three. A chunk asks for the placements
+  -- of its own box (the kind's radius grows it) and blits each tree, clipped
+  -- to the chunk, so a tree that crosses chunks is whole. A tree stands on
+  -- the ground top of its base column, not on lake or river water, not
+  -- within a site's beard, not on a slope over 35 degrees, not below 41.5 m.
+  --
+  -- Region ids 0..4: tree density (of the chance) and the species mix
+  -- (oak, birch, pine, willow); the noise terrain is region 0 throughout.
+  --   0  0.9   0.55 0.25 0.10 0.10      3  0.8   0.20 0.50 0.30 0.00
+  --   1  1.0   0.10 0.20 0.70 0.00      4  0.5   0.35 0.15 0.20 0.30
+  --   2  0.6   0.40 0.40 0.20 0.00
+  --
+  -- Ruins stand on the atlas's sites: template s_index % 3 of wall, tower,
+  -- arch (viewer/assets/ruins, palette 1 and 2 stone, 3 rubble as dirt),
+  -- turned by the site's hash (Strata.Seed.cell(seed, 28, s_index, 0, 0)),
+  -- centred on the site, its bottom row on the ground at the site floor.
 
-  pfn put(a : NativeI32Arr, x : Int, wy : Int, z : Int, y0 : Int, id : Int, over : Bool) : NativeI32Arr do
-    let ly = wy - y0
-    if x < 0 || x > 31 || z < 0 || z > 31 || ly < 0 || ly > 31 do a
-    else
-      let i = x + 32 * (z + 32 * ly)
-      if over || NativeArray.get_i32(a, i) == 0 do NativeArray.set_i32(a, i, id) else a end
+  -- the tree templates (species s at 3 s .. 3 s + 2), the ruins (wall, tower, arch), the trees' reach in metres
+  type Decor = Decor(List(Strata.Template.Template), List(Strata.Template.Template), Float)
+
+  doc "No trees and no ruins: the land alone."
+  fn bare_decor() : Decor do Decor(Nil, Nil, 4.0) end
+
+  pfn trees_go(scale : Float, seed : Int, i : Int, acc : List(Strata.Template.Template)) : List(Strata.Template.Template) do
+    if i < 0 do acc else trees_go(scale, seed, i - 1, Cons(StrataViewer.Trees.build(i / 3, Strata.Seed.mix(seed, 600 + i), scale), acc)) end
+  end
+  pfn reach_go(ts : List(Strata.Template.Template), scale : Float, best : Float) : Float do
+    match ts do
+      Nil -> best
+      Cons(t, rest) -> reach_go(rest, scale, fmax(best, (int_to_float(StrataViewer.Trees.base_offset(t)) +. 0.5) *. scale))
     end
   end
 
-  pfn canopy_go(a : NativeI32Arr, x : Int, z : Int, top : Int, y0 : Int, k : Int) : NativeI32Arr do
-    -- 5 x 5 x 3 of leaves under a 3 x 3 cap; k walks the 100 cells
-    if k >= 100 do a
-    else
-      let layer = k / 25
-      let dx = k % 5 - 2
-      let dz = (k / 5) % 5 - 2
-      let cap = layer == 3
-      let skip = (cap && (dx < -1 || dx > 1 || dz < -1 || dz > 1)) || (!cap && (dx == -2 || dx == 2) && (dz == -2 || dz == 2) && layer == 2)
-      canopy_go(if skip do a else put(a, x + dx, top - 2 + layer, z + dz, y0, 8, false) end, x, z, top, y0, k + 1)
+  -- a ruin's palette: 1 and 2 stone, 3 rubble (dirt)
+  pfn ruin_palette() : NativeI32Arr do
+    NativeArray.set_i32(NativeArray.set_i32(NativeArray.set_i32(NativeArray.make_i32(256, 0), 1, 1), 2, 1), 3, 2)
+  end
+  pfn vox_file(path : String) : Option(NativeU8Arr) do
+    match File.read(path) do
+      Ok(text) -> Some(Bytes.to_u8_arr(Bytes.from_string(text)))
+      Err(_) -> None
+    end
+  end
+  -- a ruin template from viewer/assets/ruins (run from the repository) or assets/ruins (from viewer/)
+  pfn ruin(name : String, scale : Float, acc : List(Strata.Template.Template)) : List(Strata.Template.Template) do
+    let bytes = match vox_file("viewer/assets/ruins/" ++ name) do
+        Some(b) -> Some(b)
+        None -> vox_file("assets/ruins/" ++ name)
+      end
+    match bytes do
+      Some(b) ->
+        match Strata.Template.from_vox(b, ruin_palette(), scale) do
+          Some(t) -> Cons(t, acc)
+          None -> acc
+        end
+      None -> acc
     end
   end
 
-  pfn trunk_go(a : NativeI32Arr, x : Int, z : Int, wy : Int, top : Int, y0 : Int) : NativeI32Arr do
-    if wy > top do a else trunk_go(put(a, x, wy, z, y0, 7, true), x, z, wy + 1, top, y0) end
+  doc "The trees and ruins of a world of [scale] metres a voxel for [seed]: 12 tree templates and the three ruins (none if their files are not found)."
+  fn decor(scale : Float, seed : Int) : Decor do
+    let ts = trees_go(scale, seed, 11, Nil)
+    let rs = ruin("wall.vox", scale, ruin("tower.vox", scale, ruin("arch.vox", scale, Nil)))
+    Decor(ts, if List.length(rs) == 3 do rs else Nil end, fmax(4.0, reach_go(ts, scale, 0.0)))
   end
 
-  pfn trees_go(a : NativeI32Arr, hs : NativeIntArr, ws : NativeIntArr, x0 : Int, y0 : Int, z0 : Int, scale : Float, seed : Int, i : Int) : NativeI32Arr do
-    if i >= 1024 do a
+  doc "The tree templates of a Decor (species s at 3 s .. 3 s + 2)."
+  fn decor_trees(d : Decor) : List(Strata.Template.Template) do match d do Decor(v, _, _) -> v end end
+  doc "The ruin templates of a Decor: wall, tower, arch, or none."
+  fn decor_ruins(d : Decor) : List(Strata.Template.Template) do match d do Decor(_, v, _) -> v end end
+  pfn decor_reach(d : Decor) : Float do match d do Decor(_, _, v) -> v end end
+
+  doc "The tree kind of a Decor: cells 6 m, its radius the trees' reach, jitter 0.6, salt 21, chance 0.35."
+  fn tree_kind(d : Decor) : Strata.Feature.Kind do Strata.Feature.kind(6.0, decor_reach(d), 0.6, 21, 0.35) end
+
+  doc "How high over the ground a tree or a ruin may reach, in metres (the early-outs leave this much room)."
+  fn feature_top() : Float do 18.0 end
+  doc "How far from its base a tree may reach, in metres (the island's early-out window covers this much more)."
+  fn max_reach() : Float do 10.0 end
+
+  pfn region_density(r : Int) : Float do
+    if r == 0 do 0.9 else if r == 1 do 1.0 else if r == 2 do 0.6 else if r == 3 do 0.8 else 0.5 end end end end
+  end
+  -- the cumulative species mix of a region: the species whose share u falls in
+  pfn species_of(r : Int, u : Float) : Int do
+    let (a, b, c) = if r == 0 do (0.55, 0.80, 0.90)
+      else if r == 1 do (0.10, 0.30, 1.00)
+      else if r == 2 do (0.40, 0.80, 1.00)
+      else if r == 3 do (0.20, 0.70, 1.00)
+      else (0.35, 0.50, 0.70) end end end end
+    if u < a do 0 else if u < b do 1 else if u < c do 2 else 3 end end end
+  end
+
+  doc "The species (0 oak, 1 birch, 2 pine, 3 willow) a placement's index picks in a region, by the region's mix."
+  fn tree_species(region : Int, index : Int) : Int do species_of(region, Strata.Seed.unit(index)) end
+
+  doc "The tree template a placement's index picks in a region: the species by the region's mix, then one of its three; None with no trees."
+  fn pick_tree(d : Decor, region : Int, index : Int) : Option(Strata.Template.Template) do
+    let ts = decor_trees(d)
+    if List.length(ts) < 12 do None
     else
-      let x = i % 32
-      let z = i / 32
-      let h = NativeArray.get_int(hs, i)
-      if x >= 2 && x <= 29 && z >= 2 && z <= 29 && NativeArray.get_int(ws, i) == 0 && has_tree(x0 + x, z0 + z, int_to_float(h) *. scale, seed) do
-        let top = h + 5
-        trees_go(trunk_go(canopy_go(a, x, z, top, y0, 0), x, z, h + 1, top, y0), hs, ws, x0, y0, z0, scale, seed, i + 1)
-      else trees_go(a, hs, ws, x0, y0, z0, scale, seed, i + 1) end
+      let sp = tree_species(region, index)
+      let v = float_to_int(Strata.Seed.unit(Strata.Seed.next(index)) *. 3.0)
+      List.nth_opt(ts, 3 * sp + (if v > 2 do 2 else v end))
     end
   end
 
-  doc "The chunk at chunk coordinates (cx, cy, cz) for [seed], in a world of [scale] metres a voxel. Pure: the same inputs give the same chunk."
-  fn terrain(scale : Float, cx : Int, cy : Int, cz : Int, seed : Int) : Strata.Chunk.Chunk do
+  -- whether a placement stands in the box x0..x1, z0..z1 (metres) grown by r: the only ones whose template can reach it
+  pfn reaches(p : Strata.Feature.Placed, x0 : Float, z0 : Float, x1 : Float, z1 : Float, r : Float) : Bool do
+    let x = Strata.Feature.p_xm(p)
+    let z = Strata.Feature.p_zm(p)
+    if x < x0 -. r do false else if x > x1 +. r do false else if z < z0 -. r do false else z <= z1 +. r end end end
+  end
+
+  doc "A tree's world box (x0, y0, z0, x1, y1, z1) and where it is blitted: template t with its base on ground top y of column (wx, wz), turned rot. The trunk's base voxel is (wx, y + 1, wz)."
+  fn tree_origin(t : Strata.Template.Template, wx : Int, y : Int, wz : Int) : (Int, Int, Int) do
+    let half = StrataViewer.Trees.base_offset(t)
+    (wx - half, y + 1, wz - half)
+  end
+
+  -- a tree on ground top y of column (wx, wz), blitted into chunk c at key k
+  pfn put_tree(c : Strata.Chunk.Chunk, k : Strata.Coord.Key, t : Strata.Template.Template, p : Strata.Feature.Placed, wx : Int, y : Int, wz : Int) : Strata.Chunk.Chunk do
+    match tree_origin(t, wx, y, wz) do
+      (ox, oy, oz) -> Strata.Template.blit(c, k, t, ox, oy, oz, Strata.Feature.p_rot(p), Strata.Feature.p_stream(p))
+    end
+  end
+
+  -- whether a slope of (dx, dz) metres a metre is over 35 degrees
+  pfn steep(dx : Float, dz : Float) : Bool do dx *. dx +. dz *. dz > 0.7002075 *. 0.7002075 end
+
+  -- the noise terrain's column (ground, lake line) in voxels, its square's lake taken into account
+  pfn noise_col(wx : Int, wz : Int, seed : Int, scale : Float) : (Int, Int) do
+    let xm = int_to_float(wx) *. scale
+    let zm = int_to_float(wz) *. scale
+    lake_column(lake_of(fdiv(float_to_int(Math.floor(xm)), 192), fdiv(float_to_int(Math.floor(zm)), 192), seed), xm, zm, height_m(xm, zm, seed), scale)
+  end
+  pfn noise_h(wx : Int, wz : Int, seed : Int, scale : Float) : Float do match noise_col(wx, wz, seed, scale) do (h, _) -> int_to_float(h) end end
+
+  doc "The noise terrain's trees that can reach the chunk at (cx, cz): (template, placement, base column x, ground top y, base column z)."
+  fn noise_trees(d : Decor, scale : Float, cx : Int, cz : Int, seed : Int) : List((Strata.Template.Template, Strata.Feature.Placed, Int, Int, Int)) do
+    let x0 = int_to_float(cx * 32) *. scale
+    let z0 = int_to_float(cz * 32) *. scale
+    let x1 = int_to_float(cx * 32 + 31) *. scale
+    let z1 = int_to_float(cz * 32 + 31) *. scale
+    if List.length(decor_trees(d)) < 12 do Nil
+    else
+      let k = tree_kind(d)
+      let ps = Strata.Feature.candidates(k, seed, x0, z0, x1, z1, fn (_x, _z) -> region_density(0))
+      List.reverse(List.fold_left(ps, Nil, fn (acc, p) -> noise_tree(d, k, p, x0, z0, x1, z1, scale, seed, acc)))
+    end
+  end
+  pfn noise_tree(d : Decor, k : Strata.Feature.Kind, p : Strata.Feature.Placed, x0 : Float, z0 : Float, x1 : Float, z1 : Float, scale : Float, seed : Int, acc : List((Strata.Template.Template, Strata.Feature.Placed, Int, Int, Int))) : List((Strata.Template.Template, Strata.Feature.Placed, Int, Int, Int)) do
+    if !reaches(p, x0, z0, x1, z1, Strata.Feature.k_radius(k)) do acc
+    else
+      let wx = float_to_int(Math.floor(Strata.Feature.p_xm(p) /. scale))
+      let wz = float_to_int(Math.floor(Strata.Feature.p_zm(p) /. scale))
+      match noise_col(wx, wz, seed, scale) do
+        (h, line) ->
+          let hm = int_to_float(h) *. scale
+          if line > 0 do acc
+          else if !grassy(hm) do acc
+          else if hm < 41.5 do acc
+          else
+            -- central differences in voxels: a slope in metres a metre
+            let gx = (noise_h(wx + 1, wz, seed, scale) -. noise_h(wx - 1, wz, seed, scale)) /. 2.0
+            let gz = (noise_h(wx, wz + 1, seed, scale) -. noise_h(wx, wz - 1, seed, scale)) /. 2.0
+            if steep(gx, gz) do acc
+            else
+              match pick_tree(d, 0, Strata.Feature.p_index(p)) do
+                Some(t) -> Cons((t, p, wx, h, wz), acc)
+                None -> acc
+              end
+            end
+          end end end
+      end
+    end
+  end
+
+  -- the trees blitted into chunk c at key k
+  pfn trees_into(c : Strata.Chunk.Chunk, k : Strata.Coord.Key, ts : List((Strata.Template.Template, Strata.Feature.Placed, Int, Int, Int))) : Strata.Chunk.Chunk do
+    match ts do
+      Nil -> c
+      Cons((t, p, wx, y, wz), rest) -> trees_into(put_tree(c, k, t, p, wx, y, wz), k, rest)
+    end
+  end
+  -- the highest voxel a list of trees reaches
+  pfn trees_top(ts : List((Strata.Template.Template, Strata.Feature.Placed, Int, Int, Int)), best : Int) : Int do
+    match ts do
+      Nil -> best
+      Cons((t, _, _, y, _), rest) -> trees_top(rest, if y + Strata.Template.t_sy(t) > best do y + Strata.Template.t_sy(t) else best end)
+    end
+  end
+
+  doc "The chunk at chunk coordinates (cx, cy, cz) for [seed], in a world of [scale] metres a voxel, with no trees. Pure: the same inputs give the same chunk."
+  fn terrain(scale : Float, cx : Int, cy : Int, cz : Int, seed : Int) : Strata.Chunk.Chunk do terrain_with(bare_decor(), scale, cx, cy, cz, seed) end
+
+  doc "The noise terrain's chunk at (cx, cy, cz) for [seed] with the trees of d. Pure."
+  fn terrain_with(d : Decor, scale : Float, cx : Int, cy : Int, cz : Int, seed : Int) : Strata.Chunk.Chunk do
     let y0 = cy * 32
     let sv = sea_v(scale)
     -- the lake squares are 192 m, so the square of a chunk's corner is found in metres
@@ -317,10 +475,15 @@ mod StrataViewer do
         let lo = min_go(hs, 0, 100000)
         let hi = max_go(hs, 0, -100000)
         let wet = max_go(ws, 0, sv)
-        let roof = (if hi > wet do hi else wet end) + 8
-        if y0 > roof do Ch.uniform(0)
-        else if y0 + 31 < lo - 3 do Ch.uniform(1)
-        else Ch.from_flat(trees_go(ground_go(NativeArray.make_i32(32768, 0), hs, ws, cx * 32, y0, cz * 32, sv, scale, seed, 0), hs, ws, cx * 32, y0, cz * 32, scale, seed, 0)) end end
+        if y0 + 31 < lo - 3 do Ch.uniform(1)
+        else
+          -- the trees that reach this chunk decide how high it can hold anything
+          let ts = noise_trees(d, scale, cx, cz, seed)
+          let ground_roof = (if hi > wet do hi else wet end) + 2
+          let tree_roof = trees_top(ts, 0)
+          if y0 > (if tree_roof > ground_roof do tree_roof else ground_roof end) do Ch.uniform(0)
+          else trees_into(Ch.from_flat(ground_go(NativeArray.make_i32(32768, 0), hs, ws, cx * 32, y0, cz * 32, sv, scale, seed, 0)), Strata.Coord.key(cx, cy, cz), ts) end
+        end
     end
   end
 
@@ -575,9 +738,9 @@ mod StrataViewer do
   -- under the sea's line, snow over 95 m), 1 to 3 dirt (sand where the top
   -- would be sand), deeper and ceilings stone; air at or under the sea is
   -- sea water. Tall grass and posts stand on grass inside the chunk, trees
-  -- on the column's density surface, found from the same lattice noise.
-  -- A chunk wholly above the highest H + A (and the water, and 8 m for
-  -- trees) is air and one wholly below the lowest H - A - 40 m is stone,
+  -- (see Features) on their base column's density surface, found from the same lattice noise.
+  -- A chunk wholly above the highest H + A (and the water, and feature_top for
+  -- trees and ruins) is air and one wholly below the lowest H - A - 40 m is stone,
   -- decided from the atlas samples alone before any column is made.
 
   pfn amp() : Float do 12.0 end
@@ -779,11 +942,11 @@ mod StrataViewer do
   pfn passes() : Int do 4 end
   pfn halo() : Int do 2 * passes() end
 
-  -- The columns of an area 32 x 32 from (x0, z0) and its halo, side = 32 + 2 halo:
-  -- H in metres and calm; and for the area's own 32 x 32, ground, lake and river lines.
+  -- The columns of an area n x n from (x0, z0) and its halo, side = n + 2 halo:
+  -- H in metres and calm; and for the area's own n x n, ground, lake and river lines.
   type Cols3 = Cols3(NativeF32Arr, NativeF32Arr, NativeIntArr, NativeIntArr, NativeIntArr)
-  pfn cols3_go(wn : Win, x0 : Int, z0 : Int, seed : Int, scale : Float, t : Int, hm : NativeF32Arr, cm : NativeF32Arr, gs : NativeIntArr, ls : NativeIntArr, rs : NativeIntArr) : Cols3 do
-    let side = 32 + 2 * halo()
+  pfn cols3_go(wn : Win, x0 : Int, z0 : Int, n : Int, seed : Int, scale : Float, t : Int, hm : NativeF32Arr, cm : NativeF32Arr, gs : NativeIntArr, ls : NativeIntArr, rs : NativeIntArr) : Cols3 do
+    let side = n + 2 * halo()
     if t >= side * side do Cols3(hm, cm, gs, ls, rs)
     else
       let x = t % side - halo()
@@ -792,10 +955,10 @@ mod StrataViewer do
         (g, l, r, h, c) ->
           let hm2 = NativeArray.set_f32(hm, t, h)
           let cm2 = NativeArray.set_f32(cm, t, c)
-          if x >= 0 && x <= 31 && z >= 0 && z <= 31 do
-            let k = x + 32 * z
-            cols3_go(wn, x0, z0, seed, scale, t + 1, hm2, cm2, NativeArray.set_int(gs, k, g), NativeArray.set_int(ls, k, l), NativeArray.set_int(rs, k, r))
-          else cols3_go(wn, x0, z0, seed, scale, t + 1, hm2, cm2, gs, ls, rs) end
+          if x >= 0 && x < n && z >= 0 && z < n do
+            let k = x + n * z
+            cols3_go(wn, x0, z0, n, seed, scale, t + 1, hm2, cm2, NativeArray.set_int(gs, k, g), NativeArray.set_int(ls, k, l), NativeArray.set_int(rs, k, r))
+          else cols3_go(wn, x0, z0, n, seed, scale, t + 1, hm2, cm2, gs, ls, rs) end
       end
     end
   end
@@ -813,45 +976,97 @@ mod StrataViewer do
     end
   end
 
-  -- the area's own H and calm (32 x 32): the relaxed heights, then kept within
+  -- the area's own H and calm (n x n): the relaxed heights, then kept within
   -- the halo patch's range (a pass can overshoot into a one-column pit); calm-0 columns as they were
-  pfn inner_go(hm : NativeF32Arr, hr : NativeF32Arr, cm : NativeF32Arr, lo : Float, hi : Float, hs : NativeF32Arr, cs : NativeF32Arr, c : Int) : (NativeF32Arr, NativeF32Arr) do
-    if c >= 1024 do (hs, cs)
+  pfn inner_go(hm : NativeF32Arr, hr : NativeF32Arr, cm : NativeF32Arr, lo : Float, hi : Float, hs : NativeF32Arr, cs : NativeF32Arr, n : Int, c : Int) : (NativeF32Arr, NativeF32Arr) do
+    if c >= n * n do (hs, cs)
     else
-      let t = (c % 32 + halo()) + (32 + 2 * halo()) * (c / 32 + halo())
+      let t = (c % n + halo()) + (n + 2 * halo()) * (c / n + halo())
       let calm = NativeArray.get_f32(cm, t)
       let h = if calm <= 0.0 do NativeArray.get_f32(hm, t) else fmin(hi, fmax(lo, NativeArray.get_f32(hr, t))) end
-      inner_go(hm, hr, cm, lo, hi, NativeArray.set_f32(hs, c, h), NativeArray.set_f32(cs, c, calm), c + 1)
+      inner_go(hm, hr, cm, lo, hi, NativeArray.set_f32(hs, c, h), NativeArray.set_f32(cs, c, calm), n, c + 1)
     end
   end
 
-  -- The area 32 x 32 from whole-voxel column (x0, z0): its relaxed H and calm,
-  -- and its ground, lake and river lines (voxels).
+  -- ── Sites: the ground pulled to a ruin's floor ───────────────────────────
+  -- Within a site's radius + 3 m a land column's H moves toward the site
+  -- floor, all the way within the radius and linearly to not at all over
+  -- the 3 m margin, and its calm toward 0 (no density noise, no caves where
+  -- the ruin stands); lake and river columns are left as they were. It is
+  -- done after the thermal relax and before the density, and is a function
+  -- of the column alone, so chunks agree along their seams. Sites are 150 m
+  -- apart, so an area under 150 m across meets at most the beard of the site
+  -- nearest its centre.
+  pfn beard_margin() : Float do 3.0 end
+
+  -- how far a column at (xm, zm) is pulled to site s: 1 within its radius, 0 past radius + 3 m
+  pfn beard_w(s : Strata.Atlas.Site, xm : Float, zm : Float) : Float do
+    let dx = xm -. Strata.Atlas.s_x(s)
+    let dz = zm -. Strata.Atlas.s_z(s)
+    clamp01((Strata.Atlas.s_radius(s) +. beard_margin() -. Math.sqrt(dx *. dx +. dz *. dz)) /. beard_margin())
+  end
+
+  -- the site whose beard can reach an area n x n columns from (x0m, z0m) metres
+  pfn site_for(a : Strata.Atlas.Atlas, x0m : Float, z0m : Float, n : Int, scale : Float) : Option(Strata.Atlas.Site) do
+    let half = int_to_float(n) *. scale *. 0.5
+    Strata.Atlas.site_near(a, x0m +. half, z0m +. half, half *. 1.4143 +. 40.0)
+  end
+
+  pfn beard_go(s : Strata.Atlas.Site, hs : NativeF32Arr, cs : NativeF32Arr, ls : NativeIntArr, rs : NativeIntArr, x0 : Int, z0 : Int, n : Int, scale : Float, c : Int) : (NativeF32Arr, NativeF32Arr) do
+    if c >= n * n do (hs, cs)
+    else
+      let w = beard_w(s, int_to_float(x0 + c % n) *. scale, int_to_float(z0 + c / n) *. scale)
+      if w <= 0.0 do beard_go(s, hs, cs, ls, rs, x0, z0, n, scale, c + 1)
+      else if NativeArray.get_int(ls, c) > 0 do beard_go(s, hs, cs, ls, rs, x0, z0, n, scale, c + 1)
+      else if NativeArray.get_int(rs, c) > 0 do beard_go(s, hs, cs, ls, rs, x0, z0, n, scale, c + 1)
+      else
+        let h = NativeArray.get_f32(hs, c)
+        let h2 = h +. (Strata.Atlas.s_floor(s) -. h) *. w
+        beard_go(s, NativeArray.set_f32(hs, c, h2), NativeArray.set_f32(cs, c, NativeArray.get_f32(cs, c) *. (1.0 -. w)), ls, rs, x0, z0, n, scale, c + 1)
+      end end end
+    end
+  end
+
+  doc "Whether a place (xm, zm) is within a site's beard (its radius + 3 m): no tree stands there."
+  fn in_site(a : Strata.Atlas.Atlas, xm : Float, zm : Float) : Bool do
+    match Strata.Atlas.site_near(a, xm, zm, 40.0) do
+      Some(s) -> beard_w(s, xm, zm) > 0.0
+      None -> false
+    end
+  end
+
+  -- The area n x n from whole-voxel column (x0, z0): its relaxed H (pulled
+  -- to a site's floor in its beard) and calm, and its ground, lake and river lines (voxels).
   type Area = Area(NativeF32Arr, NativeF32Arr, NativeIntArr, NativeIntArr, NativeIntArr)
-  pfn area(a : Strata.Atlas.Atlas, scale : Float, x0 : Int, z0 : Int, seed : Int) : Area do
-    let side = 32 + 2 * halo()
+  pfn area_n(a : Strata.Atlas.Atlas, scale : Float, x0 : Int, z0 : Int, n : Int, seed : Int) : Area do
+    let side = n + 2 * halo()
     let cnt = side * side
     let x0m = int_to_float(x0) *. scale
     let z0m = int_to_float(z0) *. scale
     let hw = int_to_float(halo()) *. scale
-    let wn = island_window(a, x0m -. hw, z0m -. hw, x0m +. 31.0 *. scale +. hw, z0m +. 31.0 *. scale +. hw)
-    match cols3_go(wn, x0, z0, seed, scale, 0, NativeArray.make_f32(cnt, 0.0), NativeArray.make_f32(cnt, 0.0), NativeArray.make_int(1024, 0), NativeArray.make_int(1024, 0), NativeArray.make_int(1024, 0)) do
+    let far = int_to_float(n - 1) *. scale
+    let wn = island_window(a, x0m -. hw, z0m -. hw, x0m +. far +. hw, z0m +. far +. hw)
+    match cols3_go(wn, x0, z0, n, seed, scale, 0, NativeArray.make_f32(cnt, 0.0), NativeArray.make_f32(cnt, 0.0), NativeArray.make_int(n * n, 0), NativeArray.make_int(n * n, 0), NativeArray.make_int(n * n, 0)) do
       Cols3(hm, cm, gs, ls, rs) ->
         let tal = NativeArray.make_f32(cnt, 0.0)
         let tal2 = if Ns.field2(rock_s(), Strata.Seed.mix(seed, 10), 1.0 /. 80.0, x0m -. hw, z0m -. hw, scale, side, side, tal) == cnt do talus_go(tal, 0, cnt) else tal end
         let hr = Strata.Thermal.relax(hm, side, scale, tal2, passes())
         match span_go(hm, 0, cnt, 1000000.0, 0.0 -. 1000000.0) do
           (lo, hi) ->
-            match inner_go(hm, hr, cm, lo, hi, NativeArray.make_f32(1024, 0.0), NativeArray.make_f32(1024, 0.0), 0) do
-              (hs, cms) -> Area(hs, cms, gs, ls, rs)
+            match inner_go(hm, hr, cm, lo, hi, NativeArray.make_f32(n * n, 0.0), NativeArray.make_f32(n * n, 0.0), n, 0) do
+              (hs, cms) ->
+                match site_for(a, x0m, z0m, n, scale) do
+                  Some(st) -> match beard_go(st, hs, cms, ls, rs, x0, z0, n, scale, 0) do (hs2, cms2) -> Area(hs2, cms2, gs, ls, rs) end
+                  None -> Area(hs, cms, gs, ls, rs)
+                end
             end
         end
     end
   end
 
-  doc "The island's thermally relaxed 2D heights H (metres) of the 32 x 32 columns from whole-voxel column (x0, z0), index x + 32 * z: what the density is built on. Any (x0, z0), not only a chunk's corner."
+  doc "The island's thermally relaxed 2D heights H (metres) of the 32 x 32 columns from whole-voxel column (x0, z0), index x + 32 * z, pulled to a site's floor in its beard: what the density is built on. Any (x0, z0), not only a chunk's corner."
   fn relaxed_heights(a : Strata.Atlas.Atlas, scale : Float, x0 : Int, z0 : Int, seed : Int) : NativeF32Arr do
-    match area(a, scale, x0, z0, seed) do Area(hs, _, _, _, _) -> hs end
+    match area_n(a, scale, x0, z0, 32, seed) do Area(hs, _, _, _, _) -> hs end
   end
 
   -- the lattice noise on the rows of one column, rows r0..r0 + cnt - 1 (8 voxels apart), bilinear between its four sample columns
@@ -894,20 +1109,129 @@ mod StrataViewer do
     top_go(rows, r0, h, cm, scale, hi, low)
   end
 
-  -- where trees may stand: the density top of each tree column, else far below
-  pfn bases_go(hs : NativeF32Arr, cms : NativeF32Arr, ens : NativeF32Arr, ls : NativeIntArr, rs : NativeIntArr, x0 : Int, z0 : Int, seed : Int, scale : Float, out : NativeIntArr, c : Int) : NativeIntArr do
-    if c >= 1024 do out
+  -- The island's trees on an area's columns: hs, cms, ls, rs are n x n from
+  -- whole-voxel column (ax0, az0). A tree stands on the density top of its
+  -- base column (so on an overhang's top too) when the column is neither
+  -- lake nor river nor in a site's beard, its slope (central differences of
+  -- H) is 35 degrees or less, its entrance noise 0.6 or less (where caves cut
+  -- up through the ground) and its top 41.5 m or more.
+  pfn island_tree(a : Strata.Atlas.Atlas, d : Decor, p : Strata.Feature.Placed, hs : NativeF32Arr, cms : NativeF32Arr, ls : NativeIntArr, rs : NativeIntArr, ax0 : Int, az0 : Int, n : Int, seed : Int, scale : Float, acc : List((Strata.Template.Template, Strata.Feature.Placed, Int, Int, Int))) : List((Strata.Template.Template, Strata.Feature.Placed, Int, Int, Int)) do
+    let xm = Strata.Feature.p_xm(p)
+    let zm = Strata.Feature.p_zm(p)
+    let wx = float_to_int(Math.floor(xm /. scale))
+    let wz = float_to_int(Math.floor(zm /. scale))
+    let px = wx - ax0
+    let pz = wz - az0
+    if px < 1 || px > n - 2 || pz < 1 || pz > n - 2 do acc
     else
-      let x = c % 32
-      let z = c / 32
-      let inside = x >= 2 && x <= 29 && z >= 2 && z <= 29
-      let ok = if !inside do false
-        else if NativeArray.get_int(ls, c) + NativeArray.get_int(rs, c) > 0 do false
-        else if NativeArray.get_f32(ens, c) > 0.6 do false
-        else roll(x0 + x, z0 + z, seed, 21) > 0.988 end end end
-      let b = if ok do density_top(seed, x0 + x, z0 + z, NativeArray.get_f32(hs, c), NativeArray.get_f32(cms, c), scale) else 0 - 100000 end
-      bases_go(hs, cms, ens, ls, rs, x0, z0, seed, scale, NativeArray.set_int(out, c, b), c + 1)
+      let c = px + n * pz
+      if NativeArray.get_int(ls, c) > 0 do acc
+      else if NativeArray.get_int(rs, c) > 0 do acc
+      else if in_site(a, xm, zm) do acc
+      else
+        let gx = (NativeArray.get_f32(hs, c + 1) -. NativeArray.get_f32(hs, c - 1)) /. (2.0 *. scale)
+        let gz = (NativeArray.get_f32(hs, c + n) -. NativeArray.get_f32(hs, c - n)) /. (2.0 *. scale)
+        if steep(gx, gz) do acc
+        else if Ns.sample2(single_s(), Strata.Seed.mix(seed, 9), 1.0 /. 120.0, int_to_float(wx) *. scale, int_to_float(wz) *. scale) > 0.6 do acc
+        else
+          let top = density_top(seed, wx, wz, NativeArray.get_f32(hs, c), NativeArray.get_f32(cms, c), scale)
+          if int_to_float(top) *. scale < 41.5 do acc
+          else
+            match pick_tree(d, Strata.Atlas.region_at(a, xm, zm), Strata.Feature.p_index(p)) do
+              Some(t) -> Cons((t, p, wx, top, wz), acc)
+              None -> acc
+            end
+          end
+        end end
+      end end end
     end
+  end
+
+  doc "The island's trees that can reach the chunk at (cx, cz), from its area padded by pad columns each side (n = 32 + 2 pad, from column (32 cx - pad, 32 cz - pad)): (template, placement, base column x, ground top y, base column z)."
+  fn island_trees(a : Strata.Atlas.Atlas, d : Decor, hs : NativeF32Arr, cms : NativeF32Arr, ls : NativeIntArr, rs : NativeIntArr, cx : Int, cz : Int, pad : Int, seed : Int, scale : Float) : List((Strata.Template.Template, Strata.Feature.Placed, Int, Int, Int)) do
+    if List.length(decor_trees(d)) < 12 do Nil
+    else
+      let k = tree_kind(d)
+      let x0 = int_to_float(cx * 32) *. scale
+      let z0 = int_to_float(cz * 32) *. scale
+      let x1 = int_to_float(cx * 32 + 31) *. scale
+      let z1 = int_to_float(cz * 32 + 31) *. scale
+      let ps = Strata.Feature.candidates(k, seed, x0, z0, x1, z1, fn (x, z) -> region_density(Strata.Atlas.region_at(a, x, z)))
+      let n = 32 + 2 * pad
+      List.reverse(List.fold_left(ps, Nil, fn (acc, p) -> if reaches(p, x0, z0, x1, z1, Strata.Feature.k_radius(k)) do island_tree(a, d, p, hs, cms, ls, rs, cx * 32 - pad, cz * 32 - pad, n, seed, scale, acc) else acc end))
+    end
+  end
+
+  doc "The trees that reach the island chunk column (cx, cz) for [seed], as island_full finds them: (template, placement, base column x, ground top y, base column z)."
+  fn island_chunk_trees(a : Strata.Atlas.Atlas, d : Decor, scale : Float, cx : Int, cz : Int, seed : Int) : List((Strata.Template.Template, Strata.Feature.Placed, Int, Int, Int)) do
+    let pad = tree_pad(d, scale)
+    match area_n(a, scale, cx * 32 - pad, cz * 32 - pad, 32 + 2 * pad, seed) do
+      Area(hp, cp, _, lp, rp) -> island_trees(a, d, hp, cp, lp, rp, cx, cz, pad, seed, scale)
+    end
+  end
+
+  doc "The ruin standing on site s, and where: (template, x, y, z, rot) for Strata.Template.blit, centred on the site, its bottom row on the ground at the site floor (whole voxel vox(floor) + 1), turned by the site's hash."
+  fn site_ruin(d : Decor, s : Strata.Atlas.Site, scale : Float, seed : Int) : Option((Strata.Template.Template, Int, Int, Int, Int)) do
+    match List.nth_opt(decor_ruins(d), Strata.Atlas.s_index(s) % 3) do
+      None -> None
+      Some(t) ->
+        let rot = int_and(int_shr(Strata.Seed.cell(seed, 28, Strata.Atlas.s_index(s), 0, 0), 20), 3)
+        match Strata.Template.bounds(t, 0, 0, 0, rot) do
+          (_, _, _, w1, _, d1) ->
+            let cx = float_to_int(Math.floor(Strata.Atlas.s_x(s) /. scale))
+            let cz = float_to_int(Math.floor(Strata.Atlas.s_z(s) /. scale))
+            Some((t, cx - (w1 + 1) / 2, vox(Strata.Atlas.s_floor(s), scale) + 1, cz - (d1 + 1) / 2, rot))
+        end
+    end
+  end
+
+  -- how far the ground around a site falls or rises from its floor: the most over 16 directions 25 m out
+  pfn site_drop(a : Strata.Atlas.Atlas, s : Strata.Atlas.Site, i : Int, best : Float) : Float do
+    if i >= 16 do best
+    else
+      let h = Strata.Atlas.height_at(a, Strata.Atlas.s_x(s) +. 25.0 *. dir_x(i), Strata.Atlas.s_z(s) +. 25.0 *. dir_z(i))
+      site_drop(a, s, i + 1, fmax(best, Math.abs(h -. Strata.Atlas.s_floor(s))))
+    end
+  end
+  pfn slope_go(a : Strata.Atlas.Atlas, ss : List(Strata.Atlas.Site), best : Option(Strata.Atlas.Site), bd : Float) : Option(Strata.Atlas.Site) do
+    match ss do
+      Nil -> best
+      Cons(s, rest) ->
+        let dd = site_drop(a, s, 0, 0.0)
+        if dd > bd do slope_go(a, rest, Some(s), dd) else slope_go(a, rest, best, bd) end
+    end
+  end
+  doc "The site on the steepest ground: the one whose atlas ground 25 m out departs most from its floor (scene 27, and the viewer test)."
+  fn slope_site(a : Strata.Atlas.Atlas) : Option(Strata.Atlas.Site) do slope_go(a, Strata.Atlas.sites(a), None, 0.0 -. 1.0) end
+
+  -- the direction 0..15 (see dir_x) in which the ground 25 m out from a site is lowest
+  pfn low_dir(a : Strata.Atlas.Atlas, s : Strata.Atlas.Site, i : Int, best : Int, bh : Float) : Int do
+    if i >= 16 do best
+    else
+      let h = Strata.Atlas.height_at(a, Strata.Atlas.s_x(s) +. 25.0 *. dir_x(i), Strata.Atlas.s_z(s) +. 25.0 *. dir_z(i))
+      if h < bh do low_dir(a, s, i + 1, i, h) else low_dir(a, s, i + 1, best, bh) end
+    end
+  end
+
+  -- the ruin of the site near chunk (cx, cy, cz), if any, blitted into c
+  pfn ruins_into(a : Strata.Atlas.Atlas, d : Decor, c : Strata.Chunk.Chunk, cx : Int, cy : Int, cz : Int, scale : Float, seed : Int) : Strata.Chunk.Chunk do
+    let half = 16.0 *. scale
+    match Strata.Atlas.site_near(a, int_to_float(cx * 32) *. scale +. half, int_to_float(cz * 32) *. scale +. half, half *. 1.4143 +. 40.0) do
+      None -> c
+      Some(s) ->
+        match site_ruin(d, s, scale, seed) do
+          Some((t, ox, oy, oz, rot)) -> Strata.Template.blit(c, Strata.Coord.key(cx, cy, cz), t, ox, oy, oz, rot, Strata.Seed.cell(seed, 29, Strata.Atlas.s_index(s), 0, 0))
+          None -> c
+        end
+    end
+  end
+
+  -- the inner 32 x 32 of an n x n array padded by pad
+  pfn inner_f32(src : NativeF32Arr, n : Int, pad : Int, out : NativeF32Arr, c : Int) : NativeF32Arr do
+    if c >= 1024 do out else inner_f32(src, n, pad, NativeArray.set_f32(out, c, NativeArray.get_f32(src, (c % 32 + pad) + n * (c / 32 + pad))), c + 1) end
+  end
+  pfn inner_int(src : NativeIntArr, n : Int, pad : Int, out : NativeIntArr, c : Int) : NativeIntArr do
+    if c >= 1024 do out else inner_int(src, n, pad, NativeArray.set_int(out, c, NativeArray.get_int(src, (c % 32 + pad) + n * (c / 32 + pad))), c + 1) end
   end
 
   -- lake and river columns get Task 6's fill; tall grass and posts on grass
@@ -941,12 +1265,18 @@ mod StrataViewer do
   pfn quick_bounds(a : Strata.Atlas.Atlas, x0m : Float, z0m : Float, scale : Float) : (Float, Float, Float) do
     let st = Strata.Atlas.step(a)
     let nn = Strata.Atlas.n(a)
-    -- the thermal halo's columns, and one sample beyond them
-    let m = float_to_int(Math.ceil(int_to_float(halo()) *. scale /. st)) + 1
+    -- the thermal halo's columns and the trees' reach, and one sample beyond them
+    let m = float_to_int(Math.ceil((int_to_float(halo()) *. scale +. max_reach()) /. st)) + 1
     let i0 = float_to_int(Math.floor(x0m /. st)) + nn / 2 - m
     let j0 = float_to_int(Math.floor(z0m /. st)) + nn / 2 - m
     let side = float_to_int(Math.ceil(32.0 *. scale /. st)) + 1 + 2 * m
-    match span_go(Strata.Atlas.window(a, 0, i0, j0, side), 0, side * side, 1000000.0, 0.0 -. 1000000.0) do
+    -- a site's beard pulls the ground to its floor
+    let half = 16.0 *. scale
+    let (flo, fhi) = match Strata.Atlas.site_near(a, x0m +. half, z0m +. half, half *. 1.4143 +. int_to_float(m) *. st +. 40.0) do
+        Some(s) -> (Strata.Atlas.s_floor(s), Strata.Atlas.s_floor(s))
+        None -> (1000000.0, 0.0 -. 1000000.0)
+      end
+    match span_go(Strata.Atlas.window(a, 0, i0, j0, side), 0, side * side, flo, fhi) do
       (lo, hi) ->
         match span_go(Strata.Atlas.window(a, 2, i0, j0, side), 0, side * side, 1000000.0, 0.0 -. 1000000.0) do
           (_, lake) -> (lo -. 8.0, fmax(hi +. 6.0, lake +. 1.0), fmax(lake, int_to_float(sea())))
@@ -954,7 +1284,12 @@ mod StrataViewer do
     end
   end
 
-  pfn island_full(a : Strata.Atlas.Atlas, scale : Float, cx : Int, cy : Int, cz : Int, seed : Int) : Strata.Chunk.Chunk do
+  -- how many columns an island chunk's area reaches past it each side: the trees' reach and one more for their slope
+  pfn tree_pad(d : Decor, scale : Float) : Int do
+    if List.length(decor_trees(d)) < 12 do 0 else float_to_int(Math.ceil(decor_reach(d) /. scale)) + 1 end
+  end
+
+  pfn island_full(a : Strata.Atlas.Atlas, d : Decor, scale : Float, cx : Int, cy : Int, cz : Int, seed : Int) : Strata.Chunk.Chunk do
     let x0 = cx * 32
     let y0 = cy * 32
     let z0 = cz * 32
@@ -962,8 +1297,15 @@ mod StrataViewer do
     let x0m = int_to_float(x0) *. scale
     let y0m = int_to_float(y0) *. scale
     let z0m = int_to_float(z0) *. scale
-    match area(a, scale, x0, z0, seed) do
-      Area(hs, cms, gs, ls, rs) ->
+    let pad = tree_pad(d, scale)
+    let n = 32 + 2 * pad
+    match area_n(a, scale, x0 - pad, z0 - pad, n, seed) do
+      Area(hp, cp, gp, lp, rp) ->
+        let hs = if pad == 0 do hp else inner_f32(hp, n, pad, NativeArray.make_f32(1024, 0.0), 0) end
+        let cms = if pad == 0 do cp else inner_f32(cp, n, pad, NativeArray.make_f32(1024, 0.0), 0) end
+        let gs = if pad == 0 do gp else inner_int(gp, n, pad, NativeArray.make_int(1024, 0), 0) end
+        let ls = if pad == 0 do lp else inner_int(lp, n, pad, NativeArray.make_int(1024, 0), 0) end
+        let rs = if pad == 0 do rp else inner_int(rp, n, pad, NativeArray.make_int(1024, 0), 0) end
         let ens0 = NativeArray.make_f32(1024, 0.0)
         let ens = if Ns.field2(single_s(), Strata.Seed.mix(seed, 9), 1.0 /. 120.0, x0m, z0m, scale, 32, 32, ens0) == 1024 do ens0 else ens0 end
         let ns = dens_field(seed, x0m, y0m, z0m, scale)
@@ -978,39 +1320,46 @@ mod StrataViewer do
         let dens = if any_cut(dens0, 0) do drop_islands(dens0) else dens0 end
         let above = above_go(hs, cms, ens, fs, ns, ta, tb, cav, NativeArray.make_f32(1024, 0.0), y0m +. 32.0 *. scale, seam, 0)
         let mats = Strata.Surface.scan_wet(dens, above, NativeArray.make_int(1024, sv - y0), fn (depth, yl, wet) -> material(depth, y0 + yl, sv, scale, wet))
-        let done = finish_go(mats, gs, ls, rs, x0, y0, z0, sv, scale, seed, 0)
-        let bases = bases_go(hs, cms, ens, ls, rs, x0, z0, seed, scale, NativeArray.make_int(1024, 0), 0)
-        Ch.from_flat(trees_go(done, bases, NativeArray.make_int(1024, 0), x0, y0, z0, scale, seed, 0))
+        let land = Ch.from_flat(finish_go(mats, gs, ls, rs, x0, y0, z0, sv, scale, seed, 0))
+        -- a tree stands at least H - A, so a chunk wholly under that holds none
+        let (low, _) = span_go(hp, 0, n * n, 1000000.0, 0.0 -. 1000000.0)
+        let ts = if (int_to_float(y0 + 32) *. scale) < low -. amp() do Nil else island_trees(a, d, hp, cp, lp, rp, cx, cz, pad, seed, scale) end
+        ruins_into(a, d, trees_into(land, Strata.Coord.key(cx, cy, cz), ts), cx, cy, cz, scale, seed)
     end
   end
 
-  doc "The island chunk's early-out at chunk coordinates (cx, cy, cz), decided from the atlas alone: 0 wholly air, 1 wholly stone, -1 when the chunk must be generated in full."
+  doc "The island chunk's early-out at chunk coordinates (cx, cy, cz), decided from the atlas alone: 0 wholly air, 1 wholly stone, -1 when the chunk must be generated in full. Room is left for trees and ruins (feature_top over the ground)."
   fn island_early(a : Strata.Atlas.Atlas, scale : Float, cx : Int, cy : Int, cz : Int) : Int do
     let y0m = int_to_float(cy * 32) *. scale
     match quick_bounds(a, int_to_float(cx * 32) *. scale, int_to_float(cz * 32) *. scale, scale) do
       (lo, hi, wet) ->
-        if y0m > fmax(hi +. amp() /. squash(), wet) +. 8.0 do 0
+        if y0m > fmax(hi +. amp() /. squash(), wet) +. feature_top() do 0
         else if y0m +. 31.0 *. scale < lo -. amp() /. squash() -. 40.0 do 1
         else 0 - 1 end end
     end
   end
 
-  doc "The island chunk at chunk coordinates (cx, cy, cz) generated in full, without the early-outs (for checking them)."
-  fn island_full_chunk(a : Strata.Atlas.Atlas, scale : Float, cx : Int, cy : Int, cz : Int, seed : Int) : Strata.Chunk.Chunk do
-    island_full(a, scale, cx, cy, cz, seed)
+  doc "The island chunk at chunk coordinates (cx, cy, cz) generated in full with the trees and ruins of d, without the early-outs (for checking them)."
+  fn island_full_chunk(a : Strata.Atlas.Atlas, d : Decor, scale : Float, cx : Int, cy : Int, cz : Int, seed : Int) : Strata.Chunk.Chunk do
+    island_full(a, d, scale, cx, cy, cz, seed)
   end
 
-  doc "The island chunk at chunk coordinates (cx, cy, cz) for [seed], read from atlas [a], in a world of [scale] metres a voxel. Pure."
+  doc "The island chunk at chunk coordinates (cx, cy, cz) for [seed], read from atlas [a], in a world of [scale] metres a voxel: the land alone, no trees or ruins (a site's ground is pulled to its floor all the same). Pure."
   fn island_terrain(a : Strata.Atlas.Atlas, scale : Float, cx : Int, cy : Int, cz : Int, seed : Int) : Strata.Chunk.Chunk do
-    let e = island_early(a, scale, cx, cy, cz)
-    if e >= 0 do Ch.uniform(e) else island_full(a, scale, cx, cy, cz, seed) end
+    island_decorated(a, bare_decor(), scale, cx, cy, cz, seed)
   end
 
-  doc "The chunk of the viewer's land at key k for seed, in 1 m voxels."
-  fn land_chunk(land : Land, k : Strata.Coord.Key, seed : Int) : Strata.Chunk.Chunk do
+  doc "The island chunk at chunk coordinates (cx, cy, cz) with the trees and ruins of d. Pure."
+  fn island_decorated(a : Strata.Atlas.Atlas, d : Decor, scale : Float, cx : Int, cy : Int, cz : Int, seed : Int) : Strata.Chunk.Chunk do
+    let e = island_early(a, scale, cx, cy, cz)
+    if e >= 0 do Ch.uniform(e) else island_full(a, d, scale, cx, cy, cz, seed) end
+  end
+
+  doc "The chunk of the viewer's land at key k for seed, in 1 m voxels, with the trees and ruins of d."
+  fn land_chunk(land : Land, d : Decor, k : Strata.Coord.Key, seed : Int) : Strata.Chunk.Chunk do
     match land do
-      Noise -> terrain(1.0, Strata.Coord.kx(k), Strata.Coord.ky(k), Strata.Coord.kz(k), seed)
-      Island(a) -> island_terrain(a, 1.0, Strata.Coord.kx(k), Strata.Coord.ky(k), Strata.Coord.kz(k), seed)
+      Noise -> terrain_with(d, 1.0, Strata.Coord.kx(k), Strata.Coord.ky(k), Strata.Coord.kz(k), seed)
+      Island(a) -> island_decorated(a, d, 1.0, Strata.Coord.kx(k), Strata.Coord.ky(k), Strata.Coord.kz(k), seed)
     end
   end
 
@@ -1413,6 +1762,9 @@ mod StrataViewer do
   --   11 walk         standing on the ground at the origin; a scripted run walks forward
   --   22 river mouth  the island's widest river where it meets the sea, from out at sea
   --   23 lake bank    the test lake from its bank opposite the outlet, looking down across it to the river leaving it
+  --   26 forest border standing on a chunk border, looking along it through the trees either side
+  --   27 ruin slope   the ruin on the steepest site, from down its slope
+  --   28..31 trees    an oak, a birch, a pine and a willow close up
   --   0  (the default) the same spot, for playing: walking, with the keyboard and mouse
   -- Scenes 18, 19 and 23 use the lake scene_lake picks on the land in use (the
   -- island's deepest lake near the origin; on the noise terrain, test_lake's).
@@ -1430,14 +1782,14 @@ mod StrataViewer do
   end
 
   -- The first column in a fixed walk of the 128 x 128 columns about the origin
-  -- that carries a lantern post and no tree. The origin if there is none.
+  -- that carries a lantern post. The origin if there is none.
   pfn first_post(seed : Int, i : Int) : (Int, Int) do
     if i >= 16384 do (0, 0)
     else
       let x = i % 128 - 64
       let z = i / 128 - 64
       let h = height(x, z, seed)
-      if has_post(x, z, int_to_float(h), seed) && !has_tree(x, z, int_to_float(h), seed) do (x, z) else first_post(seed, i + 1) end
+      if has_post(x, z, int_to_float(h), seed) do (x, z) else first_post(seed, i + 1) end
     end
   end
 
@@ -1516,6 +1868,37 @@ mod StrataViewer do
     end
   end
 
+  -- the top of the ground at a whole-metre column: the island's density top (overhangs and the density
+  -- noise included), the noise terrain's height
+  pfn ground_top(land : Land, wx : Int, wz : Int, seed : Int) : Int do
+    match land do
+      Noise -> land_height(land, wx, wz, seed)
+      Island(a) ->
+        match area_n(a, 1.0, wx - 1, wz - 1, 3, seed) do
+          Area(hs, cms, _, _, _) -> density_top(seed, wx, wz, NativeArray.get_f32(hs, 4), NativeArray.get_f32(cms, 4), 1.0)
+        end
+    end
+  end
+
+  -- the direction 0..15 in which the ground 12 m from (wx, wz) stands nearest the tree's ground top y: a level view of it
+  pfn open_dir(land : Land, seed : Int, wx : Int, y : Int, wz : Int, i : Int, best : Int, bh : Int) : Int do
+    if i >= 16 do best
+    else
+      let h = int_abs(ground_top(land, at_x(wx, i, 12), at_z(wz, i, 12), seed) - y)
+      if h < bh do open_dir(land, seed, wx, y, wz, i + 1, i, h) else open_dir(land, seed, wx, y, wz, i + 1, best, bh) end
+    end
+  end
+
+  -- a camera 12 m from a tree's base column (wx, wz) on its most level side, 4 m over the higher of
+  -- the tree's ground top y and the ground under the camera, looking at the tree's middle
+  pfn tree_pose(land : Land, seed : Int, wx : Int, y : Int, wz : Int) : (Float, Float, Float, Float, Float) do
+    let d = open_dir(land, seed, wx, y, wz, 0, 0, 1000000)
+    let cx = at_x(wx, d, 12)
+    let cz = at_z(wz, d, 12)
+    let ey = fmax(int_to_float(y), int_to_float(ground_top(land, cx, cz, seed))) +. 4.0
+    (int_to_float(cx) +. 0.5, ey, int_to_float(cz) +. 0.5, int_to_float((d + 8) % 16) *. 0.39269908, 0.0 -. Math.atan2(ey -. (int_to_float(y) +. 5.0), 12.0))
+  end
+
   pfn pose(scene : Int, seed : Int, land : Land, tl : (Int, Int, Int, Int, Int, Int, Int)) : (Float, Float, Float, Float, Float) do
     if scene == 0 || scene == 11 do (0.5, int_to_float(land_height(land, 0, 0, seed)) +. 2.7, 0.5, 0.62, -0.1)
     else if scene == 2 do
@@ -1557,6 +1940,25 @@ mod StrataViewer do
     else if scene == 5 do (-42.0, int_to_float(land_height(land, -35, 53, seed)) +. 7.0, 44.0, 2.5, -0.25)
     else if scene == 3 do (-45.0, int_to_float(land_height(land, -45, 40, seed)) +. 2.6, 40.0, 2.5, -0.05)
     else if scene == 22 do mouth_pose(land, seed)
+    -- 26: standing on the chunk border x = -32 at z = 8, looking along it (-z) through the trees
+    -- either side (8 trees within 10 m of the line over z -32..-1, the most of 64 borders searched)
+    else if scene == 26 do (-32.0, int_to_float(ground_top(land, -32, 8, seed)) +. 2.7, 8.0, 0.0, -0.08)
+    -- 27: the site on the steepest ground, from 30 m down its slope and 10 m up
+    else if scene == 27 do
+      match land do
+        Island(a) ->
+          match slope_site(a) do
+            Some(s) -> facing(land, seed, float_to_int(Strata.Atlas.s_x(s)), float_to_int(Strata.Atlas.s_z(s)), 30, 10, low_dir(a, s, 0, 0, 1000000.0))
+            None -> (-70.0, int_to_float(land_height(land, 0, 0, seed)) +. 46.0, 96.0, 0.62, -0.42)
+          end
+        Noise -> (-70.0, int_to_float(land_height(land, 0, 0, seed)) +. 46.0, 96.0, 0.62, -0.42)
+      end
+    -- 28 to 31: one tree close up from its most open side, an oak, a birch, a pine and a willow standing alone at seed 7
+    -- (base column and ground top found by a scripted search of the island's trees)
+    else if scene == 28 do tree_pose(land, seed, -2, 96, -11)
+    else if scene == 29 do tree_pose(land, seed, -20, 83, -46)
+    else if scene == 30 do tree_pose(land, seed, 82, 99, -28)
+    else if scene == 31 do tree_pose(land, seed, -51, 68, -398)
     -- the steepest island slope found (a 6.6 m drop over 3 m at (-180, -200)) and a cavern
     -- the caves open on a snowy hill (its floor at 64 m under ground near 80 m, at (44, 78)):
     -- found by a scripted search of the island at seed 7
@@ -1571,7 +1973,7 @@ mod StrataViewer do
           let ey = int_to_float(land_height(land, bx, bz, seed)) +. 5.0
           (int_to_float(bx) +. 0.5, ey, int_to_float(bz) +. 0.5, int_to_float(d) *. 0.39269908, 0.0 -. Math.atan2(ey -. int_to_float(line), int_to_float(2 * rad + 8)))
       end
-    else (-70.0, int_to_float(land_height(land, 0, 0, seed)) +. 46.0, 96.0, 0.62, -0.42) end end end end end end end end end end end end end end end end end end end
+    else (-70.0, int_to_float(land_height(land, 0, 0, seed)) +. 46.0, 96.0, 0.62, -0.42) end end end end end end end end end end end end end end end end end end end end end end end end end
   end end
 
   -- The land for STRATA_ISLAND: the island's atlas from the cache in
@@ -1592,7 +1994,7 @@ mod StrataViewer do
   -- STRATA_CHUNK_TIMES=1: generate each of 200 surface chunks (10 x 20 about
   -- the origin, cy holding the ground at the chunk's middle) 10 times on one
   -- task, print the median and worst time a chunk on the land in use, and exit.
-  pfn time_go(land : Land, seed : Int, k : Int, acc : List(Int)) : List(Int) do
+  pfn time_go(land : Land, d : Decor, seed : Int, k : Int, acc : List(Int)) : List(Int) do
     if k >= 200 do acc
     else
       let cx = k % 10 - 5
@@ -1600,40 +2002,40 @@ mod StrataViewer do
       let cy = Strata.Coord.chunk_of(land_height(land, cx * 32 + 16, cz * 32 + 16, seed))
       let key = Strata.Coord.key(cx, cy, cz)
       let t0 = unix_time_ms()
-      let forms = gen_n(land, key, seed, 10, 0)
+      let forms = gen_n(land, d, key, seed, 10, 0)
       -- hundredths of a millisecond a chunk; the forms are used so no call is dropped (GAPS S9)
-      time_go(land, seed, k + 1, Cons((unix_time_ms() - t0) * 10 + (if forms < 0 do 1 else 0 end), acc))
+      time_go(land, d, seed, k + 1, Cons((unix_time_ms() - t0) * 10 + (if forms < 0 do 1 else 0 end), acc))
     end
   end
-  pfn gen_n(land : Land, key : Strata.Coord.Key, seed : Int, left : Int, acc : Int) : Int do
-    if left <= 0 do acc else gen_n(land, key, seed, left - 1, acc + Ch.form(land_chunk(land, key, seed))) end
+  pfn gen_n(land : Land, d : Decor, key : Strata.Coord.Key, seed : Int, left : Int, acc : Int) : Int do
+    if left <= 0 do acc else gen_n(land, d, key, seed, left - 1, acc + Ch.form(land_chunk(land, d, key, seed))) end
   end
   -- the early-outs: each of the 200 columns' chunk 7 over (air) or 7 under
   -- (stone) the ground chunk, made 100 times; (total ms, the forms seen summed)
-  pfn early_go(land : Land, seed : Int, dy : Int, k : Int, ms : Int, forms : Int) : (Int, Int) do
+  pfn early_go(land : Land, d : Decor, seed : Int, dy : Int, k : Int, ms : Int, forms : Int) : (Int, Int) do
     if k >= 200 do (ms, forms)
     else
       let cx = k % 10 - 5
       let cz = k / 10 - 10
       let cy = Strata.Coord.chunk_of(land_height(land, cx * 32 + 16, cz * 32 + 16, seed)) + dy
       let t0 = unix_time_ms()
-      let f = gen_n(land, Strata.Coord.key(cx, cy, cz), seed, 100, 0)
-      early_go(land, seed, dy, k + 1, ms + unix_time_ms() - t0, forms + f)
+      let f = gen_n(land, d, Strata.Coord.key(cx, cy, cz), seed, 100, 0)
+      early_go(land, d, seed, dy, k + 1, ms + unix_time_ms() - t0, forms + f)
     end
   end
   -- 20000 chunks in ms is twentieths of a microsecond each: as microseconds with two places
   pfn early_us(ms : Int) : String do hundredths(ms * 5) end
   pfn hundredths(v : Int) : String do int_to_string(v / 100) ++ "." ++ String.pad_left(int_to_string(v % 100), 2, "0") end
-  pfn chunk_times(land : Land, seed : Int) : Unit do
-    let ts = List.sort_by(time_go(land, seed, 0, Nil), fn (p, q) -> p < q)
+  pfn chunk_times(land : Land, d : Decor, seed : Int) : Unit do
+    let ts = List.sort_by(time_go(land, d, seed, 0, Nil), fn (p, q) -> p < q)
     println("strata_viewer: " ++ (match land do
         Noise -> "noise"
         Island(_) -> "island"
       end) ++ " chunks: median " ++ hundredths(List.nth(ts, 100)) ++ " ms, worst " ++ hundredths(List.nth(ts, 199)) ++ " ms over 200 surface chunks, 10 runs each on one task")
-    match early_go(land, seed, 7, 0, 0, 0) do
+    match early_go(land, d, seed, 7, 0, 0, 0) do
       (ms, forms) -> println("strata_viewer: air early-out " ++ early_us(ms) ++ " us a chunk over 200 chunks 7 over the ground, 100 runs each (" ++ int_to_string(forms) ++ " not uniform)")
     end
-    match early_go(land, seed, 0 - 7, 0, 0, 0) do
+    match early_go(land, d, seed, 0 - 7, 0, 0, 0) do
       (ms, forms) -> println("strata_viewer: stone early-out " ++ early_us(ms) ++ " us a chunk over 200 chunks 7 under the ground, 100 runs each (" ++ int_to_string(forms) ++ " not uniform)")
     end
   end
@@ -1646,7 +2048,10 @@ mod StrataViewer do
     let size = window_size()
     let scene = Env.get_int("STRATA_SCENE", 0)
     let land = load_land(seed)
-    if Env.get_int("STRATA_CHUNK_TIMES", 0) == 1 do chunk_times(land, seed) else () end
+    let td = unix_time_ms()
+    let dec = decor(1.0, seed)
+    println("strata_viewer: " ++ int_to_string(List.length(decor_trees(dec))) ++ " tree templates and " ++ int_to_string(List.length(decor_ruins(dec))) ++ " ruins built in " ++ int_to_string(unix_time_ms() - td) ++ " ms")
+    if Env.get_int("STRATA_CHUNK_TIMES", 0) == 1 do chunk_times(land, dec, seed) else () end
     let tl = scene_lake(land, seed)
     -- the soak starts on its circuit, 60 m over the origin's ground, looking down a little
     let mid = soak_mid(tl)
@@ -1669,7 +2074,7 @@ mod StrataViewer do
       let ez = match start do (_, _, z, _, _) -> z end
       let yaw0 = match start do (_, _, _, a, _) -> a end
       let pitch0 = match start do (_, _, _, _, a) -> a end
-      let world = Strata.World.new(reg, Strata.Terrain.gen(fn (k, sd) -> land_chunk(land, k, sd)), seed, 1.0)
+      let world = Strata.World.new(reg, Strata.Terrain.gen(fn (k, sd) -> land_chunk(land, dec, k, sd)), seed, 1.0)
       let t0 = Strata.Ffi.Vk.time()
       let s0 = Strata.Stream.run_until_settled(Strata.Stream.set_focus(Strata.Stream.start(world, Strata.Stream.config(r, 3, 32, 8)), Cons((ex, ey, ez), Nil)), 1000000)
       let t1 = Strata.Ffi.Vk.time()
