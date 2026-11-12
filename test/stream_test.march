@@ -63,6 +63,30 @@ mod Strata.Test.Stream do
     h
   end
 
+  -- ── Levels ───────────────────────────────────────────────────────────────
+  -- the same land at levels 0..2: stone under y = 0, the pillar at every level
+  pfn layered() : Strata.Terrain.Gen do
+    Strata.Terrain.gen_levels(fn (k, seed) ->
+      if Cd.ky(k) < 0 do C.uniform(1)
+      else if Cd.ky(k) == 0 do C.fill_box(C.uniform(0), 3, 0, 3, 3, (Cd.kx(k) * 7 + Cd.kz(k) * 13 + seed + Cd.level(k)) % 9 + 9, 3, 1)
+      else C.uniform(0) end end, 2)
+  end
+  pfn begin_levels() : Strata.Stream.Stream do
+    Sm.start(Wd.new(reg(), layered(), 7, 1.0), Sm.config_levels(2, 1, 8, 4, 2, 1, 2))
+  end
+  pfn at_level(s : Strata.Stream.Stream, l : Int) : Int do
+    Strata.Store.fold(Wd.chunks(Sm.world(s)), 0, fn (n, k, _c) -> if Cd.level(k) == l do n + 1 else n end)
+  end
+  pfn mesh_levels(l : List((Strata.Coord.Key, Strata.Mesh.Meshed))) : Bool do
+    match l do
+      Nil -> true
+      Cons((k, m), t) -> if Strata.Mesh.level(m) != Cd.level(k) do false else mesh_levels(t) end
+    end
+  end
+  pfn mesh_at(l : List((Strata.Coord.Key, Strata.Mesh.Meshed)), lv : Int) : Int do
+    List.fold_left(l, 0, fn (n, p) -> match p do (k, _) -> if Cd.level(k) == lv do n + 1 else n end end)
+  end
+
   describe "Stream" do
     test "loads the box around the focus and meshes every chunk with all its neighbours" do
       let s = at(begin(8, 2), 0.5, 0.5, 0.5)
@@ -200,6 +224,44 @@ mod Strata.Test.Stream do
       let s = Sm.run_until_settled(Sm.set_focus(begin(8, 2), Cons((0.5, 0.5, 0.5), Cons((640.5, 0.5, 0.5), Nil))), 20000)
       Test.assert_eq_int(Sm.loaded_count(s), 150, "two boxes that do not touch")
       Sm.stop(s)
+    end
+    test "with levels, a settled stream holds each level's box, meshes carry their level, and the world is the same by two paths" do
+      let s = at(begin_levels(), 0.5, 0.5, 0.5)
+      Test.assert_eq_int(at_level(s, 0), 75, "level 0: 5 x 3 x 5")
+      Test.assert_eq_int(at_level(s, 1), 75, "level 1: 5 x 3 x 5 of its own chunks")
+      Test.assert_eq_int(at_level(s, 2), 75, "level 2 likewise")
+      Test.assert_eq_int(Sm.loaded_count(s), 225, "nothing else")
+      match Sm.take_meshes(s) do
+        (s1, ms) ->
+          Test.assert_eq_int(mesh_at(ms, 1), 9, "level 1 meshes its inner 3 x 1 x 3")
+          Test.assert_eq_int(mesh_at(ms, 2), 9, "and level 2")
+          Test.assert_true(mesh_levels(ms), "each mesh carries its key's level")
+          let a = at(at(s1, 3200.5, 0.5, 0.5), 300.5, 40.5, -200.5)
+          let b = at(at(begin_levels(), -1600.5, 0.5, 1600.5), 300.5, 40.5, -200.5)
+          Test.assert_eq_int(Sm.loaded_count(a), Sm.loaded_count(b), "the same chunks")
+          Test.assert_eq_int(Sm.world_hash(a), Sm.world_hash(b), "the same world")
+          Sm.stop(a)
+          Sm.stop(b)
+      end
+    end
+
+    test "an edit makes its ancestors stale; a tick later they are regenerated with the edit coarsened in" do
+      let s = at(begin_levels(), 0.5, 0.5, 0.5)
+      -- a 2 x 2 x 2 carve aligned to a level-1 voxel, deep in stone
+      let o = Ed.fill_box(Sm.world(s), 4, -6, 4, 5, -5, 5, 0)
+      let st = Wd.stale(Ed.world(o))
+      Test.assert_true(has_key(st, Cd.key_at(0, -1, 0, 1)), "the level-1 ancestor is stale")
+      Test.assert_true(has_key(st, Cd.key_at(0, -1, 0, 2)), "and the level-2 one")
+      let s2 = Sm.tick(Sm.apply(s, o))
+      Test.assert_eq_int(List.length(Wd.stale(Sm.world(s2))), 0, "nothing stale after the tick")
+      let c1 = Strata.Store.get(Wd.chunks(Sm.world(s2)), Cd.key_at(0, -1, 0, 1))
+      Test.assert_eq_int(C.get(c1, 2, 29, 2), 0, "the carve is one air voxel at level 1")
+      Test.assert_eq_int(C.get(c1, 3, 29, 2), 1, "its neighbour is stone")
+      Test.assert_eq_int(C.get(c1, 2, 28, 2), 1, "and below it")
+      let c2 = Strata.Store.get(Wd.chunks(Sm.world(s2)), Cd.key_at(0, -1, 0, 2))
+      Test.assert_eq_int(C.get(c2, 1, 30, 1), 1, "at level 2 the stone around it wins")
+      Test.assert_eq_int(C.uniform_id(Wd.coarsen(Sm.world(s2), Cd.key_at(1, -1, 0, 1))), 1, "an ancestor of no edit is the generated chunk")
+      Sm.stop(s2)
     end
   end
 end

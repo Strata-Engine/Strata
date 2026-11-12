@@ -212,6 +212,20 @@ let (s3, gone) = Strata.Stream.take_unloads(s2)
 let s4 = Strata.Stream.apply(s3, Strata.Edit.fill_sphere(Strata.Stream.world(s3), 0, 0, 0, 6, 0))
 ```
 
+Levels of detail (the far field, Part F of
+`docs/2026-11-10-renderer-design.md`): a generator made with
+`Strata.Terrain.gen_levels(f, max_level)` makes a chunk for a key of any
+level up to `max_level` (`Strata.Coord.key_at(cx, cy, cz, level)`): 32
+voxels a side, each `scale * 2^level` metres, so it should be solid where
+any fine voxel under it would be. `Strata.Stream.config_levels(6, 3, 8, 4,
+10, 1, 4)` also keeps, for each level 1..4, a box 10 of that level's
+chunks out and 1 up and down about the focus; `take_meshes` returns meshes
+of every level (`Strata.Mesh.level`). Edits stay at level 0: a coarse
+chunk has the edited level-0 chunks under it coarsened over it
+(`Strata.World.coarsen`), and an edit makes its ancestors stale
+(`Strata.World.stale`), which the stream builds again on its next tick.
+Nothing draws the coarse levels yet.
+
 ## Modules
 
 | Module | Holds |

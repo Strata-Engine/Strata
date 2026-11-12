@@ -49,24 +49,19 @@ mod Strata.Mesh do
     end
   end
 
-  doc "The 27 chunks about [k] in store [s]; a chunk the store lacks reads as the store's fill."
+  doc "The 27 chunks about [k] in store [s], at [k]'s level; a chunk the store lacks reads as the store's fill."
   fn around_of(s : Strata.Store.Store(Strata.Chunk.Chunk), k : Strata.Coord.Key) : Around do
-    let cx = Strata.Coord.kx(k)
-    let cy = Strata.Coord.ky(k)
-    let cz = Strata.Coord.kz(k)
-    around_from(fn (dx, dy, dz) -> Strata.Store.get(s, Strata.Coord.key(cx + dx, cy + dy, cz + dz)))
+    around_from(fn (dx, dy, dz) -> Strata.Store.get(s, Strata.Coord.offset(k, dx, dy, dz)))
   end
 
-  pfn has_go(s : Strata.Store.Store(Strata.Chunk.Chunk), cx : Int, cy : Int, cz : Int, i : Int) : Bool do
+  pfn has_go(s : Strata.Store.Store(Strata.Chunk.Chunk), k : Strata.Coord.Key, i : Int) : Bool do
     if i >= 27 do true
-    else if Strata.Store.has(s, Strata.Coord.key(cx + i % 3 - 1, cy + i / 9 - 1, cz + (i / 3) % 3 - 1)) do has_go(s, cx, cy, cz, i + 1)
+    else if Strata.Store.has(s, Strata.Coord.offset(k, i % 3 - 1, i / 9 - 1, (i / 3) % 3 - 1)) do has_go(s, k, i + 1)
     else false end end
   end
 
-  doc "Are [k] and all 26 of its neighbours in the store? A chunk is meshed only when they are, so no face is drawn against a chunk that has not arrived."
-  fn has_all(s : Strata.Store.Store(Strata.Chunk.Chunk), k : Strata.Coord.Key) : Bool do
-    has_go(s, Strata.Coord.kx(k), Strata.Coord.ky(k), Strata.Coord.kz(k), 0)
-  end
+  doc "Are [k] and all 26 of its neighbours at its level in the store? A chunk is meshed only when they are, so no face is drawn against a chunk that has not arrived."
+  fn has_all(s : Strata.Store.Store(Strata.Chunk.Chunk), k : Strata.Coord.Key) : Bool do has_go(s, k, 0) end
 
   pfn off(v : Int) : Int do if v < 0 do -1 else if v > 31 do 1 else 0 end end end
 
@@ -107,12 +102,13 @@ mod Strata.Mesh do
   pfn qb_len(q : QBuf) : Int do match q do QBuf(_, n) -> n end end
 
   -- opaque, cutout, translucent quads; instances; the centre's occupancy;
-  -- its light classes (32768 bytes by flat index, or 1 when it is one class throughout)
-  type Meshed = Meshed(QBuf, QBuf, QBuf, QBuf, NativeU8Arr, NativeU8Arr)
+  -- its light classes (32768 bytes by flat index, or 1 when it is one class
+  -- throughout); the level of detail of its key
+  type Meshed = Meshed(QBuf, QBuf, QBuf, QBuf, NativeU8Arr, NativeU8Arr, Int)
 
   pfn layer_buf(m : Meshed, l : Int) : QBuf do
     match m do
-      Meshed(q0, q1, q2, _, _, _) -> if l == 1 do q1 else if l == 2 do q2 else q0 end end
+      Meshed(q0, q1, q2, _, _, _, _) -> if l == 1 do q1 else if l == 2 do q2 else q0 end end
     end
   end
 
@@ -123,22 +119,26 @@ mod Strata.Mesh do
   fn quads(m : Meshed, l : Strata.Blocks.Layer) : NativeI32Arr do quads_at(m, B.layer_number(l)) end
   fn quad_count(m : Meshed, l : Strata.Blocks.Layer) : Int do quad_count_at(m, B.layer_number(l)) end
   doc "The cross and model instances: two words each. Read `instance_count`."
-  fn instances(m : Meshed) : NativeI32Arr do match m do Meshed(_, _, _, qi, _, _) -> qb_arr(qi) end end
-  fn instance_count(m : Meshed) : Int do match m do Meshed(_, _, _, qi, _, _) -> qb_len(qi) / 2 end end
+  fn instances(m : Meshed) : NativeI32Arr do match m do Meshed(_, _, _, qi, _, _, _) -> qb_arr(qi) end end
+  fn instance_count(m : Meshed) : Int do match m do Meshed(_, _, _, qi, _, _, _) -> qb_len(qi) / 2 end end
   doc "The centre chunk's occupancy mask (Strata.Occupancy)."
-  fn occupancy(m : Meshed) : NativeU8Arr do match m do Meshed(_, _, _, _, o, _) -> o end end
+  fn occupancy(m : Meshed) : NativeU8Arr do match m do Meshed(_, _, _, _, o, _, _) -> o end end
   doc "The centre chunk's light classes for the renderer's light volume: 32768 bytes by flat index, or a single byte when every voxel has the same class."
-  fn light_bytes(m : Meshed) : NativeU8Arr do match m do Meshed(_, _, _, _, _, lb) -> lb end end
-  doc "The level of detail the mesh was built at. Always 0 for now."
+  fn light_bytes(m : Meshed) : NativeU8Arr do match m do Meshed(_, _, _, _, _, lb, _) -> lb end end
+  doc "The level of detail of the chunk the mesh was built for (`build` makes level 0; the stream sets its key's level)."
   fn level(m : Meshed) : Int do
-    match m do Meshed(_, _, _, _, _, _) -> 0 end
+    match m do Meshed(_, _, _, _, _, _, l) -> l end
+  end
+  doc "The mesh [m] marked as built for a chunk of level [l]."
+  fn with_level(m : Meshed, l : Int) : Meshed do
+    match m do Meshed(q0, q1, q2, qi, o, lb, _) -> Meshed(q0, q1, q2, qi, o, lb, l) end
   end
   doc "Bytes of mesh: eight per quad and per instance."
   fn bytes(m : Meshed) : Int do
     (quad_count_at(m, 0) + quad_count_at(m, 1) + quad_count_at(m, 2) + instance_count(m)) * 8
   end
 
-  pfn no_mesh(occ : NativeU8Arr, lb : NativeU8Arr) : Meshed do Meshed(qb_new(), qb_new(), qb_new(), qb_new(), occ, lb) end
+  pfn no_mesh(occ : NativeU8Arr, lb : NativeU8Arr) : Meshed do Meshed(qb_new(), qb_new(), qb_new(), qb_new(), occ, lb, 0) end
 
   pfn light_go(lb : NativeU8Arr, r : Strata.Blocks.Registry, c : Strata.Chunk.Chunk, i : Int) : NativeU8Arr do
     if i < 0 || i >= 32768 do lb else light_go(NativeArray.set_u8(lb, i, B.light_class(r, C.get_idx(c, i))), r, c, i + 1) end
@@ -437,7 +437,7 @@ mod Strata.Mesh do
       match kind_go(NativeArray.make_u8(pvol(), 0), NativeArray.make_int(204, 0), NativeArray.make_int(pvol() + 1156, 0), ids, r, 0) do
         Kinds(kind, tally, fam) ->
           match faces(Bufs(qb_new(), qb_new(), qb_new()), NativeArray.make_int(1024, 0), ids, kind, fam, tally, r, 0) do
-            Bufs(q0, q1, q2) -> Meshed(q0, q1, q2, instances_go(qb_new(), ids, kind, r, 0), occ, lb)
+            Bufs(q0, q1, q2) -> Meshed(q0, q1, q2, instances_go(qb_new(), ids, kind, r, 0), occ, lb, 0)
           end
       end
     end end
