@@ -6,7 +6,8 @@
  * +16, data at +32 (8 bytes an element for NativeIntArr and NativeFloatArr,
  * 4 for NativeI32Arr and NativeF32Arr, 1 for NativeU8Arr). Inputs are only
  * read; en_x_each, en_x_column, en_x_ray, en_x_events, en_x_near,
- * en_x_ray_entities and en_x_sweep fill a caller-owned
+ * en_x_ray_entities, en_x_sweep, en_x_releases, en_x_seen_parts and
+ * en_x_wanting fill a caller-owned
  * array, as strata_anim.c's matrices do. Reads of three numbers come back one
  * number a call (en_x_get's k). Calls March makes only for their effect
  * answer an Int it can use (GAPS S9).
@@ -14,7 +15,7 @@
  * With no world open every call does nothing and answers its default
  * (0, -1 for a kind or an id, 0.0). */
 /* Rewritten by stamp_ent.sh whenever strata_ent.h, strata_ent_grid.h, strata_ent_move.h or strata_ent_seen.h changes (GAPS S14). */
-#define STRATA_ENT_STAMP "fc3da581034d3fe3"
+#define STRATA_ENT_STAMP "58c156e853228233"
 #include <stdint.h>
 #include <time.h>
 #include "strata_ent.h"
@@ -228,6 +229,42 @@ int64_t en_x_follow(int64_t id, int64_t route, double speed, int64_t loops) {
 int64_t en_x_grounded(int64_t id) { return g_w ? en_grounded(g_w, id) : 0; }
 /* 1 if the entity was seen at the end of the last tick */
 int64_t en_x_seen(int64_t id) { return g_w ? en_seen(g_w, id) : 0; }
+
+/* ---- parts ---- */
+/* part (0 figure, 1 body, 2 voice 0, 3 voice 1) of entity id; -1 for none */
+int64_t en_x_part(int64_t id, int64_t part) { return g_w && part >= 0 && part < EN_PARTS ? en_part(g_w, id, (int)part) : -1; }
+/* answers 1 */
+int64_t en_x_set_part(int64_t id, int64_t part, int64_t v) {
+    if (g_w) en_set_part(g_w, id, part < 0 || part >= EN_PARTS ? -1 : (int)part, v);
+    return 1;
+}
+/* answers 1 */
+int64_t en_x_figure_refused(int64_t kind) {
+    if (g_w) en_figure_refused(g_w, kind < 0 || kind >= EN_KINDS ? -1 : (int)kind);
+    return 1;
+}
+int64_t en_x_release_count(void) { return g_w ? g_w->nrel : 0; }
+/* drains the release list into a NativeI32Arr of codes and a NativeIntArr of ids, as many as both hold; how many */
+int64_t en_x_releases(void *codes, void *ids) {
+    if (!g_w || !codes || !ids) return 0;
+    int64_t a = en_x_len(codes), b = en_x_len(ids), n = a < b ? a : b;
+    return en_releases(g_w, n > INT32_MAX ? INT32_MAX : (int)n, en_x_i32(codes), en_x_i64(ids));
+}
+/* en_seen_parts into a NativeI32Arr of part ids and a NativeF32Arr of 7 floats each: how many written; with an empty id
+ * array, how many there are */
+int64_t en_x_seen_parts(int64_t part, void *ids, void *poses) {
+    if (!g_w || part < 0 || part >= EN_PARTS) return 0;
+    int64_t a = en_x_len(ids), b = en_x_len(poses) / 7, n = a < b ? a : b;
+    if (a <= 0) return en_seen_parts(g_w, (int)part, 0, NULL, NULL);
+    return en_seen_parts(g_w, (int)part, n > EN_CAPACITY_MAX ? EN_CAPACITY_MAX : (int)n, en_x_i32(ids), en_x_f32(poses));
+}
+/* en_wanting into a NativeIntArr: how many written; with an empty array, how many there are */
+int64_t en_x_wanting(int64_t part, void *ids) {
+    if (!g_w || part < 0 || part >= EN_PARTS) return 0;
+    int64_t n = en_x_len(ids);
+    if (n <= 0) return en_wanting(g_w, (int)part, 0, NULL);
+    return en_wanting(g_w, (int)part, n > EN_CAPACITY_MAX ? EN_CAPACITY_MAX : (int)n, en_x_i64(ids));
+}
 
 /* seconds on a monotonic clock, for timing scenes; the kernel never reads it (its time is the dt it is given) */
 double en_x_clock(void) {

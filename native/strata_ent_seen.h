@@ -4,7 +4,8 @@
  *
  * The switch runs once a tick, after movement and before the grid (en_tick), over each kind's dense array, with d the
  * kind's seen distance and c the world's chunk side, distances measured horizontally (x and z) to the nearest focus:
- *  - a seen entity farther than d + c from every focus becomes unseen: event 4, its grounded flag cleared, then its
+ *  - a seen entity farther than d + c from every focus becomes unseen: event 4, its grounded flag cleared and its parts
+ *    released (en_release_parts: a figure or voices are the game's to free, and come back as it is seen again), then its
  *    kind's unseen rule: live, it goes on (moved as unseen); freeze, it neither moves nor ages until seen again;
  *    remove, it is removed at once (event 6, reason 2, straight after its event 4);
  *  - an unseen entity within d of a focus is a candidate. A flyer, a placed or a bodied one becomes seen at once,
@@ -156,6 +157,7 @@ static inline void en_switch(EnWorld *w, int nfocus, const double *focus) {
                 if (en_seen_by(p, d + w->chunk_metres, nfocus, focus)) { seen++; i++; continue; }
                 int64_t id = en_id(w, r);
                 w->flags[r] &= (uint8_t)~(EN_F_SEEN | EN_F_GROUNDED);
+                en_release_parts(w, r);
                 en_event(w, EN_E_LEFT, id, 0, 0, 0, 0, 0, p[0], p[1], p[2]);
                 int rule = kd->ints[EN_K_UNSEEN];
                 if (rule == 2) { en_remove(w, id, 2); continue; }

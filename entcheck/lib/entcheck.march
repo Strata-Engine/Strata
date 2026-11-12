@@ -11,9 +11,14 @@ mod Entcheck do
   needs IO.Process
   needs IO.Foreign
   needs Ent
+  needs Anim
 
   alias Strata.Entities as En
   alias Strata.Ffi.Ent as Ech
+  alias Strata.Anim as An
+  alias Strata.Rig as Rg
+  alias Strata.Clip as Cl
+  alias Strata.Sound as Snd
 
   pfn fail(msg : String) : Int do
     println(msg)
@@ -964,6 +969,252 @@ mod Entcheck do
       + check(!En.is_open(En.close(e2)), "closed"))
   end
 
+  -- ── Figures and voices ───────────────────────────────────────────────────
+  -- a rig of one part, a 0.2 m cube turning about its low corner, which its entity's position places
+  pfn cube_rig() : Strata.Rig.Rig do
+    match Rg.part(Rg.colour(Rg.new(0.1), 1, 0.6, 0.6, 0.6, 0.5, 0.0), -1, 0.0, 0.0, 0.0, 2, 2, 2) do
+      (r, p) -> Rg.box(r, p, 0, 0, 0, 1, 1, 1, 1)
+    end
+  end
+  pfn empty_world() : Strata.World.World do Strata.World.new(registry(), Strata.Terrain.gen(fn (k, seed) -> Strata.Chunk.uniform(0)), 41, 0.1) end
+  pfn physics() : Strata.Physics.Physics do Strata.Physics.new(registry(), Strata.Physics.config()) end
+  pfn figures(a : Strata.Anim.Anim) : Int do match An.stats(a) do (n, _, _, _) -> n end end
+
+  pfn add_row(e : Strata.Entities.Entities, ids : NativeIntArr, i : Int, n : Int, x0 : Float, dx : Float) : (Strata.Entities.Entities, NativeIntArr) do
+    if i >= n do (e, ids)
+    else
+      let (e1, id) = En.add(e, 0, x0 +. dx *. int_to_float(i), 0.0, 0.0, 0.0)
+      add_row(e1, NativeArray.set_int(ids, i, id), i + 1, n, x0, dx)
+    end
+  end
+  -- how many of ids have a figure (and, if voiced, voice 0)
+  pfn holding(e : Strata.Entities.Entities, ids : NativeIntArr, voiced : Bool, i : Int, n : Int) : Int do
+    if i >= NativeArray.length_int(ids) do n
+    else
+      let id = NativeArray.get_int(ids, i)
+      let has = if En.figure(e, id) < 0 do false else if voiced do En.voice(e, id, 0) >= 0 else true end end
+      holding(e, ids, voiced, i + 1, if has do n + 1 else n end)
+    end
+  end
+  pfn without_parts(e : Strata.Entities.Entities, ids : NativeIntArr, i : Int, n : Int) : Int do
+    if i >= NativeArray.length_int(ids) do n
+    else
+      let id = NativeArray.get_int(ids, i)
+      let none = if En.figure(e, id) != -1 do false else En.voice(e, id, 0) == -1 end
+      without_parts(e, ids, i + 1, if none do n + 1 else n end)
+    end
+  end
+  -- how many of ids' figures have their root's origin within 1e-4 m of the entity's position
+  pfn at_entity(e : Strata.Entities.Entities, a : Strata.Anim.Anim, ids : NativeIntArr, i : Int, n : Int) : Int do
+    if i >= NativeArray.length_int(ids) do n
+    else
+      let id = NativeArray.get_int(ids, i)
+      let m = An.matrices(a, En.figure(e, id))
+      let (x, y, z) = En.position(e, id)
+      let ok = if NativeArray.length_f32(m) < 12 do false
+        else Math.abs(NativeArray.get_f32(m, 9) -. x) < 0.0001 && Math.abs(NativeArray.get_f32(m, 10) -. y) < 0.0001 && Math.abs(NativeArray.get_f32(m, 11) -. z) < 0.0001 end
+      at_entity(e, a, ids, i + 1, if ok do n + 1 else n end)
+    end
+  end
+
+  -- parts: 10 placed entities near the focus and 10 far, of a kind with a one-part figure and one sound; one tick gives the
+  -- near ones a figure and a voice; moving the focus swaps them; a removal frees its figure by the next tick; figures stand
+  -- where their entities are and turn as they face
+  pfn parts_scene() : Int do
+    let rig_r = cube_rig()
+    let (a0, rig) = An.finish_rig(An.open(64), rig_r)
+    let kind = En.with_sound(En.with_figure(En.with_seen_distance(En.kind(), 20.0), rig), 1, 2, 0.5)
+    let e0 = world([kind], 64)
+    let (e1, near_ids) = add_row(e0, NativeArray.make_int(10, -1), 0, 10, 0.0, 1.0)
+    let (e2, far_ids) = add_row(e1, NativeArray.make_int(10, -1), 0, 10, 200.0, 1.0)
+    let w = empty_world()
+    let (e3, p3, a3, s3) = En.tick(e2, w, physics(), a0, Snd.new(), [(0.0, 0.0, 0.0)], 1.0 /. 60.0)
+    let bad = check(rig >= 0, "the cube rig is accepted")
+      + check(En.is_open(e3), "a kind with a figure and a sound opens")
+      + check(holding(e3, near_ids, true, 0, 0) == 10, "after one tick the 10 near entities have a figure and voice 0")
+      + check(without_parts(e3, far_ids, 0, 0) == 10, "... the 10 far ones neither")
+      + check(figures(a3) == 10, "... and Strata.Anim counts 10 figures")
+      + check(Snd.refused(s3) == 0, "no play refused")
+    let (e4, p4, a4, s4) = En.tick(e3, w, p3, a3, s3, [(205.0, 0.0, 0.0)], 1.0 /. 60.0)
+    let bad2 = check(holding(e4, far_ids, true, 0, 0) == 10, "moving the focus to the far ones gives them figures and voices")
+      + check(without_parts(e4, near_ids, 0, 0) == 10, "... and takes the near ones' away")
+      + check(figures(a4) == 10, "... still 10 figures")
+    let gone = NativeArray.get_int(far_ids, 3)
+    let gone_fig = En.figure(e4, gone)
+    let moved = NativeArray.get_int(far_ids, 5)
+    let e5 = En.set_facing(En.set_position(En.remove(e4, gone), moved, 210.5, 1.25, -3.0), moved, 1.0)
+    let (e6, _p6, a6, _s6) = En.tick(e5, w, p4, a4, s4, [(205.0, 0.0, 0.0)], 1.0 /. 60.0)
+    let a7 = An.update(a6, 1.0 /. 60.0)
+    let left = NativeArray.from_list_int(List.filter(NativeArray.to_list_int(far_ids), fn id -> id != gone))
+    let m = An.matrices(a7, En.figure(e6, moved))
+    let bad3 = check(figures(a6) == 9, "a removed entity's figure is freed by the next tick")
+      + check(NativeArray.length_f32(An.matrices(a7, gone_fig)) == 0, "... its figure is gone")
+      + check(at_entity(e6, a7, left, 0, 0) == 9, "after Strata.Anim.update every figure's root origin is its entity's position")
+      + check(Math.abs(NativeArray.get_f32(m, 9) -. 210.5) < 0.0001 && Math.abs(NativeArray.get_f32(m, 10) -. 1.25) < 0.0001, "... the moved one's too")
+      + check(Math.abs(NativeArray.get_f32(m, 0) -. Math.cos(1.0)) < 0.0001 && Math.abs(NativeArray.get_f32(m, 2) +. Math.sin(1.0)) < 0.0001, "... turned about +y by its facing")
+      + check(En.stat(e6, 10) == 0.0, "no figure refused")
+    report("parts", bad + bad2 + bad3 + check(!En.is_open(En.close(e6)), "closed") + check(An.capacity(An.close(a7)) == 0, "the figures closed"))
+  end
+
+  -- cap: room for 8 figures and 20 seen entities 1..20 m from the focus: the 8 nearest get one, 12 are refused; with 4 of
+  -- those 8 removed, the next 4 nearest get one at the next tick
+  pfn cap_scene() : Int do
+    let (a0, rig) = An.finish_rig(An.open(8), cube_rig())
+    let e0 = world([En.with_figure(En.with_seen_distance(En.kind(), 40.0), rig)], 64)
+    let (e1, ids) = add_row(e0, NativeArray.make_int(20, -1), 0, 20, 20.0, -1.0)
+    let w = empty_world()
+    let (e2, p2, a2, s2) = En.tick(e1, w, physics(), a0, Snd.new(), [(0.0, 0.0, 0.0)], 1.0 /. 60.0)
+    let nearest = NativeArray.from_list_int(List.drop(NativeArray.to_list_int(ids), 12))
+    let first4 = List.drop(NativeArray.to_list_int(ids), 16)
+    let next4 = NativeArray.from_list_int(List.take(List.drop(NativeArray.to_list_int(ids), 8), 4))
+    let bad = check(figures(a2) == 8, "8 figures made")
+      + check(holding(e2, ids, false, 0, 0) == 8, "8 entities have one")
+      + check(holding(e2, nearest, false, 0, 0) == 8, "... the 8 nearest the focus")
+      + check(En.stat(e2, 10) == 12.0, "the kind's refusal stat is 12 after one tick")
+    let e3 = List.fold_left(first4, e2, fn (e, id) -> En.remove(e, id))
+    let (e4, _p4, a4, _s4) = En.tick(e3, w, p2, a2, s2, [(0.0, 0.0, 0.0)], 1.0 /. 60.0)
+    let bad2 = check(figures(a4) == 8, "with 4 removed, 8 figures again at the next tick")
+      + check(holding(e4, next4, false, 0, 0) == 4, "... the next 4 nearest have one")
+      + check(holding(e4, ids, false, 0, 0) == 8, "... 8 of the 16 left")
+      + check(En.stat(e4, 10) == 20.0, "... and the 8 still without one were refused again (20 in all)")
+    report("cap", bad + bad2 + check(!En.is_open(En.close(e4)), "closed") + check(An.capacity(An.close(a4)) == 0, "the figures closed"))
+  end
+
+  -- ── The arena: 2,000 walkers with figures ────────────────────────────────
+  -- a rig of 6 parts at 0.1 m voxels, coloured by [shade]: a pelvis about its middle, a torso on it, and two legs of a
+  -- thigh and a shin, each hanging from its top
+  pfn arena_leg(r : Strata.Rig.Rig, pelvis : Int, x : Float) : Strata.Rig.Rig do
+    match Rg.part(r, pelvis, x, 0.0, 1.0, 1, 4, 1) do
+      (r1, thigh) ->
+        match Rg.part(Rg.box(Rg.anchor(r1, thigh, 0.5, 4.0, 0.5), thigh, 0, 0, 0, 0, 3, 0, 1), thigh, 0.5, 0.0, 0.5, 1, 4, 1) do
+          (r2, shin) -> Rg.box(Rg.anchor(r2, shin, 0.5, 4.0, 0.5), shin, 0, 0, 0, 0, 3, 0, 1)
+        end
+    end
+  end
+  pfn arena_rig(shade : Float) : Strata.Rig.Rig do
+    match Rg.part(Rg.colour(Rg.new(0.1), 1, shade, 0.4, 1.0 -. shade, 0.5, 0.0), -1, 0.0, 0.0, 0.0, 4, 2, 2) do
+      (r1, pelvis) ->
+        match Rg.part(Rg.box(Rg.anchor(r1, pelvis, 2.0, 1.0, 1.0), pelvis, 0, 0, 0, 3, 1, 1, 1), pelvis, 2.0, 2.0, 1.0, 4, 6, 2) do
+          (r2, torso) -> arena_leg(arena_leg(Rg.box(Rg.anchor(r2, torso, 2.0, 0.0, 1.0), torso, 0, 0, 0, 3, 5, 1, 1), pelvis, 0.5), pelvis, 3.5)
+        end
+    end
+  end
+  -- the walk: thighs swinging 25 degrees and shins 15, the legs half a stride apart, once a second
+  pfn arena_walk(r : Strata.Rig.Rig) : Strata.Clip.Clip do
+    Cl.swing(Cl.swing(Cl.swing(Cl.swing(Cl.new(r, 1.0, true), 2, 1.0, 0.0, 0.0, 25.0, 1.0, 0.0), 4, 1.0, 0.0, 0.0, 25.0, 1.0, 0.5), 3, 1.0, 0.0, 0.0, 15.0, 1.0, 0.25), 5, 1.0, 0.0, 0.0, 15.0, 1.0, 0.75)
+  end
+  -- four rigs and their walks: (anim, rig ids, walk clip ids), kind k's at index k
+  pfn arena_rigs(a : Strata.Anim.Anim, k : Int, rigs : List(Int), walks : List(Int)) : (Strata.Anim.Anim, List(Int), List(Int)) do
+    if k >= 4 do (a, List.reverse(rigs), List.reverse(walks))
+    else
+      let r = arena_rig(0.2 *. int_to_float(k + 1))
+      let (a1, rig) = An.finish_rig(a, r)
+      let (a2, walk) = An.finish_clip(a1, arena_walk(r))
+      arena_rigs(a2, k + 1, Cons(rig, rigs), Cons(walk, walks))
+    end
+  end
+  -- 1 m voxels: chunks x and z -2..1, stone at chunk y -1, air at 0 holding a wall 3 m high round x and z -60..59 and
+  -- 36 pillars 2 m square and 4 m high, 17 m apart
+  pfn arena_chunks(w : Strata.World.World, i : Int) : Strata.World.World do
+    if i >= 32 do w
+    else arena_chunks(Strata.World.insert(w, Strata.Coord.key(i % 4 - 2, i / 16 - 1, (i / 4) % 4 - 2), Strata.Chunk.uniform(if i < 16 do 1 else 0 end)), i + 1) end
+  end
+  pfn arena_pillars(w : Strata.World.World, i : Int) : Strata.World.World do
+    if i >= 36 do w
+    else
+      let px = -44 + 17 * (i % 6) + 2
+      let pz = -44 + 17 * (i / 6) + 9
+      arena_pillars(Strata.Edit.world(Strata.Edit.fill_box(w, px, 0, pz, px + 1, 3, pz + 1, 1)), i + 1)
+    end
+  end
+  pfn arena_world() : Strata.World.World do
+    let w0 = arena_chunks(Strata.World.new(registry(), Strata.Terrain.gen(fn (k, seed) -> Strata.Chunk.uniform(0)), 43, 1.0), 0)
+    let w1 = Strata.Edit.world(Strata.Edit.fill_box(w0, -60, 0, -60, 59, 2, -60, 1))
+    let w2 = Strata.Edit.world(Strata.Edit.fill_box(w1, -60, 0, 59, 59, 2, 59, 1))
+    let w3 = Strata.Edit.world(Strata.Edit.fill_box(w2, -60, 0, -60, -60, 2, 59, 1))
+    arena_pillars(Strata.Edit.world(Strata.Edit.fill_box(w3, 59, 0, -60, 59, 2, 59, 1)), 0)
+  end
+  -- walker i: kind i % 4, starting on a 50 x 40 grid 2.2 m apart, following its own looping 3 m square at 1.5 m/s
+  pfn arena_walkers(e : Strata.Entities.Entities, i : Int) : Strata.Entities.Entities do
+    if i >= 2000 do e
+    else
+      let x = -54.0 +. 2.2 *. int_to_float(i % 50)
+      let z = -43.0 +. 2.2 *. int_to_float(i / 50)
+      let (e1, route) = En.route(e, [(x, 0.9, z), (x +. 3.0, 0.9, z), (x +. 3.0, 0.9, z +. 3.0), (x, 0.9, z +. 3.0)])
+      let (e2, id) = En.add(e1, i % 4, x, 0.9, z, 0.0)
+      arena_walkers(En.follow(e2, id, route, 1.5, true), i + 1)
+    end
+  end
+  -- each walker that came into view this tick plays its kind's walk on its new figure
+  pfn arena_play(e : Strata.Entities.Entities, a : Strata.Anim.Anim, walks : List(Int), evs : List(Strata.Entities.Event)) : Strata.Anim.Anim do
+    match evs do
+      Nil -> a
+      Cons(v, t) ->
+        if En.ev_code(v) != 3 do arena_play(e, a, walks, t)
+        else
+          let id = En.ev_a(v)
+          let walk = unwrap_or(List.nth_opt(walks, En.kind_of(e, id)), -1)
+          arena_play(e, An.play(a, En.figure(e, id), 0, walk, 0.0, 1.0, 1.0, -1, false), walks, t)
+        end
+    end
+  end
+  -- ticks k..599: the tick (timed), walks started, every figure updated; (world, anim, sound, tick seconds newest first)
+  pfn arena_go(e : Strata.Entities.Entities, a : Strata.Anim.Anim, s : Strata.Sound.Sound, p : Strata.Physics.Physics, w : Strata.World.World, walks : List(Int), k : Int, times : List(Float)) : (Strata.Entities.Entities, Strata.Anim.Anim, List(Float)) do
+    if k >= 600 do (e, a, times)
+    else
+      let t0 = Ech.clock()
+      let (e1, p1, a1, s1) = En.tick(e, w, p, a, s, [(0.0, 1.7, 0.0)], 1.0 /. 60.0)
+      let t1 = Ech.clock()
+      let a2 = An.update(arena_play(e1, a1, walks, En.events(e1, w)), 1.0 /. 60.0)
+      arena_go(e1, a2, s1, p1, w, walks, k + 1, Cons(t1 -. t0, times))
+    end
+  end
+  -- one arena: (bad, hash of the entities and figures, median tick, worst tick, worst after the first, first tick,
+  -- mean and worst update)
+  pfn arena_run(w : Strata.World.World) : (Int, Int, Float, Float, Float, Float, Float, Float) do
+    let (a0, rigs, walks) = arena_rigs(An.open(2048), 0, Nil, Nil)
+    let kinds = List.map(rigs, fn rig -> En.with_figure(En.with_mover(En.kind(), En.walking(), 0.3, 0.9, 0.3, 0.6, 9.8), rig))
+    let e0 = arena_walkers(En.blocks_world(En.open(kinds, 4096, 128, 6, 32.0, 1.0), w), 0)
+    Strata.Ffi.Anim.timing_reset()
+    let (e1, a1, times) = arena_go(e0, a0, Snd.new(), physics(), w, walks, 0, Nil)
+    let update_mean = Strata.Ffi.Anim.timing(2) /. Strata.Ffi.Anim.timing(3)
+    let update_worst = Strata.Ffi.Anim.timing(1)
+    let first = pick(List.reverse(times), 0)
+    let later = List.sort_by(List.drop(List.reverse(times), 1), fn (x, y) -> x <= y)
+    let sorted = List.sort_by(times, fn (x, y) -> x <= y)
+    let (_live, seen, _waiting, refused_n) = En.stats(e1)
+    let all = NativeArray.from_list_int(List.flat_map(List.range(0, 4), fn k -> NativeArray.to_list_int(En.each(e1, k))))
+    let figs = holding(e1, all, false, 0, 0)
+    let placed = at_entity(e1, a1, all, 0, 0)
+    let (x0, _y0, z0) = En.position(e1, NativeArray.get_int(En.each(e1, 0), 0))
+    let h = En.hash(e1) + 7 * An.hash(a1)
+    let bad = check(List.all(rigs, fn r -> r >= 0) && List.all(walks, fn c -> c >= 0), "the four rigs and walks are accepted")
+      + check(seen == 2000, "all 2,000 walkers are seen")
+      + check(figures(a1) == 2000, "2,000 figures")
+      + check(figs == 2000, "... each walker holding one")
+      + check(placed == 2000, "every figure's root stands at its walker's position")
+      + check(Math.abs(x0 -. -54.0) +. Math.abs(z0 -. -43.0) > 0.5, "the walkers have walked")
+      + check(refused_n == 0, "nothing refused")
+      + check(An.stat(a1, 3) == 0.0, "no figure call refused")
+      + check(!En.is_open(En.close(e1)), "closed")
+      + check(An.capacity(An.close(a1)) == 0, "the figures closed")
+    (bad, h, pick(sorted, 300), pick(sorted, 599), pick(later, 598), first, update_mean, update_worst)
+  end
+
+  -- arena: a 120 m walled floor with pillars; 2,000 walkers of four kinds, each with a 6-part figure walking, on looping
+  -- routes, all seen; 600 ticks timed, twice alike
+  pfn arena_scene() : Int do
+    let w = arena_world()
+    let (bad1, h1, med, worst, worst_later, first, umean, uworst) = arena_run(w)
+    let (bad2, h2, med2, worst2, _wl2, _f2, umean2, _uw2) = arena_run(w)
+    let load = Env.get_int("ENTCHECK_LOAD", 99)
+    println("  run 1: tick median " ++ ms(med) ++ " ms, worst " ++ ms(worst) ++ " ms (the first, which made 2,000 figures, " ++ ms(first) ++ " ms; worst after it " ++ ms(worst_later) ++ " ms) over 600 ticks")
+    println("  run 1: Strata.Anim.update mean " ++ ms(umean) ++ " ms, worst " ++ ms(uworst) ++ " ms")
+    println("  run 2: tick median " ++ ms(med2) ++ " ms, worst " ++ ms(worst2) ++ " ms; update mean " ++ ms(umean2) ++ " ms")
+    println("  4 ms target: " ++ (if load < 8 do (if med <= 0.004 do "met" else "MISSED" end) else "not judged (load " ++ int_to_string(load) ++ ")" end))
+    report("arena", bad1 + bad2 + check(h1 == h2, "two runs give one hash"))
+  end
+
   fn main(_cap : Cap(IO)) : Unit do
     let name = Env.get("ENTCHECK_SCENE", "")
     if name == "basics" do process_exit(basics_scene())
@@ -976,9 +1227,12 @@ mod Entcheck do
     else if name == "sweep" do process_exit(sweep_scene())
     else if name == "walk" do process_exit(walk_scene())
     else if name == "jump" do process_exit(jump_scene())
+    else if name == "parts" do process_exit(parts_scene())
+    else if name == "cap" do process_exit(cap_scene())
+    else if name == "arena" do process_exit(arena_scene())
     else
-      println("entcheck: no scene named '" ++ name ++ "' (basics, columns, determinism, closed, ray, bullets, storm, sweep, walk, jump)")
+      println("entcheck: no scene named '" ++ name ++ "' (basics, columns, determinism, closed, ray, bullets, storm, sweep, walk, jump, parts, cap, arena)")
       process_exit(2)
-    end end end end end end end end end end
+    end end end end end end end end end end end end end
   end
 end

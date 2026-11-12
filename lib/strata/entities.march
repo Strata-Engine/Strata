@@ -33,18 +33,27 @@
 -- tick, and reports a touch for each overlapping pair of kinds declared with
 -- `touching`. `events` reads what the last tick reported.
 --
+-- A kind may have a figure (`with_figure`, a Strata.Anim rig) and up to two
+-- voices (`with_sound`). `tick` is `step` plus their upkeep: a seen entity
+-- gets its figure and voices as it comes into view (nearest a focus first),
+-- they follow it each tick, and they are freed when it leaves view or is
+-- removed. The kernel holds the part ids and lists what it took away.
+--
 -- A consumer lists native/strata_ent.c in its own [ffi] sources (GAPS S11).
 -- `spawn` is a March keyword, so an entity is made with `add` (GAPS S22).
 mod Strata.Entities do
 
   needs IO.Foreign
   needs Ent
+  needs Anim
 
   alias Strata.Ffi.Ent as Fen
 
   -- field names carry `en_` so no other record shares them (GAPS S18, S19)
+  -- en_figure: the rig of its figure, -1 none; en_sounds: (source, group, gain) of each voice, at most two
   type Kind = { en_mover : Int, en_unseen : Int, en_divisor : Int, en_fslots : Int, en_islots : Int,
-                en_hx : Float, en_hy : Float, en_hz : Float, en_step : Float, en_gravity : Float, en_lifetime : Float, en_seen : Float }
+                en_hx : Float, en_hy : Float, en_hz : Float, en_step : Float, en_gravity : Float, en_lifetime : Float, en_seen : Float,
+                en_figure : Int, en_sounds : List((Int, Int, Float)) }
 
   -- en_table: the block table has been sent to the kernel
   type Entities = { en_kinds : List(Kind), en_bodies : Int, en_live : Bool, en_table : Bool }
@@ -52,7 +61,8 @@ mod Strata.Entities do
   doc "A placed kind with no parts, live when unseen at divisor 1, no lifetime, no slots, seen at the world's seen cap."
   fn kind() : Kind do
     { en_mover: 0, en_unseen: 0, en_divisor: 1, en_fslots: 0, en_islots: 0,
-      en_hx: 0.0, en_hy: 0.0, en_hz: 0.0, en_step: 0.0, en_gravity: 0.0, en_lifetime: 0.0, en_seen: 0.0 }
+      en_hx: 0.0, en_hy: 0.0, en_hz: 0.0, en_step: 0.0, en_gravity: 0.0, en_lifetime: 0.0, en_seen: 0.0,
+      en_figure: -1, en_sounds: Nil }
   end
 
   doc "The kind moved by [mover] (`placed`, `flying`, `walking`, `bodied`) with a box of half extents (hx, hy, hz) metres, a step height in metres, and [gravity] in m/s2 (0 for none)."
@@ -80,14 +90,19 @@ mod Strata.Entities do
   fn with_slots(k : Kind, floats : Int, ints : Int) : Kind do { k with en_fslots: floats, en_islots: ints } end
   doc "The kind is seen within [metres] of a focus; 0 or less for the world's seen cap, the most allowed."
   fn with_seen_distance(k : Kind, metres : Float) : Kind do { k with en_seen: metres } end
+  doc "While seen, each entity of the kind has a figure of [rig] (a rig id of `Strata.Anim`), made by `tick` as it comes into view, kept at its position and facing, and removed as it leaves view or is removed. -1 for none."
+  fn with_figure(k : Kind, rig : Int) : Kind do { k with en_figure: rig } end
+  doc "While seen, each entity of the kind has a voice playing [source] in [group] at [gain] (`Strata.Sound.play`, pitch 1, priority 1), started by `tick` as it comes into view, kept at its position, and stopped (a 0.1 s fade) as it leaves view or is removed. Up to two a kind; a third makes the kind invalid."
+  fn with_sound(k : Kind, source : Int, group : Int, gain : Float) : Kind do { k with en_sounds: List.append(k.en_sounds, [(source, group, gain)]) } end
 
   -- finite, and finite still once stored as a 32-bit float
   pfn finite32(v : Float) : Bool do
     if float_is_nan(v) do false else Math.abs(v) <= 340282346638528859811704183484516925440.0 end
   end
   pfn in_range(v : Int, lo : Int, hi : Int) : Bool do v >= lo && v <= hi end
+  pfn sound_ok(snd : (Int, Int, Float)) : Bool do match snd do (_, _, gain) -> finite32(gain) end end
 
-  doc "Whether `open` would accept the kind, as far as can be told without a world: the kernel's checks, and a walking box with no zero half extent. A seen distance past the world's seen cap is found only by `open`."
+  doc "Whether `open` would accept the kind, as far as can be told without a world: the kernel's checks, a walking box with no zero half extent, and at most two sounds. A seen distance past the world's seen cap is found only by `open`."
   fn valid(k : Kind) : Bool do
     let ints_ok = in_range(k.en_mover, 0, 2) && in_range(k.en_unseen, 0, 2) && k.en_divisor >= 1
       && in_range(k.en_fslots, 0, 8) && in_range(k.en_islots, 0, 8)
@@ -95,12 +110,14 @@ mod Strata.Entities do
       && finite32(k.en_gravity) && finite32(k.en_lifetime) && finite32(k.en_seen)
     let signs = k.en_hx >= 0.0 && k.en_hy >= 0.0 && k.en_hz >= 0.0 && k.en_step >= 0.0
     let box = if k.en_mover == 2 do k.en_hx > 0.0 && k.en_hy > 0.0 && k.en_hz > 0.0 else true end
-    ints_ok && finite && signs && box
+    let parts = List.length(k.en_sounds) <= 2 && List.all(k.en_sounds, sound_ok)
+    ints_ok && finite && signs && box && parts
   end
 
   -- the kernel's kind ints and floats, in en_kind's order
   pfn kind_ints(k : Kind) : NativeI32Arr do
-    NativeArray.from_list_i32([k.en_mover, k.en_unseen, k.en_divisor, k.en_fslots, k.en_islots, if k.en_gravity != 0.0 do 1 else 0 end, 0, 0, 0])
+    NativeArray.from_list_i32([k.en_mover, k.en_unseen, k.en_divisor, k.en_fslots, k.en_islots, if k.en_gravity != 0.0 do 1 else 0 end,
+      if k.en_figure >= 0 do 1 else 0 end, 0, List.length(k.en_sounds)])
   end
   pfn kind_floats(k : Kind) : NativeF32Arr do
     NativeArray.from_list_f32([k.en_hx, k.en_hy, k.en_hz, k.en_step, k.en_lifetime, k.en_seen, k.en_gravity])
@@ -221,7 +238,7 @@ mod Strata.Entities do
 
   doc "(live, seen, waiting for ground, refused calls)."
   fn stats(e : Entities) : (Int, Int, Int, Int) do (float_to_int(stat(e, 0)), float_to_int(stat(e, 1)), float_to_int(stat(e, 2)), float_to_int(stat(e, 3))) end
-  doc "A number of the kernel's: 0 live, 1 seen, 2 waiting for ground, 3 refused calls, 4 negative dt, 5 events dropped, 6 the last refusal's reason (EN_R_* in strata_ent.h), 7 over the body budget, 8 route points held, 9 routes held (a freed route still followed is held)."
+  doc "A number of the kernel's: 0 live, 1 seen, 2 waiting for ground, 3 refused calls, 4 negative dt, 5 events (and part releases) dropped, 6 the last refusal's reason (EN_R_* in strata_ent.h), 7 over the body budget, 8 route points held, 9 routes held (a freed route still followed is held), 10 + k figures `tick` could not make for kind k (Strata.Anim full) since `open`."
   fn stat(e : Entities, which : Int) : Float do if e.en_live do Fen.stat(which) else 0.0 end end
 
   -- ── Blocks ───────────────────────────────────────────────────────────────
@@ -306,6 +323,121 @@ mod Strata.Entities do
       let n = List.length(focus)
       let written = Fen.tick(focus_go(NativeArray.make_float(3 * n, 0.0), focus, 0), dt)
       after(written, e)
+    end
+  end
+
+  -- ── Figures and voices ───────────────────────────────────────────────────
+  doc "Entity [id]'s figure (a `Strata.Anim` figure), or -1: none while it is unseen, or when its kind has none or Strata.Anim was full."
+  fn figure(e : Entities, id : Int) : Int do if e.en_live do Fen.part(id, 0) else -1 end end
+  doc "Entity [id]'s voice [n] (0 or 1, a `Strata.Sound` voice), or -1."
+  fn voice(e : Entities, id : Int, n : Int) : Int do if e.en_live do (if n == 0 || n == 1 do Fen.part(id, 2 + n) else -1 end) else -1 end end
+
+  pfn kind_at(ks : List(Kind), i : Int) : Option(Kind) do
+    match ks do
+      Nil -> None
+      Cons(k, t) -> if i <= 0 do Some(k) else kind_at(t, i - 1) end
+    end
+  end
+  pfn sound_at(ss : List((Int, Int, Float)), i : Int) : Option((Int, Int, Float)) do
+    match ss do
+      Nil -> None
+      Cons(x, t) -> if i <= 0 do Some(x) else sound_at(t, i - 1) end
+    end
+  end
+
+  -- the release list, drained: figures removed, voices stopped (code 1, bodies, is the body task's)
+  pfn release_go(codes : NativeI32Arr, ids : NativeIntArr, i : Int, n : Int, a : Strata.Anim.Anim, s : Strata.Sound.Sound) : (Strata.Anim.Anim, Strata.Sound.Sound) do
+    if i >= n do (a, s)
+    else
+      let code = NativeArray.get_i32(codes, i)
+      let id = NativeArray.get_int(ids, i)
+      let a1 = if code == 0 do Strata.Anim.remove(a, id) else a end
+      let s1 = if code == 2 || code == 3 do Strata.Sound.stop(s, id, 0.1) else s end
+      release_go(codes, ids, i + 1, n, a1, s1)
+    end
+  end
+  pfn released(a : Strata.Anim.Anim, s : Strata.Sound.Sound) : (Strata.Anim.Anim, Strata.Sound.Sound) do
+    let n = Fen.release_count()
+    if n == 0 do (a, s)
+    else
+      let codes = NativeArray.make_i32(n, 0)
+      let ids = NativeArray.make_int(n, -1)
+      release_go(codes, ids, 0, Fen.releases(codes, ids), a, s)
+    end
+  end
+
+  -- the seen entities wanting [part], nearest a focus first
+  pfn wanting(part : Int) : NativeIntArr do
+    let n = Fen.wanting(part, NativeArray.make_int(0, -1))
+    let out = NativeArray.make_int(n, -1)
+    if n == 0 do out else if Fen.wanting(part, out) == n do out else NativeArray.make_int(0, -1) end end
+  end
+
+  -- a figure for each entity wanting one: made where it stands, turned by its facing; a refusal counted for its kind
+  pfn figures_go(e : Entities, ids : NativeIntArr, i : Int, a : Strata.Anim.Anim) : Strata.Anim.Anim do
+    if i >= NativeArray.length_int(ids) do a
+    else
+      let id = NativeArray.get_int(ids, i)
+      let k = Fen.kind_of(id)
+      let rig = match kind_at(e.en_kinds, k) do
+        Some(kd) -> kd.en_figure
+        None -> -1
+      end
+      let (x, y, z) = position(e, id)
+      let (a1, fig) = Strata.Anim.spawn_at(a, rig, x, y, z, Strata.Math.Quat.from_axis_angle(0.0, 1.0, 0.0, facing(e, id)))
+      let used = if fig >= 0 do Fen.set_part(id, 0, fig) else Fen.figure_refused(k) end
+      figures_go(e, ids, i + 1, after(used, a1))
+    end
+  end
+
+  -- voice [n] for each entity wanting one: its kind's nth sound, played where it stands; a refused play leaves it to the next tick
+  pfn voices_go(e : Entities, n : Int, ids : NativeIntArr, i : Int, s : Strata.Sound.Sound) : Strata.Sound.Sound do
+    if i >= NativeArray.length_int(ids) do s
+    else
+      let id = NativeArray.get_int(ids, i)
+      let snd = match kind_at(e.en_kinds, Fen.kind_of(id)) do
+        Some(kd) -> sound_at(kd.en_sounds, n)
+        None -> None
+      end
+      match snd do
+        None -> voices_go(e, n, ids, i + 1, s)
+        Some((src, group, gain)) ->
+          let (x, y, z) = position(e, id)
+          let (s1, v) = Strata.Sound.play(s, src, group, x, y, z, gain, 1.0, 1.0)
+          let used = if v > 0 do Fen.set_part(id, 2 + n, v) else 0 end
+          voices_go(e, n, ids, i + 1, after(used, s1))
+      end
+    end
+  end
+
+  -- the seen entities holding [part]: (how many, their part ids, their poses 7 floats each)
+  pfn holders(part : Int) : (Int, NativeI32Arr, NativeF32Arr) do
+    let n = Fen.seen_parts(part, NativeArray.make_i32(0, 0), NativeArray.make_f32(0, 0.0))
+    let ids = NativeArray.make_i32(n, -1)
+    let poses = NativeArray.make_f32(7 * n, 0.0)
+    if n == 0 do (0, ids, poses) else (Fen.seen_parts(part, ids, poses), ids, poses) end
+  end
+  pfn moves_go(ids : NativeI32Arr, poses : NativeF32Arr, i : Int, n : Int, s : Strata.Sound.Sound) : Strata.Sound.Sound do
+    if i >= n do s
+    else moves_go(ids, poses, i + 1, n, Strata.Sound.move(s, NativeArray.get_i32(ids, i), NativeArray.get_f32(poses, 7 * i), NativeArray.get_f32(poses, 7 * i + 1), NativeArray.get_f32(poses, 7 * i + 2))) end
+  end
+  pfn moved(part : Int, s : Strata.Sound.Sound) : Strata.Sound.Sound do
+    let (n, ids, poses) = holders(part)
+    moves_go(ids, poses, 0, n, s)
+  end
+
+  doc "A frame's entities, after `blocks`: `step` with [focus] and [dt], then their parts. Every part the step took away (an entity removed by the game since the last tick or in the step, or gone out of view) is freed: its figure removed, its voices stopped with a 0.1 s fade. Every seen entity whose kind has a figure (`with_figure`) and has none yet gets one, nearest a focus first, made at its position turned by its facing about +y; when Strata.Anim is full the entity goes without (stat 10 + its kind counts each refusal) and is tried again next tick. Likewise each voice (`with_sound`), at pitch 1 and priority 1; a refused play is tried again next tick. Then every seen figure is placed at its entity's position and facing (one `Strata.Anim.place_many`) and every voice moved there. The game plays clips on a new figure itself (`figure` after event 3). [p] is passed through untouched; [w] is not read yet."
+  fn tick(e : Entities, _w : Strata.World.World, p : Strata.Physics.Physics, a : Strata.Anim.Anim, s : Strata.Sound.Sound,
+          focus : List((Float, Float, Float)), dt : Float) : (Entities, Strata.Physics.Physics, Strata.Anim.Anim, Strata.Sound.Sound) do
+    if !e.en_live do (e, p, a, s)
+    else
+      let e1 = step(e, focus, dt)
+      let (a1, s1) = released(a, s)
+      let a2 = figures_go(e1, wanting(0), 0, a1)
+      let s2 = voices_go(e1, 1, wanting(3), 0, voices_go(e1, 0, wanting(2), 0, s1))
+      let (n, figs, poses) = holders(0)
+      let a3 = if n == 0 do a2 else Strata.Anim.place_many(a2, n, figs, poses) end
+      (e1, p, a3, moved(3, moved(2, s2)))
     end
   end
 

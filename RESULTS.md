@@ -699,6 +699,7 @@ other sessions kept the load far above it, so none is judged.
 |---|---|---|---|---|
 | storm: 20,000 flying bullets, all seen, one touch pair against 200 targets; `step` over ticks 200 to 600 | 2.47 ms (2.57 in the run before) | 40.2 ms (97.1) | 2 ms | not judged (load 20 to 35) |
 | 5,000 removed and 5,000 added between two ticks, then the step | 1.11 ms for the 10,000 calls from March; 2.76 ms the step after | one run | 1 ms | not judged (load 20 to 35) |
+| arena: 2,000 walkers of four kinds on looping routes, all seen, each with a 6-part figure walking; `Strata.Entities.tick` over 600 ticks | 0.34 ms (0.35 in the second run) | 6.62 ms (7.74); the first tick, which makes the 2,000 figures, 2.83 ms | 4 ms | not judged (load 40) |
 
 The storm fires its bullets from four emitters 50 m from the centre in rings
 of 64 at 40 m/s; each falls to the floor or meets a target within about a
@@ -706,6 +707,12 @@ second, and the game replaces every bullet named in a touch or a block hit
 (about 350 a tick; 228,518 fired in 601 ticks, 28,973 touches). Its touch
 events equal a brute-force count on ticks 150 (59) and 300 (60), and two runs
 end on one hash.
+
+The arena's `tick` is the step, the releases, the figures and voices wanted,
+and one `Strata.Anim.place_many` for the 2,000 figures. `Strata.Anim.update`
+is timed apart, in the animation shim: mean 1.29 ms, worst 21.73 ms (1.51 ms
+mean in the second run), posing all 2,000 six-part figures every update with
+no view set. Two runs end on one hash of the entities and the figures.
 
 Where the step goes, from a C bench of a like scene (best of 20 ticks, cc -O2,
 same machine, load about 50): 1.12 ms a tick, of which 0.87 ms is the 20,000

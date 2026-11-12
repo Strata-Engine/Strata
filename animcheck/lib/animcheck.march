@@ -269,6 +269,89 @@ mod Animcheck do
     end
   end
 
+  -- ── place_many: many figures placed in one call ──────────────────────────
+  pfn pm_pos(i : Int) : (Float, Float, Float) do (int_to_float(i % 10) *. 1.5 -. 3.0, 0.25 *. int_to_float(i % 3), int_to_float(i / 10) *. 1.5) end
+  pfn pm_turn(i : Int) : Strata.Math.Quat.Quat do turn_y(int_to_float(i) *. 13.0) end
+  -- n figures of rig at the origin, their ids into figs from index i
+  pfn pm_spawn(a : Strata.Anim.Anim, rig : Int, figs : NativeI32Arr, i : Int, n : Int) : (Strata.Anim.Anim, NativeI32Arr) do
+    if i >= n do (a, figs)
+    else
+      match An.spawn_at(a, rig, 0.0, 0.0, 0.0, Qt.identity()) do
+        (a1, f) -> pm_spawn(a1, rig, NativeArray.set_i32(figs, i, f), i + 1, n)
+      end
+    end
+  end
+  -- figures 0..n-1 of figs placed one call each, figure i at pm_pos(i) turned by pm_turn(i)
+  pfn pm_place(a : Strata.Anim.Anim, figs : NativeI32Arr, i : Int, n : Int) : Strata.Anim.Anim do
+    if i >= n do a
+    else
+      match pm_pos(i) do (x, y, z) -> pm_place(An.place(a, NativeArray.get_i32(figs, i), x, y, z, pm_turn(i)), figs, i + 1, n) end
+    end
+  end
+  -- entry j of the batch: figure figs[100 + i] with figure i's place and turn
+  pfn pm_entry(ids : NativeI32Arr, poses : NativeF32Arr, j : Int, fig : Int, i : Int) : (NativeI32Arr, NativeF32Arr) do
+    match pm_pos(i) do
+      (x, y, z) ->
+        let q = pm_turn(i)
+        let p0 = NativeArray.set_f32(NativeArray.set_f32(NativeArray.set_f32(poses, 7 * j, x), 7 * j + 1, y), 7 * j + 2, z)
+        let p1 = NativeArray.set_f32(NativeArray.set_f32(NativeArray.set_f32(NativeArray.set_f32(p0, 7 * j + 3, Qt.x(q)), 7 * j + 4, Qt.y(q)), 7 * j + 5, Qt.z(q)), 7 * j + 6, Qt.w(q))
+        (NativeArray.set_i32(ids, j, fig), p1)
+    end
+  end
+  -- the batch: 100 figures and, at entry 50, the dead figure [dead]
+  pfn pm_batch(figs : NativeI32Arr, dead : Int, ids : NativeI32Arr, poses : NativeF32Arr, j : Int) : (NativeI32Arr, NativeF32Arr) do
+    if j >= 101 do (ids, poses)
+    else
+      let (ids1, poses1) = if j == 50 do pm_entry(ids, poses, j, dead, 0)
+        else
+          let i = if j < 50 do j else j - 1 end
+          pm_entry(ids, poses, j, NativeArray.get_i32(figs, 100 + i), i)
+        end
+      pm_batch(figs, dead, ids1, poses1, j + 1)
+    end
+  end
+  pfn same_go(m : NativeF32Arr, n : NativeF32Arr, k : Int) : Bool do
+    if k >= NativeArray.length_f32(m) do true
+    else if NativeArray.get_f32(m, k) != NativeArray.get_f32(n, k) do false
+    else same_go(m, n, k + 1) end end
+  end
+  -- how many of the 100 pairs (figure i, figure 100 + i) have identical matrices
+  pfn pm_same(a : Strata.Anim.Anim, figs : NativeI32Arr, i : Int, n : Int) : Int do
+    if i >= 100 do n
+    else
+      let m = An.matrices(a, NativeArray.get_i32(figs, i))
+      let o = An.matrices(a, NativeArray.get_i32(figs, 100 + i))
+      let same = if NativeArray.length_f32(m) != 36 do false else if NativeArray.length_f32(o) != 36 do false else same_go(m, o, 0) end end
+      pm_same(a, figs, i + 1, if same do n + 1 else n end)
+    end
+  end
+
+  -- place_many: figures 0..99 placed one call each and figures 100..199 at the same places in one place_many call,
+  -- with a removed figure at entry 50, pose alike; the removed one is skipped and counted once
+  pfn place_many_scene() : Int do
+    let r = chain()
+    match An.finish_rig(An.open(256), r) do
+      (a1, rig) ->
+        let (a2, figs) = pm_spawn(a1, rig, NativeArray.make_i32(201, -1), 0, 201)
+        let dead = NativeArray.get_i32(figs, 200)
+        let a3 = An.remove(a2, dead)
+        let (ids, poses) = pm_batch(figs, dead, NativeArray.make_i32(101, -1), NativeArray.make_f32(707, 0.0), 0)
+        let before = An.stat(a3, 3)
+        let a4 = An.update(An.place_many(pm_place(a3, figs, 0, 100), 101, ids, poses), 1.0 /. 60.0)
+        let same = pm_same(a4, figs, 0, 0)
+        let moved = An.matrices(a4, NativeArray.get_i32(figs, 199))
+        let (figures, _, _, _) = An.stats(a4)
+        println("  " ++ int_to_string(same) ++ " of 100 figures placed in one call pose as placed one by one")
+        let bad = check(rig >= 0, "the chain is accepted")
+          + check(same == 100, "100 figures placed in one call have the matrices of 100 place calls")
+          + check(mat_near(moved, 9, [10.5, 0.0, 13.5], 0.00001), "the last one stands where its entry put it")
+          + check(An.stat(a4, 3) -. before == 1.0, "the dead figure in the array is skipped and counted once")
+          + check(An.stat(a4, 5) == 6.0, "... as no such figure")
+          + check(figures == 200, "200 figures live")
+        report("place_many", bad + check(An.capacity(An.close(a4)) == 0, "closed"))
+    end
+  end
+
   -- ── stairs: foot placement ────────────────────────────────────────────────
   -- A two-legged rig at voxel 0.1: a pelvis 1 m up, hips 0.15 m either side
   -- along x, thigh and shin 0.5 m each, soles 0.05 m below the feet.
@@ -822,9 +905,10 @@ mod Animcheck do
     else if name == "hits" do process_exit(hits_scene())
     else if name == "arena" do process_exit(arena_scene())
     else if name == "ground128" do process_exit(ground128_scene())
+    else if name == "place_many" do process_exit(place_many_scene())
     else
-      println("animcheck: no scene named '" ++ name ++ "' (chain, table, determinism, marks, mask, empty, stairs, hits, arena, ground128)")
+      println("animcheck: no scene named '" ++ name ++ "' (chain, table, determinism, marks, mask, empty, stairs, hits, arena, ground128, place_many)")
       process_exit(2)
-    end end end end end end end end end end
+    end end end end end end end end end end end
   end
 end

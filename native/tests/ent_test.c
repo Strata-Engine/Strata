@@ -1436,6 +1436,116 @@ static void test_held_walker(void) {
     en_close(w);
 }
 
+/* ---- parts: releases, seen parts, wanting, figure refusals ---- */
+static int32_t rel_c[64]; static int64_t rel_i[64];
+
+static void test_releases(void) {
+    EnWorld *w = world(16);
+    int k = seen_kind(w, 0, 0, 40, 0);   /* placed; a figure and two voices (kind_ints) */
+    int64_t a = en_add(w, k, 0, 0, 0, 0), b = en_add(w, k, 1, 0, 0, 0);
+    tick_at(w, 0, 0, 0);
+    en_set_part(w, a, 0, 7); en_set_part(w, a, 2, 11); en_set_part(w, a, 3, 12); en_set_part(w, b, 0, 8);
+    CHECK(en_releases(w, 0, NULL, NULL) == 0, "nothing to release before any part is cleared");
+    en_remove(w, a, 0);
+    CHECK(en_releases(w, 0, NULL, NULL) == 3, "a game's removal releases the entity's three parts at once");
+    int n = en_releases(w, 64, rel_c, rel_i);
+    CHECK(n == 3 && rel_c[0] == 0 && rel_i[0] == 7 && rel_c[1] == 2 && rel_i[1] == 11 && rel_c[2] == 3 && rel_i[2] == 12,
+          "... as (code, id) pairs in part order: figure 7, voice 11, voice 12");
+    CHECK(en_releases(w, 0, NULL, NULL) == 0, "... and draining empties the list");
+    tick_at(w, 1000, 0, 0);
+    n = en_releases(w, 64, rel_c, rel_i);
+    CHECK(!en_seen(w, b) && n == 1 && rel_c[0] == 0 && rel_i[0] == 8, "becoming unseen releases its figure");
+    CHECK(en_part(w, b, 0) == -1, "... and clears the part");
+    tick_at(w, 1000, 0, 0);
+    CHECK(en_releases(w, 0, NULL, NULL) == 0, "a part is released once");
+    int64_t c = en_add(w, k, 0, 0, 0, 0);
+    en_set_part(w, c, 0, 1); en_set_part(w, c, 2, 2); en_set_part(w, c, 3, 3);
+    en_remove(w, c, 0);
+    n = en_releases(w, 2, rel_c, rel_i);
+    CHECK(n == 2 && rel_i[0] == 1 && rel_i[1] == 2 && en_releases(w, 0, NULL, NULL) == 1, "a drain of 2 takes the first two and leaves the third");
+    n = en_releases(w, 64, rel_c, rel_i);
+    CHECK(n == 1 && rel_c[0] == 3 && rel_i[0] == 3, "... which the next drain takes");
+    en_close(w);
+
+    /* the unseen rule's removal and a lifetime's release once each */
+    w = world(16);
+    int kr = seen_kind(w, 0, 2, 40, 0), kl = seen_kind(w, 0, 0, 40, 0.5f);
+    int64_t g = en_add(w, kr, 0, 0, 0, 0), l = en_add(w, kl, 0, 0, 0, 0);
+    tick_at(w, 0, 0, 0);
+    en_set_part(w, g, 0, 21); en_set_part(w, l, 3, 22);
+    tick_at(w, 1000, 0, 0);
+    n = en_releases(w, 64, rel_c, rel_i);
+    CHECK(!en_alive(w, g) && n == 2, "leaving view under the remove rule releases the figure once, the other kind's voice too");
+    l = en_add(w, kl, 0, 0, 0, 0);
+    tick_at(w, 0, 0, 0);
+    en_set_part(w, l, 2, 23);
+    for (int i = 0; i < 40 && en_alive(w, l); i++) tick_at(w, 0, 0, 0);
+    n = en_releases(w, 64, rel_c, rel_i);
+    CHECK(!en_alive(w, l) && n == 1 && rel_c[0] == 2 && rel_i[0] == 23, "a lifetime's end releases the voice");
+    en_close(w);
+}
+
+static void test_seen_parts(void) {
+    EnWorld *w = world(16);
+    int k = seen_kind(w, 0, 0, 40, 0);
+    int64_t e0 = en_add(w, k, 0, 0, 0, 0), e1 = en_add(w, k, 1, 0, 0, 0.5), e2 = en_add(w, k, 2, 3, 4, 1.0);
+    int64_t far = en_add(w, k, 500, 0, 0, 0);
+    tick_at(w, 0, 0, 0);
+    en_set_part(w, e0, 0, 5); en_set_part(w, e2, 0, 6); en_set_part(w, far, 0, 9); en_set_part(w, e1, 2, 40);
+    int32_t ids[8]; float poses[56];
+    CHECK(en_seen_parts(w, 0, 0, NULL, NULL) == 2, "two seen entities hold a figure (the unseen one is not counted)");
+    int n = en_seen_parts(w, 0, 8, ids, poses);
+    CHECK(n == 2 && ids[0] == 5 && ids[1] == 6, "... their figures, in dense order");
+    CHECK(poses[7] == 2.0f && poses[8] == 3.0f && poses[9] == 4.0f, "... each with its entity's position");
+    CHECK(poses[10] == 0 && poses[12] == 0 && fabsf(poses[11] - (float)sin(0.5)) < 1e-6f && fabsf(poses[13] - (float)cos(0.5)) < 1e-6f,
+          "... and its facing as a turn about +y (0, sin a/2, 0, cos a/2)");
+    CHECK(poses[0] == 0 && poses[3] == 0 && poses[4] == 0 && poses[5] == 0 && poses[6] == 1.0f, "facing 0 is no turn");
+    n = en_seen_parts(w, 2, 8, ids, poses);
+    CHECK(n == 1 && ids[0] == 40 && poses[0] == 1.0f, "voice 0's holders");
+    CHECK(en_seen_parts(w, 0, 1, ids, poses) == 1 && ids[0] == 5, "at most max are written");
+    CHECK(en_seen_parts(w, 1, 8, ids, poses) == 0 && en_seen_parts(w, 4, 8, ids, poses) == 0 && en_seen_parts(w, -1, 8, ids, poses) == 0,
+          "no body, and no part outside 0..3");
+    en_close(w);
+}
+
+static void test_wanting(void) {
+    EnWorld *w = world(16);
+    int k = seen_kind(w, 0, 0, 40, 0);
+    int32_t ki[9]; kind_ints(ki, 0, 1, 0, 0, 0); ki[6] = 0; ki[8] = 1;   /* no figure, one voice */
+    float fl[7] = {0.3f, 0.9f, 0.3f, 0, 0, 40, 0};
+    int kb = en_kind(w, ki, fl);
+    int64_t d5 = en_add(w, k, 5, 0, 0, 0), d1 = en_add(w, k, 0, 7, -1, 0), d3a = en_add(w, k, 0, 0, 3, 0);
+    int64_t d3b = en_add(w, k, -3, 0, 0, 0), plain = en_add(w, kb, 0.5, 0, 0, 0), far = en_add(w, k, 300, 0, 0, 0);
+    double focus[6] = {0, 0, 0, 290, 0, 0};
+    en_tick(w, 2, focus, 1.0 / 60);
+    (void)far;
+    int64_t ids[16];
+    CHECK(en_wanting(w, 0, 0, NULL) == 5, "five seen entities want a figure (the plain kind has none; the far one is seen by the second focus)");
+    int n = en_wanting(w, 0, 16, ids);
+    CHECK(n == 5 && ids[0] == d1 && ids[1] == d3a && ids[2] == d3b && ids[3] == d5 && ids[4] == far,
+          "... nearest a focus first, horizontally, ties by id; the far one 10 m from the second focus");
+    CHECK(d3a < d3b, "(the tie's lower id is the one added first)");
+    en_set_part(w, d1, 0, 3);
+    n = en_wanting(w, 0, 2, ids);
+    CHECK(n == 2 && ids[0] == d3a && ids[1] == d3b, "one given a figure no longer wants one; at most max are written");
+    n = en_wanting(w, 2, 16, ids);
+    CHECK(n == 6 && ids[0] == plain, "every seen entity wants voice 0, the plain kind's too");
+    CHECK(en_wanting(w, 3, 0, NULL) == 5 && en_wanting(w, 1, 0, NULL) == 0 && en_wanting(w, 9, 0, NULL) == 0,
+          "voice 1 only on the kind with two; no body; no part 9");
+    en_close(w);
+}
+
+static void test_figure_refusals(void) {
+    EnWorld *w = world(16);
+    int k0 = seen_kind(w, 0, 0, 40, 0), k1 = seen_kind(w, 0, 0, 40, 0);
+    en_figure_refused(w, k1); en_figure_refused(w, k1);
+    CHECK(en_stat(w, 10 + k1) == 2 && en_stat(w, 10 + k0) == 0, "figure refusals are counted for their kind (stat 10 + kind)");
+    CHECK(en_stat(w, 10 + 61) == 0 && en_stat(w, 3) == 0, "another kind reads 0; nothing refused");
+    en_figure_refused(w, 7);
+    CHECK(en_stat(w, 3) == 1 && en_stat(w, 6) == EN_R_KIND, "a kind not registered is refused");
+    en_close(w);
+}
+
 int main(void) {
     test_kinds();
     test_add_and_read();
@@ -1471,6 +1581,10 @@ int main(void) {
     test_unseen_rules();
     test_ground_goes();
     test_held_walker();
+    test_releases();
+    test_seen_parts();
+    test_wanting();
+    test_figure_refusals();
     if (fails == 0) printf("ent_test: ok\n");
     return fails == 0 ? 0 : 1;
 }
