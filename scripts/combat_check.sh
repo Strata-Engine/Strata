@@ -59,6 +59,25 @@ if twice channel STRATA_COMBAT_SCENE=channel STRATA_FRAMES=1800; then
   if [ "$swam" -gt 60 ] && [ "$crossed" -eq 1 ] && [ "$struck" -ge 1 ] && [ "$deep" -le 120 ]; then echo "ok   channel: swam $swam frames no deeper than $deep cm, crossed, struck $struck times"
   else echo "FAIL channel: swam $swam frames (want over 60), crossed $crossed (want 1), struck $struck (want 1 or more), deepest $deep cm (want 120 or less)"; cat "$OUT/channel.txt"; FAILED=1; fi
 fi
+# The player, by script: an archer fells a still rusher 20 m off with three arrows.
+if twice archer STRATA_COMBAT_SCRIPT=archer STRATA_FRAMES=150; then
+  shots=$(num archer '^combat: archer shots \([0-9]*\), kills [0-9]*$'); k=$(num archer '^combat: archer shots [0-9]*, kills \([0-9]*\)$')
+  if [ "$shots" -eq 3 ] && [ "$k" -eq 1 ]; then echo "ok   archer: three arrows, one kill"
+  else echo "FAIL archer: shots $shots (want 3), kills $k (want 1)"; cat "$OUT/archer.txt"; FAILED=1; fi
+fi
+# A player who only stands is killed by a rusher, lies 3 s, and is stood at a spawn point by the viewer.
+if twice victim STRATA_COMBAT_SCRIPT=victim STRATA_FRAMES=700; then
+  died=$(num victim '^combat: player died at frame \([0-9]*\), back at frame [0-9]*$'); back=$(num victim '^combat: player died at frame [0-9]*, back at frame \([0-9]*\)$')
+  off=$(num victim '^combat: victim eye \([0-9]*\) cm from its spawn point, deaths [0-9]*$')
+  if [ "$died" -gt 0 ] && [ $((back - died)) -ge 179 ] && [ $((back - died)) -le 181 ] && [ "$off" -ge 0 ] && [ "$off" -le 100 ]; then echo "ok   victim: died at frame $died, back $((back - died)) frames later, $off cm from its spawn point"
+  else echo "FAIL victim: died $died, back $back (want 180 frames later), eye $off cm from its spawn point (want 100 or less)"; cat "$OUT/victim.txt"; FAILED=1; fi
+fi
+# A player far from the field pauses the match: nothing changes after frame 60.
+if twice far STRATA_COMBAT_SCRIPT=far STRATA_FRAMES=600; then
+  h60=$(num far '^combat: far fingerprint \([0-9]*\) at frame 60$'); h600=$(num far '^combat: frame 600 fingerprint \([0-9]*\), .*$')
+  if [ "$h60" -ge 0 ] && [ "$h60" = "$h600" ]; then echo "ok   far: the match stood still from frame 60 to 600"
+  else echo "FAIL far: fingerprint $h60 at frame 60, $h600 at 600 (want equal)"; cat "$OUT/far.txt"; FAILED=1; fi
+fi
 # The match with no player: someone reaches 30, and the same someone the second time.
 if twice match STRATA_COMBAT_PLAYER=0 STRATA_FRAMES=90000; then
   if grep -q '^combat: winner [A-Za-z]* 30 at frame [0-9]*$' "$OUT/match.txt" && [ "$(grep -c '^combat: table ' "$OUT/match.txt")" -eq 12 ]; then echo "ok   match: $(grep '^combat: winner' "$OUT/match.txt" | sed 's/^combat: //')"

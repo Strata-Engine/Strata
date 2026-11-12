@@ -39,3 +39,11 @@ Task 6: Ruling: fighters with nothing to do gather at a rally point, the open gr
 Task 6: Ruling: spawn points are on open ground: dry, not leaves or wood, with two cells of headroom.
 Task 6: Ruling: the sidestep of a blocked fighter grows (0.5, 1, 2, 4 s) and alternates left and right until it has moved 2 m; the design's fixed half second to the left left fighters stuck behind two-block terraces at two spawn points for the whole match.
 Task 6: Measured: bots-only match, winner at frame 41,945 (11.6 minutes), 133 kills, 5 idle respawns (Task 4: 52,356 frames, 249 kills, 68 idle respawns).
+Task 6: complete (commit c42c678, tests: forge test test/combat_test.march -> 80/80; combat_check.sh -> field, duel, trap, fire, channel, match ok)
+Task 7: Ruling: in a match the viewer's dig and build are one block within 6 m (`Match.single_edit`); the viewer's own are spheres of radius 6 and 2. The user's words: "single block terrain edits".
+Task 7: Ruling: the trigger is the left button held, not its press: an archer holds and looses every 0.6 s. On a block's slot the left button's press digs, as before.
+Task 7: Ruling: a dead player's view tips to the sky and movement stops for the 3 s; the design's "the view drops to the ground" would move the body, since the viewer keeps one position for the eye and the body.
+Task 7: Ruling: scripted players run on their own grounds (scene 5 `range`, 6 `victim`): the player at a spawn point, the rusher 20 or 10 m off along the first lane of walkable ground in plain sight. On the rally-to-spawn line first tried, the arrows met a terrace and the rusher could not reach the player.
+Task 7: Ruling: the viewer also moves the walker's physics body when the match sets the player down (`Physics.place_driven`); setting the eye alone left the player 16 m from its spawn point.
+Task 7: Ruling: `Match.start` takes the script as well as the scene; `Match.view` gives a scripted player's view to the camera; the plan's `script_input` is inside `frame`.
+Task 7: Note: the single_edit test was written after the function and passed at once.
