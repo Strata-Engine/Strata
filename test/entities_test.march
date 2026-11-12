@@ -1,0 +1,115 @@
+-- Entities: kinds as pure data. No kernel call here (library tests do not
+-- link C); the kernel-backed checks are entcheck's scenes.
+mod Strata.Test.Entities do
+
+  needs IO.Clock      -- charged to every test module once any uses Check.all (GAPS S3)
+  needs IO.Process
+  import Test
+  alias Strata.Entities as En
+
+  -- a kind's fields, ints then floats, so two kinds compare field by field
+  pfn ints_of(k : Strata.Entities.Kind) : List(Int) do [k.en_mover, k.en_unseen, k.en_divisor, k.en_fslots, k.en_islots] end
+  pfn floats_of(k : Strata.Entities.Kind) : List(Float) do [k.en_hx, k.en_hy, k.en_hz, k.en_step, k.en_gravity, k.en_lifetime, k.en_seen] end
+
+  -- the positions where two lists differ
+  pfn diff_go(a : List(a), b : List(a), i : Int, acc : List(Int)) : List(Int) do
+    match (a, b) do
+      (Cons(x, xs), Cons(y, ys)) -> diff_go(xs, ys, i + 1, if x == y do acc else Cons(i, acc) end)
+      _ -> List.reverse(acc)
+    end
+  end
+  pfn int_diff(a : Strata.Entities.Kind, b : Strata.Entities.Kind) : List(Int) do diff_go(ints_of(a), ints_of(b), 0, Nil) end
+  pfn float_diff(a : Strata.Entities.Kind, b : Strata.Entities.Kind) : List(Int) do diff_go(floats_of(a), floats_of(b), 0, Nil) end
+
+  describe "Entity kinds" do
+    test "the default kind is valid" do
+      assert En.valid(En.kind())
+    end
+
+    test "the default kind is placed, live, divisor 1, no lifetime, no slots" do
+      let k = En.kind()
+      assert ints_of(k) == [En.placed(), En.lives(), 1, 0, 0]
+      assert floats_of(k) == [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    end
+
+    test "the mover and unseen numbers" do
+      assert [En.placed(), En.flying(), En.walking(), En.bodied()] == [0, 1, 2, 3]
+      assert [En.lives(), En.freezes(), En.goes()] == [0, 1, 2]
+      assert [En.col_position(), En.col_velocity(), En.col_facing(), En.col_float(0), En.col_float(7)] == [0, 1, 2, 10, 17]
+    end
+
+    test "9 float slots is not valid; 8 is" do
+      assert !En.valid(En.with_slots(En.kind(), 9, 0))
+      assert !En.valid(En.with_slots(En.kind(), 0, 9))
+      assert !En.valid(En.with_slots(En.kind(), -1, 0))
+      assert En.valid(En.with_slots(En.kind(), 8, 8))
+    end
+
+    test "divisor 0 is not valid" do
+      assert !En.valid(En.with_unseen(En.kind(), En.lives(), 0))
+      assert En.valid(En.with_unseen(En.kind(), En.goes(), 4))
+      assert !En.valid(En.with_unseen(En.kind(), 3, 1))
+    end
+
+    test "a walking mover with a zero half extent is not valid" do
+      assert !En.valid(En.with_mover(En.kind(), En.walking(), 0.3, 0.0, 0.3, 0.5, 9.8))
+      assert !En.valid(En.with_mover(En.kind(), En.walking(), 0.0, 0.9, 0.3, 0.5, 9.8))
+      assert En.valid(En.with_mover(En.kind(), En.walking(), 0.3, 0.9, 0.3, 0.5, 9.8))
+      assert En.valid(En.with_mover(En.kind(), En.flying(), 0.0, 0.0, 0.0, 0.0, 0.0))
+    end
+
+    test "other invalid kinds: mover out of range, bodied without a body, bad numbers" do
+      assert !En.valid(En.with_mover(En.kind(), 4, 0.3, 0.3, 0.3, 0.0, 0.0))
+      assert !En.valid(En.with_mover(En.kind(), En.bodied(), 0.3, 0.3, 0.3, 0.0, 0.0))
+      assert !En.valid(En.with_mover(En.kind(), En.flying(), -0.1, 0.3, 0.3, 0.0, 0.0))
+      assert !En.valid(En.with_mover(En.kind(), En.flying(), 0.3, 0.3, 0.3, -0.5, 0.0))
+      assert !En.valid(En.with_mover(En.kind(), En.flying(), 0.3, 0.3, 0.3, 0.0, float_nan()))
+      assert !En.valid(En.with_lifetime(En.kind(), float_infinity()))
+      assert !En.valid(En.with_seen_distance(En.kind(), float_nan()))
+    end
+
+    test "with_mover changes only the mover's fields" do
+      let k = En.with_mover(En.kind(), En.walking(), 0.3, 0.9, 0.4, 0.5, 9.8)
+      assert int_diff(En.kind(), k) == [0]
+      assert float_diff(En.kind(), k) == [0, 1, 2, 3, 4]
+      assert floats_of(k) == [0.3, 0.9, 0.4, 0.5, 9.8, 0.0, 0.0]
+    end
+
+    test "with_unseen changes only the rule and the divisor" do
+      let k = En.with_unseen(En.kind(), En.freezes(), 3)
+      assert int_diff(En.kind(), k) == [1, 2]
+      assert float_diff(En.kind(), k) == []
+      assert k.en_unseen == 1
+      assert k.en_divisor == 3
+    end
+
+    test "with_lifetime changes only the lifetime" do
+      let k = En.with_lifetime(En.kind(), 2.5)
+      assert int_diff(En.kind(), k) == []
+      assert float_diff(En.kind(), k) == [5]
+      assert k.en_lifetime == 2.5
+    end
+
+    test "with_slots changes only the slot counts" do
+      let k = En.with_slots(En.kind(), 3, 2)
+      assert int_diff(En.kind(), k) == [3, 4]
+      assert float_diff(En.kind(), k) == []
+      assert k.en_fslots == 3
+      assert k.en_islots == 2
+    end
+
+    test "with_seen_distance changes only the seen distance" do
+      let k = En.with_seen_distance(En.kind(), 64.0)
+      assert int_diff(En.kind(), k) == []
+      assert float_diff(En.kind(), k) == [6]
+      assert k.en_seen == 64.0
+    end
+
+    test "with_ functions compose without touching each other's fields" do
+      let k = En.with_seen_distance(En.with_slots(En.with_lifetime(En.with_unseen(En.with_mover(En.kind(), En.flying(), 0.1, 0.2, 0.3, 0.0, 9.8), En.goes(), 2), 1.5), 4, 1), 50.0)
+      assert ints_of(k) == [1, 2, 2, 4, 1]
+      assert floats_of(k) == [0.1, 0.2, 0.3, 0.0, 9.8, 1.5, 50.0]
+      assert En.valid(k)
+    end
+  end
+end
