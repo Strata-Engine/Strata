@@ -10,15 +10,17 @@ Design: `docs/2026-11-10-strata-design.md`. Build plan:
 
 ## Toolchain
 
-Strata is meant to compile against March `origin/main`, and
-`scripts/env.sh` puts a build of it first on the path (at
+Strata compiles against March `origin/main` (as of `f6481bbe6`, march
+0.7.0). `scripts/env.sh` puts a build of it first on the path (at
 `~/code/march-main`, a git worktree of the March repository built with
-`dune build`; set `STRATA_MARCH_HOME` to point elsewhere). In practice the
-builds on the development machine have used March 0.5.0: forge takes the
-toolchain `~/.march/current` names (0.5.0 there) ahead of the one
-`scripts/env.sh` puts on the path, so the gate and every number in
-`RESULTS.md` come from 0.5.0. A switch to March main is planned; it was
-last tried at commit `1a4251bc8` (march 0.7.0).
+`dune build`; set `STRATA_MARCH_HOME` to point elsewhere) and sets
+`MARCH_HOME` to an empty directory there, because forge otherwise takes the
+toolchain `~/.march/current` names (0.5.0 on the development machine) ahead
+of the one on the path. March 0.5.0 no longer builds Strata: file, settings
+and print calls answer a capability result (`Authority.must`), and hashes
+use `int_wrapping_mul`, neither of which 0.5.0 has. The numbers in
+`RESULTS.md` up to the island's are from 0.5.0; those of path finding are
+from main.
 
 The renderer needs Vulkan and GLFW. On macOS:
 
@@ -517,20 +519,57 @@ MARCH_PIN_MAIN=1 STRATA_SHORE=1 STRATA_COMBAT=1 STRATA_LIGHT=4 ./viewer/.march/b
   wood, leaves, tall grass and ice within 2 m and turns grass to dirt.
 - **They**: seven rushers (100 health, a swing for 25) and four shooters (60
   health, arrows). Each goes for the nearest fighter it can see, whoever that
-  is. They swim, climb out at a low bank, and cannot attack from the water.
-  They do not dig, place or burn.
+  is. They find their way (`Strata.Nav`): round a wall, a pit or a cliff when
+  the straight way is shut, through water if that is the way, and a rusher
+  goes on for 6 s after a target that steps out of sight. They swim, climb
+  out at a low bank, and cannot attack from the water. They do not dig,
+  place or burn. `STRATA_COMBAT_NAV=0` plays the match without path finding.
 - **Keys**: Tab the table, Enter another match once one is won. Flight is off.
   More than 150 m from the field the match is paused.
 - A fighter is an entity (`Strata.Entities`) drawn as a figure (`Strata.Anim`)
   the match places each frame; shots are flying entities; the rules are pure
   March in `viewer/lib/combat.march`, the rest in `viewer/lib/match.march` and
-  `match_hud.march`. `scripts/combat_check.sh` plays ten scripted scenes
+  `match_hud.march`. `scripts/combat_check.sh` plays eleven scripted scenes
   hidden, each twice, and the gate runs it.
 
-Not in it: melee for the player, path finding (a blocked fighter sidesteps;
-one stuck 20 s is put back at a spawn point), enemies that dig or burn, fire
+Not in it: melee for the player, fighters that keep clear of each other (one
+blocked by another sidesteps; one stuck 20 s is put back at a spawn point),
+enemies that dig or burn, fire
 that spreads, drowning, new sounds, a flash on a hit (waiting on a per-figure
 tint in the animation work).
+
+## Finding the way
+
+`Strata.Nav` answers where a walker can stand and how it gets from one
+place to another; `Strata.Steer` which way a mover should head
+(`docs/2026-11-12-nav-design.md`). Neither knows what a walker is in a game.
+
+```march
+-- a walker from its box in metres: 0.6 m wide, 1.8 m tall, climbs 1.05 m, drops 4 m
+let k = Strata.Nav.with_swim(Strata.Nav.walker_of(Strata.World.scale(w), 0.3, 1.8, 1.05, 4.0), true)
+
+-- the cell under a place, then the way from one to another: at most 1200 cells expanded
+match Strata.Nav.foot(w, k, x, y, z, 2) do
+  Some((ax, ay, az)) ->
+    let p = Strata.Nav.find(w, k, ax, ay, az, gx, gy, gz, 1200)
+    -- its corners, in metres; drop those reached as the mover goes
+    let corners = Strata.Nav.points(Strata.Nav.smooth(w, k, Strata.Nav.cells(p), 10), Strata.World.scale(w))
+    Strata.Nav.advance(corners, px, pz, 0.5)
+  None -> Nil
+end
+
+-- no path needed when the walker can go straight
+Strata.Nav.straight(w, k, ax, ay, az, gx, gy, gz)
+
+-- the cheapest way to any cell a game's own test accepts: here, one out of a threat's sight
+Strata.Nav.nearest(w, k, ax, ay, az, fn (x, y, z) -> hidden_from(threat, x, y, z), 600)
+```
+
+A path that is not `arrived` ends at the cell nearest the goal that the
+search reached: walk it and ask again. A search reads the world as it is, so
+an edit is seen by the next one; there is nothing to rebuild. It works in a
+window of at most 96 cells across (and 40 and twice the walker's height up
+and down) and on loaded chunks only.
 
 ## Using it from a game
 
@@ -643,6 +682,8 @@ boundary over the ground; their numbers are in `RESULTS.md`.
 | `Strata.Edit` | single, list, box and sphere edits; blasts |
 | `Strata.Stream` | loading around focus points; task-built chunks and meshes |
 | `Strata.Query` | raycast and swept box collision |
+| `Strata.Nav` | where a walker stands; A* paths over the voxels, nearest-by-test, straight lines, corners |
+| `Strata.Steer` | directions over the ground for a mover: seek, flee, arrive, keep apart, blend, turn |
 | `Strata.Fluid` | finite fluids: fall, run to a drop, stay level, sink, rest |
 | `Strata.Slots`, `Strata.Render` | renderer slot bookkeeping; keeping the renderer in step with a stream |
 | `Strata.Model` | a model block's drawing geometry |
