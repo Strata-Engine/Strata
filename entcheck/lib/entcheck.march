@@ -405,27 +405,40 @@ mod Entcheck do
       fire_go(En.set_velocity(e1, id, 50.0, 0.0, 0.0), i + 1)
     end
   end
-  -- (block hits, hits whose block is not the wall's or whose point is not on its face)
-  pfn hits_go(evs : List(Strata.Entities.Event), n : Int, wrong : Int) : (Int, Int) do
+  -- (block hits, hits whose block is not the wall's or whose point is not on its face); each hit's
+  -- entity is marked in [seen] (a byte a row), so a second hit by one bullet is counted as wrong too
+  pfn hits_go(evs : List(Strata.Entities.Event), seen : NativeU8Arr, n : Int, wrong : Int) : (NativeU8Arr, Int, Int) do
     match evs do
-      Nil -> (n, wrong)
+      Nil -> (seen, n, wrong)
       Cons(v, t) ->
-        if En.ev_code(v) != 2 do hits_go(t, n, wrong)
+        if En.ev_code(v) != 2 do hits_go(t, seen, n, wrong)
         else
           let (px, _py, _pz) = En.ev_point(v)
           let (vx, _vy, _vz) = En.ev_voxel(v)
-          let ok = En.ev_block(v) == 2 && En.ev_face(v) == 3 && vx == 40 && Math.abs(px -. 4.0) < 0.0001
-          hits_go(t, n + 1, if ok do wrong else wrong + 1 end)
+          let row = row_of(En.ev_a(v))
+          let first = if row < 2048 do NativeArray.get_u8(seen, row) == 0 else false end
+          let ok = first && En.ev_block(v) == 2 && En.ev_face(v) == 3 && vx == 40 && Math.abs(px -. 4.0) < 0.0001
+          let seen2 = if first do NativeArray.set_u8(seen, row, 1) else seen end
+          hits_go(t, seen2, n + 1, if ok do wrong else wrong + 1 end)
         end
     end
   end
-  pfn volley_go(e : Strata.Entities.Entities, w : Strata.World.World, tick : Int, n : Int, wrong : Int) : (Strata.Entities.Entities, Int, Int) do
-    if tick >= 30 do (e, n, wrong)
+  pfn count_u8(a : NativeU8Arr, i : Int, n : Int) : Int do
+    if i >= NativeArray.length_u8(a) do n else count_u8(a, i + 1, n + NativeArray.get_u8(a, i)) end
+  end
+  pfn volley_go(e : Strata.Entities.Entities, w : Strata.World.World, seen : NativeU8Arr, tick : Int, n : Int, wrong : Int) : (Strata.Entities.Entities, Int, Int, Int) do
+    if tick >= 30 do (e, n, wrong, count_u8(seen, 0, 0))
     else
       let e1 = En.step(e, [(0.0, 1.0, 0.0)], 1.0 /. 60.0)
-      let (n1, w1) = hits_go(En.events(e1, w), n, wrong)
-      volley_go(e1, w, tick + 1, n1, w1)
+      let (seen1, n1, w1) = hits_go(En.events(e1, w), seen, n, wrong)
+      volley_go(e1, w, seen1, tick + 1, n1, w1)
     end
+  end
+  -- every bullet's position, from the position column, on the wall's face (x = 4.0)
+  pfn at_wall(p : NativeF32Arr, i : Int) : Bool do
+    if i >= NativeArray.length_f32(p) / 3 do true
+    else if Math.abs(NativeArray.get_f32(p, 3 * i) -. 4.0) > 0.0001 do false
+    else at_wall(p, i + 1) end end
   end
 
   -- bullets: 1,000 flyers fired at a glass wall each report one block hit, of the wall's block
@@ -433,11 +446,13 @@ mod Entcheck do
     let w = wall_world()
     let e0 = En.blocks_world(world([En.with_mover(En.kind(), En.flying(), 0.05, 0.05, 0.05, 0.0, 0.0)], 2048), w)
     let e1 = fire_go(e0, 0)
-    let (e2, hits, wrong) = volley_go(e1, w, 0, 0, 0)
+    let (e2, hits, wrong, distinct) = volley_go(e1, w, NativeArray.make_u8(2048, 0), 0, 0, 0)
     let first = NativeArray.get_int(En.each(e2, 0), 0)
     let (fx, _fy, _fz) = En.position(e2, first)
     println("  " ++ int_to_string(hits) ++ " block hits in 30 ticks")
-    report("bullets", check(hits == 1000, "every one of the 1,000 reports one block hit")
+    report("bullets", check(hits == 1000, "1,000 block hits")
+      + check(distinct == 1000, "from 1,000 different bullets: one hit each")
+      + check(at_wall(En.column(e2, 0, En.col_position()), 0), "every row of the position column is on the wall")
       + check(wrong == 0, "each of the wall's block (glass, id 2), at voxel x 40, face 3, on x = 4.0 m")
       + check(Math.abs(fx -. 4.0) < 0.0001 && En.velocity(e2, first) == (0.0, 0.0, 0.0), "a bullet rests on the wall")
       + check(live(e2) == 1000 && refused(e2) == 0, "all still live, nothing refused")

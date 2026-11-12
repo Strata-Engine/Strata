@@ -64,16 +64,18 @@ mod Strata.Stream do
   -- chunks loaded or edited and the chunks unloaded not yet taken by
   -- `take_changed` (the entity kernel's). The two sets keep each key once: a
   -- chunk loaded after it was unloaded leaves the unloaded set, and the
-  -- other way about. (Fields carry `sl_` so no other record shares them,
-  -- GAPS S18, S19.)
-  type ChunkLog = { sl_unloads : List(Strata.Coord.Key), sl_changed : Strata.Store.Store(Bool), sl_dropped : Strata.Store.Store(Bool) }
+  -- other way about. They are kept only once `take_changed` has been called
+  -- (sl_on), so a stream nobody takes from (the viewer's) holds nothing in
+  -- them. (Fields carry `sl_` so no other record shares them, GAPS S18, S19.)
+  type ChunkLog = { sl_unloads : List(Strata.Coord.Key), sl_on : Bool, sl_changed : Strata.Store.Store(Bool), sl_dropped : Strata.Store.Store(Bool) }
 
-  pfn no_log() : ChunkLog do { sl_unloads: Nil, sl_changed: So.empty(false), sl_dropped: So.empty(false) } end
+  pfn no_log() : ChunkLog do { sl_unloads: Nil, sl_on: false, sl_changed: So.empty(false), sl_dropped: So.empty(false) } end
   pfn log_unload(lg : ChunkLog, k : Strata.Coord.Key) : ChunkLog do
-    { sl_unloads: Cons(k, lg.sl_unloads), sl_changed: So.remove(lg.sl_changed, k), sl_dropped: So.put(lg.sl_dropped, k, true) }
+    if lg.sl_on do { sl_unloads: Cons(k, lg.sl_unloads), sl_on: true, sl_changed: So.remove(lg.sl_changed, k), sl_dropped: So.put(lg.sl_dropped, k, true) }
+    else { lg with sl_unloads: Cons(k, lg.sl_unloads) } end
   end
   pfn log_loaded(lg : ChunkLog, k : Strata.Coord.Key) : ChunkLog do
-    { lg with sl_changed: So.put(lg.sl_changed, k, true), sl_dropped: So.remove(lg.sl_dropped, k) }
+    if lg.sl_on do { lg with sl_changed: So.put(lg.sl_changed, k, true), sl_dropped: So.remove(lg.sl_dropped, k) } else lg end
   end
   -- the loaded keys of [ks] as changed (an edit's dirty chunks)
   pfn log_edited(lg : ChunkLog, w : Strata.World.World, ks : List(Strata.Coord.Key)) : ChunkLog do
@@ -513,11 +515,20 @@ mod Strata.Stream do
     end
   end
 
-  doc "Chunks loaded or edited, and chunks unloaded, since the last take: each chunk once, in one list or the other. Apart from `take_meshes` and `take_unloads`, which the renderer empties; Strata.Entities reads this to keep its copy of the blocks. Until taken, the keys are kept: a stream nobody takes from keeps one key for each chunk unloaded and not loaded again."
+  doc "Chunks loaded or edited, and chunks unloaded, since the last take: each chunk once, in one list or the other. Apart from `take_meshes` and `take_unloads`, which the renderer empties; Strata.Entities reads this to keep its copy of the blocks. Nothing is recorded until the first take, which lists every chunk loaded then (and nothing unloaded); from then on each take lists what happened since the one before. A stream nobody takes from records nothing."
   fn take_changed(s : Stream) : (Stream, List(Strata.Coord.Key), List(Strata.Coord.Key)) do
     match s do
       Stream(w, c, fs, q, got, gts, mts, m, gone, gts2, mts2) ->
-        (Stream(w, c, fs, q, got, gts, mts, m, { gone with sl_changed: So.empty(false), sl_dropped: So.empty(false) }, gts2, mts2), So.keys(gone.sl_changed), So.keys(gone.sl_dropped))
+        let lg = { gone with sl_on: true, sl_changed: So.empty(false), sl_dropped: So.empty(false) }
+        let changed = if gone.sl_on do So.keys(gone.sl_changed) else So.keys(Wo.chunks(w)) end
+        (Stream(w, c, fs, q, got, gts, mts, m, lg, gts2, mts2), changed, So.keys(gone.sl_dropped))
+    end
+  end
+
+  doc "How many chunk keys `take_changed` holds for its next take, loaded or edited and unloaded together; 0 before the first take. For tests."
+  fn changed_pending(s : Stream) : Int do
+    match s do
+      Stream(_, _, _, _, _, _, _, _, gone, _, _) -> So.size(gone.sl_changed) + So.size(gone.sl_dropped)
     end
   end
 
