@@ -6,8 +6,8 @@
  * +16, data at +32 (8 bytes an element for NativeIntArr and NativeFloatArr,
  * 4 for NativeI32Arr and NativeF32Arr, 1 for NativeU8Arr). Inputs are only
  * read; en_x_each, en_x_column, en_x_ray, en_x_events, en_x_near,
- * en_x_ray_entities, en_x_sweep, en_x_releases, en_x_seen_parts and
- * en_x_wanting fill a caller-owned
+ * en_x_ray_entities, en_x_sweep, en_x_releases, en_x_seen_parts,
+ * en_x_wanting and en_x_holding fill a caller-owned
  * array, as strata_anim.c's matrices do. Reads of three numbers come back one
  * number a call (en_x_get's k). Calls March makes only for their effect
  * answer an Int it can use (GAPS S9).
@@ -15,7 +15,7 @@
  * With no world open every call does nothing and answers its default
  * (0, -1 for a kind or an id, 0.0). */
 /* Rewritten by stamp_ent.sh whenever strata_ent.h, strata_ent_grid.h, strata_ent_move.h or strata_ent_seen.h changes (GAPS S14). */
-#define STRATA_ENT_STAMP "58c156e853228233"
+#define STRATA_ENT_STAMP "71e494a56ba1b89a"
 #include <stdint.h>
 #include <time.h>
 #include "strata_ent.h"
@@ -264,6 +264,20 @@ int64_t en_x_wanting(int64_t part, void *ids) {
     int64_t n = en_x_len(ids);
     if (n <= 0) return en_wanting(g_w, (int)part, 0, NULL);
     return en_wanting(g_w, (int)part, n > EN_CAPACITY_MAX ? EN_CAPACITY_MAX : (int)n, en_x_i64(ids));
+}
+/* en_holding into a NativeIntArr: the seen entities holding part, how many written; with an empty array, how many there are */
+int64_t en_x_holding(int64_t part, void *ids) {
+    if (!g_w || part < 0 || part >= EN_PARTS) return 0;
+    int64_t n = en_x_len(ids);
+    if (n <= 0) return en_holding(g_w, (int)part, 0, NULL);
+    return en_holding(g_w, (int)part, n > EN_CAPACITY_MAX ? EN_CAPACITY_MAX : (int)n, en_x_i64(ids));
+}
+/* answers 1 */
+int64_t en_x_body_lost(int64_t id) { if (g_w) en_body_lost(g_w, id); return 1; }
+/* answers 1 */
+int64_t en_x_body_over(int64_t n) {
+    if (g_w) en_body_over(g_w, n < 0 ? -1 : n > INT32_MAX ? INT32_MAX : (int)n);
+    return 1;
 }
 
 /* seconds on a monotonic clock, for timing scenes; the kernel never reads it (its time is the dt it is given) */

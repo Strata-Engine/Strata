@@ -1546,6 +1546,50 @@ static void test_figure_refusals(void) {
     en_close(w);
 }
 
+/* bodies: holders, a body lost (event 7, no release, not wanted again while seen), released on leaving view, stat 7 */
+static void test_bodies(void) {
+    EnWorld *w = world(16);
+    int32_t ki[9]; kind_ints(ki, 3, 1, 0, 0, 1); ki[6] = 0; ki[8] = 0;   /* bodied, a body, no figure, no voices */
+    float fl[7] = {0.3f, 0.9f, 0.3f, 0, 0, 40, 0};
+    int k = en_kind(w, ki, fl);
+    CHECK(k >= 0, "a bodied kind with a body registers");
+    int64_t a = en_add(w, k, 1, 0, 0, 0), b = en_add(w, k, 2, 0, 0, 0), far = en_add(w, k, 500, 0, 0, 0);
+    tick_at(w, 0, 0, 0);
+    int64_t ids[16];
+    CHECK(en_wanting(w, 1, 0, NULL) == 2 && en_holding(w, 1, 0, NULL) == 0, "the two seen bodied entities want a body; none holds one");
+    en_set_part(w, a, 1, 5); en_set_part(w, b, 1, 6);
+    CHECK(en_holding(w, 1, 0, NULL) == 2 && en_holding(w, 1, 16, ids) == 2 && ids[0] == a && ids[1] == b,
+          "both hold one, listed by entity id in dense order");
+    CHECK(en_holding(w, 1, 1, ids) == 1 && ids[0] == a, "at most max holders are written");
+    CHECK(en_holding(w, 0, 0, NULL) == 0 && en_holding(w, 4, 0, NULL) == 0, "no figure held; no part 4");
+    en_body_lost(w, a);
+    CHECK(en_part(w, a, 1) == -1 && en_releases(w, 0, NULL, NULL) == 0, "a lost body clears the part and releases nothing");
+    int n = en_events(w, EN_EVENTS, ev_i, ev_f);
+    CHECK(n >= 1 && ev_i[(n - 1) * 7] == EN_E_BODY_LOST && ev_i[(n - 1) * 7 + 1] == a && ev_i[(n - 1) * 7 + 3] == 5 &&
+          ev_f[(n - 1) * 3] == 1.0, "... and appends event 7 to the last tick's events: the entity, the body, its position");
+    CHECK(en_wanting(w, 1, 0, NULL) == 0, "... and while seen it does not want another");
+    tick_at(w, 0, 0, 0);
+    CHECK(count_code(w, EN_E_BODY_LOST) == 0 && en_wanting(w, 1, 0, NULL) == 0 && en_part(w, a, 1) == -1,
+          "the next tick clears the event; still no body wanted");
+    double before = en_stat(w, 3);
+    en_body_lost(w, a); en_body_lost(w, far + 1000000000);
+    CHECK(en_stat(w, 3) == before + 2 && en_events(w, 0, NULL, NULL) == 0, "a body lost on an entity holding none, or a dead id, is refused");
+    tick_at(w, 1000, 0, 0);
+    n = en_releases(w, 16, rel_c, rel_i);
+    CHECK(n == 1 && rel_c[0] == 1 && rel_i[0] == 6, "leaving view releases the body as code 1");
+    tick_at(w, 0, 0, 0);
+    CHECK(en_wanting(w, 1, 0, NULL) == 2, "seen again, both want a body, the one that lost its body too");
+    CHECK(en_stat(w, 7) == 0, "stat 7 reads 0 until told");
+    en_body_over(w, 6);
+    CHECK(en_stat(w, 7) == 6, "en_body_over sets stat 7");
+    before = en_stat(w, 3);
+    en_body_over(w, -1);
+    CHECK(en_stat(w, 7) == 6 && en_stat(w, 3) == before + 1 && en_stat(w, 6) == EN_R_VALUE, "a negative count is refused");
+    en_body_over(w, 0);
+    CHECK(en_stat(w, 7) == 0, "... and 0 sets it back");
+    en_close(w);
+}
+
 int main(void) {
     test_kinds();
     test_add_and_read();
@@ -1585,6 +1629,7 @@ int main(void) {
     test_seen_parts();
     test_wanting();
     test_figure_refusals();
+    test_bodies();
     if (fails == 0) printf("ent_test: ok\n");
     return fails == 0 ? 0 : 1;
 }

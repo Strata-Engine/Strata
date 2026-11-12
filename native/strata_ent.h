@@ -65,8 +65,10 @@
 /* a row's flags */
 /* seen (strata_ent_seen.h); a flyer that hit a block, still until the game moves it; a walker standing on something; a
  * follower whose route loops; a follower that has reported event 8 for its present stall; an unseen walker waiting to
- * be set on the ground; an unseen entity frozen by its kind's rule */
-enum { EN_F_SEEN = 1, EN_F_STUCK = 2, EN_F_GROUNDED = 4, EN_F_LOOPS = 8, EN_F_BLOCKED = 16, EN_F_WAITING = 32, EN_F_FROZEN = 64 };
+ * be set on the ground; an unseen entity frozen by its kind's rule; a seen entity whose body was lost (en_body_lost),
+ * wanting no other until it has left view */
+enum { EN_F_SEEN = 1, EN_F_STUCK = 2, EN_F_GROUNDED = 4, EN_F_LOOPS = 8, EN_F_BLOCKED = 16, EN_F_WAITING = 32, EN_F_FROZEN = 64,
+       EN_F_LOST = 128 };
 /* event codes */
 enum { EN_E_TOUCH = 1, EN_E_BLOCK = 2, EN_E_ENTERED = 3, EN_E_LEFT = 4, EN_E_ROUTE = 5, EN_E_REMOVED = 6, EN_E_BODY_LOST = 7, EN_E_BLOCKED = 8 };
 
@@ -179,6 +181,7 @@ struct EnWorld {
     /* parts */
     int32_t *rel_code; int64_t *rel_id; int nrel;   /* capacity x EN_PARTS: (part, id) pairs cleared and not yet drained */
     double fig_refused[EN_KINDS];   /* figures the game could not make for each kind (en_figure_refused) */
+    int body_over;               /* entities wanting a body left over by the game's last tick (en_body_over) */
     double *focus; int nfocus, focus_cap;   /* the last tick's focus points, 3 doubles each */
     EnWant *want;                /* capacity: en_wanting's scratch */
 };
@@ -608,7 +611,7 @@ static inline uint64_t en_hash(const EnWorld *w) {
  * 3 refused calls, 4 ticks given a dt negative or not finite, 5 events dropped (past EN_EVENTS in a tick, or removals
  * queued between ticks), 6 last refusal reason (EN_R_*), 7 entities over the body budget, 8 route points held, 9 routes
  * held (a freed route still followed is held), 10 + k figures the game could not make for kind k (en_figure_refused).
- * Releases dropped (en_release_parts) are counted in 5 too. Bodies come in a later task; until then 7 reads 0. */
+ * Releases dropped (en_release_parts) are counted in 5 too. 7 is what the game last said (en_body_over). */
 static inline double en_stat(const EnWorld *w, int which) {
     if (which >= 10 && which < 10 + EN_KINDS) return w->fig_refused[which - 10];
     switch (which) {
@@ -619,6 +622,7 @@ static inline double en_stat(const EnWorld *w, int which) {
     case 4: return w->bad_dt;
     case 5: return w->dropped;
     case 6: return w->reason;
+    case 7: return w->body_over;
     case 8: return w->route_pts_held;
     case 9: return w->routes_held;
     default: return 0;
@@ -966,7 +970,7 @@ static inline int en_want_order(const void *a, const void *b) {
 
 /* The seen entities whose kind has part but that hold none, nearest a focus of the last tick first (measured
  * horizontally, to the nearest focus), equal distances by id: their ids into ids, at most max; how many written. With ids
- * NULL, answers how many there are. */
+ * NULL, answers how many there are. An entity whose body was lost (en_body_lost) does not want another while seen. */
 static inline int en_wanting(EnWorld *w, int part, int max, int64_t *ids) {
     if (part < 0 || part >= EN_PARTS) return 0;
     int n = 0;
@@ -977,6 +981,7 @@ static inline int en_wanting(EnWorld *w, int part, int max, int64_t *ids) {
         for (int i = 0; i < kd->live; i++) {
             int r = dense[i];
             if (!(w->flags[r] & EN_F_SEEN) || w->part[(size_t)r * EN_PARTS + part] >= 0) continue;
+            if (part == 1 && (w->flags[r] & EN_F_LOST)) continue;   /* its body was lost: none again until it leaves view */
             if (ids) {
                 const double *p = w->pos + r * 3;
                 double best = INFINITY;
@@ -994,6 +999,48 @@ static inline int en_wanting(EnWorld *w, int part, int max, int64_t *ids) {
     int m = max < n ? (max < 0 ? 0 : max) : n;
     for (int i = 0; i < m; i++) ids[i] = w->want[i].id;
     return m;
+}
+
+/* The seen entities holding part, kind by kind in dense order: their entity ids into ids, at most max; how many
+ * written. With ids NULL, answers how many there are. */
+static inline int en_holding(const EnWorld *w, int part, int max, int64_t *ids) {
+    if (part < 0 || part >= EN_PARTS) return 0;
+    int n = 0;
+    for (int k = 0; k < w->nkinds; k++) {
+        const EnKind *kd = &w->kinds[k];
+        if (!en_kind_has_part(kd, part)) continue;
+        const int32_t *dense = w->dense + (size_t)k * w->capacity;
+        for (int i = 0; i < kd->live; i++) {
+            int r = dense[i];
+            if (!(w->flags[r] & EN_F_SEEN) || w->part[(size_t)r * EN_PARTS + part] < 0) continue;
+            if (ids) { if (n >= max) return n; ids[n] = en_id(w, r); }
+            n++;
+        }
+    }
+    return n;
+}
+
+/* The game found entity id's body gone (Strata.Physics.exists false: removed, or written into the world as blocks):
+ * the body part is cleared without going on the release list (there is nothing left to free) and event 7 is appended
+ * to the last tick's events (a the id, i0 the body's id, the point its position). While it stays seen it wants no
+ * other body (en_wanting skips it); leaving view clears that. Refused for a dead id (EN_R_ENTITY) or one holding no
+ * body (EN_R_PART). */
+static inline void en_body_lost(EnWorld *w, int64_t id) {
+    int r = en_row(w, id);
+    if (r < 0) { en_refuse(w, EN_R_ENTITY); return; }
+    int64_t *b = w->part + (size_t)r * EN_PARTS + 1;
+    if (*b < 0) { en_refuse(w, EN_R_PART); return; }
+    const double *p = w->pos + r * 3;
+    en_event(w, EN_E_BODY_LOST, id, 0, *b, 0, 0, 0, p[0], p[1], p[2]);
+    *b = -1;
+    w->flags[r] |= EN_F_LOST;
+}
+
+/* the game's count of entities wanting a body that its budget left without one this tick: en_stat(7). Refused (EN_R_VALUE)
+ * below 0. */
+static inline void en_body_over(EnWorld *w, int n) {
+    if (n < 0) { en_refuse(w, EN_R_VALUE); return; }
+    w->body_over = n;
 }
 
 #endif

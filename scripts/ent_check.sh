@@ -12,7 +12,7 @@ EC=entcheck/.march/build/release/entcheck
 # the jump and arena scenes judge their targets only under a load average below 8 (the integer part is passed)
 ENTCHECK_LOAD=$(uptime | sed 's/.*load average[s]*: *//' | cut -d' ' -f1 | cut -d. -f1 | tr -d ,)
 export ENTCHECK_LOAD
-for s in basics columns determinism closed ray bullets storm sweep walk jump parts cap arena; do
+for s in basics columns determinism closed ray bullets storm sweep walk jump parts cap arena bodies; do
   if ! ENTCHECK_SCENE=$s $EC > "$OUT/$s.log" 2>&1; then echo "FAIL: entcheck scene $s"; cat "$OUT/$s.log"; exit 1; fi
   tail -1 "$OUT/$s.log"
 done

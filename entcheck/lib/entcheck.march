@@ -1215,6 +1215,143 @@ mod Entcheck do
     report("arena", bad1 + bad2 + check(h1 == h2, "two runs give one hash"))
   end
 
+  -- ── Bodies ───────────────────────────────────────────────────────────────
+  -- 1 m voxels: chunks x -2..1, y -1..2, z -2..1, stone below y = 0, air above, and a wall 4 m high at x = 6, z 6..14
+  pfn body_chunks(w : Strata.World.World, i : Int) : Strata.World.World do
+    if i >= 64 do w
+    else body_chunks(Strata.World.insert(w, Strata.Coord.key(i % 4 - 2, (i / 4) % 4 - 1, i / 16 - 2), Strata.Chunk.uniform(if (i / 4) % 4 == 0 do 1 else 0 end)), i + 1) end
+  end
+  pfn body_world() : Strata.World.World do
+    let w0 = body_chunks(Strata.World.new(registry(), Strata.Terrain.gen(fn (k, seed) -> Strata.Chunk.uniform(0)), 43, 1.0), 0)
+    Strata.Edit.world(Strata.Edit.fill_box(w0, 6, 0, 6, 6, 3, 14, 1))
+  end
+  -- a dynamic body's blocks: one stone voxel
+  pfn body_cube() : Strata.Body.Grid do Strata.Body.grid_set(Strata.Body.grid(1, 1, 1), 0, 0, 0, 1) end
+
+  type BodyFrame = BodyFrame(Strata.Entities.Entities, Strata.Stream.Stream, Strata.Physics.Physics, Strata.Anim.Anim, Strata.Sound.Sound)
+  pfn bf_e(f : BodyFrame) : Strata.Entities.Entities do match f do BodyFrame(e, _, _, _, _) -> e end end
+  pfn bf_p(f : BodyFrame) : Strata.Physics.Physics do match f do BodyFrame(_, _, p, _, _) -> p end end
+  pfn bf_s(f : BodyFrame) : Strata.Stream.Stream do match f do BodyFrame(_, s, _, _, _) -> s end end
+  pfn bf_with_e(f : BodyFrame, e : Strata.Entities.Entities) : BodyFrame do match f do BodyFrame(_, s, p, a, snd) -> BodyFrame(e, s, p, a, snd) end end
+  pfn bf_with_p(f : BodyFrame, p : Strata.Physics.Physics) : BodyFrame do match f do BodyFrame(e, s, _, a, snd) -> BodyFrame(e, s, p, a, snd) end end
+
+  -- a frame: one physics step, then the entities' tick, at the focus
+  pfn body_frame(f : BodyFrame, focus : (Float, Float, Float)) : BodyFrame do
+    match f do
+      BodyFrame(e, s, p, a, snd) ->
+        let (p1, s1) = Strata.Physics.step(p, s, [focus])
+        let (e1, p2, a1, snd1) = En.tick(e, Strata.Stream.world(s1), p1, a, snd, [focus], 1.0 /. 60.0)
+        BodyFrame(e1, s1, p2, a1, snd1)
+    end
+  end
+  -- how far entity [id] is from its body's centre (0 if it has none)
+  pfn body_gap(f : BodyFrame, id : Int) : Float do
+    let b = En.body(bf_e(f), id)
+    if b < 0 do 0.0
+    else
+      let (x, y, z) = En.position(bf_e(f), id)
+      let (qx, qy, qz) = Strata.Physics.position(bf_p(f), b)
+      Math.sqrt((x -. qx) *. (x -. qx) +. (y -. qy) *. (y -. qy) +. (z -. qz) *. (z -. qz))
+    end
+  end
+  -- [n] frames; the worst gap of entity [id] from its body after each
+  pfn body_frames(f : BodyFrame, focus : (Float, Float, Float), id : Int, n : Int, worst : Float) : (BodyFrame, Float) do
+    if n <= 0 do (f, worst)
+    else
+      let f1 = body_frame(f, focus)
+      let g = body_gap(f1, id)
+      body_frames(f1, focus, id, n - 1, if g > worst do g else worst end)
+    end
+  end
+  pfn count_code(evs : List(Strata.Entities.Event), code : Int, id : Int) : Int do
+    List.length(List.filter(evs, fn v -> En.ev_code(v) == code && En.ev_a(v) == id))
+  end
+  pfn add_bodied(e : Strata.Entities.Entities, ids : NativeIntArr, i : Int, n : Int) : (Strata.Entities.Entities, NativeIntArr) do
+    if i >= n do (e, ids)
+    else
+      let (e1, id) = En.add(e, 0, int_to_float(n - i), 1.0, 0.0, 0.0)
+      add_bodied(e1, NativeArray.set_int(ids, i, id), i + 1, n)
+    end
+  end
+  pfn with_body(e : Strata.Entities.Entities, ids : NativeIntArr, i : Int, n : Int) : Int do
+    if i >= NativeArray.length_int(ids) do n
+    else with_body(e, ids, i + 1, if En.body(e, NativeArray.get_int(ids, i)) >= 0 do n + 1 else n end) end
+  end
+
+  -- budget: a body budget of 4 and 10 seen bodied entities 1..10 m from the focus: the 4 nearest get bodies, stat 7 is 6
+  -- on each tick (not summed)
+  pfn budget_part(w : Strata.World.World) : Int do
+    let e0 = En.open([En.with_driven_body(En.kind(), 0.3, 0.9, 0.3)], 64, 4, 4, 32.0, 1.0)
+    let (e1, ids) = add_bodied(e0, NativeArray.make_int(10, -1), 0, 10)
+    let f0 = BodyFrame(e1, Strata.Stream.start(w, Strata.Stream.config(4, 2, 32, 4)), physics(), An.open(8), Snd.new())
+    let f1 = body_frame(f0, (0.0, 1.0, 0.0))
+    let f2 = body_frame(f1, (0.0, 1.0, 0.0))
+    let nearest = NativeArray.from_list_int(List.drop(NativeArray.to_list_int(ids), 6))
+    println("  budget: " ++ int_to_string(Strata.Physics.count(bf_p(f1))) ++ " bodies, stat 7 " ++ float_to_string(En.stat(bf_e(f1), 7)) ++ " then " ++ float_to_string(En.stat(bf_e(f2), 7)))
+    check(En.is_open(e0), "a driven-body kind opens")
+      + check(Strata.Physics.count(bf_p(f1)) == 4, "budget 4 with 10 seen bodied entities gives 4 bodies")
+      + check(with_body(bf_e(f1), ids, 0, 0) == 4 && with_body(bf_e(f1), nearest, 0, 0) == 4, "... to the 4 nearest the focus")
+      + check(En.stat(bf_e(f1), 7) == 6.0, "... and stat 7 is 6")
+      + check(En.stat(bf_e(f2), 7) == 6.0 && Strata.Physics.count(bf_p(f2)) == 4, "... 6 again on the next tick, still 4 bodies")
+      + check(!En.is_open(En.close(bf_e(f2))), "closed")
+  end
+
+  -- bodies: a driven body walked 2 m in a second and one stopped by a wall; a dynamic body dropped 2.5 m lands, its
+  -- entity following; leaving view removes the bodies; a body removed behind the layer's back is reported lost once
+  pfn bodies_scene() : Int do
+    let w = body_world()
+    let driven = En.with_driven_body(En.kind(), 0.3, 0.9, 0.3)
+    let dynamic = En.with_dynamic_body(En.kind(), body_cube())
+    let e0 = En.open([driven, dynamic], 256, 128, 4, 32.0, 1.0)
+    let (e1, a_id) = En.add(e0, 0, 0.0, 1.0, 0.0, 0.0)
+    let (e2, b_id) = En.add(e1, 0, 4.5, 1.0, 10.0, 0.0)
+    let (e3, d_id) = En.add(e2, 1, -10.0, 3.0, -10.0, 0.5)
+    let e4 = En.set_velocity(En.set_velocity(e3, a_id, 2.0, 0.0, 0.0), b_id, 2.0, 0.0, 0.0)
+    let focus = (0.0, 1.0, 0.0)
+    let f0 = BodyFrame(e4, Strata.Stream.start(w, Strata.Stream.config(4, 2, 32, 4)), physics(), An.open(8), Snd.new())
+    -- the first frame gives the bodies, the next 60 drive them for a second
+    let f1 = body_frame(f0, focus)
+    let given = En.body(bf_e(f1), a_id) >= 0 && En.body(bf_e(f1), b_id) >= 0 && En.body(bf_e(f1), d_id) >= 0
+    let (f2, worst_a) = body_frames(f1, focus, a_id, 60, 0.0)
+    let (ax, ay, az) = En.position(bf_e(f2), a_id)
+    let (bx, _by, _bz) = En.position(bf_e(f2), b_id)
+    let (pax, pay, paz) = Strata.Physics.position(bf_p(f2), En.body(bf_e(f2), a_id))
+    println("  driven: A at x " ++ float_to_string(ax) ++ ", B stopped at x " ++ float_to_string(bx) ++ "; A's worst gap from its body " ++ float_to_string(worst_a))
+    let bad = check(En.is_open(e0), "a driven and a dynamic kind open")
+      + check(given, "after one frame each of the three has a body")
+      + check(Strata.Physics.count(bf_p(f1)) == 3, "... and physics holds three")
+      + check(Math.abs(ax -. 2.0) <= 0.1, "a driven body given (2, 0, 0) for 1 s moves 2 m within 0.1")
+      + check(ax == pax && ay == pay && az == paz, "... and its body's position equals the entity's")
+      + check(worst_a == 0.0, "... after every frame")
+      + check(bx < 5.71 && bx > 5.6, "one driven at a wall 1.5 m away is stopped at the wall")
+    -- the dynamic one, 60 frames more with the driven ones still
+    let f3 = bf_with_e(f2, En.set_velocity(En.set_velocity(bf_e(f2), a_id, 0.0, 0.0, 0.0), b_id, 0.0, 0.0, 0.0))
+    let (f4, worst_d) = body_frames(f3, focus, d_id, 60, body_gap(f2, d_id))
+    let (_dx, dy, _dz) = En.position(bf_e(f4), d_id)
+    println("  dynamic: landed at y " ++ float_to_string(dy) ++ "; worst gap from its body " ++ float_to_string(worst_d))
+    let bad2 = check(Math.abs(dy -. 0.5) <= 0.05, "a dynamic body dropped from 3 m lands (its centre 0.5 m up)")
+      + check(worst_d <= 0.05, "... its entity following the body within 0.05 m after every frame")
+    -- a body taken away behind the layer's back
+    let lost = En.body(bf_e(f4), a_id)
+    let f5 = body_frame(bf_with_p(f4, Strata.Physics.remove(bf_p(f4), lost)), focus)
+    let evs5 = En.events(bf_e(f5), Strata.Stream.world(bf_s(f5)))
+    let f6 = body_frame(f5, focus)
+    let evs6 = En.events(bf_e(f6), Strata.Stream.world(bf_s(f6)))
+    let bad3 = check(count_code(evs5, 7, a_id) == 1 && List.length(List.filter(evs5, fn v -> En.ev_code(v) == 7)) == 1, "Strata.Physics.remove behind the layer's back writes one event 7")
+      + check(En.body(bf_e(f5), a_id) == -1, "... and body reads -1")
+      + check(En.body(bf_e(f6), a_id) == -1 && count_code(evs6, 7, a_id) == 0, "... still -1 the tick after, with no second event 7")
+      + check(En.alive(bf_e(f6), a_id), "... and the entity stays")
+    -- leaving view
+    let held = Strata.Physics.count(bf_p(f6))
+    let f7 = body_frame(f6, (500.0, 1.0, 500.0))
+    let after_n = Strata.Physics.count(bf_p(f7))
+    println("  leaving view: physics held " ++ int_to_string(held) ++ " bodies, then " ++ int_to_string(after_n))
+    let bad4 = check(held == 2 && after_n == 0, "leaving view removes the bodies (Strata.Physics.count falls from 2 to 0)")
+      + check(En.body(bf_e(f7), b_id) == -1 && En.body(bf_e(f7), d_id) == -1, "... and body reads -1")
+      + check(!En.is_open(En.close(bf_e(f7))), "closed")
+    report("bodies", bad + bad2 + bad3 + bad4 + budget_part(w))
+  end
+
   fn main(_cap : Cap(IO)) : Unit do
     let name = Env.get("ENTCHECK_SCENE", "")
     if name == "basics" do process_exit(basics_scene())
@@ -1230,9 +1367,10 @@ mod Entcheck do
     else if name == "parts" do process_exit(parts_scene())
     else if name == "cap" do process_exit(cap_scene())
     else if name == "arena" do process_exit(arena_scene())
+    else if name == "bodies" do process_exit(bodies_scene())
     else
-      println("entcheck: no scene named '" ++ name ++ "' (basics, columns, determinism, closed, ray, bullets, storm, sweep, walk, jump, parts, cap, arena)")
+      println("entcheck: no scene named '" ++ name ++ "' (basics, columns, determinism, closed, ray, bullets, storm, sweep, walk, jump, parts, cap, arena, bodies)")
       process_exit(2)
-    end end end end end end end end end end end end end
+    end end end end end end end end end end end end end end
   end
 end
