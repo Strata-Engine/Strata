@@ -42,7 +42,7 @@ mod Strata.Atlas do
   type Site = Site(Float, Float, Float, Float, Int, Int)
 
   -- def, height, region, water, receiver, drainage, river width, sites, river polylines, carved lakes
-  type Atlas = Atlas(Def, NativeF32Arr, NativeIntArr, NativeF32Arr, NativeIntArr, NativeF32Arr, NativeF32Arr, List(Site), List(List((Float, Float, Float))), List((Float, Float, Float)))
+  type Atlas = Atlas(Def, NativeF32Arr, NativeIntArr, NativeF32Arr, NativeIntArr, NativeF32Arr, NativeF32Arr, List(Site), List(List((Float, Float, Float))), List((Float, Float, Float)), Int)
 
   doc "A grid of n x n samples, step metres apart, centred on the origin: an island of the given radius, regions about region_size metres across (region_count ids), sea at sea metres, eroded with Strata.Erosion.default_params(); rivers from 2000 m^2 of drainage, 6 lakes carved 30 m in radius and 5 m deep, lakes 0.3 m below their spill, 8 sites 150 m apart on ground no rougher than 2 m over 3 x 3 samples."
   fn def(n : Int, step : Float, island_radius : Float, region_size : Float, region_count : Int, sea : Float) : Def do
@@ -93,22 +93,24 @@ mod Strata.Atlas do
   fn s_region(s : Site) : Int do match s do Site(_, _, _, _, v, _) -> v end end
   fn s_index(s : Site) : Int do match s do Site(_, _, _, _, _, v) -> v end end
 
-  fn def_of(a : Atlas) : Def do match a do Atlas(d, _, _, _, _, _, _, _, _, _) -> d end end
-  pfn heights(a : Atlas) : NativeF32Arr do match a do Atlas(_, v, _, _, _, _, _, _, _, _) -> v end end
-  pfn regions(a : Atlas) : NativeIntArr do match a do Atlas(_, _, v, _, _, _, _, _, _, _) -> v end end
-  pfn waters(a : Atlas) : NativeF32Arr do match a do Atlas(_, _, _, v, _, _, _, _, _, _) -> v end end
-  pfn receivers(a : Atlas) : NativeIntArr do match a do Atlas(_, _, _, _, v, _, _, _, _, _) -> v end end
-  pfn drainages(a : Atlas) : NativeF32Arr do match a do Atlas(_, _, _, _, _, v, _, _, _, _) -> v end end
-  pfn widths(a : Atlas) : NativeF32Arr do match a do Atlas(_, _, _, _, _, _, v, _, _, _) -> v end end
+  doc "The seed the atlas was built for."
+  fn seed_of(a : Atlas) : Int do match a do Atlas(_, _, _, _, _, _, _, _, _, _, v) -> v end end
+  fn def_of(a : Atlas) : Def do match a do Atlas(d, _, _, _, _, _, _, _, _, _, _) -> d end end
+  pfn heights(a : Atlas) : NativeF32Arr do match a do Atlas(_, v, _, _, _, _, _, _, _, _, _) -> v end end
+  pfn regions(a : Atlas) : NativeIntArr do match a do Atlas(_, _, v, _, _, _, _, _, _, _, _) -> v end end
+  pfn waters(a : Atlas) : NativeF32Arr do match a do Atlas(_, _, _, v, _, _, _, _, _, _, _) -> v end end
+  pfn receivers(a : Atlas) : NativeIntArr do match a do Atlas(_, _, _, _, v, _, _, _, _, _, _) -> v end end
+  pfn drainages(a : Atlas) : NativeF32Arr do match a do Atlas(_, _, _, _, _, v, _, _, _, _, _) -> v end end
+  pfn widths(a : Atlas) : NativeF32Arr do match a do Atlas(_, _, _, _, _, _, v, _, _, _, _) -> v end end
 
   doc "The structure sites, in the order they were taken."
-  fn sites(a : Atlas) : List(Site) do match a do Atlas(_, _, _, _, _, _, _, v, _, _) -> v end end
+  fn sites(a : Atlas) : List(Site) do match a do Atlas(_, _, _, _, _, _, _, v, _, _, _) -> v end end
 
   doc "The rivers as polylines of (x m, z m, width m), one from each river head down its receivers to the first sample that is not river: the sea, a lake (whose outlet starts its own), or the grid's edge. Downstream of a confluence polylines share their points."
-  fn rivers(a : Atlas) : List(List((Float, Float, Float))) do match a do Atlas(_, _, _, _, _, _, _, _, v, _) -> v end end
+  fn rivers(a : Atlas) : List(List((Float, Float, Float))) do match a do Atlas(_, _, _, _, _, _, _, _, v, _, _) -> v end end
 
   doc "The carved lakes, in the order they were taken: (x m, z m, water level m) at each centre; the level is -1 if the bowl held no water."
-  fn lakes(a : Atlas) : List((Float, Float, Float)) do match a do Atlas(_, _, _, _, _, _, _, _, _, v) -> v end end
+  fn lakes(a : Atlas) : List((Float, Float, Float)) do match a do Atlas(_, _, _, _, _, _, _, _, _, v, _) -> v end end
 
   fn n(a : Atlas) : Int do d_n(def_of(a)) end
   fn step(a : Atlas) : Float do d_step(def_of(a)) end
@@ -474,7 +476,7 @@ mod Strata.Atlas do
             let k2 = Nz.field2(Nz.settings(2, 1, 2.0, 0.5, 0, 0.25 *. rz), Sd3.mix(seed, salt_region()), 1.0 /. rz, x0, x0, d_step(d), n, n, cells)
             let rs = quantise_go(NativeArray.make_int(Strata.Size.of(cnt), 0), cells, hs2, d, 0)
             let ranked = List.sort_by(candidates_go(d, seed, hs2, ws, wd, 0, cnt, Nil), fn (p, q) -> ranked_before(p, q))
-            Atlas(d, hs2, rs, ws, rcv, ar, wd, take_go(d, hs2, rs, ranked, 0, Nil), lines, lake_list(d, ws, centres))
+            Atlas(d, hs2, rs, ws, rcv, ar, wd, take_go(d, hs2, rs, ranked, 0, Nil), lines, lake_list(d, ws, centres), seed)
         end
     end
   end
@@ -629,15 +631,18 @@ mod Strata.Atlas do
   -- ── Bytes ────────────────────────────────────────────────────────────────
   -- An atlas as bytes, for a cache on disk, little-endian: a version byte;
   -- the Def in its field order (floats as binary64, counts as 32 bits); the
-  -- six layers as held (binary32 floats, 32-bit ints); then the sites, the
+  -- seed (its low 32 bits, then its high 32); the six layers as held (binary32 floats, 32-bit ints); then the sites, the
   -- river polylines and the carved lakes, each list led by its length.
   -- March has no bit casts, so a float is taken apart into sign, exponent
   -- and mantissa by hand; every value comes back exactly.
   --
   -- version() names the layout AND what build makes: raise it whenever
   -- build's output for a Def could change, so a cache made by older code is
-  -- never read. It is in the bytes, so in cache_name too.
-  pfn version() : Int do 1 end
+  -- never read. It is in the bytes, so in cache_name too. 2: the seed is
+  -- written after the Def. test/atlas_test.march stores the hash of one
+  -- atlas: when that test fails, build's arithmetic changed, and this must
+  -- be raised.
+  pfn version() : Int do 2 end
 
   ptype Wr = Wr(NativeU8Arr, Int)
 
@@ -758,11 +763,11 @@ mod Strata.Atlas do
     end
   end
 
-  doc "The atlas as bytes, for from_bytes: a version byte, the Def, the layers, the sites, the rivers and the lakes."
+  doc "The atlas as bytes, for from_bytes: a version byte, the Def, the seed, the layers, the sites, the rivers and the lakes."
   fn to_bytes(a : Atlas) : NativeU8Arr do
     let cnt = n(a) * n(a)
-    let size = def_size() + 24 * cnt + 4 + 40 * List.length(sites(a)) + points_size(rivers(a), 4) + 4 + 24 * List.length(lakes(a))
-    let w1 = put_def(Wr(NativeArray.make_u8(Strata.Size.of(size), 0), 0), def_of(a))
+    let size = def_size() + 8 + 24 * cnt + 4 + 40 * List.length(sites(a)) + points_size(rivers(a), 4) + 4 + 24 * List.length(lakes(a))
+    let w1 = w32(w32(put_def(Wr(NativeArray.make_u8(Strata.Size.of(size), 0), 0), def_of(a)), seed_of(a)), int_shr(seed_of(a), 32))
     let w2 = put_fs(put_is(put_fs(put_fs(put_is(put_fs(w1, heights(a), 0, cnt), regions(a), 0, cnt), waters(a), 0, cnt), drainages(a), 0, cnt), receivers(a), 0, cnt), widths(a), 0, cnt)
     let w3 = put_points(w32(put_rivers(w32(put_sites(w32(w2, List.length(sites(a))), sites(a)), List.length(rivers(a))), rivers(a)), List.length(lakes(a))), lakes(a))
     match w3 do Wr(b, _) -> b end
@@ -803,13 +808,14 @@ mod Strata.Atlas do
   doc "The atlas to_bytes wrote, or None if the bytes are cut short, run long, or come from another version."
   fn from_bytes(b : NativeU8Arr) : Option(Atlas) do
     let len = NativeArray.length_u8(b)
-    if len < def_size() do None
+    if len < def_size() + 8 do None
     else if NativeArray.get_u8(b, 0) != version() do None
     else
       let d = get_def(b)
+      let seed = r32(b, def_size()) + int_shl(r32s(b, def_size() + 4), 32)
       let nn = d_n(d)
       let cnt = nn * nn
-      let p0 = def_size()
+      let p0 = def_size() + 8
       if nn < 1 || nn > 8192 || p0 + 24 * cnt > len do None
       else
         let hs = get_fs(b, p0, NativeArray.make_f32(Strata.Size.of(cnt), 0.0), 0, cnt)
@@ -833,7 +839,7 @@ mod Strata.Atlas do
                       None -> None
                       Some(lc) ->
                         if p3 + 4 + 24 * lc != len do None
-                        else Some(Atlas(d, hs, rs, ws, rcv, ar, wd, get_sites(b, p1 + 4, 0, sc, Nil), lines, get_points(b, p3 + 4, 0, lc, Nil))) end
+                        else Some(Atlas(d, hs, rs, ws, rcv, ar, wd, get_sites(b, p1 + 4, 0, sc, Nil), lines, get_points(b, p3 + 4, 0, lc, Nil), seed)) end
                     end
                 end
             end
@@ -846,18 +852,33 @@ mod Strata.Atlas do
     if i >= cnt do h else fold_bytes(b, i + 1, cnt, fold(h, NativeArray.get_u8(b, i))) end
   end
 
-  doc "The file a cache keeps this seed's atlas in: atlas-<seed>-<a hash of the Def's exact bytes and the format version>.bin."
-  fn cache_name(d : Def, seed : Int) : String do
-    let b = match put_def(Wr(NativeArray.make_u8(Strata.Size.of(def_size()), 0), 0), d) do Wr(v, _) -> v end
-    "atlas-" ++ int_to_string(seed) ++ "-" ++ int_to_string(fold_bytes(b, 0, def_size(), 7)) ++ ".bin"
+  -- the Def's exact bytes, version byte first
+  pfn def_bytes(d : Def) : NativeU8Arr do match put_def(Wr(NativeArray.make_u8(Strata.Size.of(def_size()), 0), 0), d) do Wr(v, _) -> v end end
+
+  pfn same_bytes(a : NativeU8Arr, b : NativeU8Arr, i : Int, cnt : Int) : Bool do
+    if i >= cnt do true else if NativeArray.get_u8(a, i) != NativeArray.get_u8(b, i) do false else same_bytes(a, b, i + 1, cnt) end end
   end
 
-  doc "The atlas for (d, seed) from dir/cache_name(d, seed) if that file holds it, else built and written there (dir is made if missing; a failed write only loses the cache)."
+  doc "Whether atlas a was built for Def d (byte for byte) and seed."
+  fn built_for(a : Atlas, d : Def, seed : Int) : Bool do
+    if seed_of(a) != seed do false else same_bytes(def_bytes(def_of(a)), def_bytes(d), 0, def_size()) end
+  end
+
+  doc "The file a cache keeps this seed's atlas in: atlas-<seed>-<a hash of the Def's exact bytes and the format version>.bin."
+  fn cache_name(d : Def, seed : Int) : String do
+    "atlas-" ++ int_to_string(seed) ++ "-" ++ int_to_string(fold_bytes(def_bytes(d), 0, def_size(), 7)) ++ ".bin"
+  end
+
+  doc "The atlas for (d, seed) from dir/cache_name(d, seed) if that file holds the atlas of that Def and seed, else built and written there (dir is made if missing; a failed write only loses the cache). A file holding another Def or seed (a name collision, or a file copied over) is rebuilt and rewritten."
   fn load_or_build(dir : String, d : Def, seed : Int) : Atlas do
     let path = dir ++ "/" ++ cache_name(d, seed)
-    let cached = match File.read(path) do
+    let read = match File.read(path) do
       Ok(text) -> from_bytes(Bytes.to_u8_arr(Bytes.from_string(text)))
       Err(_) -> None
+    end
+    let cached = match read do
+      Some(a) -> if built_for(a, d, seed) do Some(a) else None end
+      None -> None
     end
     match cached do
       Some(a) -> a
