@@ -709,6 +709,8 @@ Under the load these ran at, the city's and the arena's medians sit well
 under their targets and the storm's just over its own; the spawn-and-remove
 figure is twice its target. A quiet machine is needed to judge any of them.
 
+Voiced entities: not measured; each voice move is O(placed voices), so a tick is O(V^2) in voiced seen entities, until Strata.Sound gains a batched move.
+
 The storm fires its bullets from four emitters 50 m from the centre in rings
 of 64 at 40 m/s; each falls to the floor or meets a target within about a
 second, and the game replaces every bullet named in a touch or a block hit

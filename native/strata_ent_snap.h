@@ -195,6 +195,9 @@ static inline int en_snapshot_fits(const EnWorld *w, int ni, const int32_t *ints
         for (int i = 0; i < hw; i++) zero += routes_at[4 * (size_t)i + 3] == 0;
         ok = zero == nrf;
     }
+    /* the pool's free blocks: in order, each at least one point, none touching the one before (start > end, not >=).
+     * This relies on en_pool_release (strata_ent_move.h) always joining neighbouring free blocks, so a live world never
+     * holds two touching ones; were it ever to leave them apart, its own snapshots would be refused here. */
     int64_t freepts = 0;
     for (int i = 0, end = -1; i < nfx && ok; i++, a += 2) {
         int start = ints[a], len = ints[a + 1];

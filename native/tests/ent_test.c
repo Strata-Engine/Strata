@@ -41,13 +41,15 @@ static void test_kinds(void) {
     kind_ints(ki, 1, 0, 0, 0, 0);
     CHECK(en_kind(w, ki, kind_floats) == -1, "a kind of divisor 0 is refused");
     CHECK(en_stat(w, 6) == EN_R_DIVISOR, "... for its divisor");
+    kind_ints(ki, 1, EN_DIVISOR_MAX + 1, 0, 0, 0);
+    CHECK(en_kind(w, ki, kind_floats) == -1 && en_stat(w, 6) == EN_R_DIVISOR, "a kind of divisor 65,537 is refused, for its divisor");
     kind_ints(ki, 4, 1, 0, 0, 0);
     CHECK(en_kind(w, ki, kind_floats) == -1, "a kind of mover 4 is refused");
     CHECK(en_stat(w, 6) == EN_R_MOVER, "... for its mover");
     kind_ints(ki, 2, 1, 0, 0, 1);
     CHECK(en_kind(w, ki, kind_floats) == -1, "a body on a walking kind is refused");
     CHECK(en_stat(w, 6) == EN_R_BODY, "... for its body");
-    CHECK(en_stat(w, 3) == 4, "the four refusals are counted");
+    CHECK(en_stat(w, 3) == 5, "the five refusals are counted");
     for (int k = 1; k < EN_KINDS; k++) CHECK(plain_kind(w, 0, 0) == k, "kinds 1..61 are made in order");
     CHECK(plain_kind(w, 0, 0) == -1, "the 63rd kind is refused");
     CHECK(en_stat(w, 6) == EN_R_FULL, "... for a full table");
@@ -1092,6 +1094,12 @@ static void test_divisor(void) {
     }
     CHECK(fabs(moved[0] - 8.0) < 0.05, "divisor 1: 8 m in 240 ticks at 2 m/s");
     CHECK(fabs(moved[1] - moved[0]) < 0.1, "divisor 4 moves an unseen follower as far in 240 ticks within 0.1 m");
+    EnWorld *w = world(16);
+    CHECK(walk_kind(w, 0.6f, EN_DIVISOR_MAX) == 0, "the largest divisor, 65,536, is accepted");
+    int64_t c = en_add(w, 0, 0, 0, 0, 0);
+    for (int i = 0; i < 3; i++) en_tick(w, 0, NULL, 1.0 / 60);
+    CHECK(en_alive(w, c) && en_stat(w, 3) == 0, "... and its entity ticks with nothing refused");
+    en_close(w);
 }
 
 static void test_route_limits(void) {

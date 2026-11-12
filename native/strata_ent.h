@@ -63,6 +63,7 @@
 #define EN_CELL 4.0                /* the grid's cell, metres */
 #define EN_CELL_MAX 1000000000.0   /* |grid cell coordinate| at most; farther positions share the last cell */
 #define EN_ROUTE_MAX 256           /* points a route at most */
+#define EN_DIVISOR_MAX 65536       /* a kind's unseen divisor at most, so the step test (due + r % n) cannot overflow */
 
 /* a row's flags */
 /* seen (strata_ent_seen.h); a flyer that hit a block, still until the game moves it; a walker standing on something; a
@@ -83,7 +84,7 @@ enum {
     EN_R_FULL = 4,      /* the kind table or the world is full */
     EN_R_MOVER = 5,     /* a mover outside 0..3 */
     EN_R_UNSEEN = 6,    /* an unseen rule outside 0..2 */
-    EN_R_DIVISOR = 7,   /* a tick divisor below 1 */
+    EN_R_DIVISOR = 7,   /* a tick divisor below 1 or above EN_DIVISOR_MAX */
     EN_R_SLOTS = 8,     /* a slot count outside 0..EN_SLOTS, or a slot past the kind's */
     EN_R_BODY = 9,      /* a body on a mover other than Body, or a Body mover without one */
     EN_R_PART = 10,     /* a part outside 0..3, a flag not 0/1, too many voices, or a part the kind lacks */
@@ -278,7 +279,7 @@ static inline EnWorld *en_open(int capacity, int route_points, int bodies, doubl
 }
 
 /* ---- kinds ---- */
-/* ints: mover (0 placed, 1 flying, 2 walking, 3 body), unseen (0 live, 1 freeze, 2 remove), divisor >= 1,
+/* ints: mover (0 placed, 1 flying, 2 walking, 3 body), unseen (0 live, 1 freeze, 2 remove), divisor 1..EN_DIVISOR_MAX,
  * float slots, int slots, gravity 0/1, has figure 0/1, has body 0/1, voices 0..2.
  * floats: hx, hy, hz (half extents, metres, >= 0), step height (>= 0), lifetime (<= 0 none),
  * seen distance (<= 0: the seen cap; at most the seen cap), gravity m/s2. The kind's index, or -1. */
@@ -286,7 +287,7 @@ static inline int en_kind(EnWorld *w, const int32_t ints[9], const float floats[
     if (!ints || !floats) return en_refuse(w, EN_R_VALUE);
     if (ints[EN_K_MOVER] < 0 || ints[EN_K_MOVER] > 3) return en_refuse(w, EN_R_MOVER);
     if (ints[EN_K_UNSEEN] < 0 || ints[EN_K_UNSEEN] > 2) return en_refuse(w, EN_R_UNSEEN);
-    if (ints[EN_K_DIVISOR] < 1) return en_refuse(w, EN_R_DIVISOR);
+    if (ints[EN_K_DIVISOR] < 1 || ints[EN_K_DIVISOR] > EN_DIVISOR_MAX) return en_refuse(w, EN_R_DIVISOR);
     if (ints[EN_K_FSLOTS] < 0 || ints[EN_K_FSLOTS] > EN_SLOTS || ints[EN_K_ISLOTS] < 0 || ints[EN_K_ISLOTS] > EN_SLOTS)
         return en_refuse(w, EN_R_SLOTS);
     if ((ints[EN_K_GRAVITY] | 1) != 1) return en_refuse(w, EN_R_VALUE);
@@ -568,9 +569,13 @@ static inline uint64_t en_fnv(uint64_t h, const void *data, size_t len) {
     return h;
 }
 
-/* FNV-1a over each live row, kind by kind in en_each order: id, kind, position, velocity, facing, age,
- * the kind's slots, the parts, whether a block has stopped it, whether it is grounded, and its route, waypoint,
- * speed, looping and stall; then each held route in id order: id, state, followers and points. */
+/* FNV-1a over what a snapshot holds (strata_ent_snap.h) and the parts: each live row, kind by kind in en_each order:
+ * id, kind, position, velocity, facing, age, the kind's slots, the parts (part ids: a snapshot holds none, and a
+ * restore needs none held, so a restored world and its original hash alike when neither holds parts), whether a
+ * block has stopped it, whether it is grounded, frozen or waiting for ground, and its route, waypoint, speed,
+ * looping, blocked state and stall; then the free-row stack bottom first, each free row with its generation; then
+ * each held route in id order: id, state, followers and points; then the tick counter. Not covered (as a snapshot
+ * does not hold them): the seen flag, the block table and chunks, touch pairs, events, stats and the grid. */
 static inline uint64_t en_hash(const EnWorld *w) {
     uint64_t h = 1469598103934665603ull;
     for (int k = 0; k < w->nkinds; k++) {
@@ -588,7 +593,7 @@ static inline uint64_t en_hash(const EnWorld *w) {
             h = en_fnv(h, w->fslot + (size_t)r * EN_SLOTS, (size_t)kd->ints[EN_K_FSLOTS] * sizeof *w->fslot);
             h = en_fnv(h, w->islot + (size_t)r * EN_SLOTS, (size_t)kd->ints[EN_K_ISLOTS] * sizeof *w->islot);
             h = en_fnv(h, w->part + (size_t)r * EN_PARTS, EN_PARTS * sizeof *w->part);
-            uint8_t kept = w->flags[r] & (EN_F_STUCK | EN_F_GROUNDED | EN_F_LOOPS | EN_F_BLOCKED);
+            uint8_t kept = w->flags[r] & (EN_F_STUCK | EN_F_GROUNDED | EN_F_LOOPS | EN_F_BLOCKED | EN_F_WAITING | EN_F_FROZEN);
             h = en_fnv(h, &kept, 1);
             h = en_fnv(h, w->rt_route + r, sizeof *w->rt_route);
             if (w->rt_route[r] >= 0) {
@@ -599,6 +604,11 @@ static inline uint64_t en_hash(const EnWorld *w) {
             }
         }
     }
+    for (int i = 0; i < w->nfree; i++) {
+        int r = w->free_rows[i];
+        h = en_fnv(h, &r, sizeof r);
+        h = en_fnv(h, w->gen + r, sizeof *w->gen);
+    }
     for (int i = 0; i < w->routes_hw; i++) {
         const EnRoute *rt = &w->routes[i];
         if (rt->state == 0) continue;
@@ -607,6 +617,7 @@ static inline uint64_t en_hash(const EnWorld *w) {
         h = en_fnv(h, &rt->users, sizeof rt->users);
         h = en_fnv(h, w->rpts + (size_t)rt->start * 3, (size_t)rt->n * 3 * sizeof *w->rpts);
     }
+    h = en_fnv(h, &w->tick_count, sizeof w->tick_count);
     return h;
 }
 

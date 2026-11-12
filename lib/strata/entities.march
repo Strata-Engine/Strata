@@ -84,7 +84,7 @@ mod Strata.Entities do
   fn placed() : Int do 0 end
   doc "Position advances by velocity."
   fn flying() : Int do 1 end
-  doc "A box swept against the blocks, with gravity and a step height."
+  doc "A box swept against the blocks, with gravity and a step height. A seen walker whose box would reach above (or below) the chunks the kernel holds does not move that tick: size the stream's vertical radius to the terrain."
   fn walking() : Int do 2 end
   doc "Goes where its physics body goes: set by `with_driven_body` or `with_dynamic_body`, and valid only with one of them."
   fn bodied() : Int do 3 end
@@ -112,7 +112,7 @@ mod Strata.Entities do
   fn with_seen_distance(k : Kind, metres : Float) : Kind do { k with en_seen: metres } end
   doc "While seen, each entity of the kind has a figure of [rig] (a rig id of `Strata.Anim`), made by `tick` as it comes into view, kept at its position and facing, and removed as it leaves view or is removed. -1 for none."
   fn with_figure(k : Kind, rig : Int) : Kind do { k with en_figure: rig } end
-  doc "While seen, each entity of the kind has a voice playing [source] in [group] at [gain] (`Strata.Sound.play`, pitch 1, priority 1), started by `tick` as it comes into view, kept at its position, and stopped (a 0.1 s fade) as it leaves view or is removed. Up to two a kind; a third makes the kind invalid."
+  doc "While seen, each entity of the kind has a voice playing [source] in [group] at [gain] (`Strata.Sound.play`, pitch 1, priority 1), started by `tick` as it comes into view, kept at its position, and stopped (a 0.1 s fade) as it leaves view or is removed. Up to two a kind; a third makes the kind invalid. Voices are meant to be looping sources: a one-shot voice that ends stays held by its entity (not replayed) until the entity leaves view. A known limit: each voice moved is a `Strata.Sound.move`, O(placed voices), so a tick costs O(V^2) in voiced seen entities, until Strata.Sound gains a batched move."
   fn with_sound(k : Kind, source : Int, group : Int, gain : Float) : Kind do { k with en_sounds: List.append(k.en_sounds, [(source, group, gain)]) } end
 
   -- finite, and finite still once stored as a 32-bit float
@@ -124,7 +124,7 @@ mod Strata.Entities do
 
   doc "Whether `open` would accept the kind, as far as can be told without a world: the kernel's checks (among them a body exactly when the mover is bodied), a walking or driven box with no zero half extent, and at most two sounds. A seen distance past the world's seen cap is found only by `open`."
   fn valid(k : Kind) : Bool do
-    let ints_ok = in_range(k.en_mover, 0, 3) && in_range(k.en_unseen, 0, 2) && k.en_divisor >= 1
+    let ints_ok = in_range(k.en_mover, 0, 3) && in_range(k.en_unseen, 0, 2) && in_range(k.en_divisor, 1, 65536)
       && in_range(k.en_fslots, 0, 8) && in_range(k.en_islots, 0, 8)
     let finite = finite32(k.en_hx) && finite32(k.en_hy) && finite32(k.en_hz) && finite32(k.en_step)
       && finite32(k.en_gravity) && finite32(k.en_lifetime) && finite32(k.en_seen)
@@ -199,9 +199,11 @@ mod Strata.Entities do
 
   doc "Entity [id]'s position in metres."
   fn position(e : Entities, id : Int) : (Float, Float, Float) do three(e, id, 0) end
+  doc "Set entity [id]'s position. A bodied entity holding a body is overwritten from its body each `tick`: teleport a driven body with `Strata.Physics.place_driven` (the body's id from `body`)."
   fn set_position(e : Entities, id : Int, x : Float, y : Float, z : Float) : Entities do put(e, id, 0, x, y, z) end
   doc "Entity [id]'s velocity in metres a second."
   fn velocity(e : Entities, id : Int) : (Float, Float, Float) do three(e, id, 1) end
+  doc "Set entity [id]'s velocity. For a bodied entity holding a body it only steers a driven body (moved at it each `tick`); the position is overwritten from the body each `tick`, so a driven body is teleported with `Strata.Physics.place_driven`, and a dynamic body moves as physics moves it."
   fn set_velocity(e : Entities, id : Int, x : Float, y : Float, z : Float) : Entities do put(e, id, 1, x, y, z) end
   doc "Entity [id]'s facing, radians about the vertical."
   fn facing(e : Entities, id : Int) : Float do one(e, id, 2) end
@@ -255,7 +257,7 @@ mod Strata.Entities do
   doc "The column of float slot [n]."
   fn col_float(n : Int) : Int do 10 + n end
 
-  doc "A hash of every live entity: equal call sequences give equal hashes. 0 when not open."
+  doc "A hash of what a snapshot holds (every live entity, its route progress and its frozen and waiting state, the routes, the free rows and their generations, the tick counter) and the entities' part ids: equal call sequences give equal hashes. Not covered: seen state, blocks, touch pairs, events and stats. 0 when not open."
   fn hash(e : Entities) : Int do if e.en_live do Fen.hash() else 0 end end
 
   doc "(live, seen, waiting for ground, refused calls)."
@@ -308,15 +310,20 @@ mod Strata.Entities do
     end
   end
 
-  doc "Bring the kernel's copy of the blocks up to date with [s]: each chunk loaded or edited since the last call is sent, each chunk unloaded is dropped (`Strata.Stream.take_changed`). The first call also sends the block table, from the stream's registry. Call once a frame after `Strata.Stream.tick`."
+  doc "Bring the kernel's copy of the blocks up to date with [s]: each chunk loaded or edited since the last call is sent, each chunk unloaded is dropped (`Strata.Stream.take_changed`). The first call after `open` also sends the block table, from the stream's registry, and every chunk the stream holds loaded, the changed sets taken and set aside, so a world opened again on a stream already taken from holds exactly the loaded chunks. Call once a frame after `Strata.Stream.tick`."
   fn blocks(e : Entities, s : Strata.Stream.Stream) : (Entities, Strata.Stream.Stream) do
     if !e.en_live do (e, s)
+    else if !e.en_table do
+      let w = Strata.Stream.world(s)
+      let e1 = with_table(e, Strata.World.registry(w))
+      let held = Strata.Store.fold(Strata.World.chunks(w), 0, fn (n, k, c) -> n + send_chunk(k, c))
+      let (s1, changed, gone) = Strata.Stream.take_changed(s)
+      after(held + List.length(changed) + List.length(gone), (e1, s1))
     else
-      let e1 = with_table(e, Strata.World.registry(Strata.Stream.world(s)))
       let (s1, changed, gone) = Strata.Stream.take_changed(s)
       let held = send_go(Strata.Stream.world(s1), changed, 0) + drop_go(gone, 0)
-      after(held, (e1, s1))
-    end
+      after(held, (e, s1))
+    end end
   end
 
   doc "Send every loaded chunk of [w] to the kernel (and the block table, if not yet sent). For tests and tools; a game streams with `blocks`."
@@ -517,7 +524,7 @@ mod Strata.Entities do
     moves_go(ids, poses, 0, n, s)
   end
 
-  doc "A frame's entities, after `blocks`: `step` with [focus] and [dt], then their parts. Every part the step took away (an entity removed by the game since the last tick or in the step, or gone out of view) is freed: its figure removed, its body taken out of [p] (`Strata.Physics.remove`), its voices stopped with a 0.1 s fade. Then each body still held: one [p] no longer has (`Strata.Physics.exists` false: removed, or written into the world as blocks) is cleared and reported as event 7, and the entity, kept, gets no other until it has left view; a driven body is moved by `Strata.Physics.drive` against [w] at the entity's velocity for [dt] and the entity set at the swept box's centre; a dynamic body's centre of mass after the latest finished step (`Strata.Physics.position`) becomes the entity's position. Then every seen bodied entity without a body gets one, nearest a focus first, while the bodies held by entities number fewer than the budget given to `open`: a driven box (`Strata.Physics.add_driven`) centred on it, or its kind's grid (`Strata.Physics.add`) with the centre of mass on it, turned by its facing about +y; how many are left without one this tick is stat 7. A bodied entity without a body does not move (as a placed one). The game still steps physics itself (`Strata.Physics.begin` and `finish`). Every seen entity whose kind has a figure (`with_figure`) and has none yet gets one, nearest a focus first, made at its position turned by its facing about +y; when Strata.Anim is full the entity goes without (stat 10 + its kind counts each refusal) and is tried again next tick. Likewise each voice (`with_sound`), at pitch 1 and priority 1; a refused play is tried again next tick. Then every seen figure is placed at its entity's position and facing (one `Strata.Anim.place_many`) and every voice moved there. The game plays clips on a new figure itself (`figure` after event 3)."
+  doc "A frame's entities, after `blocks`: `step` with [focus] and [dt], then their parts. Every part the step took away (an entity removed by the game since the last tick or in the step, or gone out of view) is freed: its figure removed, its body taken out of [p] (`Strata.Physics.remove`), its voices stopped with a 0.1 s fade. Then each body still held: one [p] no longer has (`Strata.Physics.exists` false: removed, or written into the world as blocks) is cleared and reported as event 7, and the entity, kept, gets no other until it has left view; a driven body is moved by `Strata.Physics.drive` against [w] at the entity's velocity for [dt] and the entity set at the swept box's centre; a dynamic body's centre of mass after the latest finished step (`Strata.Physics.position`) becomes the entity's position. Then every seen bodied entity without a body gets one, nearest a focus first, while the bodies held by entities number fewer than the budget given to `open`: a driven box (`Strata.Physics.add_driven`) centred on it, or its kind's grid (`Strata.Physics.add`) with the centre of mass on it, turned by its facing about +y; how many are left without one this tick is stat 7. A bodied entity without a body does not move (as a placed one). The game still steps physics itself (`Strata.Physics.begin` and `finish`). Every seen entity whose kind has a figure (`with_figure`) and has none yet gets one, nearest a focus first, made at its position turned by its facing about +y; when Strata.Anim is full the entity goes without (stat 10 + its kind counts each refusal) and is tried again next tick. Likewise each voice (`with_sound`), at pitch 1 and priority 1; a refused play is tried again next tick. Then every seen figure is placed at its entity's position and facing (one `Strata.Anim.place_many`) and every voice moved there. The game plays clips on a new figure itself (`figure` after event 3). Bodied entities move after `step` (in the bodies pass above), so the grid (`near`, `raycast`), touches and the seen switch see them where the previous tick left them."
   fn tick(e : Entities, w : Strata.World.World, p : Strata.Physics.Physics, a : Strata.Anim.Anim, s : Strata.Sound.Sound,
           focus : List((Float, Float, Float)), dt : Float) : (Entities, Strata.Physics.Physics, Strata.Anim.Anim, Strata.Sound.Sound) do
     if !e.en_live do (e, p, a, s)
@@ -573,7 +580,7 @@ mod Strata.Entities do
     else Snapshot(NativeArray.make_i32(0, 0), NativeArray.make_f32(0, 0.0), NativeArray.make_float(0, 0.0)) end end
   end
 
-  doc "Rebuild the entity world from [s]: every entity, route and free row as the snapshot holds them, every entity unseen with no parts; the next `tick` gives the near ones their parts back. The kinds are not in the snapshot: the world must have been opened with the same kinds (count and slot counts are checked) and capacity. False, and nothing changed, if the snapshot does not fit (another capacity or kinds, another version, cut short) or while any entity holds a figure, body or voice (use `restore_with`). The blocks the kernel holds are kept."
+  doc "Rebuild the entity world from [s]: every entity, route and free row as the snapshot holds them, every entity unseen with no parts; the next `tick` gives the near ones their parts back. The kinds are not in the snapshot: the world must have been opened with the same kinds (count and slot counts are checked) and capacity. False, and nothing changed, if the snapshot does not fit (another capacity or kinds, another version, cut short) or while any entity holds a figure, body or voice (use `restore_with`). The block table, the chunks the kernel holds and the touch pairs (`touching`) are kept from the live world, not taken from the snapshot: restoring into a freshly opened world needs its `touching` pairs declared again (and its blocks sent by `blocks`)."
   fn restore(e : Entities, s : Snapshot) : (Entities, Bool) do
     if !e.en_live do (e, false)
     else
@@ -608,7 +615,7 @@ mod Strata.Entities do
     List.fold_left(kinds, 0, fn (m, k) -> if k >= 0 && k < 62 do int_or(m, int_shl(1, k)) else m end)
   end
 
-  doc "The ids, sorted, of the entities within [radius] metres of (x, y, z) whose kind is in the mask [kinds] (see `mask`), as the last `step` left them: one added since is not found until the next step, one removed since is not found at all. Empty when not open."
+  doc "The ids, sorted, of the entities within [radius] metres of (x, y, z) whose kind is in the mask [kinds] (see `mask`), as the last `step` left them: one added since is not found until the next step, one removed since is not found at all. A bodied entity is found where the tick before left it: `tick` moves bodied entities after its `step`. Empty when not open."
   fn near(e : Entities, x : Float, y : Float, z : Float, radius : Float, kinds : Int) : NativeIntArr do
     let n = if e.en_live do Fen.near(x, y, z, radius, kinds, NativeArray.make_int(0, -1)) else 0 end
     let out = NativeArray.make_int(n, -1)
@@ -673,7 +680,7 @@ mod Strata.Entities do
     end
   end
 
-  doc "What the last `step` reported, in order: removals the game made since the step before (reason 0), then the step's own events. A block hit's block is read from [w]. Codes: 1 touch, 2 block hit, 3 entered view, 4 left view, 5 route finished, 6 removed, 7 body lost, 8 blocked."
+  doc "What the last `step` reported, in order: removals the game made since the step before (reason 0), then the step's own events; after a `tick`, event 7 (body lost), written by its bodies pass after the step, comes last. A block hit's block is read from [w]. Codes: 1 touch, 2 block hit, 3 entered view, 4 left view, 5 route finished, 6 removed, 7 body lost, 8 blocked."
   fn events(e : Entities, w : Strata.World.World) : List(Event) do
     let n = if e.en_live do Fen.event_count() else 0 end
     if n == 0 do Nil
