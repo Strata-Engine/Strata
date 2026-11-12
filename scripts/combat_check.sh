@@ -62,6 +62,14 @@ if twice channel STRATA_COMBAT_SCENE=channel STRATA_FRAMES=1800; then
   if [ "$swam" -gt 60 ] && [ "$crossed" -eq 1 ] && [ "$struck" -ge 1 ] && [ "$deep" -le 120 ]; then echo "ok   channel: swam $swam frames no deeper than $deep cm, crossed, struck $struck times"
   else echo "FAIL channel: swam $swam frames (want over 60), crossed $crossed (want 1), struck $struck (want 1 or more), deepest $deep cm (want 120 or less)"; cat "$OUT/channel.txt"; FAILED=1; fi
 fi
+# A fence: a wall raised between a rusher and the target it has seen. With path finding it goes round and strikes; without, it never arrives.
+if twice fence STRATA_COMBAT_SCENE=fence STRATA_COMBAT_PLAYER=0 STRATA_FRAMES=900 && twice fence-straight STRATA_COMBAT_SCENE=fence STRATA_COMBAT_PLAYER=0 STRATA_COMBAT_NAV=0 STRATA_FRAMES=900; then
+  struck=$(num fence '^combat: fence struck \([0-9]*\), .*$'); back=$(num fence '^combat: fence struck .*, respawns \([0-9]*\), .*$'); paths=$(num fence '^combat: fence struck .*, paths \([0-9]*\)$')
+  straight=$(num fence-straight '^combat: fence struck \([0-9]*\), .*$')
+  if [ "$struck" -ge 1 ] && [ "$back" -eq 0 ] && [ "$paths" -eq 1 ] && [ "$straight" -eq 0 ]; then echo "ok   fence: round the wall and struck $struck times; going straight, as before Strata.Nav, struck $straight"
+  else echo "FAIL fence: struck $struck (want 1 or more), respawns $back (want 0), paths $paths (want 1); going straight struck $straight (want 0)"; cat "$OUT/fence.txt"; FAILED=1; fi
+  grep '^nav:' "$OUT/fence-a.log" | sed 's/^/     /'
+fi
 # The player, by script: an archer fells a still rusher 20 m off with three arrows.
 if twice archer STRATA_COMBAT_SCRIPT=archer STRATA_FRAMES=150; then
   shots=$(num archer '^combat: archer shots \([0-9]*\), kills [0-9]*, .*$'); k=$(num archer '^combat: archer shots [0-9]*, kills \([0-9]*\), .*$')
@@ -99,6 +107,7 @@ fi
 if twice match STRATA_COMBAT_PLAYER=0 STRATA_FRAMES=90000; then
   if grep -q '^combat: winner [A-Za-z]* 30 at frame [0-9]*$' "$OUT/match.txt" && [ "$(grep -c '^combat: table ' "$OUT/match.txt")" -eq 12 ]; then echo "ok   match: $(grep '^combat: winner' "$OUT/match.txt" | sed 's/^combat: //')"
   else echo "FAIL match: no winner in 90000 frames"; cat "$OUT/match.txt"; FAILED=1; fi
+  grep '^nav:' "$OUT/match-a.log" | sed 's/^/     /'; grep '^combat: leader\|idle respawns' "$OUT/match.txt" | sed 's/^combat: /     /' 
 fi
 
 [ $FAILED -eq 0 ] && echo "combat: PASS" || { echo "combat: FAIL (logs in $OUT)"; exit 1; }
