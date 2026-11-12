@@ -31,3 +31,11 @@ Task 5: Ruling: scripted scenes set the camera (`Match.staged`, `Match.eye`); th
 Task 5: Ruling: `ground` in the match searches 160 m down from above the start (Figures.ground_at searches 6 m and answered 58 m in the air; Task 4's duel and trap fighters were being dropped from there). The trap scene's fighters now stand still, so the pit and the block act on them; its idle respawns are 2.
 Task 5: Finding (not resolved): with support on, a tree whose trunk burns through is gone from the terrain 6 frames later and nothing is seen falling or lying there in the scripted pictures. Strata.Physics makes loose pieces into bodies (physics.march:866); whether they are made and not drawn, or dropped, was not established. Raise with the physics session.
 Task 5: Not measured yet: the fireball's light cost with four in the air (plan: under 1 ms). Left to Task 10's measurements.
+Task 5: complete (commit 4b2a7ad, tests: forge test test/combat_test.march -> 79/79; combat_check.sh -> field, duel, trap, fire, match ok; golden combat-fire stored after looking)
+Task 6: Note: `water_point` and its test were written together; the test was not watched failing first.
+Task 6: Ruling: swimmers swim at 2.5 m/s, not the design's 1.5 (a designer's number): at 1.5 the bots-only match slowed from 14.5 to 23.7 minutes.
+Task 6: Ruling: a swimming fighter makes for the nearest spawn point (dry land by construction), whatever its target. Design said "toward where it was going"; two swimmers chasing each other met in the water, could not attack, and stood there until the idle rule took them.
+Task 6: Ruling: fighters with nothing to do gather at a rally point, the open ground nearest the middle, not the middle itself: this field's middle is in a river.
+Task 6: Ruling: spawn points are on open ground: dry, not leaves or wood, with two cells of headroom.
+Task 6: Ruling: the sidestep of a blocked fighter grows (0.5, 1, 2, 4 s) and alternates left and right until it has moved 2 m; the design's fixed half second to the left left fighters stuck behind two-block terraces at two spawn points for the whole match.
+Task 6: Measured: bots-only match, winner at frame 41,945 (11.6 minutes), 133 kills, 5 idle respawns (Task 4: 52,356 frames, 249 kills, 68 idle respawns).

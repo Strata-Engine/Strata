@@ -52,6 +52,13 @@ if twice fire STRATA_COMBAT_SCENE=fire STRATA_FRAMES=200; then
   if [ "$wood" -ge 1 ] && [ "$grass" -ge 1 ] && [ "$left" -ge 10 ] && [ "$left" -le 35 ]; then echo "ok   fire: burned $wood wood and $grass grass; the bystander is left with $left of 60"
   else echo "FAIL fire: wood $wood, grass $grass (want 1 or more of each), bystander left with $left (want 10 to 35)"; cat "$OUT/fire.txt"; FAILED=1; fi
 fi
+# Water: a rusher swims a 6 m channel to its target, at the surface, climbs out and strikes.
+if twice channel STRATA_COMBAT_SCENE=channel STRATA_FRAMES=1800; then
+  swam=$(num channel '^combat: channel swam \([0-9]*\) frames, .*$'); crossed=$(num channel '^combat: channel swam .*, crossed \([0-9]*\), .*$')
+  struck=$(num channel '^combat: channel swam .*, struck \([0-9]*\), .*$'); deep=$(num channel '^combat: channel swam .*, deepest \([0-9]*\) cm$')
+  if [ "$swam" -gt 60 ] && [ "$crossed" -eq 1 ] && [ "$struck" -ge 1 ] && [ "$deep" -le 120 ]; then echo "ok   channel: swam $swam frames no deeper than $deep cm, crossed, struck $struck times"
+  else echo "FAIL channel: swam $swam frames (want over 60), crossed $crossed (want 1), struck $struck (want 1 or more), deepest $deep cm (want 120 or less)"; cat "$OUT/channel.txt"; FAILED=1; fi
+fi
 # The match with no player: someone reaches 30, and the same someone the second time.
 if twice match STRATA_COMBAT_PLAYER=0 STRATA_FRAMES=90000; then
   if grep -q '^combat: winner [A-Za-z]* 30 at frame [0-9]*$' "$OUT/match.txt" && [ "$(grep -c '^combat: table ' "$OUT/match.txt")" -eq 12 ]; then echo "ok   match: $(grep '^combat: winner' "$OUT/match.txt" | sed 's/^combat: //')"

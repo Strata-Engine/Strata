@@ -11,7 +11,9 @@
 -- `duel`, two shooters 15 m apart; 2 `trap`, a rusher and a shooter
 -- standing still, the ground dug from under the one at frame 60 and a
 -- block set in the other's place at frame 300; 3 `fire`, a fireball thrown at a tree's trunk from
--- 10 m at frame 30, a shooter standing a metre from where it lands.
+-- 10 m at frame 30, a shooter standing a metre from where it lands; 4
+-- `channel`, a rusher and a shooter that does nothing, a 6 m channel of
+-- water cut between them at frame 1.
 mod StrataViewer.Match do
 
   needs IO.Foreign
@@ -31,16 +33,16 @@ mod StrataViewer.Match do
   -- decided, the clip playing and the seconds it is held whatever the
   -- fighter's speed, seconds until a swing begun lands (0: none), seconds
   -- without headway and of sidestep left, where headway and idleness are
-  -- measured from, whether it gave or took a hit this frame, and where it
-  -- was last frame.
+  -- measured from, whether it gave or took a hit this frame, whether it is
+  -- swimming, and where it was last frame.
   type MtBody = { mb_ent : Int, mb_fig : Int, mb_bow : Int, mb_cool : Float, mb_tgt : Int, mb_intent : Int, mb_clip : Int, mb_act : Float, mb_blow : Float,
-                  mb_stall : Float, mb_side : Float, mb_ax : Float, mb_az : Float, mb_ix : Float, mb_iz : Float, mb_fought : Bool,
+                  mb_stall : Float, mb_side : Float, mb_ax : Float, mb_az : Float, mb_ix : Float, mb_iz : Float, mb_fought : Bool, mb_swim : Bool, mb_tries : Int,
                   mb_x : Float, mb_y : Float, mb_z : Float }
 
   -- A shot: its entity while it flies (-1 once it has landed), its figure,
   -- who loosed it, whether it is fire, seconds in the air, and for an arrow
-  -- stuck in something the seconds it stays.
-  type MtShot = { ms_ent : Int, ms_fig : Int, ms_who : Int, ms_fire : Bool, ms_age : Float, ms_stuck : Float }
+  -- stuck in something the seconds it stays; and where it was last frame.
+  type MtShot = { ms_ent : Int, ms_fig : Int, ms_who : Int, ms_fire : Bool, ms_age : Float, ms_stuck : Float, ms_x : Float, ms_y : Float, ms_z : Float }
 
   -- What the player does this frame: the eye, the view, the trigger's press, the hotbar slot, the table key, the "another match" key.
   type MtInput = { mi_x : Float, mi_y : Float, mi_z : Float, mi_yaw : Float, mi_pitch : Float,
@@ -53,7 +55,8 @@ mod StrataViewer.Match do
                    mt_points : List((Float, Float, Float)), mt_cx : Float, mt_cy : Float, mt_cz : Float,
                    mt_dry : Int, mt_moved : Float, mt_won : Bool, mt_idles : Int, mt_changes : List((Int, Int, Int, Int)),
                    mt_fire_rig : Int, mt_still : Bool, mt_staged : Bool, mt_eye : (Float, Float, Float, Float, Float),
-                   mt_stage : (Float, Float, Float, Float, Float, Float), mt_burned : (Int, Int, Int, Int) }
+                   mt_stage : (Float, Float, Float, Float, Float, Float), mt_burned : (Int, Int, Int, Int),
+                   mt_rx : Float, mt_rz : Float, mt_frozen : Int, mt_swam : Int, mt_deep : Float, mt_crossed : Bool, mt_struck : Int }
 
   pfn turn(facing : Float) : Strata.Math.Quat.Quat do Qt.from_axis_angle(0.0, 1.0, 0.0, facing) end
   pfn hyp(dx : Float, dz : Float) : Float do Math.sqrt(dx *. dx +. dz *. dz) end
@@ -66,7 +69,8 @@ mod StrataViewer.Match do
       mt_body_rig: -1, mt_clips: Nil, mt_bow_rig: -1, mt_arrow_rig: -1,
       mt_fs: Nil, mt_bodies: Nil, mt_shots: Nil, mt_points: Nil, mt_cx: 0.0, mt_cy: 0.0, mt_cz: 0.0,
       mt_dry: 0, mt_moved: 0.0, mt_won: false, mt_idles: 0, mt_changes: Nil,
-      mt_fire_rig: -1, mt_still: false, mt_staged: false, mt_eye: (0.0, 0.0, 0.0, 0.0, 0.0), mt_stage: (0.0, 0.0, 0.0, 0.0, 0.0, 0.0), mt_burned: (0, 0, 0, 0) }
+      mt_fire_rig: -1, mt_still: false, mt_staged: false, mt_eye: (0.0, 0.0, 0.0, 0.0, 0.0), mt_stage: (0.0, 0.0, 0.0, 0.0, 0.0, 0.0), mt_burned: (0, 0, 0, 0),
+      mt_rx: 0.0, mt_rz: 0.0, mt_frozen: -1, mt_swam: 0, mt_deep: 0.0, mt_crossed: false, mt_struck: 0 }
   end
   doc "Is a match being played?"
   fn is_on(m : MtMatch) : Bool do m.mt_live end
@@ -128,9 +132,36 @@ mod StrataViewer.Match do
     if y > -999.0 do y else top -. 60.0 end
   end
 
-  -- a ring column set on dry ground; a wet one is moved toward the middle 4 m at a time
-  pfn point_go(w : Strata.World.World, cx : Float, cz : Float, top : Float, x : Float, z : Float, tries : Int) : (Float, Float, Float) do
+  -- is there room for a fighter to stand with its feet at y: nothing that collides in the two cells above
+  pfn headroom(w : Strata.World.World, x : Float, y : Float, z : Float) : Bool do
+    let reg = Strata.World.registry(w)
+    let a = Strata.World.get_block(w, float_to_int(Math.floor(x)), float_to_int(Math.floor(y +. 0.1)), float_to_int(Math.floor(z)))
+    let b = Strata.World.get_block(w, float_to_int(Math.floor(x)), float_to_int(Math.floor(y +. 1.1)), float_to_int(Math.floor(z)))
+    if a != 0 && Strata.Blocks.collides(reg, a) do false else if b != 0 && Strata.Blocks.collides(reg, b) do false else true end end
+  end
+  -- the top of open ground under (x, z): dry, not a tree's leaves or wood (a fighter set on a canopy stays there), with room to stand; -1000.0 if it is not
+  pfn open_ground(w : Strata.World.World, x : Float, z : Float, top : Float) : Float do
     let y = Fg.dry_ground_at(w, x, z, top, 160.0)
+    if y < -999.0 do y
+    else
+      let under = Strata.World.get_block(w, float_to_int(Math.floor(x)), float_to_int(Math.floor(y -. 0.5)), float_to_int(Math.floor(z)))
+      if under == 7 || under == 8 do -1000.0
+      else if !headroom(w, x -. 0.35, y, z -. 0.35) || !headroom(w, x +. 0.35, y, z -. 0.35) || !headroom(w, x -. 0.35, y, z +. 0.35) || !headroom(w, x +. 0.35, y, z +. 0.35) do -1000.0
+      else y end end
+    end
+  end
+  -- the open ground nearest the middle, looking outward 4 m at a time in eight directions: where fighters with nothing to do gather
+  pfn rally_go(w : Strata.World.World, cx : Float, cz : Float, top : Float, i : Int) : (Float, Float) do
+    let d = int_to_float(i / 8) *. 4.0
+    let a = int_to_float(i % 8) *. 0.78539816
+    if i >= 80 do (cx, cz)
+    else if open_ground(w, cx +. d *. Math.cos(a), cz +. d *. Math.sin(a), top) > -999.0 do (cx +. d *. Math.cos(a), cz +. d *. Math.sin(a))
+    else rally_go(w, cx, cz, top, i + 1) end end
+  end
+
+  -- a ring column set on open ground; one that is wet or under a tree is moved toward the middle 4 m at a time
+  pfn point_go(w : Strata.World.World, cx : Float, cz : Float, top : Float, x : Float, z : Float, tries : Int) : (Float, Float, Float) do
+    let y = open_ground(w, x, z, top)
     if y > -999.0 do (x, y, z)
     else if tries <= 0 do (cx, ground(w, cx, cz, top), cz)
     else
@@ -172,7 +203,7 @@ mod StrataViewer.Match do
 
   pfn no_body() : MtBody do
     { mb_ent: -1, mb_fig: -1, mb_bow: -1, mb_cool: 0.0, mb_tgt: -1, mb_intent: 1, mb_clip: -1, mb_act: 0.0, mb_blow: 0.0,
-      mb_stall: 0.0, mb_side: 0.0, mb_ax: 0.0, mb_az: 0.0, mb_ix: 0.0, mb_iz: 0.0, mb_fought: false, mb_x: 0.0, mb_y: 0.0, mb_z: 0.0 }
+      mb_stall: 0.0, mb_side: 0.0, mb_ax: 0.0, mb_az: 0.0, mb_ix: 0.0, mb_iz: 0.0, mb_fought: false, mb_swim: false, mb_tries: 0, mb_x: 0.0, mb_y: 0.0, mb_z: 0.0 }
   end
   pfn body(bs : List(MtBody), i : Int) : MtBody do
     match bs do
@@ -346,16 +377,18 @@ mod StrataViewer.Match do
                   println("combat: could not open the entity or figure world")
                   off()
                 else
-                  let fs = if scene == 1 do bench_but(Cb.roster(), 8, 9, 0) else if scene == 2 do bench_but(Cb.roster(), 1, 8, 0) else if scene == 3 do bench_but(Cb.roster(), 8, 8, 0) else Cb.roster() end end end
+                  let fs = if scene == 1 do bench_but(Cb.roster(), 8, 9, 0) else if scene == 2 do bench_but(Cb.roster(), 1, 8, 0) else if scene == 3 do bench_but(Cb.roster(), 8, 8, 0) else if scene == 4 do bench_but(Cb.roster(), 1, 8, 0) else Cb.roster() end end end end
                   let m0 = { off() with mt_live: true, mt_seed: seed, mt_player: player && scene == 0, mt_scene: scene, mt_ent: ent, mt_anim: a2,
                              mt_rigs: List.append(Fg.rigs(crowd), [Fg.bow(), Fg.arrow(), Fg.fireball()]), mt_fire_rig: fire_rig, mt_body_rig: Fg.body_id(crowd), mt_clips: Fg.clip_ids(crowd),
                              mt_bow_rig: bow_rig, mt_arrow_rig: arrow_rig, mt_fs: fs, mt_bodies: empty_bodies(0),
-                             mt_points: points, mt_cx: cx, mt_cy: ground(w, cx, cz, top), mt_cz: cz, mt_dry: dry }
+                             mt_points: points, mt_cx: cx, mt_cy: ground(w, cx, cz, top), mt_cz: cz, mt_dry: dry,
+                             mt_rx: Tuple.first(rally_go(w, cx, cz, top, 0)), mt_rz: Tuple.second(rally_go(w, cx, cz, top, 0)) }
                   println("combat: 12 fighters, " ++ int_to_string(List.length(points)) ++ " spawn points, middle (" ++ int_to_string(float_to_int(Math.round(cx))) ++ ", " ++ int_to_string(float_to_int(Math.round(cz))) ++ "), dry " ++ int_to_string(dry) ++ " of 64")
                   if scene == 1 do set_down(set_down(m0, 8, cx -. 7.5, ground(w, cx -. 7.5, cz, top), cz), 9, cx +. 7.5, ground(w, cx +. 7.5, cz, top), cz)
                   else if scene == 2 do { set_down(set_down(m0, 1, cx -. 15.0, ground(w, cx -. 15.0, cz, top), cz), 8, cx +. 15.0, ground(w, cx +. 15.0, cz, top), cz) with mt_still: true }
                   else if scene == 3 do fire_stage(m0, w, top)
-                  else set_all(m0, nearest_go(points, sx, sz, 0, 0, 1000000.0), 0) end end end
+                  else if scene == 4 do { set_down(set_down(m0, 1, cx -. 10.0, ground(w, cx -. 10.0, cz, top), cz), 8, cx +. 10.0, ground(w, cx +. 10.0, cz, top), cz) with mt_frozen: 8, mt_staged: true, mt_eye: (cx -. 1.0, ground(w, cx, cz, top) +. 4.5, cz -. 11.0, 3.14159265, -0.38) }
+                  else set_all(m0, nearest_go(points, sx, sz, 0, 0, 1000000.0), 0) end end end end
                 end
             end
         end
@@ -403,7 +436,7 @@ mod StrataViewer.Match do
     if Strata.Query.is_hit(h) do
       let d = Strata.Query.hit_dist(h)
       match An.spawn_at(m.mt_anim, m.mt_arrow_rig, ox +. dx *. (d -. 0.3), oy +. dy *. (d -. 0.3), oz +. dz *. (d -. 0.3), q) do
-        (a1, fig) -> { m with mt_anim: a1, mt_shots: Cons({ ms_ent: -1, ms_fig: fig, ms_who: who, ms_fire: false, ms_age: 0.0, ms_stuck: 5.0 }, m.mt_shots) }
+        (a1, fig) -> { m with mt_anim: a1, mt_shots: Cons({ ms_ent: -1, ms_fig: fig, ms_who: who, ms_fire: false, ms_age: 0.0, ms_stuck: 5.0, ms_x: ox, ms_y: oy, ms_z: oz }, m.mt_shots) }
       end
     else
       match En.add(m.mt_ent, 2, ox, oy, oz, Math.atan2(dx, dz)) do
@@ -411,7 +444,7 @@ mod StrataViewer.Match do
           if id < 0 do { m with mt_ent: e1 }
           else
             match An.spawn_at(m.mt_anim, m.mt_arrow_rig, ox, oy, oz, q) do
-              (a1, fig) -> { m with mt_ent: En.set_velocity(e1, id, dx *. 60.0, dy *. 60.0, dz *. 60.0), mt_anim: a1, mt_shots: Cons({ ms_ent: id, ms_fig: fig, ms_who: who, ms_fire: false, ms_age: 0.0, ms_stuck: 0.0 }, m.mt_shots) }
+              (a1, fig) -> { m with mt_ent: En.set_velocity(e1, id, dx *. 60.0, dy *. 60.0, dz *. 60.0), mt_anim: a1, mt_shots: Cons({ ms_ent: id, ms_fig: fig, ms_who: who, ms_fire: false, ms_age: 0.0, ms_stuck: 0.0, ms_x: ox, ms_y: oy, ms_z: oz }, m.mt_shots) }
             end
           end
       end
@@ -426,7 +459,7 @@ mod StrataViewer.Match do
         else
           match An.spawn_at(m.mt_anim, m.mt_fire_rig, ox, oy, oz, Qt.identity()) do
             (a1, fig) -> { m with mt_ent: En.set_velocity(e1, id, dx *. 18.0, dy *. 18.0, dz *. 18.0), mt_anim: if fig < 0 do a1 else An.traced(a1, fig, true) end,
-                                  mt_shots: Cons({ ms_ent: id, ms_fig: fig, ms_who: who, ms_fire: true, ms_age: 0.0, ms_stuck: 0.0 }, m.mt_shots) }
+                                  mt_shots: Cons({ ms_ent: id, ms_fig: fig, ms_who: who, ms_fire: true, ms_age: 0.0, ms_stuck: 0.0, ms_x: ox, ms_y: oy, ms_z: oz }, m.mt_shots) }
           end
         end
     end
@@ -466,7 +499,7 @@ mod StrataViewer.Match do
   -- the shot whose entity is [id], as (found, the shot) and the others
   pfn pull_shot(ss : List(MtShot), id : Int, acc : List(MtShot)) : (Bool, MtShot, List(MtShot)) do
     match ss do
-      Nil -> (false, { ms_ent: -1, ms_fig: -1, ms_who: -1, ms_fire: false, ms_age: 0.0, ms_stuck: 0.0 }, List.reverse(acc))
+      Nil -> (false, { ms_ent: -1, ms_fig: -1, ms_who: -1, ms_fire: false, ms_age: 0.0, ms_stuck: 0.0, ms_x: 0.0, ms_y: 0.0, ms_z: 0.0 }, List.reverse(acc))
       Cons(s, rest) -> if s.ms_ent == id do (true, s, List.append(List.reverse(acc), rest)) else pull_shot(rest, id, Cons(s, acc)) end
     end
   end
@@ -536,20 +569,24 @@ mod StrataViewer.Match do
     end
   end
 
-  -- Each shot a frame older: one flying is drawn where its entity is and is gone after 80 m; one stuck is gone when its time is up.
-  pfn shots_go(ss : List(MtShot), e : Strata.Entities.Entities, a : Strata.Anim.Anim, dt : Float, acc : List(MtShot)) : (Strata.Entities.Entities, Strata.Anim.Anim, List(MtShot)) do
+  -- Each shot a frame older: one flying is drawn where its entity is, and is gone after 80 m or where its step enters water; one stuck is gone when its time is up.
+  pfn shots_go(ss : List(MtShot), wet : Int -> Int -> Int -> Bool, e : Strata.Entities.Entities, a : Strata.Anim.Anim, dt : Float, acc : List(MtShot)) : (Strata.Entities.Entities, Strata.Anim.Anim, List(MtShot)) do
     match ss do
       Nil -> (e, a, List.reverse(acc))
       Cons(s, rest) ->
         if s.ms_ent < 0 do
-          (if s.ms_stuck -. dt <= 0.0 do shots_go(rest, e, An.remove(a, s.ms_fig), dt, acc)
-           else shots_go(rest, e, a, dt, Cons({ s with ms_stuck: s.ms_stuck -. dt }, acc)) end)
-        else if (!s.ms_fire && s.ms_age +. dt > 1.34) || !En.alive(e, s.ms_ent) do shots_go(rest, En.remove(e, s.ms_ent), An.remove(a, s.ms_fig), dt, acc)
+          (if s.ms_stuck -. dt <= 0.0 do shots_go(rest, wet, e, An.remove(a, s.ms_fig), dt, acc)
+           else shots_go(rest, wet, e, a, dt, Cons({ s with ms_stuck: s.ms_stuck -. dt }, acc)) end)
+        else if (!s.ms_fire && s.ms_age +. dt > 1.34) || !En.alive(e, s.ms_ent) do shots_go(rest, wet, En.remove(e, s.ms_ent), An.remove(a, s.ms_fig), dt, acc)
         else
           match En.position(e, s.ms_ent) do
             (x, y, z) ->
-              match En.velocity(e, s.ms_ent) do
-                (vx, vy, vz) -> shots_go(rest, e, An.place(a, s.ms_fig, x, y, z, along(vx, vy, vz)), dt, Cons({ s with ms_age: s.ms_age +. dt }, acc))
+              match Cb.water_point(wet, s.ms_x, s.ms_y, s.ms_z, x, y, z) do
+                (true, _, _, _) -> shots_go(rest, wet, En.remove(e, s.ms_ent), An.remove(a, s.ms_fig), dt, acc)
+                (false, _, _, _) ->
+                  match En.velocity(e, s.ms_ent) do
+                    (vx, vy, vz) -> shots_go(rest, wet, e, An.place(a, s.ms_fig, x, y, z, along(vx, vy, vz)), dt, Cons({ s with ms_age: s.ms_age +. dt, ms_x: x, ms_y: y, ms_z: z }, acc))
+                  end
               end
           end
         end end
@@ -580,7 +617,7 @@ mod StrataViewer.Match do
     let tgt = if Cb.winner(m.mt_fs) >= 0 do -1 else Cb.target(i, ps, alive_, fn j -> clear_line(w, me, point(ps, j))) end
     let off_field = hyp(b.mb_x -. m.mt_cx, b.mb_z -. m.mt_cz) > 80.0
     let metres = if tgt < 0 do 0.0 else match point(ps, tgt) do (tx, ty, tz) -> len3(tx -. b.mb_x, ty -. b.mb_y, tz -. b.mb_z) end end
-    let code = Cb.intent_code(Cb.intent(Cb.kind(m.mt_fs, i), off_field, false, tgt, metres, b.mb_cool))
+    let code = Cb.intent_code(Cb.intent(Cb.kind(m.mt_fs, i), off_field, b.mb_swim, tgt, metres, b.mb_cool))
     if code == 6 do
       -- at the target's chest, ahead of it by its travel, off by up to 4 degrees
       let tb = body(m.mt_bodies, tgt)
@@ -603,8 +640,9 @@ mod StrataViewer.Match do
   pfn heading(m : MtMatch, ps : List((Float, Float, Float)), i : Int, b : MtBody) : (Float, Float, Float, Float, Float) do
     let code = b.mb_intent
     let goal = if code == 0 do (m.mt_cx, 0.0, m.mt_cz)
-      else if code == 1 do (if hyp(b.mb_x -. m.mt_cx, b.mb_z -. m.mt_cz) > 14.0 do (m.mt_cx, 0.0, m.mt_cz) else point(m.mt_points, (i * 3 + m.mt_frame / 300) % 8) end)
-      else point(ps, b.mb_tgt) end end
+      else if code == 1 do (if hyp(b.mb_x -. m.mt_rx, b.mb_z -. m.mt_rz) > 14.0 do (m.mt_rx, 0.0, m.mt_rz) else point(m.mt_points, (i * 3 + m.mt_frame / 300) % 8) end)
+      else if code == 7 do point(m.mt_points, nearest_go(m.mt_points, b.mb_x, b.mb_z, 0, 0, 1000000.0))
+      else point(ps, b.mb_tgt) end end end
     match goal do
       (gx, _, gz) ->
         let dx = gx -. b.mb_x
@@ -612,40 +650,87 @@ mod StrataViewer.Match do
         let d = hyp(dx, dz)
         let ux = if d < 0.01 do 0.0 else dx /. d end
         let uz = if d < 0.01 do 0.0 else dz /. d end
-        -- 0 return and 2 chase run (a chaser stops at arm's length); 1 wander jogs to the middle and then about it; 5 retreat backs away; 3, 4, 6 stand and face
-        if Cb.winner(m.mt_fs) >= 0 || m.mt_still do (0.0, 0.0, 0.0, ux, uz)
+        -- 0 return and 2 chase run (a chaser stops at arm's length); 1 wander jogs to the rally point and then about it; 7 a swimmer makes for the nearest spawn point, dry land; 5 retreat backs away; 3, 4, 6 stand and face
+        if Cb.winner(m.mt_fs) >= 0 || m.mt_still || i == m.mt_frozen do (0.0, 0.0, 0.0, ux, uz)
         else if code == 0 do (ux, uz, 4.2, ux, uz)
         else if code == 2 do (ux, uz, if d < 1.0 do 0.0 else 4.2 end, ux, uz)
+        else if code == 7 do (ux, uz, 4.2, ux, uz)
         else if code == 1 do (ux, uz, if d < 1.0 do 0.0 else 2.8 end, ux, uz)
         else if code == 5 do (0.0 -. ux, 0.0 -. uz, 2.8, ux, uz)
-        else (0.0, 0.0, 0.0, ux, uz) end end end end end
+        else (0.0, 0.0, 0.0, ux, uz) end end end end end end
     end
   end
 
+  -- Is computer fighter [i] swimming? It begins when more than 0.55 of its box is under liquid and stops under 0.4.
+  pfn wet_one(m : MtMatch, w : Strata.World.World, f : Strata.Fluid.Fluid, i : Int) : MtMatch do
+    let b = body(m.mt_bodies, i)
+    let under = Strata.Fluid.depth_in(f, w, b.mb_x -. 0.3, b.mb_y -. 0.9, b.mb_z -. 0.3, b.mb_x +. 0.3, b.mb_y +. 0.9, b.mb_z +. 0.3)
+    let swim = if b.mb_swim do under > 0.4 else under > 0.55 end
+    if swim == b.mb_swim do m else with_body(m, i, { b with mb_swim: swim }) end
+  end
+  pfn cell(v : Float) : Int do float_to_int(Math.floor(v)) end
+  pfn is_solid(w : Strata.World.World, x : Float, y : Float, z : Float) : Bool do
+    let id = Strata.World.get_block(w, cell(x), cell(y), cell(z))
+    if id == 0 do false else Strata.Blocks.collides(Strata.World.registry(w), id) end
+  end
+
+  -- A swimming fighter is moved by the match, not the walking mover (which knows no water and would walk the bed): held with its shoulders at the surface,
+  -- swum 2.5 m/s along (ux, uz) and carried by the current; at a bank no more than a block above the surface it is set on the bank, walking again.
+  pfn swim_move(m : MtMatch, w : Strata.World.World, f : Strata.Fluid.Fluid, i : Int, ux : Float, uz : Float, speed : Float, dt : Float) : MtMatch do
+    let b = body(m.mt_bodies, i)
+    let here = Strata.Fluid.surface(f, w, cell(b.mb_x), cell(b.mb_y), cell(b.mb_z))
+    let surface = if here > -1000.0 do here else Strata.Fluid.surface(f, w, cell(b.mb_x), cell(b.mb_y -. 0.8), cell(b.mb_z)) end
+    if surface < -1000.0 do with_body(m, i, { b with mb_swim: false })
+    else
+      let go = if speed > 0.0 do 2.5 else 0.0 end
+      let ease = if 6.0 *. dt > 1.0 do 1.0 else 6.0 *. dt end
+      let ny = b.mb_y +. (surface -. 0.5 -. b.mb_y) *. ease
+      match Strata.Fluid.flow(f, w, cell(b.mb_x), cell(b.mb_y), cell(b.mb_z)) do
+        (cx, _, cz) ->
+          let nx = b.mb_x +. (ux *. go +. cx) *. dt
+          let nz = b.mb_z +. (uz *. go +. cz) *. dt
+          let blocked = is_solid(w, nx +. ux *. 0.4, ny, nz +. uz *. 0.4) || is_solid(w, nx +. ux *. 0.4, ny +. 0.7, nz +. uz *. 0.4)
+          let bank = if blocked do Fg.dry_ground_at(w, nx +. ux *. 0.7, nz +. uz *. 0.7, surface +. 1.6, 3.0) else -1000.0 end
+          let out = blocked && bank > -999.0 && bank <= surface +. 1.05
+          let px = if out do nx +. ux *. 0.7 else if blocked do b.mb_x else nx end end
+          let pz = if out do nz +. uz *. 0.7 else if blocked do b.mb_z else nz end end
+          let py = if out do bank +. 0.95 else ny end
+          let e1 = En.set_velocity(En.set_position(m.mt_ent, b.mb_ent, px, py, pz), b.mb_ent, 0.0, 0.0, 0.0)
+          let e2 = if ux == 0.0 && uz == 0.0 do e1 else En.set_facing(e1, b.mb_ent, Math.atan2(ux, uz)) end
+          let deep = if surface -. py > m.mt_deep && !out do surface -. py else m.mt_deep end
+          with_body({ m with mt_ent: e2, mt_swam: m.mt_swam + 1, mt_deep: deep }, i, { b with mb_swim: !out })
+      end
+    end
+  end
+
+  pfn side_time(tries : Int) : Float do if tries <= 0 do 0.5 else if tries == 1 do 1.0 else if tries == 2 do 2.0 else 4.0 end end end end
+
   -- Decide (every 15th frame, the fighters staggered) and steer computer fighter [i]: its velocity and facing set on its entity.
-  pfn steer(m0 : MtMatch, w : Strata.World.World, ps : List((Float, Float, Float)), alive_ : List(Bool), i : Int, dt : Float) : MtMatch do
+  pfn steer(m0 : MtMatch, w : Strata.World.World, f : Strata.Fluid.Fluid, ps : List((Float, Float, Float)), alive_ : List(Bool), i : Int, dt : Float) : MtMatch do
     let b0 = body(m0.mt_bodies, i)
     if i >= 12 do m0
-    else if b0.mb_ent < 0 || !Cb.alive(m0.mt_fs, i) do steer(m0, w, ps, alive_, i + 1, dt)
+    else if b0.mb_ent < 0 || !Cb.alive(m0.mt_fs, i) do steer(m0, w, f, ps, alive_, i + 1, dt)
     else
-      let m = if (m0.mt_frame + i) % 15 == 0 && !m0.mt_still do decide(m0, w, ps, alive_, i) else m0 end
+      let m = if (m0.mt_frame + i) % 15 == 0 && !m0.mt_still && i != m0.mt_frozen do decide(wet_one(m0, w, f, i), w, ps, alive_, i) else wet_one(m0, w, f, i) end
       let b1 = body(m.mt_bodies, i)
       match heading(m, ps, i, b1) do
         (ux, uz, speed, fx, fz) ->
-          -- blocked a second: half a second to the left
-          let sx = if b1.mb_side > 0.0 do 0.0 -. uz else ux end
-          let sz = if b1.mb_side > 0.0 do ux else uz end
+          -- blocked a second: a while to the side, longer each time it is blocked again before it has got anywhere (0.5 s, 1, 2, 4), left then right by turns
+          let hand = if b1.mb_tries % 2 == 1 do 1.0 else -1.0 end
+          let sx = if b1.mb_side > 0.0 do hand *. uz else ux end
+          let sz = if b1.mb_side > 0.0 do 0.0 -. hand *. ux else uz end
           let vy = match En.velocity(m.mt_ent, b1.mb_ent) do (_, v, _) -> v end
           let e1 = En.set_velocity(m.mt_ent, b1.mb_ent, sx *. speed, vy, sz *. speed)
           let e2 = if fx == 0.0 && fz == 0.0 do e1 else En.set_facing(e1, b1.mb_ent, Math.atan2(if speed > 0.0 do sx else fx end, if speed > 0.0 do sz else fz end)) end
           let moving = speed > 0.0
           let gone = hyp(b1.mb_x -. b1.mb_ax, b1.mb_z -. b1.mb_az) >= 0.5
           let stall = if !moving || gone do 0.0 else b1.mb_stall +. dt end
-          let b2 = { b1 with mb_side: if stall >= 1.0 do 0.5 else if b1.mb_side > 0.0 do b1.mb_side -. dt else 0.0 end end,
+          let b2 = { b1 with mb_side: if stall >= 1.0 do side_time(b1.mb_tries) else if b1.mb_side > 0.0 do b1.mb_side -. dt else 0.0 end end,
+                     mb_tries: if stall >= 1.0 do b1.mb_tries + 1 else b1.mb_tries end,
                      mb_stall: if stall >= 1.0 do 0.0 else stall end,
                      mb_ax: if gone || !moving do b1.mb_x else b1.mb_ax end, mb_az: if gone || !moving do b1.mb_z else b1.mb_az end,
                      mb_cool: if b1.mb_cool > 0.0 do b1.mb_cool -. dt else 0.0 end }
-          steer(with_body({ m with mt_ent: e2 }, i, b2), w, ps, alive_, i + 1, dt)
+          steer(if b2.mb_swim do swim_move(with_body(m, i, b2), w, f, i, sx, sz, speed, dt) else with_body({ m with mt_ent: e2 }, i, b2) end, w, f, ps, alive_, i + 1, dt)
       end
     end end
   end
@@ -662,7 +747,7 @@ mod StrataViewer.Match do
           let dz = z -. b.mb_z
           let d = hyp(dx, dz)
           let ahead = if d < 0.05 do 1.0 else (dx *. Math.sin(facing) +. dz *. Math.cos(facing)) /. d end
-          if len3(dx, y -. b.mb_y, dz) <= 1.6 && ahead >= 0.7071 do blow_on(strike(m, j, i, Cb.swing_damage()), ps, alive_, i, facing, j + 1)
+          if len3(dx, y -. b.mb_y, dz) <= 1.6 && ahead >= 0.7071 do blow_on(strike({ m with mt_struck: m.mt_struck + 1 }, j, i, Cb.swing_damage()), ps, alive_, i, facing, j + 1)
           else blow_on(m, ps, alive_, i, facing, j + 1) end
       end
     end end
@@ -689,7 +774,7 @@ mod StrataViewer.Match do
             let step = hyp(x -. b.mb_x, z -. b.mb_z)
             let speed = if dt > 0.0 do step /. dt else 0.0 end
             let held = b.mb_act -. dt > 0.0
-            let want = if held do b.mb_clip else if speed > 3.0 do 2 else if speed > 0.3 do 1 else 0 end end end
+            let want = if b.mb_swim do 5 else if held do b.mb_clip else if speed > 3.0 do 2 else if speed > 0.3 do 1 else 0 end end end end
             let a1 = An.place(m.mt_anim, b.mb_fig, x, y -. 0.9, z, turn(En.facing(m.mt_ent, b.mb_ent)))
             let a2 = if want == b.mb_clip do a1 else An.play(a1, b.mb_fig, 0, clip(m, want), 0.15, 1.0, 1.0, -1, false) end
             settle(with_body({ m with mt_anim: a2, mt_moved: m.mt_moved +. step }, i, { b with mb_x: x, mb_y: y, mb_z: z, mb_clip: want, mb_act: if held do b.mb_act -. dt else 0.0 end }), i + 1, dt)
@@ -707,7 +792,7 @@ mod StrataViewer.Match do
       else
         match Cb.idle(Cb.at(m.mt_fs, i), hyp(b.mb_x -. b.mb_ix, b.mb_z -. b.mb_iz), b.mb_fought, dt) do
           (f2, stuck) ->
-            let anchored = if f2.cb_idle == 0.0 do { b with mb_ix: b.mb_x, mb_iz: b.mb_z, mb_fought: false } else { b with mb_fought: false } end
+            let anchored = if f2.cb_idle == 0.0 do { b with mb_ix: b.mb_x, mb_iz: b.mb_z, mb_fought: false, mb_tries: 0 } else { b with mb_fought: false } end
             let m1 = with_body({ m with mt_fs: Cb.with_fighter(m.mt_fs, i, f2) }, i, anchored)
             if !stuck do idles(m1, ps, alive_, i + 1, dt)
             else
@@ -737,6 +822,18 @@ mod StrataViewer.Match do
         println("combat: table " ++ name ++ " " ++ int_to_string(k) ++ " " ++ int_to_string(d))
         print_table(rest)
     end
+  end
+
+  -- the channel scene's edit at frame 1: 6 m wide across x at the middle, 24 m long, water 3 deep with its top at the middle's ground, 6 m of air over it
+  pfn channel_go(x0 : Int, g : Int, z0 : Int, i : Int, acc : List((Int, Int, Int, Int))) : List((Int, Int, Int, Int)) do
+    if i >= 6 * 24 * 9 do acc
+    else
+      let dy = i / (6 * 24)
+      channel_go(x0, g, z0, i + 1, Cons((x0 + i % 6, g - 3 + dy, z0 + (i / 6) % 24, if dy < 3 do 5 else 0 end), acc))
+    end
+  end
+  pfn channel_edits(m : MtMatch) : List((Int, Int, Int, Int)) do
+    if m.mt_scene != 4 || m.mt_frame != 1 do Nil else channel_go(cell(m.mt_cx) - 3, cell(m.mt_cy), cell(m.mt_cz) - 12, 0, Nil) end
   end
 
   -- the trap scene's own edits: the three cells under the rusher dug at frame 60, a stone set in the shooter's two cells at frame 300
@@ -771,7 +868,7 @@ mod StrataViewer.Match do
   end
 
   doc "One frame of the match, [dt] seconds: the entity world's blocks brought up to date with the stream, the player's box set, the dead brought back, the computer fighters deciding, shooting, swinging and steering, the entities stepped, what they report acted on, the figures placed and advanced. Answers the match, the stream, and the block changes the match asks for, (x, y, z, id) each, for the viewer to apply as one edit."
-  fn frame(m0 : MtMatch, s : Strata.Stream.Stream, _f : Strata.Fluid.Fluid, inp : MtInput, dt : Float) : (MtMatch, Strata.Stream.Stream, List((Int, Int, Int, Int))) do
+  fn frame(m0 : MtMatch, s : Strata.Stream.Stream, f : Strata.Fluid.Fluid, inp : MtInput, dt : Float) : (MtMatch, Strata.Stream.Stream, List((Int, Int, Int, Int))) do
     if !m0.mt_live do (m0, s, Nil)
     else
       match En.blocks(m0.mt_ent, s) do
@@ -784,12 +881,13 @@ mod StrataViewer.Match do
             end
           let ps = places(m1, inp, m1.mt_bodies, 0)
           let alive_ = living(m1, 0)
-          let m2 = staged_throw(steer(m1, w, ps, alive_, 1, dt))
+          let m2 = staged_throw(steer(m1, w, f, ps, alive_, 1, dt))
           let focus = if m2.mt_player do [(inp.mi_x, inp.mi_y, inp.mi_z), (m2.mt_cx, m2.mt_cy, m2.mt_cz)] else [(m2.mt_cx, m2.mt_cy, m2.mt_cz)] end
           let e3 = En.step(m2.mt_ent, focus, dt)
           let m3 = spent_fire(events_go({ m2 with mt_ent: e3 }, w, ps, En.events(e3, w)), w, ps, m2.mt_shots)
           let m4 = settle(blows(m3, ps, alive_, 1, dt), 1, dt)
-          let m5 = match shots_go(m4.mt_shots, m4.mt_ent, m4.mt_anim, dt, Nil) do
+          let reg = Strata.World.registry(w)
+          let m5 = match shots_go(m4.mt_shots, fn (bx, by0, bz) -> Fg.is_liquid(reg, Strata.World.get_block(w, bx, by0, bz)), m4.mt_ent, m4.mt_anim, dt, Nil) do
               (e5, a5, ss) -> { m4 with mt_ent: e5, mt_anim: a5, mt_shots: ss }
             end
           let m6 = idles(m5, ps, alive_, 1, dt)
@@ -798,8 +896,10 @@ mod StrataViewer.Match do
             println("combat: winner " ++ Cb.name(m6.mt_fs, win) ++ " " ++ int_to_string(Cb.kills(m6.mt_fs, win)) ++ " at frame " ++ int_to_string(m6.mt_frame))
             print_table(table(m6))
           else () end
-          let changes = List.append(trap_edits(m6), m6.mt_changes)
-          ({ m6 with mt_anim: An.update(m6.mt_anim, dt), mt_frame: m6.mt_frame + 1, mt_won: win >= 0, mt_changes: Nil }, s1, changes)
+          let changes = List.append(channel_edits(m6), List.append(trap_edits(m6), m6.mt_changes))
+          let rusher = body(m6.mt_bodies, 1)
+          let over = m6.mt_scene == 4 && m6.mt_swam > 0 && rusher.mb_x > m6.mt_cx +. 3.5
+          ({ m6 with mt_anim: An.update(m6.mt_anim, dt), mt_frame: m6.mt_frame + 1, mt_won: win >= 0, mt_changes: Nil, mt_crossed: m6.mt_crossed || over }, s1, changes)
       end
     end
   end
@@ -846,10 +946,11 @@ mod StrataViewer.Match do
     let head = "combat: frame " ++ int_to_string(m.mt_frame) ++ " fingerprint " ++ int_to_string(fingerprint(m)) ++ ", moved " ++ int_to_string(float_to_int(m.mt_moved)) ++ " m, outside " ++ int_to_string(outside_go(m, m.mt_bodies, 0, 0))
     if m.mt_scene == 1 do head ++ "\ncombat: duel kills " ++ int_to_string(Cb.kills(m.mt_fs, 8)) ++ " " ++ int_to_string(Cb.kills(m.mt_fs, 9))
     else if m.mt_scene == 2 do head ++ "\ncombat: trap inside " ++ int_to_string(inside_go(m, w, m.mt_bodies, 0, 0)) ++ ", respawns " ++ int_to_string(m.mt_idles)
+    else if m.mt_scene == 4 do head ++ "\ncombat: channel swam " ++ int_to_string(m.mt_swam) ++ " frames, crossed " ++ (if m.mt_crossed do "1" else "0" end) ++ ", struck " ++ int_to_string(m.mt_struck) ++ ", deepest " ++ int_to_string(float_to_int(m.mt_deep *. 100.0)) ++ " cm"
     else if m.mt_scene == 3 do
       match m.mt_burned do
         (n, wood, leaves, grass) -> head ++ "\ncombat: fire burned " ++ int_to_string(n) ++ " cells: wood " ++ int_to_string(wood) ++ ", leaves " ++ int_to_string(leaves) ++ ", grass " ++ int_to_string(grass) ++ ", bystander health " ++ int_to_string(Cb.health(m.mt_fs, 8))
       end
-    else head ++ "\ncombat: leader " ++ leader(table(m)) ++ ", kills in all " ++ int_to_string(total_kills(table(m), 0)) ++ ", idle respawns " ++ int_to_string(m.mt_idles) end end end
+    else head ++ "\ncombat: leader " ++ leader(table(m)) ++ ", kills in all " ++ int_to_string(total_kills(table(m), 0)) ++ ", idle respawns " ++ int_to_string(m.mt_idles) end end end end
   end
 end
