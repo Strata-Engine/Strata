@@ -700,6 +700,99 @@ mod Strata.Test.Physics do
     end
   end
 
+
+  -- ── Support ──────────────────────────────────────────────────────────────
+  pfn supported() : Strata.Physics.Physics do Ph.new(reg(), Ph.with_support(Ph.config(), true, -1)) end
+  pfn pillar_world() : Strata.World.World do Ed.world(Ed.fill_box(Ed.world(Ed.fill_box(world(), 0, 0, 0, 0, 5, 0, 1)), -1, 6, -1, 1, 6, 1, 1)) end
+  pfn kinds_seen(p : Strata.Physics.Physics, k : Int) : Bool do List.any(Ph.events(p), fn e -> Ph.ev_kind(e) == k) end
+  pfn first_id(p : Strata.Physics.Physics) : Int do
+    match Ph.ids(p) do
+      Cons(i, _) -> i
+      Nil -> -1
+    end
+  end
+  -- chunks x -2..5, y -1..2, z -2..1
+  pfn wide_world() : Strata.World.World do wide_go(Wd.new(reg(), flat(), 7, 1.0), 0) end
+  pfn wide_go(w : Strata.World.World, i : Int) : Strata.World.World do
+    if i >= 128 do w else wide_go(load(w, i % 8 - 2, (i / 8) % 4 - 1, i / 32 - 2), i + 1) end
+  end
+  pfn grid_x(p : Strata.Physics.Physics, id : Int) : Int do match Ph.classes(p, id) do (_, sx, _, _) -> sx end end
+
+  describe "Physics support" do
+    test "with support off nothing comes loose" do
+      let o = Ed.fill_box(world(), 0, 10, 0, 2, 12, 2, 1)
+      let s = run(Sim(Ph.wake(phys(), o), Ed.world(o)), 3)
+      Test.assert_eq_int(Ph.count(sp(s)), 0, "no body")
+      Test.assert_eq_int(Strata.World.get_block(sw(s), 1, 11, 1), 1, "the floating cube is still blocks")
+    end
+
+    test "loose terrain falls" do
+      let o = Ed.set_block(pillar_world(), 0, 2, 0, 0)
+      let s = run(Sim(Ph.wake(supported(), o), Ed.world(o)), 3)
+      Test.assert_eq_int(Ph.count(sp(s)), 1, "the piece is a body within 3 steps")
+      Test.assert_eq_int(Strata.World.get_block(sw(s), 0, 4, 0), 0, "its cells are air")
+      Test.assert_eq_int(Strata.World.get_block(sw(s), 1, 6, 1), 0, "the roof's too")
+      Test.assert_eq_int(Strata.World.get_block(sw(s), 0, 1, 0), 1, "the pillar below the cut stays")
+      Test.assert_true(kinds_seen(sp(run(Sim(Ph.wake(supported(), o), Ed.world(o)), 1)), 2), "a loose event")
+      let id = first_id(sp(s))
+      let y3 = py(s, id)
+      Test.assert_true(py(run(s, 120), id) < y3 -. 1.5, "and it has fallen onto the stump by step 120")
+    end
+
+    test "a large piece is split along 128-voxel lines" do
+      let o = Ed.fill_box(wide_world(), 0, 20, 0, 149, 21, 1, 1)
+      let s = run(Sim(Ph.wake(supported(), o), Ed.world(o)), 1)
+      Test.assert_eq_int(Ph.count(sp(s)), 2, "two bodies")
+      let xs = List.sort_by(List.map(Ph.ids(sp(s)), fn i -> grid_x(sp(s), i)), fn (a, b) -> a >= b)
+      Test.assert_true(xs == Cons(128, Cons(22, Nil)), "128 and 22 long")
+    end
+
+    test "a stale piece is redone, not applied" do
+      let o = Ed.set_block(pillar_world(), 0, 2, 0, 0)
+      match Ph.begin(Ph.wake(supported(), o), Ed.world(o), Nil) do
+        (p1, j) ->
+          let refill = Ed.set_block(Ed.world(o), 0, 2, 0, 1)
+          match Ph.finish_world(j, Ph.wake(p1, refill), Ed.world(refill)) do
+            (p2, o2) ->
+              let w2 = Ed.world(o2)
+              Test.assert_eq_int(Ph.count(p2), 0, "no body from the stale piece")
+              Test.assert_eq_int(Strata.World.get_block(w2, 0, 2, 0), 1, "the placed block is still there")
+              Test.assert_eq_int(Strata.World.get_block(w2, 0, 4, 0), 1, "the pillar above it too")
+              Test.assert_true(kinds_seen(p2, 4), "a deferred event")
+              let s3 = run(Sim(p2, w2), 2)
+              Test.assert_eq_int(Ph.count(sp(s3)), 0, "worked out afresh at the next step, it stays")
+              Test.assert_eq_int(Strata.World.get_block(sw(s3), 1, 6, 1), 1, "the roof is still up")
+          end
+      end
+    end
+
+    test "with support on two runs give equal hashes at every step" do
+      Check.all_with(Gen.tuple2(Gen.list(Gen.int(0, 6)), Gen.list(Gen.tuple2(Gen.int(0, 15), Gen.int(0, 15)))), fn c -> support_det(c), { Check.default_config() with num_runs: 6 })
+    end
+  end
+
+  -- random terrain, then sphere carves at random places under it; both runs see the same edits
+  pfn carve_all(p : Strata.Physics.Physics, w : Strata.World.World, cs : List((Int, Int)), n : Int) : Sim do
+    match cs do
+      Nil -> Sim(p, w)
+      Cons((x, z), t) ->
+        if n >= 4 do Sim(p, w)
+        else
+          let o = Ed.fill_sphere(w, x, 2, z, 2, 0)
+          carve_all(Ph.wake(p, o), Ed.world(o), t, n + 1)
+      end
+    end
+  end
+  pfn support_det(c : (List(Int), List((Int, Int)))) : Bool do
+    match c do
+      (hs, cs) ->
+        let w = shaped(world(), List.map(hs, fn h -> h + 4), 0)
+        match carve_all(supported(), w, cs, 0) do
+          Sim(p, w2) -> same_hashes(Sim(p, w2), Sim(p, w2), 40)
+        end
+    end
+  end
+
   pfn ids_of_row(p : Strata.Physics.Physics, n : Int, i : Int, acc : List(Int)) : (Strata.Physics.Physics, List(Int)) do
     if i >= n do (p, reverse(acc))
     else

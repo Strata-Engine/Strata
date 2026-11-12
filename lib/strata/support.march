@@ -1,0 +1,267 @@
+-- Support — what an edit leaves without support, and so comes loose.
+--
+-- Worked over a window round the edit: the edits' bounds grown by the
+-- longest span any colliding block has, plus two voxels. In it, each cell is
+-- air (or a block that does not collide), solid, or an anchor: a block the
+-- registry marks as one, any block at or below the anchor depth, and any
+-- cell of a chunk that is not loaded, so the edge of the loaded world never
+-- falls away.
+--
+-- Support starts at the anchors, and at every solid cell on the window's
+-- boundary (what lies beyond the window counts as held). Each block takes
+-- its distance, in voxels, from them: a block resting on another takes that
+-- one's distance unchanged; a block beside or hanging under another is one
+-- further. A block is held when its distance is within its own material's
+-- span, and only a held block passes support on. Blocks without support that touch
+-- face to face are one loose piece, which breaks off where it meets held
+-- blocks. So a floating island cut free falls whole, a ledge longer than its
+-- material's span breaks off past the span, and a block resting on a held
+-- bridge stays.
+--
+-- A loose piece larger than the fill cap (200 000 voxels) is counted as held
+-- instead, and counted in `capped`.
+mod Strata.Support do
+
+  alias Strata.Blocks as Bs
+
+  -- each loose piece's cells; fills stopped at the cap
+  type Loose = Loose(List(List((Int, Int, Int))), Int)
+
+  doc "Each loose piece's cells, in a fixed order: pieces by their first cell in the window's scan order, cells in the order the piece was filled."
+  fn pieces(l : Loose) : List(List((Int, Int, Int))) do match l do Loose(ps, _) -> ps end end
+  doc "How many loose pieces were larger than the fill cap and were counted as held."
+  fn capped(l : Loose) : Int do match l do Loose(_, n) -> n end end
+
+  doc "The fill cap: a loose piece larger than this many voxels is counted as held."
+  fn fill_cap() : Int do 200000 end
+
+  -- ── The window ───────────────────────────────────────────────────────────
+  -- low corner, sizes; per cell: 0 air, 1 solid, 2 anchor; and each solid cell's span in voxels
+  type Win = Win(Int, Int, Int, Int, Int, Int, NativeU8Arr, NativeU8Arr)
+
+  pfn clamp255(v : Int) : Int do if v < 1 do 1 else if v > 255 do 255 else v end end end
+  pfn span_vox(r : Strata.Blocks.Registry, id : Int, scale : Float) : Int do clamp255(float_to_int(int_to_float(Bs.span_cm(r, id)) /. (scale *. 100.0))) end
+
+  -- per id: kind (0 air, 1 solid, 2 anchor) and span in voxels
+  pfn tables(r : Strata.Blocks.Registry, scale : Float, kinds : NativeU8Arr, spans : NativeU8Arr, i : Int, n : Int) : (NativeU8Arr, NativeU8Arr) do
+    if i >= n do (kinds, spans)
+    else
+      let k = if !Bs.collides(r, i) do 0 else if Bs.anchors(r, i) do 2 else 1 end end
+      tables(r, scale, NativeArray.set_u8(kinds, i, k), NativeArray.set_u8(spans, i, span_vox(r, i, scale)), i + 1, n)
+    end
+  end
+  pfn tget(t : NativeU8Arr, id : Int) : Int do if id < 0 || id >= NativeArray.length_u8(t) do 0 else NativeArray.get_u8(t, id) end end
+
+  pfn fill_cells(kinds : NativeU8Arr, spans : NativeU8Arr, w : Strata.World.World, tk : NativeU8Arr, ts : NativeU8Arr, anchor_y : Int, ox : Int, oy : Int, oz : Int, sx : Int, sy : Int, n : Int, maxspan : Int,
+                 c : Strata.Chunk.Chunk, ck : Int, ld : Bool, i : Int) : (NativeU8Arr, NativeU8Arr) do
+    if i >= n do (kinds, spans)
+    else
+      let x = ox + i % sx
+      let y = oy + (i / sx) % sy
+      let z = oz + i / (sx * sy)
+      let key = Strata.Coord.key_of_voxel(x, y, z)
+      let kh = Strata.Coord.key_hash(key)
+      -- the chunk is looked up again only when the cell is in another one
+      let c2 = if kh == ck do c else Strata.Store.get(Strata.World.chunks(w), key) end
+      let ld2 = if kh == ck do ld else Strata.World.is_loaded(w, key) end
+      if !ld2 do
+        fill_cells(NativeArray.set_u8(kinds, i, 2), NativeArray.set_u8(spans, i, maxspan), w, tk, ts, anchor_y, ox, oy, oz, sx, sy, n, maxspan, c2, kh, ld2, i + 1)
+      else
+        let id = Strata.Chunk.get_or(c2, Strata.Coord.local_of(x), Strata.Coord.local_of(y), Strata.Coord.local_of(z), 0)
+        let k0 = tget(tk, id)
+        let k = if k0 == 1 && y <= anchor_y do 2 else k0 end
+        fill_cells(NativeArray.set_u8(kinds, i, k), NativeArray.set_u8(spans, i, tget(ts, id)), w, tk, ts, anchor_y, ox, oy, oz, sx, sy, n, maxspan, c2, kh, ld2, i + 1)
+      end
+    end
+  end
+
+  pfn window(r : Strata.Blocks.Registry, w : Strata.World.World, scale : Float, anchor_y : Int, x0 : Int, y0 : Int, z0 : Int, x1 : Int, y1 : Int, z1 : Int) : Win do
+    let sx = x1 - x0 + 1
+    let sy = y1 - y0 + 1
+    let sz = z1 - z0 + 1
+    let n = sx * sy * sz
+    let nid = Bs.count(r)
+    match tables(r, scale, NativeArray.make_u8(nid + 1, 0), NativeArray.make_u8(nid + 1, 1), 0, nid) do
+      (tk, ts) ->
+        let maxspan = clamp255(float_to_int(int_to_float(Bs.max_span_cm(r)) /. (scale *. 100.0)))
+        match fill_cells(NativeArray.make_u8(n, 0), NativeArray.make_u8(n, 0), w, tk, ts, anchor_y, x0, y0, z0, sx, sy, n, maxspan, Strata.Chunk.uniform(0), -1, false, 0) do
+          (kinds, spans) -> Win(x0, y0, z0, sx, sy, sz, kinds, spans)
+        end
+    end
+  end
+
+  -- ── Spreading support ────────────────────────────────────────────────────
+  -- each cell's distance from support, -1 where none has reached; buckets of cells waiting at each distance
+  type Spread = Spread(NativeIntArr, Strata.Tree.Tree(List(Int)))
+
+  pfn push(sp : Spread, i : Int, v : Int) : Spread do
+    match sp do
+      Spread(vals, bk) ->
+        if v > 255 do sp
+        else if NativeArray.get_int(vals, i) >= 0 && NativeArray.get_int(vals, i) <= v do sp
+        else Spread(NativeArray.set_int(vals, i, v), Strata.Tree.set(bk, v, Cons(i, Strata.Tree.get(bk, v)))) end end
+    end
+  end
+
+  pfn solid_k(k : Int) : Bool do k == 1 || k == 2 end
+
+  -- the anchors and the solid cells on the window's boundary start it, each at its span
+  pfn seed(win : Win, sp : Spread, i : Int, n : Int) : Spread do
+    if i >= n do sp
+    else
+      match win do
+        Win(_, _, _, sx, sy, sz, kinds, spans) ->
+          let k = NativeArray.get_u8(kinds, i)
+          let x = i % sx
+          let y = (i / sx) % sy
+          let z = i / (sx * sy)
+          let edge = x == 0 || y == 0 || z == 0 || x == sx - 1 || y == sy - 1 || z == sz - 1
+          seed(win, if k == 2 || (k == 1 && edge) do push(sp, i, 0) else sp end, i + 1, n)
+      end
+    end
+  end
+
+  -- a neighbour of cell (x, y, z) in the window, if inside and solid: its index, or -1
+  pfn at(win : Win, x : Int, y : Int, z : Int) : Int do
+    match win do
+      Win(_, _, _, sx, sy, sz, kinds, _) ->
+        if x < 0 || y < 0 || z < 0 || x >= sx || y >= sy || z >= sz do -1
+        else
+          let j = x + sx * (y + sy * z)
+          if solid_k(NativeArray.get_u8(kinds, j)) do j else -1 end
+        end
+    end
+  end
+
+  -- empty bucket v, cell by cell: a held cell passes support up at v, sideways and down at v + 1
+  pfn drain(win : Win, sp : Spread, v : Int) : Spread do
+    match sp do
+      Spread(vals, bk) ->
+        match Strata.Tree.get(bk, v) do
+          Nil -> sp
+          Cons(i, rest) ->
+            let sp1 = Spread(vals, Strata.Tree.set(bk, v, rest))
+            if NativeArray.get_int(vals, i) != v do drain(win, sp1, v)
+            else if !held_at(win, i, v) do drain(win, sp1, v)
+            else
+              match win do
+                Win(_, _, _, sx, sy, _, _, _) ->
+                  let x = i % sx
+                  let y = (i / sx) % sy
+                  let z = i / (sx * sy)
+                  let pu = fn (s0, j, val) -> if j < 0 do s0 else push(s0, j, val) end
+                  let s2 = pu(sp1, at(win, x, y + 1, z), v)
+                  let s3 = pu(pu(pu(pu(pu(s2, at(win, x + 1, y, z), v + 1), at(win, x - 1, y, z), v + 1), at(win, x, y, z + 1), v + 1), at(win, x, y, z - 1), v + 1), at(win, x, y - 1, z), v + 1)
+                  drain(win, s3, v)
+              end
+            end end
+        end
+    end
+  end
+  -- an anchor is always held; a solid block while its distance is within its span
+  pfn held_at(win : Win, i : Int, d : Int) : Bool do
+    match win do
+      Win(_, _, _, _, _, _, kinds, spans) -> NativeArray.get_u8(kinds, i) == 2 || d <= NativeArray.get_u8(spans, i)
+    end
+  end
+  pfn levels(win : Win, sp : Spread, v : Int) : Spread do
+    if v > 255 do sp else levels(win, drain(win, sp, v), v + 1) end
+  end
+
+  -- ── Loose pieces ─────────────────────────────────────────────────────────
+  -- seen marks, the fill stack and its height, the cells found, how many
+  type Fill = Fill(NativeU8Arr, NativeIntArr, Int, List((Int, Int, Int)), Int)
+
+  pfn unheld(win : Win, vals : NativeIntArr, j : Int) : Bool do
+    match win do
+      -- (GAPS S16: a guard joined by && does not keep the read from happening)
+      Win(_, _, _, _, _, _, kinds, spans) ->
+        if j < 0 do false
+        else if NativeArray.get_u8(kinds, j) != 1 do false
+        else NativeArray.get_int(vals, j) < 0 || NativeArray.get_int(vals, j) > NativeArray.get_u8(spans, j) end end
+    end
+  end
+  pfn add_cell(win : Win, vals : NativeIntArr, f : Fill, j : Int) : Fill do
+    match f do
+      Fill(seen, st, h, cells, n) ->
+        if j < 0 do f
+        else if NativeArray.get_u8(seen, j) == 1 || !unheld(win, vals, j) do f
+        else
+          match win do
+            Win(ox, oy, oz, sx, sy, _, _, _) ->
+              Fill(NativeArray.set_u8(seen, j, 1), NativeArray.set_int(st, h, j), h + 1, Cons((ox + j % sx, oy + (j / sx) % sy, oz + j / (sx * sy)), cells), n + 1)
+          end
+        end end
+    end
+  end
+  pfn flood(win : Win, vals : NativeIntArr, f : Fill) : Fill do
+    match f do
+      Fill(seen, st, h, cells, n) ->
+        if h <= 0 do f
+        else
+          match win do
+            Win(_, _, _, sx, sy, _, _, _) ->
+              let i = NativeArray.get_int(st, h - 1)
+              let x = i % sx
+              let y = (i / sx) % sy
+              let z = i / (sx * sy)
+              let f0 = Fill(seen, st, h - 1, cells, n)
+              let ad = fn (ff, j) -> add_cell(win, vals, ff, j)
+              flood(win, vals, ad(ad(ad(ad(ad(ad(f0, at(win, x + 1, y, z)), at(win, x - 1, y, z)), at(win, x, y + 1, z)), at(win, x, y - 1, z)), at(win, x, y, z + 1)), at(win, x, y, z - 1)))
+          end
+        end
+    end
+  end
+  pfn collect(win : Win, vals : NativeIntArr, seen : NativeU8Arr, st : NativeIntArr, cap : Int, i : Int, n : Int, acc : List(List((Int, Int, Int))), capped_n : Int) : Loose do
+    if i >= n do Loose(reverse(acc), capped_n)
+    else if NativeArray.get_u8(seen, i) == 1 || !unheld(win, vals, i) do collect(win, vals, seen, st, cap, i + 1, n, acc, capped_n)
+    else
+      match flood(win, vals, add_cell(win, vals, Fill(seen, st, 0, Nil, 0), i)) do
+        Fill(seen2, st2, _, cells, cnt) ->
+          if cnt > cap do collect(win, vals, seen2, st2, cap, i + 1, n, acc, capped_n + 1)
+          else collect(win, vals, seen2, st2, cap, i + 1, n, Cons(reverse(cells), acc), capped_n) end
+      end
+    end end
+  end
+
+  -- ── Putting it together ──────────────────────────────────────────────────
+  pfn bounds(cs : List(Strata.Edit.Change), x0 : Int, y0 : Int, z0 : Int, x1 : Int, y1 : Int, z1 : Int) : (Int, Int, Int, Int, Int, Int) do
+    match cs do
+      Nil -> (x0, y0, z0, x1, y1, z1)
+      Cons(c, t) ->
+        match (Strata.Edit.low(c), Strata.Edit.high(c)) do
+          ((a0, b0, c0), (a1, b1, c1)) ->
+            bounds(t, if a0 < x0 do a0 else x0 end, if b0 < y0 do b0 else y0 end, if c0 < z0 do c0 else z0 end, if a1 > x1 do a1 else x1 end, if b1 > y1 do b1 else y1 end, if c1 > z1 do c1 else z1 end)
+        end
+    end
+  end
+
+  doc "What [changes] (an edit's change records) leave without support in world [w], as `loose` does, with a fill cap of [cap] voxels."
+  fn loose_capped(r : Strata.Blocks.Registry, w : Strata.World.World, changes : List(Strata.Edit.Change), anchor_y : Int, scale : Float, cap : Int) : Loose do
+    match changes do
+      Nil -> Loose(Nil, 0)
+      Cons(c0, _) ->
+        match Strata.Edit.low(c0) do
+          (ax, ay, az) ->
+            match bounds(changes, ax, ay, az, ax, ay, az) do
+              (x0, y0, z0, x1, y1, z1) ->
+                let g = clamp255(float_to_int(Math.ceil(int_to_float(Bs.max_span_cm(r)) /. (scale *. 100.0)))) + 2
+                let win = window(r, w, scale, anchor_y, x0 - g, y0 - g, z0 - g, x1 + g, y1 + g, z1 + g)
+                match win do
+                  Win(_, _, _, sx, sy, sz, _, _) ->
+                    let n = sx * sy * sz
+                    let sp0 = Spread(NativeArray.make_int(n, -1), Strata.Tree.from_list(List.map(List.range(0, 256), fn _ -> Nil), Nil))
+                    match levels(win, seed(win, sp0, 0, n), 0) do
+                      Spread(vals, _) -> collect(win, vals, NativeArray.make_u8(n, 0), NativeArray.make_int(n, 0), cap, 0, n, Nil, 0)
+                    end
+                end
+            end
+        end
+    end
+  end
+
+  doc "What [changes] (an edit's change records) leave without support in world [w] at [scale] metres a voxel, every block at or below [anchor_y] being anchored. Pieces larger than 200 000 voxels are counted as held (see `capped`)."
+  fn loose(r : Strata.Blocks.Registry, w : Strata.World.World, changes : List(Strata.Edit.Change), anchor_y : Int, scale : Float) : Loose do
+    loose_capped(r, w, changes, anchor_y, scale, fill_cap())
+  end
+end
