@@ -1,0 +1,300 @@
+-- The island across scales, and its stored hashes. The same seed makes the
+-- same island in metres at 1 m and at 0.5 m a voxel (ground, lake water,
+-- trees, ruins, posts), and twelve island chunks keep the hashes recorded
+-- for them.
+mod StrataViewer.Test.Island do
+  -- the app's capabilities are charged to its test module too (GAPS S3)
+  needs IO.Console
+  needs IO.FileRead
+  needs IO.Process
+  needs IO.Spawn
+  needs IO.FileSystem
+  needs IO.Clock
+  import Test
+
+  alias StrataViewer as Vw
+
+  -- the viewer's own island, read from its cache (built once if missing)
+  pfn island() : Strata.Atlas.Atlas do Strata.Atlas.load_or_build(".march/atlas", Vw.island_def(), 7) end
+
+  pfn whole(m : Float) : Int do float_to_int(Math.floor(m)) end
+  pfn col_h(c : (Int, Int, Int)) : Int do match c do (h, _, _) -> h end end
+  pfn col_lake(c : (Int, Int, Int)) : Int do match c do (_, l, _) -> l end end
+
+  -- ── Ground, lake water ───────────────────────────────────────────────────
+  -- ground: stone, dirt, grass, sand, snow (not water, plants, posts or ice)
+  pfn ground_id(id : Int) : Bool do
+    if id == 1 do true else if id == 2 do true else if id == 3 do true else if id == 4 do true else id == 6 end end end end
+  end
+  pfn terrain(a : Strata.Atlas.Atlas, s : Float, wx : Int, y : Int, wz : Int) : Strata.Chunk.Chunk do
+    Vw.island_terrain(a, s, Strata.Coord.chunk_of(wx), Strata.Coord.chunk_of(y), Strata.Coord.chunk_of(wz), 7)
+  end
+  -- the highest ground voxel of column (wx, wz) from y down to ymin, c the terrain chunk of row ky
+  pfn top_go(a : Strata.Atlas.Atlas, s : Float, wx : Int, wz : Int, c : Strata.Chunk.Chunk, ky : Int, y : Int, ymin : Int) : Int do
+    if y < ymin do 0 - 1000000
+    else if Strata.Coord.chunk_of(y) != ky do top_go(a, s, wx, wz, terrain(a, s, wx, y, wz), Strata.Coord.chunk_of(y), y, ymin)
+    else if ground_id(Strata.Chunk.get_or(c, Strata.Coord.local_of(wx), Strata.Coord.local_of(y), Strata.Coord.local_of(wz), 0)) do y
+    else top_go(a, s, wx, wz, c, ky, y - 1, ymin) end end end
+  end
+  -- the ground top of the column holding (xm, zm) at s metres a voxel, in metres: the top of its highest ground voxel
+  pfn ground_m(a : Strata.Atlas.Atlas, s : Float, xm : Float, zm : Float) : Float do
+    let wx = whole(xm /. s)
+    let wz = whole(zm /. s)
+    let h = col_h(Vw.island_column(a, wx, wz, 7, s))
+    let y0 = h + whole(24.0 /. s)
+    int_to_float(top_go(a, s, wx, wz, terrain(a, s, wx, y0, wz), Strata.Coord.chunk_of(y0), y0, h - whole(48.0 /. s)) + 1) *. s
+  end
+  -- the top of the lake water of the column holding (xm, zm) at s metres a voxel, in metres; 0 with none
+  pfn lake_m(a : Strata.Atlas.Atlas, s : Float, xm : Float, zm : Float) : Float do
+    let l = col_lake(Vw.island_column(a, whole(xm /. s), whole(zm /. s), 7, s))
+    if l > 0 do int_to_float(l + 1) *. s else 0.0 end
+  end
+
+  -- the first lake that holds water
+  pfn wet_lake(ls : List((Float, Float, Float))) : (Float, Float, Float) do
+    match ls do
+      Nil -> (0.0, 0.0, 0.0 -. 1.0)
+      Cons((x, z, lv), rest) -> if lv >= 0.0 do (x, z, lv) else wet_lake(rest) end
+    end
+  end
+  -- the first river point standing over [above] metres and at least [wide] metres wide
+  pfn river_point(a : Strata.Atlas.Atlas, rs : List(List((Float, Float, Float))), above : Float, wide : Float) : (Float, Float, Float) do
+    match rs do
+      Nil -> (0.0, 0.0, 0.0)
+      Cons(r, rest) ->
+        match List.find(r, fn pt -> match pt do (x, z, w) -> if w < wide do false else Strata.Atlas.height_at(a, x, z) > above end end) do
+          Some(p) -> p
+          None -> river_point(a, rest, above, wide)
+        end
+    end
+  end
+
+  -- ── Trees ────────────────────────────────────────────────────────────────
+  -- (cell x, cell z, template index, base x, base y, base z), the base in metres (the bottom of the trunk's first voxel)
+  pfn tree_of(a : Strata.Atlas.Atlas, d : StrataViewer.Decor, s : Float, e : (Strata.Template.Template, Strata.Feature.Placed, Int, Int, Int)) : (Int, Int, Int, Float, Float, Float) do
+    match e do
+      (_, p, wx, y, wz) ->
+        let xm = Strata.Feature.p_xm(p)
+        let zm = Strata.Feature.p_zm(p)
+        (whole(xm /. 6.0), whole(zm /. 6.0), Vw.tree_pick(d, Strata.Atlas.region_at(a, xm, zm), Strata.Feature.p_index(p)), int_to_float(wx) *. s, int_to_float(y + 1) *. s, int_to_float(wz) *. s)
+    end
+  end
+  -- the trees of the chunk column holding (xm, zm) at s metres a voxel whose base column lies in that chunk column
+  pfn trees_m(a : Strata.Atlas.Atlas, d : StrataViewer.Decor, s : Float, xm : Float, zm : Float) : List((Int, Int, Int, Float, Float, Float)) do
+    let cx = Strata.Coord.chunk_of(whole(xm /. s))
+    let cz = Strata.Coord.chunk_of(whole(zm /. s))
+    let es = List.filter(Vw.island_chunk_trees(a, d, s, cx, cz, 7), fn e -> match e do (_, _, wx, _, wz) -> if Strata.Coord.chunk_of(wx) != cx do false else Strata.Coord.chunk_of(wz) == cz end end)
+    List.map(es, fn e -> tree_of(a, d, s, e))
+  end
+  pfn tr_cx(t : (Int, Int, Int, Float, Float, Float)) : Int do match t do (v, _, _, _, _, _) -> v end end
+  pfn tr_cz(t : (Int, Int, Int, Float, Float, Float)) : Int do match t do (_, v, _, _, _, _) -> v end end
+  pfn tr_pick(t : (Int, Int, Int, Float, Float, Float)) : Int do match t do (_, _, v, _, _, _) -> v end end
+  pfn tr_x(t : (Int, Int, Int, Float, Float, Float)) : Float do match t do (_, _, _, v, _, _) -> v end end
+  pfn tr_y(t : (Int, Int, Int, Float, Float, Float)) : Float do match t do (_, _, _, _, v, _) -> v end end
+  pfn tr_z(t : (Int, Int, Int, Float, Float, Float)) : Float do match t do (_, _, _, _, _, v) -> v end end
+  pfn near(p : Float, q : Float, tol : Float) : Bool do Math.abs(p -. q) <= tol end
+  -- the trees of ts that stand at 0.5 m too, in the same cell, as the same template, their base within a metre: (checked, mismatches)
+  pfn trees_agree(a : Strata.Atlas.Atlas, dh : StrataViewer.Decor, ts : List((Int, Int, Int, Float, Float, Float)), n : Int, bad : Int) : (Int, Int) do
+    match ts do
+      Nil -> (n, bad)
+      Cons(t, rest) ->
+        let fine = trees_m(a, dh, 0.5, tr_x(t) +. 0.25, tr_z(t) +. 0.25)
+        let same = List.find(fine, fn f -> if tr_cx(f) != tr_cx(t) do false else tr_cz(f) == tr_cz(t) end)
+        let ok = match same do
+            None -> false
+            Some(f) -> if tr_pick(f) != tr_pick(t) do false else if !near(tr_x(f), tr_x(t), 1.0) do false else if !near(tr_z(f), tr_z(t), 1.0) do false else near(tr_y(f), tr_y(t), 1.0) end end end
+          end
+        let _said = if ok do () else println("cross-scale: the tree of cell (" ++ int_to_string(tr_cx(t)) ++ ", " ++ int_to_string(tr_cz(t)) ++ ") at 1 m (base " ++ float_to_string(tr_x(t)) ++ ", " ++ float_to_string(tr_y(t)) ++ ", " ++ float_to_string(tr_z(t)) ++ ") differs at 0.5 m: " ++ (match same do
+            None -> "not there (" ++ int_to_string(List.length(fine)) ++ " trees in that chunk column)"
+            Some(f) -> "template " ++ int_to_string(tr_pick(f)) ++ " against " ++ int_to_string(tr_pick(t)) ++ ", base " ++ float_to_string(tr_x(f)) ++ ", " ++ float_to_string(tr_y(f)) ++ ", " ++ float_to_string(tr_z(f))
+          end)) end
+        trees_agree(a, dh, rest, n + 1, if ok do bad else bad + 1 end)
+    end
+  end
+
+  -- ── Ruins ────────────────────────────────────────────────────────────────
+  -- the ruin on site s at scale sc as a box in metres (x0, y0, z0, x1, y1, z1), the far faces' far sides
+  pfn ruin_box(d : StrataViewer.Decor, st : Strata.Atlas.Site, sc : Float) : Option((Float, Float, Float, Float, Float, Float)) do
+    match Vw.site_ruin(d, st, sc, 7) do
+      None -> None
+      Some((t, ox, oy, oz, rot)) ->
+        match Strata.Template.bounds(t, ox, oy, oz, rot) do
+          (x0, y0, z0, x1, y1, z1) -> Some((int_to_float(x0) *. sc, int_to_float(y0) *. sc, int_to_float(z0) *. sc, int_to_float(x1 + 1) *. sc, int_to_float(y1 + 1) *. sc, int_to_float(z1 + 1) *. sc))
+        end
+    end
+  end
+
+  -- ── Columns ──────────────────────────────────────────────────────────────
+  pfn land_x(i : Int) : Float do if i == 8 do 176.25 else 104.25 +. 40.0 *. int_to_float(i % 3) +. 8.0 *. int_to_float(i / 3) end end
+  pfn land_z(i : Int) : Float do if i == 8 do 240.25 else 184.25 +. 40.0 *. int_to_float(i / 3) end end
+  -- 30 columns in metres (a quarter metre into a whole metre, so each is one column at either scale), named
+  pfn columns(a : Strata.Atlas.Atlas, trees : List((Int, Int, Int, Float, Float, Float))) : List((String, Float, Float)) do
+    -- open land round the meadow (144, 224) on a 40 m grid; the ninth point, (200.25, 264.25) on the grid, stands
+    -- on a slope steep enough for the thermal pass (tuned at 1 m, its reach in voxels) to leave 2.5 m between the
+    -- scales, so it is moved to (176.25, 240.25)
+    let land = List.map(List.range(0, 12), fn i -> ("land " ++ int_to_string(i), land_x(i), land_z(i)))
+    let (lx, lz, _) = wet_lake(Strata.Atlas.lakes(a))
+    let lake = List.map(List.range(0, 4), fn i -> ("lake " ++ int_to_string(i), int_to_float(whole(lx) + 2 * (i % 2) - 1) +. 0.25, int_to_float(whole(lz) + 2 * (i / 2) - 1) +. 0.25))
+    let (rx, rz, rw) = river_point(a, Strata.Atlas.rivers(a), 45.0, 3.0)
+    let off = rw +. 3.0
+    let bank = List.map(List.range(0, 4), fn i -> ("river bank " ++ int_to_string(i), int_to_float(whole(rx +. (if i == 0 do off else if i == 1 do 0.0 -. off else 0.0 end end))) +. 0.25, int_to_float(whole(rz +. (if i == 2 do off else if i == 3 do 0.0 -. off else 0.0 end end))) +. 0.25))
+    let bases = List.map(List.take(trees, 6), fn t -> ("tree base " ++ int_to_string(tr_cx(t)) ++ "," ++ int_to_string(tr_cz(t)), tr_x(t) +. 0.25, tr_z(t) +. 0.25))
+    let ruin = match Vw.slope_site(a) do
+        None -> Nil
+        Some(st) ->
+          let sx = Strata.Atlas.s_x(st)
+          let sz = Strata.Atlas.s_z(st)
+          List.map(List.range(0, 4), fn i -> ("ruin site " ++ int_to_string(i), int_to_float(whole(sx) + 2 * (i % 2) - 1) +. 0.25, int_to_float(whole(sz) + 2 * (i / 2) - 1) +. 0.25))
+      end
+    List.append(land, List.append(lake, List.append(bank, List.append(bases, ruin))))
+  end
+  -- columns whose ground tops differ by more than a metre between 1 m and 0.5 m (each said)
+  pfn ground_go(a : Strata.Atlas.Atlas, cs : List((String, Float, Float)), bad : Int) : Int do
+    match cs do
+      Nil -> bad
+      Cons((nm, x, z), rest) ->
+        let g1 = ground_m(a, 1.0, x, z)
+        let g2 = ground_m(a, 0.5, x, z)
+        let ok = near(g1, g2, 1.0)
+        println("cross-scale: " ++ nm ++ " (" ++ float_to_string(x) ++ ", " ++ float_to_string(z) ++ ") ground " ++ float_to_string(g1) ++ " m at 1 m, " ++ float_to_string(g2) ++ " m at 0.5 m" ++ (if ok do "" else "  DIFFERS" end))
+        ground_go(a, rest, if ok do bad else bad + 1 end)
+    end
+  end
+
+  -- the lake columns of cs (named "lake ...") holding lake water at 1 m whose line at 0.5 m is within a metre of it
+  pfn lakes_go(a : Strata.Atlas.Atlas, cs : List((String, Float, Float)), i : Int, ok : Int) : Int do
+    match cs do
+      Nil -> ok
+      Cons((nm, x, z), rest) ->
+        if !string_starts_with(nm, "lake") do lakes_go(a, rest, i, ok)
+        else
+          let l1 = lake_m(a, 1.0, x, z)
+          let l2 = lake_m(a, 0.5, x, z)
+          println("cross-scale: " ++ nm ++ " lake line " ++ float_to_string(l1) ++ " m at 1 m, " ++ float_to_string(l2) ++ " m at 0.5 m")
+          lakes_go(a, rest, i + 1, if l1 <= 0.0 do ok else if near(l1, l2, 1.0) do ok + 1 else ok end end)
+        end
+    end
+  end
+
+  -- ── Posts ────────────────────────────────────────────────────────────────
+  -- the posts (id 12) of a chunk: their count, and how many stand on a column other than a whole metre's centre column at s
+  pfn posts_go(c : Strata.Chunk.Chunk, ox : Int, oz : Int, s : Float, i : Int, n : Int, off : Int) : (Int, Int) do
+    if i >= 32768 do (n, off)
+    else if Strata.Chunk.get_idx(c, i) != 12 do posts_go(c, ox, oz, s, i + 1, n, off)
+    else
+      let wx = ox + i % 32
+      let wz = oz + (i / 32) % 32
+      let centre = if whole((int_to_float(whole(int_to_float(wx) *. s +. 0.000001)) +. 0.5) /. s +. 0.000001) != wx do false
+        else whole((int_to_float(whole(int_to_float(wz) *. s +. 0.000001)) +. 0.5) /. s +. 0.000001) == wz end
+      posts_go(c, ox, oz, s, i + 1, n + 1, if centre do off else off + 1 end)
+    end end
+  end
+  -- the posts over the 64 m square from (128, 192) m at s metres a voxel: (count, off a metre's centre column)
+  pfn posts_m(a : Strata.Atlas.Atlas, s : Float) : (Int, Int) do
+    let side = whole(64.0 /. s) / 32
+    let c0x = whole(128.0 /. s) / 32
+    let c0z = whole(192.0 /. s) / 32
+    posts_area(a, s, c0x, c0z, side, 0, (0, 0))
+  end
+  pfn posts_area(a : Strata.Atlas.Atlas, s : Float, c0x : Int, c0z : Int, side : Int, k : Int, acc : (Int, Int)) : (Int, Int) do
+    if k >= side * side do acc else posts_area(a, s, c0x, c0z, side, k + 1, posts_col(a, s, c0x + k % side, c0z + k / side, acc)) end
+  end
+  pfn posts_col(a : Strata.Atlas.Atlas, s : Float, cx : Int, cz : Int, acc : (Int, Int)) : (Int, Int) do
+    let h = col_h(Vw.island_column(a, cx * 32 + 16, cz * 32 + 16, 7, s))
+    let ky = Strata.Coord.chunk_of(h)
+    posts_rows(a, s, cx, cz, ky - 1, ky + 1, acc)
+  end
+  pfn posts_rows(a : Strata.Atlas.Atlas, s : Float, cx : Int, cz : Int, cy : Int, cy1 : Int, acc : (Int, Int)) : (Int, Int) do
+    if cy > cy1 do acc
+    else
+      match (acc, posts_go(Vw.island_terrain(a, s, cx, cy, cz, 7), cx * 32, cz * 32, s, 0, 0, 0)) do
+        ((n, o), (n2, o2)) -> posts_rows(a, s, cx, cz, cy + 1, cy1, (n + n2, o + o2))
+      end
+    end
+  end
+
+  describe "The island across scales" do
+    test "at 1 m and 0.5 m a voxel: the same ground, lake water, trees and ruin in metres" do
+      let a = island()
+      let d1 = Vw.decor(1.0, 7)
+      let dh = Vw.decor(0.5, 7)
+      -- the forest (144, 80): its trees at 1 m
+      let forest = trees_m(a, d1, 1.0, 144.25, 80.25)
+      let cs = columns(a, forest)
+      Test.assert_eq_int(List.length(cs), 30, "30 columns")
+      Test.assert_eq_int(ground_go(a, cs, 0), 0, "every column's ground top agrees within a metre")
+      Test.assert_eq_int(lakes_go(a, cs, 0, 0), 4, "the 4 lake columns hold lake water at 1 m, and at 0.5 m its line within a metre")
+      Test.assert_true(List.length(forest) >= 6, "the forest's chunk column holds 6 trees or more")
+      match trees_agree(a, dh, List.take(forest, 6), 0, 0) do
+        (n, bad) ->
+          Test.assert_eq_int(n, 6, "6 trees")
+          Test.assert_eq_int(bad, 0, "each stands at 0.5 m in the same cell, as the same template, its base within a metre")
+      end
+      match Vw.slope_site(a) do
+        None -> Test.assert_true(false, "the island has a site")
+        Some(st) ->
+          match (ruin_box(d1, st, 1.0), ruin_box(dh, st, 0.5)) do
+            (Some((ax0, ay0, az0, ax1, ay1, az1)), Some((bx0, by0, bz0, bx1, by1, bz1))) ->
+              println("cross-scale: the ruin at 1 m spans x " ++ float_to_string(ax0) ++ ".." ++ float_to_string(ax1) ++ ", z " ++ float_to_string(az0) ++ ".." ++ float_to_string(az1) ++ " from y " ++ float_to_string(ay0) ++ "; at 0.5 m x " ++ float_to_string(bx0) ++ ".." ++ float_to_string(bx1) ++ ", z " ++ float_to_string(bz0) ++ ".." ++ float_to_string(bz1) ++ " from y " ++ float_to_string(by0))
+              Test.assert_true(ax1 -. ax0 == bx1 -. bx0, "as many metres along x")
+              Test.assert_true(az1 -. az0 == bz1 -. bz0, "as many metres along z")
+              Test.assert_true(ay1 -. ay0 == by1 -. by0, "as many metres high")
+              Test.assert_true(near(ax0, bx0, 1.0), "standing where it does, within a metre, along x")
+              Test.assert_true(near(az0, bz0, 1.0), "and along z")
+              Test.assert_true(near(ay0, by0, 1.0), "on the same floor within a metre")
+            _ -> Test.assert_true(false, "the ruin stands at both scales")
+          end
+      end
+    end
+
+    test "posts are rolled per square metre: as many at 0.5 m as at 1 m, each on a metre's centre column" do
+      let a = island()
+      match (posts_m(a, 1.0), posts_m(a, 0.5)) do
+        ((n1, o1), (n2, o2)) ->
+          println("cross-scale: posts over 64 m square: " ++ int_to_string(n1) ++ " at 1 m, " ++ int_to_string(n2) ++ " at 0.5 m (" ++ int_to_string(o2) ++ " off a centre column)")
+          Test.assert_true(n1 >= 5, "the meadow has posts")
+          Test.assert_eq_int(o1, 0, "at 1 m every column is its metre's")
+          Test.assert_eq_int(o2, 0, "at 0.5 m each post stands on its metre's centre column")
+          Test.assert_true(n2 * 4 <= n1 * 5, "no more than a quarter more posts at 0.5 m")
+          Test.assert_true(n2 * 5 >= n1 * 4, "nor a fifth fewer")
+      end
+    end
+  end
+
+  -- ── Stored hashes ────────────────────────────────────────────────────────
+  -- Twelve island chunks at seed 7 and 1 m a voxel, generated as the viewer generates them (trees, ruins and
+  -- early-outs), and the Strata.Chunk.hash recorded for each on 2026-11-12. They guard the generator through the
+  -- switch to March main and the performance work: a change in any of them means the island changed.
+  pfn stored() : List((String, Strata.Coord.Key, Int)) do
+    [("the hilltop: the island's highest atlas ground (8 m grid), its ground chunk", Strata.Coord.key(1, 3, 0), 136032914992390),
+     ("a slope with trees: the forest's ground at (144, 80)", Strata.Coord.key(4, 2, 2), 121497547661991),
+     ("a lake: the first wet lake's centre at its level", Strata.Coord.key(0, 2, -4), 115465949554533),
+     ("a river: a point 3 m wide or more over 45 m, at its ground", Strata.Coord.key(-1, 1, -15), 136052928486783),
+     ("caves: under the cave scene's hill (44, 78), y 64 to 95 m, the ground at 106 m", Strata.Coord.key(1, 2, 2), 101638274931855),
+     ("a ruin site: the slope site's ruin on its floor", Strata.Coord.key(12, 1, -12), 133726094032749),
+     ("the coast: walking +x from the origin to the first ground under 39 m, at the sea line", Strata.Coord.key(18, 1, 0), 122742266628754),
+     ("underground: y 32 to 63 m under the hills south-west of the origin, a few cave voxels", Strata.Coord.key(-2, 1, 1), 142732099105608),
+     ("level 1 over the forest", Strata.Coord.parent(Strata.Coord.key(4, 2, 2)), 105090326297854),
+     ("level 1 over the hilltop", Strata.Coord.parent(Strata.Coord.key(1, 3, 0)), 149419971776492),
+     ("level 2 over the forest", Strata.Coord.parent(Strata.Coord.parent(Strata.Coord.key(4, 2, 2))), 134955375367052),
+     ("level 2 over the hilltop", Strata.Coord.parent(Strata.Coord.parent(Strata.Coord.key(1, 3, 0))), 149516392925721)]
+  end
+  pfn stored_go(g : Strata.Terrain.Gen, ks : List((String, Strata.Coord.Key, Int)), bad : Int) : Int do
+    match ks do
+      Nil -> bad
+      Cons((nm, k, want), rest) ->
+        let h = Strata.Chunk.hash(Strata.Terrain.run(g, k, 7))
+        let _said = if h == want do () else println("island hash: " ++ nm ++ ": " ++ int_to_string(h) ++ ", stored " ++ int_to_string(want)) end
+        stored_go(g, rest, if h == want do bad else bad + 1 end)
+    end
+  end
+
+  describe "The island's stored hashes" do
+    test "twelve island chunks at seed 7 and 1 m keep their stored hashes" do
+      let a = island()
+      let g = Vw.island_gen(a, Vw.decor(1.0, 7), 1.0)
+      Test.assert_eq_int(List.length(stored()), 12, "twelve keys")
+      Test.assert_eq_int(stored_go(g, stored(), 0), 0, "every hash as stored")
+    end
+  end
+end

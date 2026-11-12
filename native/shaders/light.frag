@@ -50,7 +50,10 @@ void main() {
     bool wet = submerged() && world.y < u.water2.x;
     vec3 dim = wet ? depth_light(world.y) : vec3(1.0);
     float ripple = wet ? caustics(world) : 1.0;
-    if (mode == 1) { o_lit = vec4(fogged(albedo * (u.sun_color.rgb * ndl * dim * ripple + sky_flat(n) * dim), world), 1.0); return; }
+    // a chunk above level 0 (the far field) is lit by the sun and sky alone, as mode 1 lights everything:
+    // it is not in the light volume, and its rays would start inside the finer world under it
+    bool far = !figure && r8 < 16 && nm.g > 0.5;
+    if (mode == 1 || far) { o_lit = vec4(fogged(albedo * (u.sun_color.rgb * ndl * dim * ripple + sky_flat(n) * dim), world), 1.0); return; }
 
     // What the same surface point had last frame, if it was on screen and is
     // the same surface: same face, same distance from that frame's eye.

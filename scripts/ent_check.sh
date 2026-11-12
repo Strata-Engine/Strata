@@ -13,7 +13,7 @@ EC=entcheck/.march/build/release/entcheck
 # the city reads the island's atlas from .march/atlas, building it there the first time (about 5 s)
 ENTCHECK_LOAD=$(uptime | sed 's/.*load average[s]*: *//' | cut -d' ' -f1 | cut -d. -f1 | tr -d ,)
 export ENTCHECK_LOAD
-for s in basics columns determinism closed ray bullets storm sweep walk jump parts cap arena bodies restore reopen city; do
+for s in basics columns determinism closed ray bullets storm sweep walk jump levels parts cap arena bodies restore reopen city; do
   if ! ENTCHECK_SCENE=$s $EC > "$OUT/$s.log" 2>&1; then echo "FAIL: entcheck scene $s"; cat "$OUT/$s.log"; exit 1; fi
   tail -1 "$OUT/$s.log"
 done

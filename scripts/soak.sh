@@ -1,9 +1,14 @@
 #!/bin/sh
-# A long scripted flight with streaming, edits, moving water and the display on: 3000 frames
-# round a lake that is breached at frame 300, a sphere carved every 100. Asserts nothing was refused, nothing is
-# left waiting, no buffer space was lost, the quad buffer did not grow
-# without bound, and no frame took over 20 ms (the target is 16.7; the
-# margin is for a busy machine). Prints the viewer's summary line.
+# A long scripted flight over the island at 0.25 m a voxel, with streaming,
+# blasts, moving water and the display on: 6010 frames (1000 fluid steps, one
+# every sixth frame) round the test lake, 40 m out and 12 m over its water, a
+# crater blasted where the camera looks every 100 frames. Asserts nothing was
+# refused, nothing is left waiting, no buffer space was lost, the quad buffer
+# did not grow without bound, no frame took over 20 ms (the target is 16.7;
+# the margin is for a busy machine), no fluid step held the main thread over
+# 6 ms, and no atlas lake loaded at the start and at the end lost more than
+# 1% of its water (Strata.Fluid.amount over its box). Prints the viewer's
+# summary line and each lake's water.
 #
 # Sound: the flight runs with sound on miniaudio's null device (paced like a
 # real one, silent), and asserts the mixer never underran and no command was
@@ -11,6 +16,11 @@
 # sound run must match within 0.5 ms (judged only on a quiet machine), and
 # one that holds the main thread 100 ms every 600 frames, which the mixer
 # must not notice. Nothing is played aloud. STRATA_SOAK_AUDIO=0 skips sound.
+#
+# The flight runs with the viewer's far field (four levels unless
+# STRATA_LEVELS says otherwise) and records it: the chunks loaded at the
+# start, level by level, the ticks and time they took to settle, and at the
+# end the chunks loaded, slots in use and meshes still retained.
 #   scripts/soak.sh            the default quad buffer
 #   scripts/soak.sh 200000     a quad buffer of that many quads, smaller than the
 #                              scene needs: uploads are refused and wait, and the
@@ -23,15 +33,16 @@ QUADS="${1:-0}"
 # MoltenVK holds a presented frame for a whole second, which is no fault of the engine.
 AUDIO=null; [ "${STRATA_SOAK_AUDIO:-1}" = "0" ] && AUDIO=0
 soak() { # frames, audio mode, stall interval
-  env MARCH_PIN_MAIN=1 STRATA_HIDDEN="${STRATA_HIDDEN:-1}" STRATA_OFFSCREEN="${STRATA_OFFSCREEN:-1}" STRATA_UI=1 STRATA_SOAK="$1" STRATA_BREACH=300 STRATA_QUADS="$QUADS" STRATA_SHOT=/dev/null STRATA_AUDIO="$2" STRATA_STALL="$3" ./viewer/.march/build/release/strata_viewer 2>&1
+  env MARCH_PIN_MAIN=1 STRATA_HIDDEN="${STRATA_HIDDEN:-1}" STRATA_OFFSCREEN="${STRATA_OFFSCREEN:-1}" STRATA_UI=1 STRATA_SCALE="${STRATA_SCALE:-0.25}" STRATA_SOAK="$1" STRATA_QUADS="$QUADS" STRATA_SHOT=/dev/null STRATA_AUDIO="$2" STRATA_STALL="$3" ./viewer/.march/build/release/strata_viewer 2>&1
 }
-out=$(soak 3000 $AUDIO 0)
+out=$(soak "${STRATA_SOAK:-6010}" $AUDIO 0)
 line=$(echo "$out" | grep '^soak:')
-lake_start=$(echo "$out" | sed -n 's/^soak-lake: lake_start=\([0-9]*\).*/\1/p')
-[ -n "$line" ] || { echo "FAIL: the viewer printed no soak line"; exit 1; }
+[ -n "$line" ] || { echo "FAIL: the viewer printed no soak line"; echo "$out" | tail -5; exit 1; }
 echo "$line"
 # a field of the summary line by its whole name: the space keeps worst_ms from matching fluid_worst_ms
 get() { echo "$line" | sed -n "s/.* $1=\\([0-9.]*\\).*/\\1/p"; }
+echo "$out" | grep '^strata_viewer: far field' | sed 's/^strata_viewer: /at the start, /'
+echo "far field at the end: levels $(get levels), $(get loaded) chunks loaded, $(get slots) slots in use, $(get retained) retained, worst frame $(get worst_ms) ms (load average $(uptime | sed 's/.*load averages*: *\([0-9.]*\).*/\1/'))"
 fail=0
 # with the default buffer everything must fit; with a given one the run only has to survive
 if [ "$QUADS" = "0" ]; then
@@ -43,13 +54,11 @@ fi
 [ "$(get text_waiting)" = "0" ] || { echo "FAIL: glyphs were still waiting at the end"; fail=1; }
 [ "$(get atlas_bytes)" -le 16777216 ] || { echo "FAIL: the glyph atlas is over 16 MB"; fail=1; }
 [ "$(get leaked)" = "0" ] || { echo "FAIL: an allocator lost buffer space"; fail=1; }
-# the circuit keeps a steady view, so what the GPU holds must stay near what it started with
-[ "$(get live_quads)" -le 1500000 ] || { echo "FAIL: the quad buffer grew without bound"; fail=1; }
+# the circuit keeps a steady view, so what the GPU holds must stay near what it started with: 3 million
+# quads for the near field alone, Part F's 64 MB (8 388 608 quads) with the far field
+qmax=3000000; [ "$(get levels)" != "0" ] && qmax=8388608
+[ "$(get live_quads)" -le $qmax ] || { echo "FAIL: the quad buffer grew without bound"; fail=1; }
 awk "BEGIN { exit !($(get worst_ms) <= 20.0) }" || { echo "FAIL: a frame took over 20 ms"; fail=1; }
-# the lake breached at frame 300 must be draining, and water is never made
-echo "lake at the breach: ${lake_start:-?} voxels"
-[ -n "$lake_start" ] && [ "$lake_start" -gt 0 ] || { echo "FAIL: no lake to breach"; fail=1; }
-[ -n "$lake_start" ] && [ "$(get lake_end)" -lt "$lake_start" ] || { echo "FAIL: the breached lake did not drain"; fail=1; }
 [ "$(get fluid_waiting)" = "0" ] || { echo "FAIL: fluid cells were left waiting at the end: the cap was exceeded"; fail=1; }
 # offscreen a frame is about 3 ms, so six frames can be less than the worker needs and the main thread waits for it
 awk "BEGIN { exit !($(get fluid_worst_ms) <= 6.0) }" || { echo "FAIL: a fluid step held the main thread for over 6 ms"; fail=1; }
@@ -72,4 +81,17 @@ if [ "$AUDIO" = "null" ]; then
   echo "with a 100 ms stall every 600 frames: underruns $su"
   [ "$su" = "0" ] || { echo "FAIL: a stalled frame made the mixer underrun"; fail=1; }
 fi
+# the lakes at rest: each loaded at both ends keeps 99% of its water
+lakes=$(echo "$out" | grep '^soak-lake:')
+echo "$lakes"
+compared=0
+for l in $(echo "$lakes" | tr ' ' ','); do
+  s=$(echo "$l" | sed -n 's/.*start=\(-*[0-9]*\).*/\1/p'); e=$(echo "$l" | sed -n 's/.*end=\(-*[0-9]*\).*/\1/p')
+  if [ "$s" -gt 0 ] && [ "$e" -ge 0 ]; then
+    compared=$((compared + 1))
+    [ $((e * 100)) -ge $((s * 99)) ] || { echo "FAIL: a lake lost more than 1% of its water: $l"; fail=1; }
+  fi
+done
+echo "lakes loaded at both ends and compared: $compared"
+[ $compared -gt 0 ] || { echo "FAIL: no lake was loaded at both ends"; fail=1; }
 [ $fail -eq 0 ] && echo "soak: PASS" || exit 1
