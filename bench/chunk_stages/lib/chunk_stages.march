@@ -1,0 +1,204 @@
+-- chunk_stages: one stage of an island surface chunk, repeated.
+--
+-- For each of the 200 surface chunks STRATA_CHUNK_TIMES uses (10 x 20 about
+-- the origin, the chunk holding the ground), everything a stage needs is
+-- prepared once and the stage is then run REPS times. A run with REPS=0 is
+-- the preparation alone, so (REPS=10 run) - (REPS=0 run), over 2000, is the
+-- stage's cost a chunk; run.sh takes the difference of CPU time and of
+-- instructions retired, which a loaded machine does not disturb the way it
+-- disturbs the wall clock.
+--
+-- The stages are the pieces of StrataViewer.island_full, called in its
+-- order with its arguments. lib/strata_viewer.march here is a generated copy
+-- of the viewer's (build.sh), with its private functions made public.
+--
+--   STAGE=n   which stage (see `stage` below)
+--   REPS=n    how many times each chunk's stage is run (default 10)
+mod ChunkStages do
+
+  needs IO
+  needs IO.Process
+  needs IO.Spawn
+  needs IO.FileSystem
+
+
+  pfn rep(left : Int, f : Int -> Int, acc : Int) : Int do
+    if left <= 0 do acc else rep(left - 1, f, acc + f(left)) end
+  end
+
+  pfn f32_at(a : NativeF32Arr, i : Int) : Int do float_to_int(NativeArray.get_f32(a, i)) end
+
+  -- one chunk's stage, prepared once and run reps times; a checksum so nothing is dropped
+  pfn stage(mode : Int, a : Strata.Atlas.Atlas, d : StrataViewer.Decor, scale : Float, cx : Int, cy : Int, cz : Int, seed : Int, reps : Int) : Int do
+    let g = StrataViewer.decor_gp(d)
+    let x0 = cx * 32
+    let y0 = cy * 32
+    let z0 = cz * 32
+    let sv = StrataViewer.sea_v(g, scale)
+    let x0m = int_to_float(x0) *. scale
+    let y0m = int_to_float(y0) *. scale
+    let z0m = int_to_float(z0) *. scale
+    let pad = StrataViewer.tree_pad(d, scale)
+    let n = 32 + 2 * pad
+    let hl = StrataViewer.halo(g)
+    let side = n + 2 * hl
+    let cnt = side * side
+    let ax0 = x0 - pad
+    let az0 = z0 - pad
+    let ax0m = int_to_float(ax0) *. scale
+    let az0m = int_to_float(az0) *. scale
+    let hw = int_to_float(hl) *. scale
+    let far = int_to_float(n - 1) *. scale
+    if mode == 1 do rep(reps, fn _ -> Strata.Chunk.form(StrataViewer.island_full(a, d, scale, 0, cx, cy, cz, seed)), 0)
+    else if mode == 20 do rep(reps, fn _ -> StrataViewer.island_early_of(g, a, scale, cx, cy + 7, cz), 0)
+    else if mode == 21 do rep(reps, fn _ -> StrataViewer.island_early_of(g, a, scale, cx, cy - 7, cz), 0)
+    -- 31: no timing: how many of the 17 chunks cy - 8 .. cy + 8 of this chunk column are generated in full
+    else if mode == 31 do full_go(g, a, scale, cx, cy, cz, 0 - 8, 0)
+    else if mode == 22 do rep(reps, fn _ -> match StrataViewer.area_n(g, a, scale, x0, z0, 32, seed) do StrataViewer.Area(hs, _, _, _, _) -> f32_at(hs, 0) end, 0)
+    else if mode == 23 do
+      let bare = StrataViewer.bare_decor_of(g)
+      rep(reps, fn _ -> Strata.Chunk.form(StrataViewer.island_full(a, bare, scale, 0, cx, cy, cz, seed)), 0)
+    else if mode == 2 do rep(reps, fn _ -> match StrataViewer.island_window(a, ax0m -. hw, az0m -. hw, ax0m +. far +. hw, az0m +. far +. hw) do StrataViewer.Win(_, _, sd, _, _, _, _, _, _, _) -> sd end, 0)
+    else if mode == 6 do rep(reps, fn _ -> match StrataViewer.area_n(g, a, scale, ax0, az0, n, seed) do StrataViewer.Area(hs, _, _, _, _) -> f32_at(hs, 0) end, 0)
+    else
+      let wn = StrataViewer.island_window(a, ax0m -. hw, az0m -. hw, ax0m +. far +. hw, az0m +. far +. hw)
+      -- 26, 27, 28: the columns with the window's river list emptied, its lake flag cleared, or both
+      --             (what river_damp and the lake-rim search cost; the columns made are then not the island's)
+      -- 30: no timing: the river samples in the window and whether it holds a lake
+      if mode == 30 do match wn do StrataViewer.Win(_, _, _, _, _, _, _, _, rs, wet) -> List.length(rs) * 1000 + (if wet do 1 else 0 end) end
+      else if mode >= 26 && mode <= 28 do
+        let wn2 = match wn do StrataViewer.Win(i0, j0, sd, st, nn, hs, ls, ws, rs, wet) -> StrataViewer.Win(i0, j0, sd, st, nn, hs, ls, ws, if mode == 27 do rs else Nil end, if mode == 26 do wet else false end) end
+        rep(reps, fn _ -> match StrataViewer.cols3_go(g, hl, wn2, ax0, az0, n, seed, scale, 0, NativeArray.make_f32(cnt, 0.0), NativeArray.make_f32(cnt, 0.0), NativeArray.make_int(n * n, 0), NativeArray.make_int(n * n, 0), NativeArray.make_int(n * n, 0)) do StrataViewer.Cols3(hm, _, _, _, _) -> f32_at(hm, 0) end, 0)
+      else if mode == 3 do rep(reps, fn _ -> match StrataViewer.cols3_go(g, hl, wn, ax0, az0, n, seed, scale, 0, NativeArray.make_f32(cnt, 0.0), NativeArray.make_f32(cnt, 0.0), NativeArray.make_int(n * n, 0), NativeArray.make_int(n * n, 0), NativeArray.make_int(n * n, 0)) do StrataViewer.Cols3(hm, _, _, _, _) -> f32_at(hm, 0) end, 0)
+      else if mode == 4 do rep(reps, fn _ ->
+          let tal = NativeArray.make_f32(cnt, 0.0)
+          let tal2 = if Strata.Noise.field2(StrataViewer.rock_s(), Strata.Seed.mix(seed, 10), StrataViewer.p_rock_freq(g), ax0m -. hw, az0m -. hw, scale, side, side, tal) == cnt do StrataViewer.talus_go(tal, StrataViewer.p_talus_mid(g), StrataViewer.p_talus_spread(g), 0, cnt) else tal end
+          f32_at(tal2, 0), 0)
+      else
+        match StrataViewer.cols3_go(g, hl, wn, ax0, az0, n, seed, scale, 0, NativeArray.make_f32(cnt, 0.0), NativeArray.make_f32(cnt, 0.0), NativeArray.make_int(n * n, 0), NativeArray.make_int(n * n, 0), NativeArray.make_int(n * n, 0)) do
+          StrataViewer.Cols3(hm, _, _, _, _) ->
+            let tal = NativeArray.make_f32(cnt, 0.0)
+            let tal2 = if Strata.Noise.field2(StrataViewer.rock_s(), Strata.Seed.mix(seed, 10), StrataViewer.p_rock_freq(g), ax0m -. hw, az0m -. hw, scale, side, side, tal) == cnt do StrataViewer.talus_go(tal, StrataViewer.p_talus_mid(g), StrataViewer.p_talus_spread(g), 0, cnt) else tal end
+            if mode == 5 do rep(reps, fn _ -> f32_at(Strata.Thermal.relax(hm, side, scale, tal2, StrataViewer.p_passes(g)), 0), 0)
+            else after_area(mode, a, d, scale, cx, cy, cz, seed, reps) end
+        end
+      end end end end
+    end end end end end end end end
+  end
+
+  pfn full_go(g : StrataViewer.Gp, a : Strata.Atlas.Atlas, scale : Float, cx : Int, cy : Int, cz : Int, dy : Int, acc : Int) : Int do
+    if dy > 8 do acc else full_go(g, a, scale, cx, cy, cz, dy + 1, if StrataViewer.island_early_of(g, a, scale, cx, cy + dy, cz) < 0 do acc + 1 else acc end) end
+  end
+
+  -- the stages after the area: island_full's body from `match area_n ...` on
+  pfn after_area(mode : Int, a : Strata.Atlas.Atlas, d : StrataViewer.Decor, scale : Float, cx : Int, cy : Int, cz : Int, seed : Int, reps : Int) : Int do
+    let g = StrataViewer.decor_gp(d)
+    let x0 = cx * 32
+    let y0 = cy * 32
+    let z0 = cz * 32
+    let sv = StrataViewer.sea_v(g, scale)
+    let x0m = int_to_float(x0) *. scale
+    let y0m = int_to_float(y0) *. scale
+    let z0m = int_to_float(z0) *. scale
+    let pad = StrataViewer.tree_pad(d, scale)
+    let n = 32 + 2 * pad
+    match StrataViewer.area_n(g, a, scale, x0 - pad, z0 - pad, n, seed) do
+      StrataViewer.Area(hp, cp, gp, lp, rp) ->
+        if mode == 7 do rep(reps, fn _ ->
+            let hs = StrataViewer.inner_f32(hp, n, pad, NativeArray.make_f32(1024, 0.0), 0)
+            let cms = StrataViewer.inner_f32(cp, n, pad, NativeArray.make_f32(1024, 0.0), 0)
+            let gs = StrataViewer.inner_int(gp, n, pad, NativeArray.make_int(1024, 0), 0)
+            let ls = StrataViewer.inner_int(lp, n, pad, NativeArray.make_int(1024, 0), 0)
+            let rs = StrataViewer.inner_int(rp, n, pad, NativeArray.make_int(1024, 0), 0)
+            f32_at(hs, 0) + f32_at(cms, 0) + NativeArray.get_int(gs, 0) + NativeArray.get_int(ls, 0) + NativeArray.get_int(rs, 0), 0)
+        else
+          let hs = StrataViewer.inner_f32(hp, n, pad, NativeArray.make_f32(1024, 0.0), 0)
+          let cms = StrataViewer.inner_f32(cp, n, pad, NativeArray.make_f32(1024, 0.0), 0)
+          let gs = StrataViewer.inner_int(gp, n, pad, NativeArray.make_int(1024, 0), 0)
+          let ls = StrataViewer.inner_int(lp, n, pad, NativeArray.make_int(1024, 0), 0)
+          let rs = StrataViewer.inner_int(rp, n, pad, NativeArray.make_int(1024, 0), 0)
+          if mode == 8 do rep(reps, fn _ ->
+              let ens0 = NativeArray.make_f32(1024, 0.0)
+              let e = Strata.Noise.field2(StrataViewer.single_s(), Strata.Seed.mix(seed, 9), StrataViewer.p_entrance_freq(g), x0m, z0m, scale, 32, 32, ens0)
+              let ns = StrataViewer.dens_field(g, seed, x0m, y0m, z0m, scale)
+              let ta = StrataViewer.lattice_field(StrataViewer.tunnel_s(), Strata.Seed.mix(seed, 6), StrataViewer.p_tunnel_freq(g), x0m, y0m, z0m, scale)
+              let tb = StrataViewer.lattice_field(StrataViewer.tunnel_s(), Strata.Seed.mix(seed, 7), StrataViewer.p_tunnel_freq(g), x0m, y0m, z0m, scale)
+              let cav = StrataViewer.lattice_field(StrataViewer.single_s(), Strata.Seed.mix(seed, 8), StrataViewer.p_cavern_freq(g), x0m, y0m, z0m, scale)
+              e + f32_at(ens0, 0) + f32_at(ns, 0) + f32_at(ta, 0) + f32_at(tb, 0) + f32_at(cav, 0), 0)
+          else
+            let ens = NativeArray.make_f32(1024, 0.0)
+            let e = Strata.Noise.field2(StrataViewer.single_s(), Strata.Seed.mix(seed, 9), StrataViewer.p_entrance_freq(g), x0m, z0m, scale, 32, 32, ens)
+            let ns = StrataViewer.dens_field(g, seed, x0m, y0m, z0m, scale)
+            let ta = StrataViewer.lattice_field(StrataViewer.tunnel_s(), Strata.Seed.mix(seed, 6), StrataViewer.p_tunnel_freq(g), x0m, y0m, z0m, scale)
+            let tb = StrataViewer.lattice_field(StrataViewer.tunnel_s(), Strata.Seed.mix(seed, 7), StrataViewer.p_tunnel_freq(g), x0m, y0m, z0m, scale)
+            let cav = StrataViewer.lattice_field(StrataViewer.single_s(), Strata.Seed.mix(seed, 8), StrataViewer.p_cavern_freq(g), x0m, y0m, z0m, scale)
+            if mode == 9 do rep(reps, fn _ -> f32_at(StrataViewer.factor_cols(StrataViewer.factors_go(a, g, x0m, z0m, scale, NativeArray.make_f32(81, 0.0), 0), NativeArray.make_f32(1024, 0.0), 0), 0), 0)
+            else if mode == 10 do rep(reps, fn _ -> f32_at(StrataViewer.lattice_fill(ns), 0) + f32_at(StrataViewer.lattice_fill(ta), 0) + f32_at(StrataViewer.lattice_fill(tb), 0) + f32_at(StrataViewer.lattice_fill(cav), 0), 0)
+            else
+              let fs = StrataViewer.factor_cols(StrataViewer.factors_go(a, g, x0m, z0m, scale, NativeArray.make_f32(81, 0.0), 0), NativeArray.make_f32(1024, 0.0), 0)
+              let seam = StrataViewer.p_sea(g) +. 1.0
+              let cv = StrataViewer.cave_vals(g)
+              let sand = StrataViewer.p_sand_below(g)
+              let snow = StrataViewer.p_snow_above(g)
+              let fl = StrataViewer.Fields(hs, cms, ens, fs, StrataViewer.lattice_fill(ns), StrataViewer.lattice_fill(ta), StrataViewer.lattice_fill(tb), StrataViewer.lattice_fill(cav))
+              if mode == 11 do rep(reps, fn _ -> f32_at(StrataViewer.dens_go(cv, fl, NativeArray.make_f32(32768, 0.0), y0m, scale, seam), 0), 0)
+              else
+                let dens0 = StrataViewer.dens_go(cv, fl, NativeArray.make_f32(32768, 0.0), y0m, scale, seam)
+                if mode == 12 do rep(reps, fn _ -> f32_at(if StrataViewer.any_cut(dens0, 0) do StrataViewer.drop_islands(dens0) else dens0 end, 0), 0)
+                else if mode == 24 do rep(reps, fn _ -> if StrataViewer.any_cut(dens0, 0) do 1 else 0 end, 0) + e
+                else
+                  let dens = if StrataViewer.any_cut(dens0, 0) do StrataViewer.drop_islands(dens0) else dens0 end
+                  if mode == 13 do rep(reps, fn _ -> f32_at(StrataViewer.above_go(cv, hs, cms, ens, fs, ns, ta, tb, cav, NativeArray.make_f32(1024, 0.0), y0m +. 32.0 *. scale, seam, 0), 0), 0)
+                  else
+                    let above = StrataViewer.above_go(cv, hs, cms, ens, fs, ns, ta, tb, cav, NativeArray.make_f32(1024, 0.0), y0m +. 32.0 *. scale, seam, 0)
+                    if mode == 14 do rep(reps, fn _ -> NativeArray.get_i32(Strata.Surface.scan_wet(dens, above, NativeArray.make_int(1024, sv - y0), fn (depth, yl, wet) -> StrataViewer.material(sand, snow, depth, y0 + yl, sv, scale, wet)), 0), 0)
+                    else if mode == 15 do rep(reps, fn _ -> NativeArray.get_i32(StrataViewer.finish_go(g, true, Strata.Surface.scan_wet(dens, above, NativeArray.make_int(1024, sv - y0), fn (depth, yl, wet) -> StrataViewer.material(sand, snow, depth, y0 + yl, sv, scale, wet)), gs, ls, rs, x0, y0, z0, sv, scale, seed, 0), 0), 0)
+                    else
+                      let mats = StrataViewer.finish_go(g, true, Strata.Surface.scan_wet(dens, above, NativeArray.make_int(1024, sv - y0), fn (depth, yl, wet) -> StrataViewer.material(sand, snow, depth, y0 + yl, sv, scale, wet)), gs, ls, rs, x0, y0, z0, sv, scale, seed, 0)
+                      if mode == 16 do rep(reps, fn _ -> Strata.Chunk.form(Strata.Chunk.from_flat(mats)), 0)
+                      else
+                        let land = Strata.Chunk.from_flat(mats)
+                        if mode == 17 do rep(reps, fn _ -> List.length(StrataViewer.island_trees(a, d, hp, cp, lp, rp, cx, cz, pad, seed, scale)), 0)
+                        else
+                          let ts = StrataViewer.island_trees(a, d, hp, cp, lp, rp, cx, cz, pad, seed, scale)
+                          let key = Strata.Coord.key(cx, cy, cz)
+                          if mode == 18 do rep(reps, fn _ -> Strata.Chunk.form(StrataViewer.trees_into(land, key, ts)), 0)
+                          else if mode == 19 do rep(reps, fn _ -> Strata.Chunk.form(StrataViewer.ruins_into(a, d, land, cx, cy, cz, scale, seed)), 0)
+                          else if mode == 25 do List.length(ts)
+                          else 0 end end end
+                        end
+                      end
+                    end end
+                  end
+                end end
+              end
+            end end
+          end
+        end
+    end
+  end
+
+  pfn keys_go(mode : Int, a : Strata.Atlas.Atlas, d : StrataViewer.Decor, scale : Float, seed : Int, reps : Int, k : Int, acc : Int) : Int do
+    if k >= 200 do acc
+    else
+      let key = StrataViewer.surface_key(StrataViewer.Island(a), seed, scale, k, 0)
+      keys_go(mode, a, d, scale, seed, reps, k + 1, acc + stage(mode, a, d, scale, Strata.Coord.kx(key), Strata.Coord.ky(key), Strata.Coord.kz(key), seed, reps))
+    end
+  end
+
+  fn main(_cap : Cap(IO)) : Unit do
+    let mode = Env.get_int("STAGE", 1)
+    let reps = Env.get_int("REPS", 10)
+    let seed = 7
+    let scale = 1.0
+    let g = StrataViewer.gp_of(StrataViewer.load_params(StrataViewer.params_path()))
+    let a = StrataViewer.load_atlas(g, seed)
+    let d = StrataViewer.decor_of(g, scale, seed)
+    let pad = StrataViewer.tree_pad(d, scale)
+    println("chunk_stages: stage " ++ int_to_string(mode) ++ " reps " ++ int_to_string(reps) ++ "; pad " ++ int_to_string(pad) ++ ", halo " ++ int_to_string(StrataViewer.halo(g)) ++ ", patch side " ++ int_to_string(32 + 2 * pad + 2 * StrataViewer.halo(g)))
+    let sum = keys_go(mode, a, d, scale, seed, reps, 0, 0)
+    if mode == 30 do println("chunk_stages: over 200 chunks, river samples in the window " ++ int_to_string(sum / 1000) ++ " in all; windows holding a lake sample " ++ int_to_string(sum % 1000))
+    else if mode == 31 do println("chunk_stages: over 200 chunk columns, " ++ int_to_string(sum) ++ " chunks are generated in full (not early-outs)")
+    else println("chunk_stages: checksum " ++ int_to_string(sum)) end end
+  end
+end

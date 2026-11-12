@@ -1,0 +1,125 @@
+-- The thermal relax of one island chunk's padded patch: 66 x 66 columns, 4
+-- passes, as StrataViewer.area_n calls Strata.Thermal.relax.
+-- VARIANT 0: Strata.Thermal's code as it stands (copied from lib/strata/thermal.march).
+-- VARIANT 1: the same passes with every Float-valued `if` written as
+--            arithmetic or moved onto an Int (see ../float_if): same heights
+--            to rounding, no boxed Float.
+-- The heights are a synthetic hilly patch; the talus angles 25 to 55 degrees.
+mod StageThermal do
+  needs IO
+
+  -- ── as lib/strata/thermal.march ──────────────────────────────────────────
+  pfn copy_go(src : NativeF32Arr, dst : NativeF32Arr, k : Int, cnt : Int) : NativeF32Arr do
+    if k >= cnt do dst else copy_go(src, NativeArray.set_f32(dst, k, NativeArray.get_f32(src, k)), k + 1, cnt) end
+  end
+  pfn drops_go(talus : NativeF32Arr, step : Float, out : NativeF32Arr, k : Int, cnt : Int) : NativeF32Arr do
+    if k >= cnt do out
+    else drops_go(talus, step, NativeArray.set_f32(out, k, step *. Math.tan(NativeArray.get_f32(talus, k) *. 0.017453292519943295)), k + 1, cnt) end
+  end
+  pfn excess(h : NativeF32Arr, k : Int, q : Int, t : Float) : Float do
+    let e = NativeArray.get_f32(h, k) -. NativeArray.get_f32(h, q) -. t
+    if e > 0.0 do e else 0.0 end
+  end
+  pfn fmax(p : Float, q : Float) : Float do if p > q do p else q end end
+  pfn give(d : NativeF32Arr, q : Int, v : Float) : NativeF32Arr do
+    if v > 0.0 do NativeArray.set_f32(d, q, NativeArray.get_f32(d, q) +. v) else d end
+  end
+  pfn moves(h : NativeF32Arr, drops : NativeF32Arr, d : NativeF32Arr, n : Int, k : Int) : NativeF32Arr do
+    let i = k % n
+    let j = k / n
+    let t = NativeArray.get_f32(drops, k)
+    let el = if i > 0 do excess(h, k, k - 1, t) else 0.0 end
+    let er = if i < n - 1 do excess(h, k, k + 1, t) else 0.0 end
+    let eu = if j > 0 do excess(h, k, k - n, t) else 0.0 end
+    let ed = if j < n - 1 do excess(h, k, k + n, t) else 0.0 end
+    let total = el +. er +. eu +. ed
+    if total <= 0.0 do d
+    else
+      let most = fmax(fmax(el, er), fmax(eu, ed))
+      let share = 0.5 *. most /. total
+      let d1 = NativeArray.set_f32(d, k, NativeArray.get_f32(d, k) -. 0.5 *. most)
+      give(give(give(give(d1, k - 1, share *. el), k + 1, share *. er), k - n, share *. eu), k + n, share *. ed)
+    end
+  end
+  pfn moves_go(h : NativeF32Arr, drops : NativeF32Arr, d : NativeF32Arr, n : Int, k : Int) : NativeF32Arr do
+    if k >= n * n do d else moves_go(h, drops, moves(h, drops, d, n, k), n, k + 1) end
+  end
+  pfn apply_go(h : NativeF32Arr, d : NativeF32Arr, k : Int, cnt : Int) : NativeF32Arr do
+    if k >= cnt do h else apply_go(NativeArray.set_f32(h, k, NativeArray.get_f32(h, k) +. NativeArray.get_f32(d, k)), d, k + 1, cnt) end
+  end
+  pfn pass_go(h : NativeF32Arr, drops : NativeF32Arr, n : Int, left : Int) : NativeF32Arr do
+    if left <= 0 do h
+    else pass_go(apply_go(h, moves_go(h, drops, NativeArray.make_f32(n * n, 0.0), n, 0), 0, n * n), drops, n, left - 1) end
+  end
+  pfn relax(h : NativeF32Arr, n : Int, step : Float, talus : NativeF32Arr, passes : Int) : NativeF32Arr do
+    let cnt = n * n
+    pass_go(copy_go(h, NativeArray.make_f32(cnt, 0.0), 0, cnt), drops_go(talus, step, NativeArray.make_f32(cnt, 0.0), 0, cnt), n, passes)
+  end
+
+  -- ── the same, no Float-valued `if` ───────────────────────────────────────
+  pfn pos(e : Float) : Float do 0.5 *. (e +. Math.abs(e)) end
+  pfn amax(p : Float, q : Float) : Float do 0.5 *. (p +. q +. Math.abs(p -. q)) end
+  -- a neighbour off the patch is the column itself: its excess is pos(-t) = 0
+  pfn excess2(h : NativeF32Arr, k : Int, q : Int, t : Float) : Float do
+    pos(NativeArray.get_f32(h, k) -. NativeArray.get_f32(h, q) -. t)
+  end
+  pfn moves2(h : NativeF32Arr, drops : NativeF32Arr, d : NativeF32Arr, n : Int, k : Int) : NativeF32Arr do
+    let i = k % n
+    let j = k / n
+    let t = NativeArray.get_f32(drops, k)
+    let el = excess2(h, k, if i > 0 do k - 1 else k end, t)
+    let er = excess2(h, k, if i < n - 1 do k + 1 else k end, t)
+    let eu = excess2(h, k, if j > 0 do k - n else k end, t)
+    let ed = excess2(h, k, if j < n - 1 do k + n else k end, t)
+    let total = el +. er +. eu +. ed
+    if total <= 0.0 do d
+    else
+      let most = amax(amax(el, er), amax(eu, ed))
+      let share = 0.5 *. most /. total
+      let d1 = NativeArray.set_f32(d, k, NativeArray.get_f32(d, k) -. 0.5 *. most)
+      give(give(give(give(d1, k - 1, share *. el), k + 1, share *. er), k - n, share *. eu), k + n, share *. ed)
+    end
+  end
+  pfn moves_go2(h : NativeF32Arr, drops : NativeF32Arr, d : NativeF32Arr, n : Int, k : Int) : NativeF32Arr do
+    if k >= n * n do d else moves_go2(h, drops, moves2(h, drops, d, n, k), n, k + 1) end
+  end
+  pfn pass_go2(h : NativeF32Arr, drops : NativeF32Arr, n : Int, left : Int) : NativeF32Arr do
+    if left <= 0 do h
+    else pass_go2(apply_go(h, moves_go2(h, drops, NativeArray.make_f32(n * n, 0.0), n, 0), 0, n * n), drops, n, left - 1) end
+  end
+  pfn relax2(h : NativeF32Arr, n : Int, step : Float, talus : NativeF32Arr, passes : Int) : NativeF32Arr do
+    let cnt = n * n
+    pass_go2(copy_go(h, NativeArray.make_f32(cnt, 0.0), 0, cnt), drops_go(talus, step, NativeArray.make_f32(cnt, 0.0), 0, cnt), n, passes)
+  end
+
+  -- ── the patch ────────────────────────────────────────────────────────────
+  pfn heights(a : NativeF32Arr, n : Int, k : Int) : NativeF32Arr do
+    if k >= n * n do a
+    else heights(NativeArray.set_f32(a, k, 50.0 +. 3.0 *. Math.sin(int_to_float(k % n) *. 0.35) *. Math.cos(int_to_float(k / n) *. 0.27)), n, k + 1) end
+  end
+  pfn angles(a : NativeF32Arr, n : Int, k : Int) : NativeF32Arr do
+    if k >= n * n do a
+    else angles(NativeArray.set_f32(a, k, 40.0 +. 15.0 *. Math.sin(int_to_float(k % n) *. 0.11 +. int_to_float(k / n) *. 0.07)), n, k + 1) end
+  end
+
+  pfn sum_go(a : NativeF32Arr, k : Int, cnt : Int, acc : Float) : Float do
+    if k >= cnt do acc else sum_go(a, k + 1, cnt, acc +. NativeArray.get_f32(a, k) *. int_to_float(k % 7)) end
+  end
+
+  pfn rep(h : NativeF32Arr, tal : NativeF32Arr, variant : Int, left : Int, acc : Float) : Float do
+    if left <= 0 do acc
+    else
+      let r = if variant == 0 do relax(h, 66, 1.0, tal, 4) else relax2(h, 66, 1.0, tal, 4) end
+      rep(h, tal, variant, left - 1, acc +. NativeArray.get_f32(r, 2000 + left % 7))
+    end
+  end
+
+  fn main(_cap : Cap(IO)) : Unit do
+    let h = heights(NativeArray.make_f32(4356, 0.0), 66, 0)
+    let tal = angles(NativeArray.make_f32(4356, 0.0), 66, 0)
+    let variant = Env.get_int("VARIANT", 0)
+    println(float_to_string(rep(h, tal, variant, Env.get_int("REPS", 1), 0.0)))
+    -- a weighted sum of the relaxed patch, to compare the variants and the C
+    println(float_to_string(sum_go(if variant == 0 do relax(h, 66, 1.0, tal, 4) else relax2(h, 66, 1.0, tal, 4) end, 0, 4356, 0.0)))
+  end
+end
