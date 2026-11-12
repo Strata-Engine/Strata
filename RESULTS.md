@@ -679,10 +679,12 @@ animcheck/.march/build/release/animcheck` on a quiet machine to judge them.
 - **Rays.** These rays run from 0.2-2.6 m up in front of the crowd toward a
   figure 0-2 m up, and 9 562 of 10 000 hit. Most stop at the first figure in
   their way, which is why they are cheap.
-- **Memory** at 4 096 figures (sizeof, decimal MB), rigs excluded: 46.33 MB,
-  leaving 1.67 MB under 48 MB.
-  - Figures 7.88 (AnFig 1 924 B), matrices 12.58, previous matrices 12.58.
+- **Memory** at 4 096 figures (sizeof, decimal MB), rigs excluded: 46.34 MB,
+  leaving 1.66 MB under 48 MB.
+  - Figures 7.90 (AnFig 1 928 B), matrices 12.58, previous matrices 12.58.
   - Keys 5.51, clips 2.21, rigs 0.87, masks 0.07, marks 0.26, events 1.31.
   - Ids 0.05, procedural pool 1.70, hit grid 0.38, draw list 0.92 (16 384
     parts).
-  - Counting the rig data too (sockets 0.26, part grids 2.51) gives 49.10 MB.
+  - Counting the rig data too (sockets 0.26, part grids 2.51) gives 49.11 MB.
+- **Drawing.** A figure posed every few updates is drawn with its blend
+  stretched over that period, one period behind its pose (review fix I1).

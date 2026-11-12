@@ -1591,6 +1591,54 @@ static void test_two_poses(void) {
     an_close(w);
 }
 
+/* a steady turn (85 degrees a second for 2 s), drawn at blend 0, 0.5 and 1 after each of 24 updates
+ * of 0.05 s: the angle never goes back and never jumps more than one update's turn (4.25 degrees).
+ * (a figure coming into view catches up at twice the rate: one update's turn a half step, no more).
+ * mode 0 far, 1 out of view, 2 out of view then into view at the 9th update, 3 in view and near */
+static int drawn_steady(int mode, float *most_jump, int *posed) {
+    AnWorld *w = an_open(4);
+    int rig = chain(w, 0);
+    TK spin[2] = {{1, 1, 0, 0}, {1, 1, 2, 170}};
+    int c = turns(w, rig, 2, 0, 2, spin, 0, NULL, NULL);
+    an_spawn(w, rig);   /* slot 0: a different stagger for the figure under test */
+    int f = an_spawn(w, rig);
+    an_play(w, f, 0, c, 0, 1, 1, -1, 0);
+    an_update(w, 0.05f);   /* posed once near: a new figure is drawn from its first pose, not slid into it */
+    float eye[3] = {500, 0, 0};
+    if (mode == 0) an_view(w, NULL, eye, 100);
+    if (mode == 1 || mode == 2) far_view(w);
+    float last = -1, jump = 0;
+    int ok = 1;
+    *posed = 0;
+    for (int k = 0; k < 24; k++) {
+        if (mode == 2 && k == 9) an_view(w, NULL, NULL, 0);
+        an_update(w, 0.05f);
+        for (int b = 0; b <= 2; b++) {
+            float a = angle(an_draw_matrices(w, f, 0.5f * b), 1);
+            if (last >= 0) {
+                if (a < last - 1e-3f) ok = 0;
+                if (a - last > jump) jump = a - last;
+            }
+            last = a;
+        }
+    }
+    *posed = (int)an_stat(w, 1);
+    *most_jump = jump;
+    an_close(w);
+    return ok && jump <= 4.25f + 1e-2f && last > 60;
+}
+static void test_drawn_steady(void) {
+    const char *name[4] = {"far", "out of view", "out of view, then in view", "near"};
+    for (int mode = 0; mode < 4; mode++) {
+        float jump; int posed;
+        int ok = drawn_steady(mode, &jump, &posed);
+        printf("  drawn %s: largest step %.3f degrees\n", name[mode], jump);
+        char what[160];
+        snprintf(what, sizeof what, "a %s figure's drawn turn never goes back nor jumps more than one update's turn", name[mode]);
+        CHECK(ok, what);
+    }
+}
+
 static void test_traced_cap(void) {
     AnWorld *w = an_open(80);
     int rig = chain(w, 0);
@@ -1691,6 +1739,7 @@ int main(void) {
     test_cull_hash();
     test_far_springs();
     test_two_poses();
+    test_drawn_steady();
     test_traced_cap();
     test_draw_cap();
     test_view_refusals();

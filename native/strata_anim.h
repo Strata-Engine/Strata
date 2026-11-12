@@ -223,8 +223,10 @@ typedef struct {
     /* cost control: set by the schedule in an_update, never by a query */
     uint8_t always, traced;      /* always posed; traced: 0 no, 1 drawn traced, 2 waiting past the cap */
     uint8_t cls, frozen;         /* AN_C_* as the last update found it; springs frozen (far, not always) */
-    uint8_t wait, unposed, pad2[2];   /* updates skipped since its last scheduled pose; never posed by an update */
+    uint8_t wait, unposed;       /* updates skipped since its last scheduled pose (reset to a stagger on a class change); never posed by an update */
+    uint8_t dspan, dsince;       /* drawing: updates between its last two poses, and since the last (the blend is stretched over the span) */
     float pend;                  /* seconds since its last scheduled pose (the springs' dt) */
+    float dmove;                 /* drawing: updates of motion from the pose before last to the last */
     float vbmin[3], vbmax[3], vpos[3];   /* its bounds and placement at its last scheduled pose (culling reads them) */
     AnLayer layer[AN_LAYERS];
 } AnFig;
@@ -534,7 +536,7 @@ static inline int an_spawn(AnWorld *w, int rig) {
     memset(f, 0, sizeof *f);
     f->id = id; f->rig = rig; f->q[3] = 1; f->proc = -1;
     f->att = -1; f->att_q[3] = 1;
-    f->unposed = 1;
+    f->unposed = 1; f->dspan = 1; f->dmove = 1;
     an_id_insert(w, id, s);
     w->live++;
     an_settle(w, f);                           /* the rest pose, at the origin */
@@ -1239,6 +1241,35 @@ static inline void an_sort_events(AnWorld *w) {
     if (a != w->events) memcpy(w->events, a, (size_t)n * sizeof *a);
 }
 
+/* a rotation's quaternion from its 3x3 (column-major, as an_qmat writes it) */
+static inline void an_mat_q(const float *m, float q[4]) {
+    float m00 = m[0], m10 = m[1], m20 = m[2], m01 = m[3], m11 = m[4], m21 = m[5], m02 = m[6], m12 = m[7], m22 = m[8];
+    float tr = m00 + m11 + m22;
+    if (tr > 0) {
+        float s = sqrtf(tr + 1) * 2;
+        q[3] = 0.25f * s; q[0] = (m21 - m12) / s; q[1] = (m02 - m20) / s; q[2] = (m10 - m01) / s;
+    } else if (m00 > m11 && m00 > m22) {
+        float s = sqrtf(1 + m00 - m11 - m22) * 2;
+        q[3] = (m21 - m12) / s; q[0] = 0.25f * s; q[1] = (m01 + m10) / s; q[2] = (m02 + m20) / s;
+    } else if (m11 > m22) {
+        float s = sqrtf(1 + m11 - m00 - m22) * 2;
+        q[3] = (m02 - m20) / s; q[0] = (m01 + m10) / s; q[1] = 0.25f * s; q[2] = (m12 + m21) / s;
+    } else {
+        float s = sqrtf(1 + m22 - m00 - m11) * 2;
+        q[3] = (m10 - m01) / s; q[0] = (m02 + m20) / s; q[1] = (m12 + m21) / s; q[2] = 0.25f * s;
+    }
+    an_qnorm(q);
+}
+/* a part between two 3x4s: the rotation slerped, the origin lerped; u 0 is a, 1 is b, exactly */
+static inline void an_mat_mix(const float *a, const float *b, float u, float *o) {
+    if (!(u > 0)) { memcpy(o, a, 12 * sizeof(float)); return; }
+    if (u >= 1) { memcpy(o, b, 12 * sizeof(float)); return; }
+    float qa[4], qb[4], q[4], p[3];
+    an_mat_q(a, qa); an_mat_q(b, qb);
+    an_slerp(qa, qb, u, q);
+    for (int k = 0; k < 3; k++) p[k] = a[9 + k] + (b[9 + k] - a[9 + k]) * u;
+    an_write_mat(q, p, o);
+}
 /* ---- cost control: the view, and which figures an update poses ---- */
 
 /* f's bounds as culling sees them: as of its last scheduled pose, carried
@@ -1311,12 +1342,28 @@ static inline void an_update(AnWorld *w, float dt) {
         for (int s = 0; s < w->capacity; s++) {
             AnFig *f = &w->figs[s];
             if (f->id < 0 || f->depth != d) continue;
-            if (!an_sched(w, f, s, dt)) { an_mark(w, f); w->skipped++; continue; }
+            if (!an_sched(w, f, s, dt)) { an_mark(w, f); w->skipped++; if (f->dsince < 255) f->dsince++; continue; }
             if (f->att >= 0) an_attach_place(w, f);
-            size_t len = (size_t)w->rigs[f->rig].nparts * 12 * sizeof(float);
-            memcpy(an_fig_prev(w, f), an_fig_mats(w, f), len);
+            int np = w->rigs[f->rig].nparts;
+            size_t len = (size_t)np * 12 * sizeof(float);
+            /* the pose before last is where the drawing has got to: the last pose, unless
+             * its span was longer than the updates since (a figure whose period shrank,
+             * coming into view); then the motion left to draw (in updates) is drawn over
+             * half as many updates, so the drawn lag halves each pose and nothing jumps */
+            int span = f->dspan ? f->dspan : 1;
+            float reached = (float)(f->dsince + 1) / (float)span;
+            if (reached >= 1) {
+                memcpy(an_fig_prev(w, f), an_fig_mats(w, f), len);
+                f->dspan = (uint8_t)(f->dsince + 1); f->dmove = (float)f->dspan;
+            } else {
+                for (int p = 0; p < np; p++) an_mat_mix(an_fig_prev(w, f) + p * 12, an_fig_mats(w, f) + p * 12, reached, an_fig_prev(w, f) + p * 12);
+                f->dmove = (1 - reached) * f->dmove + (float)(f->dsince + 1);
+                int half = (int)ceilf(f->dmove * 0.5f - 1e-3f);
+                f->dspan = (uint8_t)(half < 1 ? 1 : (half > 255 ? 255 : half));
+            }
+            f->dsince = 0;
             an_pose(w, f, f->pend);
-            if (f->unposed) { memcpy(an_fig_prev(w, f), an_fig_mats(w, f), len); f->unposed = 0; }
+            if (f->unposed) { memcpy(an_fig_prev(w, f), an_fig_mats(w, f), len); f->unposed = 0; f->dspan = 1; f->dmove = 1; }
             f->pend = 0;
             memcpy(f->vbmin, f->bmin, sizeof f->vbmin); memcpy(f->vbmax, f->bmax, sizeof f->vbmax); memcpy(f->vpos, f->pos, sizeof f->vpos);
             w->posed++;
@@ -2057,44 +2104,27 @@ static inline void an_traced(AnWorld *w, int fig, int on) {
     else { f->traced = 2; w->nwaiting++; }
 }
 
-/* a rotation's quaternion from its 3x3 (column-major, as an_qmat writes it) */
-static inline void an_mat_q(const float *m, float q[4]) {
-    float m00 = m[0], m10 = m[1], m20 = m[2], m01 = m[3], m11 = m[4], m21 = m[5], m02 = m[6], m12 = m[7], m22 = m[8];
-    float tr = m00 + m11 + m22;
-    if (tr > 0) {
-        float s = sqrtf(tr + 1) * 2;
-        q[3] = 0.25f * s; q[0] = (m21 - m12) / s; q[1] = (m02 - m20) / s; q[2] = (m10 - m01) / s;
-    } else if (m00 > m11 && m00 > m22) {
-        float s = sqrtf(1 + m00 - m11 - m22) * 2;
-        q[3] = (m21 - m12) / s; q[0] = 0.25f * s; q[1] = (m01 + m10) / s; q[2] = (m02 + m20) / s;
-    } else if (m11 > m22) {
-        float s = sqrtf(1 + m11 - m00 - m22) * 2;
-        q[3] = (m02 - m20) / s; q[0] = (m01 + m10) / s; q[1] = 0.25f * s; q[2] = (m12 + m21) / s;
-    } else {
-        float s = sqrtf(1 + m22 - m00 - m11) * 2;
-        q[3] = (m10 - m01) / s; q[0] = (m02 + m20) / s; q[1] = (m12 + m21) / s; q[2] = 0.25f * s;
-    }
-    an_qnorm(q);
-}
-/* a part between two 3x4s: the rotation slerped, the origin lerped; u 0 is a, 1 is b, exactly */
-static inline void an_mat_mix(const float *a, const float *b, float u, float *o) {
-    if (!(u > 0)) { memcpy(o, a, 12 * sizeof(float)); return; }
-    if (u >= 1) { memcpy(o, b, 12 * sizeof(float)); return; }
-    float qa[4], qb[4], q[4], p[3];
-    an_mat_q(a, qa); an_mat_q(b, qb);
-    an_slerp(qa, qb, u, q);
-    for (int k = 0; k < 3; k++) p[k] = a[9 + k] + (b[9 + k] - a[9 + k]) * u;
-    an_write_mat(q, p, o);
+/* how far along from the pose before last to the last pose f is drawn at
+ * blend 0..1: a figure posed every update, blend itself; one posed every
+ * span updates walks the span over that many updates, (since + blend) /
+ * span, so its drawn motion runs on, never back, one period behind */
+static inline float an_draw_u(const AnFig *f, float blend) {
+    float b = blend > 0 ? (blend < 1 ? blend : 1) : 0;
+    if (f->dspan <= 1) return f->dsince ? 1 : b;
+    float u = ((float)f->dsince + b) / (float)f->dspan;
+    return u < 1 ? u : 1;
 }
 /* figure fig drawn between the pose before its last and its last, at blend
- * 0..1 (1: its last pose); 12 floats a part, valid until the next call. A
- * figure the updates skip draws between its last two poses, however old. NULL
- * if there is no such figure. */
+ * 0..1 of the time since the last update; 12 floats a part, valid until the
+ * next call. A figure posed every update draws its last two poses at blend
+ * (0 and 1 exactly); one the schedule poses every few updates is stretched
+ * over that period (an_draw_u). NULL if there is no such figure. */
 static inline const float *an_draw_matrices(AnWorld *w, int fig, float blend) {
     AnFig *f = an_fig(w, fig);
     if (!f) return NULL;
     const float *a = an_fig_prev(w, f), *b = an_fig_mats(w, f);
-    for (int p = 0; p < w->rigs[f->rig].nparts; p++) an_mat_mix(a + p * 12, b + p * 12, blend, w->dscratch + p * 12);
+    float u = an_draw_u(f, blend);
+    for (int p = 0; p < w->rigs[f->rig].nparts; p++) an_mat_mix(a + p * 12, b + p * 12, u, w->dscratch + p * 12);
     return w->dscratch;
 }
 /* the renderer's source: every part with volume of every figure in view now
@@ -2111,10 +2141,11 @@ static inline int an_draw_list(AnWorld *w, float blend, const int32_t **rig_part
         if (f->id < 0 || !(f->always || an_in_view(w, f))) continue;
         const AnRig *r = &w->rigs[f->rig];
         const float *a = an_fig_prev(w, f), *b = an_fig_mats(w, f);
+        float u = an_draw_u(f, blend);
         for (int p = 0; p < r->nparts; p++) {
             if (!an_has_box(r, p)) continue;
             if (n >= AN_DRAW_MAX) { w->draw_over += 1; continue; }
-            an_mat_mix(a + p * 12, b + p * 12, blend, w->dl_xf + (size_t)n * 12);
+            an_mat_mix(a + p * 12, b + p * 12, u, w->dl_xf + (size_t)n * 12);
             w->dl_rp[n] = f->rig * AN_PARTS + p;
             w->dl_flags[n] = (f->traced == 1 ? 1 : 0) | (f->id << 8);
             n++;

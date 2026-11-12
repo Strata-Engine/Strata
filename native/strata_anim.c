@@ -24,7 +24,7 @@
  * themselves on the monotonic clock (an_x_timing). The kernel never reads a
  * clock, so no answer depends on it. */
 /* Rewritten by stamp_anim.sh whenever strata_anim.h changes (GAPS S14). */
-#define STRATA_ANIM_STAMP "c4c4020d7ec59a4b"
+#define STRATA_ANIM_STAMP "73cc95d6621233e8"
 #include <stdint.h>
 #include <time.h>
 #include "strata_anim.h"
