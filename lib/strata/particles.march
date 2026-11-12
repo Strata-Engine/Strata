@@ -1,0 +1,239 @@
+-- Strata.Particles — effects as data, and where and how many of their
+-- particles to emit. Pure: nothing here touches the GPU. A game threads a
+-- `Particles` value as it threads `Strata.Sound`: it defines effects once,
+-- fires bursts and moves emitters, calls `step` once a frame, and hands the
+-- result to `Strata.Render.particles`, which sends the new effects and the
+-- queued bursts to the renderer and answers the value drained.
+--
+-- A particle, once born, is the renderer's: it flies on a closed form
+-- (start, velocity, a constant acceleration, linear drag, a sway) and
+-- colours and grows by its effect's ramps over its life
+-- (native/strata_particles.h). Particles meet nothing.
+--
+-- An emitter owes `rate * dt` particles a step and carries the fraction. A
+-- moving emitter spreads a step's particles along the segment from where it
+-- was to where it is, so a fast emitter leaves an unbroken trail; past 4 m
+-- in one step it is taken to have jumped, and spawns where it is. A step
+-- spawns at most 4096 particles an emitter, in bursts of at most 512; what
+-- is owed past that is dropped, not carried. Every burst's randomness is a
+-- seed mixed from the value's seed and a counter, so the same calls give the
+-- same particles.
+mod Strata.Particles do
+
+  -- look, layer, lit once a particle, colour keys (age, r, g, b, opacity),
+  -- size keys (age, metres), acceleration, drag, sway (metres, Hz), spin
+  type PtEffect = { pe_glow : Bool, pe_layer : Int, pe_once : Bool, pe_colour : List((Float, Float, Float, Float, Float)),
+                    pe_size : List((Float, Float)), pe_ax : Float, pe_ay : Float, pe_az : Float, pe_drag : Float,
+                    pe_wob : Float, pe_hz : Float, pe_spin : Float }
+
+  type PtShape = PtPoint(Float, Float, Float) | PtSphere(Float, Float, Float, Float) | PtBox(Float, Float, Float, Float, Float, Float)
+
+  -- one burst for the renderer: effect, shape code (0 point, 1 sphere, 2 box)
+  -- and its a b c, the segment the starts are spread along, the mean
+  -- velocity, its spread, how many, the life and its spread, the size
+  -- scale's spread, the seed
+  type PtSpawn = { ps_effect : Int, ps_shape : Int, ps_a : Float, ps_b : Float, ps_c : Float,
+                   ps_from : (Float, Float, Float), ps_to : (Float, Float, Float), ps_v : (Float, Float, Float),
+                   ps_spread : Float, ps_count : Int, ps_life : Float, ps_life_spread : Float, ps_size_spread : Float, ps_seed : Int }
+
+  -- an emitter: its id, effect, shape (its centre now), where its centre was
+  -- at the last step, mean velocity, spread, rate a second, life and its
+  -- spread, the fraction of a particle carried
+  type PtEmitter = { pm_id : Int, pm_effect : Int, pm_shape : PtShape, pm_last : (Float, Float, Float), pm_v : (Float, Float, Float),
+                     pm_spread : Float, pm_rate : Float, pm_life : Float, pm_life_spread : Float, pm_carry : Float }
+
+  -- the seed and burst counter, the effects defined (id, table floats) newest
+  -- first, how many of them the renderer has, the next emitter id, the live
+  -- emitters, the bursts queued newest first
+  type Particles = { pp_seed : Int, pp_counter : Int, pp_effects : List((Int, List(Float))), pp_sent : Int,
+                     pp_next : Int, pp_emitters : List(PtEmitter), pp_queue : List(PtSpawn) }
+
+  doc "The most effects a game may define (ids 1 to 63; 0 is the renderer's spray)."
+  fn most_effects() : Int do 63 end
+  doc "The most particles one burst holds."
+  fn burst_most() : Int do 512 end
+  doc "The most particles one emitter spawns in a step."
+  fn step_most() : Int do 4096 end
+  doc "How far an emitter may move in one step and still leave a trail, in metres."
+  fn trail_most() : Float do 4.0 end
+  pfn size_spread() : Float do 0.25 end
+
+  -- ── Effects ──────────────────────────────────────────────────────────────
+
+  doc "An effect to build on: shaded, texture layer 13, white and opaque, 0.2 m across, no acceleration, no drag, lit once a particle."
+  fn effect() : PtEffect do
+    { pe_glow: false, pe_layer: 13, pe_once: true, pe_colour: [(0.0, 1.0, 1.0, 1.0, 1.0)], pe_size: [(0.0, 0.2)],
+      pe_ax: 0.0, pe_ay: 0.0, pe_az: 0.0, pe_drag: 0.0, pe_wob: 0.0, pe_hz: 0.0, pe_spin: 0.0 }
+  end
+  doc "Glowing: added to what is behind, not lit (flame, sparks)."
+  fn glowing(e : PtEffect) : PtEffect do { e with pe_glow: true } end
+  doc "Shaded: blended over what is behind and lit by the sun and sky (smoke, dust, steam)."
+  fn shaded(e : PtEffect) : PtEffect do { e with pe_glow: false } end
+  doc "Light a shaded effect at every pixel, as spray is, instead of once a particle: dearer for large particles."
+  fn lit_per_pixel(e : PtEffect) : PtEffect do { e with pe_once: false } end
+  doc "The texture layer its particles are drawn with."
+  fn layer(e : PtEffect, l : Int) : PtEffect do { e with pe_layer: l } end
+  doc "The colour over a particle's life: up to four keys (age 0..1, r, g, b linear, opacity), the first four given, in order of age; between keys linear, one key constant."
+  fn colour(e : PtEffect, keys : List((Float, Float, Float, Float, Float))) : PtEffect do
+    let ks = List.take(keys, 4)
+    { e with pe_colour: if List.is_empty(ks) do [(0.0, 1.0, 1.0, 1.0, 1.0)] else List.sort_by(ks, fn (a, b) -> match (a, b) do ((x, _, _, _, _), (y, _, _, _, _)) -> x <= y end) end }
+  end
+  doc "The size over a particle's life: up to four keys (age 0..1, metres across), the first four given, in order of age."
+  fn size(e : PtEffect, keys : List((Float, Float))) : PtEffect do
+    let ks = List.take(keys, 4)
+    { e with pe_size: if List.is_empty(ks) do [(0.0, 0.2)] else List.sort_by(ks, fn (a, b) -> match (a, b) do ((x, _), (y, _)) -> x <= y end) end }
+  end
+  doc "A constant acceleration, m/s2: (0, -9.8, 0) falls, a positive y rises."
+  fn accel(e : PtEffect, ax : Float, ay : Float, az : Float) : PtEffect do { e with pe_ax: ax, pe_ay: ay, pe_az: az } end
+  doc "Linear drag, per second: the velocity tends to the acceleration over [k]."
+  fn drag(e : PtEffect, k : Float) : PtEffect do { e with pe_drag: if k < 0.0 do 0.0 else k end } end
+  doc "A sideways sway of [metres] at [hz], phased by each particle."
+  fn wobble(e : PtEffect, metres : Float, hz : Float) : PtEffect do { e with pe_wob: metres, pe_hz: hz } end
+  doc "How fast the sprite turns, radians a second."
+  fn spin(e : PtEffect, rad_per_s : Float) : PtEffect do { e with pe_spin: rad_per_s } end
+
+  pfn pad(xs : List(Float), n : Int) : List(Float) do List.append(xs, List.repeat(0.0, n - List.length(xs))) end
+  pfn b2f(b : Bool) : Float do if b do 1.0 else 0.0 end end
+  doc "The effect as the renderer's table holds it: 40 floats, laid out as native/strata_particles.h says."
+  fn floats(e : PtEffect) : List(Float) do
+    let cs = e.pe_colour
+    let ss = e.pe_size
+    let head = [b2f(e.pe_glow), int_to_float(e.pe_layer), b2f(e.pe_once), int_to_float(List.length(cs))]
+    let ckeys = pad(List.flat_map(cs, fn k -> match k do (_, r, g, b, o) -> [r, g, b, o] end), 16)
+    let cages = pad(List.map(cs, fn k -> match k do (a, _, _, _, _) -> a end), 4)
+    let sizes = pad(List.map(ss, fn k -> match k do (_, m) -> m end), 4)
+    let sages = pad(List.map(ss, fn k -> match k do (a, _) -> a end), 4)
+    let dyn = [int_to_float(List.length(ss)), e.pe_drag, e.pe_wob, e.pe_hz]
+    let acc = [e.pe_ax, e.pe_ay, e.pe_az, e.pe_spin]
+    List.concat([head, ckeys, cages, sizes, sages, dyn, acc])
+  end
+
+  -- ── The value ────────────────────────────────────────────────────────────
+
+  doc "No effects, no emitters, nothing queued; [seed] decides every burst's randomness."
+  fn new(seed : Int) : Particles do
+    { pp_seed: seed, pp_counter: 0, pp_effects: Nil, pp_sent: 0, pp_next: 1, pp_emitters: Nil, pp_queue: Nil }
+  end
+
+  doc "Define effect [e]: answers its id, 1 to 63, or -1 when 63 are defined already."
+  fn define(p : Particles, e : PtEffect) : (Particles, Int) do
+    let id = List.length(p.pp_effects) + 1
+    if id > most_effects() do (p, 0 - 1)
+    else ({ p with pp_effects: Cons((id, floats(e)), p.pp_effects) }, id) end
+  end
+
+  doc "A point at (x, y, z) metres."
+  fn point(x : Float, y : Float, z : Float) : PtShape do PtPoint(x, y, z) end
+  doc "A sphere about (x, y, z) of radius [r] metres."
+  fn sphere(x : Float, y : Float, z : Float, r : Float) : PtShape do PtSphere(x, y, z, r) end
+  doc "A box about (x, y, z) of half sizes (hx, hy, hz) metres."
+  fn box(x : Float, y : Float, z : Float, hx : Float, hy : Float, hz : Float) : PtShape do PtBox(x, y, z, hx, hy, hz) end
+
+  pfn centre(s : PtShape) : (Float, Float, Float) do
+    match s do
+      PtPoint(x, y, z) -> (x, y, z)
+      PtSphere(x, y, z, _) -> (x, y, z)
+      PtBox(x, y, z, _, _, _) -> (x, y, z)
+    end
+  end
+  -- the shape's code and its a b c
+  pfn form(s : PtShape) : (Int, Float, Float, Float) do
+    match s do
+      PtPoint(_, _, _) -> (0, 0.0, 0.0, 0.0)
+      PtSphere(_, _, _, r) -> (1, r, 0.0, 0.0)
+      PtBox(_, _, _, hx, hy, hz) -> (2, hx, hy, hz)
+    end
+  end
+
+  -- queue [count] particles, in bursts of at most 512, along from -> to
+  pfn queue(p : Particles, effect : Int, s : PtShape, from : (Float, Float, Float), to : (Float, Float, Float), v : (Float, Float, Float),
+            spread : Float, count : Int, life : Float, life_spread : Float) : Particles do
+    if count <= 0 do p
+    else
+      let n = if count > burst_most() do burst_most() else count end
+      match form(s) do
+        (code, a, b, c) ->
+          let sp = { ps_effect: effect, ps_shape: code, ps_a: a, ps_b: b, ps_c: c, ps_from: from, ps_to: to, ps_v: v,
+                     ps_spread: spread, ps_count: n, ps_life: life, ps_life_spread: life_spread, ps_size_spread: size_spread(),
+                     ps_seed: Strata.Seed.mix(p.pp_seed, p.pp_counter) }
+          queue({ p with pp_counter: p.pp_counter + 1, pp_queue: Cons(sp, p.pp_queue) }, effect, s, from, to, v, spread, count - n, life, life_spread)
+      end
+    end
+  end
+
+  doc "A burst of [count] particles of [effect] from shape [s] now: velocity about [v] m/s, give or take a ball of radius [spread], living [life] seconds give or take the share [life_spread]."
+  fn burst(p : Particles, effect : Int, s : PtShape, v : (Float, Float, Float), spread : Float, count : Int, life : Float, life_spread : Float) : Particles do
+    queue(p, effect, s, centre(s), centre(s), v, spread, count, life, life_spread)
+  end
+
+  doc "An emitter of [effect] at shape [s], [rate] particles a second, as `burst` describes them; answers its id. It emits at each `step` until stopped."
+  fn emitter(p : Particles, effect : Int, s : PtShape, v : (Float, Float, Float), spread : Float, rate : Float, life : Float, life_spread : Float) : (Particles, Int) do
+    let em = { pm_id: p.pp_next, pm_effect: effect, pm_shape: s, pm_last: centre(s), pm_v: v, pm_spread: spread,
+               pm_rate: rate, pm_life: life, pm_life_spread: life_spread, pm_carry: 0.0 }
+    ({ p with pp_next: p.pp_next + 1, pp_emitters: Cons(em, p.pp_emitters) }, p.pp_next)
+  end
+
+  doc "Move emitter [id] to shape [s]; its next step's particles are spread from where it was."
+  fn move(p : Particles, id : Int, s : PtShape) : Particles do
+    { p with pp_emitters: List.map(p.pp_emitters, fn em -> if em.pm_id == id do { em with pm_shape: s } else em end) }
+  end
+  doc "Change emitter [id]'s rate, particles a second."
+  fn set_rate(p : Particles, id : Int, rate : Float) : Particles do
+    { p with pp_emitters: List.map(p.pp_emitters, fn em -> if em.pm_id == id do { em with pm_rate: rate } else em end) }
+  end
+  doc "Stop emitter [id]; its particles already out live their lives."
+  fn stop(p : Particles, id : Int) : Particles do
+    { p with pp_emitters: List.filter(p.pp_emitters, fn em -> em.pm_id != id) }
+  end
+  doc "How many emitters are live."
+  fn live_emitters(p : Particles) : Int do List.length(p.pp_emitters) end
+
+  pfn dist(a : (Float, Float, Float), b : (Float, Float, Float)) : Float do
+    match (a, b) do ((ax, ay, az), (qx, qy, qz)) -> Math.sqrt((ax -. qx) *. (ax -. qx) +. (ay -. qy) *. (ay -. qy) +. (az -. qz) *. (az -. qz)) end
+  end
+  pfn step_go(p : Particles, ems : List(PtEmitter), dt : Float, acc : List(PtEmitter)) : Particles do
+    match ems do
+      Nil -> { p with pp_emitters: List.reverse(acc) }
+      Cons(em, rest) ->
+        let owed = (if dt > 0.0 do em.pm_rate *. dt else 0.0 end) +. em.pm_carry
+        let whole = float_to_int(Math.floor(owed))
+        let n = if whole > step_most() do step_most() else whole end
+        let carry = owed -. int_to_float(whole)
+        let here = centre(em.pm_shape)
+        let from = if dist(em.pm_last, here) > trail_most() do here else em.pm_last end
+        let p2 = queue(p, em.pm_effect, em.pm_shape, from, here, em.pm_v, em.pm_spread, n, em.pm_life, em.pm_life_spread)
+        step_go(p2, rest, dt, Cons({ em with pm_last: here, pm_carry: carry }, acc))
+    end
+  end
+  doc "A step of [dt] seconds: each live emitter queues what it owes."
+  fn step(p : Particles, dt : Float) : Particles do step_go(p, List.reverse(p.pp_emitters), dt, Nil) end
+
+  doc "The bursts queued, oldest first."
+  fn queued(p : Particles) : List(PtSpawn) do List.reverse(p.pp_queue) end
+  doc "The effects defined that the renderer does not have yet, as (id, its 40 floats), lowest id first."
+  fn pending_effects(p : Particles) : List((Int, List(Float))) do
+    List.reverse(List.filter(p.pp_effects, fn e -> match e do (id, _) -> id > p.pp_sent end))
+  end
+  doc "The queue emptied and every effect marked sent: what `Strata.Render.particles` answers once it has sent them."
+  fn drain(p : Particles) : Particles do { p with pp_queue: Nil, pp_sent: List.length(p.pp_effects) } end
+
+  doc "A burst's effect."
+  fn sp_effect(s : PtSpawn) : Int do s.ps_effect end
+  doc "How many particles a burst holds."
+  fn sp_count(s : PtSpawn) : Int do s.ps_count end
+  doc "Where a burst's starts begin, metres."
+  fn sp_from(s : PtSpawn) : (Float, Float, Float) do s.ps_from end
+  doc "Where a burst's starts end, metres."
+  fn sp_to(s : PtSpawn) : (Float, Float, Float) do s.ps_to end
+  doc "A burst's seed."
+  fn sp_seed(s : PtSpawn) : Int do s.ps_seed end
+  doc "A burst's shape code (0 point, 1 sphere, 2 box)."
+  fn sp_shape(s : PtSpawn) : Int do s.ps_shape end
+  doc "The 18 floats the renderer's `emit` takes for a burst: segment, shape a b c, velocity, spread, life, its spread, the size spread, two unused."
+  fn sp_floats(s : PtSpawn) : List(Float) do
+    match (s.ps_from, s.ps_to, s.ps_v) do
+      ((x0, y0, z0), (x1, y1, z1), (vx, vy, vz)) ->
+        [x0, y0, z0, x1, y1, z1, s.ps_a, s.ps_b, s.ps_c, vx, vy, vz, s.ps_spread, s.ps_life, s.ps_life_spread, s.ps_size_spread, 0.0, 0.0]
+    end
+  end
+end
