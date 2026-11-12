@@ -96,7 +96,7 @@ float sun_visible(vec3 at, vec3 n, vec3 toward) {
 }
 
 // How bright a fully emitting block is, against a sun of about 1.
-const float GLOW = 5.0;
+const float GLOW = 5.0;   // strata_vk.c's SV_GLOW (a figure's glow reach for history) must equal it
 
 // Lamps near each cell of the light volume (strata_vk.c, lamps_to_frame):
 // per cell (first, count); each lamp a glowing voxel (x, y, z voxels, class).
@@ -154,10 +154,11 @@ vec3 lamp_light(vec3 at, vec3 n, ivec2 px, int frame) {
 // The light arriving at a point (voxel units) on a face with normal n from
 // everything but the sun: [rays] rays over the hemisphere, more of them near
 // the normal. One that escapes brings the sky's colour; one that hits brings
-// what the block there emits and what it passes on from the sun and the sky.
+// what the block (or traced figure's voxel) there emits and what it passes on from the sun and the sky.
 // Where there are lamps listed, one more ray is aimed at one of them, and the
 // hemisphere's rays leave lamps out: a small lamp is found by few of them,
-// so its light would take many frames to settle.
+// so its light would take many frames to settle. A traced figure's glowing
+// voxels are in no lamp list, so the hemisphere's rays keep them.
 vec3 sky_light(vec3 at, vec3 n, ivec2 px, int frame, int rays) {
     bool aimed = u.water2.z > 0.5;
     float own = aimed ? 0.0 : 1.0;
@@ -172,8 +173,9 @@ vec3 sky_light(vec3 at, vec3 n, ivec2 px, int frame, int rays) {
         if (!trace_steps(at + n * 0.02, dir, 48.0, false, 40, 12.0, -1000000, h)) sum += sky_base(dir) + h.glow * GLOW * own;
         else {
             vec3 hn = NORMALS[h.face];
-            sum += (class_emission(h.cls) * GLOW + h.glow * GLOW) * own
-                 + class_color(h.cls) * (u.sun_color.rgb * max(dot(hn, u.sun.xyz), 0.0) * 0.5 + sky_flat(hn));
+            // a traced figure's voxel is in no lamp list: its light is found by these rays, aimed or not
+            sum += hit_emission(h.cls) * GLOW * (h.cls >= PALETTE_HIT ? 1.0 : own) + h.glow * GLOW * own
+                 + hit_color(h.cls) * (u.sun_color.rgb * max(dot(hn, u.sun.xyz), 0.0) * 0.5 + sky_flat(hn));
         }
     }
     return sum / float(max(rays, 1)) + (aimed ? lamp_light(at, n, px, frame) : vec3(0.0));

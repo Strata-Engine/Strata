@@ -115,3 +115,44 @@ double sn_sample3(int64_t kind, int64_t octaves, double lac, double gain, int64_
     fnl_state ws = sn_warp_state(seed, freq, warp);
     return (double)sn_one3(&s, &ws, fractal, warp, x, y, z);
 }
+
+/* Strata.Lattice's fill: 9 x 5 x 9 samples (one every 4, 8, 4 voxels, index
+ * i + 9 * (j + 5 * k)) to a 32-cubed chunk's 32768 values at
+ * x + 32 * (z + 32 * y), trilinearly. Here and not in March because the
+ * caller owns `out` and March native arrays are copy-on-write: only a C
+ * write fills the caller's array. Separable: a 9 x 9 plane per voxel row,
+ * a row of 9 per z, then four voxels a cell along x. The fractions are the
+ * constants k / 8 and k / 4, so there are no weight tables. Returns 32768,
+ * or 0 (writing nothing) when either array is too small. */
+int64_t sl_fill(void *samples, void *out) {
+    if (narr_len(samples) < 405 || narr_len(out) < 32768) return 0;
+    const float *s = (const float *)narr_data(samples);
+    float *o = (float *)narr_data(out);
+    float plane[81], row[9];
+    for (int y = 0; y < 32; y++) {
+        int j = y >> 3;
+        float ty = (float)(y & 7) * 0.125f;
+        for (int k = 0; k < 9; k++)
+            for (int i = 0; i < 9; i++) {
+                float a = s[i + 9 * (j + 5 * k)], b = s[i + 9 * (j + 1 + 5 * k)];
+                plane[i + 9 * k] = a + (b - a) * ty;
+            }
+        for (int z = 0; z < 32; z++) {
+            int k = z >> 2;
+            float tz = (float)(z & 3) * 0.25f;
+            for (int i = 0; i < 9; i++) {
+                float a = plane[i + 9 * k], b = plane[i + 9 * (k + 1)];
+                row[i] = a + (b - a) * tz;
+            }
+            float *line = o + 32 * (z + 32 * y);
+            for (int c = 0; c < 8; c++) {
+                float a = row[c], d = row[c + 1] - a;
+                line[4 * c] = a;
+                line[4 * c + 1] = a + 0.25f * d;
+                line[4 * c + 2] = a + 0.5f * d;
+                line[4 * c + 3] = a + 0.75f * d;
+            }
+        }
+    }
+    return 32768;
+}

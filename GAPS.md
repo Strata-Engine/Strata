@@ -249,3 +249,13 @@ chunks' numbers.
 ## S29: `on` and `none` cannot be parameter names
 
 Each is a bare "parse error" at the function. Workaround: other names.
+
+## S30: a March function cannot fill an array the caller passed in
+
+Native arrays are copy-on-write values: `NativeArray.set_f32(out, i, v)`
+on an array the caller still holds writes a fresh copy, so a March
+`fill(samples, out) : Int` returned 32768 and left the caller's `out` all
+zeros (met in `Strata.Lattice`). Only a C write through the FFI lands in the
+caller's array, which is how `Strata.Noise.field2` and `field3` work.
+Workaround: return the array, or, where an out-parameter API is wanted,
+write the loop in C (`sl_fill` in `native/strata_noise.c`).

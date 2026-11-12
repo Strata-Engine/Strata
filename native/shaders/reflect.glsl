@@ -28,7 +28,8 @@ vec3 mirror_dir(vec3 toward_eye, vec3 m, vec3 n) {
 // What a mirror ray from [at] (voxel units) along unit [dir] sees. A hit that
 // was on screen last frame takes its surface colour from the screen and its
 // sun visibility from the light pass's memory; any other hit takes its class's
-// colour and one shadow ray; a miss is sky.
+// (or a traced figure voxel's palette) colour and one shadow ray; a miss is sky.
+// Either way the plain figures' shadow map darkens it too.
 // [skip_y] is the layer of see-through voxels the ray may pass (the water it leaves), or a layer that does not exist.
 vec3 reflected(vec3 at, vec3 dir, int skip_y) {
     Hit h;
@@ -39,7 +40,7 @@ vec3 reflected(vec3 at, vec3 dir, int skip_y) {
     vec3 hn = NORMALS[h.face];
     vec3 was = screen_of(u.prev_vp, hp);
     vec3 now = screen_of(u.vp, hp);
-    vec3 albedo = class_color(h.cls);
+    vec3 albedo = hit_color(h.cls);
     float vis = -1.0;
     if (u.vol.w > 0 && on_screen(was) && on_screen(now)) {
         vec4 om = texture(meta_prev, was.xy);
@@ -49,6 +50,8 @@ vec3 reflected(vec3 at, vec3 dir, int skip_y) {
         }
     }
     if (vis < 0.0) vis = sun_visible(hv, hn, u.sun.xyz);
-    vec3 col = albedo * (u.sun_color.rgb * max(dot(hn, u.sun.xyz), 0.0) * vis + sky_flat(hn)) + (class_emission(h.cls) + h.glow) * GLOW;
+    // the plain figures' shadow map, as on screen (the memory holds traced shadows only)
+    if (u.fshadow.x > 0.5 && vis > 0.0) vis = min(vis, fig_shadow(hp, hn));
+    vec3 col = albedo * (u.sun_color.rgb * max(dot(hn, u.sun.xyz), 0.0) * vis + sky_flat(hn)) + (hit_emission(h.cls) + h.glow) * GLOW;
     return fogged(col, hp);
 }
