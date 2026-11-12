@@ -1,0 +1,314 @@
+-- entcheck — Strata's entity checks, run against the entity kernel through
+-- Strata.Entities, headless (no window, no GPU).
+--
+--   ENTCHECK_SCENE=name ./entcheck
+--
+-- prints "scene name: ok", or the failure and exits 1. scripts/ent_check.sh
+-- builds it and runs every scene.
+mod Entcheck do
+
+  needs IO
+  needs IO.Process
+  needs IO.Foreign
+  needs Ent
+
+  alias Strata.Entities as En
+
+  pfn fail(msg : String) : Int do
+    println(msg)
+    1
+  end
+  pfn report(name : String, failures : Int) : Int do
+    if failures == 0 do
+      println("scene " ++ name ++ ": ok")
+      0
+    else
+      println("scene " ++ name ++ ": FAILED")
+      1
+    end
+  end
+  pfn check(ok : Bool, msg : String) : Int do if ok do 0 else fail("  not so: " ++ msg) end end
+
+  pfn refused(e : Strata.Entities.Entities) : Int do match En.stats(e) do (_, _, _, r) -> r end end
+  pfn live(e : Strata.Entities.Entities) : Int do match En.stats(e) do (n, _, _, _) -> n end end
+  pfn reason(e : Strata.Entities.Entities) : Int do float_to_int(En.stat(e, 6)) end
+  pfn row_of(id : Int) : Int do int_and(id, 1048575) end
+
+  -- the Task 1 kind: a flyer with 3 float and 2 int slots (or as given)
+  pfn flyer(fslots : Int, islots : Int) : Strata.Entities.Kind do
+    En.with_slots(En.with_mover(En.kind(), En.flying(), 0.25, 0.5, 0.25, 0.5, 9.8), fslots, islots)
+  end
+  -- a world of [capacity] with the stream radius 52 chunks of 3.2 m: a seen cap of 160 m
+  pfn world(kinds : List(Strata.Entities.Kind), capacity : Int) : Strata.Entities.Entities do En.open(kinds, capacity, 128, 52, 3.2, 0.1) end
+
+  pfn slots_zero(e : Strata.Entities.Entities, id : Int, n : Int) : Bool do
+    if n >= 8 do true
+    else if En.float(e, id, n) != 0.0 do false
+    else if En.int(e, id, n) != 0 do false
+    else slots_zero(e, id, n + 1) end end end
+  end
+
+  -- add and read: a new entity's position, facing, velocity, age, kind and slots
+  pfn add_and_read(e0 : Strata.Entities.Entities) : (Strata.Entities.Entities, Int) do
+    let (e, id) = En.add(e0, 0, 1.5, 2.5, 3.5, 0.25)
+    let bad = check(id >= 0, "an entity is added")
+      + check(En.alive(e, id), "it is alive")
+      + check(live(e) == 1, "one is live")
+      + check(En.position(e, id) == (1.5, 2.5, 3.5), "its position reads (1.5, 2.5, 3.5)")
+      + check(En.facing(e, id) == 0.25, "its facing reads 0.25")
+      + check(En.velocity(e, id) == (0.0, 0.0, 0.0), "its velocity reads 0")
+      + check(En.age(e, id) == 0.0, "its age reads 0")
+      + check(En.kind_of(e, id) == 0, "its kind is 0")
+      + check(slots_zero(e, id, 0), "every slot reads 0")
+    (En.remove(e, id), bad)
+  end
+
+  -- slots: set and read within the kind's counts; past them refused and read 0
+  pfn slots(e0 : Strata.Entities.Entities) : (Strata.Entities.Entities, Int) do
+    let (e1, id) = En.add(e0, 0, 0.0, 0.0, 0.0, 0.0)
+    let e2 = En.set_float(e1, id, 2, 7.5)
+    let r0 = refused(e2)
+    let e3 = En.set_float(e2, id, 3, 1.0)
+    let bad = check(En.float(e3, id, 2) == 7.5, "float slot 2 set to 7.5 reads 7.5")
+      + check(refused(e3) == r0 + 1 && reason(e3) == 8, "float slot 3 on a 3-slot kind is refused")
+      + check(En.float(e3, id, 3) == 0.0, "... and reads 0")
+    let e4 = En.set_int(e3, id, 1, -42)
+    let e5 = En.set_int(e4, id, 2, 5)
+    let bad2 = check(En.int(e5, id, 1) == -42, "int slot 1 set to -42 reads -42")
+      + check(En.int(e5, id, 2) == 0 && reason(e5) == 8, "int slot 2 on a 2-slot kind is refused and reads 0")
+    let e6 = En.set_facing(En.set_velocity(e5, id, 1.0, -2.0, 0.5), id, 1.25)
+    let r1 = refused(e6)
+    let e7 = En.set_position(e6, id, 1.0, float_nan(), 3.0)
+    let bad3 = check(En.velocity(e7, id) == (1.0, -2.0, 0.5), "a velocity set reads back")
+      + check(En.facing(e7, id) == 1.25, "a facing set reads back")
+      + check(refused(e7) == r1 + 1 && reason(e7) == 3, "a NaN position is refused, for its value")
+      + check(En.position(e7, id) == (0.0, 0.0, 0.0), "... and the position is unchanged")
+    (En.remove(e7, id), bad + bad2 + bad3)
+  end
+
+  -- stale ids: A removed, B takes its row; A reads defaults and every write through it is counted
+  pfn stale(e0 : Strata.Entities.Entities) : (Strata.Entities.Entities, Int) do
+    let (e1, a) = En.add(e0, 0, 1.0, 2.0, 3.0, 0.5)
+    let e2 = En.remove(En.set_int(En.set_float(e1, a, 0, 4.0), a, 0, 9), a)
+    let (e3, b) = En.add(e2, 0, 10.0, 20.0, 30.0, 0.0)
+    let bad = check(b >= 0 && b != a, "B is added with a new id")
+      + check(row_of(b) == row_of(a), "B takes A's row")
+      + check(!En.alive(e3, a), "A is not alive")
+      + check(En.alive(e3, b), "B is alive")
+    let r0 = refused(e3)
+    let e4 = En.set_position(e3, a, 7.0, 7.0, 7.0)
+    let bad2 = check(En.position(e4, b) == (10.0, 20.0, 30.0), "a set through A leaves B's position unchanged")
+      + check(refused(e4) == r0 + 1, "... and is counted once")
+      + check(reason(e4) == 2, "... for a dead id")
+      + check(En.position(e4, a) == (0.0, 0.0, 0.0), "A's position reads 0")
+      + check(En.facing(e4, a) == 0.0, "A's facing reads 0")
+      + check(En.kind_of(e4, a) == -1, "A's kind reads -1")
+      + check(En.float(e4, a, 0) == 0.0 && En.int(e4, a, 0) == 0, "A's slots read 0")
+    let r1 = refused(e4)
+    let e5 = En.remove(En.set_velocity(En.set_int(En.set_float(e4, a, 0, 1.0), a, 0, 1), a, 1.0, 1.0, 1.0), a)
+    let bad3 = check(refused(e5) == r1 + 4, "slot, velocity and remove calls through A are each counted")
+      + check(slots_zero(e5, b, 0), "B starts with A's slots cleared")
+      + check(!En.alive(e5, -1) && !En.alive(e5, 0) && !En.alive(e5, int_shl(1, 61)), "made-up ids are not alive")
+    (En.remove(e5, b), bad + bad2 + bad3)
+  end
+
+  -- basics: open, add and read, slots, stale ids, refused kinds, close
+  pfn basics_scene() : Int do
+    let e = world([flyer(3, 2)], 16)
+    let ok = check(En.is_open(e), "a world of one valid kind opens")
+    let (e1, b1) = add_and_read(e)
+    let (e2, b2) = slots(e1)
+    let (e3, b3) = stale(e2)
+    let b4 = check(live(e3) == 0, "everything added was removed")
+      + check(!En.is_open(En.close(e3)), "closed")
+    let nine = world([flyer(3, 2), En.with_slots(En.kind(), 9, 0)], 16)
+    let b5 = check(!En.is_open(nine), "a world with a 9-slot kind is not open")
+    let flat = world([En.with_mover(En.kind(), En.walking(), 0.3, 0.0, 0.3, 0.5, 9.8)], 16)
+    let b6 = check(!En.is_open(flat), "a world with a walker of no height is not open")
+    let far = world([En.with_seen_distance(flyer(0, 0), 161.0)], 16)
+    let b7 = check(!En.is_open(far), "a world with a kind seen past the seen cap (160 m) is not open")
+    let near = world([En.with_seen_distance(flyer(0, 0), 160.0)], 16)
+    let b8 = check(En.is_open(near), "a kind seen at the seen cap is accepted")
+      + check(!En.is_open(En.close(near)), "closed")
+    report("basics", ok + b1 + b2 + b3 + b4 + b5 + b6 + b7 + b8)
+  end
+
+  pfn add_go(e : Strata.Entities.Entities, i : Int, n : Int) : Strata.Entities.Entities do
+    if i >= n do e
+    else
+      let (e1, _id) = En.add(e, 0, int_to_float(i), 0.5, 0.0 -. int_to_float(i), 0.0)
+      add_go(e1, i + 1, n)
+    end
+  end
+  pfn vel_of(i : Int, axis : Int) : Float do
+    if axis == 0 do int_to_float(i) *. 0.5 else if axis == 1 do 0.0 -. int_to_float(i % 17) *. 0.25 else 1.0 end end
+  end
+  pfn vel_fill(a : NativeF32Arr, i : Int, n : Int) : NativeF32Arr do
+    if i >= 3 * n do a else vel_fill(NativeArray.set_f32(a, i, vel_of(i / 3, i % 3)), i + 1, n) end
+  end
+  pfn same_f32(a : NativeF32Arr, b : NativeF32Arr, i : Int) : Bool do
+    if i >= NativeArray.length_f32(a) do NativeArray.length_f32(a) == NativeArray.length_f32(b)
+    else if i >= NativeArray.length_f32(b) do false
+    else if NativeArray.get_f32(a, i) != NativeArray.get_f32(b, i) do false
+    else same_f32(a, b, i + 1) end end end
+  end
+  -- every entity's own velocity read equals its row of the column
+  pfn each_vel(e : Strata.Entities.Entities, ids : NativeIntArr, want : NativeF32Arr, i : Int) : Bool do
+    if i >= NativeArray.length_int(ids) do true
+    else
+      let (x, y, z) = En.velocity(e, NativeArray.get_int(ids, i))
+      if x == NativeArray.get_f32(want, 3 * i) && y == NativeArray.get_f32(want, 3 * i + 1) && z == NativeArray.get_f32(want, 3 * i + 2) do each_vel(e, ids, want, i + 1) else false end
+    end
+  end
+  pfn pos_ok(p : NativeF32Arr, i : Int, n : Int) : Bool do
+    if i >= n do true
+    else if NativeArray.get_f32(p, 3 * i) != int_to_float(i) || NativeArray.get_f32(p, 3 * i + 1) != 0.5 || NativeArray.get_f32(p, 3 * i + 2) != 0.0 -. int_to_float(i) do false
+    else pos_ok(p, i + 1, n) end end
+  end
+
+  -- columns: 1,000 entities of one kind, the velocity column written in one call and read back equal
+  pfn columns_scene() : Int do
+    let e = add_go(world([flyer(1, 0)], 2048), 0, 1000)
+    let ids = En.each(e, 0)
+    let p = En.column(e, 0, En.col_position())
+    let bad = check(En.is_open(e), "open")
+      + check(NativeArray.length_int(ids) == 1000, "each gives 1,000 ids")
+      + check(NativeArray.length_f32(p) == 3000, "the position column holds 3,000 floats")
+      + check(pos_ok(p, 0, 1000), "... each entity's position, in add order")
+    let v = vel_fill(NativeArray.make_f32(3000, 0.0), 0, 1000)
+    let e1 = En.set_column(e, 0, En.col_velocity(), v)
+    let back = En.column(e1, 0, En.col_velocity())
+    let bad2 = check(same_f32(v, back, 0), "the velocity column reads back equal")
+      + check(each_vel(e1, ids, v, 0), "each entity's velocity is its row of the column")
+      + check(refused(e1) == 0, "nothing refused")
+    let e2 = En.set_column(e1, 0, En.col_velocity(), NativeArray.make_f32(2997, 9.0))
+    let e3 = En.set_column(e2, 0, En.col_facing(), NativeArray.make_f32(1000, 0.75))
+    let bad3 = check(refused(e2) == 1 && reason(e2) == 12, "a column of 999 rows is refused, for its rows")
+      + check(same_f32(v, En.column(e2, 0, En.col_velocity()), 0), "... and writes nothing")
+      + check(En.facing(e3, NativeArray.get_int(ids, 999)) == 0.75, "the facing column writes each row's facing")
+      + check(NativeArray.length_f32(En.column(e3, 0, En.col_float(0))) == 1000, "the float slot 0 column has a float a row")
+      + check(NativeArray.length_f32(En.column(e3, 0, En.col_float(1))) == 0, "a slot past the kind's is no column")
+      + check(NativeArray.length_int(En.each(e3, 1)) == 0, "each of a kind not registered is empty")
+    report("columns", bad + bad2 + bad3 + check(!En.is_open(En.close(e3)), "closed"))
+  end
+
+  -- the Task 1 script's generator: a 32-bit LCG, the top 24 bits
+  pfn rng(s : Int) : Int do int_and(s * 1664525 + 1013904223, 4294967295) end
+  pfn top(s : Int) : Int do s / 256 end
+
+  -- one step of the Task 1 script; state is (world, ids, n, rng state)
+  pfn script_go(e : Strata.Entities.Entities, ids : NativeIntArr, n : Int, s : Int, step : Int) : (Strata.Entities.Entities, Int) do
+    if step >= 1000 do (e, n)
+    else
+      let s1 = rng(s)
+      let r = top(s1) % 10
+      if r < 5 || n == 0 do
+        let s2 = rng(s1)
+        let s3 = rng(s2)
+        let s4 = rng(s3)
+        let s5 = rng(s4)
+        let s6 = rng(s5)
+        let k = if int_and(top(s2), 1) == 1 do 1 else 0 end
+        let (e1, id) = En.add(e, k, int_to_float(top(s3) % 1000) *. 0.1, int_to_float(top(s4) % 100) *. 0.1, int_to_float(top(s5) % 1000) *. 0.1, 0.01 *. int_to_float(top(s6) % 628))
+        if id >= 0 do script_go(e1, NativeArray.set_int(ids, n, id), n + 1, s6, step + 1) else script_go(e1, ids, n, s6, step + 1) end
+      else if r < 8 do
+        let s2 = rng(s1)
+        let s3 = rng(s2)
+        let s4 = rng(s3)
+        let s5 = rng(s4)
+        let s6 = rng(s5)
+        let s7 = rng(s6)
+        let id = NativeArray.get_int(ids, top(s2) % n)
+        let x = int_to_float(top(s3) % 50) *. 0.5
+        let z = 0.25 *. int_to_float(top(s4) % 8)
+        let which = top(s5) % 3
+        let e1 = if which == 0 do En.set_position(e, id, x, -1.0, z) else if which == 1 do En.set_velocity(e, id, x, -1.0, z) else En.set_facing(e, id, x) end end
+        let e2 = En.set_int(En.set_float(e1, id, 0, int_to_float(top(s6) % 100) *. 0.01), id, 0, top(s7) % 1000)
+        script_go(e2, ids, n, s7, step + 1)
+      else
+        let s2 = rng(s1)
+        let i = top(s2) % n
+        let e1 = En.remove(e, NativeArray.get_int(ids, i))
+        script_go(e1, NativeArray.set_int(ids, i, NativeArray.get_int(ids, n - 1)), n - 1, s2, step + 1)
+      end end
+    end
+  end
+
+  -- one run of the script through open and close: (hash, live, refused, hash after one slot changed, live once closed).
+  -- Adds outnumber removes, so the 256 rows fill and later adds are refused, as in the C test.
+  pfn determinism_run() : (Int, Int, Int, Int, Int) do
+    let e0 = world([flyer(3, 2), flyer(1, 1)], 256)
+    let (e1, _n) = script_go(e0, NativeArray.make_int(256, -1), 0, 12345, 0)
+    let h = En.hash(e1)
+    let n = live(e1)
+    let r = refused(e1)
+    let first = NativeArray.get_int(En.each(e1, 0), 0)
+    let e2 = En.set_float(e1, first, 1, En.float(e1, first, 1) +. 1.0)
+    let changed = En.hash(e2)
+    let after = live(En.close(e2))
+    (h, n, r, changed, after)
+  end
+  -- determinism: the Task 1 scripted run twice in one process gives one hash
+  pfn determinism_scene() : Int do
+    let (h1, n1, r1, c1, after1) = determinism_run()
+    let (h2, n2, r2, _c2, after2) = determinism_run()
+    println("  hash " ++ int_to_string(h1) ++ " and " ++ int_to_string(h2) ++ "; " ++ int_to_string(n1) ++ " live, " ++ int_to_string(r1) ++ " adds refused once full")
+    report("determinism", check(h1 == h2, "two runs give one hash")
+      + check(h1 != 0, "the hash is not 0")
+      + check(n1 > 0 && n1 == n2, "the script leaves the same entities live")
+      + check(r1 == r2, "the same calls refused in both runs (adds once the 256 rows are full)")
+      + check(c1 != h1, "changing one slot changes the hash")
+      + check(after1 == 0 && after2 == 0, "none live once closed"))
+  end
+
+  -- every call on world c, which is closed: ignored, or the defaults
+  pfn closed_calls(c : Strata.Entities.Entities, id : Int) : Int do
+    let (c1, id2) = En.add(c, 0, 1.0, 2.0, 3.0, 0.0)
+    let c2 = En.set_facing(En.set_velocity(En.set_position(c1, id, 5.0, 5.0, 5.0), id, 1.0, 1.0, 1.0), id, 1.0)
+    let c3 = En.remove(En.set_int(En.set_float(c2, id, 0, 2.0), id, 0, 3), id)
+    let c4 = En.set_column(c3, 0, En.col_position(), NativeArray.make_f32(3, 1.0))
+    check(!En.is_open(c4), "not open")
+      + check(id2 == -1, "add gives -1")
+      + check(!En.alive(c4, id), "nothing is alive")
+      + check(En.kind_of(c4, id) == -1, "kind_of gives -1")
+      + check(En.position(c4, id) == (0.0, 0.0, 0.0) && En.velocity(c4, id) == (0.0, 0.0, 0.0), "position and velocity read 0")
+      + check(En.facing(c4, id) == 0.0 && En.age(c4, id) == 0.0, "facing and age read 0")
+      + check(En.float(c4, id, 0) == 0.0 && En.int(c4, id, 0) == 0, "slots read 0")
+      + check(NativeArray.length_int(En.each(c4, 0)) == 0, "each is empty")
+      + check(NativeArray.length_f32(En.column(c4, 0, En.col_position())) == 0, "a column is empty")
+      + check(En.hash(c4) == 0, "the hash is 0")
+      + check(En.stats(c4) == (0, 0, 0, 0) && En.stat(c4, 0) == 0.0, "the stats are 0")
+  end
+
+  -- closed: every call on a closed world is ignored or gives the defaults, even with another world open
+  pfn closed_scene() : Int do
+    let (e, id) = En.add(world([flyer(1, 1)], 16), 0, 1.0, 2.0, 3.0, 0.0)
+    let c = En.close(e)
+    let bad = closed_calls(c, id)
+    let (o, oid) = En.add(world([flyer(1, 1)], 16), 0, 4.0, 5.0, 6.0, 0.0)
+    let h = En.hash(o)
+    let bad2 = closed_calls(c, oid)
+      + check(En.alive(o, oid) && En.position(o, oid) == (4.0, 5.0, 6.0), "the open world's entity is untouched by calls on the closed one")
+      + check(live(o) == 1 && refused(o) == 0 && En.hash(o) == h, "... its count, refusals and hash too")
+    let oc = En.close(o)
+    let huge = En.open([flyer(0, 0)], 2000000, 128, 52, 3.2, 0.1)
+    let bad3 = closed_calls(huge, 0) + check(!En.is_open(huge), "a world over 1,048,576 is not open")
+    let dflt = En.open([flyer(0, 0)], 0, 0, 52, 3.2, 0.1)
+    let bad4 = check(En.is_open(dflt), "capacity and bodies 0 take the defaults and open")
+      + check(!En.is_open(En.close(dflt)), "closed")
+      + check(!En.is_open(oc), "the second world closed")
+    report("closed", bad + bad2 + bad3 + bad4)
+  end
+
+  fn main(_cap : Cap(IO)) : Unit do
+    let name = Env.get("ENTCHECK_SCENE", "")
+    if name == "basics" do process_exit(basics_scene())
+    else if name == "columns" do process_exit(columns_scene())
+    else if name == "determinism" do process_exit(determinism_scene())
+    else if name == "closed" do process_exit(closed_scene())
+    else
+      println("entcheck: no scene named '" ++ name ++ "' (basics, columns, determinism, closed)")
+      process_exit(2)
+    end end end end
+  end
+end
