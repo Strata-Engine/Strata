@@ -259,3 +259,19 @@ zeros (met in `Strata.Lattice`). Only a C write through the FFI lands in the
 caller's array, which is how `Strata.Noise.field2` and `field3` work.
 Workaround: return the array, or, where an out-parameter API is wanted,
 write the loop in C (`sl_fill` in `native/strata_noise.c`).
+
+## S31: a `Check.all` property never fails under `forge test`
+
+Met writing the far field's slot tests (generation Task 12): a property
+that is plainly false, `Check.all(Gen.int(0, 10), fn x -> false)`, passes,
+as do `Check.all_with` with a fixed seed and a `Check.all` whose result is
+bound and followed by an assertion. `MARCH_SKIP_PROPERTIES` is not set
+(forge sets it only for `--skip-properties`). So every `Check.all` in the
+suite checks nothing: a mutation of `Strata.Slots`' draw rule that drew a
+region twice went unnoticed by the property written for it, and was caught
+at once by the same walk run as an ordinary loop. Workaround: properties
+that matter are written as a fixed set of pseudo-random walks (a small
+linear congruential generator in the test) asserted with `Test.assert_*`;
+`test/slots_test.march` does this for the which-chunk-draws rule. The
+existing properties (chunk, slots under random traffic, and others) are
+left as they are, and are worth rewriting the same way.

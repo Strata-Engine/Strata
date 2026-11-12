@@ -27,9 +27,15 @@
 -- Levels (Part F of the renderer design): with `config_levels`, each level
 -- 1..levels (no higher than the generator declares) keeps a box of its own
 -- chunks, `far_h` out in x and z and `far_v` in y, around the level-L chunk
--- holding each focus, loaded, unloaded and meshed as level 0's is (its
--- neighbours are its own level's). Each level loads its whole box, also
--- under the finer levels. A level-0 edit makes its ancestors stale
+-- holding each focus, loaded and unloaded as level 0's is (its neighbours
+-- are its own level's). Each level's box also holds the parents of the box
+-- below it, and every level but the top is snapped out to whole chunks of
+-- the level above (the unload band is grown before it is snapped), so the
+-- renderer's which-chunk-draws rule (Strata.Slots) has clean edges. Each
+-- level loads its whole box, also under the finer levels, but a coarse
+-- chunk whose eight children are all loaded and can all be meshed is not
+-- meshed: the children draw that region. When one of them, or a neighbour
+-- one needs, unloads, the chunks above are looked at again and meshed. A level-0 edit makes its ancestors stale
 -- (Strata.World): `apply` and `tick` put the loaded (or wanted) ones at the
 -- head of the generation queue with a fresh stamp, and they go through the
 -- same two-tick pipeline as any chunk, so an edit never waits on a
@@ -187,21 +193,14 @@ mod Strata.Stream do
     end
   end
 
+  doc "The highest level streamed: the configuration's, no higher than the generator declares (0: the near field only)."
+  fn top_level(s : Stream) : Int do match s do Stream(w, c, _, _, _, _, _, _, _, _, _, _) -> top(c, w) end end
+
   fn world(s : Stream) : Strata.World.World do match s do Stream(w, _, _, _, _, _, _, _, _, _, _, _) -> w end end
   fn loaded_count(s : Stream) : Int do Wo.loaded_count(world(s)) end
 
   -- ── The wanted set ───────────────────────────────────────────────────────
   pfn absv(v : Int) : Int do if v < 0 do 0 - v else v end end
-
-  -- Is k within (h, v) chunks of some focus?
-  pfn near(fs : List(Strata.Coord.Key), k : Strata.Coord.Key, h : Int, v : Int) : Bool do
-    match fs do
-      Nil -> false
-      Cons(f, t) ->
-        if absv(Ko.kx(k) - Ko.kx(f)) <= h && absv(Ko.kz(k) - Ko.kz(f)) <= h && absv(Ko.ky(k) - Ko.ky(f)) <= v do true
-        else near(t, k, h, v) end
-    end
-  end
 
   pfn pow2(l : Int) : Int do if l <= 0 do 1 else 2 * pow2(l - 1) end end
   -- floor(v / d) for d > 0, any sign
@@ -213,13 +212,57 @@ mod Strata.Stream do
     List.map(fs, fn f -> Ko.key_at(fdiv(Ko.kx(f), n), fdiv(Ko.ky(f), n), fdiv(Ko.kz(f), n), l))
   end
 
+  -- One axis of a focus's box at level [l], before snapping: [rl] level-l
+  -- chunks about the level-l chunk holding the focus ([r0] at level 0), and
+  -- the parents of the level below's box, grown by [grow]. [f] is the
+  -- focus's level-0 chunk coordinate.
+  pfn span(f : Int, r0 : Int, rl : Int, l : Int, grow : Int) : (Int, Int) do
+    if l <= 0 do (f - r0 - grow, f + r0 + grow)
+    else
+      match span(f, r0, rl, l - 1, grow) do
+        (lo, hi) ->
+          let fl = fdiv(f, pow2(l))
+          let a = fdiv(lo, 2)
+          let b = fdiv(hi, 2)
+          (if a < fl - rl - grow do a else fl - rl - grow end, if b > fl + rl + grow do b else fl + rl + grow end)
+      end
+    end
+  end
+  -- ... snapped out to whole chunks of the level above, when there is one ([top] the highest level)
+  pfn snapped(f : Int, r0 : Int, rl : Int, l : Int, top : Int, grow : Int) : (Int, Int) do
+    match span(f, r0, rl, l, grow) do
+      (lo, hi) -> if l < top do (2 * fdiv(lo, 2), 2 * fdiv(hi, 2) + 1) else (lo, hi) end
+    end
+  end
+  pfn inside(v : Int, r : (Int, Int)) : Bool do
+    match r do (lo, hi) -> if v < lo do false else v <= hi end end
+  end
+  -- A focus's box at level [l] as (x0, x1, y0, y1, z0, z1), level-l chunk coordinates, inclusive.
+  pfn box_of(c : Config, top : Int, f : Strata.Coord.Key, l : Int, grow : Int) : (Int, Int, Int, Int, Int, Int) do
+    match snapped(Ko.kx(f), rh(c), fh(c), l, top, grow) do
+      (x0, x1) -> match snapped(Ko.ky(f), rv(c), fv(c), l, top, grow) do
+        (y0, y1) -> match snapped(Ko.kz(f), rh(c), fh(c), l, top, grow) do
+          (z0, z1) -> (x0, x1, y0, y1, z0, z1)
+        end
+      end
+    end
+  end
+
   -- Is k in its level's box about some focus, grown by [grow] chunks? Levels
   -- above [hi] are wanted nowhere.
   pfn in_box(c : Config, hi : Int, fs : List(Strata.Coord.Key), k : Strata.Coord.Key, grow : Int) : Bool do
     let l = Ko.level(k)
-    if l == 0 do near(fs, k, rh(c) + grow, rv(c) + grow)
-    else if l < 0 || l > hi do false
-    else near(focus_at(fs, l), k, fh(c) + grow, fv(c) + grow) end end
+    if l < 0 do false else if l > hi do false else in_boxes(c, hi, fs, k, l, grow) end end
+  end
+  pfn in_boxes(c : Config, hi : Int, fs : List(Strata.Coord.Key), k : Strata.Coord.Key, l : Int, grow : Int) : Bool do
+    match fs do
+      Nil -> false
+      Cons(f, t) ->
+        if !inside(Ko.kx(k), snapped(Ko.kx(f), rh(c), fh(c), l, hi, grow)) do in_boxes(c, hi, t, k, l, grow)
+        else if !inside(Ko.kz(k), snapped(Ko.kz(f), rh(c), fh(c), l, hi, grow)) do in_boxes(c, hi, t, k, l, grow)
+        else if !inside(Ko.ky(k), snapped(Ko.ky(f), rv(c), fv(c), l, hi, grow)) do in_boxes(c, hi, t, k, l, grow)
+        else true end end end
+    end
   end
 
   pfn has_key(l : List(Strata.Coord.Key), k : Strata.Coord.Key) : Bool do
@@ -236,34 +279,52 @@ mod Strata.Stream do
     if a >= b && a >= c do a else if b >= c do b else c end end
   end
 
-  -- Sort one focus's box into buckets by Chebyshev distance: bucket d gains
-  -- the box's keys at distance d that are not loaded and not already seen.
-  -- One pass over the box; i walks it.
-  pfn bucket(w : Strata.World.World, seen : Strata.Store.Store(Bool), bs : Strata.Tree.Tree(List(Strata.Coord.Key)), f : Strata.Coord.Key, h : Int, v : Int, multi : Bool, i : Int) : (Strata.Store.Store(Bool), Strata.Tree.Tree(List(Strata.Coord.Key))) do
-    let nh = 2 * h + 1
-    let nv = 2 * v + 1
-    if i >= nh * nh * nv do (seen, bs)
-    else
-      let dx = i % nh - h
-      let dz = (i / nh) % nh - h
-      let dy = i / (nh * nh) - v
-      let k = Ko.offset(f, dx, dy, dz)
-      -- with one focus no key can come up twice, so the seen set is left alone
-      if Wo.is_loaded(w, k) || (multi && So.has(seen, k)) do bucket(w, seen, bs, f, h, v, multi, i + 1)
-      else
-        let d = cheb(dx, dy, dz)
-        bucket(w, if multi do So.put(seen, k, true) else seen end, Strata.Tree.set(bs, d, Cons(k, Strata.Tree.get(bs, d))), f, h, v, multi, i + 1)
-      end
+  -- Sort one focus's box into buckets by Chebyshev distance from the chunk
+  -- [fl] holding the focus: bucket d gains the box's keys at distance d that
+  -- are not loaded and not already seen. One pass over the box; i walks it.
+  pfn bucket(w : Strata.World.World, seen : Strata.Store.Store(Bool), bs : Strata.Tree.Tree(List(Strata.Coord.Key)), fl : Strata.Coord.Key, bx : (Int, Int, Int, Int, Int, Int), multi : Bool, i : Int) : (Strata.Store.Store(Bool), Strata.Tree.Tree(List(Strata.Coord.Key))) do
+    match bx do
+      (x0, x1, y0, y1, z0, z1) ->
+        let nx = x1 - x0 + 1
+        let nz = z1 - z0 + 1
+        let ny = y1 - y0 + 1
+        if i >= nx * nz * ny do (seen, bs)
+        else
+          let x = x0 + i % nx
+          let z = z0 + (i / nx) % nz
+          let y = y0 + i / (nx * nz)
+          let k = Ko.key_at(x, y, z, Ko.level(fl))
+          -- with one focus no key can come up twice, so the seen set is left alone
+          if Wo.is_loaded(w, k) || (multi && So.has(seen, k)) do bucket(w, seen, bs, fl, bx, multi, i + 1)
+          else
+            let d = cheb(x - Ko.kx(fl), y - Ko.ky(fl), z - Ko.kz(fl))
+            bucket(w, if multi do So.put(seen, k, true) else seen end, Strata.Tree.set(bs, d, Cons(k, Strata.Tree.get(bs, d))), fl, bx, multi, i + 1)
+          end
+        end
     end
   end
 
-  pfn buckets_for(w : Strata.World.World, seen : Strata.Store.Store(Bool), bs : Strata.Tree.Tree(List(Strata.Coord.Key)), fs : List(Strata.Coord.Key), h : Int, v : Int, multi : Bool) : Strata.Tree.Tree(List(Strata.Coord.Key)) do
+  -- how far a box reaches from [fl], the chunk holding its focus, in chunks (Chebyshev)
+  pfn reach(fl : Strata.Coord.Key, bx : (Int, Int, Int, Int, Int, Int)) : Int do
+    match bx do
+      (x0, x1, y0, y1, z0, z1) ->
+        List.fold_left(Cons(Ko.kx(fl) - x0, Cons(x1 - Ko.kx(fl), Cons(Ko.ky(fl) - y0, Cons(y1 - Ko.ky(fl), Cons(Ko.kz(fl) - z0, Cons(z1 - Ko.kz(fl), Nil)))))), 0, fn (m, v) -> if v > m do v else m end)
+    end
+  end
+
+  pfn buckets_for(w : Strata.World.World, c : Config, top : Int, l : Int, seen : Strata.Store.Store(Bool), bs : Strata.Tree.Tree(List(Strata.Coord.Key)), fs : List(Strata.Coord.Key), multi : Bool) : Strata.Tree.Tree(List(Strata.Coord.Key)) do
     match fs do
       Nil -> bs
       Cons(f, t) ->
-        match bucket(w, seen, bs, f, h, v, multi, 0) do
-          (seen2, bs2) -> buckets_for(w, seen2, bs2, t, h, v, multi)
+        match bucket(w, seen, bs, head_or(focus_at(Cons(f, Nil), l), f), box_of(c, top, f, l, 0), multi, 0) do
+          (seen2, bs2) -> buckets_for(w, c, top, l, seen2, bs2, t, multi)
         end
+    end
+  end
+  pfn head_or(l : List(Strata.Coord.Key), d : Strata.Coord.Key) : Strata.Coord.Key do
+    match l do
+      Nil -> d
+      Cons(h, _) -> h
     end
   end
 
@@ -285,21 +346,23 @@ mod Strata.Stream do
   end
 
   -- One level's wanted chunks that are not loaded, nearest to a focus first.
-  pfn missing_at(w : Strata.World.World, fs : List(Strata.Coord.Key), h : Int, v : Int) : List(Strata.Coord.Key) do
-    let far = if h > v do h else v end
+  pfn missing_at(w : Strata.World.World, c : Config, top : Int, fs : List(Strata.Coord.Key), l : Int) : List(Strata.Coord.Key) do
+    let far = List.fold_left(fs, 0, fn (m, f) ->
+      let r = reach(head_or(focus_at(Cons(f, Nil), l), f), box_of(c, top, f, l, 0))
+      if r > m do r else m end)
     let multi = match fs do
       Cons(_, Cons(_, _)) -> true
       _ -> false
     end
-    drain(buckets_for(w, So.empty(false), Strata.Tree.from_list(nils(far + 1, Nil), Nil), fs, h, v, multi), far, Nil)
+    drain(buckets_for(w, c, top, l, So.empty(false), Strata.Tree.from_list(nils(far + 1, Nil), Nil), fs, multi), far, Nil)
   end
 
   -- Wanted chunks that are not loaded: level 0 nearest to a focus first,
   -- then each coarser level likewise.
   pfn missing(w : Strata.World.World, c : Config, fs : List(Strata.Coord.Key)) : List(Strata.Coord.Key) do
     let hi = top(c, w)
-    let coarse = List.fold_left(List.reverse(List.range(1, hi + 1)), Nil, fn (acc, l) -> List.append(missing_at(w, focus_at(fs, l), fh(c), fv(c)), acc))
-    List.append(missing_at(w, fs, rh(c), rv(c)), coarse)
+    let coarse = List.fold_left(List.reverse(List.range(1, hi + 1)), Nil, fn (acc, l) -> List.append(missing_at(w, c, hi, fs, l), acc))
+    List.append(missing_at(w, c, hi, fs, 0), coarse)
   end
 
   -- ── Unloading ────────────────────────────────────────────────────────────
@@ -319,7 +382,9 @@ mod Strata.Stream do
         if keep do drop_far(d, t, c, fs)
         else
           match d do
-            Dropped(w, m, gone) -> drop_far(Dropped(Wo.unload(w, k), forget(m, k), log_unload(gone, k)), t, c, fs)
+            Dropped(w, m, gone) ->
+              let w2 = Wo.unload(w, k)
+              drop_far(Dropped(w2, wake(forget(m, k), w2, k, top(c, w2)), log_unload(gone, k)), t, c, fs)
           end
         end
     end
@@ -371,6 +436,33 @@ mod Strata.Stream do
     else
       let n = Ko.offset(k, i % 3 - 1, i / 9 - 1, (i / 3) % 3 - 1)
       add_todo(if Wo.is_loaded(w, n) do Cons(n, todo) else todo end, w, k, i + 1)
+    end
+  end
+
+  -- [k] unloaded: a coarse chunk over it, or over a chunk that needed it as a
+  -- neighbour, may no longer have all its children meshable, and so must be
+  -- meshed itself. Those are the parents of k's 27, at most 8 keys: put the
+  -- loaded ones on the todo list (send_meshes decides).
+  pfn wake(m : Meshing, w : Strata.World.World, k : Strata.Coord.Key, top : Int) : Meshing do
+    if Ko.level(k) >= top do m
+    else
+      match m do
+        Meshing(need, asked, ready, todo, clock) ->
+          let ps = List.map(List.range(0, 8), fn i -> Ko.key_at(fdiv(Ko.kx(k) + 2 * (i % 2) - 1, 2), fdiv(Ko.ky(k) + 2 * ((i / 2) % 2) - 1, 2), fdiv(Ko.kz(k) + 2 * (i / 4) - 1, 2), Ko.level(k) + 1))
+          Meshing(need, asked, ready, List.fold_left(ps, todo, fn (acc, p) -> if Wo.is_loaded(w, p) do Cons(p, acc) else acc end), clock)
+      end
+    end
+  end
+
+  -- Are all eight children of coarse chunk [k] loaded and meshable (all their
+  -- neighbours loaded)? Then they draw its region and it needs no mesh.
+  pfn under(w : Strata.World.World, k : Strata.Coord.Key) : Bool do
+    if Ko.level(k) <= 0 do false else all_meshable(w, Ko.children(k)) end
+  end
+  pfn all_meshable(w : Strata.World.World, ks : List(Strata.Coord.Key)) : Bool do
+    match ks do
+      Nil -> true
+      Cons(k, t) -> if Strata.Mesh.has_all(Wo.chunks(w), k) do all_meshable(w, t) else false end
     end
   end
 
@@ -529,11 +621,13 @@ mod Strata.Stream do
             Meshing(need, asked, ready, td, clock) ->
               let want = So.get(need, k)
               if want == 0 || want == So.get(asked, k) || !Strata.Mesh.has_all(Wo.chunks(w), k) do send_meshes(t, seen2, m, out, left, w, room)
+              -- a coarse chunk over meshable children is not meshed; wake looks at it again when one goes
+              else if under(w, k) do send_meshes(t, seen2, m, out, left, w, room)
               else if room <= 0 do send_meshes(t, seen2, m, out, Cons(k, left), w, room)
               else
                 let task = mesh_task(Wo.registry(w), Strata.Mesh.around_of(Wo.chunks(w), k), Ko.level(k))
                 send_meshes(t, seen2, Meshing(need, So.put(asked, k, want), ready, td, clock), Cons(MeshTask(k, want, task), out), left, w, room - 1)
-              end end
+              end end end
           end
         end
     end

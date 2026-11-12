@@ -24,6 +24,7 @@ mod Strata.Test.Slots do
     Strata.Mesh.build(reg(), Strata.Mesh.around_from(fn (dx, dy, dz) -> if dx == 0 && dy == 0 && dz == 0 do c else C.uniform(0) end))
   end
   pfn k(n : Int) : Strata.Coord.Key do Cd.key(n, 0 - n, n * 3) end
+  pfn one_key(k : Strata.Coord.Key) : List((Strata.Coord.Key, Strata.Mesh.Meshed)) do Cons((k, mesh(1)), Nil) end
   pfn one(n : Int, quads : Int) : List((Strata.Coord.Key, Strata.Mesh.Meshed)) do Cons((k(n), mesh(quads)), Nil) end
 
   pfn uploads(l : List(Strata.Slots.Action), acc : Int) : Int do
@@ -200,6 +201,230 @@ mod Strata.Test.Slots do
         let s = run(Sl.new(5), ops, mesh(1))
         distinct(s, 0, 1, 5) && Sl.used(s) == held(s, 0, 0) && Sl.used(s) <= 5
       )
+    end
+  end
+
+  -- ── Levels: which chunk draws (Part F) ─────────────────────────────────────
+  pfn lv(cap : Int, top : Int) : Strata.Slots.Slots do
+    match Sl.with_levels(Sl.new(cap), top) do (s, _) -> s end
+  end
+  pfn par() : Strata.Coord.Key do Cd.key_at(0, 0, 0, 1) end
+  pfn kids() : List(Strata.Coord.Key) do Cd.children(par()) end
+  pfn meshed(ks : List(Strata.Coord.Key)) : List((Strata.Coord.Key, Strata.Mesh.Meshed)) do List.map(ks, fn k -> (k, mesh(1))) end
+  pfn none_drawn(s : Strata.Slots.Slots, ks : List(Strata.Coord.Key)) : Bool do
+    match ks do
+      Nil -> true
+      Cons(k, t) -> if Sl.drawn(s, k) do false else none_drawn(s, t) end
+    end
+  end
+  pfn all_drawn(s : Strata.Slots.Slots, ks : List(Strata.Coord.Key)) : Bool do
+    match ks do
+      Nil -> true
+      Cons(k, t) -> if Sl.drawn(s, k) do all_drawn(s, t) else false end
+    end
+  end
+  pfn all_held(s : Strata.Slots.Slots, ks : List(Strata.Coord.Key)) : Bool do
+    match ks do
+      Nil -> true
+      Cons(k, t) -> if Sl.slot_of(s, k) >= 0 do all_held(s, t) else false end
+    end
+  end
+  pfn hides(l : List(Strata.Slots.Action), slot : Int) : Bool do
+    match l do
+      Nil -> false
+      Cons(a, t) -> if Sl.is_visibility(a) && Sl.slot(a) == slot && !Sl.shown(a) do true else hides(t, slot) end
+    end
+  end
+  pfn pfrees(l : List(Strata.Slots.Action), acc : Int) : Int do
+    match l do
+      Nil -> acc
+      Cons(a, t) -> pfrees(t, if Sl.is_free(a) do acc + 1 else acc end)
+    end
+  end
+  -- the index of the last upload and of the first free, so an order can be checked
+  pfn first_free_at(l : List(Strata.Slots.Action), i : Int) : Int do
+    match l do
+      Nil -> -1
+      Cons(a, t) -> if Sl.is_free(a) do i else first_free_at(t, i + 1) end
+    end
+  end
+  pfn last_upload_at(l : List(Strata.Slots.Action), i : Int, last : Int) : Int do
+    match l do
+      Nil -> last
+      Cons(a, t) -> last_upload_at(t, i + 1, if Sl.is_upload(a) do i else last end)
+    end
+  end
+  pfn take(l : List(Strata.Coord.Key), n : Int) : List(Strata.Coord.Key) do
+    if n <= 0 do Nil else match l do
+      Nil -> Nil
+      Cons(h, t) -> Cons(h, take(t, n - 1))
+    end end
+  end
+
+  -- a level-2 key, its 8 level-1 children and their 64 level-0 children: 73 keys
+  pfn top2() : Strata.Coord.Key do Cd.key_at(0, 0, 0, 2) end
+  pfn ones() : List(Strata.Coord.Key) do Cd.children(top2()) end
+  pfn zeros() : List(Strata.Coord.Key) do List.fold_left(ones(), Nil, fn (acc, k) -> List.append(Cd.children(k), acc)) end
+  pfn tree_keys() : List(Strata.Coord.Key) do Cons(top2(), List.append(ones(), zeros())) end
+  -- a narrower tree, so that a random walk often holds a key and its parent at once:
+  -- the level-2 key, two of its children, and the first one's eight
+  pfn narrow_keys() : List(Strata.Coord.Key) do Cons(top2(), Cons(nth_key(ones(), 0), Cons(nth_key(ones(), 1), Cd.children(nth_key(ones(), 0))))) end
+  -- a scripted walk over the narrow tree: fill bottom up, empty the middle, refill, leave from the bottom, come back from the top
+  pfn script() : List((Int, Int)) do
+    List.append(List.map(List.range(0, 11), fn i -> (10 - i, 1)),
+      List.append(Cons((1, 0), Cons((3, 0), Cons((4, 0), Nil))),
+        List.append(List.map(List.range(3, 11), fn i -> (i, 0)),
+          List.append(Cons((1, 1), Cons((0, 0), Cons((2, 0), Nil))), List.map(List.range(0, 11), fn i -> (i, 1))))))
+  end
+  pfn nth_key(ks : List(Strata.Coord.Key), i : Int) : Strata.Coord.Key do
+    match ks do
+      Nil -> top2()
+      Cons(h, t) -> if i <= 0 do h else nth_key(t, i - 1) end
+    end
+  end
+  pfn walk(s : Strata.Slots.Slots, ks : List(Strata.Coord.Key), ops : List((Int, Int)), m : Strata.Mesh.Meshed) : Strata.Slots.Slots do
+    match ops do
+      Nil -> s
+      Cons((i, what), t) ->
+        let k = nth_key(ks, i)
+        walk(if what == 0 do step(s, Nil, Cons(k, Nil)) else step(s, Cons((k, m), Nil), Nil) end, ks, t, m)
+    end
+  end
+  -- a pseudo-random op list: (key index below [nkeys], 0 the key goes, else a mesh arrives)
+  pfn lcg(x : Int) : Int do (x * 1103515245 + 12345) % 2147483648 end
+  pfn rand_ops(x : Int, n : Int, nkeys : Int, acc : List((Int, Int))) : List((Int, Int)) do
+    if n <= 0 do acc
+    else
+      let a = lcg(x)
+      let b = lcg(a)
+      rand_ops(b, n - 1, nkeys, Cons(((a / 65536) % nkeys, (b / 65536) % 3), acc))
+    end
+  end
+  -- the walk, checked with `once` after every step
+  pfn checked(s : Strata.Slots.Slots, ks : List(Strata.Coord.Key), ops : List((Int, Int)), m : Strata.Mesh.Meshed) : Bool do
+    match ops do
+      Nil -> true
+      Cons(op, t) ->
+        let s2 = walk(s, ks, Cons(op, Nil), m)
+        if once(s2, zeros()) do checked(s2, ks, t, m) else false end
+    end
+  end
+  -- every level-0 cell of the tree: drawn by at most one of the three keys over it, and by exactly one when any of them holds a mesh
+  pfn once(s : Strata.Slots.Slots, cells : List(Strata.Coord.Key)) : Bool do
+    match cells do
+      Nil -> true
+      Cons(c, t) ->
+        let over = Cons(c, Cons(Cd.parent(c), Cons(Cd.parent(Cd.parent(c)), Nil)))
+        let n = List.fold_left(over, 0, fn (acc, k) -> if Sl.drawn(s, k) do acc + 1 else acc end)
+        let any = List.fold_left(over, false, fn (acc, k) -> if acc do true else Sl.slot_of(s, k) >= 0 end)
+        if n > 1 do false
+        else if any && n == 0 do false
+        else once(s, t) end end
+    end
+  end
+
+  describe "Slots with levels: which chunk draws" do
+    test "a level-1 key and seven of its children: the parent is drawn and none of the children" do
+      let s = step(lv(64, 1), Cons((par(), mesh(1)), meshed(take(kids(), 7))), Nil)
+      Test.assert_true(Sl.drawn(s, par()), "the parent is drawn")
+      Test.assert_true(none_drawn(s, take(kids(), 7)), "no child is")
+      Test.assert_true(all_held(s, take(kids(), 7)), "though each holds its mesh")
+    end
+    test "with all eight children they are drawn and the parent is hidden, keeping its slot" do
+      let s7 = step(lv(64, 1), Cons((par(), mesh(1)), meshed(take(kids(), 7))), Nil)
+      let ps = Sl.slot_of(s7, par())
+      match Sl.plan(s7, meshed(Cons(nth_key(kids(), 7), Nil)), Nil) do
+        (s8, acts) ->
+          Test.assert_false(Sl.drawn(s8, par()), "the parent is hidden")
+          Test.assert_eq_int(Sl.slot_of(s8, par()), ps, "in the slot it had")
+          Test.assert_true(hides(acts, ps), "the plan hides the parent's slot")
+          Test.assert_true(all_drawn(s8, kids()), "all eight children are drawn")
+      end
+    end
+    test "when the eight children leave and the parent holds its mesh, it is drawn at once and their slots are freed" do
+      let s8 = step(lv(64, 1), Cons((par(), mesh(1)), meshed(kids())), Nil)
+      match Sl.plan(s8, Nil, kids()) do
+        (s9, acts) ->
+          Test.assert_true(Sl.drawn(s9, par()), "the parent is drawn again, with no new upload")
+          Test.assert_eq_int(uploads(acts, 0), 0, "nothing is uploaded")
+          Test.assert_eq_int(pfrees(acts, 0), 8, "the eight slots are freed")
+          Test.assert_eq_int(Sl.retained(s9), 0, "nothing is retained")
+      end
+    end
+    test "when the eight children leave before their parent has a mesh, they keep their slots and are drawn until the parent's upload" do
+      let s8 = step(lv(64, 1), meshed(kids()), Nil)
+      Test.assert_true(all_drawn(s8, kids()), "with no parent held the children are drawn")
+      match Sl.plan(s8, Nil, kids()) do
+        (s9, acts) ->
+          Test.assert_eq_int(pfrees(acts, 0), 0, "no slot is freed")
+          Test.assert_eq_int(Sl.retained(s9), 8, "the eight are retained")
+          Test.assert_true(all_drawn(s9, kids()), "and still drawn")
+          let s10 = step(s9, Nil, Nil)
+          Test.assert_eq_int(Sl.retained(s10), 8, "a plan without the parent's mesh keeps them")
+          match Sl.plan(s10, one_key(par()), Nil) do
+            (s11, acts2) ->
+              Test.assert_eq_int(uploads(acts2, 0), 1, "the parent is uploaded")
+              Test.assert_eq_int(pfrees(acts2, 0), 8, "and the eight retained slots freed")
+              Test.assert_true(last_upload_at(acts2, 0, -1) < first_free_at(acts2, 0), "after the upload")
+              Test.assert_eq_int(Sl.retained(s11), 0, "nothing is retained")
+              Test.assert_true(Sl.drawn(s11, par()), "the parent is drawn")
+              Test.assert_true(none_drawn(s11, kids()), "and the children are gone")
+          end
+      end
+    end
+    test "a retained key whose parent leaves too, with no level above, is freed" do
+      let s9 = step(step(lv(64, 1), meshed(kids()), Nil), Nil, kids())
+      match Sl.plan(s9, Nil, Cons(par(), Nil)) do
+        (s10, acts) ->
+          Test.assert_eq_int(pfrees(acts, 0), 8, "the retained slots are freed")
+          Test.assert_eq_int(Sl.retained(s10), 0, "nothing is retained")
+      end
+    end
+    test "a retained key that is meshed again is live again" do
+      let s9 = step(step(lv(64, 1), meshed(kids()), Nil), Nil, kids())
+      let s10 = step(s9, meshed(kids()), Nil)
+      Test.assert_eq_int(Sl.retained(s10), 0, "nothing is retained")
+      let s11 = step(s10, one_key(par()), Nil)
+      Test.assert_true(all_held(s11, kids()), "the parent's arrival frees none of them")
+      Test.assert_false(Sl.drawn(s11, par()), "and the parent is hidden under them")
+    end
+    test "a key outside the levels, a body part's, is drawn and freed as before" do
+      let pk = Strata.Physics.part_key(3, 0)
+      let s = step(lv(64, 1), one_key(pk), Nil)
+      Test.assert_true(Sl.drawn(s, pk), "drawn")
+      match Sl.plan(s, Nil, Cons(pk, Nil)) do
+        (s2, acts) ->
+          Test.assert_eq_int(pfrees(acts, 0), 1, "freed at once")
+          Test.assert_eq_int(Sl.retained(s2), 0, "not retained")
+      end
+    end
+    test "over a scripted walk, no region is drawn twice, and none that holds a mesh goes undrawn, at every step" do
+      let ks = narrow_keys()
+      let m = mesh(1)
+      let r = List.fold_left(script(), (lv(64, 2), true), fn (acc, op) ->
+        match acc do (s, ok) -> let s2 = walk(s, ks, Cons(op, Nil), m)
+          (s2, ok && once(s2, zeros())) end)
+      match r do (s, ok) ->
+        Test.assert_true(ok, "once at every step")
+        Test.assert_eq_int(Sl.retained(s), 0, "and at the end, with every key back, nothing is retained")
+      end
+    end
+    -- pseudo-random walks, checked after every step (Check.all cannot fail here: GAPS S31)
+    test "over 40 pseudo-random walks of 150 steps in the narrow tree, the same holds at every step" do
+      let ks = narrow_keys()
+      let m = mesh(1)
+      let bad = List.fold_left(List.range(1, 41), 0, fn (acc, seed) -> if checked(lv(64, 2), ks, rand_ops(seed, 150, 11, Nil), m) do acc else acc + 1 end)
+      Test.assert_eq_int(bad, 0, "walks that drew a region twice or not at all")
+    end
+    test "over 20 pseudo-random walks of 300 steps in the whole 73-key tree, the same holds at every step, and slots in use are the keys holding one" do
+      let ks = tree_keys()
+      let m = mesh(1)
+      let bad = List.fold_left(List.range(1, 21), 0, fn (acc, seed) ->
+        let ops = rand_ops(seed * 7919, 300, 73, Nil)
+        let s = walk(lv(128, 2), ks, ops, m)
+        let counted = Sl.used(s) == List.fold_left(ks, 0, fn (a, k) -> if Sl.slot_of(s, k) >= 0 do a + 1 else a end)
+        if checked(lv(128, 2), ks, ops, m) && counted do acc else acc + 1 end)
+      Test.assert_eq_int(bad, 0, "walks that drew a region twice or not at all, or miscounted")
     end
   end
 end
