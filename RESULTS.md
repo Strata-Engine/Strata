@@ -453,3 +453,55 @@ MoltenVK holds a frame for a whole second.
 Found on the way (GAPS S15): passing the shared block registry into the
 mesher's per-face function made meshing seven times slower. The soak caught
 it; chunk streaming is back to 0.27 s for 1183 chunks.
+
+# Generation plan
+
+## Task 10: the island measured against the design's targets
+
+Release builds, one task for the chunk timings, on the shared development
+machine (14 cores). Every row gives the load average it was measured at.
+The load never fell under 28 during the task and the timings below were all
+taken between 37 and 58; the chunk numbers move by half again between runs
+at the same load, so they are ranges, not points. Nothing was cut to meet a
+number.
+
+| target | result | load | |
+|---|---|---|---|
+| atlas build, 512 x 512: under 60 s | 13.5 s (built fresh into an empty cache) | 46 | met |
+| atlas build, 256 x 256: under 15 s | 2.0 s (the demo, fresh cache) | 53 | met |
+| atlas read from the cache | 41 to 47 ms | 40 to 55 | |
+| surface chunk at 1 m, median: 1 ms | 25.9 to 41.7 ms | 37 to 56 | missed |
+| surface chunk at 1 m, worst: 3 ms | 57.8 to 72.3 ms | 37 to 56 | missed |
+| surface chunk at 0.5 m, median / worst | 27.3 to 41.7 ms / 59.1 to 92.6 ms | 43 to 56 | missed |
+| surface chunk at 0.25 m, median / worst: 1 ms / 3 ms | 37.3 to 43.3 ms / 84.9 to 107.2 ms | 43 to 56 | missed |
+| air chunk: under 20 us | 54 to 114 us at 1 m, 39 to 57 us at 0.5 m, 34 us at 0.25 m | 37 to 56 | missed |
+| solid chunk: under 20 us | 59 to 112 us at 1 m, 41 to 56 us at 0.5 m, 23 us at 0.25 m | 37 to 56 | missed |
+| soak worst frame: 16.7 ms (the soak allows 20) | 294 to 399 ms at 0.25 m (mean 30.5 to 38.9 ms); 146 ms at 1 m (mean 7.7 ms) | 55 to 67 | missed |
+| soak fluid step on the main thread: under 6 ms | 3.4 to 33.9 ms at 0.25 m; 0.2 ms at 1 m | 55 to 67 | missed at 0.25 m |
+| lakes at rest: no lake loses over 1% in 1000 fluid steps | 0 eighths lost: the one lake loaded at both ends at 0.25 m kept 194 720 of 194 720; at 1 m two lakes kept 3392 and 2776 | 55 to 67 | met |
+
+A surface chunk is the one holding the ground at the middle of each of 200
+columns about the origin; an air (solid) chunk is the one 224 m over
+(under) it: 7 chunks at 1 m, 14 at 0.5 m, 28 at 0.25 m, every one uniform.
+(Seven chunks at 0.25 m, 56 m, is inside the early-out's margin over the
+hills and was generated in full; the first 0.25 m run measured that, 6.6 ms,
+by mistake.)
+
+Against the code before this task: the Task 9 viewer, built from its commit
+and run alternately with this one in the same minutes, timed 31.5 and
+29.3 ms median at 1 m where this one timed 33.7 and 35.7 ms (load 37 to
+46): a tenth to a fifth slower, about as much as one run differs from the
+next. The likeliest share is the eight settings the density now takes as
+arguments a voxel where it had constants; reading them from an array each
+voxel instead had timed 27.6 ms against 25.9 ms for the arguments, in runs
+a few minutes apart. Not chased further.
+
+The soak flies 40 m round the test lake 12 m over its water at 0.25 m for
+6010 frames (1000 fluid steps), blasting a crater where it looks every 100
+frames. Nothing was refused or left waiting, no buffer space was lost, the
+GPU held 1.64 million quads (1.45 million at 1 m). Its slow frames are not
+the frame's own work: the slowest (294 ms) spent 0.94 ms in March and 0.59
+ms in the renderer's shim, the rest out of the process's hands on a machine
+at load 55. At 0.25 m the stream keeps eight workers generating chunks four
+times as small as at 1 m, so the main thread competes for cores more often
+(2857 frames over 25 ms at 0.25 m, 367 at 1 m, in runs a minute apart).

@@ -29,9 +29,12 @@ the shaders (`native/build_shaders.sh`).
 
 In the viewer: W A S D move, the mouse looks, space jumps, F switches
 between walking and flying (space and left shift then rise and sink), left
-click carves a sphere, right click builds one, escape quits. Carve the
-rim of a lake in the hills and it drains. `L` steps
-through the light modes and `[` and `]` lower and raise the sun.
+click blasts a crater (with a spray in the colour of what it threw up),
+right click builds a sphere, escape quits. Blast the rim of a lake in the
+hills and it drains. `L` steps through the light modes, `[` and `]` lower
+and raise the sun, and `R` rereads the island's settings and regenerates.
+
+## The island
 
 The world is an island 2 km across, read from `Strata.Atlas`: rivers run
 to the sea in their channels and lakes stand at their spill level. Under
@@ -40,9 +43,55 @@ caves that open here and there, its steepest slopes relaxed to scree
 (`Strata.Thermal`), grass over dirt over stone laid by `Strata.Surface`.
 Trees, grown at start-up by a procedural branching generator (oak, birch,
 pine, willow) and scattered by `Strata.Feature`, stand across chunk borders;
-ruins stand on the atlas's sites with the ground pulled up to them. Its atlas
-takes about 4 s to build and is cached in `.march/atlas` (read in about
-30 ms after that); `STRATA_ISLAND=0` brings back the older noise terrain.
+ruins stand on the atlas's sites with the ground pulled up to them.
+
+**The atlas cache.** The atlas is one pass over the whole island (height,
+erosion, drainage, rivers, lakes, regions, sites); at 512 x 512 samples it
+takes seconds to build, so `Strata.Atlas.load_or_build(dir, def, seed)` keeps
+it in `dir` (the viewer's `.march/atlas`) under a name made from the
+definition and the seed, and reads it back in tens of milliseconds. Change a
+setting of the definition and a new atlas is built beside the old.
+
+**The generator calls a game makes.** A generator is a pure function of a
+chunk key and a seed, and may carry a second one, its stamps:
+
+```march
+-- the chunk function, and the replay of its template pass alone
+let g = Strata.Terrain.with_stamps(Strata.Terrain.gen(fn (k, seed) -> chunk(k, seed)),
+                                   Strata.Terrain.Stamps(fn (k, seed) -> stamps(k, seed)))
+let w = Strata.World.new(reg, g, seed, 0.25)          -- metres a voxel
+
+-- which voxels of a chunk a placed structure wrote: its index + 1, 0 for none
+let st = Strata.Terrain.stamps(g, k, seed)            -- all zeros without stamps
+
+-- a crater: a sphere whose radius varies by direction, up to 1.3 times
+let o = Strata.Edit.blast(Strata.Stream.world(s), x, y, z, 6, crater_seed, 0)
+
+-- tuning: drop every unedited chunk and remake it from a new generator
+let s2 = Strata.Stream.regenerate(s, g2)
+```
+
+Stamps are not stored: a game asks for them when it needs them (a blast on
+a ruin), and a stamped voxel that is now air was removed by an edit.
+
+**The scale rule.** Everything the generator knows is in metres: lengths,
+heights, noise periods. The world's scale (metres a voxel, given to
+`Strata.World.new`) only decides how finely that shape is cut into voxels,
+so the same seed makes the same island at 1 m, 0.5 m or 0.25 m a voxel, its
+features as many metres across. Voxel counts (a blast's radius, a chunk's 32)
+stay voxels. The stream's focus and `Strata.Query.raycast` take metres;
+the renderer, the camera, edits and `Strata.Fluid` work in voxels. The
+viewer's fixed scenes are posed at 1 m; `STRATA_SCALE=0.25` runs it finer.
+
+**The parameter file.** Every number the viewer's generator uses (the atlas
+definition, the detail and density noise, the cave thresholds, the surface
+lines, the tree kind, each region's tree density, species mix and cave
+factor) is a line of `viewer/assets/island.gen`, `name = value`, read at
+start and again on `R` (or `STRATA_REGEN=1` in a scripted run). A name the
+file leaves out takes the code's default and is said once a load; a name it
+does not know, or a line it cannot read, is said and ignored. Regenerating
+first finishes the fluid's step in flight and starts the fluid afresh, then
+drops every chunk nobody edited and makes it again.
 
 Environment switches for scripted runs are listed at the top of
 `viewer/lib/strata_viewer.march`: a fixed scene (`STRATA_SCENE`), a frame
@@ -174,9 +223,9 @@ let s4 = Strata.Stream.apply(s3, Strata.Edit.fill_sphere(Strata.Stream.world(s3)
 | `Strata.Quad` | the packed 8-byte quad and instance formats |
 | `Strata.Occupancy` | one-bit-per-voxel solid masks |
 | `Strata.Mesh` | the greedy mesher |
-| `Strata.Terrain` | the generator contract |
+| `Strata.Terrain` | the generator contract; a generator's stamps (its structure layer) |
 | `Strata.World` | loaded chunks, the edited-chunk cache, queued edits |
-| `Strata.Edit` | single, list, box and sphere edits |
+| `Strata.Edit` | single, list, box and sphere edits; blasts |
 | `Strata.Stream` | loading around focus points; task-built chunks and meshes |
 | `Strata.Query` | raycast and swept box collision |
 | `Strata.Fluid` | finite fluids: fall, run to a drop, stay level, sink, rest |
