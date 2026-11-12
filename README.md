@@ -479,6 +479,38 @@ let e3 = Strata.Entities.set_column(e2, 0, Strata.Entities.col_velocity(), vel)
 
     (cd entcheck && forge build --release) && ENTCHECK_SCENE=basics entcheck/.march/build/release/entcheck
 
+## The match
+
+A small complete game in the viewer, to show the parts working together: a
+free-for-all between the player and eleven computer fighters, first to 30
+kills (`docs/2026-11-12-combat-design.md`).
+
+```sh
+MARCH_PIN_MAIN=1 STRATA_SHORE=1 STRATA_COMBAT=1 STRATA_LIGHT=4 ./viewer/.march/build/release/strata_viewer
+```
+
+- **You**: slot 1 is a bow (accurate, 35 a hit, an arrow every 0.6 s), slot 2
+  fire (60 where it lands, less out to 2 m, yourself included; a fireball
+  every 1.5 s). Hold the left button to shoot. Slots 3 to 9 are blocks: the
+  left button digs one block within 6 m, the right places one. Fire burns
+  wood, leaves, tall grass and ice within 2 m and turns grass to dirt.
+- **They**: seven rushers (100 health, a swing for 25) and four shooters (60
+  health, arrows). Each goes for the nearest fighter it can see, whoever that
+  is. They swim, climb out at a low bank, and cannot attack from the water.
+  They do not dig, place or burn.
+- **Keys**: Tab the table, Enter another match once one is won. Flight is off.
+  More than 150 m from the field the match is paused.
+- A fighter is an entity (`Strata.Entities`) drawn as a figure (`Strata.Anim`)
+  the match places each frame; shots are flying entities; the rules are pure
+  March in `viewer/lib/combat.march`, the rest in `viewer/lib/match.march` and
+  `match_hud.march`. `scripts/combat_check.sh` plays ten scripted scenes
+  hidden, each twice, and the gate runs it.
+
+Not in it: melee for the player, path finding (a blocked fighter sidesteps;
+one stuck 20 s is put back at a spawn point), enemies that dig or burn, fire
+that spreads, drowning, new sounds, a flash on a hit (waiting on a per-figure
+tint in the animation work).
+
 ## Using it from a game
 
     [deps]
