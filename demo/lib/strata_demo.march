@@ -84,27 +84,31 @@ mod StrataDemo do
     voxels(height_m(int_to_float(wx) *. scale, int_to_float(wz) *. scale, seed), scale)
   end
 
-  pfn block_at(wx : Int, wy : Int, wz : Int, h : Int, lvl : Int, seed : Int) : Int do
+  -- a voxel of a level-0 chunk when scatter, else of a coarser one (no tall grass or lamps)
+  pfn block_at(wx : Int, wy : Int, wz : Int, h : Int, lvl : Int, seed : Int, scatter : Bool) : Int do
     if wy > h + 1 do (if wy <= lvl do 3 else 0 end)
     else if wy == h + 1 do
       (if wy <= lvl do 3
+       else if !scatter do 0
        else if Strata.Seed.unit(Strata.Seed.cell(seed, 11, wx, 0, wz)) > 0.93 do 13
        else if Strata.Seed.unit(Strata.Seed.cell(seed, 12, wx, 0, wz)) > 0.998 do 12
-       else 0 end end end)
+       else 0 end end end end)
     else if wy >= h - 2 do 2
     else 1 end end end
   end
 
-  pfn fill_go(a : NativeI32Arr, x0 : Int, y0 : Int, z0 : Int, lvl : Int, seed : Int, hs : NativeIntArr, i : Int) : NativeI32Arr do
+  pfn fill_go(a : NativeI32Arr, x0 : Int, y0 : Int, z0 : Int, lvl : Int, seed : Int, scatter : Bool, hs : NativeIntArr, i : Int) : NativeI32Arr do
     if i >= 32768 do a
     else
       let x = i % 32
       let z = (i / 32) % 32
-      fill_go(NativeArray.set_i32(a, i, block_at(x0 + x, y0 + i / 1024, z0 + z, NativeArray.get_int(hs, x + 32 * z), lvl, seed)), x0, y0, z0, lvl, seed, hs, i + 1)
+      fill_go(NativeArray.set_i32(a, i, block_at(x0 + x, y0 + i / 1024, z0 + z, NativeArray.get_int(hs, x + 32 * z), lvl, seed, scatter)), x0, y0, z0, lvl, seed, scatter, hs, i + 1)
     end
   end
-  pfn heights_go(hs : NativeIntArr, x0 : Int, z0 : Int, seed : Int, scale : Float, i : Int) : NativeIntArr do
-    if i >= 1024 do hs else heights_go(NativeArray.set_int(hs, i, column(x0 + i % 32, z0 + i / 32, seed, scale)), x0, z0, seed, scale, i + 1) end
+  -- the columns' ground voxels, the land lifted [lift] metres
+  pfn heights_go(hs : NativeIntArr, x0 : Int, z0 : Int, seed : Int, scale : Float, lift : Float, i : Int) : NativeIntArr do
+    if i >= 1024 do hs
+    else heights_go(NativeArray.set_int(hs, i, voxels(height_m(int_to_float(x0 + i % 32) *. scale, int_to_float(z0 + i / 32) *. scale, seed) +. lift, scale)), x0, z0, seed, scale, lift, i + 1) end
   end
   pfn span_go(hs : NativeIntArr, i : Int, lo : Int, hi : Int) : (Int, Int) do
     if i >= 1024 do (lo, hi)
@@ -114,37 +118,61 @@ mod StrataDemo do
     end
   end
 
-  pfn chunk_for(k : Strata.Coord.Key, seed : Int, scale : Float) : Strata.Chunk.Chunk do
+  pfn pow2f(l : Int) : Float do if l <= 0 do 1.0 else 2.0 *. pow2f(l - 1) end end
+
+  -- The chunk at k. A level-L chunk is the same land at scale * 2^L metres a
+  -- voxel, with no tall grass or lamps, and the land lifted half a voxel so
+  -- a coarse voxel is solid where a fine one under it would be (as the viewer's island).
+  pfn chunk_for(k : Strata.Coord.Key, seed : Int, scale0 : Float) : Strata.Chunk.Chunk do
+    let l = Kd2.level(k)
+    let scale = scale0 *. pow2f(l)
     let x0 = 32 * Kd2.kx(k)
     let y0 = 32 * Kd2.ky(k)
     let z0 = 32 * Kd2.kz(k)
     let lvl = level(scale)
-    let hs = heights_go(NativeArray.make_int(1024, 0), x0, z0, seed, scale, 0)
+    let hs = heights_go(NativeArray.make_int(1024, 0), x0, z0, seed, scale, if l == 0 do 0.0 else 0.5 *. scale end, 0)
     match span_go(hs, 0, 100000, -100000) do
       (lo, hi) ->
         if y0 > (if hi + 1 > lvl do hi + 1 else lvl end) do Cd2.uniform(0)
         else if y0 + 31 < lo - 2 do Cd2.uniform(1)
-        else Cd2.from_flat(fill_go(NativeArray.make_i32(32768, 0), x0, y0, z0, lvl, seed, hs, 0)) end end
+        else Cd2.from_flat(fill_go(NativeArray.make_i32(32768, 0), x0, y0, z0, lvl, seed, l == 0, hs, 0)) end end
     end
   end
 
-  doc "The demo's generator for a world of [scale] metres a voxel."
-  fn terrain(scale : Float) : Strata.Terrain.Gen do Strata.Terrain.gen(fn (k, seed) -> chunk_for(k, seed, scale)) end
+  doc "The highest level of detail the demo's generator makes."
+  fn levels() : Int do 4 end
+
+  doc "The demo's generator for a world of [scale] metres a voxel, at levels 0..levels()."
+  fn terrain(scale : Float) : Strata.Terrain.Gen do Strata.Terrain.gen_levels(fn (k, seed) -> chunk_for(k, seed, scale), levels()) end
 
   -- ── Measuring ────────────────────────────────────────────────────────────
   pfn fixed1(v : Float) : String do float_to_string(Math.round(v *. 100.0) /. 100.0) end
   pfn per(total_ms : Int, n : Int) : String do fixed1(int_to_float(total_ms) /. int_to_float(if n < 1 do 1 else n end)) ++ " ms" end
 
-  -- (total ms, worst ms, count) of generating each chunk of a box, one at a time
-  pfn bench_gen(g : Strata.Terrain.Gen, seed : Int, cx : Int, cy : Int, cz : Int, h : Int, v : Int, i : Int, total : Int, worst : Int) : (Int, Int, Int) do
+  -- (total ms, worst ms, count) of generating each chunk of a box of level-[lv] chunks, one at a time
+  pfn bench_gen(g : Strata.Terrain.Gen, lv : Int, seed : Int, cx : Int, cy : Int, cz : Int, h : Int, v : Int, i : Int, total : Int, worst : Int) : (Int, Int, Int) do
     let nh = 2 * h + 1
     let nv = 2 * v + 1
     if i >= nh * nh * nv do (total, worst, i)
     else
       let t0 = unix_time_ms()
-      let c = Strata.Terrain.run(g, Kd2.key(cx + i % nh - h, cy + i / (nh * nh) - v, cz + (i / nh) % nh - h), seed)
+      let c = Strata.Terrain.run(g, Kd2.key_at(cx + i % nh - h, cy + i / (nh * nh) - v, cz + (i / nh) % nh - h, lv), seed)
       let dt = unix_time_ms() - t0 + (if Cd2.form(c) < 0 do 1 else 0 end)
-      bench_gen(g, seed, cx, cy, cz, h, v, i + 1, total + dt, if dt > worst do dt else worst end)
+      bench_gen(g, lv, seed, cx, cy, cz, h, v, i + 1, total + dt, if dt > worst do dt else worst end)
+    end
+  end
+
+  -- floor(v / 2^l)
+  pfn up(v : Int, l : Int) : Int do if l <= 0 do v else up(if v >= 0 do v / 2 else 0 - ((1 - v) / 2) end, l - 1) end end
+
+  -- the generator's time a chunk at levels 1..top over the box of the same radii about the level-l chunk holding chunk (cx, cy, cz)
+  pfn bench_levels(g : Strata.Terrain.Gen, seed : Int, cx : Int, cy : Int, cz : Int, h : Int, v : Int, l : Int, top : Int) : Unit do
+    if l > top do ()
+    else
+      match bench_gen(g, l, seed, up(cx, l), up(cy, l), up(cz, l), h, v, 0, 0, 0) do
+        (total, worst, count) -> println("  terrain at level " ++ int_to_string(l) ++ ": " ++ per(total, count) ++ " a chunk over " ++ int_to_string(count) ++ " chunks, worst " ++ int_to_string(worst) ++ " ms")
+      end
+      bench_levels(g, seed, cx, cy, cz, h, v, l + 1, top)
     end
   end
 
@@ -207,9 +235,10 @@ mod StrataDemo do
         println(name ++ ": " ++ int_to_string(n) ++ " chunks loaded (" ++ int_to_string(u) ++ " uniform, " ++ int_to_string(p) ++ " paletted, " ++ int_to_string(d) ++ " direct)")
         println("  voxel storage " ++ int_to_string(bytes / 1024) ++ " KB, " ++ int_to_string(bytes / (if n < 1 do 1 else n end)) ++ " bytes a chunk on average (a flat byte array would be 32768)")
     end
-    match bench_gen(Wd2.terrain(w), seed, cx, cy, cz, h, v, 0, 0, 0) do
+    match bench_gen(Wd2.terrain(w), 0, seed, cx, cy, cz, h, v, 0, 0, 0) do
       (total, worst, count) -> println("  terrain: " ++ per(total, count) ++ " a chunk over " ++ int_to_string(count) ++ " chunks, worst " ++ int_to_string(worst) ++ " ms")
     end
+    bench_levels(Wd2.terrain(w), seed, cx, cy, cz, h, v, 1, 2)
     match bench_mesh(w, Std.keys(Wd2.chunks(w)), MeshStat(0, 0, 0, 0, 0, 0, 0, 0)) do
       MeshStat(n, qs, ins, nb, total, worst, full, full_ms) ->
         println("  mesh: " ++ per(total, n) ++ " a chunk over " ++ int_to_string(n) ++ " chunks, worst " ++ int_to_string(worst) ++ " ms; " ++ per(full_ms, full) ++ " over the " ++ int_to_string(full) ++ " that have something to draw")

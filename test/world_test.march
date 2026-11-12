@@ -104,6 +104,80 @@ mod Strata.Test.World do
     end
   end
 
+  -- ── Levels ───────────────────────────────────────────────────────────────
+  -- 1 stone, 2..9 a fluid (9 full), 10 tall grass (a cross)
+  pfn reg3() : Strata.Blocks.Registry do
+    let water = B.with_layer(B.with_opacity(B.def(), Strata.Blocks.SeeThrough), Strata.Blocks.Translucent)
+    let grass = B.with_collide(B.with_style(B.with_opacity(B.def(), Strata.Blocks.Clear), Strata.Blocks.Cross), false)
+    match B.register(B.empty(), B.def()) do
+      Ok((r1, _)) ->
+        match B.register_fluid(r1, water) do
+          Ok((r2, _)) ->
+            match B.register(r2, grass) do
+              Ok((r3, _)) -> r3
+              Err(_) -> r2
+            end
+          Err(_) -> r1
+        end
+      Err(_) -> B.empty()
+    end
+  end
+  -- stone below y = 0 at levels 0..2
+  pfn flat_levels() : Strata.Terrain.Gen do
+    Strata.Terrain.gen_levels(fn (k, seed) -> if Cd.ky(k) < 0 do C.uniform(1) else C.uniform(0) end, 2)
+  end
+  pfn load_key(w : Strata.World.World, k : Strata.Coord.Key) : Strata.World.World do
+    Wd.insert(w, k, Strata.Terrain.run(Wd.terrain(w), k, Wd.seed(w)))
+  end
+  -- 20 of the 64 level-0 chunks under level-2 key (0, -1, 0): loaded, each with a 4-cube carved at its corner
+  pfn carve20(w : Strata.World.World, i : Int) : Strata.World.World do
+    if i >= 20 do w
+    else
+      let cx = i % 4
+      let cy = 0 - 1 - (i / 4) % 4
+      let cz = i / 16
+      let w1 = load_key(w, Cd.key(cx, cy, cz))
+      carve20(Ed.world(Ed.fill_box(w1, 32 * cx + 4 * (i % 8), 32 * cy + 8, 32 * cz + 4, 32 * cx + 4 * (i % 8) + 3, 32 * cy + 11, 32 * cz + 7, 0)), i + 1)
+    end
+  end
+  pfn same_chunk(a : Strata.Chunk.Chunk, b : Strata.Chunk.Chunk, i : Int) : Bool do
+    if i >= 32768 do true
+    else if C.get_or(a, i % 32, i / 1024, (i / 32) % 32, -1) != C.get_or(b, i % 32, i / 1024, (i / 32) % 32, -1) do false
+    else same_chunk(a, b, i + 1) end end
+  end
+  pfn count_air(c : Strata.Chunk.Chunk, i : Int, n : Int) : Int do
+    if i >= 32768 do n else count_air(c, i + 1, if C.get_or(c, i % 32, i / 1024, (i / 32) % 32, -1) == 0 do n + 1 else n end) end
+  end
+
+  describe "World levels" do
+    test "coarsening: solid cube blocks win, then a fluid as a full voxel, then air; a cross counts as air" do
+      let w0 = load_key(Wd.new(reg3(), flat_levels(), 7, 1.0), Cd.key(0, 0, 0))
+      -- cube (0..1)^3: one tall grass; cube x 2..3: water (a part state) and air; cube x 4..5: two water, one stone, one grass
+      let cells = Cons((0, 0, 0, 10), Cons((2, 0, 0, 4), Cons((4, 0, 0, 1), Cons((5, 0, 0, 3), Cons((4, 1, 0, 3), Cons((5, 1, 1, 10), Nil))))))
+      let w = Ed.world(Ed.set_many(w0, cells))
+      Test.assert_true(Wd.is_edited(w, Cd.key(0, 0, 0)), "the fine chunk is edited")
+      let c = Wd.coarsen(w, Cd.key_at(0, 0, 0, 1))
+      Test.assert_eq_int(C.get(c, 0, 0, 0), 0, "a lone cross in air coarsens to air")
+      Test.assert_eq_int(C.get(c, 1, 0, 0), 9, "water and air coarsen to water, a full voxel of its family")
+      Test.assert_eq_int(C.get(c, 2, 0, 0), 1, "stone, water and grass coarsen to stone, though water is the commoner")
+      Test.assert_eq_int(C.get(c, 3, 0, 0), 0, "an untouched cube of air stays air")
+    end
+    test "a coarse chunk is put as given; coarsen_over on the edits captured gives World.coarsen's chunk" do
+      let w = carve20(Wd.new(reg3(), flat_levels(), 7, 1.0), 0)
+      let k = Cd.key_at(0, -1, 0, 2)
+      let fines = Wd.edits_under(w, k)
+      Test.assert_eq_int(List.length(fines), 20, "20 edited fine chunks captured")
+      let generated = Strata.Terrain.run(Wd.terrain(w), k, Wd.seed(w))
+      let plain = Strata.Store.get(Wd.chunks(Wd.insert(w, k, generated)), k)
+      Test.assert_eq_int(C.uniform_id(plain), 1, "insert does no coarsening: the generated chunk as it was given")
+      -- what a worker task does
+      let made = Wd.coarsen_over(Wd.registry(w), k, generated, fines)
+      let put = Strata.Store.get(Wd.chunks(Wd.insert(w, k, made)), k)
+      Test.assert_true(same_chunk(put, Wd.coarsen(w, k), 0), "equal to World.coarsen")
+      Test.assert_eq_int(count_air(put, 0, 0), 20, "each carve one air voxel at level 2")
+    end
+  end
+
   describe "World" do
     test "a block reads as air until its chunk is inserted" do
       let w = fresh()

@@ -1,6 +1,5 @@
--- The viewer's lakes: terrain stays a pure function, a lake's rim holds its
--- water, and the sea is not a fluid. Then the island read from an atlas:
--- lakes, rivers, the damped detail.
+-- The viewer's lakes: the island read from an atlas, its lakes, rivers and
+-- damped detail, and the sea is not a fluid.
 mod StrataViewer.Test.Lakes do
   -- the app's capabilities are charged to its test module too (GAPS S3)
   needs IO.Console
@@ -18,26 +17,6 @@ mod StrataViewer.Test.Lakes do
 
   pfn same_go(a : Strata.Chunk.Chunk, b : Strata.Chunk.Chunk, i : Int) : Bool do
     if i >= 32768 do true else if Chl2.get_or(a, i % 32, i / 1024, (i / 32) % 32, -1) != Chl2.get_or(b, i % 32, i / 1024, (i / 32) % 32, -1) do false else same_go(a, b, i + 97) end end
-  end
-
-  -- load the chunks covering x0..x1, z0..z1 (chunk coordinates) at heights cy 0..2
-  pfn load_go(w : Strata.World.World, x0 : Int, x1 : Int, z0 : Int, z1 : Int, x : Int, y : Int, z : Int) : Strata.World.World do
-    if y > 2 do w
-    else if z > z1 do load_go(w, x0, x1, z0, z1, x0, y + 1, z0)
-    else if x > x1 do load_go(w, x0, x1, z0, z1, x0, y, z + 1)
-    else load_go(Wl2.insert(w, Cl2.key(x, y, z), Vw.terrain(1.0, x, y, z, 7)), x0, x1, z0, z1, x + 1, y, z) end end end
-  end
-
-  -- every lake-water cell at the water line has no air beside it; the count of water cells seen, or -1 at the first leak
-  pfn held(w : Strata.World.World, cx : Int, cz : Int, rad : Int, line : Int, i : Int, n : Int, seen : Int) : Int do
-    if i >= n * n do seen
-    else
-      let x = cx - rad - 4 + i % n
-      let z = cz - rad - 4 + i / n
-      if !Bl2.is_fluid(Vw.registry(), Wl2.get_block(w, x, line, z)) do held(w, cx, cz, rad, line, i + 1, n, seen)
-      else if Wl2.get_block(w, x - 1, line, z) == 0 || Wl2.get_block(w, x + 1, line, z) == 0 || Wl2.get_block(w, x, line, z - 1) == 0 || Wl2.get_block(w, x, line, z + 1) == 0 do -1
-      else held(w, cx, cz, rad, line, i + 1, n, seen + 1) end end
-    end
   end
 
 
@@ -599,26 +578,72 @@ mod StrataViewer.Test.Lakes do
     end
   end
 
+  -- ── Levels ─────────────────────────────────────────────────────────────
+  -- ground: not air, water, lake water, tall grass or a post
+  pfn ground(id : Int) : Bool do
+    if id <= 0 do false else if id == 5 do false else if id == 11 || id == 12 do false else id < Vw.lake_base() end end end
+  end
+  -- the coarsening of a level-1 key's eight children: whether any of the 2 x 2 x 2 fine voxels under each coarse voxel is ground (flat index)
+  pfn coarse_go(cs : List(Strata.Chunk.Chunk), out : NativeIntArr, i : Int) : NativeIntArr do
+    if i >= 32768 do out
+    else
+      let x = i % 32
+      let z = (i / 32) % 32
+      let y = i / 1024
+      -- Coord.children's order: x fastest, then y, then z
+      let c = List.nth(cs, (x / 16) + 2 * (y / 16) + 4 * (z / 16))
+      let fx = (2 * x) % 32
+      let fy = (2 * y) % 32
+      let fz = (2 * z) % 32
+      let any = List.any(List.range(0, 8), fn t -> ground(Chl2.get_or(c, fx + t % 2, fy + (t / 2) % 2, fz + t / 4, 0)))
+      coarse_go(cs, NativeArray.set_int(out, i, if any do 1 else 0 end), i + 1)
+    end
+  end
+  -- ground in the coarse chunk at (x, y, z) or one of its 26 neighbours inside it
+  pfn near_ground(c : Strata.Chunk.Chunk, x : Int, y : Int, z : Int, t : Int) : Bool do
+    if t >= 27 do false
+    else if ground(Chl2.get_or(c, x + t % 3 - 1, y + t / 9 - 1, z + (t / 3) % 3 - 1, 0)) do true
+    else near_ground(c, x, y, z, t + 1) end end
+  end
+  -- the chunk coordinate and the local of v - 1, v or v + 1 (d = -1..1) across a chunk border
+  pfn across(v : Int, d : Int) : (Int, Int) do if v + d < 0 do (-1, 31) else if v + d > 31 do (1, 0) else (0, v + d) end end end
+  -- as near_ground, looking into the neighbouring chunks (generated) where a neighbour lies outside
+  pfn near_ground_out(g : Strata.Terrain.Gen, key : Strata.Coord.Key, c : Strata.Chunk.Chunk, x : Int, y : Int, z : Int, t : Int) : Bool do
+    if t >= 27 do false
+    else
+      match (across(x, t % 3 - 1), across(y, t / 9 - 1), across(z, (t / 3) % 3 - 1)) do
+        ((ox, lx), (oy, ly), (oz, lz)) ->
+          let ch = if ox == 0 && oy == 0 && oz == 0 do c else Strata.Terrain.run(g, Cl2.offset(key, ox, oy, oz), 7) end
+          if ground(Chl2.get_or(ch, lx, ly, lz, 0)) do true else near_ground_out(g, key, c, x, y, z, t + 1) end
+      end
+    end
+  end
+  -- (coarsened ground voxels, those with no coarse ground within one voxel)
+  pfn contain_go(g : Strata.Terrain.Gen, key : Strata.Coord.Key, c : Strata.Chunk.Chunk, fine : NativeIntArr, i : Int, n : Int, miss : Int) : (Int, Int) do
+    if i >= 32768 do (n, miss)
+    else if NativeArray.get_int(fine, i) == 0 do contain_go(g, key, c, fine, i + 1, n, miss)
+    else if near_ground(c, i % 32, i / 1024, (i / 32) % 32, 0) do contain_go(g, key, c, fine, i + 1, n + 1, miss)
+    else if near_ground_out(g, key, c, i % 32, i / 1024, (i / 32) % 32, 0) do contain_go(g, key, c, fine, i + 1, n + 1, miss)
+    else contain_go(g, key, c, fine, i + 1, n + 1, miss + 1) end end end end
+  end
+  -- 10 level-1 keys at the ground, drawn from the island's middle: (coarsened ground voxels, those missed, the most missed in one key)
+  pfn levels_go(a : Strata.Atlas.Atlas, g : Strata.Terrain.Gen, k : Int, n : Int, miss : Int, worst : Int) : (Int, Int, Int) do
+    if k >= 10 do (n, miss, worst)
+    else
+      let h = Strata.Seed.cell(7, 79, k, 0, 0)
+      let cx = int_abs(h) % 12 - 6
+      let cz = int_abs(h / 64) % 12 - 6
+      let gy = col_h(Vw.island_column(a, cx * 64 + 32, cz * 64 + 32, 7, 1.0))
+      let key = Cl2.parent(Cl2.key(2 * cx, Cl2.chunk_of(gy), 2 * cz))
+      let coarse = Strata.Terrain.run(g, key, 7)
+      let fine = coarse_go(List.map(Cl2.children(key), fn ck -> Strata.Terrain.run(g, ck, 7)), NativeArray.make_int(32768, 0), 0)
+      match contain_go(g, key, coarse, fine, 0, 0, 0) do
+        (cnt, m) -> levels_go(a, g, k + 1, n + cnt, miss + m, if m > worst do m else worst end)
+      end
+    end
+  end
+
   describe "Viewer lakes" do
-    test "terrain with lakes is still a pure function" do
-      match Vw.test_lake(7) do
-        (cx, cz, rad, line, _) ->
-          Test.assert_true(rad > 0, "seed 7 has a lake near the origin")
-          let kx = Cl2.chunk_of(cx)
-          let kz = Cl2.chunk_of(cz)
-          Test.assert_true(same_go(Vw.terrain(1.0, kx, Cl2.chunk_of(line), kz, 7), Vw.terrain(1.0, kx, Cl2.chunk_of(line), kz, 7), 0), "the same chunk twice")
-      end
-    end
-    test "a lake's rim holds its water" do
-      match Vw.test_lake(7) do
-        (cx, cz, rad, line, _) ->
-          let w = load_go(Wl2.new(Vw.registry(), Strata.Terrain.gen(fn (k, seed) -> Chl2.uniform(0)), 7, 1.0), Cl2.chunk_of(cx - rad - 5), Cl2.chunk_of(cx + rad + 5), Cl2.chunk_of(cz - rad - 5), Cl2.chunk_of(cz + rad + 5), Cl2.chunk_of(cx - rad - 5), 0, Cl2.chunk_of(cz - rad - 5))
-          let n = held(w, cx, cz, rad, line, 0, 2 * rad + 9, 0)
-          Test.assert_true(n > 0, "the lake has water at its line, and none of it stands beside air")
-          Test.assert_true(Bl2.is_fluid(Vw.registry(), Wl2.get_block(w, cx, line, cz)), "its middle is lake water")
-          Test.assert_eq_int(Wl2.get_block(w, cx, line + 1, cz), 0, "with air over it")
-      end
-    end
     test "a column inside an atlas lake holds lake water to the lake level over sand" do
       let a = atlas()
       match wet_lake(Strata.Atlas.lakes(a)) do
@@ -803,6 +828,23 @@ mod StrataViewer.Test.Lakes do
       Test.assert_false(Bl2.is_fluid(Vw.registry(), 5), "the sea never moves")
       Test.assert_true(Bl2.is_fluid(Vw.registry(), Vw.lake_base()), "lake water does")
       Test.assert_eq_int(Bl2.fill(Vw.registry(), Vw.lake_base() + 7), 8, "and its last state is a full voxel")
+    end
+    test "a level-1 chunk holds the coarsening of its eight children within one voxel, on 10 keys at the ground" do
+      let a = island()
+      match levels_go(a, Vw.island_gen(a, Vw.bare_decor(), 1.0), 0, 0, 0, 0) do
+        (n, miss, worst) ->
+          println("levels: " ++ int_to_string(n) ++ " coarsened ground voxels over 10 level-1 keys, " ++ int_to_string(miss) ++ " with no level-1 ground within one voxel (worst key " ++ int_to_string(worst) ++ ")")
+          Test.assert_true(n > 10000, "the keys hold ground")
+          Test.assert_eq_int(miss, 0, "every coarsened ground voxel has level-1 ground within one voxel")
+      end
+    end
+    test "a level-3 key beyond the atlas is sea: water to the sea line, ground under it, air over it" do
+      let a = island()
+      let c = Strata.Terrain.run(Vw.island_gen(a, Vw.bare_decor(), 1.0), Cl2.key_at(6, 0, -7, 3), 7)
+      -- 8 m voxels: the sea at 40 m is voxel 5, the floor at 20 m voxel 2
+      Test.assert_true(List.all(List.range(0, 1024), fn t -> Chl2.get_or(c, t % 32, 5, t / 32, -1) == 5), "water at the sea line in every column")
+      Test.assert_true(List.all(List.range(0, 1024), fn t -> Chl2.get_or(c, t % 32, 6, t / 32, -1) == 0), "air over it")
+      Test.assert_true(List.all(List.range(0, 1024), fn t -> ground(Chl2.get_or(c, t % 32, 0, t / 32, -1))), "ground at the bottom")
     end
   end
 end

@@ -75,6 +75,30 @@ mod Strata.Test.Stream do
     h
   end
 
+  -- ── Levels ───────────────────────────────────────────────────────────────
+  -- the same land at levels 0..2: stone under y = 0, the pillar at every level
+  pfn layered() : Strata.Terrain.Gen do
+    Strata.Terrain.gen_levels(fn (k, seed) ->
+      if Cd.ky(k) < 0 do C.uniform(1)
+      else if Cd.ky(k) == 0 do C.fill_box(C.uniform(0), 3, 0, 3, 3, (Cd.kx(k) * 7 + Cd.kz(k) * 13 + seed + Cd.level(k)) % 9 + 9, 3, 1)
+      else C.uniform(0) end end, 2)
+  end
+  pfn begin_levels() : Strata.Stream.Stream do
+    Sm.start(Wd.new(reg(), layered(), 7, 1.0), Sm.config_levels(2, 1, 8, 4, 2, 1, 2))
+  end
+  pfn at_level(s : Strata.Stream.Stream, l : Int) : Int do
+    Strata.Store.fold(Wd.chunks(Sm.world(s)), 0, fn (n, k, _c) -> if Cd.level(k) == l do n + 1 else n end)
+  end
+  pfn mesh_levels(l : List((Strata.Coord.Key, Strata.Mesh.Meshed))) : Bool do
+    match l do
+      Nil -> true
+      Cons((k, m), t) -> if Strata.Mesh.level(m) != Cd.level(k) do false else mesh_levels(t) end
+    end
+  end
+  pfn mesh_at(l : List((Strata.Coord.Key, Strata.Mesh.Meshed)), lv : Int) : Int do
+    List.fold_left(l, 0, fn (n, p) -> match p do (k, _) -> if Cd.level(k) == lv do n + 1 else n end end)
+  end
+
   describe "Stream" do
     test "loads the box around the focus and meshes every chunk with all its neighbours" do
       let s = at(begin(8, 2), 0.5, 0.5, 0.5)
@@ -263,10 +287,115 @@ mod Strata.Test.Stream do
       Sm.stop(s2)
     end
 
+    test "regenerate remakes every unedited chunk from the new generator and keeps the edited ones" do
+      let s = at(begin(8, 2), 0.5, 0.5, 0.5)
+      let s1 = Sm.apply(s, Ed.set_block(Sm.world(s), 5, -5, 5, 0))
+      -- the new land: stone everywhere, also above y = 0
+      let s2 = Sm.regenerate(s1, Strata.Terrain.gen(fn (k, seed) -> C.uniform(1)))
+      match Sm.take_unloads(s2) do
+        (s3, gone) ->
+          Test.assert_true(has_key(gone, Cd.key(1, 0, 1)), "an unedited chunk is dropped: the renderer frees it")
+          Test.assert_false(has_key(gone, Cd.key(0, -1, 0)), "the edited chunk is not")
+          let s4 = Sm.run_until_settled(s3, 20000)
+          Test.assert_eq_int(Wd.get_block(Sm.world(s4), 40, 20, 40), 1, "an unedited chunk is the new land's")
+          Test.assert_eq_int(Wd.get_block(Sm.world(s4), 5, -5, 5), 0, "the edit is kept")
+          Test.assert_eq_int(Sm.loaded_count(s4), Sm.loaded_count(s), "the same box is loaded")
+          Sm.stop(s4)
+      end
+    end
+
     test "two focus points load the union of their boxes" do
       let s = Sm.run_until_settled(Sm.set_focus(begin(8, 2), Cons((0.5, 0.5, 0.5), Cons((640.5, 0.5, 0.5), Nil))), 20000)
       Test.assert_eq_int(Sm.loaded_count(s), 150, "two boxes that do not touch")
       Sm.stop(s)
+    end
+    test "with levels, a settled stream holds each level's box, meshes carry their level, and the world is the same by two paths" do
+      let s = at(begin_levels(), 0.5, 0.5, 0.5)
+      Test.assert_eq_int(at_level(s, 0), 75, "level 0: 5 x 3 x 5")
+      Test.assert_eq_int(at_level(s, 1), 75, "level 1: 5 x 3 x 5 of its own chunks")
+      Test.assert_eq_int(at_level(s, 2), 75, "level 2 likewise")
+      Test.assert_eq_int(Sm.loaded_count(s), 225, "nothing else")
+      match Sm.take_meshes(s) do
+        (s1, ms) ->
+          Test.assert_eq_int(mesh_at(ms, 1), 9, "level 1 meshes its inner 3 x 1 x 3")
+          Test.assert_eq_int(mesh_at(ms, 2), 9, "and level 2")
+          Test.assert_true(mesh_levels(ms), "each mesh carries its key's level")
+          let a = at(at(s1, 3200.5, 0.5, 0.5), 300.5, 40.5, -200.5)
+          let b = at(at(begin_levels(), -1600.5, 0.5, 1600.5), 300.5, 40.5, -200.5)
+          Test.assert_eq_int(Sm.loaded_count(a), Sm.loaded_count(b), "the same chunks")
+          Test.assert_eq_int(Sm.world_hash(a), Sm.world_hash(b), "the same world")
+          Sm.stop(a)
+          Sm.stop(b)
+      end
+    end
+
+    test "an edit makes its ancestors stale; they regenerate through the pipeline, off the next frame, with the edit coarsened in" do
+      let s = at(begin_levels(), 0.5, 0.5, 0.5)
+      -- a 2 x 2 x 2 carve aligned to a level-1 voxel, deep in stone
+      let o = Ed.fill_box(Sm.world(s), 4, -6, 4, 5, -5, 5, 0)
+      let st = Wd.stale(Ed.world(o))
+      Test.assert_true(has_key(st, Cd.key_at(0, -1, 0, 1)), "the level-1 ancestor is stale")
+      Test.assert_true(has_key(st, Cd.key_at(0, -1, 0, 2)), "and the level-2 one")
+      let s1 = Sm.tick(Sm.apply(s, o))
+      Test.assert_eq_int(List.length(Wd.stale(Sm.world(s1))), 0, "the stale keys are taken")
+      match Sm.pending(s1) do
+        (_, gens, _, _) -> Test.assert_eq_int(gens, 2, "a tick later both are still being generated: the tick did not wait for them")
+      end
+      let old = Strata.Store.get(Wd.chunks(Sm.world(s1)), Cd.key_at(0, -1, 0, 1))
+      Test.assert_eq_int(C.get(old, 2, 29, 2), 1, "and the old level-1 chunk is still loaded, without the carve")
+      let s2 = Sm.tick(Sm.tick(s1))
+      let c1 = Strata.Store.get(Wd.chunks(Sm.world(s2)), Cd.key_at(0, -1, 0, 1))
+      Test.assert_eq_int(C.get(c1, 2, 29, 2), 0, "two ticks on, the carve is one air voxel at level 1")
+      Test.assert_eq_int(C.get(c1, 3, 29, 2), 1, "its neighbour is stone")
+      Test.assert_eq_int(C.get(c1, 2, 28, 2), 1, "and below it")
+      let c2 = Strata.Store.get(Wd.chunks(Sm.world(s2)), Cd.key_at(0, -1, 0, 2))
+      Test.assert_eq_int(C.get(c2, 1, 30, 1), 1, "at level 2 the stone around it wins")
+      Test.assert_true(C.form(c1) != 0, "the level-1 chunk was replaced")
+      let s3 = Sm.run_until_settled(s2, 20000)
+      Test.assert_true(Sm.settled(s3), "and the stream settles")
+      Test.assert_eq_int(C.uniform_id(Wd.coarsen(Sm.world(s3), Cd.key_at(1, -1, 0, 1))), 1, "an ancestor of no edit is the generated chunk")
+      Sm.stop(s3)
+    end
+
+    test "a stale key edited again before its first result lands: the older result is not applied, and once settled the chunk shows both edits" do
+      let s = at(begin_levels(), 0.5, 0.5, 0.5)
+      let k1 = Cd.key_at(0, -1, 0, 1)
+      let s1 = Sm.tick(Sm.apply(s, Ed.fill_box(Sm.world(s), 4, -6, 4, 5, -5, 5, 0)))
+      -- the first carve's tasks are running; a second carve in the same level-1 chunk
+      let s2 = Sm.apply(s1, Ed.fill_box(Sm.world(s1), 8, -6, 4, 9, -5, 5, 0))
+      let s3 = Sm.tick(Sm.tick(s2))
+      -- the first tasks' results (captured before the second carve) land now, with an older stamp
+      Test.assert_eq_int(C.get(Strata.Store.get(Wd.chunks(Sm.world(s3)), k1), 2, 29, 2), 1, "the result with the older stamp is not applied")
+      let s4 = Sm.run_until_settled(s3, 20000)
+      let c1 = Strata.Store.get(Wd.chunks(Sm.world(s4)), k1)
+      Test.assert_eq_int(C.get(c1, 2, 29, 2), 0, "the first carve")
+      Test.assert_eq_int(C.get(c1, 4, 29, 2), 0, "and the second")
+      Test.assert_eq_int(C.get(c1, 3, 29, 2), 1, "stone between them")
+      Sm.stop(s4)
+    end
+
+    test "a stale key that leaves the box before its task returns: the result is dropped, and coming back generates it with the edit" do
+      let s = at(begin_levels(), 0.5, 0.5, 0.5)
+      let k1 = Cd.key_at(0, -1, 0, 1)
+      let s1 = Sm.tick(Sm.apply(s, Ed.fill_box(Sm.world(s), 4, -6, 4, 5, -5, 5, 0)))
+      let far = at(s1, 3200.5, 0.5, 0.5)
+      Test.assert_false(Wd.is_loaded(Sm.world(far), k1), "nothing is loaded for it far away")
+      Test.assert_eq_int(Sm.loaded_count(far), 225, "only the far boxes")
+      let back = at(far, 0.5, 0.5, 0.5)
+      Test.assert_eq_int(C.get(Strata.Store.get(Wd.chunks(Sm.world(back)), k1), 2, 29, 2), 0, "back again, it shows the edit")
+      Sm.stop(back)
+    end
+
+    test "a loaded stale key in the unload band is still refreshed" do
+      let s = at(begin_levels(), 0.5, 0.5, 0.5)
+      let k1 = Cd.key_at(0, -1, 0, 1)
+      let s1 = Sm.apply(s, Ed.fill_box(Sm.world(s), 4, -6, 4, 5, -5, 5, 0))
+      -- level-1 chunk 0 is now 3 chunks from the focus's: past its box (2), inside the unload band
+      let away = at(s1, 192.5, 0.5, 0.5)
+      Test.assert_true(Wd.is_loaded(Sm.world(away), k1), "the stale chunk is kept in the band")
+      Test.assert_false(Wd.is_loaded(Sm.world(away), Cd.key(0, -1, 0)), "its edited level-0 chunk has gone to the cache")
+      Test.assert_eq_int(C.get(Strata.Store.get(Wd.chunks(Sm.world(away)), k1), 2, 29, 2), 0, "and it was refreshed with the edit")
+      Sm.stop(away)
     end
   end
 end
