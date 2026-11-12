@@ -17,6 +17,8 @@ layout(set = 0, binding = 0) uniform U {
     ivec4 bodies;    // x moving bodies' boxes in the movers buffer, y bodies in the body table
     vec4 water;      // the liquid the eye is under: rgb its colour, w how fast it swallows light per metre (0: the eye is in air)
     vec4 water2;     // x the height of that liquid's surface (metres)
+    mat4 sun_vp;     // the plain figures' shadow map: world (metres) to its clip space, orthographic from the sun, OpenGL conventions
+    vec4 fshadow;    // x 1 when the map holds figures this frame (else it is not read), y one texel in its 0..1 coordinates, z depth per metre toward the sun
 } u;
 
 // OpenGL clip space to Vulkan's: y points down, depth runs 0..1.

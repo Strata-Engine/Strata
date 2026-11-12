@@ -27,7 +27,7 @@
 /* Rewritten by build_shaders.sh whenever the shaders change: forge decides
  * whether to recompile this file from its text alone, not from the headers
  * it includes (GAPS S14). */
-#define STRATA_SHADERS_STAMP "8e8865211af95378"
+#define STRATA_SHADERS_STAMP "09040d4b9862cd4d"
 #include "strata_shaders.h"
 #include "strata_spray.h"
 #include "strata_alloc.h"
@@ -61,6 +61,11 @@ static inline void   *narr_data(void *a) { return (char *)a + NARR_HDR; }
 #define SV_REGIONS (SV_REGION_TRANS + SV_FRAMES)
 
 typedef SaRange Range;
+
+/* One figure part as the figure pass draws it (std430, 32 bytes): its
+ * origin in metres, flags (bit 0: the figure moved since the last frame),
+ * and its rotation. */
+struct FigInst { float pos[3]; uint32_t flags; float rot[4]; };
 
 typedef struct { float pos[4]; float rot[4]; int32_t dims[4]; float sphere[4]; } BodyRow;    /* std430, 64 bytes: low corner (metres), rotation, size and first word, bounding sphere (voxels) */
 typedef struct { int shaped, placed; float pos[3], rot[4], seen_pos[3], seen_rot[4]; int32_t dims[3]; uint32_t first, nwords; } BodyRec;
@@ -100,10 +105,12 @@ typedef struct {
     VkBuffer stats; VkDeviceMemory stats_mem; uint32_t *stats_map;   /* written by the cull pass: commands per range [6], chunks, quads */
     VkBuffer ui; VkDeviceMemory ui_mem; float *ui_map;   /* this frame's 2D layer */
     VkBuffer gstage; VkDeviceMemory gstage_mem; unsigned char *gstage_map;   /* this frame's new glyph pixels, before they are copied in */
+    VkBuffer finst; VkDeviceMemory finst_mem; struct FigInst *finst_map;   /* this frame's figure parts: where each is drawn */
     int stats_valid;           /* the cull pass has run for this Frame at least once */
     VkFence fence;             /* signalled when the frame's commands have run */
     VkSemaphore sem_image, sem_done;
     int ts_written;            /* its two timestamp queries hold values */
+    int fsm_ts;                /* and its third and fourth: round the figure shadow pass, which ran */
 } Frame;
 
 static SaAlloc g_quads;        /* ranges of the quad buffer, in quads */
@@ -180,6 +187,7 @@ static struct {
     /* The 2D layer: the quads the game last handed over, drawn last. Each
      * Frame copies them when it is recorded. */
     VkPipeline pipe_ui;
+    VkPipeline pipe_fig;           /* figure parts: shared piece meshes, instanced at their poses */
     float *ui_cpu; uint32_t ui_n; uint64_t ui_dropped;
     Target glyphs; VkSampler glyph_sampler; uint32_t glyph_px, glyph_pages;   /* the glyph atlas: strata_text's pages, one layer each */
     Target ui_art; VkSampler ui_sampler;   /* the interface atlas: one image of a game's own interface art */
@@ -213,8 +221,9 @@ static struct {
     int vsync_off;                 /* ask for the immediate present mode */
     double stat[6];                /* last frame: CPU ms, ms waiting, draw calls, GPU ms, translucent chunks drawn, microseconds ordering them */
     /* a chunk being assembled by sv_chunk_begin .. sv_chunk_commit */
-    struct { int64_t slot; int32_t origin[3]; uint32_t *part[4]; uint32_t n[4], cap[4]; int open; int body; } stage;
-    VkQueryPool qpool; int have_ts; float ts_period;
+    struct { int64_t slot; int32_t origin[3]; uint32_t *part[4]; uint32_t n[4], cap[4]; int open; int body; int fig; int32_t rp; } stage;
+    VkQueryPool qpool; int have_ts; float ts_period;   /* four timestamps a Frame: the frame's start and end, the figure shadow pass's */
+    VkDeviceSize max_ssbo;         /* the most of a buffer one storage descriptor may reach */
     int64_t refused;               /* uploads turned away because the buffer was full */
     /* stats of the last frame */
     int64_t drawn_chunks, drawn_quads;
@@ -229,7 +238,9 @@ static struct {
 /* The uniform block, in floats (native/shaders/ubo.glsl): vp 0, sun 16,
  * sky 20, fog 24, eye 28, misc 32 (ints), inv_vp 36, prev_vp 52, light 68,
  * sun colour 72, light volume size 76 (ints). */
-#define UBO_FLOATS 100
+#define UBO_FLOATS 120
+#define UBO_SUN_VP 100         /* mat4: world to the figure shadow map's clip space */
+#define UBO_FSHADOW 116        /* vec4: x the map holds figures this frame, y a texel in its 0..1 coordinates, z its depth per metre */
 #define UBO_BODIES 88          /* ints: x moving bodies' boxes in the movers buffer, y bodies in the body table */
 #define UBO_WATER 92           /* two vec4: the liquid the eye is in (rgb, and how fast it swallows light; 0: none), and its surface height */
 #define UBO_EDIT 80            /* two vec4: the low and high corners (voxels) of what an edit just changed; the first w is 1 while it settles */
@@ -522,13 +533,15 @@ static int make_render_pass(VkImageLayout final, VkRenderPass *out) {
 /* kind 0: opaque and cutout quads; 1: translucent quads; 2: cross instances;
  * 3: loose quads; 4: the light pass; 5: the lit image to the screen;
  * 6: spray (final pass, blended, after the translucent quads);
- * 7: the 2D layer (final pass, blended, no depth, last of all).
- * Kinds 0, 2 and 3 belong to the geometry pass, 4 to the light pass, 1 and 5
+ * 7: the 2D layer (final pass, blended, no depth, last of all);
+ * 8: figure pieces (geometry pass; quads read from the quad buffer as words).
+ * Kinds 0, 2, 3 and 8 belong to the geometry pass, 4 to the light pass, 1 and 5
  * to the final pass. */
 static int make_pipeline(int kind, VkPipeline *out) {
-    int spray = kind == 6, ui = kind == 7;
-    int blend = kind == 1 || spray || ui, cross = kind == 2, loose = kind == 3, full = kind == 4 || kind == 5, geom = kind == 0 || cross || loose;
-    VkShaderModule vs = ui ? shader(strata_ui_vert, sizeof(strata_ui_vert))
+    int spray = kind == 6, ui = kind == 7, fig = kind == 8;
+    int blend = kind == 1 || spray || ui, cross = kind == 2, loose = kind == 3, full = kind == 4 || kind == 5, geom = kind == 0 || cross || loose || fig;
+    VkShaderModule vs = fig ? shader(strata_figure_vert, sizeof(strata_figure_vert))
+                      : ui ? shader(strata_ui_vert, sizeof(strata_ui_vert))
                       : spray ? shader(strata_spray_vert, sizeof(strata_spray_vert))
                       : cross ? shader(strata_cross_vert, sizeof(strata_cross_vert))
                       : loose ? shader(strata_loose_vert, sizeof(strata_loose_vert))
@@ -567,14 +580,14 @@ static int make_pipeline(int kind, VkPipeline *out) {
         { .location = 2, .binding = 0, .format = VK_FORMAT_R32G32B32A32_SFLOAT, .offset = 32 },
         { .location = 3, .binding = 0, .format = VK_FORMAT_R32G32B32A32_SFLOAT, .offset = 48 } };
     VkPipelineVertexInputStateCreateInfo vin = { .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
-        .vertexBindingDescriptionCount = full ? 0 : 1, .pVertexBindingDescriptions = ui ? &ubind : spray ? &sbind : (loose ? &lbind : &bind),
-        .vertexAttributeDescriptionCount = full ? 0 : (ui ? 4 : spray ? 3 : (loose ? 4 : 2)), .pVertexAttributeDescriptions = ui ? uattrs : spray ? sattrs : (loose ? lattrs : attrs) };
+        .vertexBindingDescriptionCount = (full || fig) ? 0 : 1, .pVertexBindingDescriptions = ui ? &ubind : spray ? &sbind : (loose ? &lbind : &bind),
+        .vertexAttributeDescriptionCount = (full || fig) ? 0 : (ui ? 4 : spray ? 3 : (loose ? 4 : 2)), .pVertexAttributeDescriptions = ui ? uattrs : spray ? sattrs : (loose ? lattrs : attrs) };
     VkPipelineInputAssemblyStateCreateInfo ia = { .sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
         .topology = (cross || full) ? VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST : VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP };
     VkPipelineViewportStateCreateInfo vp = { .sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO, .viewportCount = 1, .scissorCount = 1 };
     VkPipelineRasterizationStateCreateInfo rs = { .sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO, .polygonMode = VK_POLYGON_MODE_FILL,
         /* a see-through surface is visible from behind too: water from below */
-        .cullMode = (kind == 0) ? VK_CULL_MODE_BACK_BIT : VK_CULL_MODE_NONE, .frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE, .lineWidth = 1.0f };
+        .cullMode = (kind == 0 || fig) ? VK_CULL_MODE_BACK_BIT : VK_CULL_MODE_NONE, .frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE, .lineWidth = 1.0f };
     VkPipelineMultisampleStateCreateInfo ms = { .sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO, .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT };
     /* only the geometry pass writes depth; translucent quads test against it; full-screen passes ignore it */
     VkPipelineDepthStencilStateCreateInfo ds = { .sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO, .depthTestEnable = (full || ui) ? VK_FALSE : VK_TRUE,
@@ -1089,6 +1102,488 @@ static void on_resize(GLFWwindow *w, int width, int height) { (void)w; (void)wid
 /* ── Open / close ─────────────────────────────────────────────────────────── */
 /* Open a window and build the renderer. [quad_capacity] is how many quads
  * the GPU buffer holds; zero or less means the default, 8 388 608 (64 MB). */
+/* ── Figures ──────────────────────────────────────────────────────────────── */
+/* A rig's part meshes are uploaded once (rig_part_begin, chunk_part,
+ * chunk_commit) as pieces of 32 voxels a side and drawn for every figure of
+ * the rig. Each frame the pose kernel's draw list (an_x_draw_list in
+ * strata_anim.c) gives every visible part of every figure and its matrix;
+ * the parts are culled by their bounding spheres, grouped by rig part, and
+ * each piece is drawn once, instanced over every figure showing that part.
+ * A figure quad's texture field is a palette index: the G-buffer pass takes
+ * its colour, roughness and emission from the rig's palette.
+ *
+ * Absent strata_anim.c, the weak definition below answers no parts, so a
+ * game that draws but does not animate still links. */
+__attribute__((weak)) int an_x_draw_list(double blend, const int32_t **rig_part, const float **xf, const int32_t **flags) {
+    (void)blend; if (rig_part) *rig_part = NULL; if (xf) *xf = NULL; if (flags) *flags = NULL;
+    return 0;
+}
+
+#define SV_FIG_RIGS 256                   /* AN_RIGS */
+#define SV_FIG_PARTS 64                   /* AN_PARTS */
+#define SV_FIG_RP (SV_FIG_RIGS * SV_FIG_PARTS)
+#define SV_FIG_PIECES 16384
+#define SV_FIG_INST 16384                 /* AN_DRAW_MAX: parts in one draw list */
+#define SV_FIG_SEEN 32768                 /* figures remembered between frames, to tell which moved (twice the most a list holds) */
+typedef struct { int32_t rp, next; uint32_t first, count; int32_t o[3]; float lo[3], hi[3]; } FigPiece;   /* lo, hi: what its quads cover, voxels of the piece */
+static struct {
+    FigPiece *pieces; int32_t npieces, free_head;
+    int32_t *head;                        /* SV_FIG_RP: the first piece of each rig part, -1 */
+    float (*anchor)[4];                   /* SV_FIG_RP: the part's anchor (its voxels) and voxel size (metres) */
+    float (*sphere)[4];                   /* SV_FIG_RP: a sphere round the part's pieces, metres in the part's frame; w < 0 until worked out */
+    VkBuffer pal; VkDeviceMemory pal_mem; uint32_t *pal_map;   /* SV_FIG_RIGS x 256 entries, two words each */
+    int32_t *count, *base, *touched; int32_t ntouched;         /* per rig part: instances this frame, where they start */
+    int32_t *order;                       /* the culled draw list's entries, in order */
+    uint8_t *moving;                      /* per draw-list entry: its figure moved */
+    struct FigSeen { int32_t id; float sum; } *seen[2]; int now;   /* figures drawn last frame and this, by id: a checksum of their matrices */
+    struct FigGroup { int32_t rp, base, n; } *groups; int32_t ngroups;
+    float blend;
+    int64_t parts, draws; double cpu_us, list_us;
+    /* the plain figures' sun shadow map (fig_shadow_*): one depth image shared by the frames in flight */
+    struct FigGroup *sgroups; int32_t nsgroups;
+    VkImage fsm; VkDeviceMemory fsm_mem; VkImageView fsm_view; VkSampler fsm_sampler;
+    VkRenderPass fsm_pass; VkFramebuffer fsm_fb; VkPipeline fsm_pipe;
+    int fsm_off;                          /* STRATA_FIG_SHADOWS=0: no figure casts a shadow */
+    int fsm_fresh;                        /* the map has not yet been put in its sampled layout */
+    int64_t sparts, sdraws; double shadow_ms;
+} fg;
+
+/* The shadow map: SV_FSM_RES texels a side over a square SV_FSM_HALF x 2
+ * metres a side round the eye (so it holds the view out to 64 m whichever
+ * way it looks), seen from the sun, its depth reaching SV_FSM_DEPTH metres
+ * toward and away from the sun. A texel is 6.25 cm, a figure voxel. */
+#define SV_FSM_RES 2048
+#define SV_FSM_HALF 64.0f
+#define SV_FSM_DEPTH 128.0f
+static int fig_shadow_make(void);
+static void fig_shadow_free(void);
+
+static int fig_init(void) {
+    fg.pieces = calloc(SV_FIG_PIECES, sizeof *fg.pieces);
+    fg.head = malloc(SV_FIG_RP * sizeof *fg.head);
+    fg.anchor = calloc(SV_FIG_RP, sizeof *fg.anchor);
+    fg.sphere = calloc(SV_FIG_RP, sizeof *fg.sphere);
+    fg.count = calloc(SV_FIG_RP, sizeof *fg.count);
+    fg.base = calloc(SV_FIG_RP, sizeof *fg.base);
+    fg.touched = calloc(SV_FIG_RP, sizeof *fg.touched);
+    fg.order = calloc(SV_FIG_INST, sizeof *fg.order);
+    fg.moving = calloc(SV_FIG_INST, 1);
+    fg.groups = calloc(SV_FIG_RP, sizeof *fg.groups);
+    fg.seen[0] = calloc(SV_FIG_SEEN, sizeof *fg.seen[0]);
+    fg.seen[1] = calloc(SV_FIG_SEEN, sizeof *fg.seen[1]);
+    fg.sgroups = calloc(SV_FIG_RP, sizeof *fg.sgroups);
+    if (!fg.pieces || !fg.head || !fg.anchor || !fg.sphere || !fg.count || !fg.base || !fg.touched || !fg.order || !fg.moving || !fg.groups || !fg.seen[0] || !fg.seen[1] || !fg.sgroups) return 0;
+    for (int i = 0; i < SV_FIG_RP; i++) { fg.head[i] = -1; fg.anchor[i][3] = 1.0f; fg.sphere[i][3] = -1.0f; }
+    fg.npieces = 0; fg.free_head = -1; fg.blend = 1.0f;
+    void *map = NULL;
+    if (!make_buffer((VkDeviceSize)SV_FIG_RIGS * 256 * 8, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &fg.pal, &fg.pal_mem, &map)) return 0;
+    fg.pal_map = map; memset(fg.pal_map, 0, (size_t)SV_FIG_RIGS * 256 * 8);
+    const char *fs = getenv("STRATA_FIG_SHADOWS");
+    fg.fsm_off = fs && fs[0] == '0';
+    return fig_shadow_make();
+}
+static void fig_free(void) {
+    if (g.dev) { if (fg.pal) vkDestroyBuffer(g.dev, fg.pal, NULL); if (fg.pal_mem) vkFreeMemory(g.dev, fg.pal_mem, NULL); fig_shadow_free(); }
+    free(fg.pieces); free(fg.head); free(fg.anchor); free(fg.sphere); free(fg.count); free(fg.base); free(fg.touched);
+    free(fg.order); free(fg.moving); free(fg.groups); free(fg.seen[0]); free(fg.seen[1]); free(fg.sgroups);
+    memset(&fg, 0, sizeof fg);
+}
+
+/* Begin uploading one piece of rig [rig]'s part [part]: the 32-cubed piece
+ * whose low corner is (ox, oy, oz) in the part's grid. Give its quads with
+ * sv_chunk_part(0, ...) and finish with sv_chunk_commit, as for a chunk. It
+ * is shared by every figure of the rig and never written into the light
+ * volume. A piece given again replaces the one it had; an empty one removes it. */
+int64_t sv_rig_part_begin(int64_t rig, int64_t part, int64_t ox, int64_t oy, int64_t oz) {
+    g.stage.open = 0;
+    if (!g.ok || !fg.pieces || rig < 0 || rig >= SV_FIG_RIGS || part < 0 || part >= SV_FIG_PARTS) return 0;
+    for (int i = 0; i < 4; i++) g.stage.n[i] = 0;
+    g.stage.origin[0] = (int32_t)ox; g.stage.origin[1] = (int32_t)oy; g.stage.origin[2] = (int32_t)oz;
+    g.stage.rp = (int32_t)(rig * SV_FIG_PARTS + part);
+    g.stage.open = 1; g.stage.body = 0; g.stage.fig = 1;
+    g.stage_light_n = 0;
+    return 1;
+}
+static int64_t fig_commit(void) {
+    g.stage.open = 0; g.stage.fig = 0;
+    if (g.stage.n[1] || g.stage.n[2] || g.stage.n[3]) return 0;       /* palette voxels are opaque: one part of quads */
+    int32_t rp = g.stage.rp, at = -1, prev = -1;
+    for (int32_t i = fg.head[rp]; i >= 0; prev = i, i = fg.pieces[i].next)
+        if (fg.pieces[i].o[0] == g.stage.origin[0] && fg.pieces[i].o[1] == g.stage.origin[1] && fg.pieces[i].o[2] == g.stage.origin[2]) { at = i; break; }
+    uint32_t n = g.stage.n[0], first = 0;
+    if (n > 0 && !sa_alloc(&g_quads, n, &first)) { g.refused++; return 0; }
+    if (n > 0) memcpy(g.giga_map + (size_t)first * 2, g.stage.part[0], (size_t)n * 8);
+    if (at >= 0) {                        /* frames in flight may still draw the old range: held two frames */
+        sa_release(&g_quads, (Range){ fg.pieces[at].first, fg.pieces[at].count }, g.frame_no);
+        if (n == 0) {
+            if (prev >= 0) fg.pieces[prev].next = fg.pieces[at].next; else fg.head[rp] = fg.pieces[at].next;
+            fg.pieces[at].next = fg.free_head; fg.free_head = at;
+            fg.sphere[rp][3] = -1.0f;
+            return 1;
+        }
+    } else {
+        if (n == 0) return 1;
+        if (fg.free_head >= 0) { at = fg.free_head; fg.free_head = fg.pieces[at].next; }
+        else if (fg.npieces < SV_FIG_PIECES) at = fg.npieces++;
+        else { sa_cancel(&g_quads, (Range){ first, n }); g.refused++; return 0; }
+        fg.pieces[at].rp = rp; fg.pieces[at].next = fg.head[rp]; fg.head[rp] = at;
+        memcpy(fg.pieces[at].o, g.stage.origin, sizeof fg.pieces[at].o);
+    }
+    FigPiece *pc = &fg.pieces[at];
+    pc->first = first; pc->count = n;
+    for (int k = 0; k < 3; k++) { pc->lo[k] = 32.0f; pc->hi[k] = 0.0f; }
+    const uint32_t *q = g.stage.part[0];
+    for (uint32_t i = 0; i < n; i++) {    /* what each quad covers: Strata.Quad's layout, as quad.vert reads it */
+        uint32_t w0 = q[i * 2], face = (w0 >> 25) & 7u;
+        float p[3] = { (float)(w0 & 31u), (float)((w0 >> 5) & 31u), (float)((w0 >> 10) & 31u) };
+        float w = (float)(((w0 >> 15) & 31u) + 1u), h = (float)(((w0 >> 20) & 31u) + 1u), e[3];
+        if (face < 2u) { e[0] = w; e[1] = 1.0f; e[2] = h; } else if (face < 4u) { e[0] = 1.0f; e[1] = h; e[2] = w; } else { e[0] = w; e[1] = h; e[2] = 1.0f; }
+        for (int k = 0; k < 3; k++) { if (p[k] < pc->lo[k]) pc->lo[k] = p[k]; if (p[k] + e[k] > pc->hi[k]) pc->hi[k] = p[k] + e[k]; }
+    }
+    fg.sphere[rp][3] = -1.0f;
+    return 1;
+}
+/* Rig [rig]'s part [part] turns about (ax, ay, az) of its own grid (its
+ * anchor, in its voxels), and its voxels are [voxel] metres: a piece's quads
+ * sit at (piece corner + quad position - anchor) x voxel in the part's frame. */
+int64_t sv_rig_part_anchor(int64_t rig, int64_t part, double ax, double ay, double az, double voxel) {
+    if (!g.ok || !fg.anchor || rig < 0 || rig >= SV_FIG_RIGS || part < 0 || part >= SV_FIG_PARTS || !(voxel > 0.0) || !isfinite(ax) || !isfinite(ay) || !isfinite(az) || !isfinite(voxel)) return 0;
+    int32_t rp = (int32_t)(rig * SV_FIG_PARTS + part);
+    fg.anchor[rp][0] = (float)ax; fg.anchor[rp][1] = (float)ay; fg.anchor[rp][2] = (float)az; fg.anchor[rp][3] = (float)voxel;
+    fg.sphere[rp][3] = -1.0f;
+    return 1;
+}
+static uint32_t unorm(double v, double scale) { return v <= 0.0 ? 0u : (v >= 1.0 ? (uint32_t)scale : (uint32_t)(v * scale + 0.5)); }
+/* Rig [rig]'s palette: 256 entries of five floats (red, green, blue: linear
+ * 0..1; roughness 0..1; emission 0..1). Entry 0 is empty and never drawn.
+ * Packed two words an entry: red and green in 11 bits, blue in 10; roughness
+ * and emission in 16 bits each. */
+int64_t sv_rig_palette(int64_t rig, void *floats) {
+    if (!g.ok || !fg.pal_map || rig < 0 || rig >= SV_FIG_RIGS || !floats || narr_len(floats) < 256 * 5) return 0;
+    const float *c = narr_data(floats);
+    uint32_t *e = fg.pal_map + (size_t)rig * 256 * 2;
+    for (int i = 0; i < 256; i++, c += 5) {
+        e[i * 2] = unorm(c[0], 2047.0) | (unorm(c[1], 2047.0) << 11) | (unorm(c[2], 1023.0) << 22);
+        e[i * 2 + 1] = unorm(c[3], 65535.0) | (unorm(c[4], 65535.0) << 16);
+    }
+    return 1;
+}
+/* How far between its last two poses each figure is drawn (0..1), passed to
+ * the draw list each frame. 1 until a game sets it: the last pose. */
+void sv_set_blend(double blend) { fg.blend = blend > 0.0 ? (blend < 1.0 ? (float)blend : 1.0f) : 0.0f; }
+
+/* a sphere round rig part rp's pieces, in metres in the part's frame */
+static void fig_sphere(int32_t rp) {
+    float lo[3] = { 1e30f, 1e30f, 1e30f }, hi[3] = { -1e30f, -1e30f, -1e30f }, v = fg.anchor[rp][3];
+    for (int32_t i = fg.head[rp]; i >= 0; i = fg.pieces[i].next)
+        for (int k = 0; k < 3; k++) {
+            float a = ((float)fg.pieces[i].o[k] + fg.pieces[i].lo[k] - fg.anchor[rp][k]) * v, b = ((float)fg.pieces[i].o[k] + fg.pieces[i].hi[k] - fg.anchor[rp][k]) * v;
+            if (a < lo[k]) lo[k] = a; if (b > hi[k]) hi[k] = b;
+        }
+    float r2 = 0.0f;
+    for (int k = 0; k < 3; k++) { fg.sphere[rp][k] = 0.5f * (lo[k] + hi[k]); float d = 0.5f * (hi[k] - lo[k]); r2 += d * d; }
+    fg.sphere[rp][3] = sqrtf(r2) + 1e-4f;
+}
+/* a rotation matrix (column-major 3x3) as a unit quaternion x y z w */
+static void fig_mat_q(const float *m, float *q) {
+    float m00 = m[0], m10 = m[1], m20 = m[2], m01 = m[3], m11 = m[4], m21 = m[5], m02 = m[6], m12 = m[7], m22 = m[8], tr = m00 + m11 + m22;
+    if (tr > 0.0f) { float s = sqrtf(tr + 1.0f) * 2.0f; q[3] = 0.25f * s; q[0] = (m21 - m12) / s; q[1] = (m02 - m20) / s; q[2] = (m10 - m01) / s; }
+    else if (m00 > m11 && m00 > m22) { float s = sqrtf(1.0f + m00 - m11 - m22) * 2.0f; q[3] = (m21 - m12) / s; q[0] = 0.25f * s; q[1] = (m01 + m10) / s; q[2] = (m02 + m20) / s; }
+    else if (m11 > m22) { float s = sqrtf(1.0f + m11 - m00 - m22) * 2.0f; q[3] = (m02 - m20) / s; q[0] = (m01 + m10) / s; q[1] = 0.25f * s; q[2] = (m12 + m21) / s; }
+    else { float s = sqrtf(1.0f + m22 - m00 - m11) * 2.0f; q[3] = (m10 - m01) / s; q[0] = (m02 + m20) / s; q[1] = (m12 + m21) / s; q[2] = 0.25f * s; }
+    float l = sqrtf(q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]);
+    if (l > 0.0f) for (int k = 0; k < 4; k++) q[k] /= l; else { q[0] = q[1] = q[2] = 0.0f; q[3] = 1.0f; }
+}
+static uint32_t fig_hash(int32_t id) { uint32_t h = (uint32_t)id * 2654435761u; return (h ^ (h >> 15)) & (SV_FIG_SEEN - 1); }
+
+/* This frame's figure parts into the Frame's instance buffer, grouped by rig
+ * part: the draw list at the blend set, each part culled by its sphere
+ * against the view, and each figure marked moving when its matrices differ
+ * from last frame's (or it was not drawn then). */
+static void fig_shadow_prepare(Frame *F, int n, const int32_t *rp, const float *xf, const int32_t *fl);
+static void fig_prepare(Frame *F) {
+    fg.ngroups = 0; fg.parts = 0; fg.nsgroups = 0; fg.sparts = 0;
+    g.ubo_map[UBO_FSHADOW] = 0.0f;        /* no shadow map this frame unless plain figures fill it below */
+    double t0 = glfwGetTime();
+    const int32_t *rp = NULL, *fl = NULL; const float *xf = NULL;
+    int n = an_x_draw_list((double)fg.blend, &rp, &xf, &fl);
+    double t1 = glfwGetTime();
+    fg.list_us = (t1 - t0) * 1e6;
+    if (n <= 0 || !rp || !xf || !fl || !F->finst_map) { fg.cpu_us = fg.list_us; return; }
+    if (n > SV_FIG_INST) n = SV_FIG_INST;
+    /* the view's six planes, from the view-projection's rows (OpenGL clip volume) */
+    const float *m = g.ubo_map;
+    float pl[6][4];
+    for (int p = 0; p < 6; p++) {
+        int axis = p >> 1; float sgn = (p & 1) ? -1.0f : 1.0f, len = 0.0f;
+        for (int c = 0; c < 4; c++) pl[p][c] = m[c * 4 + 3] + sgn * m[c * 4 + axis];
+        for (int c = 0; c < 3; c++) len += pl[p][c] * pl[p][c];
+        len = sqrtf(len); if (len > 0.0f) for (int c = 0; c < 4; c++) pl[p][c] /= len;
+    }
+    /* which figures moved: a checksum of each figure's matrices against last frame's */
+    struct FigSeen *was = fg.seen[fg.now], *is = fg.seen[fg.now ^ 1];
+    memset(is, 0, SV_FIG_SEEN * sizeof *is);
+    for (int i = 0; i < n; ) {
+        int32_t id = fl[i] >> 8; int j = i; float sum = 0.0f;
+        for (; j < n && (fl[j] >> 8) == id; j++) for (int k = 0; k < 12; k++) sum += xf[(size_t)j * 12 + k] * (float)(k + 1 + (j - i) * 13);
+        int mv = 1;
+        for (uint32_t h = fig_hash(id), probes = 0; probes < SV_FIG_SEEN; h = (h + 1) & (SV_FIG_SEEN - 1), probes++) {
+            if (was[h].id == 0) break;
+            if (was[h].id == id + 1) { mv = was[h].sum != sum; break; }
+        }
+        for (uint32_t h = fig_hash(id), probes = 0; probes < SV_FIG_SEEN; h = (h + 1) & (SV_FIG_SEEN - 1), probes++)
+            if (is[h].id == 0) { is[h].id = id + 1; is[h].sum = sum; break; }
+        for (int k = i; k < j; k++) fg.moving[k] = (uint8_t)mv;
+        i = j;
+    }
+    fg.now ^= 1;
+    /* cull, and count each rig part's instances */
+    int kept = 0;
+    fg.ntouched = 0;
+    for (int i = 0; i < n; i++) {
+        int32_t r = rp[i];
+        if (r < 0 || r >= SV_FIG_RP || fg.head[r] < 0) continue;
+        if (fg.sphere[r][3] < 0.0f) fig_sphere(r);
+        const float *x = xf + (size_t)i * 12, *s = fg.sphere[r];
+        float c[3];
+        for (int k = 0; k < 3; k++) c[k] = x[k] * s[0] + x[3 + k] * s[1] + x[6 + k] * s[2] + x[9 + k];
+        int out = 0;
+        for (int p = 0; p < 6 && !out; p++) if (pl[p][0] * c[0] + pl[p][1] * c[1] + pl[p][2] * c[2] + pl[p][3] < -s[3]) out = 1;
+        if (out) continue;
+        if (fg.count[r]++ == 0) fg.touched[fg.ntouched++] = r;
+        fg.order[kept++] = i;
+    }
+    int32_t at = 0;
+    for (int t = 0; t < fg.ntouched; t++) {
+        int32_t r = fg.touched[t];
+        fg.groups[t] = (struct FigGroup){ r, at, fg.count[r] };
+        fg.base[r] = at; at += fg.count[r]; fg.count[r] = 0;
+    }
+    fg.ngroups = fg.ntouched;
+    for (int k = 0; k < kept; k++) {
+        int i = fg.order[k]; int32_t r = rp[i];
+        struct FigInst *o = &F->finst_map[fg.base[r] + fg.count[r]++];
+        const float *x = xf + (size_t)i * 12;
+        o->pos[0] = x[9]; o->pos[1] = x[10]; o->pos[2] = x[11];
+        o->flags = fg.moving[i] ? 1u : 0u;
+        fig_mat_q(x, o->rot);
+    }
+    for (int t = 0; t < fg.ntouched; t++) fg.count[fg.touched[t]] = 0;
+    fg.parts = kept;
+    fig_shadow_prepare(F, n, rp, xf, fl);
+    fg.cpu_us = (glfwGetTime() - t0) * 1e6;
+}
+/* Draw this frame's figure parts, in the geometry pass: each piece of each
+ * rig part shown, instanced over the figures showing it. Answers the draws. */
+static int fig_draw(Frame *F, const struct FigGroup *groups, int32_t ngroups, uint32_t inst0) {
+    int draws = 0;
+    for (int t = 0; t < ngroups; t++) {
+        const struct FigGroup *gr = &groups[t];
+        const float *an = fg.anchor[gr->rp];
+        for (int32_t i = fg.head[gr->rp]; i >= 0; i = fg.pieces[i].next) {
+            const FigPiece *pc = &fg.pieces[i];
+            /* base, flags (bit 1: a figure), first quad, quads, first instance, rig; the piece's corner less the anchor; the voxel */
+            uint32_t pcw[10] = { 0u, 2u, pc->first, pc->count, inst0 + (uint32_t)gr->base, (uint32_t)(gr->rp / SV_FIG_PARTS), 0, 0, 0, 0 };
+            float f4[4] = { (float)pc->o[0] - an[0], (float)pc->o[1] - an[1], (float)pc->o[2] - an[2], an[3] };
+            memcpy(pcw + 6, f4, sizeof f4);
+            vkCmdPushConstants(F->cmd, g.layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof pcw, pcw);
+            vkCmdDraw(F->cmd, 4, pc->count * (uint32_t)gr->n, 0, 0);
+            draws++;
+        }
+    }
+    return draws;
+}
+static int fig_record(Frame *F) {
+    fg.draws = 0;
+    if (fg.ngroups == 0) return 0;
+    vkCmdBindPipeline(F->cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g.pipe_fig);
+    fg.draws = fig_draw(F, fg.groups, fg.ngroups, 0);
+    return (int)fg.draws;
+}
+
+/* ── The plain figures' sun shadow map ──────────────────────────────────────
+ * Each frame that draws a plain (not traced) figure in light modes 2 to 8,
+ * with the sun up, the figures' pieces are drawn again, depth only, into one
+ * square map seen from the sun round the eye (fig_shadow_prepare chooses the
+ * parts: the draw list's untraced parts whose spheres reach the map, at
+ * instances SV_FIG_INST on in the Frame's buffer). The light pass compares
+ * each pixel against it (shade.glsl, fig_shadow) and takes the darker of
+ * that and the traced shadow. A frame with no plain figure in reach records
+ * no pass and the light pass reads no map (u.fshadow.x 0). */
+static int fig_shadow_make(void) {
+    const VkFormat fmt = VK_FORMAT_D16_UNORM;      /* 4 mm steps over its 256 m of depth */
+    VkFormatProperties fp; vkGetPhysicalDeviceFormatProperties(g.phys, fmt, &fp);
+    int linear = (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT) != 0;
+    VkImageCreateInfo ici = { .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D, .format = fmt,
+        .extent = { SV_FSM_RES, SV_FSM_RES, 1 }, .mipLevels = 1, .arrayLayers = 1, .samples = VK_SAMPLE_COUNT_1_BIT,
+        .tiling = VK_IMAGE_TILING_OPTIMAL, .usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT };
+    VKOK(vkCreateImage(g.dev, &ici, NULL, &fg.fsm), "figure shadow map");
+    VkMemoryRequirements mr; vkGetImageMemoryRequirements(g.dev, fg.fsm, &mr);
+    VkMemoryAllocateInfo ai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = mr.size,
+        .memoryTypeIndex = mem_type(mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) };
+    VKOK(vkAllocateMemory(g.dev, &ai, NULL, &fg.fsm_mem), "figure shadow map memory");
+    VKOK(vkBindImageMemory(g.dev, fg.fsm, fg.fsm_mem, 0), "figure shadow map bind");
+    VkImageViewCreateInfo vi = { .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = fg.fsm, .viewType = VK_IMAGE_VIEW_TYPE_2D,
+        .format = fmt, .subresourceRange = { VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1 } };
+    VKOK(vkCreateImageView(g.dev, &vi, NULL, &fg.fsm_view), "figure shadow map view");
+    /* a comparing sampler: lit where the point is no farther from the sun than the map's depth; past the edges, lit */
+    VkSamplerCreateInfo si = { .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO, .magFilter = linear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST,
+        .minFilter = linear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST, .mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST,
+        .addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER, .addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER,
+        .addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER, .borderColor = VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE,
+        .compareEnable = VK_TRUE, .compareOp = VK_COMPARE_OP_LESS_OR_EQUAL, .maxAnisotropy = 1.0f };
+    VKOK(vkCreateSampler(g.dev, &si, NULL, &fg.fsm_sampler), "figure shadow sampler");
+    if (getenv("STRATA_DEBUG")) fprintf(stderr, "strata_vk: figure shadow map %dx%d D16, %s filtering\n", SV_FSM_RES, SV_FSM_RES, linear ? "linear" : "nearest");
+    /* its pass: cleared, drawn, left to be sampled; it follows the last frame's reads of it */
+    VkAttachmentDescription att = { .format = fmt, .samples = VK_SAMPLE_COUNT_1_BIT, .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR, .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+        .stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE, .stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
+        .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED, .finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL };
+    VkAttachmentReference dref = { 0, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL };
+    VkSubpassDescription sub = { .pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS, .pDepthStencilAttachment = &dref };
+    VkSubpassDependency dep[2] = {
+        { .srcSubpass = VK_SUBPASS_EXTERNAL, .dstSubpass = 0, .srcStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+          .dstStageMask = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+          .srcAccessMask = VK_ACCESS_SHADER_READ_BIT, .dstAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT },
+        { .srcSubpass = 0, .dstSubpass = VK_SUBPASS_EXTERNAL, .srcStageMask = VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+          .dstStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+          .srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT, .dstAccessMask = VK_ACCESS_SHADER_READ_BIT } };
+    VkRenderPassCreateInfo rpi = { .sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO, .attachmentCount = 1, .pAttachments = &att,
+        .subpassCount = 1, .pSubpasses = &sub, .dependencyCount = 2, .pDependencies = dep };
+    VKOK(vkCreateRenderPass(g.dev, &rpi, NULL, &fg.fsm_pass), "figure shadow pass");
+    VkFramebufferCreateInfo fi = { .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO, .renderPass = fg.fsm_pass, .attachmentCount = 1,
+        .pAttachments = &fg.fsm_view, .width = SV_FSM_RES, .height = SV_FSM_RES, .layers = 1 };
+    VKOK(vkCreateFramebuffer(g.dev, &fi, NULL, &fg.fsm_fb), "figure shadow framebuffer");
+    /* its pipeline: the figure pieces, depth only, no fragment stage. The faces turned from the
+     * sun are drawn (the front faces culled), so a lit face never shadows itself; a little bias more */
+    VkShaderModule vs = shader(strata_figure_shadow_vert, sizeof(strata_figure_shadow_vert));
+    VkPipelineShaderStageCreateInfo stage = { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_VERTEX_BIT, .module = vs, .pName = "main" };
+    VkPipelineVertexInputStateCreateInfo vin = { .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO };
+    VkPipelineInputAssemblyStateCreateInfo ia = { .sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO, .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP };
+    VkPipelineViewportStateCreateInfo vps = { .sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO, .viewportCount = 1, .scissorCount = 1 };
+    VkPipelineRasterizationStateCreateInfo rs = { .sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO, .polygonMode = VK_POLYGON_MODE_FILL,
+        .cullMode = VK_CULL_MODE_FRONT_BIT, .frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE, .lineWidth = 1.0f,
+        .depthBiasEnable = VK_TRUE, .depthBiasConstantFactor = 2.0f, .depthBiasSlopeFactor = 2.0f };
+    VkPipelineMultisampleStateCreateInfo ms = { .sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO, .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT };
+    VkPipelineDepthStencilStateCreateInfo ds = { .sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO, .depthTestEnable = VK_TRUE,
+        .depthWriteEnable = VK_TRUE, .depthCompareOp = VK_COMPARE_OP_LESS };
+    VkPipelineColorBlendStateCreateInfo cb = { .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO, .attachmentCount = 0 };
+    VkDynamicState dyn[2] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
+    VkPipelineDynamicStateCreateInfo dsi = { .sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, .dynamicStateCount = 2, .pDynamicStates = dyn };
+    VkGraphicsPipelineCreateInfo pi = { .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, .stageCount = 1, .pStages = &stage,
+        .pVertexInputState = &vin, .pInputAssemblyState = &ia, .pViewportState = &vps, .pRasterizationState = &rs, .pMultisampleState = &ms,
+        .pDepthStencilState = &ds, .pColorBlendState = &cb, .pDynamicState = &dsi, .layout = g.layout, .renderPass = fg.fsm_pass };
+    VkResult r = vkCreateGraphicsPipelines(g.dev, VK_NULL_HANDLE, 1, &pi, NULL, &fg.fsm_pipe);
+    vkDestroyShaderModule(g.dev, vs, NULL);
+    if (r != VK_SUCCESS) { die("figure shadow pipeline", (int)r); return 0; }
+    fg.fsm_fresh = 1;                     /* the first frame puts it in the layout its descriptor names (fig_shadow_first) */
+    return 1;
+}
+/* Before any pass of the first frame: the map into the layout its
+ * descriptor names, for the light pass reads it every frame (if only to
+ * pass over it) whether or not a shadow pass has drawn it. */
+static void fig_shadow_first(Frame *F) {
+    if (!fg.fsm_fresh || !fg.fsm) return;
+    fg.fsm_fresh = 0;
+    VkImageMemoryBarrier b = { .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, .srcAccessMask = 0, .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+        .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED, .newLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .image = fg.fsm,
+        .subresourceRange = { VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1 } };
+    vkCmdPipelineBarrier(F->cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, NULL, 0, NULL, 1, &b);
+}
+static void fig_shadow_free(void) {
+    if (fg.fsm_pipe) vkDestroyPipeline(g.dev, fg.fsm_pipe, NULL);
+    if (fg.fsm_fb) vkDestroyFramebuffer(g.dev, fg.fsm_fb, NULL);
+    if (fg.fsm_pass) vkDestroyRenderPass(g.dev, fg.fsm_pass, NULL);
+    if (fg.fsm_sampler) vkDestroySampler(g.dev, fg.fsm_sampler, NULL);
+    if (fg.fsm_view) vkDestroyImageView(g.dev, fg.fsm_view, NULL);
+    if (fg.fsm) vkDestroyImage(g.dev, fg.fsm, NULL);
+    if (fg.fsm_mem) vkFreeMemory(g.dev, fg.fsm_mem, NULL);
+}
+/* The map's view for this frame (into the uniforms) and the parts it holds
+ * (into the Frame's instance buffer from SV_FIG_INST, grouped by rig part).
+ * The draw list's flags say which figures are traced (bit 0): those are left
+ * out, their shadows being traced. */
+static void fig_shadow_prepare(Frame *F, int n, const int32_t *rp, const float *xf, const int32_t *fl) {
+    const float *sun = g.ubo_map + 16, *eye = g.ubo_map + 28;
+    if (fg.fsm_off || !fg.fsm_pipe || g.light_mode < 2 || g.light_mode > 8 || !(sun[1] > 0.01f)) return;
+    float sl = sqrtf(sun[0] * sun[0] + sun[1] * sun[1] + sun[2] * sun[2]);
+    float s[3] = { sun[0] / sl, sun[1] / sl, sun[2] / sl };
+    /* the map's axes: r and v across it, s toward the sun (r x v = s, as a camera's right, up and back) */
+    float up[3] = { 0.0f, 1.0f, 0.0f };
+    if (fabsf(s[1]) > 0.99f) { up[0] = 1.0f; up[1] = 0.0f; }
+    float r[3] = { up[1] * s[2] - up[2] * s[1], up[2] * s[0] - up[0] * s[2], up[0] * s[1] - up[1] * s[0] };
+    float rl = sqrtf(r[0] * r[0] + r[1] * r[1] + r[2] * r[2]);
+    for (int k = 0; k < 3; k++) r[k] /= rl;
+    float v[3] = { s[1] * r[2] - s[2] * r[1], s[2] * r[0] - s[0] * r[2], s[0] * r[1] - s[1] * r[0] };
+    /* centred on the eye, moved in whole texels so its edges do not crawl as the eye moves */
+    const float texel = 2.0f * SV_FSM_HALF / (float)SV_FSM_RES;
+    float cx = floorf((eye[0] * r[0] + eye[1] * r[1] + eye[2] * r[2]) / texel) * texel;
+    float cy = floorf((eye[0] * v[0] + eye[1] * v[1] + eye[2] * v[2]) / texel) * texel;
+    float cz = eye[0] * s[0] + eye[1] * s[1] + eye[2] * s[2];
+    /* parts whose spheres reach the map's box, untraced */
+    int kept = 0;
+    fg.ntouched = 0;
+    for (int i = 0; i < n; i++) {
+        int32_t q = rp[i];
+        if ((fl[i] & 1) || q < 0 || q >= SV_FIG_RP || fg.head[q] < 0) continue;
+        if (fg.sphere[q][3] < 0.0f) fig_sphere(q);
+        const float *x = xf + (size_t)i * 12, *sp = fg.sphere[q];
+        float c[3];
+        for (int k = 0; k < 3; k++) c[k] = x[k] * sp[0] + x[3 + k] * sp[1] + x[6 + k] * sp[2] + x[9 + k];
+        float lx = c[0] * r[0] + c[1] * r[1] + c[2] * r[2] - cx, ly = c[0] * v[0] + c[1] * v[1] + c[2] * v[2] - cy, lz = c[0] * s[0] + c[1] * s[1] + c[2] * s[2] - cz;
+        if (fabsf(lx) > SV_FSM_HALF + sp[3] || fabsf(ly) > SV_FSM_HALF + sp[3] || fabsf(lz) > SV_FSM_DEPTH + sp[3]) continue;
+        if (fg.count[q]++ == 0) fg.touched[fg.ntouched++] = q;
+        fg.order[kept++] = i;
+    }
+    if (kept == 0) { fg.ntouched = 0; return; }
+    int32_t at = 0;
+    for (int t = 0; t < fg.ntouched; t++) {
+        int32_t q = fg.touched[t];
+        fg.sgroups[t] = (struct FigGroup){ q, at, fg.count[q] };
+        fg.base[q] = at; at += fg.count[q]; fg.count[q] = 0;
+    }
+    fg.nsgroups = fg.ntouched;
+    struct FigInst *out = F->finst_map + SV_FIG_INST;
+    for (int k = 0; k < kept; k++) {
+        int i = fg.order[k]; int32_t q = rp[i];
+        struct FigInst *o = &out[fg.base[q] + fg.count[q]++];
+        const float *x = xf + (size_t)i * 12;
+        o->pos[0] = x[9]; o->pos[1] = x[10]; o->pos[2] = x[11];
+        o->flags = 0u;
+        fig_mat_q(x, o->rot);
+    }
+    for (int t = 0; t < fg.ntouched; t++) fg.count[fg.touched[t]] = 0;
+    fg.sparts = kept;
+    /* world to the map's clip space (OpenGL conventions, column-major): across it by r and v, depth toward the sun */
+    float *m = g.ubo_map + UBO_SUN_VP;
+    for (int k = 0; k < 3; k++) { m[k * 4 + 0] = r[k] / SV_FSM_HALF; m[k * 4 + 1] = v[k] / SV_FSM_HALF; m[k * 4 + 2] = -s[k] / SV_FSM_DEPTH; m[k * 4 + 3] = 0.0f; }
+    m[12] = -cx / SV_FSM_HALF; m[13] = -cy / SV_FSM_HALF; m[14] = cz / SV_FSM_DEPTH; m[15] = 1.0f;
+    float *fs = g.ubo_map + UBO_FSHADOW;
+    fs[0] = 1.0f; fs[1] = 1.0f / (float)SV_FSM_RES; fs[2] = 0.5f / SV_FSM_DEPTH; fs[3] = 0.0f;
+}
+/* Draw the map, between the geometry and light passes, when it holds any
+ * part. Answers the draws. Timed on the GPU (stat 14) where timestamps are. */
+static int fig_shadow_record(Frame *F, uint32_t q0) {
+    fg.sdraws = 0;
+    F->fsm_ts = 0;
+    if (fg.nsgroups == 0) return 0;
+    if (g.have_ts) vkCmdWriteTimestamp(F->cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, g.qpool, q0 + 2);
+    VkClearValue clear; clear.depthStencil.depth = 1.0f; clear.depthStencil.stencil = 0;
+    VkRenderPassBeginInfo rbi = { .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO, .renderPass = fg.fsm_pass, .framebuffer = fg.fsm_fb,
+        .renderArea = { { 0, 0 }, { SV_FSM_RES, SV_FSM_RES } }, .clearValueCount = 1, .pClearValues = &clear };
+    vkCmdBeginRenderPass(F->cmd, &rbi, VK_SUBPASS_CONTENTS_INLINE);
+    VkViewport vpt = { 0, 0, (float)SV_FSM_RES, (float)SV_FSM_RES, 0.0f, 1.0f };
+    VkRect2D sc = { { 0, 0 }, { SV_FSM_RES, SV_FSM_RES } };
+    vkCmdSetViewport(F->cmd, 0, 1, &vpt); vkCmdSetScissor(F->cmd, 0, 1, &sc);
+    vkCmdBindPipeline(F->cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, fg.fsm_pipe);
+    vkCmdBindDescriptorSets(F->cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g.layout, 0, 1, &F->dset, 0, NULL);
+    fg.sdraws = fig_draw(F, fg.sgroups, fg.nsgroups, SV_FIG_INST);
+    vkCmdEndRenderPass(F->cmd);
+    if (g.have_ts) { vkCmdWriteTimestamp(F->cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, g.qpool, q0 + 3); F->fsm_ts = 1; }
+    return (int)fg.sdraws;
+}
+
+
 int64_t sv_open(int64_t w, int64_t h, int64_t capture_mouse, int64_t quad_capacity) {
     memset(&g, 0, sizeof g);
     if (!glfwInit()) { die("glfwInit", 0); return 0; }
@@ -1135,7 +1630,7 @@ int64_t sv_open(int64_t w, int64_t h, int64_t capture_mouse, int64_t quad_capaci
     }
     if (!found) { die("no graphics+present queue", 0); return 0; }
     { VkPhysicalDeviceProperties pp; vkGetPhysicalDeviceProperties(g.phys, &pp);
-      g.have_ts = qf[g.qfam].timestampValidBits != 0; g.ts_period = pp.limits.timestampPeriod; }
+      g.have_ts = qf[g.qfam].timestampValidBits != 0; g.ts_period = pp.limits.timestampPeriod; g.max_ssbo = pp.limits.maxStorageBufferRange; }
     float prio = 1.0f;
     VkDeviceQueueCreateInfo qci = { .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, .queueFamilyIndex = g.qfam, .queueCount = 1, .pQueuePriorities = &prio };
     /* enable the portability subset extension when the device advertises it, as the spec requires */
@@ -1175,7 +1670,7 @@ int64_t sv_open(int64_t w, int64_t h, int64_t capture_mouse, int64_t quad_capaci
     g.swap_ok = 1;
 
     /* one set layout for every pipeline: 0 uniforms, 1 chunk table, 2 indirect commands, 3 cull statistics, 4 command -> slot */
-    VkDescriptorSetLayoutBinding dslb[24] = {
+    VkDescriptorSetLayoutBinding dslb[28] = {
         { .binding = 0, .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, .descriptorCount = 1,
           .stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT },
         { .binding = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1,
@@ -1209,11 +1704,18 @@ int64_t sv_open(int64_t w, int64_t h, int64_t capture_mouse, int64_t quad_capaci
         /* the 2D layer's interface atlas */
         { .binding = 22, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT },
         /* and its glyph atlas */
-        { .binding = 23, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT } };
-    VkDescriptorSetLayoutCreateInfo dsli = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 24, .pBindings = dslb };
+        { .binding = 23, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT },
+        /* figures: 24 the rigs' palettes, 25 this frame's figure parts, 26 the quad buffer read as words */
+        { .binding = 24, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT },
+        { .binding = 25, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_VERTEX_BIT },
+        { .binding = 26, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_VERTEX_BIT },
+        /* 27 the plain figures' sun shadow map, a comparing sampler */
+        { .binding = 27, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT } };
+    VkDescriptorSetLayoutCreateInfo dsli = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 28, .pBindings = dslb };
     VKOK(vkCreateDescriptorSetLayout(g.dev, &dsli, NULL, &g.dsl), "descriptor set layout");
-    /* where the call's range starts in draw_slot, and per-call flags (bit 0: cutout) */
-    VkPushConstantRange pcr = { .stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, .offset = 0, .size = 8 };
+    /* where the call's range starts in draw_slot, and per-call flags (bit 0: cutout, bit 1: a figure);
+     * a figure piece's draw adds eight words more (fig_record) */
+    VkPushConstantRange pcr = { .stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, .offset = 0, .size = 40 };
     VkPipelineLayoutCreateInfo pli = { .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = 1, .pSetLayouts = &g.dsl,
         .pushConstantRangeCount = 1, .pPushConstantRanges = &pcr };
     VKOK(vkCreatePipelineLayout(g.dev, &pli, NULL, &g.layout), "pipeline layout");
@@ -1225,6 +1727,7 @@ int64_t sv_open(int64_t w, int64_t h, int64_t capture_mouse, int64_t quad_capaci
     if (!make_pipeline(5, &g.pipe_composite)) return 0;
     if (!make_pipeline(6, &g.pipe_spray)) return 0;
     if (!make_pipeline(7, &g.pipe_ui)) return 0;
+    if (!make_pipeline(8, &g.pipe_fig)) return 0;
     g.ui_cpu = calloc((size_t)SV_UI_QUADS * SV_UI_FLOATS, sizeof(float));
     if (!g.ui_cpu) return 0;
     g.ui_n = 0; g.ui_dropped = 0;
@@ -1238,7 +1741,7 @@ int64_t sv_open(int64_t w, int64_t h, int64_t capture_mouse, int64_t quad_capaci
 
     void *map = NULL;
     g.quad_cap = (quad_capacity > 0 && quad_capacity < 0x20000000) ? (uint32_t)quad_capacity : SV_DEFAULT_QUADS;
-    if (!make_buffer((VkDeviceSize)g.quad_cap * 8, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, &g.giga, &g.giga_mem, &map)) return 0;
+    if (!make_buffer((VkDeviceSize)g.quad_cap * 8, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &g.giga, &g.giga_mem, &map)) return 0;
     g.giga_map = map;
     g.ubo_map = calloc(UBO_FLOATS, sizeof(float));
     g.sky_rays = 2; g.reflections = 1; g.light_mode = 4;
@@ -1272,7 +1775,7 @@ int64_t sv_open(int64_t w, int64_t h, int64_t capture_mouse, int64_t quad_capaci
     if (!make_buffer((VkDeviceSize)SV_MAX_BLOCKS * 32, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &g.blocks, &g.blocks_mem, &map)) return 0;
     g.blocks_map = map;
     memset(g.blocks_map, 0, (size_t)SV_MAX_BLOCKS * 32);
-    VkDescriptorPoolSize dps[3] = { { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, SV_FRAMES }, { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 11 * SV_FRAMES }, { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 12 * SV_FRAMES } };
+    VkDescriptorPoolSize dps[3] = { { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, SV_FRAMES }, { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 14 * SV_FRAMES }, { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 13 * SV_FRAMES } };
     VkDescriptorPoolCreateInfo dpi = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = SV_FRAMES, .poolSizeCount = 3, .pPoolSizes = dps };
     VKOK(vkCreateDescriptorPool(g.dev, &dpi, NULL, &g.dpool), "descriptor pool");
     for (int f = 0; f < SV_FRAMES; f++) {
@@ -1283,6 +1786,9 @@ int64_t sv_open(int64_t w, int64_t h, int64_t capture_mouse, int64_t quad_capaci
         F->ui_map = map;
         if (!make_buffer(SV_GLYPH_STAGE, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, &F->gstage, &F->gstage_mem, &map)) return 0;
         F->gstage_map = map;
+        /* the parts drawn, then (from SV_FIG_INST) the parts in the shadow map */
+        if (!make_buffer((VkDeviceSize)SV_FIG_INST * 2 * sizeof(struct FigInst), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &F->finst, &F->finst_mem, &map)) return 0;
+        F->finst_map = map; memset(F->finst_map, 0, (size_t)SV_FIG_INST * 2 * sizeof(struct FigInst));
         VkDescriptorSetAllocateInfo dai = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, .descriptorPool = g.dpool, .descriptorSetCount = 1, .pSetLayouts = &g.dsl };
         VKOK(vkAllocateDescriptorSets(g.dev, &dai, &F->dset), "descriptor set");
         if (!make_buffer(UBO_FLOATS * 4, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, &F->ubo, &F->ubo_mem, &map)) return 0;
@@ -1323,6 +1829,22 @@ int64_t sv_open(int64_t w, int64_t h, int64_t capture_mouse, int64_t quad_capaci
                 .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &bb[b] };
         vkUpdateDescriptorSets(g.dev, 5, bw, 0, NULL);
     }
+    if (!fig_init()) { die("figures", 0); return 0; }
+    for (int f = 0; f < SV_FRAMES; f++) {
+        Frame *F = &g.frames[f];
+        /* the quad buffer as words: no more of it than one storage descriptor may reach (a figure piece past that is not drawn right) */
+        VkDeviceSize qrange = (VkDeviceSize)g.quad_cap * 8;
+        if (qrange > g.max_ssbo) qrange = g.max_ssbo;
+        VkDescriptorBufferInfo fb[3] = { { fg.pal, 0, VK_WHOLE_SIZE }, { F->finst, 0, VK_WHOLE_SIZE }, { g.giga, 0, qrange } };
+        VkWriteDescriptorSet fw[4];
+        for (uint32_t b = 0; b < 3; b++)
+            fw[b] = (VkWriteDescriptorSet){ .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = F->dset, .dstBinding = 24 + b, .descriptorCount = 1,
+                .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &fb[b] };
+        VkDescriptorImageInfo si = { fg.fsm_sampler, fg.fsm_view, VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL };
+        fw[3] = (VkWriteDescriptorSet){ .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = F->dset, .dstBinding = 27, .descriptorCount = 1,
+            .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .pImageInfo = &si };
+        vkUpdateDescriptorSets(g.dev, 4, fw, 0, NULL);
+    }
     bind_targets();               /* the sets did not exist when the frame's images were made */
     if (!make_buffer(256 * 32, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &g.ltable, &g.ltable_mem, &map)) return 0;
     g.ltable_map = map; memset(g.ltable_map, 0, 256 * 32);
@@ -1357,7 +1879,7 @@ int64_t sv_open(int64_t w, int64_t h, int64_t capture_mouse, int64_t quad_capaci
         VKOK(vkCreateFence(g.dev, &fi, NULL, &g.frames[f].fence), "fence");
     }
     if (g.have_ts) {
-        VkQueryPoolCreateInfo qi = { .sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, .queryType = VK_QUERY_TYPE_TIMESTAMP, .queryCount = 2 * SV_FRAMES };
+        VkQueryPoolCreateInfo qi = { .sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, .queryType = VK_QUERY_TYPE_TIMESTAMP, .queryCount = 4 * SV_FRAMES };
         if (vkCreateQueryPool(g.dev, &qi, NULL, &g.qpool) != VK_SUCCESS) g.have_ts = 0;
     }
     g.stat[3] = -1.0;
@@ -1392,7 +1914,11 @@ void sv_close(void) {
         if (g.pipe_light) vkDestroyPipeline(g.dev, g.pipe_light, NULL);
         if (g.pipe_composite) vkDestroyPipeline(g.dev, g.pipe_composite, NULL);
         if (g.pipe_ui) vkDestroyPipeline(g.dev, g.pipe_ui, NULL);
+        if (g.pipe_fig) vkDestroyPipeline(g.dev, g.pipe_fig, NULL);
+        fig_free();
         for (int f = 0; f < SV_FRAMES; f++) {
+            if (g.frames[f].finst) vkDestroyBuffer(g.dev, g.frames[f].finst, NULL);
+            if (g.frames[f].finst_mem) vkFreeMemory(g.dev, g.frames[f].finst_mem, NULL);
             if (g.frames[f].ui) vkDestroyBuffer(g.dev, g.frames[f].ui, NULL);
             if (g.frames[f].ui_mem) vkFreeMemory(g.dev, g.frames[f].ui_mem, NULL);
             if (g.frames[f].gstage) vkDestroyBuffer(g.dev, g.frames[f].gstage, NULL);
@@ -1477,12 +2003,25 @@ void sv_set_vsync(int64_t on) { int off = on ? 0 : 1; if (g.ok && off != g.vsync
  * calls issued, 3 GPU ms or -1 if the driver
  * gives no timestamps, 4 translucent chunks drawn, 5 microseconds spent
  * ordering them. And since the start: 6 swapchain rebuilds, 7 buffer
- * elements lost because an allocator's list was full. */
+ * elements lost because an allocator's list was full. 8 spray particles
+ * live, 9 2D quads dropped. Figures, of the last frame: 10 parts drawn
+ * (after culling), 11 figure draws issued, 12 microseconds of CPU preparing
+ * them (the draw list, culling, grouping), 13 microseconds of that in the
+ * draw list alone (an_x_draw_list: the slerps), 14 GPU milliseconds of the
+ * figure shadow map's pass (0 when it did not run or there are no
+ * timestamps), 15 parts drawn into it, 16 its draws. */
 double sv_stat(int64_t which) {
     if (which == 6) return (double)g.rebuilds;
     if (which == 7) return (double)g_quads.leaked + (double)g_loose.leaked;
     if (which == 8) return g.spray_births ? (double)sp_count(&g.ring) : 0.0;
     if (which == 9) return (double)g.ui_dropped;
+    if (which == 10) return (double)fg.parts;
+    if (which == 11) return (double)fg.draws;
+    if (which == 12) return fg.cpu_us;
+    if (which == 13) return fg.list_us;
+    if (which == 14) return fg.shadow_ms;
+    if (which == 15) return (double)fg.sparts;
+    if (which == 16) return (double)fg.sdraws;
     return (which >= 0 && which < 6) ? g.stat[which] : -1.0;
 }
 int64_t sv_drawn_chunks(void) { return g.drawn_chunks; }
@@ -1630,6 +2169,7 @@ int64_t sv_chunk_begin(int64_t slot, double ox, double oy, double oz) {
     for (int i = 0; i < 4; i++) g.stage.n[i] = 0;
     g.stage.open = 1;
     g.stage.body = 0;
+    g.stage.fig = 0;
     g.stage_light_n = 0;
     return 1;
 }
@@ -1783,8 +2323,10 @@ int64_t sv_chunk_light(void *bytes, int64_t n) {
     return 1;
 }
 
+static int64_t fig_commit(void);
 int64_t sv_chunk_commit(void) {
     if (!g.stage.open) return 0;
+    if (g.stage.fig) return fig_commit();
     g.stage.open = 0;
     int64_t slot = g.stage.slot;
     const uint32_t *inst = g.stage.part[3];
@@ -1863,6 +2405,7 @@ void sv_chunk_free(int64_t slot) {
     sa_release(&g_loose, (Range){ e->first[4], e->count[4] }, g.frame_no); e->first[4] = 0; e->count[4] = 0;
     touch((uint32_t)slot);
 }
+
 
 /* Give model [index] its drawing geometry: [nquads] quads of 21 floats
  * (Strata.Model). Chunks uploaded afterwards draw it; ones already uploaded
@@ -2010,7 +2553,7 @@ int64_t sv_frame(void) {
     if (!g.ok) return 0;
     if (g.resized || !g.swap_ok) { g.resized = 0; if (!rebuild_swapchain()) return 0; }
     Frame *F = &g.frames[g.frame_no % SV_FRAMES];
-    uint32_t q0 = (uint32_t)(g.frame_no % SV_FRAMES) * 2;
+    uint32_t q0 = (uint32_t)(g.frame_no % SV_FRAMES) * 4;
     double t_start = glfwGetTime();
     /* this Frame was last used two frames ago; when its fence is signalled,
      * everything released up to then is idle */
@@ -2037,6 +2580,9 @@ int64_t sv_frame(void) {
         uint64_t ts[2] = { 0, 0 };
         if (vkGetQueryPoolResults(g.dev, g.qpool, q0, 2, sizeof ts, ts, sizeof ts[0], VK_QUERY_RESULT_64_BIT) == VK_SUCCESS)
             g.stat[3] = (double)(ts[1] - ts[0]) * (double)g.ts_period / 1.0e6;
+        fg.shadow_ms = 0.0;
+        if (F->fsm_ts && vkGetQueryPoolResults(g.dev, g.qpool, q0 + 2, 2, sizeof ts, ts, sizeof ts[0], VK_QUERY_RESULT_64_BIT) == VK_SUCCESS)
+            fg.shadow_ms = (double)(ts[1] - ts[0]) * (double)g.ts_period / 1.0e6;
     }
     uint32_t idx = 0;
     int offscreen = g.offscreen;
@@ -2055,7 +2601,8 @@ int64_t sv_frame(void) {
     vkResetCommandBuffer(F->cmd, 0);
     VkCommandBufferBeginInfo bi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
     vkBeginCommandBuffer(F->cmd, &bi);
-    if (g.have_ts) { vkCmdResetQueryPool(F->cmd, g.qpool, q0, 2); vkCmdWriteTimestamp(F->cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, g.qpool, q0); }
+    fig_shadow_first(F);
+    if (g.have_ts) { vkCmdResetQueryPool(F->cmd, g.qpool, q0, 4); vkCmdWriteTimestamp(F->cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, g.qpool, q0); }
     /* cull: one compute invocation per slot writes the indirect commands */
     int32_t *misc = (int32_t *)(g.ubo_map + 32);
     misc[0] = (int32_t)g.hi_slot; misc[1] = SV_CMD_STRIDE; misc[2] = (int32_t)g.layers; misc[3] = (int32_t)g.nblocks;
@@ -2092,6 +2639,7 @@ int64_t sv_frame(void) {
      * copies: bring them up to date. From here to the next time this Frame
      * comes round, nothing the CPU does can change what it draws. */
     bodies_to_frame(F);
+    fig_prepare(F);
     memcpy(F->ubo_map, g.ubo_map, UBO_FLOATS * 4);
     for (uint32_t i = 0; i < F->npending; i++) {
         uint32_t slot = F->pending[i];
@@ -2149,7 +2697,10 @@ int64_t sv_frame(void) {
         vkCmdPushConstants(F->cmd, g.layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, 8, pc);
         vkCmdDrawIndirect(F->cmd, g.cmds, (VkDeviceSize)base * 16, n, 16); draws++;
     }
+    draws += fig_record(F);
     vkCmdEndRenderPass(F->cmd);
+    /* 1b. the plain figures' sun shadow map, when any is in reach */
+    draws += fig_shadow_record(F, q0);
 
     /* 2. light: one full-screen triangle reads those buffers and writes the lit image */
     VkRenderPassBeginInfo lbi = { .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO, .renderPass = g.pass_l, .framebuffer = g.fb_l[g.frame_no % SV_FRAMES],

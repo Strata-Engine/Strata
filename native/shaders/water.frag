@@ -39,6 +39,7 @@ void main() {
     }
     // one ray at the sun's centre: translucent surfaces keep no memory between frames
     float sun_vis = u.light.x >= 2.0 ? sun_visible(v_world / u.eye.w, n, u.sun.xyz) : 1.0;
+    if (u.fshadow.x > 0.5 && sun_vis > 0.0) sun_vis = min(sun_vis, fig_shadow(v_world, n));
     vec3 col = base.rgb * (u.sun_color.rgb * max(dot(n, u.sun.xyz), 0.0) * sun_vis + sky_flat(n));
     float alpha = base.a;
     if (u.light.x >= 3.0) {
