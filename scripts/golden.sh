@@ -103,13 +103,20 @@ figure-walk-lit-4s:STRATA_SCENE=32 STRATA_LIGHT=4 STRATA_FRAMES=243 STRATA_FIG_S
 figure-shadow:STRATA_SCENE=33 STRATA_LIGHT=4 STRATA_SUN=18 DRAWS=35
 figure-shadow-walk-2s:STRATA_SCENE=33 STRATA_LIGHT=4 STRATA_SUN=18 STRATA_FRAMES=123 DRAWS=35
 figure-shadow-walk-4s:STRATA_SCENE=33 STRATA_LIGHT=4 STRATA_SUN=18 STRATA_FRAMES=243 DRAWS=35
+traced-shadow:STRATA_SCENE=34 STRATA_LIGHT=4 STRATA_SUN=18 DRAWS=35
+traced-shadow-walk-2s:STRATA_SCENE=34 STRATA_LIGHT=4 STRATA_SUN=18 STRATA_FRAMES=123 DRAWS=35
+traced-shadow-walk-4s:STRATA_SCENE=34 STRATA_LIGHT=4 STRATA_SUN=18 STRATA_FRAMES=243 DRAWS=35
+figure-reflection:STRATA_SCENE=35 STRATA_LIGHT=3 STRATA_SUN=12 STRATA_FRAMES=90 DRAWS=20
+glowing-figure:STRATA_SCENE=36 STRATA_LIGHT=4 STRATA_SUN=2 STRATA_FRAMES=123 DRAWS=21
 '
 # indirect draw calls a frame must issue, whatever the scene holds; a scene
 # with a kind of geometry nowhere in it says DRAWS=n (a figure scene adds one
 # draw per figure piece shown: the humanoid's 15 parts are one piece each, and
 # as many again for the plain figures' shadow map in light modes 2 to 8; scenes
 # 31 and 32 were stored before figures cast shadows and keep them off with
-# STRATA_FIG_SHADOWS=0, scene 33 shows them). STRICT=1 holds a scene
+# STRATA_FIG_SHADOWS=0, scene 33 shows them; a traced figure is left out of
+# the map: scene 34 maps its one plain runner, 35 and 36 map none, 36 adds the
+# torch's one piece). STRICT=1 holds a scene
 # to a difference of 4 in 0.05% of pixels: small text is few pixels. Line 9's note stands:
 # a new scene's first picture is left as test/golden/name.actual.ppm to be
 # looked at and stored by hand (gzip -9 -c it to test/golden/name.ppm.gz)

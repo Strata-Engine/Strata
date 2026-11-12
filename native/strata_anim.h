@@ -71,6 +71,7 @@
 #define AN_FAR_EVERY 2             /* a figure past the far distance poses one update in this many */
 #define AN_TRACED 64               /* figures drawn traced at once; more are counted in stat 9 and drawn plain */
 #define AN_DRAW_MAX (1 << 14)      /* parts in one draw list (twice the arena's 7 680); more are counted in stat 10 */
+#define AN_SHADOW_REACH 24.0f      /* metres along the ground a figure out of view may lie from the view and still be listed for its shadow */
 
 /* why the last refused call was refused: an_stat(5) */
 enum {
@@ -290,6 +291,7 @@ struct AnWorld {
     float *prev;                                                 /* capacity x AN_PARTS x 12: the pose before the last */
     float planes[24]; int nplanes;                               /* the view: 0 or 6 unit planes, n.p + d >= 0 inside */
     float eye[3], far_m; int has_far;                            /* the eye, and the distance past which a figure is far */
+    float dsun[3]; int has_dsun;                                 /* the drawing's sun (an_draw_sun): toward it, unit, above the horizon */
     int ntraced, nwaiting;                                       /* figures drawn traced, and those waiting past the cap */
     int skipped;                                                 /* figures the last update did not pose (stat 11) */
     double draw_over;                                            /* parts left out of the last draw list (stat 10) */
@@ -2127,18 +2129,55 @@ static inline const float *an_draw_matrices(AnWorld *w, int fig, float blend) {
     for (int p = 0; p < w->rigs[f->rig].nparts; p++) an_mat_mix(a + p * 12, b + p * 12, u, w->dscratch + p * 12);
     return w->dscratch;
 }
+/* the sun the drawing casts shadows by (the direction toward it; NULL, or
+ * one at or below 0.01 up, for none). Drawing only: it widens the draw list
+ * to figures out of view whose shadows may fall in it, and changes no
+ * answer, no hash and no figure's posing class. Refused, changing nothing,
+ * if a value is not finite. */
+static inline void an_draw_sun(AnWorld *w, const float sun[3]) {
+    if (sun && !an_finite(sun, 3)) { an_refuse(w, AN_R_VALUE); return; }
+    float l = sun ? sqrtf(sun[0] * sun[0] + sun[1] * sun[1] + sun[2] * sun[2]) : 0;
+    w->has_dsun = sun && l > 1e-12f && sun[1] / l > 0.01f;
+    for (int k = 0; k < 3; k++) w->dsun[k] = w->has_dsun ? sun[k] / l : 0;
+}
+/* is f, out of view, near enough that its sun shadow may fall in view: its
+ * bounds swept away from the sun until their top has come down by their
+ * height, but at most AN_SHADOW_REACH metres along the ground, reach within
+ * AN_MARGIN of the inside of every plane */
+static inline int an_shadow_in_view(const AnWorld *w, const AnFig *f) {
+    if (!w->nplanes || !w->has_dsun) return 0;
+    float lo[3], hi[3];
+    an_cull_box(f, lo, hi);
+    const float *s = w->dsun;
+    float flat = sqrtf(s[0] * s[0] + s[2] * s[2]);
+    float t = (hi[1] - lo[1]) / s[1];                         /* along -sun, down by the height */
+    if (flat * t > AN_SHADOW_REACH) t = AN_SHADOW_REACH / flat;
+    float sweep[3] = { -s[0] * t, -s[1] * t, -s[2] * t };
+    for (int i = 0; i < w->nplanes; i++) {
+        const float *pl = w->planes + 4 * i;
+        float d = pl[3], along = 0;
+        for (int k = 0; k < 3; k++) { d += pl[k] * (pl[k] > 0 ? hi[k] : lo[k]); along += pl[k] * sweep[k]; }
+        if (along > 0) d += along;                             /* the swept box's corner furthest inside */
+        if (d < -AN_MARGIN) return 0;
+    }
+    return 1;
+}
 /* the renderer's source: every part with volume of every figure in view now
  * (or always posed), in slot then part order, drawn at blend as
  * an_draw_matrices draws it: rig x AN_PARTS + part, its 3x4 and its flags
- * (bit 0 traced; the figure's id from bit 8). Answers how many; the arrays are
- * the world's, valid until the next call. Past AN_DRAW_MAX parts the rest are
- * left out, counted in stat 10. */
+ * (bit 0 traced; bit 1 out of view, listed only because its sun shadow may
+ * fall in view (an_draw_sun): for the shadow and the rays, not to be drawn;
+ * the figure's id from bit 8). Answers how many; the arrays are the world's,
+ * valid until the next call. Past AN_DRAW_MAX parts the rest are left out,
+ * counted in stat 10. */
 static inline int an_draw_list(AnWorld *w, float blend, const int32_t **rig_part, const float **xf, const int32_t **flags) {
     int n = 0;
     w->draw_over = 0;
     for (int s = 0; s < w->capacity; s++) {
         const AnFig *f = &w->figs[s];
-        if (f->id < 0 || !(f->always || an_in_view(w, f))) continue;
+        if (f->id < 0) continue;
+        int shade = 0;
+        if (!(f->always || an_in_view(w, f))) { if (!an_shadow_in_view(w, f)) continue; shade = 2; }
         const AnRig *r = &w->rigs[f->rig];
         const float *a = an_fig_prev(w, f), *b = an_fig_mats(w, f);
         float u = an_draw_u(f, blend);
@@ -2147,7 +2186,7 @@ static inline int an_draw_list(AnWorld *w, float blend, const int32_t **rig_part
             if (n >= AN_DRAW_MAX) { w->draw_over += 1; continue; }
             an_mat_mix(a + p * 12, b + p * 12, u, w->dl_xf + (size_t)n * 12);
             w->dl_rp[n] = f->rig * AN_PARTS + p;
-            w->dl_flags[n] = (f->traced == 1 ? 1 : 0) | (f->id << 8);
+            w->dl_flags[n] = (f->traced == 1 ? 1 : 0) | shade | (f->id << 8);
             n++;
         }
     }

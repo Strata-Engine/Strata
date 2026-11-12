@@ -101,7 +101,7 @@ const float GLOW = 5.0;
 // The light arriving at a point (voxel units) on a face with normal n from
 // everything but the sun: [rays] rays over the hemisphere, more of them near
 // the normal. One that escapes brings the sky's colour; one that hits brings
-// what the block there emits and what it passes on from the sun and the sky.
+// what the block (or traced figure's voxel) there emits and what it passes on from the sun and the sky.
 vec3 sky_light(vec3 at, vec3 n, ivec2 px, int frame, int rays) {
     vec3 a = normalize(cross(n, abs(n.y) < 0.9 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0)));
     vec3 b = cross(n, a);
@@ -114,8 +114,8 @@ vec3 sky_light(vec3 at, vec3 n, ivec2 px, int frame, int rays) {
         if (!trace_steps(at + n * 0.02, dir, 48.0, false, 40, 12.0, -1000000, h)) sum += sky_base(dir) + h.glow * GLOW;
         else {
             vec3 hn = NORMALS[h.face];
-            sum += class_emission(h.cls) * GLOW + h.glow * GLOW
-                 + class_color(h.cls) * (u.sun_color.rgb * max(dot(hn, u.sun.xyz), 0.0) * 0.5 + sky_flat(hn));
+            sum += hit_emission(h.cls) * GLOW + h.glow * GLOW
+                 + hit_color(h.cls) * (u.sun_color.rgb * max(dot(hn, u.sun.xyz), 0.0) * 0.5 + sky_flat(hn));
         }
     }
     return sum / float(max(rays, 1));

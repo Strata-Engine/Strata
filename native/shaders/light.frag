@@ -5,7 +5,7 @@ layout(location = 0) in vec2 v_uv;
 layout(location = 0) out vec4 o_lit;
 layout(location = 1) out vec4 o_hist;
 layout(location = 2) out vec4 o_meta;
-// boxes (voxels, low and high corners) round bodies that moved this frame
+// boxes (voxels, low and high corners) round bodies that moved this frame, then round traced figures that moved lately (strata_vk.c, fig_trace_prepare)
 layout(std430, set = 0, binding = 21) readonly buffer Movers { vec4 boxes[]; } movers;
 
 // A colour for a light class, for looking at the volume.
@@ -74,8 +74,8 @@ void main() {
     // An edit unsettles the pixels it can reach: those within 32 voxels of the chunks it changed.
     // So does a sun that has just moved, everywhere.
     bool settling = u.vol.w <= 2 || u.edit_lo.w > 0.5 && all(greaterThan(at, u.edit_lo.xyz - 32.0)) && all(lessThan(at, u.edit_hi.xyz + 32.0));
-    // so does a body moving near it: its own surface, and its shadow
-    for (int m = 0; m < u.bodies.x && m < 16; m++)
+    // so does a body or a traced figure moving near it: its own surface, its shadow, the sky light it blocks and the light it gives
+    for (int m = 0; m < u.bodies.x && m < 80; m++)
         if (all(greaterThan(at, movers.boxes[2 * m].xyz)) && all(lessThan(at, movers.boxes[2 * m + 1].xyz))) settling = true;
     // and a figure that moved since the last frame, on its own surface
     if (figure && (fcode & 64) != 0) settling = true;
