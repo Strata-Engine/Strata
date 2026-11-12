@@ -18,10 +18,12 @@ for d in . demo viewer; do
 done
 # C tests, then the golden images; both need a compiler, the second a GPU
 mkdir -p native/tests/bin
-for t in native/tests/*_test.c; do
+# (*_test.cpp: tests of native/strata_vox.cpp, C++ because ogt_vox.h is;
+# -fno-exceptions keeps them free of the C++ runtime, as in the forge builds)
+for t in native/tests/*_test.c native/tests/*_test.cpp; do
   [ -f "$t" ] || continue
-  b="native/tests/bin/$(basename "$t" .c)"
-  if ! cc -O1 -Wall -Wextra -Inative -o "$b" "$t" > .verify.log 2>&1 || ! "$b" >> .verify.log 2>&1; then
+  b="native/tests/bin/$(basename "${t%.*}")"
+  if ! cc -O1 -Wall -Wextra -fno-exceptions -Inative -o "$b" "$t" > .verify.log 2>&1 || ! "$b" >> .verify.log 2>&1; then
     echo "FAIL: $t"; tail -20 .verify.log; exit 1
   fi
 done
