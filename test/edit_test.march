@@ -1,0 +1,102 @@
+-- Edit.blast: a carve sphere whose radius varies by direction, dirtying
+-- only the chunks it touches, the same crater for the same seed.
+mod Strata.Test.Edit do
+
+  needs IO.Clock      -- charged to every test module once any uses Check.all (GAPS S3)
+  needs IO.Process
+  import Test
+  alias Strata.World as Wd
+  alias Strata.Edit as Ed
+  alias Strata.Coord as Cd
+  alias Strata.Chunk as C
+  alias Strata.Blocks as B
+
+  pfn reg() : Strata.Blocks.Registry do
+    match B.register(B.empty(), B.def()) do
+      Ok((r, _)) -> r
+      Err(_) -> B.empty()
+    end
+  end
+  -- solid stone everywhere
+  pfn solid() : Strata.World.World do Wd.new(reg(), Strata.Terrain.gen(fn (k, seed) -> C.uniform(1)), 7, 1.0) end
+  pfn load(w : Strata.World.World, cx : Int, cy : Int, cz : Int) : Strata.World.World do
+    let k = Cd.key(cx, cy, cz)
+    Wd.insert(w, k, Strata.Terrain.run(Wd.terrain(w), k, Wd.seed(w)))
+  end
+  -- the 4 x 4 x 4 box of chunks -2..1 on each axis
+  pfn load_box(w : Strata.World.World, i : Int) : Strata.World.World do
+    if i >= 64 do w else load_box(load(w, i % 4 - 2, (i / 4) % 4 - 2, i / 16 - 2), i + 1) end
+  end
+  pfn has_key(l : List(Strata.Coord.Key), k : Strata.Coord.Key) : Bool do
+    match l do
+      Nil -> false
+      Cons(h, t) -> if Cd.key_eq(h, k) do true else has_key(t, k) end
+    end
+  end
+
+  -- the air voxels in the cube of half-side n about (cx, cy, cz): count, and the farthest one's squared distance
+  pfn carved(w : Strata.World.World, cx : Int, cy : Int, cz : Int, n : Int, i : Int, cnt : Int, far : Int) : (Int, Int) do
+    let side = 2 * n + 1
+    if i >= side * side * side do (cnt, far)
+    else
+      let dx = i % side - n
+      let dy = (i / side) % side - n
+      let dz = i / (side * side) - n
+      if Wd.get_block(w, cx + dx, cy + dy, cz + dz) != 0 do carved(w, cx, cy, cz, n, i + 1, cnt, far)
+      else
+        let d2 = dx * dx + dy * dy + dz * dz
+        carved(w, cx, cy, cz, n, i + 1, cnt + 1, if d2 > far do d2 else far end)
+      end
+    end
+  end
+  -- do two worlds hold the same blocks over the cube of half-side n about (cx, cy, cz)?
+  pfn same(a : Strata.World.World, b : Strata.World.World, cx : Int, cy : Int, cz : Int, n : Int, i : Int) : Bool do
+    let side = 2 * n + 1
+    if i >= side * side * side do true
+    else
+      let x = cx + i % side - n
+      let y = cy + (i / side) % side - n
+      let z = cz + i / (side * side) - n
+      if Wd.get_block(a, x, y, z) != Wd.get_block(b, x, y, z) do false else same(a, b, cx, cy, cz, n, i + 1) end
+    end
+  end
+
+  describe "Edit.blast" do
+    test "a blast on a chunk border dirties exactly the two chunks it touches" do
+      let o = Ed.blast(load_box(solid(), 0), 0, 16, 16, 4, 11, 0)
+      Test.assert_eq_int(List.length(Ed.dirty(o)), 2, "two chunks")
+      Test.assert_true(has_key(Ed.dirty(o), Cd.key(0, 0, 0)), "the +x one")
+      Test.assert_true(has_key(Ed.dirty(o), Cd.key(-1, 0, 0)), "the -x one")
+      Test.assert_true(List.length(Ed.changes(o)) > 100, "every carved voxel is recorded")
+    end
+    test "a blast inside one chunk dirties that chunk alone" do
+      let o = Ed.blast(load_box(solid(), 0), 16, 16, 16, 6, 11, 0)
+      Test.assert_eq_int(List.length(Ed.dirty(o)), 1, "one chunk")
+      Test.assert_true(has_key(Ed.dirty(o), Cd.key(0, 0, 0)), "its own")
+    end
+    test "the same seed gives the same crater, another seed another" do
+      let w = load_box(solid(), 0)
+      let a = Ed.world(Ed.blast(w, 3, 5, -4, 6, 11, 0))
+      let b = Ed.world(Ed.blast(w, 3, 5, -4, 6, 11, 0))
+      let c = Ed.world(Ed.blast(w, 3, 5, -4, 6, 12, 0))
+      Test.assert_true(same(a, b, 3, 5, -4, 9, 0), "seed 11 twice: the same voxels")
+      Test.assert_false(same(a, c, 3, 5, -4, 9, 0), "seeds 11 and 12 differ")
+    end
+    test "the radius never exceeds 1.3 times the given, and the crater is not a ball" do
+      let w = load_box(solid(), 0)
+      let ok = List.all(List.range(1, 9), fn s ->
+        match carved(Ed.world(Ed.blast(w, 0, 0, 0, 7, s, 0)), 0, 0, 0, 12, 0, 0, 0) do
+          (cnt, far) -> cnt > 0 && far * 100 <= 7 * 7 * 169
+        end)
+      Test.assert_true(ok, "no carved voxel beyond 9.1 from the centre, over 8 seeds")
+      let ball = carved(Ed.world(Ed.fill_sphere(w, 0, 0, 0, 7, 0)), 0, 0, 0, 12, 0, 0, 0)
+      let crater = carved(Ed.world(Ed.blast(w, 0, 0, 0, 7, 11, 0)), 0, 0, 0, 12, 0, 0, 0)
+      Test.assert_true(match (ball, crater) do ((n1, _), (n2, _)) -> n1 != n2 end, "a different set of voxels from the sphere")
+    end
+    test "a negative radius is no edit" do
+      let o = Ed.blast(load_box(solid(), 0), 0, 0, 0, -1, 11, 0)
+      Test.assert_eq_int(List.length(Ed.dirty(o)), 0, "nothing dirty")
+      Test.assert_eq_int(List.length(Ed.changes(o)), 0, "nothing recorded")
+    end
+  end
+end
