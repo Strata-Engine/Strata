@@ -1,13 +1,17 @@
 // Rays through the light volume.
 //
 // The volume holds one byte per voxel, a light class (0 = empty), for every
-// chunk the renderer has been given, addressed by voxel coordinate modulo its
-// size. `owner` says, per chunk-sized cell, which chunk's voxels are in it,
-// so a ray never mistakes a wrapped-round chunk for the one it is in: where
+// chunk the renderer has been given whose voxels are not all one class, each
+// in a 32-voxel page of a pool (16 x 16 pages a layer). `owner` says, per
+// chunk-sized cell (a chunk's coordinate modulo the stream's box), which
+// chunk is in it and where its voxels are: a page, or one class throughout.
+// So a ray never mistakes a wrapped-round chunk for the one it is in: where
 // the owner is not the chunk the ray is in, the ray has left the loaded
 // world and sees nothing. `coarse` says how high each 8-voxel cell's contents
 // reach, so empty space, and the air over the ground, is crossed eight voxels
-// at a time.
+// at a time. It and the owner each hold two heights: of everything, and of
+// everything but see-through classes. A ray that passes through water and
+// glass uses the second, so it crosses a lake as it crosses air.
 layout(set = 0, binding = 11) uniform usampler3D vol;
 layout(set = 0, binding = 12) uniform usampler3D coarse;
 layout(set = 0, binding = 13) uniform isampler3D owner;
@@ -47,6 +51,14 @@ struct Hit {
 };
 
 ivec3 wrap(ivec3 v, ivec3 size) { return ((v % size) + size) % size; }
+
+// Where a chunk's voxels start in the pool, from its owner texel's w; -1
+// when they are all one class (w >> 13 is that class).
+ivec3 page_of(int w) {
+    if (((w >> 12) & 1) == 0) return ivec3(-1);
+    int p = w >> 13;
+    return ivec3((p % 16) * 32, ((p / 16) % 16) * 32, (p / 256) * 32);
+}
 
 // Is the texture of a cutout class solid where the ray enters this voxel?
 bool cutout_blocks(uint c, vec3 p, int face) {
@@ -131,6 +143,8 @@ bool trace_steps(vec3 ro, vec3 rd, float tmax, bool stop_glass, int steps, float
     int face = 0;
     ivec3 last_chunk = ivec3(-1000000);
     ivec3 shift = ivec3(0);                       // from a chunk coordinate to its cell in the volume
+    ivec3 page = ivec3(-1);                       // where the chunk's voxels start in the pool, or -1 when they are all one class
+    uint whole = 0u;                              // ... that class
     float chunk_top = 0.0;                        // how high the contents of the chunk the ray is in reach, in voxels
     ivec3 last_thin = ivec3(-1000000);
     uint before = 0u;                             // the class of the voxel the ray was in last
@@ -148,7 +162,8 @@ bool trace_steps(vec3 ro, vec3 rd, float tmax, bool stop_glass, int steps, float
             ivec3 cell = wrap(ch, dims);
             ivec4 own = texelFetch(owner, cell, 0);
             if (own.w == 0 || own.xyz != ch) break;                // off the edge of what is loaded
-            last_chunk = ch; shift = cell - ch; chunk_top = float(own.w - 1);
+            last_chunk = ch; shift = cell - ch; chunk_top = stop_glass ? float((own.w & 63) - 1) : float((own.w >> 6) & 63);
+            page = page_of(own.w); whole = uint(own.w >> 13);
             if (any_bodies) {
                 uvec2 e = body_cells.cells[cell.x + dims.x * (cell.y + dims.y * cell.z)];
                 for (uint k = 0u; k < e.y && k < 64u; k++) body_ray(body_list.ids[e.x + k], ro, d, tmax, stop_glass, bt, bcls, bface);
@@ -158,11 +173,11 @@ bool trace_steps(vec3 ro, vec3 rd, float tmax, bool stop_glass, int steps, float
         if (chunk_top == 0.0 || (d.y >= 0.0 && p.y - float(ch.y * 32) >= chunk_top)) {
             lo = vec3(ch * 32); hi = lo + 32.0;                      // nothing in this chunk on the ray's way: cross it whole
             before = 0u;
-        } else if (skip_cell(texelFetch(coarse, (v >> 3) + shift * 4, 0).r, p.y - float((v.y >> 3) * 8), d.y)) {
+        } else if (skip_cell(stop_glass ? texelFetch(coarse, (v >> 3) + shift * 4, 0).r & 15u : texelFetch(coarse, (v >> 3) + shift * 4, 0).r >> 4, p.y - float((v.y >> 3) * 8), d.y)) {
             lo = vec3((v >> 3) * 8); hi = lo + 8.0;                  // nothing in this 8-voxel cell on the ray's way: cross it whole
             before = 0u;
         } else {
-            uint c = texelFetch(vol, v + shift * 32, 0).r;
+            uint c = page.x >= 0 ? texelFetch(vol, page + (v & 31), 0).r : whole;
             if (c != 0u) {
                 int kind = class_kind(c);
                 bool stops = kind == 1 || (kind == 2 && c != before && cutout_blocks(c, p, face)) || (kind == 3 && stop_glass && v.y != skip_y && v.y != skip_y + 1);
@@ -207,5 +222,6 @@ uint class_at(vec3 p) {
     ivec3 cell = wrap(ch, u.vol.xyz);
     ivec4 own = texelFetch(owner, cell, 0);
     if (own.w == 0 || own.xyz != ch) return 0u;
-    return texelFetch(vol, v + (cell - ch) * 32, 0).r;
+    ivec3 page = page_of(own.w);
+    return page.x >= 0 ? texelFetch(vol, page + (v & 31), 0).r : uint(own.w >> 13);
 }

@@ -16,7 +16,7 @@ layout(set = 0, binding = 0) uniform U {
     vec4 edit_hi;    // xyz its high corner
     ivec4 bodies;    // x moving bodies' boxes in the movers buffer, y bodies in the body table
     vec4 water;      // the liquid the eye is under: rgb its colour, w how fast it swallows light per metre (0: the eye is in air)
-    vec4 water2;     // x the height of that liquid's surface (metres)
+    vec4 water2;     // x the height of that liquid's surface (metres); y 1 when water may keep its memory between frames (storage images); z 1 when there are lamps for the light pass to aim at
 } u;
 
 // OpenGL clip space to Vulkan's: y points down, depth runs 0..1.

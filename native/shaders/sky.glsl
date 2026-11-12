@@ -98,11 +98,69 @@ float sun_visible(vec3 at, vec3 n, vec3 toward) {
 // How bright a fully emitting block is, against a sun of about 1.
 const float GLOW = 5.0;
 
+// Lamps near each cell of the light volume (strata_vk.c, lamps_to_frame):
+// per cell (first, count); each lamp a glowing voxel (x, y, z voxels, class).
+layout(std430, set = 0, binding = 28) readonly buffer LampCells { uvec2 cells[]; } lamp_cells;
+layout(std430, set = 0, binding = 29) readonly buffer LampList { ivec4 lamps[]; } lamp_list;
+
+// What lamp [l] would give a point at [at] facing [n] if nothing stood
+// between, as sky_light counts light (cosine-weighted, over pi), and how far
+// away it is and in what direction. A lamp's light reaches 16 voxels,
+// fading out from 12, as lights in games do: past that it is a few
+// hundredths of what it is close by, and not worth a ray.
+vec3 lamp_gives(ivec4 l, vec3 at, vec3 n, out vec3 dir, out float d) {
+    vec3 to = vec3(l.xyz) + 0.5 - at;
+    float d2 = dot(to, to);
+    d = sqrt(d2);
+    dir = to / max(d, 1.0e-4);
+    float c = dot(n, dir);
+    if (c <= 0.0 || d >= 16.0) return vec3(0.0);
+    // a voxel seen from d away covers about 1.2 / d^2 of the sphere; near, no more than a half
+    float omega = min(1.2 / max(d2, 0.25), 3.14159);
+    return class_emission(uint(l.w)) * GLOW * omega * c / 3.14159 * smoothstep(16.0, 12.0, d);
+}
+
+// Light from the lamps listed for [at]'s cell: one of them, chosen in
+// proportion to what it would give (in one pass: each lamp in turn takes
+// the place of the one held with the chance its share of the total so far
+// gives it), and a ray to see whether anything stands between. Divided by
+// the chance of choosing it, so that on average the sum over them all is
+// counted, with little noise when one lamp gives most of it.
+vec3 lamp_light(vec3 at, vec3 n, ivec2 px, int frame) {
+    ivec3 cell = wrap(ivec3(floor(at)) >> 5, u.vol.xyz);
+    uvec2 e = lamp_cells.cells[cell.x + u.vol.x * (cell.y + u.vol.y * cell.z)];
+    if (e.y == 0u) return vec3(0.0);
+    vec3 dir, held_dir = vec3(0.0); float d, held_d = 0.0;
+    vec3 held = vec3(0.0); float held_w = 0.0, total = 0.0;
+    vec2 r = rand2(px, frame, 97);
+    float u0 = r.x;
+    for (uint i = 0u; i < e.y; i++) {
+        vec3 g = lamp_gives(lamp_list.lamps[e.x + i], at, n, dir, d);
+        float w = g.r + g.g + g.b;
+        if (w <= 0.0) continue;
+        total += w;
+        float p = w / total;
+        // one uniform number serves every choice: it is stretched over what is left of it each time
+        if (u0 < p) { held = g; held_w = w; held_dir = dir; held_d = d; u0 = u0 / p; }
+        else u0 = (u0 - p) / (1.0 - p);
+    }
+    if (held_w <= 0.0) return vec3(0.0);
+    Hit h;
+    // stop short of the lamp's own voxel; a thin lamp never stops a ray, a solid one would
+    if (held_d > 0.9 && trace_steps(at + n * 0.02, held_dir, held_d - 0.6, false, 32, 1.0e9, -1000000, h)) return vec3(0.0);
+    return held * (total / held_w);
+}
+
 // The light arriving at a point (voxel units) on a face with normal n from
 // everything but the sun: [rays] rays over the hemisphere, more of them near
 // the normal. One that escapes brings the sky's colour; one that hits brings
 // what the block there emits and what it passes on from the sun and the sky.
+// Where there are lamps listed, one more ray is aimed at one of them, and the
+// hemisphere's rays leave lamps out: a small lamp is found by few of them,
+// so its light would take many frames to settle.
 vec3 sky_light(vec3 at, vec3 n, ivec2 px, int frame, int rays) {
+    bool aimed = u.water2.z > 0.5;
+    float own = aimed ? 0.0 : 1.0;
     vec3 a = normalize(cross(n, abs(n.y) < 0.9 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0)));
     vec3 b = cross(n, a);
     vec3 sum = vec3(0.0);
@@ -111,12 +169,12 @@ vec3 sky_light(vec3 at, vec3 n, ivec2 px, int frame, int rays) {
         float rad = sqrt(r.x), ang = r.y * 6.2831853;
         vec3 dir = normalize(a * (rad * cos(ang)) + b * (rad * sin(ang)) + n * sqrt(max(1.0 - r.x, 0.0)));
         Hit h;
-        if (!trace_steps(at + n * 0.02, dir, 48.0, false, 40, 12.0, -1000000, h)) sum += sky_base(dir) + h.glow * GLOW;
+        if (!trace_steps(at + n * 0.02, dir, 48.0, false, 40, 12.0, -1000000, h)) sum += sky_base(dir) + h.glow * GLOW * own;
         else {
             vec3 hn = NORMALS[h.face];
-            sum += class_emission(h.cls) * GLOW + h.glow * GLOW
+            sum += (class_emission(h.cls) * GLOW + h.glow * GLOW) * own
                  + class_color(h.cls) * (u.sun_color.rgb * max(dot(hn, u.sun.xyz), 0.0) * 0.5 + sky_flat(hn));
         }
     }
-    return sum / float(max(rays, 1));
+    return sum / float(max(rays, 1)) + (aimed ? lamp_light(at, n, px, frame) : vec3(0.0));
 }

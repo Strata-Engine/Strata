@@ -27,7 +27,7 @@
 /* Rewritten by build_shaders.sh whenever the shaders change: forge decides
  * whether to recompile this file from its text alone, not from the headers
  * it includes (GAPS S14). */
-#define STRATA_SHADERS_STAMP "8e8865211af95378"
+#define STRATA_SHADERS_STAMP "b8f6af702dd38e96"
 #include "strata_shaders.h"
 #include "strata_spray.h"
 #include "strata_alloc.h"
@@ -48,7 +48,13 @@ static inline void   *narr_data(void *a) { return (char *)a + NARR_HDR; }
 #define SV_GLYPH_STAGE ST_UPLOAD_BYTES   /* bytes of new glyph pixels a frame carries to the atlas: all strata_text makes in a frame */
 #define SV_GLYPH_RECTS ST_UPLOAD_RECTS
 #define SV_LIGHT_PER_FRAME 128 /* chunks whose light bytes one frame may copy into the volume */
-#define SV_LIGHT_WRITE_BYTES (32768 + 64 + 8)   /* per write: the voxels, the coarse cells, the owner texel */
+#define SV_LIGHT_WRITE_BYTES (32768 + 64 + 16)  /* per write: the voxels, the coarse cells, the owner texel */
+/* The light volume keeps a chunk's voxels only when they are not all one
+ * class: in a page of a pool, 16 x 16 pages a layer. A chunk all of one class
+ * (air, stone, sea) is that class in its owner texel. Measured, 70 to 77% of
+ * the chunks a stream holds are all one class; the pool holds half of them. */
+#define SV_PAGES_X 16
+#define SV_PAGES_Y 16
 #define SV_MAX_KEYS 512
 
 #define SV_RANGES 6            /* 0 opaque, 1 cutout, 2 translucent, 3 cross, 4 loose, 5 spare */
@@ -95,6 +101,9 @@ typedef struct {
     VkBuffer table; VkDeviceMemory table_mem; ChunkEntry *table_map;
     VkBuffer btable, bcells, blist, bmovers; VkDeviceMemory btable_mem, bcells_mem, blist_mem, bmovers_mem;
     BodyRow *btable_map; uint32_t *bcells_map, *blist_map; float *bmovers_map;
+    /* lamps near each cell of the light volume, for the light pass to aim at: per cell (first, count), then the list */
+    VkBuffer lcells, llist; VkDeviceMemory lcells_mem, llist_mem; uint32_t *lcells_map; int32_t *llist_map;
+    uint32_t lamp_version;         /* the lamp lists this frame's copy holds */
     uint32_t *pending; uint32_t npending; unsigned char *is_pending;   /* slots changed since this Frame's table was last brought up to date */
     VkBuffer lstage; VkDeviceMemory lstage_mem; unsigned char *lstage_map;   /* this frame's light-volume writes, before they are copied in */
     VkBuffer stats; VkDeviceMemory stats_mem; uint32_t *stats_map;   /* written by the cull pass: commands per range [6], chunks, quads */
@@ -120,6 +129,10 @@ static SaAlloc g_bbytes;       /* ranges of the body class buffer, in 32-bit wor
 #define SV_BODY_LIST    262144           /* list entries a frame */
 #define SV_MOVERS       16               /* boxes a frame where moving bodies unsettle light history */
 #define SV_MAX_CELLS    65536            /* light volume cells (chunks) the body lists can cover */
+#define SV_CHUNK_LAMPS  64               /* glowing voxels a chunk keeps for the light pass to aim at */
+#define SV_LAMP_LIST    65536            /* entries in all cells' lists of nearby lamps, together */
+#define SV_LAMP_REACH   16               /* voxels a lamp's light reaches (the light pass fades it out from 12) */
+#define SV_CELL_LAMPS   16               /* lamps a cell lists at most */
 
 #define SV_LOOSE_QUADS 262144  /* 16 MB of 64-byte loose quads */
 #define SV_MAX_MODELS 4096
@@ -145,17 +158,30 @@ static struct {
      * flight: a frame reads the other's and writes its own. hist: rgb sky
      * light, a sun visibility. hmeta: r samples, g view depth, b face. */
     Target hist[SV_FRAMES], hmeta[SV_FRAMES];
+    /* What the translucent pass remembers between frames, one pair per frame
+     * in flight, read and written by the water shader as storage images:
+     * whist rgb the mirror colour, a the sun's visibility; wdist the view
+     * depth of the surface it belongs to (0: nothing). A water pixel traces
+     * one frame in four and reuses the rest, as the light pass does. */
+    Target whist[SV_FRAMES], wdist[SV_FRAMES];
+    int water_mem;                 /* the device lets a fragment shader write images: water keeps that memory */
+    int water_fresh;               /* the water memory images are new and must be cleared before use */
     int hist_reset;                /* frames left in which that memory must not be read (fresh images) */
     VkSampler nearest;             /* for reading the frame's own images, texel for texel */
     int sky_rays, reflections;     /* light quality: sky rays a pixel a sample, 0..8; mirror rays on or off */
     int light_mode;                /* 0: the pre-ray-tracing shading, through the deferred passes */
     /* The light volume: a light class per voxel for every chunk held, the
      * coarse copy (how high each 8-voxel cell's contents reach), and which chunk each cell holds. */
-    Target vol, coarse, owner;
+    Target vol, coarse, owner;     /* vol: the pool of pages */
+    int32_t *cell_page;            /* per cell: the page its chunk's voxels are in, or -1 */
+    int32_t *free_pages; int nfree_pages, npages;   /* pages not in use, as a stack; how many the pool has */
+    uint64_t pages_refused;        /* chunks whose voxels found no page: their cells hold nothing */
     int vn, vnv;                   /* its size in chunks: vn across (x and z), vnv up */
     VkBuffer ltable; VkDeviceMemory ltable_mem; int32_t *ltable_map;
     float *tex_mean; uint32_t tex_mean_n;   /* each texture layer's mean colour, linear, three floats a layer */
-    struct LightCell { int32_t chunk[3]; int valid; int uniform; uint32_t hash, solid; } *cells;   /* per cell, as last queued: its chunk, and its class if it is one class throughout, else -1 */
+    struct LightCell { int32_t chunk[3]; int valid; int uniform; uint32_t hash, solid; int nlamps; int32_t *lamps; } *cells;   /* lamps: nlamps glowing voxels, 4 ints each (x, y, z voxels, class) */
+    uint32_t lamp_version;        /* bumped whenever any cell's lamps change */
+    int vn_old_cells;             /* how many cells g.cells has */   /* per cell, as last queued: its chunk, and its class if it is one class throughout, else -1 */
     struct LightWrite { int cell[3]; int32_t chunk[3]; int valid; int uniform; int edit; unsigned char *bytes; } *lq;   /* writes waiting to be copied in, oldest first */
     uint32_t nlq, lq_cap;
     int32_t edit_lo[3], edit_hi[3];   /* the chunks an edit changed, while light_edit counts down */
@@ -291,7 +317,7 @@ static void destroy_swapchain(void) {
     if (g.off_mem) vkFreeMemory(g.dev, g.off_mem, NULL);
     g.off_fb = VK_NULL_HANDLE; g.off_view = VK_NULL_HANDLE; g.off = VK_NULL_HANDLE; g.off_mem = VK_NULL_HANDLE;
     if (g.fb_g) vkDestroyFramebuffer(g.dev, g.fb_g, NULL);
-    for (int f = 0; f < SV_FRAMES; f++) { if (g.fb_l[f]) vkDestroyFramebuffer(g.dev, g.fb_l[f], NULL); g.fb_l[f] = VK_NULL_HANDLE; drop_target(&g.hist[f]); drop_target(&g.hmeta[f]); }
+    for (int f = 0; f < SV_FRAMES; f++) { if (g.fb_l[f]) vkDestroyFramebuffer(g.dev, g.fb_l[f], NULL); g.fb_l[f] = VK_NULL_HANDLE; drop_target(&g.hist[f]); drop_target(&g.hmeta[f]); drop_target(&g.whist[f]); drop_target(&g.wdist[f]); }
     g.fb_g = VK_NULL_HANDLE;
     drop_target(&g.gb_albedo); drop_target(&g.gb_nm); drop_target(&g.lit);
     if (g.depth_view) vkDestroyImageView(g.dev, g.depth_view, NULL);
@@ -378,7 +404,11 @@ static int make_swapchain(void) {
     for (int f = 0; f < SV_FRAMES; f++) {
         if (!make_image(FMT_LIT, tu, VK_IMAGE_ASPECT_COLOR_BIT, &g.hist[f].img, &g.hist[f].mem, &g.hist[f].view)) return 0;
         if (!make_image(FMT_LIT, tu, VK_IMAGE_ASPECT_COLOR_BIT, &g.hmeta[f].img, &g.hmeta[f].mem, &g.hmeta[f].view)) return 0;
+        VkImageUsageFlags su = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        if (!make_image(FMT_LIT, su, VK_IMAGE_ASPECT_COLOR_BIT, &g.whist[f].img, &g.whist[f].mem, &g.whist[f].view)) return 0;
+        if (!make_image(VK_FORMAT_R32_SFLOAT, su, VK_IMAGE_ASPECT_COLOR_BIT, &g.wdist[f].img, &g.wdist[f].mem, &g.wdist[f].view)) return 0;
     }
+    g.water_fresh = 1;
     g.hist_reset = SV_FRAMES;
     if (!make_image(g.format, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, VK_IMAGE_ASPECT_COLOR_BIT, &g.off, &g.off_mem, &g.off_view)) return 0;
     return 1;
@@ -409,6 +439,15 @@ static void bind_targets(void) {
             hw[b] = (VkWriteDescriptorSet){ .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = g.frames[f].dset, .dstBinding = 15 + b, .descriptorCount = 1,
                 .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .pImageInfo = &hi[b] };
         vkUpdateDescriptorSets(g.dev, 2, hw, 0, NULL);
+        /* the water's memory: the other frame's to read, this frame's to write */
+        VkDescriptorImageInfo wi[4] = {
+            { VK_NULL_HANDLE, g.whist[o].view, VK_IMAGE_LAYOUT_GENERAL }, { VK_NULL_HANDLE, g.wdist[o].view, VK_IMAGE_LAYOUT_GENERAL },
+            { VK_NULL_HANDLE, g.whist[f].view, VK_IMAGE_LAYOUT_GENERAL }, { VK_NULL_HANDLE, g.wdist[f].view, VK_IMAGE_LAYOUT_GENERAL } };
+        VkWriteDescriptorSet ww[4];
+        for (uint32_t b = 0; b < 4; b++)
+            ww[b] = (VkWriteDescriptorSet){ .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = g.frames[f].dset, .dstBinding = 24 + b, .descriptorCount = 1,
+                .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .pImageInfo = &wi[b] };
+        vkUpdateDescriptorSets(g.dev, 4, ww, 0, NULL);
     }
 }
 
@@ -920,12 +959,23 @@ static int light_box(int64_t radius_h, int64_t radius_v) {
     g.nlq = 0;
     g.vn = (int)(2 * radius_h + 3); g.vnv = (int)(2 * radius_v + 3);
     uint32_t n = (uint32_t)g.vn, nv = (uint32_t)g.vnv;
-    if (!make_volume(&g.vol, VK_FORMAT_R8_UINT, n * 32, nv * 32, n * 32)) return 0;
+    uint32_t ncells = n * nv * n;
+    uint32_t layers = (ncells / 2 + SV_PAGES_X * SV_PAGES_Y - 1) / (SV_PAGES_X * SV_PAGES_Y);
+    if (layers < 1) layers = 1;
+    g.npages = (int)(layers * SV_PAGES_X * SV_PAGES_Y);
+    if (!make_volume(&g.vol, VK_FORMAT_R8_UINT, SV_PAGES_X * 32, SV_PAGES_Y * 32, layers * 32)) return 0;
     if (!make_volume(&g.coarse, VK_FORMAT_R8_UINT, n * 4, nv * 4, n * 4)) return 0;
-    if (!make_volume(&g.owner, VK_FORMAT_R16G16B16A16_SINT, n, nv, n)) return 0;
-    free(g.cells);
-    g.cells = calloc((size_t)n * nv * n, sizeof *g.cells);
-    if (!g.cells) { g.vn = 0; g.vnv = 0; return 0; }
+    if (!make_volume(&g.owner, VK_FORMAT_R32G32B32A32_SINT, n, nv, n)) return 0;
+    if (g.cells) for (int i = 0; i < g.vn_old_cells; i++) free(g.cells[i].lamps);
+    free(g.cells); free(g.cell_page); free(g.free_pages);
+    g.cells = calloc(ncells, sizeof *g.cells);
+    g.vn_old_cells = (int)ncells; g.lamp_version++;
+    g.cell_page = malloc(ncells * sizeof *g.cell_page);
+    g.free_pages = malloc((size_t)g.npages * sizeof *g.free_pages);
+    if (!g.cells || !g.cell_page || !g.free_pages) { g.vn = 0; g.vnv = 0; return 0; }
+    for (uint32_t i = 0; i < ncells; i++) g.cell_page[i] = -1;
+    for (int i = 0; i < g.npages; i++) g.free_pages[i] = g.npages - 1 - i;
+    g.nfree_pages = g.npages; g.pages_refused = 0;
     /* everything starts empty and owned by nobody */
     VkCommandBufferAllocateInfo cai = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, .commandPool = g.cpool, .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1 };
     VkCommandBuffer cb; VKOK(vkAllocateCommandBuffers(g.dev, &cai, &cb), "light volume command buffer");
@@ -1006,6 +1056,31 @@ static void light_queue(const int32_t *chunk, int valid, int uniform, unsigned c
         solid = (row[0] == 1 || row[0] == 2 || row[0] == 4 || row[3] != 0) ? (uint32_t)uniform * 16777619u : 2166136261u;
     }
     if (valid && same_owner && bytes && c->uniform < 0 && c->hash == hash) { free(bytes); return; }
+    /* the chunk's glowing voxels, at most SV_CHUNK_LAMPS of them, spread over all it has */
+    {
+        int32_t found[SV_CHUNK_LAMPS * 4]; int nf = 0, seen = 0;
+        if (valid && g.ltable_map) {
+            if (bytes) {
+                for (int i = 0; i < 32768; i++) {
+                    unsigned char k = bytes[i];
+                    if (!k || g.ltable_map[k * 8 + 3] == 0) continue;
+                    /* past the cap, a later lamp replaces one at a stride, so the kept ones spread across the chunk */
+                    int slot = nf < SV_CHUNK_LAMPS ? nf++ : (seen % SV_CHUNK_LAMPS);
+                    seen++;
+                    found[slot * 4] = chunk[0] * 32 + (i & 31); found[slot * 4 + 1] = chunk[1] * 32 + (i >> 10); found[slot * 4 + 2] = chunk[2] * 32 + ((i >> 5) & 31); found[slot * 4 + 3] = k;
+                }
+            } else if (uniform > 0 && g.ltable_map[uniform * 8 + 3] != 0) {
+                for (int i = 0; i < SV_CHUNK_LAMPS; i++) { int x = (i & 3) * 8 + 4, y = ((i >> 2) & 3) * 8 + 4, z = (i >> 4) * 8 + 4;
+                    found[i * 4] = chunk[0] * 32 + x; found[i * 4 + 1] = chunk[1] * 32 + y; found[i * 4 + 2] = chunk[2] * 32 + z; found[i * 4 + 3] = uniform; }
+                nf = SV_CHUNK_LAMPS;
+            }
+        }
+        if (nf != c->nlamps || (nf && memcmp(found, c->lamps, (size_t)nf * 16) != 0)) {
+            free(c->lamps); c->lamps = NULL; c->nlamps = 0;
+            if (nf) { c->lamps = malloc((size_t)nf * 16); if (c->lamps) { memcpy(c->lamps, found, (size_t)nf * 16); c->nlamps = nf; } }
+            g.lamp_version++;
+        }
+    }
     /* new voxels for a chunk the volume already held: an edit, whose lighting must be re-estimated */
     int edit = valid && same_owner && c->solid != solid;
     if (g.nlq == g.lq_cap) {
@@ -1022,18 +1097,33 @@ static void light_queue(const int32_t *chunk, int valid, int uniform, unsigned c
     c->valid = valid; c->uniform = w->uniform; c->hash = hash; c->solid = solid;
 }
 
+/* Is light class [c] see-through (kind 3: water, glass)? Rays that pass
+ * through those need not look at them. */
+static int see_through(unsigned char c) { return g.ltable_map && g.ltable_map[c * 8] == 3; }
+
 /* Record, in this frame's commands, the copies that bring the volume up to
  * date: as many queued writes as one frame may carry, oldest first. */
 static void light_flush(Frame *F) {
     if (g.nlq == 0) return;
     uint32_t n = g.nlq < SV_LIGHT_PER_FRAME ? g.nlq : SV_LIGHT_PER_FRAME;
     static VkBufferImageCopy rv[SV_LIGHT_PER_FRAME], rc[SV_LIGHT_PER_FRAME], ro[SV_LIGHT_PER_FRAME];
+    uint32_t nv_copies = 0;
     for (uint32_t i = 0; i < n; i++) {
         struct LightWrite *w = &g.lq[i];
         unsigned char *dst = F->lstage_map + (size_t)i * SV_LIGHT_WRITE_BYTES;
         unsigned char *coarse = dst + 32768;
-        int16_t *own = (int16_t *)(dst + 32768 + 64);
+        int32_t *own = (int32_t *)(dst + 32768 + 64);
+        int ci = w->cell[0] + g.vn * (w->cell[1] + g.vnv * w->cell[2]);
+        /* a chunk with voxels of more than one class keeps its page, or takes one; any other lets its page go */
+        int page = -1;
+        if (w->bytes && w->valid) {
+            page = g.cell_page[ci];
+            if (page < 0 && g.nfree_pages > 0) page = g.free_pages[--g.nfree_pages];
+            if (page < 0) g.pages_refused++;
+        } else if (g.cell_page[ci] >= 0) g.free_pages[g.nfree_pages++] = g.cell_page[ci];
+        g.cell_page[ci] = page;
         int any = 0;                 /* how high the chunk's contents reach, 0..32 */
+        int hard = 0;                /* ... leaving out see-through classes (kind 3: water, glass), 0..32 */
         if (w->bytes) {
             /* the chunk's flat index is x + 32 * (z + 32 * y); the volume wants x fastest, then y, then z */
             for (int z = 0; z < 32; z++) for (int y = 0; y < 32; y++)
@@ -1041,22 +1131,39 @@ static void light_flush(Frame *F) {
             memset(coarse, 0, 64);
             for (int z = 0; z < 32; z++) for (int y = 0; y < 32; y++) {
                 const unsigned char *row = dst + 32 * (y + 32 * z);
-                /* a coarse cell holds how high its contents reach, 1..8 (0: nothing): a ray above that and rising can cross the cell whole */
+                /* A coarse cell holds two heights, 1..8 (0: nothing): in its low four
+                 * bits how high its contents reach, in its high four how high its
+                 * contents other than see-through classes reach. A ray above the
+                 * height that matters to it and rising can cross the cell whole; a
+                 * ray that passes through water and glass (sun and sky rays)
+                 * crosses a lake eight voxels at a time. */
                 for (int x = 0; x < 32; x++) if (row[x]) {
                     unsigned char *cc = &coarse[(x >> 3) + 4 * ((y >> 3) + 4 * (z >> 3))];
-                    if (*cc < (y & 7) + 1) *cc = (unsigned char)((y & 7) + 1);
+                    unsigned char h = (unsigned char)((y & 7) + 1);
+                    if ((*cc & 15) < h) *cc = (unsigned char)((*cc & 0xF0) | h);
                     if (any < y + 1) any = y + 1;
+                    if (!see_through(row[x])) {
+                        if ((*cc >> 4) < h) *cc = (unsigned char)((*cc & 15) | (h << 4));
+                        if (hard < y + 1) hard = y + 1;
+                    }
                 }
             }
         } else {
-            memset(dst, w->uniform, 32768);
-            memset(coarse, w->uniform ? 8 : 0, 64);
-            any = w->uniform != 0 ? 32 : 0;
+            int clear = w->uniform == 0, glassy = !clear && see_through((unsigned char)w->uniform);
+            memset(coarse, clear ? 0 : (glassy ? 8 : 8 | (8 << 4)), 64);
+            any = clear ? 0 : 32;
+            hard = clear || glassy ? 0 : 32;
         }
-        own[0] = (int16_t)w->chunk[0]; own[1] = (int16_t)w->chunk[1]; own[2] = (int16_t)w->chunk[2]; own[3] = (int16_t)(w->valid ? 1 + any : 0);   /* 0: no chunk here; else 1 + how high its contents reach */
+        /* w: 0, no chunk here; else 1 + how high its contents reach, plus 64
+         * times how high its contents other than see-through ones reach, plus
+         * from bit 12 where its voxels are: 1 + 2 * its page, or 2 * its one class */
+        int where = w->bytes ? (page >= 0 ? 1 + 2 * page : -1) : 2 * (w->uniform > 0 ? w->uniform : 0);
+        own[0] = w->chunk[0]; own[1] = w->chunk[1]; own[2] = w->chunk[2];
+        own[3] = (w->valid && where >= 0) ? (1 + any + 64 * hard) | (where << 12) : 0;
         VkDeviceSize base = (VkDeviceSize)i * SV_LIGHT_WRITE_BYTES;
-        rv[i] = (VkBufferImageCopy){ .bufferOffset = base, .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
-            .imageOffset = { w->cell[0] * 32, w->cell[1] * 32, w->cell[2] * 32 }, .imageExtent = { 32, 32, 32 } };
+        /* only a chunk with a page has voxels to copy */
+        if (page >= 0) rv[nv_copies++] = (VkBufferImageCopy){ .bufferOffset = base, .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+            .imageOffset = { (page % SV_PAGES_X) * 32, ((page / SV_PAGES_X) % SV_PAGES_Y) * 32, (page / (SV_PAGES_X * SV_PAGES_Y)) * 32 }, .imageExtent = { 32, 32, 32 } };
         rc[i] = (VkBufferImageCopy){ .bufferOffset = base + 32768, .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
             .imageOffset = { w->cell[0] * 4, w->cell[1] * 4, w->cell[2] * 4 }, .imageExtent = { 4, 4, 4 } };
         ro[i] = (VkBufferImageCopy){ .bufferOffset = base + 32768 + 64, .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
@@ -1067,9 +1174,11 @@ static void light_flush(Frame *F) {
     g.nlq -= n;
     VkImage imgs[3] = { g.vol.img, g.coarse.img, g.owner.img };
     VkBufferImageCopy *regs[3] = { rv, rc, ro };
+    uint32_t counts[3] = { nv_copies, n, n };
     for (int k = 0; k < 3; k++) {
+        if (counts[k] == 0) continue;
         volume_layout(F->cmd, imgs[k], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-        vkCmdCopyBufferToImage(F->cmd, F->lstage, imgs[k], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, n, regs[k]);
+        vkCmdCopyBufferToImage(F->cmd, F->lstage, imgs[k], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, counts[k], regs[k]);
         volume_layout(F->cmd, imgs[k], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     }
 }
@@ -1156,7 +1265,9 @@ int64_t sv_open(int64_t w, int64_t h, int64_t capture_mouse, int64_t quad_capaci
     /* every indirect command carries a first instance: where its chunk's quads start */
     if (!have.multiDrawIndirect || !have.drawIndirectFirstInstance || !have11.shaderDrawParameters) { die("device lacks multiDrawIndirect, drawIndirectFirstInstance or shaderDrawParameters", 0); return 0; }
     g.aniso = have.samplerAnisotropy ? 1 : 0;
-    VkPhysicalDeviceFeatures feats = { .multiDrawIndirect = VK_TRUE, .drawIndirectFirstInstance = VK_TRUE, .samplerAnisotropy = have.samplerAnisotropy };
+    VkPhysicalDeviceFeatures feats = { .multiDrawIndirect = VK_TRUE, .drawIndirectFirstInstance = VK_TRUE, .samplerAnisotropy = have.samplerAnisotropy,
+        .fragmentStoresAndAtomics = have.fragmentStoresAndAtomics };
+    g.water_mem = have.fragmentStoresAndAtomics ? 1 : 0;
     VkPhysicalDeviceVulkan11Features feats11 = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES, .shaderDrawParameters = VK_TRUE };
     VkDeviceCreateInfo dci = { .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, .pNext = &feats11, .queueCreateInfoCount = 1, .pQueueCreateInfos = &qci,
         .enabledExtensionCount = nd, .ppEnabledExtensionNames = dext, .pEnabledFeatures = &feats };
@@ -1175,7 +1286,7 @@ int64_t sv_open(int64_t w, int64_t h, int64_t capture_mouse, int64_t quad_capaci
     g.swap_ok = 1;
 
     /* one set layout for every pipeline: 0 uniforms, 1 chunk table, 2 indirect commands, 3 cull statistics, 4 command -> slot */
-    VkDescriptorSetLayoutBinding dslb[24] = {
+    VkDescriptorSetLayoutBinding dslb[30] = {
         { .binding = 0, .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, .descriptorCount = 1,
           .stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT },
         { .binding = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1,
@@ -1209,8 +1320,16 @@ int64_t sv_open(int64_t w, int64_t h, int64_t capture_mouse, int64_t quad_capaci
         /* the 2D layer's interface atlas */
         { .binding = 22, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT },
         /* and its glyph atlas */
-        { .binding = 23, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT } };
-    VkDescriptorSetLayoutCreateInfo dsli = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 24, .pBindings = dslb };
+        { .binding = 23, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT },
+        /* the water's memory: last frame's mirror colour and depth, this frame's */
+        { .binding = 24, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT },
+        { .binding = 25, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT },
+        { .binding = 26, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT },
+        { .binding = 27, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT },
+        /* lamps near each light-volume cell: per cell (first, count), and the list */
+        { .binding = 28, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT },
+        { .binding = 29, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT } };
+    VkDescriptorSetLayoutCreateInfo dsli = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 30, .pBindings = dslb };
     VKOK(vkCreateDescriptorSetLayout(g.dev, &dsli, NULL, &g.dsl), "descriptor set layout");
     /* where the call's range starts in draw_slot, and per-call flags (bit 0: cutout) */
     VkPushConstantRange pcr = { .stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, .offset = 0, .size = 8 };
@@ -1272,8 +1391,9 @@ int64_t sv_open(int64_t w, int64_t h, int64_t capture_mouse, int64_t quad_capaci
     if (!make_buffer((VkDeviceSize)SV_MAX_BLOCKS * 32, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &g.blocks, &g.blocks_mem, &map)) return 0;
     g.blocks_map = map;
     memset(g.blocks_map, 0, (size_t)SV_MAX_BLOCKS * 32);
-    VkDescriptorPoolSize dps[3] = { { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, SV_FRAMES }, { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 11 * SV_FRAMES }, { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 12 * SV_FRAMES } };
-    VkDescriptorPoolCreateInfo dpi = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = SV_FRAMES, .poolSizeCount = 3, .pPoolSizes = dps };
+    VkDescriptorPoolSize dps[4] = { { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, SV_FRAMES }, { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 13 * SV_FRAMES }, { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 12 * SV_FRAMES },
+                                    { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 4 * SV_FRAMES } };
+    VkDescriptorPoolCreateInfo dpi = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = SV_FRAMES, .poolSizeCount = 4, .pPoolSizes = dps };
     VKOK(vkCreateDescriptorPool(g.dev, &dpi, NULL, &g.dpool), "descriptor pool");
     for (int f = 0; f < SV_FRAMES; f++) {
         Frame *F = &g.frames[f];
@@ -1299,6 +1419,10 @@ int64_t sv_open(int64_t w, int64_t h, int64_t capture_mouse, int64_t quad_capaci
         F->blist_map = map;
         if (!make_buffer((VkDeviceSize)SV_MOVERS * 32, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &F->bmovers, &F->bmovers_mem, &map)) return 0;
         F->bmovers_map = map; memset(F->bmovers_map, 0, SV_MOVERS * 32);
+        if (!make_buffer((VkDeviceSize)SV_MAX_CELLS * 8, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &F->lcells, &F->lcells_mem, &map)) return 0;
+        F->lcells_map = map; memset(F->lcells_map, 0, (size_t)SV_MAX_CELLS * 8);
+        if (!make_buffer((VkDeviceSize)SV_LAMP_LIST * 16, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &F->llist, &F->llist_mem, &map)) return 0;
+        F->llist_map = map; F->lamp_version = (uint32_t)-1;
         F->pending = calloc(SV_MAX_SLOTS, sizeof *F->pending);
         F->is_pending = calloc(SV_MAX_SLOTS, 1);
         if (!F->pending || !F->is_pending) return 0;
@@ -1322,6 +1446,12 @@ int64_t sv_open(int64_t w, int64_t h, int64_t capture_mouse, int64_t quad_capaci
             bw[b] = (VkWriteDescriptorSet){ .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = F->dset, .dstBinding = 17 + b, .descriptorCount = 1,
                 .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &bb[b] };
         vkUpdateDescriptorSets(g.dev, 5, bw, 0, NULL);
+        VkDescriptorBufferInfo lb2[2] = { { F->lcells, 0, VK_WHOLE_SIZE }, { F->llist, 0, VK_WHOLE_SIZE } };
+        VkWriteDescriptorSet lw2[2];
+        for (uint32_t b = 0; b < 2; b++)
+            lw2[b] = (VkWriteDescriptorSet){ .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = F->dset, .dstBinding = 28 + b, .descriptorCount = 1,
+                .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &lb2[b] };
+        vkUpdateDescriptorSets(g.dev, 2, lw2, 0, NULL);
     }
     bind_targets();               /* the sets did not exist when the frame's images were made */
     if (!make_buffer(256 * 32, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &g.ltable, &g.ltable_mem, &map)) return 0;
@@ -1452,7 +1582,7 @@ void sv_close(void) {
     free(g.trans); free(g.trans_at); free(g.trans_keys);
     free(g.spray_births); g.spray_births = NULL;
     free(g.ui_cpu); g.ui_cpu = NULL; g.ui_n = 0;
-    free(g.ubo_map); free(g.entries); free(g.cells); free(g.stage_light);
+    free(g.ubo_map); free(g.entries); if (g.cells) for (int i = 0; i < g.vn_old_cells; i++) free(g.cells[i].lamps); free(g.cells); g.vn_old_cells = 0; free(g.cell_page); free(g.free_pages); free(g.stage_light);
     for (uint32_t i = 0; i < g.nlq; i++) free(g.lq[i].bytes);
     free(g.lq);
     for (int i = 0; i < 4; i++) free(g.stage.part[i]);
@@ -1480,6 +1610,9 @@ void sv_set_vsync(int64_t on) { int off = on ? 0 : 1; if (g.ok && off != g.vsync
  * elements lost because an allocator's list was full. */
 double sv_stat(int64_t which) {
     if (which == 6) return (double)g.rebuilds;
+    if (which == 10) return (double)(g.npages - g.nfree_pages);   /* light pages in use */
+    if (which == 11) return (double)g.pages_refused;               /* chunks that found no light page */
+    if (which == 12) return (double)g.npages * 32768.0;          /* bytes the light volume's pool holds */
     if (which == 7) return (double)g_quads.leaked + (double)g_loose.leaked;
     if (which == 8) return g.spray_births ? (double)sp_count(&g.ring) : 0.0;
     if (which == 9) return (double)g.ui_dropped;
@@ -1736,6 +1869,46 @@ static void bodies_to_frame(Frame *F) {
     bu[0] = (int32_t)nmov; bu[1] = (int32_t)n;
 }
 
+/* The lamps near each cell of the light volume, into this frame's copy when
+ * they have changed: every glowing voxel a chunk keeps is listed for each
+ * cell whose chunk comes within SV_LAMP_REACH voxels of it, at most
+ * SV_CELL_LAMPS a cell, so a point finds every lamp whose light reaches it. */
+static void lamps_to_frame(Frame *F) {
+    float *wt = g.ubo_map + UBO_WATER;
+    if (!g.cells || g.vn <= 0 || g.vnv <= 0) { wt[6] = 0.0f; return; }
+    int nx = g.vn, ny = g.vnv, nz = g.vn;
+    uint32_t ncells = (uint32_t)(nx * ny * nz);
+    if (ncells > SV_MAX_CELLS) { wt[6] = 0.0f; return; }
+    if (F->lamp_version != g.lamp_version) {
+        memset(F->lcells_map, 0, (size_t)ncells * 8);
+        for (int pass = 0; pass < 2; pass++) {
+            if (pass == 1) { uint32_t at = 0; for (uint32_t c = 0; c < ncells; c++) { uint32_t k = F->lcells_map[c * 2 + 1]; if (k > SV_CELL_LAMPS) k = SV_CELL_LAMPS; F->lcells_map[c * 2] = at; at += k; F->lcells_map[c * 2 + 1] = 0; } }
+            for (uint32_t c = 0; c < ncells; c++) {
+                struct LightCell *lc = &g.cells[c];
+                if (!lc->valid || lc->nlamps == 0) continue;
+                for (int i = 0; i < lc->nlamps; i++) {
+                    const int32_t *l = lc->lamps + i * 4;
+                    int lo[3], hi[3];
+                    for (int a = 0; a < 3; a++) { lo[a] = (l[a] - SV_LAMP_REACH) >> 5; hi[a] = (l[a] + SV_LAMP_REACH) >> 5; }
+                    for (int cz = lo[2]; cz <= hi[2]; cz++) for (int cy = lo[1]; cy <= hi[1]; cy++) for (int cx = lo[0]; cx <= hi[0]; cx++) {
+                        uint32_t t = (uint32_t)(wrapi(cx, nx) + nx * (wrapi(cy, ny) + ny * wrapi(cz, nz)));
+                        if (pass == 0) { F->lcells_map[t * 2 + 1]++; continue; }
+                        uint32_t k = F->lcells_map[t * 2 + 1];
+                        if (k >= SV_CELL_LAMPS || F->lcells_map[t * 2] + k >= SV_LAMP_LIST) continue;
+                        memcpy(F->llist_map + (F->lcells_map[t * 2] + k) * 4, l, 16);
+                        F->lcells_map[t * 2 + 1]++;
+                    }
+                }
+            }
+        }
+        F->lamp_version = g.lamp_version;
+    }
+    /* how many lamps the light pass may aim at, anywhere (0: none, skip the lists) */
+    uint32_t total = 0;
+    for (uint32_t c = 0; c < ncells && total == 0; c++) total += F->lcells_map[c * 2 + 1];
+    wt[6] = total > 0 && !(getenv("STRATA_LAMPS") && getenv("STRATA_LAMPS")[0] == '0') ? 1.0f : 0.0f;
+}
+
 /* Begin uploading one part of a body (a 32-cubed piece of its grid) into
  * [slot]; parts and commit as for a chunk. It is drawn at the pose
  * sv_slot_pose gives and never written into the light volume. */
@@ -1975,7 +2148,7 @@ void sv_set_underwater(double surface_y, double r, double gr, double b, double d
     if (!g.ok) return;
     float *wt = g.ubo_map + UBO_WATER;
     wt[0] = (float)r; wt[1] = (float)gr; wt[2] = (float)b; wt[3] = density > 0.0 ? (float)density : 0.0f;
-    wt[4] = (float)surface_y; wt[5] = 0.0f; wt[6] = 0.0f; wt[7] = 0.0f;
+    wt[4] = (float)surface_y;   /* wt[5] is the water-memory flag and wt[6] the lamps flag, both set each frame */
 }
 void sv_set_eye(double x, double y, double z, double scale) {
     if (!g.ok) return;
@@ -2092,6 +2265,8 @@ int64_t sv_frame(void) {
      * copies: bring them up to date. From here to the next time this Frame
      * comes round, nothing the CPU does can change what it draws. */
     bodies_to_frame(F);
+    lamps_to_frame(F);
+    g.ubo_map[UBO_WATER + 5] = g.water_mem ? 1.0f : 0.0f;
     memcpy(F->ubo_map, g.ubo_map, UBO_FLOATS * 4);
     for (uint32_t i = 0; i < F->npending; i++) {
         uint32_t slot = F->pending[i];
@@ -2159,6 +2334,36 @@ int64_t sv_frame(void) {
     vkCmdBindPipeline(F->cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g.pipe_light);
     vkCmdDraw(F->cmd, 3, 1, 0, 0);
     vkCmdEndRenderPass(F->cmd);
+
+    /* the water's memory: this frame's depth image is cleared (nothing
+     * remembered yet); last frame's writes are made visible to this frame's reads */
+    if (g.water_mem) {
+        int fi = (int)(g.frame_no % SV_FRAMES);
+        VkImageSubresourceRange rr = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+        VkClearColorValue zero_c = { .float32 = { 0.0f, 0.0f, 0.0f, 0.0f } };
+        if (g.water_fresh) {
+            VkImageMemoryBarrier wb[2 * SV_FRAMES];
+            for (int k = 0; k < SV_FRAMES; k++) {
+                wb[2 * k] = (VkImageMemoryBarrier){ .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, .srcAccessMask = 0, .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+                    .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED, .newLayout = VK_IMAGE_LAYOUT_GENERAL, .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                    .image = g.whist[k].img, .subresourceRange = rr };
+                wb[2 * k + 1] = wb[2 * k]; wb[2 * k + 1].image = g.wdist[k].img;
+            }
+            vkCmdPipelineBarrier(F->cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 2 * SV_FRAMES, wb);
+            for (int k = 0; k < SV_FRAMES; k++) {
+                vkCmdClearColorImage(F->cmd, g.whist[k].img, VK_IMAGE_LAYOUT_GENERAL, &zero_c, 1, &rr);
+                vkCmdClearColorImage(F->cmd, g.wdist[k].img, VK_IMAGE_LAYOUT_GENERAL, &zero_c, 1, &rr);
+            }
+            g.water_fresh = 0;
+        } else {
+            VkMemoryBarrier rb = { .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT, .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT };
+            vkCmdPipelineBarrier(F->cmd, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &rb, 0, NULL, 0, NULL);
+            vkCmdClearColorImage(F->cmd, g.wdist[fi].img, VK_IMAGE_LAYOUT_GENERAL, &zero_c, 1, &rr);
+        }
+        VkMemoryBarrier mb2 = { .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT };
+        vkCmdPipelineBarrier(F->cmd, VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 1, &mb2, 0, NULL, 0, NULL);
+    }
 
     /* 3. final: the lit image to the screen, then translucent surfaces over
      * it, far to near, blended, tested against the geometry pass's depth */
