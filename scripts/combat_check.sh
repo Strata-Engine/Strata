@@ -39,14 +39,15 @@ if twice duel STRATA_COMBAT_SCENE=duel STRATA_FRAMES=1200; then
   a=$(num duel '^combat: duel kills \([0-9]*\) [0-9]*$'); b=$(num duel '^combat: duel kills [0-9]* \([0-9]*\)$')
   fl=$(num duel '^combat: duel flinches \([0-9]*\), .*$'); fa=$(num duel '^combat: duel flinches [0-9]*, falls \([0-9]*\), .*$')
   most=$(num duel '^combat: duel .*, pieces at most \([0-9]*\), .*$'); now=$(num duel '^combat: duel .*, pieces now \([0-9]*\), .*$'); rigs=$(num duel '^combat: duel .*, rigs \([0-9]*\)$')
-  if [ "$a" -ge 0 ] && [ $((a + b)) -ge 1 ] && [ "$fl" -ge 1 ] && [ "$fa" -ge 1 ] && [ "$most" -ge 15 ] && [ "$most" -le $((15 * fa)) ] && [ "$rigs" -eq 12 ]; then echo "ok   duel: kills $a and $b; $fl flinches, $fa falls, $most loose pieces at most ($now left), 12 shirts"
-  else echo "FAIL duel: kills $a and $b (want one at least), flinches $fl, falls $fa (want one of each), pieces at most $most (want 15 to 15 a fall), rigs $rigs (want 12)"; cat "$OUT/duel.txt"; FAILED=1; fi
+  if [ "$a" -ge 0 ] && [ $((a + b)) -ge 1 ] && [ "$fl" -ge 1 ] && [ "$fa" -ge 1 ] && [ "$most" -ge 15 ] && [ "$most" -le $((15 * fa)) ] && [ "$rigs" -eq 12 ] && [ "$(num duel '^combat: duel arrows stuck \([0-9]*\), upright [0-9]*$')" -ge 1 ] && [ $(( $(num duel '^combat: duel arrows stuck [0-9]*, upright \([0-9]*\)$') * 2 )) -le "$(num duel '^combat: duel arrows stuck \([0-9]*\), upright [0-9]*$')" ]; then echo "ok   duel: kills $a and $b; $fl flinches, $fa falls, $most loose pieces at most ($now left), 12 shirts"
+  else echo "FAIL duel: kills $a and $b (want one at least), flinches $fl, falls $fa (want one of each), pieces at most $most (want 15 to 15 a fall), rigs $rigs (want 12), or its stuck arrows stand upright"; cat "$OUT/duel.txt"; FAILED=1; fi
 fi
-# A trap: the ground dug from under a rusher, a block set where a shooter stands. No one ends inside a block, and the idle rule frees the stuck.
+# A trap: the ground dug from under a rusher, a block set where a shooter stands. The rusher falls into the pit; no one ends inside a block; the idle rule frees the stuck.
 if twice trap STRATA_COMBAT_SCENE=trap STRATA_FRAMES=1800; then
-  inside=$(num trap '^combat: trap inside \([0-9]*\), respawns [0-9]*$'); back=$(num trap '^combat: trap inside [0-9]*, respawns \([0-9]*\)$')
-  if [ "$inside" -eq 0 ] && [ "$back" -ge 1 ]; then echo "ok   trap: no one inside a block, $back put back by the idle rule"
-  else echo "FAIL trap: inside $inside (want 0), respawns $back (want 1 or more)"; cat "$OUT/trap.txt"; FAILED=1; fi
+  fell=$(num trap '^combat: trap fell \([0-9]*\) cm, .*$'); at420=$(num trap '^combat: trap fell .*, inside at frame 420 \([0-9]*\), .*$')
+  inside=$(num trap '^combat: trap fell .*, inside \([0-9]*\), respawns [0-9]*$'); back=$(num trap '^combat: trap fell .*, respawns \([0-9]*\)$')
+  if [ "$fell" -ge 250 ] && [ "$inside" -eq 0 ] && [ "$back" -ge 1 ]; then echo "ok   trap: the rusher fell $fell cm into the pit; $at420 inside a block 2 s after it was set, none at the end; $back put back by the idle rule"
+  else echo "FAIL trap: fell $fell cm (want 250 or more), inside at the end $inside (want 0), respawns $back (want 1 or more)"; cat "$OUT/trap.txt"; FAILED=1; fi
 fi
 # Fire: a fireball thrown at a tree's trunk burns wood and grass within 2 m and hurts the shooter standing a metre off by about 40.
 if twice fire STRATA_COMBAT_SCENE=fire STRATA_FRAMES=200; then
@@ -63,9 +64,16 @@ if twice channel STRATA_COMBAT_SCENE=channel STRATA_FRAMES=1800; then
 fi
 # The player, by script: an archer fells a still rusher 20 m off with three arrows.
 if twice archer STRATA_COMBAT_SCRIPT=archer STRATA_FRAMES=150; then
-  shots=$(num archer '^combat: archer shots \([0-9]*\), kills [0-9]*$'); k=$(num archer '^combat: archer shots [0-9]*, kills \([0-9]*\)$')
-  if [ "$shots" -eq 3 ] && [ "$k" -eq 1 ]; then echo "ok   archer: three arrows, one kill"
-  else echo "FAIL archer: shots $shots (want 3), kills $k (want 1)"; cat "$OUT/archer.txt"; FAILED=1; fi
+  shots=$(num archer '^combat: archer shots \([0-9]*\), kills [0-9]*, .*$'); k=$(num archer '^combat: archer shots [0-9]*, kills \([0-9]*\), .*$')
+  pushes=$(num archer '^combat: archer shots .*, pushes \([0-9]*\)$')
+  if [ "$shots" -eq 3 ] && [ "$k" -eq 1 ] && [ "$pushes" -eq 2 ]; then echo "ok   archer: three arrows, one kill, the two it survived pushed it back"
+  else echo "FAIL archer: shots $shots (want 3), kills $k (want 1), pushes $pushes (want 2)"; cat "$OUT/archer.txt"; FAILED=1; fi
+fi
+# The same with a stone wall a metre behind the target: an arrow that passes through it into the wall in one tick still counts.
+if twice waller STRATA_COMBAT_SCRIPT=waller STRATA_FRAMES=150; then
+  shots=$(num waller '^combat: archer shots \([0-9]*\), kills [0-9]*, .*$'); k=$(num waller '^combat: archer shots [0-9]*, kills \([0-9]*\), .*$')
+  if [ "$shots" -eq 3 ] && [ "$k" -eq 1 ]; then echo "ok   waller: three arrows fell a target backed by a wall"
+  else echo "FAIL waller: shots $shots (want 3), kills $k (want 1)"; cat "$OUT/waller.txt"; FAILED=1; fi
 fi
 # A player who only stands is killed by a rusher, lies 3 s, and is stood at a spawn point by the viewer.
 if twice victim STRATA_COMBAT_SCRIPT=victim STRATA_FRAMES=700; then
@@ -83,8 +91,9 @@ fi
 # Ten short matches in a row: each has its winner, and nothing of an earlier match is left in the world.
 if twice ten STRATA_COMBAT_PLAYER=0 STRATA_COMBAT_WIN=3 STRATA_COMBAT_REPEAT=9 STRATA_FRAMES=90000; then
   wins=$(grep -c '^combat: winner [A-Za-z]* 3 at frame' "$OUT/ten.txt"); ents=$(num ten '^combat: matches 10, live entities \([0-9]*\), figures [0-9]*$'); figs=$(num ten '^combat: matches 10, live entities [0-9]*, figures \([0-9]*\)$')
-  if [ "$wins" -eq 10 ] && [ "$ents" -ge 0 ] && [ "$ents" -le 28 ] && [ "$figs" -ge 0 ] && [ "$figs" -le 60 ]; then echo "ok   ten matches: ten winners; $ents entities and $figs figures live after the tenth"
-  else echo "FAIL ten matches: $wins winners (want 10), live entities $ents (want 28 or fewer), figures $figs (want 60 or fewer)"; cat "$OUT/ten.txt"; FAILED=1; fi
+  starts=$(sed -n 's/^combat: rematch [0-9]*: \(.*\)$/\1/p' "$OUT/ten.txt" | sort -u | wc -l | tr -d ' '); first=$(sed -n 's/^combat: rematch [0-9]*: \(.*\)$/\1/p' "$OUT/ten.txt" | head -1)
+  if [ "$wins" -eq 10 ] && [ "$(grep -c '^combat: rematch ' "$OUT/ten.txt")" -eq 9 ] && [ "$starts" -eq 1 ] && [ "$first" = "entities added 11, figures 15" ]; then echo "ok   ten matches: ten winners; each rematch begins with 11 entities and 15 figures, nothing left over"
+  else echo "FAIL ten matches: $wins winners (want 10); rematches begin with $starts different counts (want 1: entities added 11, figures 15), the first: $first"; cat "$OUT/ten.txt"; FAILED=1; fi
 fi
 # The match with no player: someone reaches 30, and the same someone the second time.
 if twice match STRATA_COMBAT_PLAYER=0 STRATA_FRAMES=90000; then

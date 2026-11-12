@@ -61,3 +61,28 @@ Task 9: Ruling: STRATA_COMBAT_HOLD=1 keeps a scripted run going to its last fram
 Task 9: Ruling: `again` takes no world; the ten-match check allows 28 live entities and 60 figures after the tenth (measured: 10 and 17).
 Task 9: Mistake: three runs of the viewer went out without STRATA_HIDDEN (the settings were in one shell variable, which zsh passes as a single word): a window was open on the user's screen for about ten minutes, then twice briefly. Scripted runs are launched through a shell function now.
 Task 9: complete (commit 8f04db6, tests: forge test test/combat_test.march -> 82/82; combat_check.sh all ten ok; goldens combat-fight and combat-end stored after looking)
+
+## Final review (one fresh reviewer, whole branch 5267b6d..90012f3)
+
+No Critical findings. Fix pass:
+
+Final: fixed arrow knockback always zero (the removed arrow's velocity was read) — combat_check archer `pushes 2` RED (0) -> GREEN.
+Final: fixed a touch lost when the same arrow's block hit is reported first — touches are handled before block hits. Not reproduced: the new `waller` scene (a wall a metre behind the target) passed before the fix too; kept as a guard.
+Final: fixed stuck arrows drawn upright (the kernel zeroes a shot's velocity before reporting the block) — a shot keeps its own direction; combat_check duel `arrows stuck 1, upright 1` RED -> `upright 0` GREEN.
+Final: fixed the first-step test being a fixed metre and absent for fireballs — `Combat.muzzle_reach(speed, dt)`, test muzzle_reach RED (no function) -> GREEN; a fireball with a block in its first step bursts there. The glue's use of it has no scene of its own.
+Final: fixed shooters not leading the player (its velocity was taken as zero) — the eye's travel since the last frame. No test: scripted players do not move; wiring only.
+Final: fixed the trap check that could not fail — it asserts the rusher fell 250 cm or more (300 measured) and reports who is inside a block 2 s after it is set (0: the mover put the shooter out).
+Final: fixed the ten-match check's loose bounds — every rematch must begin with exactly 11 entities and 15 figures (it does, nine times).
+Final: fixed (regraded from Minor: a second burn and blast at the world's origin) a fireball bursting twice when it lands on the frame it is 4 s old. No test: needs that coincidence.
+Final: fixed (regraded from Minor: seen on every idle fighter) the wander goal flipping each frame at 14 m from the rally point — a fighter patrols once it has reached the rally point, until 60 m from it. No test: a matter of looks; the field check's travel is 419 m (415 before).
+Final: Ruling: finding 8, the tree that vanishes when its trunk burns, is not fixed here — the physics session confirmed it as its bug (`finish_world` drops the bodies a step makes but applies the step's edit) with a fix on its branch (0ae7a68), not yet on main — until then a burned-through tree disappears.
+Final: Ruling: the reviewer is right that the plan called a bots-only match over 54,000 frames a finding, not a budget to raise; it takes 58,160 (16.2 minutes) after the fixes. Left as it is and reported to the user: the design gave no length, and the numbers that set the pace (health, damage, knockback) are the design's.
+Final: minor (deferred): the respawn point is chosen counting the returning fighter as living at its death place.
+Final: minor (deferred): swings land every 1.0 or 1.25 s (the 0.25 s decision tick).
+Final: minor (deferred): the viewer's dig and build sounds play on a weapon's slot; a dead player can still dig and place.
+Final: minor (deferred): the player can place a block inside a fighter or on a spawn point.
+Final: minor (deferred): a swimmer's bank exit does not check headroom; in water 1.0 to 1.4 m deep a swimmer's feet are eased into the bed.
+Final: minor (deferred): a retreating shooter faces the way it walks, not its target.
+Final: minor (deferred): a swimmer making for the nearest spawn point can turn back to its own bank; a shooter firing at a submerged player never retargets.
+Final: minor (deferred): no strike sound on a hit and no knockback for the player (both in the design); 196 of 256 rigs used.
+Final: Ruling (declined to judge, now measured): the walking mover puts a fighter out of a block set in its place (trap: 0 inside at frame 420).
