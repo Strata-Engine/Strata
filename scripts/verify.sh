@@ -9,7 +9,7 @@ run() { # dir, command...
     echo "FAIL: ($d) $*"; tail -40 .verify.log; exit 1
   fi
 }
-for d in . demo viewer soundcheck animcheck; do
+for d in . demo viewer soundcheck animcheck entcheck; do
   [ -f "$d/forge.toml" ] || continue
   run "$d" forge check
   run "$d" forge build --release
@@ -27,6 +27,8 @@ for t in native/tests/*_test.c; do
 done
 # the animation scenes: figures posed by the C kernel through Strata.Anim, headless
 if ! scripts/anim_check.sh > .verify.log 2>&1; then echo "FAIL: scripts/anim_check.sh"; tail -20 .verify.log; exit 1; fi
+# the entity scenes: entities added, read and written by the C kernel through Strata.Entities, headless
+if ! scripts/ent_check.sh > .verify.log 2>&1; then echo "FAIL: scripts/ent_check.sh"; tail -20 .verify.log; exit 1; fi
 # the audio goldens: rendered in game time, no device opened, nothing played aloud
 if ! scripts/audio_golden.sh > .verify.log 2>&1; then echo "FAIL: scripts/audio_golden.sh"; tail -20 .verify.log; exit 1; fi
 if [ "${STRATA_NO_GPU:-0}" != "1" ]; then
