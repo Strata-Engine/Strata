@@ -86,7 +86,7 @@ mod Strata.Test.Template do
   end
 
   pfn wall_bytes() : NativeU8Arr do
-    match File.read("viewer/assets/ruins/wall.vox") do
+    match Authority.must(File.read("viewer/assets/ruins/wall.vox")) do
       Ok(text) -> Bytes.to_u8_arr(Bytes.from_string(text))
       Err(_) -> NativeArray.make_u8(0, 0)
     end
@@ -113,6 +113,16 @@ mod Strata.Test.Template do
   pfn fourcc(a : Int, b : Int, c : Int, d : Int) : Int do a + 256 * (b + 256 * (c + 256 * d)) end
   pfn vox_head() : List(Int) do Cons(fourcc(86, 79, 88, 32), Cons(150, Nil)) end -- "VOX ", version 150
   pfn main_id() : Int do fourcc(77, 65, 73, 78) end                            -- "MAIN"
+
+  pfn fit_miss(t : Strata.Template.Template, f : Strata.Template.Template, i : Int, fx : Int, fy : Int) : Int do
+    let x = i % fx
+    let y = (i / fx) % fy
+    let z = i / (fx * fy)
+    let src = x / 2 + Tp.t_sx(t) * (y / 2 + Tp.t_sy(t) * (z / 2))
+    if NativeArray.get_i32(Tp.t_ids(f), i) != NativeArray.get_i32(Tp.t_ids(t), src) do 1
+    else if NativeArray.get_u8(Tp.t_prob(f), i) != NativeArray.get_u8(Tp.t_prob(t), src) do 1
+    else 0 end end
+  end
 
   describe "Template" do
     test "a hole is never written: the middle of a hollow block stays stone" do
@@ -181,6 +191,59 @@ mod Strata.Test.Template do
         Some(t) -> Test.assert_eq_int(ids_count(t, 8), 0, "no dark stone")
       end
       Test.assert_true(Option.is_none(Tp.from_vox(NativeArray.make_u8(64, 7), palette(7, 8, 9), 1.0)), "junk is None")
+    end
+
+    test "fit keeps a template at its own voxel size unchanged" do
+      let t = Tp.with_prob(ell(), 1, 100)
+      match Tp.fit(t, 1.0) do
+        None -> Test.assert_true(false, "fitted")
+        Some(f) ->
+          Test.assert_eq_int(Tp.t_sx(f), 3, "3 long")
+          Test.assert_eq_int(Tp.t_sy(f), 1, "1 high")
+          Test.assert_eq_int(Tp.t_sz(f), 2, "2 deep")
+          Test.assert_true(Tp.t_voxel_size(f) == 1.0, "its own size")
+          Test.assert_eq_int(NativeArray.get_i32(Tp.t_ids(f), 3), 20, "the foot")
+          Test.assert_eq_int(NativeArray.get_u8(Tp.t_prob(f), 1), 100, "the probability kept")
+      end
+    end
+
+    test "fit replicates each voxel k x k x k at a whole multiple, probabilities carried per source voxel" do
+      let t = Tp.with_yslice(Tp.with_prob(ell(), 1, 100), 0, 200)
+      match Tp.fit(t, 0.5) do
+        None -> Test.assert_true(false, "fitted at 0.5")
+        Some(f) ->
+          Test.assert_eq_int(Tp.t_sx(f), 6, "6 long")
+          Test.assert_eq_int(Tp.t_sy(f), 2, "2 high")
+          Test.assert_eq_int(Tp.t_sz(f), 4, "4 deep")
+          Test.assert_true(Tp.t_voxel_size(f) == 0.5, "the world's size")
+          -- every fine voxel holds its source voxel's id and probability
+          let fx = 6
+          let fy = 2
+          let n = 6 * 2 * 4
+          let bad = List.fold_left(List.range(0, n), 0, fn (acc, i) -> acc + fit_miss(t, f, i, fx, fy))
+          Test.assert_eq_int(bad, 0, "every fine voxel is its source voxel")
+          Test.assert_eq_int(NativeArray.get_u8(Tp.t_yslice(f), 0), 200, "row 0's probability")
+          Test.assert_eq_int(NativeArray.get_u8(Tp.t_yslice(f), 1), 200, "carried to row 1")
+      end
+      match Tp.fit(ell(), 0.5) do
+        None -> Test.assert_true(false, "the plain ell fitted")
+        Some(f) -> Test.assert_eq_int(solid(Tp.blit(C.uniform(0), origin(), f, 0, 0, 0, 0, 5)), 32, "the ell's 4 voxels, 8 fine ones each")
+      end
+      match Tp.fit(hollow(), 0.25) do
+        None -> Test.assert_true(false, "fitted at 0.25")
+        Some(f) ->
+          Test.assert_eq_int(Tp.t_sx(f), 12, "12 a side")
+          Test.assert_eq_int(solid(Tp.blit(C.uniform(0), origin(), f, 0, 0, 0, 0, 5)), 26 * 64, "26 voxels, 64 each")
+          Test.assert_eq_int(at(Tp.blit(C.uniform(0), origin(), f, 0, 0, 0, 0, 5), 5, 5, 5), 0, "the hole is 4 x 4 x 4")
+          Test.assert_eq_int(at(Tp.blit(C.uniform(0), origin(), f, 0, 0, 0, 0, 5), 3, 5, 5), 2, "beside it the wall")
+      end
+    end
+
+    test "fit refuses a world coarser than the template, or no whole ratio" do
+      Test.assert_true(Option.is_none(Tp.fit(ell(), 2.0)), "a coarser world")
+      Test.assert_true(Option.is_none(Tp.fit(ell(), 0.3)), "1 / 0.3 is not whole")
+      Test.assert_true(Option.is_none(Tp.fit(ell(), 0.4)), "1 / 0.4 is not whole")
+      Test.assert_true(Option.is_some(Tp.fit(ell(), 0.1)), "1 / 0.1 is 10")
     end
 
     test "from_vox of a corrupt file is None, and the process carries on" do

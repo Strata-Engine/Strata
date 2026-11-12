@@ -8,6 +8,10 @@
 #
 # A scene is a line "name:environment" below. Every scene renders 60 frames
 # at 1280x800 pixels with radius 6 and writes the frame three before the end.
+# Every scene runs without the far field (STRATA_LEVELS=0) unless it says
+# otherwise: the stored images predate it. The far-field scenes run with the
+# viewer's four levels, settled before the first frame, and are shot at
+# frame 120.
 # Every scene but fine-overview (the 10 cm world) is on the island, its atlas cached in .march/atlas, generated
 # from viewer/assets/island.gen.
 cd "$(dirname "$0")/.." || exit 1
@@ -97,6 +101,9 @@ ui-frames:STRATA_SCENE=1 STRATA_UI=1 STRATA_UI_SHOW=2 DRAWS=6 STRICT=1
 text-sheet:STRATA_SCENE=1 STRATA_UI=1 STRATA_UI_SHOW=3 DRAWS=6 STRICT=1
 text-styles:STRATA_SCENE=1 STRATA_LIGHT=4 STRATA_UI=1 STRATA_UI_SHOW=4 DRAWS=6 STRICT=1
 text-scripts:STRATA_SCENE=1 STRATA_UI=1 STRATA_UI_SHOW=7 DRAWS=6 STRICT=1
+combat-fight:STRATA_ISLAND=1 STRATA_RADIUS=10 STRATA_SHORE=1 STRATA_COMBAT=1 STRATA_COMBAT_SCRIPT=archer STRATA_LIGHT=4 STRATA_UI=1 STRATA_FRAMES=140 DRAWS=22
+combat-end:STRATA_ISLAND=1 STRATA_RADIUS=10 STRATA_SHORE=1 STRATA_COMBAT=1 STRATA_COMBAT_SCRIPT=archer STRATA_COMBAT_WIN=1 STRATA_COMBAT_HOLD=1 STRATA_LIGHT=4 STRATA_UI=1 STRATA_FRAMES=140 DRAWS=22
+combat-fire:STRATA_ISLAND=1 STRATA_RADIUS=10 STRATA_SHORE=1 STRATA_COMBAT=1 STRATA_COMBAT_SCENE=fire STRATA_LIGHT=4 STRATA_SUN=8 STRATA_FRAMES=60 DRAWS=38
 humanoid-poses:STRATA_SCENE=31 STRATA_LIGHT=4 STRATA_SUN=12 STRATA_FIG_SHADOWS=0 DRAWS=20
 figure-walk-lit-2s:STRATA_SCENE=32 STRATA_LIGHT=4 STRATA_FRAMES=123 STRATA_FIG_SHADOWS=0 DRAWS=20
 figure-walk-lit-3s:STRATA_SCENE=32 STRATA_LIGHT=4 STRATA_FRAMES=183 STRATA_FIG_SHADOWS=0 DRAWS=20
@@ -116,6 +123,8 @@ forest-border:STRATA_SCENE=128 STRATA_LIGHT=4
 ruin-slope:STRATA_SCENE=129 STRATA_LIGHT=4
 crater-ruin:STRATA_SCENE=134 STRATA_LIGHT=4 STRATA_FRAMES=120
 overview-regenerated:STRATA_SCENE=1 STRATA_REGEN=1 GOLDEN_AS=overview
+far-island-from-hill:STRATA_SCENE=135 STRATA_LEVELS=4 STRATA_LIGHT=4 STRATA_FRAMES=123
+far-ring-boundary:STRATA_SCENE=136 STRATA_LEVELS=4 STRATA_RADIUS=4 STRATA_LIGHT=4 STRATA_FRAMES=123
 '
 # indirect draw calls a frame must issue, whatever the scene holds; a scene
 # with a kind of geometry nowhere in it says DRAWS=n (a figure scene adds one
@@ -137,7 +146,7 @@ for line in $(echo "$SCENES" | tr ' ' ','); do
   says=""; strict=""
   for kv in $envs; do case "$kv" in GOLDEN_AS=*) stored="${kv#GOLDEN_AS=}";; DRAWS=*) draws="${kv#DRAWS=}";; SAYS=*) says="$(echo "${kv#SAYS=}" | tr '_' ' ')";; STRICT=1) strict="4 0.05";; esac; done
   shot="$OUT/$name.ppm"
-  if ! env MARCH_PIN_MAIN=1 STRATA_RADIUS=6 STRATA_HIDDEN=1 STRATA_OFFSCREEN=1 STRATA_PIXELS=1 STRATA_SIZE=1280x800 STRATA_FRAMES=60 STRATA_LIGHT=0 STRATA_SHOT="$shot" $envs \
+  if ! env MARCH_PIN_MAIN=1 STRATA_LEVELS=0 STRATA_RADIUS=6 STRATA_HIDDEN=1 STRATA_OFFSCREEN=1 STRATA_PIXELS=1 STRATA_SIZE=1280x800 STRATA_FRAMES=60 STRATA_LIGHT=0 STRATA_SHOT="$shot" $envs \
        ./viewer/.march/build/release/strata_viewer > "$OUT/$name.log" 2>&1 || [ ! -s "$shot" ]; then
     echo "FAIL: $name did not render"; tail -5 "$OUT/$name.log"; FAILED=1; continue
   fi
@@ -176,7 +185,7 @@ fi
 if [ $UPDATE -eq 0 ]; then
   for mode in 2 4; do
     for n in 121 122; do
-      env MARCH_PIN_MAIN=1 STRATA_RADIUS=6 STRATA_HIDDEN=1 STRATA_OFFSCREEN=1 STRATA_PIXELS=1 STRATA_SIZE=1280x800 STRATA_SCENE=1 STRATA_LIGHT=$mode STRATA_FRAMES=$n STRATA_SHOT="$OUT/still$n.ppm" ./viewer/.march/build/release/strata_viewer > /dev/null 2>&1
+      env MARCH_PIN_MAIN=1 STRATA_LEVELS=0 STRATA_RADIUS=6 STRATA_HIDDEN=1 STRATA_OFFSCREEN=1 STRATA_PIXELS=1 STRATA_SIZE=1280x800 STRATA_SCENE=1 STRATA_LIGHT=$mode STRATA_FRAMES=$n STRATA_SHOT="$OUT/still$n.ppm" ./viewer/.march/build/release/strata_viewer > /dev/null 2>&1
     done
     if res=$($DIFF "$OUT/still121.ppm" "$OUT/still122.ppm" 4 0.05 2>&1); then echo "ok   stillness, light mode $mode: $res"
     else echo "FAIL stillness, light mode $mode (frames 118 and 119): $res"; FAILED=1; fi
@@ -190,7 +199,7 @@ fi
 # blast's remesh alone is one or two chunks that only grow, so it either fits
 # or never does), so the check follows the terrain.
 if [ $UPDATE -eq 0 ]; then
-  RUN="env MARCH_PIN_MAIN=1 STRATA_LIGHT=0 STRATA_RADIUS=6 STRATA_HIDDEN=1 STRATA_OFFSCREEN=1 STRATA_PIXELS=1 STRATA_SIZE=1280x800 STRATA_SCENE=4 STRATA_FRAMES=60 STRATA_SHOT=/dev/null ./viewer/.march/build/release/strata_viewer"
+  RUN="env MARCH_PIN_MAIN=1 STRATA_LEVELS=0 STRATA_LIGHT=0 STRATA_RADIUS=6 STRATA_HIDDEN=1 STRATA_OFFSCREEN=1 STRATA_PIXELS=1 STRATA_SIZE=1280x800 STRATA_SCENE=4 STRATA_FRAMES=60 STRATA_SHOT=/dev/null ./viewer/.march/build/release/strata_viewer"
   need=$($RUN 2>&1 | sed -n 's/.*; \([0-9]*\) quads,.*/\1/p' | head -1)
   line=$(STRATA_QUADS=$((need + 40000)) $RUN 2>&1 | grep 'done after')
   refused=$(echo "$line" | sed -n 's/.*uploads refused \([0-9]*\),.*/\1/p')

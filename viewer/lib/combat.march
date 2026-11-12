@@ -1,0 +1,432 @@
+-- Combat — the rules of the viewer's free-for-all match
+-- (docs/2026-11-12-combat-design.md): who the fighters are, what a hit
+-- does, who takes a kill, the table, what a computer fighter means to do,
+-- where a fighter comes back, and what fire burns. Pure: no entities, no
+-- renderer, no clock. StrataViewer.Match drives the engine with it.
+mod StrataViewer.Combat do
+
+  type CbKind = CbPlayer | CbRusher | CbShooter
+
+  -- cb_back_in: seconds until a dead fighter comes back. cb_idle: seconds
+  -- since it last moved 2 m or gave or took a hit.
+  type CbFighter = { cb_name : String, cb_kind : CbKind, cb_health : Int, cb_kills : Int, cb_deaths : Int,
+                     cb_alive : Bool, cb_back_in : Float, cb_idle : Float }
+
+  -- What a hit did: nothing (the victim was already dead), hurt it, or
+  -- killed it, with the fighter credited (-1: no one).
+  type CbOutcome = CbIgnored | CbHurt | CbKilled(Int)
+
+  -- What a computer fighter means to do; the Int is its target.
+  type CbIntent = CbReturn | CbWander | CbChase(Int) | CbSwing(Int) | CbHold(Int) | CbRetreat(Int) | CbShoot(Int) | CbSwim(Int)
+
+  doc "Who a hit's outcome credits: the fighter for a kill (-1 when no one takes it), -10 for a hit that only hurt, -20 for one that was ignored. Another module reads an outcome through this."
+  fn credit(o : CbOutcome) : Int do
+    match o do
+      CbKilled(c) -> c
+      CbHurt -> -10
+      CbIgnored -> -20
+    end
+  end
+  doc "Did the hit kill?"
+  fn killed(o : CbOutcome) : Bool do credit(o) >= -1 end
+
+  doc "An intent as a number: 0 return, 1 wander, 2 chase, 3 swing, 4 hold, 5 retreat, 6 shoot, 7 swim."
+  fn intent_code(i : CbIntent) : Int do
+    match i do
+      CbReturn -> 0
+      CbWander -> 1
+      CbChase(_) -> 2
+      CbSwing(_) -> 3
+      CbHold(_) -> 4
+      CbRetreat(_) -> 5
+      CbShoot(_) -> 6
+      CbSwim(_) -> 7
+    end
+  end
+  doc "An intent's target, or -1."
+  fn intent_target(i : CbIntent) : Int do
+    match i do
+      CbReturn -> -1
+      CbWander -> -1
+      CbChase(t) -> t
+      CbSwing(t) -> t
+      CbHold(t) -> t
+      CbRetreat(t) -> t
+      CbShoot(t) -> t
+      CbSwim(t) -> t
+    end
+  end
+  doc "A kind as a number: 0 the player, 1 a rusher, 2 a shooter."
+  fn kind_code(k : CbKind) : Int do
+    match k do
+      CbPlayer -> 0
+      CbRusher -> 1
+      CbShooter -> 2
+    end
+  end
+  fn player() : CbKind do CbPlayer end
+  fn rusher() : CbKind do CbRusher end
+  fn shooter() : CbKind do CbShooter end
+
+  doc "The kills that end a match."
+  fn to_win() : Int do 30 end
+
+  doc "A fighter's full health: the player 100, a rusher 100, a shooter 60."
+  fn max_health(k : CbKind) : Int do
+    match k do
+      CbPlayer -> 100
+      CbRusher -> 100
+      CbShooter -> 60
+    end
+  end
+  fn arrow_damage() : Int do 35 end
+  fn swing_damage() : Int do 25 end
+
+  doc "A fireball's damage [metres] from where it landed: 60 at the centre, falling evenly to 20 at 2 m, nothing beyond."
+  fn fire_damage(metres : Float) : Int do
+    if metres > 2.0 do 0 else if metres <= 0.0 do 60 else 60 - float_to_int(Math.round(metres *. 20.0)) end end
+  end
+
+  pfn fresh(name : String, k : CbKind) : CbFighter do
+    { cb_name: name, cb_kind: k, cb_health: max_health(k), cb_kills: 0, cb_deaths: 0, cb_alive: true, cb_back_in: 0.0, cb_idle: 0.0 }
+  end
+
+  doc "The twelve: index 0 the player, 1 to 7 rushers, 8 to 11 shooters, all alive at full health."
+  fn roster() : List(CbFighter) do
+    [fresh("You", CbPlayer),
+     fresh("Ash", CbRusher), fresh("Rook", CbRusher), fresh("Vale", CbRusher), fresh("Moss", CbRusher),
+     fresh("Flint", CbRusher), fresh("Wren", CbRusher), fresh("Thorn", CbRusher),
+     fresh("Birch", CbShooter), fresh("Pike", CbShooter), fresh("Sedge", CbShooter), fresh("Lark", CbShooter)]
+  end
+
+  pfn nobody() : CbFighter do { cb_name: "", cb_kind: CbRusher, cb_health: 0, cb_kills: 0, cb_deaths: 0, cb_alive: false, cb_back_in: 0.0, cb_idle: 0.0 } end
+  doc "Fighter [i]; a dead, nameless one when there is none."
+  fn at(fs : List(CbFighter), i : Int) : CbFighter do
+    match fs do
+      Nil -> nobody()
+      Cons(f, rest) -> if i == 0 do f else at(rest, i - 1) end
+    end
+  end
+  fn kills(fs : List(CbFighter), i : Int) : Int do
+    let f = at(fs, i)
+    f.cb_kills
+  end
+  fn deaths(fs : List(CbFighter), i : Int) : Int do
+    let f = at(fs, i)
+    f.cb_deaths
+  end
+  fn health(fs : List(CbFighter), i : Int) : Int do
+    let f = at(fs, i)
+    f.cb_health
+  end
+  fn alive(fs : List(CbFighter), i : Int) : Bool do
+    let f = at(fs, i)
+    f.cb_alive
+  end
+  fn name(fs : List(CbFighter), i : Int) : String do
+    let f = at(fs, i)
+    f.cb_name
+  end
+  fn kind(fs : List(CbFighter), i : Int) : CbKind do
+    let f = at(fs, i)
+    f.cb_kind
+  end
+
+  doc "Seconds until dead fighter [i] is back; 0 for one alive."
+  fn back_in(fs : List(CbFighter), i : Int) : Float do
+    let f = at(fs, i)
+    if f.cb_alive do 0.0 else f.cb_back_in end
+  end
+
+  pfn put(fs : List(CbFighter), i : Int, f : CbFighter) : List(CbFighter) do
+    match fs do
+      Nil -> Nil
+      Cons(h, rest) -> if i == 0 do Cons(f, rest) else Cons(h, put(rest, i - 1, f)) end
+    end
+  end
+
+  doc "The fighters with fighter [i] replaced by [f]."
+  fn with_fighter(fs : List(CbFighter), i : Int, f : CbFighter) : List(CbFighter) do put(fs, i, f) end
+
+  pfn winner_go(fs : List(CbFighter), goal : Int, i : Int) : Int do
+    match fs do
+      Nil -> -1
+      Cons(f, rest) -> if f.cb_kills >= goal do i else winner_go(rest, goal, i + 1) end
+    end
+  end
+  doc "The fighter holding the winning kills (30), or -1."
+  fn winner(fs : List(CbFighter)) : Int do winner_go(fs, to_win(), 0) end
+  doc "`winner` for a match played to [goal] kills."
+  fn winner_at(fs : List(CbFighter), goal : Int) : Int do winner_go(fs, goal, 0) end
+
+  doc "Fighter [who] hits [victim] for [damage]. A dead victim is not hit. A kill counts a death, starts the 3 s until the victim is back, and credits [who], unless [who] is the victim or the match already has its winner. [who] may be dead: an arrow outlives its archer."
+  fn hit(fs : List(CbFighter), victim : Int, who : Int, damage : Int) : (List(CbFighter), CbOutcome) do hit_to(fs, victim, who, damage, to_win()) end
+
+  doc "`hit` for a match played to [goal] kills."
+  fn hit_to(fs : List(CbFighter), victim : Int, who : Int, damage : Int, goal : Int) : (List(CbFighter), CbOutcome) do
+    let v = at(fs, victim)
+    if !v.cb_alive do (fs, CbIgnored)
+    else if v.cb_health - damage > 0 do (put(fs, victim, { v with cb_health: v.cb_health - damage }), CbHurt)
+    else
+      let fs1 = put(fs, victim, { v with cb_health: 0, cb_alive: false, cb_back_in: 3.0, cb_deaths: v.cb_deaths + 1 })
+      if who == victim || winner_at(fs, goal) >= 0 do (fs1, CbKilled(-1))
+      else
+        let k = at(fs1, who)
+        (put(fs1, who, { k with cb_kills: k.cb_kills + 1 }), CbKilled(who))
+      end
+    end end
+  end
+
+  pfn tick_go(fs : List(CbFighter), dt : Float, i : Int, out : List(CbFighter), back : List(Int)) : (List(CbFighter), List(Int)) do
+    match fs do
+      Nil -> (List.reverse(out), List.reverse(back))
+      Cons(f, rest) ->
+        if f.cb_alive do tick_go(rest, dt, i + 1, Cons(f, out), back)
+        else if f.cb_back_in -. dt > 0.0 do tick_go(rest, dt, i + 1, Cons({ f with cb_back_in: f.cb_back_in -. dt }, out), back)
+        else tick_go(rest, dt, i + 1, Cons({ f with cb_alive: true, cb_health: max_health(f.cb_kind), cb_back_in: 0.0, cb_idle: 0.0 }, out), Cons(i, back)) end end
+    end
+  end
+  doc "[dt] seconds pass for the dead: the fighters after, and those that come back now, alive at full health."
+  fn tick(fs : List(CbFighter), dt : Float) : (List(CbFighter), List(Int)) do tick_go(fs, dt, 0, Nil, Nil) end
+
+  pfn rows(fs : List(CbFighter), i : Int) : List((Int, Int, Int)) do
+    match fs do
+      Nil -> Nil
+      Cons(f, rest) -> Cons((i, f.cb_kills, f.cb_deaths), rows(rest, i + 1))
+    end
+  end
+  pfn ahead(a : (Int, Int, Int), b : (Int, Int, Int)) : Bool do
+    match a do
+      (ia, ka, da) ->
+        match b do
+          (ib, kb, db) -> if ka != kb do ka > kb else if da != db do da < db else ia <= ib end end
+        end
+    end
+  end
+  pfn firsts(l : List((Int, Int, Int))) : List(Int) do
+    match l do
+      Nil -> Nil
+      Cons((i, _, _), rest) -> Cons(i, firsts(rest))
+    end
+  end
+  doc "The fighters' indices in table order: more kills first, then fewer deaths, then the lower index."
+  fn standings(fs : List(CbFighter)) : List(Int) do firsts(List.sort_by(rows(fs, 0), fn (a, b) -> ahead(a, b))) end
+
+  doc "[dt] seconds pass for a fighter that has [moved] metres from where its count began and has or has not [fought]: 2 m or a hit starts the count again (it reads 0 after); true when it reaches 20 s, and the count starts again then too."
+  fn idle(f : CbFighter, moved : Float, fought : Bool, dt : Float) : (CbFighter, Bool) do
+    if fought || moved >= 2.0 do ({ f with cb_idle: 0.0 }, false)
+    else if f.cb_idle +. dt >= 20.0 do ({ f with cb_idle: 0.0 }, true)
+    else ({ f with cb_idle: f.cb_idle +. dt }, false) end end
+  end
+
+  pfn d3(a : (Float, Float, Float), b : (Float, Float, Float)) : Float do
+    match a do (ax, ay, az) -> match b do (bx, by0, bz) -> Math.sqrt((ax -. bx) *. (ax -. bx) +. (ay -. by0) *. (ay -. by0) +. (az -. bz) *. (az -. bz)) end end
+  end
+  pfn pos(at_ : List((Float, Float, Float)), i : Int) : (Float, Float, Float) do
+    match at_ do
+      Nil -> (0.0, -1000000.0, 0.0)
+      Cons(p, rest) -> if i == 0 do p else pos(rest, i - 1) end
+    end
+  end
+  pfn target_go(me : Int, mine : (Float, Float, Float), ps : List((Float, Float, Float)), alive_ : List(Bool), clear : Int -> Bool, i : Int, best : Int, bd : Float) : Int do
+    match ps do
+      Nil -> best
+      Cons(p, rest) ->
+        match alive_ do
+          Nil -> best
+          Cons(a, arest) ->
+            let d = d3(mine, p)
+            -- the sight test is asked only of a living other that would be the nearest so far
+            let take = if i == me do false else if !a do false else if d > 40.0 do false else if d >= bd do false else clear(i) end end end end
+            if take do target_go(me, mine, rest, arest, clear, i + 1, i, d) else target_go(me, mine, rest, arest, clear, i + 1, best, bd) end
+        end
+    end
+  end
+  doc "The fighter [me] goes for: the nearest living other within 40 m for which [clear] answers true (a clear line to it), or -1. [at] and [alive] are every fighter's place and state, in order."
+  fn target(me : Int, at_ : List((Float, Float, Float)), alive_ : List(Bool), clear : Int -> Bool) : Int do
+    target_go(me, pos(at_, me), at_, alive_, clear, 0, -1, 1000000.0)
+  end
+
+  doc "What a computer fighter of kind [k] means to do: off the field it returns; swimming it swims on (no attack from the water); with no target it wanders. A rusher swings within 1.6 m once cool, else chases. A shooter retreats under 12 m, closes over 25 m, and between them shoots once cool, else holds. [metres] is the distance to [tgt], [cool] the seconds until it may attack again."
+  fn intent(k : CbKind, off_field : Bool, swimming : Bool, tgt : Int, metres : Float, cool : Float) : CbIntent do
+    if off_field do CbReturn
+    else if swimming do CbSwim(tgt)
+    else if tgt < 0 do CbWander
+    else
+      match k do
+        CbShooter ->
+          if metres < 12.0 do CbRetreat(tgt)
+          else if metres > 25.0 do CbChase(tgt)
+          else if cool <= 0.0 do CbShoot(tgt)
+          else CbHold(tgt) end end end
+        _ -> if metres <= 1.6 && cool <= 0.0 do CbSwing(tgt) else CbChase(tgt) end
+      end
+    end end end
+  end
+
+  doc "How far ahead of its muzzle a shot of [speed] m/s is tested for a block before it is let go, [dt] seconds a frame: its first step and a quarter metre. (An entity's first tick passes through blocks.)"
+  fn muzzle_reach(speed : Float, dt : Float) : Float do speed *. dt +. 0.25 end
+
+  doc "Fighter [i] healed where it stands: full health, its idle count started again, nothing else changed. For a fighter put back at a spawn point by the idle rule."
+  fn restore(fs : List(CbFighter), i : Int) : List(CbFighter) do
+    let f = at(fs, i)
+    put(fs, i, { f with cb_health: max_health(f.cb_kind), cb_idle: 0.0 })
+  end
+
+  doc "Fighter [i] taken out of the match: not alive, and never back. For scenes with fewer than twelve."
+  fn bench(fs : List(CbFighter), i : Int) : List(CbFighter) do
+    let f = at(fs, i)
+    put(fs, i, { f with cb_alive: false, cb_back_in: 1000000000000.0 })
+  end
+
+  -- ── Aiming ───────────────────────────────────────────────────────────────
+  doc "Shot number [n] of a match seeded [seed], aimed along [yaw] (radians about the vertical, 0 toward +z) and [pitch] (radians up): a unit direction within [spread_deg] degrees of that axis, spread evenly over the cone's disc. The same seed and number give the same direction."
+  fn aim(seed : Int, n : Int, yaw : Float, pitch : Float, spread_deg : Float) : (Float, Float, Float) do
+    let off = spread_deg *. 3.14159265 /. 180.0 *. Math.sqrt(Strata.Seed.unit(Strata.Seed.mix(seed, 2 * n)))
+    let round_ = 6.2831853 *. Strata.Seed.unit(Strata.Seed.mix(seed, 2 * n + 1))
+    -- the axis, and two unit vectors across it: to the right, and up
+    let ax = Math.sin(yaw) *. Math.cos(pitch)
+    let ay = Math.sin(pitch)
+    let az = Math.cos(yaw) *. Math.cos(pitch)
+    let rx = Math.cos(yaw)
+    let rz = 0.0 -. Math.sin(yaw)
+    let ux = 0.0 -. Math.sin(yaw) *. Math.sin(pitch)
+    let uy = Math.cos(pitch)
+    let uz = 0.0 -. Math.cos(yaw) *. Math.sin(pitch)
+    let c = Math.cos(off)
+    let s = Math.sin(off)
+    (ax *. c +. (rx *. Math.cos(round_) +. ux *. Math.sin(round_)) *. s, ay *. c +. uy *. Math.sin(round_) *. s, az *. c +. (rz *. Math.cos(round_) +. uz *. Math.sin(round_)) *. s)
+  end
+
+  pfn lead_go(src : (Float, Float, Float), dst : (Float, Float, Float), v : (Float, Float, Float), speed : Float, t : Float, n : Int) : Float do
+    if n <= 0 do t
+    else
+      match src do
+        (fx, fy, fz) ->
+          match dst do
+            (tx, ty, tz) ->
+              match v do
+                (vx, vy, vz) ->
+                  let dx = tx +. vx *. t -. fx
+                  let dy = ty +. vy *. t -. fy
+                  let dz = tz +. vz *. t -. fz
+                  lead_go(src, dst, v, speed, Math.sqrt(dx *. dx +. dy *. dy +. dz *. dz) /. speed, n - 1)
+              end
+          end
+      end
+    end
+  end
+  doc "Where dst aim a shot of [speed] m/s, falling at [gravity] m/s2, from [src] at a target now at [dst] moving at [velocity]: (yaw, pitch, seconds in flight). The yaw and pitch point ahead of the target by its travel in that time and above it by the shot's fall."
+  fn lead(src : (Float, Float, Float), dst : (Float, Float, Float), velocity : (Float, Float, Float), speed : Float, gravity : Float) : (Float, Float, Float) do
+    let t = lead_go(src, dst, velocity, speed, 0.0, 4)
+    match src do
+      (fx, fy, fz) ->
+        match dst do
+          (tx, ty, tz) ->
+            match velocity do
+              (vx, vy, vz) ->
+                let dx = tx +. vx *. t -. fx
+                let dy = ty +. vy *. t -. fy +. 0.5 *. gravity *. t *. t
+                let dz = tz +. vz *. t -. fz
+                (Math.atan2(dx, dz), Math.atan2(dy, Math.sqrt(dx *. dx +. dz *. dz)), t)
+            end
+        end
+    end
+  end
+
+  pfn ring_go(cx : Float, cz : Float, i : Int) : List((Float, Float)) do
+    if i >= 16 do Nil
+    else
+      let r = if i < 8 do 36.0 else 68.0 end
+      let a = int_to_float(i % 8) *. 0.78539816 +. (if i < 8 do 0.0 else 0.39269908 end)
+      Cons((cx +. r *. Math.cos(a), cz +. r *. Math.sin(a)), ring_go(cx, cz, i + 1))
+    end
+  end
+  doc "The sixteen columns fighters come back at, about the field's middle: eight at 36 m, eight at 68 m turned half a step."
+  fn ring(cx : Float, cz : Float) : List((Float, Float)) do ring_go(cx, cz, 0) end
+
+  pfn nearest(p : (Float, Float, Float), living : List((Float, Float, Float)), best : Float) : Float do
+    match living do
+      Nil -> best
+      Cons(q, rest) -> nearest(p, rest, if d3(p, q) < best do d3(p, q) else best end)
+    end
+  end
+  pfn spawn_go(points : List((Float, Float, Float)), living : List((Float, Float, Float)), i : Int, best : Int, bd : Float) : Int do
+    match points do
+      Nil -> best
+      Cons(p, rest) ->
+        let d = nearest(p, living, 1000000.0)
+        if d > bd do spawn_go(rest, living, i + 1, i, d) else spawn_go(rest, living, i + 1, best, bd) end
+    end
+  end
+  doc "The point a fighter comes back at: the one farthest from its nearest living fighter; the first among equals, and with no one living."
+  fn spawn_at(points : List((Float, Float, Float)), living : List((Float, Float, Float))) : Int do spawn_go(points, living, 0, 0, -1.0) end
+
+  doc "What fire leaves of a block: 0 (gone) for wood 7, leaves 8, tall grass 11 and ice 13; dirt 2 for grass 3; -1 for a block fire does not touch."
+  fn burns(block : Int) : Int do
+    if block == 7 do 0 else if block == 8 do 0 else if block == 11 do 0 else if block == 13 do 0 else if block == 3 do 2 else -1 end end end end end
+  end
+
+  pfn cells_go(x : Float, y : Float, z : Float, x0 : Int, y0 : Int, z0 : Int, n : Int, i : Int, acc : List((Int, Int, Int))) : List((Int, Int, Int)) do
+    if i >= n * n * n do acc
+    else
+      let cx = x0 + i % n
+      let cy = y0 + (i / n) % n
+      let cz = z0 + i / (n * n)
+      let dx = int_to_float(cx) +. 0.5 -. x
+      let dy = int_to_float(cy) +. 0.5 -. y
+      let dz = int_to_float(cz) +. 0.5 -. z
+      cells_go(x, y, z, x0, y0, z0, n, i + 1, if dx *. dx +. dy *. dy +. dz *. dz <= 4.0 do Cons((cx, cy, cz), acc) else acc end)
+    end
+  end
+  doc "The cells fire reaches from (x, y, z), in voxels: those whose centre is within 2 m."
+  fn burn_cells(x : Float, y : Float, z : Float) : List((Int, Int, Int)) do
+    cells_go(x, y, z, float_to_int(Math.floor(x -. 2.0)), float_to_int(Math.floor(y -. 2.0)), float_to_int(Math.floor(z -. 2.0)), 5, 0, Nil)
+  end
+
+  pfn changes_go(read : Int -> Int -> Int -> Int, cells : List((Int, Int, Int)), acc : List((Int, Int, Int, Int))) : List((Int, Int, Int, Int)) do
+    match cells do
+      Nil -> acc
+      Cons((x, y, z), rest) ->
+        let left = burns(read(x, y, z))
+        changes_go(read, rest, if left < 0 do acc else Cons((x, y, z, left), acc) end)
+    end
+  end
+  doc "What a fireball landing at (x, y, z) changes, as (x, y, z, block) each: every cell within 2 m whose block burns, with what fire leaves of it. [read] answers a cell's block."
+  fn fire_changes(read : Int -> Int -> Int -> Int, x : Float, y : Float, z : Float) : List((Int, Int, Int, Int)) do
+    changes_go(read, burn_cells(x, y, z), Nil)
+  end
+
+  pfn water_go(wet : Int -> Int -> Int -> Bool, x0 : Float, y0 : Float, z0 : Float, dx : Float, dy : Float, dz : Float, i : Int, n : Int) : (Bool, Float, Float, Float) do
+    if i > n do (false, 0.0, 0.0, 0.0)
+    else
+      let k = int_to_float(i) /. int_to_float(n)
+      let x = x0 +. dx *. k
+      let y = y0 +. dy *. k
+      let z = z0 +. dz *. k
+      if wet(float_to_int(Math.floor(x)), float_to_int(Math.floor(y)), float_to_int(Math.floor(z))) do (true, x, y, z)
+      else water_go(wet, x0, y0, z0, dx, dy, dz, i + 1, n) end
+    end
+  end
+  doc "Where a shot's step from (x0, y0, z0) to (x1, y1, z1) first enters a wet cell, sampled every eighth of a metre: (true, the point), or (false, ...) for a dry step. [wet] says whether a cell holds liquid."
+  fn water_point(wet : Int -> Int -> Int -> Bool, x0 : Float, y0 : Float, z0 : Float, x1 : Float, y1 : Float, z1 : Float) : (Bool, Float, Float, Float) do
+    let dx = x1 -. x0
+    let dy = y1 -. y0
+    let dz = z1 -. z0
+    let n = float_to_int(Math.sqrt(dx *. dx +. dy *. dy +. dz *. dz) *. 8.0) + 1
+    water_go(wet, x0, y0, z0, dx, dy, dz, 0, n)
+  end
+
+  doc "What hotbar slot [slot] (0 to 8) holds in a match: 0 the bow, 1 fire, else 2 + a block's id: stone, dirt, sand, wood, leaves, glass, ice."
+  fn tool(slot : Int) : Int do
+    if slot == 0 do 0
+    else if slot == 1 do 1
+    else if slot == 2 do 2 + 1
+    else if slot == 3 do 2 + 2
+    else if slot == 4 do 2 + 4
+    else if slot == 5 do 2 + 7
+    else if slot == 6 do 2 + 8
+    else if slot == 7 do 2 + 10
+    else 2 + 13 end end end end end end end end
+  end
+end
