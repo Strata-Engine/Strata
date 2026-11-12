@@ -633,3 +633,42 @@ After the review fixes the soak's worst frame was 54.2 and 49.0 ms in two
 runs, with a load average of 40 from another session building on the same
 machine (mean 8 to 11 ms). The frame-time limit is not judged: rerun
 `scripts/soak.sh` on a quiet machine. Every other soak check passed.
+
+# The fluid step in flat arrays
+
+On branch `cost`. The fluid step's bookkeeping moved from persistent maps
+and lists to native arrays, in March. The rules a cell follows (`decide`,
+`scan`, `share` and the rest) are unchanged.
+
+- The cells a step touches sit in one native array, 12 ints a cell, found
+  by a hash of their position (`Strata.Fluid.Tab`). Offers are chained per
+  target in a second array and settled target by target.
+- The chunks round a step's cells are fetched from the world once a step
+  (`Strata.Fluid.Reader`); every block read went through the world's chunk
+  map before.
+- The cells left active travel between steps as a flat array
+  (`Strata.Fluid.Cells`), not a map.
+- A version in C was written first and measured, then dropped: the user
+  chose to keep the engine in March.
+
+Time per active cell per step, `forge bench fluid`, old and new run in
+turn on a machine with a load average near 30:
+
+| version | 48 x 48 water | 64 x 64 water |
+|---|---|---|
+| maps and lists (before) | 5.6 to 5.9 µs | 6.0 to 6.2 µs |
+| flat arrays (now) | 2.4 to 2.7 µs | 2.5 to 2.7 µs |
+| flat arrays, scans with SIMD | about 3.5 µs | about 3.5 µs |
+| C, measured earlier | 0.8 to 1.0 µs | 0.8 to 1.0 µs |
+
+SIMD was tried on the four sideways scans, one lane a direction. March has
+no gather, so the blocks are still read one at a time; packing the lanes
+cost more than the shared comparisons saved, and it was taken out.
+
+What is left of a step's time is spread: block type lookups, reference
+counting, the planning views. The compiler costs found on the way (array
+reads that are calls, `||` that does not short-circuit) are GAPS S26 to S28;
+a fix to the March compiler is under way apart from this branch.
+
+The viewer steps fluids 30 times a second (`STRATA_FLUID_HZ`), up from
+10, so a dug-out lake drains three times sooner.

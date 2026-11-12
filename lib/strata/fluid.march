@@ -73,7 +73,9 @@ mod Strata.Fluid do
   -- beside chunks that are not loaded; the last step's events; how many
   -- active cells the last step left for later; the cells woken since a
   -- step was last begun on a worker
-  type Fluid = Fluid(Strata.Blocks.Registry, List(Int), List(Int), Int, Int, Int, Strata.Store.Store(Int), Strata.Store.Store(Int), List(Event), Int, List((Int, Int, Int)), Int)
+  -- The cells a step left active, 4 ints each (x, y, z, value), and how many.
+  type Cells = Cells(NativeIntArr, Int)
+  type Fluid = Fluid(Strata.Blocks.Registry, List(Int), List(Int), Int, Int, Int, Strata.Store.Store(Int), Strata.Store.Store(Int), List(Event), Int, List((Int, Int, Int)), Int, Cells)
 
   doc "The kind of a family whose water moves."
   fn flowing() : Int do 0 end
@@ -85,7 +87,7 @@ mod Strata.Fluid do
   doc "The same simulation with a top to its seas: a `sea` block above height [y] (in voxels) is a `sink` instead. For a world whose rivers are made of the sea's block: the sea floods what is dug beside it, and a river above it only swallows, so a lake breached into the river still drains."
   fn with_sea_top(f : Fluid, y : Int) : Fluid do
     match f do
-      Fluid(r, fl, sk, cap, reach, fall, a, d, ev, wt, nw, st) -> Fluid(r, fl, Cons(0 - 2000000 - y, drop_top(sk)), cap, reach, fall, a, d, ev, wt, nw, st)
+      Fluid(r, fl, sk, cap, reach, fall, a, d, ev, wt, nw, st, ac) -> Fluid(r, fl, Cons(0 - 2000000 - y, drop_top(sk)), cap, reach, fall, a, d, ev, wt, nw, st, ac)
     end
   end
   -- the top is kept in the sink list too, as -(2 000 000 + y); none: no top
@@ -120,34 +122,34 @@ mod Strata.Fluid do
 
   doc "A fluid simulation over [r]'s blocks. [families] lists (base id, kind): a `flowing` family must be one registered with `Strata.Blocks.register_fluid`; a `sink` or a `sea` is any block. Nothing is active until something wakes it."
   fn new(r : Strata.Blocks.Registry, families : List((Int, Int))) : Fluid do
-    Fluid(r, bases(families, 0), List.append(bases(families, 1), sea_codes(bases(families, 2))), 4096, 16, 4, Sq.empty(-1), Sq.empty(-1), Nil, 0, Nil, 0)
+    Fluid(r, bases(families, 0), List.append(bases(families, 1), sea_codes(bases(families, 2))), 4096, 16, 4, Sq.empty(-1), Sq.empty(-1), Nil, 0, Nil, 0, Cells(NativeArray.make_int(Strata.Size.of(4), 0), 0))
   end
 
   doc "The same simulation with other limits: at most [cap] active cells handled a step, a way down sought within [reach] cells, a fall of at most [fall] cells a step. The defaults are 4096, 16 and 4."
   fn with_limits(f : Fluid, cap : Int, reach : Int, fall : Int) : Fluid do
     match f do
-      Fluid(r, fl, sk, _, _, _, a, d, ev, wt, nw, st) -> Fluid(r, fl, sk, if cap < 1 do 1 else cap end, if reach < 0 do 0 else reach end, if fall < 1 do 1 else fall end, a, d, ev, wt, nw, st)
+      Fluid(r, fl, sk, _, _, _, a, d, ev, wt, nw, st, ac) -> Fluid(r, fl, sk, if cap < 1 do 1 else cap end, if reach < 0 do 0 else reach end, if fall < 1 do 1 else fall end, a, d, ev, wt, nw, st, ac)
     end
   end
 
   doc "How many cells are active."
-  fn active_count(f : Fluid) : Int do match f do Fluid(_, _, _, _, _, _, a, _, _, _, _, _) -> Sq.size(a) end end
+  fn active_count(f : Fluid) : Int do match f do Fluid(_, _, _, _, _, _, a, _, _, _, _, _, ac) -> Sq.size(a) + (match ac do Cells(_, n) -> n end) end end
   doc "How many active cells the last step left for later because of the cap."
-  fn waiting_count(f : Fluid) : Int do match f do Fluid(_, _, _, _, _, _, _, _, _, wt, _, _) -> wt end end
+  fn waiting_count(f : Fluid) : Int do match f do Fluid(_, _, _, _, _, _, _, _, _, wt, _, _, _) -> wt end end
   doc "How many cells are set aside in or beside chunks that are not loaded."
-  fn dormant_count(f : Fluid) : Int do match f do Fluid(_, _, _, _, _, _, _, d, _, _, _, _) -> Sq.size(d) end end
+  fn dormant_count(f : Fluid) : Int do match f do Fluid(_, _, _, _, _, _, _, d, _, _, _, _, _) -> Sq.size(d) end end
   doc "What fell in the last step."
-  fn events(f : Fluid) : List(Event) do match f do Fluid(_, _, _, _, _, _, _, _, ev, _, _, _) -> ev end end
+  fn events(f : Fluid) : List(Event) do match f do Fluid(_, _, _, _, _, _, _, _, ev, _, _, _, _) -> ev end end
   doc "How many steps have been applied. A step its worker computed but `finish_world` dropped is not counted, so a game reading `events` once per new count hears each step once."
-  fn steps(f : Fluid) : Int do match f do Fluid(_, _, _, _, _, _, _, _, _, _, _, st) -> st end end
+  fn steps(f : Fluid) : Int do match f do Fluid(_, _, _, _, _, _, _, _, _, _, _, st, _) -> st end end
 
   doc "Make the cell at (x, y, z) active."
   fn wake_cell(f : Fluid, x : Int, y : Int, z : Int) : Fluid do
     match f do
-      Fluid(r, fl, sk, cap, reach, fall, a, d, ev, wt, nw, st) ->
+      Fluid(r, fl, sk, cap, reach, fall, a, d, ev, wt, nw, st, ac) ->
         let k = Kq.key(x, y, z)
         -- recorded even when already active: a step running on a worker may be about to put this very cell to rest
-        Fluid(r, fl, sk, cap, reach, fall, if Sq.has(a, k) do a else Sq.put(a, k, 0) end, d, ev, wt, Cons((x, y, z), nw), st)
+        Fluid(r, fl, sk, cap, reach, fall, if Sq.has(a, k) do a else Sq.put(a, k, 0) end, d, ev, wt, Cons((x, y, z), nw), st, ac)
     end
   end
 
@@ -468,208 +470,30 @@ mod Strata.Fluid do
     end end
   end
 
-  -- ── Settling the offers ──────────────────────────────────────────────────
-  -- Offers to one target are heard in this order: by direction, then by the
-  -- giver's position, so the outcome never depends on how they were gathered.
-  pfn before(a : Offer, b : Offer) : Bool do
-    match a do
-      Offer(_, _, _, oa, _, xa, ya, za, _, _, _) ->
-        match b do
-          Offer(_, _, _, ob, _, xb, yb, zb, _, _, _) ->
-            if oa != ob do oa < ob
-            else if ya != yb do ya < yb
-            else if xa != xb do xa < xb
-            else za < zb end end end
-        end
-    end
-  end
-
-  pfn insert_offer(l : List(Offer), o : Offer) : List(Offer) do
-    match l do
-      Nil -> Cons(o, Nil)
-      Cons(h, t) -> if before(o, h) do Cons(o, l) else Cons(h, insert_offer(t, o)) end
-    end
-  end
-
-  pfn by_target(os : List(Offer), m : Strata.Store.Store(List(Offer))) : Strata.Store.Store(List(Offer)) do
-    match os do
-      Nil -> m
-      Cons(o, t) ->
-        match o do
-          Offer(tx, ty, tz, _, _, _, _, _, _, _, _) ->
-            let k = Kq.key(tx, ty, tz)
-            by_target(t, Sq.put(m, k, insert_offer(Sq.get(m, k), o)))
-        end
-    end
-  end
-
-  -- What settling builds: each cell's change in eighths; the family of each
-  -- cell that changes; how far the water in a cell that was fallen into has
-  -- fallen; events.
-  -- ... and the givers whose offer was refused or cut short: they still
-  -- hold fluid that wants to move, so they stay active.
-  -- ... and the full cells a sea would take over (x, y, z, the sea's block id).
-  type Settled = Settled(Strata.Store.Store(Int), Strata.Store.Store(Int), Strata.Store.Store(Int), List(Event), List((Int, Int, Int)), List((Int, Int, Int, Int)))
-
-  pfn add_delta(m : Strata.Store.Store(Int), k : Strata.Coord.Key, d : Int) : Strata.Store.Store(Int) do Sq.put(m, k, Sq.get(m, k) + d) end
-
-  -- One target takes its offers in order while it has room; an offer of
-  -- another family than the first it took is refused.
-  pfn take(s : Settled, os : List(Offer), room : Int, fam : Int) : Settled do
-    match os do
-      Nil -> s
-      Cons(o, t) ->
-        match o do
-          Offer(tx, ty, tz, ord, n, sx, sy, sz, base, fell, landed) ->
-            let got = if fam >= 0 && fam != base do 0 else min2(n, room) end
-            match s do
-              Settled(delta, fams, fells, evs, short, claims) ->
-                -- a sea (orders 5 and 6) gives without losing; it stays active for as long as it finds room to offer to, near or along its line
-                let short2 = if got < n || ord >= 5 do Cons((sx, sy, sz), short) else short end
-                -- order 7: a sea asks for a full cell of the family beside or under it; granted after everything else is settled, if the cell took no part in the step
-                let claims2 = if ord == 7 do Cons((tx, ty, tz, 0 - 1000 - base), claims) else claims end
-                if got <= 0 do take(Settled(delta, fams, fells, evs, short2, claims2), t, room, fam)
-                else
-                  let tk = Kq.key(tx, ty, tz)
-                  let sk = Kq.key(sx, sy, sz)
-                  let d2 = if ord >= 5 do add_delta(delta, tk, got) else add_delta(add_delta(delta, tk, got), sk, 0 - got) end
-                  let f2 = if ord >= 5 do Sq.put(fams, tk, base) else Sq.put(Sq.put(fams, tk, base), sk, base) end
-                  let arrived = if landed do 0 else min2(fell, 4095) end
-                  let fe2 = if ord == 0 do Sq.put(fells, tk, max2(Sq.get(fells, tk), arrived)) else fells end
-                  let ev2 = if ord == 0 do Cons(Event(tx, ty, tz, got, fell, landed), evs) else evs end
-                  take(Settled(d2, f2, fe2, ev2, short2, claims2), t, room - got, base)
-                end
-            end
-        end
-    end
-  end
-
-  pfn drains(s : Settled, r : Strata.Blocks.Registry, w : Strata.World.World, ds : List((Int, Int, Int, Int)), active : Strata.Store.Store(Int)) : Settled do
-    match ds do
-      Nil -> s
-      Cons((x, y, z, n), t) ->
-        match s do
-          Settled(delta, fams, fells, evs, short, claims) ->
-            let k = Kq.key(x, y, z)
-            -- water a sink swallows lands there: an event, so it is heard and sprays
-            let fell = max2(0, Sq.get(active, k)) % 4096
-            drains(Settled(add_delta(delta, k, 0 - n), Sq.put(fams, k, Bq.fluid_base(r, Wq.get_block(w, x, y, z))), fells, Cons(Event(x, y, z, n, fell, true), evs), short, claims), r, w, t, active)
-        end
-    end
-  end
-
-  -- The level of family [base] the cell holds now.
-  pfn held(r : Strata.Blocks.Registry, w : Strata.World.World, base : Int, k : Strata.Coord.Key) : Int do
-    let id = Wq.get_block(w, Kq.kx(k), Kq.ky(k), Kq.kz(k))
-    if Bq.fluid_base(r, id) == base do Bq.fill(r, id) else 0 end
-  end
-
   -- ── A step ───────────────────────────────────────────────────────────────
   pfn is_flowing(r : Strata.Blocks.Registry, fl : List(Int), w : Strata.World.World, x : Int, y : Int, z : Int) : Bool do
     let b = Bq.fluid_base(r, Wq.get_block(w, x, y, z))
     b >= 0 && has_int(fl, b)
   end
+
   pfn is_sea(r : Strata.Blocks.Registry, sk : List(Int), w : Strata.World.World, x : Int, y : Int, z : Int) : Bool do
     let id = Wq.get_block(w, x, y, z)
     id != 0 && y <= sea_top(sk) && has_int(sk, sea_code(Bq.base_of(r, id)))
   end
+
   -- does the cell hold something a step acts for: flowing fluid, or a sea?
   pfn acts(r : Strata.Blocks.Registry, fl : List(Int), sk : List(Int), w : Strata.World.World, x : Int, y : Int, z : Int) : Bool do
     is_flowing(r, fl, w, x, y, z) || is_sea(r, sk, w, x, y, z)
   end
 
-  -- A cell of the new world joins the active set if it holds flowing fluid or is a sea.
-  pfn join(a : Strata.Store.Store(Int), old : Strata.Store.Store(Int), fells : Strata.Store.Store(Int), r : Strata.Blocks.Registry, fl : List(Int), sk : List(Int), w : Strata.World.World, x : Int, y : Int, z : Int) : Strata.Store.Store(Int) do
-    if !acts(r, fl, sk, w, x, y, z) do a
-    else
-      let k = Kq.key(x, y, z)
-      if Sq.has(a, k) do a
-      else if Sq.has(fells, k) do Sq.put(a, k, Sq.get(fells, k))
-      else Sq.put(a, k, max2(0, Sq.get(old, k)) % 4096) end end
-    end
+  -- How soon a cell should have its turn, smaller first: its distance from
+  -- the nearest focus, shrunk by every step it has already waited, so the
+  -- near go first and nothing waits for ever.
+  pfn urgency(d2 : Float, waited : Int) : Float do
+    let k = int_to_float(1 + waited)
+    (if d2 < 0.0 do 1.0 else 1.0 +. d2 end) /. (k *. k)
   end
 
-  pfn join_around(a : Strata.Store.Store(Int), old : Strata.Store.Store(Int), fells : Strata.Store.Store(Int), r : Strata.Blocks.Registry, fl : List(Int), sk : List(Int), w : Strata.World.World, k : Strata.Coord.Key) : Strata.Store.Store(Int) do
-    let x = Kq.kx(k)
-    let y = Kq.ky(k)
-    let z = Kq.kz(k)
-    join(join(join(join(join(join(join(a, old, fells, r, fl, sk, w, x, y, z), old, fells, r, fl, sk, w, x - 1, y, z), old, fells, r, fl, sk, w, x + 1, y, z), old, fells, r, fl, sk, w, x, y - 1, z), old, fells, r, fl, sk, w, x, y + 1, z), old, fells, r, fl, sk, w, x, y, z - 1), old, fells, r, fl, sk, w, x, y, z + 1)
-  end
-
-  -- The claims that stand: one per cell, and only for a cell nothing else
-  -- moved into or out of this step.
-  pfn grant(claims : List((Int, Int, Int, Int)), delta : Strata.Store.Store(Int), seen : Strata.Store.Store(Bool), acc : List((Int, Int, Int, Int))) : List((Int, Int, Int, Int)) do
-    match claims do
-      Nil -> acc
-      Cons((x, y, z, id), t) ->
-        let k = Kq.key(x, y, z)
-        if Sq.get(delta, k) != 0 || Sq.get(seen, k) do grant(t, delta, seen, acc)
-        else grant(t, delta, Sq.put(seen, k, true), Cons((x, y, z, id), acc)) end
-    end
-  end
-  pfn join_granted(a : Strata.Store.Store(Int), old : Strata.Store.Store(Int), fells : Strata.Store.Store(Int), r : Strata.Blocks.Registry, fl : List(Int), sk : List(Int), w : Strata.World.World, l : List((Int, Int, Int, Int))) : Strata.Store.Store(Int) do
-    match l do
-      Nil -> a
-      Cons((x, y, z, _), t) -> join_granted(join_around(a, old, fells, r, fl, sk, w, Kq.key(x, y, z)), old, fells, r, fl, sk, w, t)
-    end
-  end
-
-  pfn any_sea(sk : List(Int)) : Bool do
-    match sk do
-      Nil -> false
-      Cons(h, t) -> h < 0 || any_sea(t)
-    end
-  end
-
-  -- A cell that changed may have made room a sea can fill from along its
-  -- line: walk from it through full cells of its family each way, and wake
-  -- the sea cell the walk ends at, if it ends at one.
-  pfn sea_along(a : Strata.Store.Store(Int), r : Strata.Blocks.Registry, sk : List(Int), w : Strata.World.World, base : Int, x : Int, y : Int, z : Int, dx : Int, dz : Int, i : Int, reach : Int) : Strata.Store.Store(Int) do
-    if i > reach do a
-    else
-      let id = Wq.get_block(w, x + i * dx, y, z + i * dz)
-      if id == 0 do a
-      else if y <= sea_top(sk) && has_int(sk, sea_code(Bq.base_of(r, id))) do (if Sq.has(a, Kq.key(x + i * dx, y, z + i * dz)) do a else Sq.put(a, Kq.key(x + i * dx, y, z + i * dz), 0) end)
-      else if Bq.fluid_base(r, id) == base && Bq.fill(r, id) == 8 do sea_along(a, r, sk, w, base, x, y, z, dx, dz, i + 1, reach)
-      else a end end end
-    end
-  end
-  pfn seas_for(a : Strata.Store.Store(Int), r : Strata.Blocks.Registry, sk : List(Int), w : Strata.World.World, k : Strata.Coord.Key, reach : Int) : Strata.Store.Store(Int) do
-    let x = Kq.kx(k)
-    let y = Kq.ky(k)
-    let z = Kq.kz(k)
-    let id = Wq.get_block(w, x, y, z)
-    let base = Bq.fluid_base(r, id)
-    -- only a cell of fluid with room in it can be topped up
-    if base < 0 || Bq.fill(r, id) >= 8 do a
-    else sea_along(sea_along(sea_along(sea_along(a, r, sk, w, base, x, y, z, -1, 0, 1, reach), r, sk, w, base, x, y, z, 1, 0, 1, reach), r, sk, w, base, x, y, z, 0, -1, 1, reach), r, sk, w, base, x, y, z, 0, 1, 1, reach) end
-  end
-
-  pfn settle_target(s : Settled, r : Strata.Blocks.Registry, w : Strata.World.World, k : Strata.Coord.Key, offers : List(Offer)) : Settled do
-    match offers do
-      Nil -> s
-      Cons(first, _) ->
-        match first do
-          Offer(_, _, _, _, _, _, _, _, base, _, _) -> take(s, offers, 8 - held(r, w, base, k), -1)
-        end
-    end
-  end
-
-  -- The block a changed cell holds after the step, as an (x, y, z, id) for the edit.
-  pfn cell_after(acc : List((Int, Int, Int, Int)), r : Strata.Blocks.Registry, w : Strata.World.World, fams : Strata.Store.Store(Int), k : Strata.Coord.Key, d : Int) : List((Int, Int, Int, Int)) do
-    if d == 0 do acc
-    else
-      let base = Sq.get(fams, k)
-      -- a cell the sea took over: the mark carries the sea's block id
-      if base <= -1000 do (if d > 0 do Cons((Kq.kx(k), Kq.ky(k), Kq.kz(k), 0 - 1000 - base), acc) else acc end)
-      else
-        let now = held(r, w, base, k) + d
-        Cons((Kq.kx(k), Kq.ky(k), Kq.kz(k), if now <= 0 do 0 else base + min2(now, 8) - 1 end), acc)
-      end
-    end
-  end
-
-  -- ── Waiting and dormant cells ────────────────────────────────────────────
   pfn dist2(fs : List((Float, Float, Float)), x : Int, y : Int, z : Int, best : Float) : Float do
     match fs do
       Nil -> best
@@ -680,14 +504,6 @@ mod Strata.Fluid do
         let d = dx *. dx +. dy *. dy +. dz *. dz
         dist2(t, x, y, z, if best < 0.0 || d < best do d else best end)
     end
-  end
-
-  -- How soon a cell should have its turn, smaller first: its distance from
-  -- the nearest focus, shrunk by every step it has already waited, so the
-  -- near go first and nothing waits for ever.
-  pfn urgency(d2 : Float, waited : Int) : Float do
-    let k = int_to_float(1 + waited)
-    (if d2 < 0.0 do 1.0 else 1.0 +. d2 end) /. (k *. k)
   end
 
   -- An active cell with its urgency: (urgency, x, y, z, fell and steps waited).
@@ -714,34 +530,6 @@ mod Strata.Fluid do
     end
   end
 
-  -- The cells having their turn, gathered by chunk, so each chunk's
-  -- neighbourhood is fetched once.
-  pfn by_chunk(l : List((Float, Int, Int, Int, Int)), m : Strata.Store.Store(List((Int, Int, Int, Int)))) : Strata.Store.Store(List((Int, Int, Int, Int))) do
-    match l do
-      Nil -> m
-      Cons((_, x, y, z, val), t) ->
-        let k = Kq.key_of_voxel(x, y, z)
-        by_chunk(t, Sq.put(m, k, Cons((x, y, z, val % 4096), Sq.get(m, k))))
-    end
-  end
-
-  pfn plan_cells(r : Strata.Blocks.Registry, fl : List(Int), sk : List(Int), v : View, reach : Int, fall : Int, p : Plan, l : List((Int, Int, Int, Int))) : Plan do
-    match l do
-      Nil -> p
-      Cons((x, y, z, fell), t) -> plan_cells(r, fl, sk, v, reach, fall, consider(r, fl, sk, v, reach, fall, p, x, y, z, fell), t)
-    end
-  end
-
-  pfn keep_waiting(a : Strata.Store.Store(Int), l : List((Float, Int, Int, Int, Int)), n : Int) : (Strata.Store.Store(Int), Int) do
-    match l do
-      Nil -> (a, n)
-      Cons((_, x, y, z, fell), t) ->
-        let k = Kq.key(x, y, z)
-        -- one more step waited
-        keep_waiting(if Sq.has(a, k) do a else Sq.put(a, k, fell + 4096) end, t, n + 1)
-    end
-  end
-
   pfn set_aside(d : Strata.Store.Store(Int), es : List((Int, Int, Int, Int))) : Strata.Store.Store(Int) do
     match es do
       Nil -> d
@@ -756,6 +544,7 @@ mod Strata.Fluid do
 
   -- Dormant cells whose surroundings have loaded come back to the active set.
   type Revived = Revived(Strata.Store.Store(Int), Strata.Store.Store(Int))
+
   pfn revive(w : Strata.World.World, active : Strata.Store.Store(Int), dormant : Strata.Store.Store(Int)) : Revived do
     if Sq.size(dormant) == 0 do Revived(active, dormant)
     else
@@ -767,41 +556,600 @@ mod Strata.Fluid do
   end
 
   -- Does an active cell have anything to do: flowing fluid, or a chunk that is not loaded (it is set aside)?
-  pfn holds(r : Strata.Blocks.Registry, fl : List(Int), sk : List(Int), w : Strata.World.World, k : Strata.Coord.Key) : Bool do
-    !Wq.is_loaded(w, Kq.key_of_voxel(Kq.kx(k), Kq.ky(k), Kq.kz(k))) || acts(r, fl, sk, w, Kq.kx(k), Kq.ky(k), Kq.kz(k))
+
+  -- ── A step's bookkeeping, in flat arrays ─────────────────────────────────
+  -- Planning (above) reads the world through views; everything a step then
+  -- keeps per cell lives in native arrays: a growable list of ints, and a
+  -- table of cells by position (open addressing, linear probing), with one
+  -- array a field. Persistent maps were most of a step's cost.
+
+  -- A growable list of ints, and how many are in use.
+  type Ints = Ints(NativeIntArr, Int)
+
+  pfn ints_new(cap : Int) : Ints do Ints(NativeArray.make_int(Strata.Size.of(if cap < 4 do 4 else cap end), 0), 0) end
+  pfn ints_n(l : Ints) : Int do match l do Ints(_, n) -> n end end
+  pfn ints_at(l : Ints, i : Int) : Int do match l do Ints(a, _) -> NativeArray.get_int(a, i) end end
+  pfn copy_into(d : NativeIntArr, s : NativeIntArr, i : Int, n : Int) : NativeIntArr do
+    if i >= n do d else copy_into(NativeArray.set_int(d, i, NativeArray.get_int(s, i)), s, i + 1, n) end
+  end
+  pfn ints_room(l : Ints, k : Int) : Ints do
+    match l do
+      Ints(a, n) -> if n + k <= NativeArray.length_int(a) do l else Ints(copy_into(NativeArray.make_int(Strata.Size.of(2 * (n + k)), 0), a, 0, n), n) end
+    end
+  end
+  pfn push3(l0 : Ints, p : Int, q : Int, r : Int) : Ints do
+    match ints_room(l0, 3) do
+      Ints(a, n) -> Ints(NativeArray.set_int(NativeArray.set_int(NativeArray.set_int(a, n, p), n + 1, q), n + 2, r), n + 3)
+    end
+  end
+  pfn push4(l0 : Ints, p : Int, q : Int, r : Int, t : Int) : Ints do
+    match ints_room(l0, 4) do
+      Ints(a, n) -> Ints(NativeArray.set_int(NativeArray.set_int(NativeArray.set_int(NativeArray.set_int(a, n, p), n + 1, q), n + 2, r), n + 3, t), n + 4)
+    end
+  end
+  pfn push6(l0 : Ints, p : Int, q : Int, r : Int, t : Int, u : Int, v : Int) : Ints do
+    match ints_room(l0, 6) do
+      Ints(a, n) -> Ints(NativeArray.set_int(NativeArray.set_int(NativeArray.set_int(NativeArray.set_int(NativeArray.set_int(NativeArray.set_int(a, n, p), n + 1, q), n + 2, r), n + 3, t), n + 4, u), n + 5, v), n + 6)
+    end
   end
 
-  pfn join_short(a : Strata.Store.Store(Int), old : Strata.Store.Store(Int), fells : Strata.Store.Store(Int), r : Strata.Blocks.Registry, fl : List(Int), sk : List(Int), w : Strata.World.World, l : List((Int, Int, Int))) : Strata.Store.Store(Int) do
-    match l do
-      Nil -> a
-      Cons((x, y, z), t) -> join_short(join(a, old, fells, r, fl, sk, w, x, y, z), old, fells, r, fl, sk, w, t)
+  -- A cell's position in one Int: 20 bits a coordinate (each within half a
+  -- million voxels of the origin), plus 1, so that 0 is never a position.
+  pfn pos_key(x : Int, y : Int, z : Int) : Int do ((x + 524288) * 1048576 + (y + 524288)) * 1048576 + (z + 524288) + 1 end
+  pfn pos_hash(x : Int, y : Int, z : Int) : Int do int_and(int_xor(int_xor(x * 73856093, y * 19349663), z * 83492791), 1073741823) end
+
+  -- The cells a step touches: capacity (a power of two), how many cells,
+  -- the hash slots (each a cell's number plus one, 0 empty: open
+  -- addressing, linear probing), and 12 ints a cell, numbered in the order
+  -- they came: position key, x, y, z, delta (eighths gained or lost), fam
+  -- (the family it holds after, or a sea mark), fell, old value, new value,
+  -- flags, and the first offer made to it plus one (0: none). Flags: 1 has
+  -- fell, 2 has old, 4 has new, 8 granted, 16 touched, 32 listed.
+  type Tab = Tab(Int, Int, NativeIntArr, NativeIntArr)
+
+  pfn zeros(n : Int) : NativeIntArr do NativeArray.make_int(Strata.Size.of(n), 0) end
+  pfn pow2_at_least(c : Int, want : Int) : Int do if c >= want do c else pow2_at_least(c * 2, want) end end
+  pfn tab_new(want : Int) : Tab do
+    let cap = pow2_at_least(64, 2 * want)
+    Tab(cap, 0, zeros(cap), zeros(12 * cap))
+  end
+
+  pfn tab_n(t : Tab) : Int do match t do Tab(_, n, _, _) -> n end end
+  pfn cell(t : Tab, i : Int, f : Int) : Int do match t do Tab(_, _, _, d) -> NativeArray.get_int(d, 12 * i + f) end end
+  pfn put(t : Tab, i : Int, f : Int, v : Int) : Tab do match t do Tab(c, n, s, d) -> Tab(c, n, s, NativeArray.set_int(d, 12 * i + f, v)) end end
+  pfn tab_x(t : Tab, i : Int) : Int do cell(t, i, 1) end
+  pfn tab_y(t : Tab, i : Int) : Int do cell(t, i, 2) end
+  pfn tab_z(t : Tab, i : Int) : Int do cell(t, i, 3) end
+  pfn tab_delta(t : Tab, i : Int) : Int do cell(t, i, 4) end
+  pfn tab_fam(t : Tab, i : Int) : Int do cell(t, i, 5) end
+  pfn tab_fell(t : Tab, i : Int) : Int do cell(t, i, 6) end
+  pfn tab_old(t : Tab, i : Int) : Int do cell(t, i, 7) end
+  pfn tab_head(t : Tab, i : Int) : Int do cell(t, i, 10) end
+  pfn has_flag(t : Tab, i : Int, f : Int) : Bool do int_and(cell(t, i, 9), f) != 0 end
+  pfn set_delta(t : Tab, i : Int, v : Int) : Tab do put(t, i, 4, v) end
+  pfn set_fam(t : Tab, i : Int, v : Int) : Tab do put(t, i, 5, v) end
+  pfn set_fell(t : Tab, i : Int, v : Int) : Tab do put(t, i, 6, v) end
+  pfn set_old(t : Tab, i : Int, v : Int) : Tab do put(t, i, 7, v) end
+  pfn set_now(t : Tab, i : Int, v : Int) : Tab do put(t, i, 8, v) end
+  pfn set_head(t : Tab, i : Int, v : Int) : Tab do put(t, i, 10, v) end
+  pfn add_flag(t : Tab, i : Int, v : Int) : Tab do put(t, i, 9, int_or(cell(t, i, 9), v)) end
+
+  -- The slot holding position [key], or the empty slot where it would go.
+  pfn probe(t : Tab, key : Int, s : Int) : Int do
+    match t do
+      Tab(c, _, slots, d) ->
+        let id1 = NativeArray.get_int(slots, s)
+        if id1 == 0 do s
+        else if NativeArray.get_int(d, 12 * (id1 - 1)) == key do s
+        else probe(t, key, int_and(s + 1, c - 1)) end end
     end
+  end
+  pfn slot_for(t : Tab, x : Int, y : Int, z : Int) : Int do
+    match t do Tab(c, _, _, _) -> probe(t, pos_key(x, y, z), int_and(pos_hash(x, y, z), c - 1)) end
+  end
+  -- The number of the cell at (x, y, z), or -1.
+  pfn find(t : Tab, x : Int, y : Int, z : Int) : Int do
+    match t do Tab(_, _, slots, _) -> NativeArray.get_int(slots, slot_for(t, x, y, z)) - 1 end
+  end
+
+  -- Twice the room: the cells are copied as they are, the slots made again.
+  pfn reslot(t : Tab, i : Int) : Tab do
+    if i >= tab_n(t) do t
+    else
+      let s = slot_for(t, tab_x(t, i), tab_y(t, i), tab_z(t, i))
+      match t do Tab(c, n, slots, d) -> reslot(Tab(c, n, NativeArray.set_int(slots, s, i + 1), d), i + 1) end
+    end
+  end
+  pfn grow(t : Tab) : Tab do
+    match t do Tab(c, n, _, d) -> reslot(Tab(2 * c, n, zeros(2 * c), copy_into(zeros(24 * c), d, 0, 12 * n)), 0) end
+  end
+
+  -- The table with (x, y, z) in it, and the cell's number.
+  pfn make(t0 : Tab, x : Int, y : Int, z : Int) : (Tab, Int) do
+    let t = match t0 do Tab(c, n, _, _) -> if (n + 1) * 4 > c * 3 do grow(t0) else t0 end end
+    let s = slot_for(t, x, y, z)
+    match t do
+      Tab(c, n, slots, d) ->
+        let id1 = NativeArray.get_int(slots, s)
+        if id1 != 0 do (t, id1 - 1)
+        else
+          let b = 12 * n
+          (Tab(c, n + 1, NativeArray.set_int(slots, s, n + 1), NativeArray.set_int(NativeArray.set_int(NativeArray.set_int(NativeArray.set_int(d, b, pos_key(x, y, z)), b + 1, x), b + 2, y), b + 3, z)), n)
+        end
+    end
+  end
+
+  -- ── Reading the blocks a step touches ───────────────────────────────────
+  -- Every block a step reads lies within one voxel of its cells, or along a
+  -- sea's line, never more than a chunk away; those chunks are fetched from
+  -- the world once a step. A reader: the low chunk x, y, z and the size in
+  -- chunks of the box, its chunks, whether each is loaded, and the world,
+  -- for anything outside (and for all of it when the cells are too spread
+  -- out for a box).
+  type Reader = Reader(Int, Int, Int, Int, Int, Int, ChunkTree, NativeIntArr, Strata.World.World)
+
+  -- The box's chunks as a balanced tree over their numbers: the half of a
+  -- node's range below goes left.
+  type ChunkTree = CLeaf(Strata.Chunk.Chunk) | CNode(Int, ChunkTree, ChunkTree)
+
+  pfn ct_build(cs : Strata.Store.Store(Strata.Chunk.Chunk), lx : Int, ly : Int, lz : Int, nx : Int, ny : Int, lo : Int, hi : Int) : ChunkTree do
+    if hi - lo <= 1 do CLeaf(Sq.get(cs, Kq.key(lx + lo % nx, ly + (lo / nx) % ny, lz + lo / (nx * ny))))
+    else
+      let mid = (lo + hi) / 2
+      CNode(mid, ct_build(cs, lx, ly, lz, nx, ny, lo, mid), ct_build(cs, lx, ly, lz, nx, ny, mid, hi))
+    end
+  end
+  pfn ct_get(t : ChunkTree, i : Int) : Strata.Chunk.Chunk do
+    match t do
+      CLeaf(c) -> c
+      CNode(mid, a, b) -> if i < mid do ct_get(a, i) else ct_get(b, i) end
+    end
+  end
+
+  pfn loaded_flags(cs : Strata.Store.Store(Strata.Chunk.Chunk), lx : Int, ly : Int, lz : Int, nx : Int, ny : Int, i : Int, n : Int, out : NativeIntArr) : NativeIntArr do
+    if i >= n do out
+    else loaded_flags(cs, lx, ly, lz, nx, ny, i + 1, n, NativeArray.set_int(out, i, if Sq.has(cs, Kq.key(lx + i % nx, ly + (i / nx) % ny, lz + i / (nx * ny))) do 1 else 0 end)) end
+  end
+  pfn reader(w : Strata.World.World, lx : Int, ly : Int, lz : Int, nx : Int, ny : Int, nz : Int) : Reader do
+    let n = if nx * ny * nz > 4096 do 0 else nx * ny * nz end
+    let cs = Wq.chunks(w)
+    let chunks = ct_build(cs, lx, ly, lz, if nx < 1 do 1 else nx end, if ny < 1 do 1 else ny end, 0, if n < 1 do 1 else n end)
+    Reader(lx, ly, lz, if n == 0 do 0 else nx end, ny, nz, chunks, loaded_flags(cs, lx, ly, lz, nx, ny, 0, n, zeros(n + 1)), w)
+  end
+  -- the reader's number for the chunk holding (x, y, z), or -1 outside its box
+  pfn rd_at(rd : Reader, x : Int, y : Int, z : Int) : Int do
+    match rd do
+      Reader(lx, ly, lz, nx, ny, nz, _, _, _) ->
+        let dx = x - 32 * lx
+        let dy = y - 32 * ly
+        let dz = z - 32 * lz
+        if dx >= 0 && dx < 32 * nx && dy >= 0 && dy < 32 * ny && dz >= 0 && dz < 32 * nz do int_shr(dx, 5) + nx * (int_shr(dy, 5) + ny * int_shr(dz, 5)) else -1 end
+    end
+  end
+  pfn rd_block(rd : Reader, x : Int, y : Int, z : Int) : Int do
+    let i = rd_at(rd, x, y, z)
+    match rd do
+      Reader(_, _, _, _, _, _, cs, _, w) -> if i < 0 do Wq.get_block(w, x, y, z) else Strata.Chunk.get_or(ct_get(cs, i), int_and(x, 31), int_and(y, 31), int_and(z, 31), 0) end
+    end
+  end
+  pfn rd_loaded(rd : Reader, x : Int, y : Int, z : Int) : Bool do
+    let i = rd_at(rd, x, y, z)
+    match rd do
+      Reader(_, _, _, _, _, _, _, fl, w) -> if i < 0 do Wq.is_loaded(w, Kq.key_of_voxel(x, y, z)) else NativeArray.get_int(fl, i) != 0 end
+    end
+  end
+  -- does the cell hold flowing fluid, or a sea? (acts, reading the block once)
+  pfn acts_rd(r : Strata.Blocks.Registry, fl : List(Int), sk : List(Int), rd : Reader, x : Int, y : Int, z : Int) : Bool do
+    let id = rd_block(rd, x, y, z)
+    let b = Bq.fluid_base(r, id)
+    if b >= 0 && has_int(fl, b) do true
+    else id != 0 && y <= sea_top(sk) && has_int(sk, sea_code(Bq.base_of(r, id))) end
+  end
+  -- the box of chunks around the cells, one chunk more each way
+  type Span = Span(Int, Int, Int, Int, Int, Int)
+  pfn span_add(s : Span, x : Int, y : Int, z : Int) : Span do
+    let cx = Kq.chunk_of(x)
+    let cy = Kq.chunk_of(y)
+    let cz = Kq.chunk_of(z)
+    match s do Span(lx, ly, lz, hx, hy, hz) -> Span(min2(lx, cx - 1), min2(ly, cy - 1), min2(lz, cz - 1), max2(hx, cx + 1), max2(hy, cy + 1), max2(hz, cz + 1)) end
+  end
+  pfn span_cells(s : Span, a : NativeIntArr, i : Int, n : Int) : Span do
+    if i >= n do s else span_cells(span_add(s, NativeArray.get_int(a, 4 * i), NativeArray.get_int(a, 4 * i + 1), NativeArray.get_int(a, 4 * i + 2)), a, i + 1, n) end
+  end
+  pfn reader_over(w : Strata.World.World, s : Span) : Reader do
+    match s do Span(lx, ly, lz, hx, hy, hz) -> if lx > hx do reader(w, 0, 0, 0, 0, 0, 0) else reader(w, lx, ly, lz, hx - lx + 1, hy - ly + 1, hz - lz + 1) end end
+  end
+
+  -- ── Settling, joining: what a step decides, kept in the table ────────────
+  -- Offers as 12 ints each: target x, y, z, order, eighths, giver x, y, z,
+  -- family, fell, landed (0 or 1), and the next offer to the same target
+  -- plus one (0: none).
+  type Book = Book(Tab, Ints)
+
+  pfn book_offers(b : Book, os : List(Offer)) : Book do
+    match os do
+      Nil -> b
+      Cons(o, rest) ->
+        match o do
+          Offer(tx, ty, tz, ord, n, gx, gy, gz, base, fell, landed) ->
+            match b do
+              Book(t0, offers) ->
+                -- the giver's slot too, now, so no slot moves while the offers are settled
+                match make(t0, gx, gy, gz) do
+                  (t1, _) ->
+                    match make(t1, tx, ty, tz) do
+                      (t2, s) ->
+                        let i = ints_n(offers) / 12
+                        let with12 = push6(push6(offers, tx, ty, tz, ord, n, gx), gy, gz, base, fell, if landed do 1 else 0 end, tab_head(t2, s))
+                        book_offers(Book(set_head(t2, s, i + 1), with12), rest)
+                    end
+                end
+            end
+        end
+    end
+  end
+
+  pfn off(o : Ints, i : Int, f : Int) : Int do ints_at(o, 12 * i + f) end
+
+  -- Offers to one target, in the order it hears them: by order, then the giver's y, x, z.
+  pfn off_before(o : Ints, a : Int, b : Int) : Bool do
+    if off(o, a, 3) != off(o, b, 3) do off(o, a, 3) < off(o, b, 3)
+    else if off(o, a, 6) != off(o, b, 6) do off(o, a, 6) < off(o, b, 6)
+    else if off(o, a, 5) != off(o, b, 5) do off(o, a, 5) < off(o, b, 5)
+    else off(o, a, 7) < off(o, b, 7) end end end
+  end
+  pfn off_insert(o : Ints, l : List(Int), i : Int) : List(Int) do
+    match l do
+      Nil -> Cons(i, Nil)
+      Cons(h, t) -> if off_before(o, i, h) do Cons(i, l) else Cons(h, off_insert(o, t, i)) end
+    end
+  end
+  pfn chain(o : Ints, next1 : Int, acc : List(Int)) : List(Int) do
+    if next1 == 0 do acc else chain(o, off(o, next1 - 1, 11), off_insert(o, acc, next1 - 1)) end
+  end
+
+  -- What settling gathers besides the table: givers short of what they
+  -- offered (x, y, z), claims a sea made (x, y, z, sea id), events (x, y, z,
+  -- eighths, fell, landed).
+  type Tally = Tally(Tab, Ints, Ints, Ints)
+
+  pfn held_now(r : Strata.Blocks.Registry, w : Reader, base : Int, x : Int, y : Int, z : Int) : Int do
+    let id = rd_block(w, x, y, z)
+    if Bq.fluid_base(r, id) == base do Bq.fill(r, id) else 0 end
+  end
+
+  -- One target takes its offers in order while it has room; an offer of
+  -- another family than the first it took is refused.
+  pfn take_all(tl : Tally, o : Ints, l : List(Int), room : Int, fam : Int) : Tally do
+    match l do
+      Nil -> tl
+      Cons(i, rest) ->
+        let ord = off(o, i, 3)
+        let n = off(o, i, 4)
+        let base = off(o, i, 8)
+        let got = if fam >= 0 && fam != base do 0 else min2(n, room) end
+        match tl do
+          Tally(t, shorts, claims, evs) ->
+            let shorts2 = if got < n || ord >= 5 do push3(shorts, off(o, i, 5), off(o, i, 6), off(o, i, 7)) else shorts end
+            let claims2 = if ord == 7 do push4(claims, off(o, i, 0), off(o, i, 1), off(o, i, 2), 0 - 1000 - base) else claims end
+            if got <= 0 do take_all(Tally(t, shorts2, claims2, evs), o, rest, room, fam)
+            else
+              let ts = find(t, off(o, i, 0), off(o, i, 1), off(o, i, 2))
+              let t1 = add_flag(set_fam(set_delta(t, ts, tab_delta(t, ts) + got), ts, base), ts, 16)
+              let t2 = if ord < 5 do
+                  let gs = find(t1, off(o, i, 5), off(o, i, 6), off(o, i, 7))
+                  add_flag(set_fam(set_delta(t1, gs, tab_delta(t1, gs) - got), gs, base), gs, 16)
+                else t1 end
+              let fell = off(o, i, 9)
+              let landed = off(o, i, 10) != 0
+              let arrived = if landed do 0 else min2(fell, 4095) end
+              let t3 = if ord == 0 do add_flag(set_fell(t2, ts, if has_flag(t2, ts, 1) do max2(tab_fell(t2, ts), arrived) else max2(0, arrived) end), ts, 1) else t2 end
+              let evs2 = if ord == 0 do push6(evs, off(o, i, 0), off(o, i, 1), off(o, i, 2), got, fell, if landed do 1 else 0 end) else evs end
+              take_all(Tally(t3, shorts2, claims2, evs2), o, rest, room - got, base)
+            end
+        end
+    end
+  end
+
+  pfn settle_slots(tl : Tally, r : Strata.Blocks.Registry, w : Reader, o : Ints, s : Int) : Tally do
+    match tl do
+      Tally(t, _, _, _) ->
+        if s >= tab_n(t) do tl
+        else
+          let h = tab_head(t, s)
+          if h == 0 do settle_slots(tl, r, w, o, s + 1)
+          else
+            let l = chain(o, h, Nil)
+            let first = match l do
+                Nil -> 0
+                Cons(i, _) -> i
+              end
+            let room = 8 - held_now(r, w, off(o, first, 8), tab_x(t, s), tab_y(t, s), tab_z(t, s))
+            settle_slots(take_all(tl, o, l, room, -1), r, w, o, s + 1)
+          end
+        end
+    end
+  end
+
+  -- What the sinks take, each an event where it lands.
+  pfn drain_all(tl : Tally, r : Strata.Blocks.Registry, w : Reader, ds : List((Int, Int, Int, Int))) : Tally do
+    match ds do
+      Nil -> tl
+      Cons((x, y, z, n), rest) ->
+        match tl do
+          Tally(t0, shorts, claims, evs) ->
+            match make(t0, x, y, z) do
+              (t, s) ->
+                let fell = if has_flag(t, s, 2) do max2(0, tab_old(t, s)) % 4096 else 0 end
+                let t2 = add_flag(set_fam(set_delta(t, s, tab_delta(t, s) - n), s, Bq.fluid_base(r, rd_block(w, x, y, z))), s, 16)
+                drain_all(Tally(t2, shorts, claims, push6(evs, x, y, z, n, fell, 1)), r, w, rest)
+            end
+        end
+    end
+  end
+
+  -- The claims that stand, as changes (x, y, z, id): cells nothing else moved into or out of.
+  pfn grant_all(t : Tab, claims : Ints, i : Int, out : List((Int, Int, Int, Int))) : (Tab, List((Int, Int, Int, Int))) do
+    if 4 * i >= ints_n(claims) do (t, out)
+    else
+      let x = ints_at(claims, 4 * i)
+      let y = ints_at(claims, 4 * i + 1)
+      let z = ints_at(claims, 4 * i + 2)
+      match make(t, x, y, z) do
+        (t1, s) ->
+          if tab_delta(t1, s) != 0 || has_flag(t1, s, 8) do grant_all(t1, claims, i + 1, out)
+          else grant_all(add_flag(t1, s, 8), claims, i + 1, Cons((x, y, z, ints_at(claims, 4 * i + 3)), out))
+        end
+      end
+    end
+  end
+
+  -- Each changed cell's block after the step, and the cells that moved.
+  pfn changed(t : Tab, r : Strata.Blocks.Registry, w : Reader, s : Int, out : List((Int, Int, Int, Int)), moved : List((Int, Int, Int))) : (List((Int, Int, Int, Int)), List((Int, Int, Int))) do
+    if s >= tab_n(t) do (out, moved)
+    else
+      let d = tab_delta(t, s)
+      if d == 0 || !has_flag(t, s, 16) do changed(t, r, w, s + 1, out, moved)
+      else
+        let x = tab_x(t, s)
+        let y = tab_y(t, s)
+        let z = tab_z(t, s)
+        let base = tab_fam(t, s)
+        let moved2 = Cons((x, y, z), moved)
+        if base <= -1000 do changed(t, r, w, s + 1, if d > 0 do Cons((x, y, z, 0 - 1000 - base), out) else out end, moved2)
+        else
+          let now = held_now(r, w, base, x, y, z) + d
+          changed(t, r, w, s + 1, Cons((x, y, z, if now <= 0 do 0 else base + min2(now, 8) - 1 end), out), moved2)
+        end
+      end
+    end
+  end
+
+  -- The next step's cells: a cell of the new world joins if it holds
+  -- flowing fluid or is a sea, with how far its water fell, or its old
+  -- value, or 0.
+  type Joined = Joined(Tab, Ints)
+
+  pfn join1(j : Joined, r : Strata.Blocks.Registry, fl : List(Int), sk : List(Int), w2 : Reader, x : Int, y : Int, z : Int) : Joined do
+    if !acts_rd(r, fl, sk, w2, x, y, z) do j
+    else
+      match j do
+        Joined(t0, out) ->
+          match make(t0, x, y, z) do
+            (t, s) ->
+              if has_flag(t, s, 4) do Joined(t, out)
+              else
+                let v = if has_flag(t, s, 1) do tab_fell(t, s) else if has_flag(t, s, 2) do max2(0, tab_old(t, s)) % 4096 else 0 end end
+                Joined(add_flag(set_now(t, s, v), s, 4), push4(out, x, y, z, v))
+              end
+          end
+      end
+    end
+  end
+  pfn join_near(j : Joined, r : Strata.Blocks.Registry, fl : List(Int), sk : List(Int), w2 : Reader, x : Int, y : Int, z : Int) : Joined do
+    join1(join1(join1(join1(join1(join1(join1(j, r, fl, sk, w2, x, y, z), r, fl, sk, w2, x - 1, y, z), r, fl, sk, w2, x + 1, y, z), r, fl, sk, w2, x, y - 1, z), r, fl, sk, w2, x, y + 1, z), r, fl, sk, w2, x, y, z - 1), r, fl, sk, w2, x, y, z + 1)
+  end
+  -- a changed cell with room may let a sea fill it along its line: wake the sea cell the line ends at
+  pfn sea_line(j : Joined, r : Strata.Blocks.Registry, sk : List(Int), w2 : Reader, base : Int, x : Int, y : Int, z : Int, dx : Int, dz : Int, i : Int, reach : Int) : Joined do
+    if i > reach do j
+    else
+      let px = x + i * dx
+      let pz = z + i * dz
+      let id = rd_block(w2, px, y, pz)
+      if id == 0 do j
+      else if y <= sea_top(sk) && has_int(sk, sea_code(Bq.base_of(r, id))) do
+        match j do
+          Joined(t0, out) ->
+            match make(t0, px, y, pz) do
+              (t, s) -> if has_flag(t, s, 4) do Joined(t, out) else Joined(add_flag(set_now(t, s, 0), s, 4), push4(out, px, y, pz, 0)) end
+            end
+        end
+      else if Bq.fluid_base(r, id) == base && Bq.fill(r, id) == 8 do sea_line(j, r, sk, w2, base, x, y, z, dx, dz, i + 1, reach)
+      else j end end end
+    end
+  end
+  pfn seas_near(j : Joined, r : Strata.Blocks.Registry, sk : List(Int), w2 : Reader, x : Int, y : Int, z : Int, reach : Int) : Joined do
+    let id = rd_block(w2, x, y, z)
+    let base = Bq.fluid_base(r, id)
+    if base < 0 || Bq.fill(r, id) >= 8 do j
+    else sea_line(sea_line(sea_line(sea_line(j, r, sk, w2, base, x, y, z, -1, 0, 1, reach), r, sk, w2, base, x, y, z, 1, 0, 1, reach), r, sk, w2, base, x, y, z, 0, -1, 1, reach), r, sk, w2, base, x, y, z, 0, 1, 1, reach) end
+  end
+  pfn join_moved(j : Joined, r : Strata.Blocks.Registry, fl : List(Int), sk : List(Int), w2 : Reader, seas : Bool, reach : Int, l : List((Int, Int, Int))) : Joined do
+    match l do
+      Nil -> j
+      Cons((x, y, z), rest) ->
+        let j2 = join_near(j, r, fl, sk, w2, x, y, z)
+        join_moved(if seas do seas_near(j2, r, sk, w2, x, y, z, reach) else j2 end, r, fl, sk, w2, seas, reach, rest)
+    end
+  end
+  pfn join_granted(j : Joined, r : Strata.Blocks.Registry, fl : List(Int), sk : List(Int), w2 : Reader, l : List((Int, Int, Int, Int))) : Joined do
+    match l do
+      Nil -> j
+      Cons((x, y, z, _), rest) -> join_granted(join_near(j, r, fl, sk, w2, x, y, z), r, fl, sk, w2, rest)
+    end
+  end
+  pfn join_shorts(j : Joined, r : Strata.Blocks.Registry, fl : List(Int), sk : List(Int), w2 : Reader, sh : Ints, i : Int) : Joined do
+    if 3 * i >= ints_n(sh) do j else join_shorts(join1(j, r, fl, sk, w2, ints_at(sh, 3 * i), ints_at(sh, 3 * i + 1), ints_at(sh, 3 * i + 2)), r, fl, sk, w2, sh, i + 1) end
+  end
+  -- cells the cap left for later keep their place, one more step waited
+  pfn keep_later(j : Joined, l : List((Float, Int, Int, Int, Int)), n : Int) : (Joined, Int) do
+    match l do
+      Nil -> (j, n)
+      Cons((_, x, y, z, v), rest) ->
+        match j do
+          Joined(t0, out) ->
+            match make(t0, x, y, z) do
+              (t, s) -> keep_later(if has_flag(t, s, 4) do Joined(t, out) else Joined(add_flag(set_now(t, s, v + 4096), s, 4), push4(out, x, y, z, v + 4096)) end, rest, n + 1)
+            end
+        end
+    end
+  end
+
+  -- ── Taking a step's cells in ─────────────────────────────────────────────
+  -- Every listed cell once, with its first value, into the table; and those
+  -- with anything to do, with how soon each should have its turn.
+  type Listed = Listed(Tab, List((Float, Int, Int, Int, Int)))
+
+  pfn list_cell(lc : Listed, r : Strata.Blocks.Registry, fl : List(Int), sk : List(Int), w : Reader, focus : List((Float, Float, Float)), x : Int, y : Int, z : Int, v : Int) : Listed do
+    match lc do
+      Listed(t0, all) ->
+        match make(t0, x, y, z) do
+          (t, s) ->
+            if has_flag(t, s, 32) do Listed(t, all)
+            else
+              let t2 = add_flag(set_old(t, s, v), s, 34)
+              -- a cell that holds no flowing fluid has nothing to do and takes no place under the cap
+              if !rd_loaded(w, x, y, z) || acts_rd(r, fl, sk, w, x, y, z) do Listed(t2, Cons((urgency(dist2(focus, x, y, z, -1.0), v / 4096), x, y, z, v), all))
+              else Listed(t2, all) end
+            end
+        end
+    end
+  end
+  pfn list_array(lc : Listed, r : Strata.Blocks.Registry, fl : List(Int), sk : List(Int), w : Reader, focus : List((Float, Float, Float)), a : NativeIntArr, i : Int, n : Int) : Listed do
+    if i >= n do lc else list_array(list_cell(lc, r, fl, sk, w, focus, NativeArray.get_int(a, 4 * i), NativeArray.get_int(a, 4 * i + 1), NativeArray.get_int(a, 4 * i + 2), NativeArray.get_int(a, 4 * i + 3)), r, fl, sk, w, focus, a, i + 1, n) end
+  end
+
+  -- ── Planning chunk by chunk ──────────────────────────────────────────────
+  -- Cells are planned through a view of their chunk and its 26 neighbours.
+  -- The cells are sorted by chunk with a counting pass over the box of
+  -- chunks they lie in, so each view is built once.
+  type ChunkSpan = ChunkSpan(Int, Int, Int, Int, Int, Int)   -- low chunk x, y, z; size in chunks x, y, z
+
+  pfn box_of(l : List((Float, Int, Int, Int, Int)), lx : Int, ly : Int, lz : Int, hx : Int, hy : Int, hz : Int) : ChunkSpan do
+    match l do
+      Nil -> if lx > hx do ChunkSpan(0, 0, 0, 1, 1, 1) else ChunkSpan(lx, ly, lz, hx - lx + 1, hy - ly + 1, hz - lz + 1) end
+      Cons((_, x, y, z, _), rest) ->
+        let cx = Kq.chunk_of(x)
+        let cy = Kq.chunk_of(y)
+        let cz = Kq.chunk_of(z)
+        box_of(rest, min2(lx, cx), min2(ly, cy), min2(lz, cz), max2(hx, cx), max2(hy, cy), max2(hz, cz))
+    end
+  end
+  pfn box_slot(b : ChunkSpan, x : Int, y : Int, z : Int) : Int do
+    match b do ChunkSpan(lx, ly, lz, nx, ny, _) -> (Kq.chunk_of(x) - lx) + nx * ((Kq.chunk_of(y) - ly) + ny * (Kq.chunk_of(z) - lz)) end
+  end
+  pfn box_size(b : ChunkSpan) : Int do match b do ChunkSpan(_, _, _, nx, ny, nz) -> nx * ny * nz end end
+
+  pfn count_slots(b : ChunkSpan, counts : NativeIntArr, l : List((Float, Int, Int, Int, Int))) : NativeIntArr do
+    match l do
+      Nil -> counts
+      Cons((_, x, y, z, _), rest) ->
+        let s = box_slot(b, x, y, z)
+        count_slots(b, NativeArray.set_int(counts, s, NativeArray.get_int(counts, s) + 1), rest)
+    end
+  end
+  pfn starts_of(counts : NativeIntArr, i : Int, n : Int, at : Int, out : NativeIntArr) : NativeIntArr do
+    if i >= n do out else starts_of(counts, i + 1, n, at + NativeArray.get_int(counts, i), NativeArray.set_int(out, i, at)) end
+  end
+  -- cells placed by slot: 4 ints each (x, y, z, fell)
+  pfn place_cells(b : ChunkSpan, next : NativeIntArr, sorted : NativeIntArr, l : List((Float, Int, Int, Int, Int))) : NativeIntArr do
+    match l do
+      Nil -> sorted
+      Cons((_, x, y, z, v), rest) ->
+        let s = box_slot(b, x, y, z)
+        let at = NativeArray.get_int(next, s)
+        let sorted2 = NativeArray.set_int(NativeArray.set_int(NativeArray.set_int(NativeArray.set_int(sorted, 4 * at, x), 4 * at + 1, y), 4 * at + 2, z), 4 * at + 3, v % 4096)
+        place_cells(b, NativeArray.set_int(next, s, at + 1), sorted2, rest)
+    end
+  end
+  pfn plan_range(r : Strata.Blocks.Registry, fl : List(Int), sk : List(Int), v : View, reach : Int, fall : Int, p : Plan, sorted : NativeIntArr, i : Int, e : Int) : Plan do
+    if i >= e do p
+    else plan_range(r, fl, sk, v, reach, fall, consider(r, fl, sk, v, reach, fall, p, NativeArray.get_int(sorted, 4 * i), NativeArray.get_int(sorted, 4 * i + 1), NativeArray.get_int(sorted, 4 * i + 2), NativeArray.get_int(sorted, 4 * i + 3)), sorted, i + 1, e) end
+  end
+  pfn plan_slots(r : Strata.Blocks.Registry, fl : List(Int), sk : List(Int), w : Strata.World.World, reach : Int, fall : Int, p : Plan, sorted : NativeIntArr, starts : NativeIntArr, counts : NativeIntArr, s : Int, n : Int) : Plan do
+    if s >= n do p
+    else
+      let c = NativeArray.get_int(counts, s)
+      if c == 0 do plan_slots(r, fl, sk, w, reach, fall, p, sorted, starts, counts, s + 1, n)
+      else
+        let st = NativeArray.get_int(starts, s)
+        let x = NativeArray.get_int(sorted, 4 * st)
+        let y = NativeArray.get_int(sorted, 4 * st + 1)
+        let z = NativeArray.get_int(sorted, 4 * st + 2)
+        let v = view_of(w, Kq.key_of_voxel(x, y, z))
+        plan_slots(r, fl, sk, w, reach, fall, plan_range(r, fl, sk, v, reach, fall, p, sorted, st, st + c), sorted, starts, counts, s + 1, n)
+      end
+    end
+  end
+  pfn plan_now(r : Strata.Blocks.Registry, fl : List(Int), sk : List(Int), w : Strata.World.World, reach : Int, fall : Int, now : List((Float, Int, Int, Int, Int)), n : Int) : Plan do
+    let b = box_of(now, 1000000, 1000000, 1000000, -1000000, -1000000, -1000000)
+    let ns = box_size(b)
+    let counts = count_slots(b, zeros(ns), now)
+    let starts = starts_of(counts, 0, ns, 0, zeros(ns))
+    let sorted = place_cells(b, starts_of(counts, 0, ns, 0, zeros(ns)), zeros(4 * n + 4), now)
+    plan_slots(r, fl, sk, w, reach, fall, Plan(Nil, Nil, Nil, Nil), sorted, starts, counts, 0, ns)
+  end
+
+  pfn any_sea(sk : List(Int)) : Bool do
+    match sk do
+      Nil -> false
+      Cons(h, t) -> h < 0 || any_sea(t)
+    end
+  end
+  pfn ints_events(l : Ints, i : Int, n : Int, acc : List(Event)) : List(Event) do
+    if i >= n do acc
+    else ints_events(l, i + 1, n, Cons(Event(ints_at(l, 6 * i), ints_at(l, 6 * i + 1), ints_at(l, 6 * i + 2), ints_at(l, 6 * i + 3), ints_at(l, 6 * i + 4), ints_at(l, 6 * i + 5) != 0), acc)) end
   end
 
   -- A step, with the sink cells its drains relied on.
   pfn step_full(f : Fluid, w : Strata.World.World, focus : List((Float, Float, Float))) : (Fluid, Strata.Edit.Outcome, List((Int, Int, Int))) do
     match f do
-      Fluid(r, fl, sk, cap, reach, fall, active0, dormant0, _, _, _, st) ->
-        match revive(w, active0, dormant0) do
-          Revived(active, dormant) ->
-            -- a woken cell that holds no flowing fluid has nothing to do and takes no place under the cap
-            let all = Sq.fold(active, Nil, fn (acc, k, v) -> if holds(r, fl, sk, w, k) do Cons((urgency(dist2(focus, Kq.kx(k), Kq.ky(k), Kq.kz(k), -1.0), v / 4096), Kq.kx(k), Kq.ky(k), Kq.kz(k), v), acc) else acc end)
-            let ordered = if List.length(all) > cap do List.sort_by(all, fn (a, b) -> nearer_cell(a, b)) else all end
-            match split_at(ordered, cap, Nil) do
-              (now, later) ->
-                match Sq.fold(by_chunk(now, Sq.empty(Nil)), Plan(Nil, Nil, Nil, Nil), fn (p, k, cells) -> plan_cells(r, fl, sk, view_of(w, k), reach, fall, p, cells)) do
-                  Plan(os, ds, es, sinks) ->
-                    let taken = Sq.fold(by_target(os, Sq.empty(Nil)), Settled(Sq.empty(0), Sq.empty(-1), Sq.empty(0), Nil, Nil, Nil), fn (s, k, offers) -> settle_target(s, r, w, k, offers))
-                    match drains(taken, r, w, ds, active) do
-                      Settled(delta, fams, fells, evs, short, claims) ->
-                        let granted = grant(claims, delta, Sq.empty(false), Nil)
-                        let o = Eq.set_many(w, List.append(granted, Sq.fold(delta, Nil, fn (acc, k, d) -> cell_after(acc, r, w, fams, k, d))))
-                        let w2 = Eq.world(o)
-                        let seas = any_sea(sk)
-                        let moved = Sq.fold(delta, Sq.empty(-1), fn (a, k, d) -> if d == 0 do a else if seas do seas_for(join_around(a, active, fells, r, fl, sk, w2, k), r, sk, w2, k, reach) else join_around(a, active, fells, r, fl, sk, w2, k) end end)
-                        -- a giver that could not give all it offered stays active: its target was taken by another
-                        match keep_waiting(join_short(join_granted(moved, active, fells, r, fl, sk, w2, granted), active, fells, r, fl, sk, w2, short), later, 0) do
-                          (active2, waiting) -> (Fluid(r, fl, sk, cap, reach, fall, active2, set_aside(dormant, es), evs, waiting, Nil, st + 1), o, sinks)
+      Fluid(r, fl, sk, cap, reach, fall, woken0, dormant0, _, _, _, st, ac) ->
+        match revive(w, woken0, dormant0) do
+          Revived(woken, dormant) ->
+            match ac do
+              Cells(ca, cn) ->
+                -- the cells the last step left first, so a cell also woken keeps its value
+                let span = Sq.fold(woken, span_cells(Span(1000000, 1000000, 1000000, -1000000, -1000000, -1000000), ca, 0, cn), fn (s, k, _) -> span_add(s, Kq.kx(k), Kq.ky(k), Kq.kz(k)))
+                let rd = reader_over(w, span)
+                let l0 = list_array(Listed(tab_new(4 * (cn + Sq.size(woken)) + 64), Nil), r, fl, sk, rd, focus, ca, 0, cn)
+                match Sq.fold(woken, l0, fn (lc, k, v) -> list_cell(lc, r, fl, sk, rd, focus, Kq.kx(k), Kq.ky(k), Kq.kz(k), v)) do
+                  Listed(t0, all) ->
+                    let count = List.length(all)
+                    let ordered = if count > cap do List.sort_by(all, fn (a, b) -> nearer_cell(a, b)) else all end
+                    match split_at(ordered, cap, Nil) do
+                      (now, later) ->
+                        match plan_now(r, fl, sk, w, reach, fall, now, min2(count, cap)) do
+                          Plan(os, ds, es, sinks) ->
+                            match book_offers(Book(t0, ints_new(12 * 64)), os) do
+                              Book(t1, offers) ->
+                                match drain_all(settle_slots(Tally(t1, ints_new(64), ints_new(64), ints_new(64)), r, rd, offers, 0), r, rd, ds) do
+                                  Tally(t2, shorts, claims, evs) ->
+                                    match grant_all(t2, claims, 0, Nil) do
+                                      (t3, granted) ->
+                                        match changed(t3, r, rd, 0, granted, Nil) do
+                                          (changes, moved) ->
+                                            let o = Eq.set_many(w, changes)
+                                            let w2 = reader_over(Eq.world(o), span)
+                                            let j1 = join_moved(Joined(t3, ints_new(4 * count + 64)), r, fl, sk, w2, any_sea(sk), reach, moved)
+                                            match keep_later(join_shorts(join_granted(j1, r, fl, sk, w2, granted), r, fl, sk, w2, shorts, 0), later, 0) do
+                                              (Joined(_, out), waiting) ->
+                                                (Fluid(r, fl, sk, cap, reach, fall, Sq.empty(-1), set_aside(dormant, es), ints_events(evs, 0, ints_n(evs) / 6, Nil), waiting, Nil, st + 1, Cells(match out do Ints(a, _) -> a end, ints_n(out) / 4)), o, sinks)
+                                            end
+                                        end
+                                    end
+                                end
+                            end
                         end
                     end
                 end
@@ -810,7 +1158,7 @@ mod Strata.Fluid do
     end
   end
 
-  doc "One step over world [w]: the active cells (the nearest [focus] first, up to the cap) decide their moves from the world as it stands, the moves are settled, and the result is one edit. The new fluid holds the cells still active, those the cap left waiting, those set aside beside chunks that are not loaded, and the step's events. [focus] is where players are, in voxels."
+  doc "One step over world [w]: the active cells (the nearest [focus] first, up to the cap) decide their moves from the world as it stands, the moves are settled, and the result is one edit. The new fluid holds the cells still active, those set aside in or beside chunks that are not loaded, and what fell."
   fn step_world(f : Fluid, w : Strata.World.World, focus : List((Float, Float, Float))) : (Fluid, Strata.Edit.Outcome) do
     match step_full(f, w, focus) do
       (f2, o, _) -> (f2, o)
@@ -820,7 +1168,7 @@ mod Strata.Fluid do
   -- ── Waking from an edit ──────────────────────────────────────────────────
   pfn wake_if(f : Fluid, w : Strata.World.World, x : Int, y : Int, z : Int) : Fluid do
     match f do
-      Fluid(r, fl, sk, _, _, _, _, _, _, _, _, _) -> if acts(r, fl, sk, w, x, y, z) do wake_cell(f, x, y, z) else f end
+      Fluid(r, fl, sk, _, _, _, _, _, _, _, _, _, _) -> if acts(r, fl, sk, w, x, y, z) do wake_cell(f, x, y, z) else f end
     end
   end
 
@@ -901,8 +1249,8 @@ mod Strata.Fluid do
   doc "Begin a step on a worker. Answers the fluid to go on waking in the meantime and the job to hand to `finish`."
   fn begin(f : Fluid, w : Strata.World.World, focus : List((Float, Float, Float))) : (Fluid, Job) do
     match f do
-      Fluid(r, fl, sk, cap, reach, fall, a, d, ev, wt, _, st) ->
-        (Fluid(r, fl, sk, cap, reach, fall, a, d, ev, wt, Nil, st), Job(task_spawn(fn _ -> worked(f, w, focus))))
+      Fluid(r, fl, sk, cap, reach, fall, a, d, ev, wt, _, st, ac) ->
+        (Fluid(r, fl, sk, cap, reach, fall, a, d, ev, wt, Nil, st, ac), Job(task_spawn(fn _ -> worked(f, w, focus))))
     end
   end
 
@@ -918,7 +1266,7 @@ mod Strata.Fluid do
       Nil -> true
       Cons((x, y, z), t) ->
         match f do
-          Fluid(r, _, sk, _, _, _, _, _, _, _, _, _) -> if has_int(sk, Bq.base_of(r, Wq.get_block(w, x, y, z))) || has_int(sk, sea_code(Bq.base_of(r, Wq.get_block(w, x, y, z)))) do still_sinks(f, w, t) else false end
+          Fluid(r, _, sk, _, _, _, _, _, _, _, _, _, _) -> if has_int(sk, Bq.base_of(r, Wq.get_block(w, x, y, z))) || has_int(sk, sea_code(Bq.base_of(r, Wq.get_block(w, x, y, z)))) do still_sinks(f, w, t) else false end
         end
     end
   end
@@ -956,7 +1304,7 @@ mod Strata.Fluid do
           Ok((f2, cs, sinks)) ->
             if still_true(w, cs) && still_sinks(f, w, sinks) do
               match f do
-                Fluid(_, _, _, _, _, _, _, _, _, _, nw, _) -> (wake_list(f2, nw), Eq.set_many(w, as_cells(cs, Nil)))
+                Fluid(_, _, _, _, _, _, _, _, _, _, nw, _, _) -> (wake_list(f2, nw), Eq.set_many(w, as_cells(cs, Nil)))
               end
             else (f, Eq.set_many(w, Nil)) end
           Err(_) -> (f, Eq.set_many(w, Nil))
@@ -988,7 +1336,7 @@ mod Strata.Fluid do
   -- 0 for anything else.
   pfn liquid(f : Fluid, w : Strata.World.World, x : Int, y : Int, z : Int) : Int do
     match f do
-      Fluid(r, fl, sk, _, _, _, _, _, _, _, _, _) ->
+      Fluid(r, fl, sk, _, _, _, _, _, _, _, _, _, _) ->
         let id = Wq.get_block(w, x, y, z)
         if id == 0 do 0
         else if has_int(sk, Bq.base_of(r, id)) || has_int(sk, sea_code(Bq.base_of(r, id))) do 8
@@ -1048,7 +1396,7 @@ mod Strata.Fluid do
   -- nothing toward higher fluid, nothing toward a wall.
   pfn pull(f : Fluid, w : Strata.World.World, base : Int, l : Int, x : Int, y : Int, z : Int) : Float do
     match f do
-      Fluid(r, _, sk, _, _, _, _, _, _, _, _, _) ->
+      Fluid(r, _, sk, _, _, _, _, _, _, _, _, _, _) ->
         let id = Wq.get_block(w, x, y, z)
         if !Wq.is_loaded(w, Kq.key_of_voxel(x, y, z)) do 0.0
         else if Bq.fluid_base(r, id) == base do int_to_float(l - liquid(f, w, x, y, z)) /. 8.0
@@ -1067,7 +1415,7 @@ mod Strata.Fluid do
   doc "Which way, and how strongly, the fluid in cell (x, y, z) is moving, as a vector: toward lower fluid and, twice as hard, toward drops; each component about -2 to 2, and (0, -1, 0) for fluid that is falling. Zero for still water, for a sink, and for a cell with no flowing fluid. A game multiplies it by how hard its water should push."
   fn flow(f : Fluid, w : Strata.World.World, x : Int, y : Int, z : Int) : (Float, Float, Float) do
     match f do
-      Fluid(r, fl, sk, _, _, _, _, _, _, _, _, _) ->
+      Fluid(r, fl, sk, _, _, _, _, _, _, _, _, _, _) ->
         let id = Wq.get_block(w, x, y, z)
         let base = Bq.fluid_base(r, id)
         if base < 0 || !has_int(fl, base) do (0.0, 0.0, 0.0)
