@@ -4,6 +4,10 @@
 -- through Strata.Ffi.Anim); this module keeps what March needs beside it:
 -- each finished rig, with its sockets and legs, by id.
 --
+-- Sockets and hit tests answer from the pose before springs, as of the last
+-- update; a figure placed, played or changed since (or hanging from one) is
+-- posed first, so an answer is never stale.
+--
 -- One world per process: `open` makes it (closing any open one), `close`
 -- frees it. Time is the dt passed to `update`, never the clock: the same
 -- calls with the same dt give the same `hash`.
@@ -22,6 +26,11 @@ mod Strata.Anim do
 
   type Anim = { rigs : List((Int, Strata.Rig.Rig)), capacity : Int }
 
+  -- (Strata.Query has a `Hit`: a type named in a record or a match must be unique across the library, GAPS S18/S19)
+  -- A ray's answer: the figure and part struck, the voxel (x, y, z) in the part's grid (as `Strata.Rig.voxel`
+  -- takes it), its palette index, the distance in metres and the struck face's normal in world space.
+  type FigureHit = { fig : Int, part : Int, x : Int, y : Int, z : Int, colour : Int, dist : Float, normal : (Float, Float, Float) }
+
   doc "Open the figure world for up to [capacity] figures (1..4096), closing any open one."
   fn open(capacity : Int) : Anim do
     let ok = Strata.Ffi.Anim.open(capacity)
@@ -37,13 +46,41 @@ mod Strata.Anim do
   doc "How many figures the world was opened for; 0 when it could not be opened or is closed."
   fn capacity(a : Anim) : Int do a.capacity end
 
-  doc "Upload rig [r] (its hierarchy, rest pose and masks); its meshes are `Strata.Rig.meshes`. Answers its id, or -1 if refused. The rig's sockets and legs stay here, read with `rig`."
+  doc "Upload rig [r]: its hierarchy, rest pose, masks, sockets, and every part's voxels (for hit tests); its meshes are `Strata.Rig.meshes`. Answers its id, or -1 if refused (the rig, or one of its masks, sockets or grids: a rig holds at most 32 sockets). The rig's sockets and legs stay here, read with `rig`."
   fn finish_rig(a : Anim, r : Strata.Rig.Rig) : (Anim, Int) do
     let id = Strata.Ffi.Anim.rig(Strata.Rig.part_count(r), Strata.Rig.parents(r), Strata.Rig.floats(r))
     if id < 0 do (a, id)
     else
       let made = Strata.Ffi.Anim.masks(id, Strata.Rig.mask_count(r), Strata.Rig.mask_counts(r), Strata.Rig.mask_roots(r))
-      if made < Strata.Rig.mask_count(r) do (a, -1) else ({ a with rigs: Cons((id, r), a.rigs) }, id) end
+      let shaped = shapes_go(id, r, 0, Strata.Rig.part_count(r), 0)
+      let socketed = sockets_go(id, r, Strata.Rig.sockets(r), 0)
+      let whole = made == Strata.Rig.mask_count(r) && shaped == Strata.Rig.part_count(r) && socketed == List.length(Strata.Rig.sockets(r))
+      if whole do ({ a with rigs: Cons((id, r), a.rigs) }, id) else (a, -1) end
+    end
+  end
+
+  -- every part's grid, for hit tests; how many were taken
+  pfn shapes_go(id : Int, r : Strata.Rig.Rig, p : Int, n : Int, ok : Int) : Int do
+    if p >= n do ok
+    else
+      match Strata.Rig.size(r, p) do
+        (sx, sy, sz) ->
+          let got = Strata.Ffi.Anim.shape(id, p, sx, sy, sz, Strata.Rig.voxel_size(r), Strata.Rig.grid(r, p))
+          shapes_go(id, r, p + 1, n, if got >= 0 do ok + 1 else ok end)
+      end
+    end
+  end
+  -- every socket, in socket order: grid coordinates less the part's anchor, in metres; how many were taken
+  pfn sockets_go(id : Int, r : Strata.Rig.Rig, ss : List((Int, Float, Float, Float, (Float, Float, Float, Float))), ok : Int) : Int do
+    match ss do
+      Nil -> ok
+      Cons((p, x, y, z, (qx, qy, qz, qw)), rest) ->
+        match Strata.Rig.anchor_at(r, p) do
+          (ax, ay, az) ->
+            let v = Strata.Rig.voxel_size(r)
+            let got = Strata.Ffi.Anim.socket_def(id, p, (x -. ax) *. v, (y -. ay) *. v, (z -. az) *. v, qx, qy, qz, qw)
+            sockets_go(id, r, rest, if got >= 0 do ok + 1 else ok end)
+        end
     end
   end
 
@@ -269,6 +306,52 @@ mod Strata.Anim do
     end
   end
 
+  -- ── Attachments, sockets and hit tests ──────────────────────────────────
+
+  doc "Hang figure [child] from figure [parent]'s socket [socket] (a socket number of the parent's rig), placed at (x, y, z) metres turned by [q] in the socket's frame. It is posed after its parent in every update, and moves with it. Chains go four deep; a cycle, a deeper chain, or no such figure or socket is refused (counted in `stats`). A figure already hanging moves to the new socket. A figure whose parent is removed is detached where it stands."
+  fn attach(a : Anim, child : Int, parent : Int, socket : Int, x : Float, y : Float, z : Float, q : Strata.Math.Quat.Quat) : Anim do
+    if Strata.Ffi.Anim.attach(child, parent, socket, x, y, z, Qt.x(q), Qt.y(q), Qt.z(q), Qt.w(q)) do a else a end
+  end
+
+  doc "Figure [child] no longer hangs; it is left at its parent's socket as the parent stands now."
+  fn detach(a : Anim, child : Int) : Anim do
+    Strata.Ffi.Anim.detach(child)
+    a
+  end
+
+  doc "Socket [s] of figure [f] (a socket number of its rig) in world space: its position in metres and its rotation, from the pose before springs as of the last update (a figure changed since is posed first). None if there is no such figure or socket."
+  fn socket(_a : Anim, f : Int, s : Int) : Option((Float, Float, Float, Strata.Math.Quat.Quat)) do
+    let out = NativeArray.make_f32(7, 0.0)
+    if Strata.Ffi.Anim.socket(f, s, out) == 1 do
+      Some((NativeArray.get_f32(out, 0), NativeArray.get_f32(out, 1), NativeArray.get_f32(out, 2), Strata.Math.Quat.Quat(NativeArray.get_f32(out, 3), NativeArray.get_f32(out, 4), NativeArray.get_f32(out, 5), NativeArray.get_f32(out, 6))))
+    else None end
+  end
+
+  pfn hit_of(ints : NativeI32Arr, fl : NativeF32Arr) : FigureHit do
+    { fig: NativeArray.get_i32(ints, 0), part: NativeArray.get_i32(ints, 1), x: NativeArray.get_i32(ints, 2), y: NativeArray.get_i32(ints, 3), z: NativeArray.get_i32(ints, 4), colour: NativeArray.get_i32(ints, 5), dist: NativeArray.get_f32(fl, 0), normal: (NativeArray.get_f32(fl, 1), NativeArray.get_f32(fl, 2), NativeArray.get_f32(fl, 3)) }
+  end
+  doc "The nearest voxel of any figure along the ray from (ox, oy, oz) in direction (dx, dy, dz) (any length), within [max] metres: each part is tested as a box in its own space, then voxel by voxel through its grid. [ignore] skips that figure and every figure hanging from it (-1 for none). From the pose before springs. Combine with `Strata.Query.raycast` to learn whether the world came first."
+  fn hit_ray(_a : Anim, ox : Float, oy : Float, oz : Float, dx : Float, dy : Float, dz : Float, max : Float, ignore : Int) : Option(FigureHit) do
+    let ints = NativeArray.make_i32(6, 0)
+    let fl = NativeArray.make_f32(4, 0.0)
+    if Strata.Ffi.Anim.hit_ray(ox, oy, oz, dx, dy, dz, max, ignore, ints, fl) == 1 do Some(hit_of(ints, fl)) else None end
+  end
+
+  pfn pairs_go(out : NativeI32Arr, i : Int, acc : List((Int, Int))) : List((Int, Int)) do
+    if i < 0 do acc else pairs_go(out, i - 1, Cons((NativeArray.get_i32(out, 2 * i), NativeArray.get_i32(out, 2 * i + 1)), acc)) end
+  end
+  doc "Every (figure, part) whose part box overlaps the box centred at (cx, cy, cz) with half sizes (hx, hy, hz) turned by [q]: part boxes, not voxels (a sword sweep needs no more). [ignore] skips that figure and what hangs from it (-1 for none). In figure order, then part order."
+  fn hit_box(_a : Anim, cx : Float, cy : Float, cz : Float, hx : Float, hy : Float, hz : Float, q : Strata.Math.Quat.Quat, ignore : Int) : List((Int, Int)) do
+    let out = NativeArray.make_i32(512, 0)
+    let n = Strata.Ffi.Anim.hit_box(cx, cy, cz, hx, hy, hz, Qt.x(q), Qt.y(q), Qt.z(q), Qt.w(q), ignore, out)
+    if n <= 256 do pairs_go(out, n - 1, Nil)
+    else
+      let all = NativeArray.make_i32(2 * n, 0)
+      let m = Strata.Ffi.Anim.hit_box(cx, cy, cz, hx, hy, hz, Qt.x(q), Qt.y(q), Qt.z(q), Qt.w(q), ignore, all)
+      pairs_go(all, (if m < n do m else n end) - 1, Nil)
+    end
+  end
+
   doc "Advance every figure by [dt] seconds and pose it. A negative dt changes nothing and is counted."
   fn update(a : Anim, dt : Float) : Anim do
     Strata.Ffi.Anim.update(dt)
@@ -296,6 +379,6 @@ mod Strata.Anim do
   fn stats(_a : Anim) : (Int, Int, Int, Int) do
     (float_to_int(Strata.Ffi.Anim.stat(0)), float_to_int(Strata.Ffi.Anim.stat(1)), float_to_int(Strata.Ffi.Anim.stat(2)), float_to_int(Strata.Ffi.Anim.stat(3)))
   end
-  doc "A figure of the kernel's: 0 figures, 1 posed, 2 stale, 3 refused calls, 4 negative dt, 5 the last refusal's reason (AN_R_* in strata_anim.h), 6 marks dropped, 7 procedural records in use."
+  doc "A figure of the kernel's: 0 figures, 1 posed, 2 stale, 3 refused calls, 4 negative dt, 5 the last refusal's reason (AN_R_* in strata_anim.h), 6 marks dropped, 7 procedural records in use, 8 passes queries made over the figures to pose stale ones."
   fn stat(_a : Anim, which : Int) : Float do Strata.Ffi.Anim.stat(which) end
 end

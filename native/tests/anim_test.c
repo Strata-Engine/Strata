@@ -2,7 +2,8 @@
  * additive layers, crossfades, blends in phase, marks, the dt edge cases,
  * degenerate clips, removed figures, refusals and determinism; then the
  * procedural stage: overrides, aim, reach (and its degenerate targets),
- * springs, the drop. */
+ * springs, the drop; then attachments, sockets, and ray and box hit tests
+ * (against brute force). */
 #include <stdio.h>
 #include <string.h>
 #include <math.h>
@@ -773,6 +774,580 @@ static void test_drop_to(void) {
     an_close(w);
 }
 
+/* ---- attachments, sockets, hit tests ---- */
+
+/* the chain's parts as 2 x 10 x 2 grids of 0.1 m voxels, every voxel filled
+ * with the part's number + 1 (the chain's boxes are exactly that) */
+static void shape_chain(AnWorld *w, int rig) {
+    static uint8_t pal[40];
+    for (int p = 0; p < 3; p++) {
+        memset(pal, p + 1, sizeof pal);
+        CHECK(an_shape(w, rig, p, 2, 10, 2, 0.1f, pal) >= 0, "the chain's grids are accepted");
+    }
+}
+static float qdiff(const float a[4], const float b[4]) {   /* 0 when a and b are one rotation */
+    float d = fabsf(a[0] * b[0] + a[1] * b[1] + a[2] * b[2] + a[3] * b[3]);
+    return 1 - (d > 1 ? 1 : d);
+}
+
+static void test_attach_follows(void) {
+    AnWorld *w = an_open(8);
+    int rig = chain(w, 0);
+    float sp[3] = {0, 0.5f, 0};
+    int s = an_socket_def(w, rig, 2, sp, an_qid);
+    CHECK(s == 0, "a rig's first socket is 0");
+    int grand = an_spawn(w, rig);   /* the lowest slots: posed after their parents all the same */
+    int child = an_spawn(w, rig);
+    int parent = an_spawn(w, rig);
+    float off[3] = {0, 0, 0.2f};
+    CHECK(an_attach(w, child, parent, s, off, an_qid) == 1, "a child hangs from the hand socket");
+    CHECK(an_attach(w, grand, child, s, off, an_qid) == 1, "and a grandchild from the child's");
+    an_update(w, 1.0f / 60);
+    const float *m = an_matrices(w, child);
+    CHECK(near(m[9], 0, 1e-5f) && near(m[10], 2.5f, 1e-5f) && near(m[11], 0.2f, 1e-5f), "the child sits at the socket plus its offset");
+    float q90[4];
+    qz(90, q90);
+    an_override(w, parent, 1, q90, NULL, 1);
+    an_update(w, 1.0f / 60);
+    m = an_matrices(w, child);
+    CHECK(near(m[9], -1.5f, 1e-5f) && near(m[10], 1, 1e-5f) && near(m[11], 0.2f, 1e-5f), "the child follows the hand through a 90-degree turn in the same update");
+    CHECK(near(angle(m, 0), 90, 1e-3f), "and turns with it");
+    m = an_matrices(w, grand);
+    CHECK(near(m[9], -4, 1e-5f) && near(m[10], 1, 1e-5f) && near(m[11], 0.4f, 1e-5f), "the grandchild follows in the same update too");
+    float pos[3], q[4];
+    CHECK(an_socket(w, parent, s, pos, q) == 1, "the socket answers");
+    CHECK(near(pos[0], -1.5f, 1e-5f) && near(pos[1], 1, 1e-5f) && near(pos[2], 0, 1e-5f), "at the turned hand");
+    CHECK(qdiff(q, q90) < 1e-6f, "turned with it");
+    double before = an_stat(w, 3);
+    CHECK(an_socket(w, parent, 1, pos, q) == 0, "a socket the rig lacks answers 0");
+    CHECK(an_stat(w, 3) == before + 1 && an_stat(w, 5) == AN_R_SOCKET, "and is refused as no such socket");
+    an_detach(w, child);
+    float far[3] = {9, 9, 9};
+    an_place(w, parent, far, an_qid);
+    an_update(w, 1.0f / 60);
+    m = an_matrices(w, child);
+    CHECK(near(m[9], -1.5f, 1e-5f) && near(m[10], 1, 1e-5f) && near(angle(m, 0), 90, 1e-3f), "a detached child stays where it was");
+    an_close(w);
+}
+
+static void test_attach_limits(void) {
+    AnWorld *w = an_open(16);
+    int rig = chain(w, 0);
+    float sp[3] = {0, 0.5f, 0};
+    int s = an_socket_def(w, rig, 2, sp, an_qid);
+    float off[3] = {0, 0, 0};
+    int f[7];
+    for (int i = 0; i < 7; i++) f[i] = an_spawn(w, rig);
+    int ok = 1;
+    for (int i = 1; i <= 4; i++) ok &= an_attach(w, f[i], f[i - 1], s, off, an_qid) == 1;
+    CHECK(ok, "a chain four deep is allowed");
+    CHECK(an_attach(w, f[5], f[4], s, off, an_qid) == 0, "depth 5 is refused");
+    CHECK(an_stat(w, 5) == AN_R_ATTACH, "as too deep");
+    CHECK(an_attach(w, f[5], f[6], s, off, an_qid) == 1, "f6 carries f5");
+    CHECK(an_attach(w, f[6], f[3], s, off, an_qid) == 0, "f6 at depth 4 would put f5 at 5: refused");
+    CHECK(an_attach(w, f[6], f[2], s, off, an_qid) == 1, "at depth 3 it is allowed");
+    CHECK(an_attach(w, f[0], f[4], s, off, an_qid) == 0, "a cycle is refused");
+    CHECK(an_stat(w, 5) == AN_R_ATTACH, "as a cycle");
+    CHECK(an_attach(w, f[0], f[0], s, off, an_qid) == 0, "a figure on itself is refused");
+    CHECK(an_attach(w, f[1], f[0], 7, off, an_qid) == 0 && an_stat(w, 5) == AN_R_SOCKET, "a socket the parent lacks is refused");
+    an_update(w, 1.0f / 60);
+    const float *m = an_matrices(w, f[4]);
+    CHECK(all_finite(m, 3) && near(m[10], 10, 1e-4f), "four links up the hands: 2.5 m each");
+    CHECK(an_stat(w, 3) == 5, "five refusals counted");
+    an_close(w);
+}
+
+static void test_attach_removed(void) {
+    AnWorld *w = an_open(8);
+    int rig = chain(w, 0);
+    float sp[3] = {0, 0.5f, 0};
+    int s = an_socket_def(w, rig, 2, sp, an_qid);
+    TK k[2] = {{1, 1, 0, 0}, {1, 1, 1, 360}};
+    int clip = turns(w, rig, 1, 1, 2, k, 0, NULL, NULL);
+    int c = an_spawn(w, rig), p = an_spawn(w, rig), g = an_spawn(w, rig);
+    float at[3] = {3, 0, 0}, off[3] = {0, 0, 0.5f};
+    an_place(w, p, at, an_qid);
+    an_play(w, p, 0, clip, 0, 1, 1, -1, 0);
+    CHECK(an_attach(w, c, p, s, off, an_qid) == 1, "the child hangs from a spinning arm");
+    CHECK(an_attach(w, g, c, s, off, an_qid) == 1, "and carries a grandchild");
+    for (int i = 0; i < 10; i++) an_update(w, 1.0f / 60);
+    float keep[36], keep_g[36];
+    memcpy(keep, an_matrices(w, c), sizeof keep);
+    memcpy(keep_g, an_matrices(w, g), sizeof keep_g);
+    an_remove(w, p);
+    float pos[3], q[4];
+    CHECK(an_socket(w, p, s, pos, q) == 0, "a socket on a removed figure answers 0");
+    int p2 = an_spawn(w, rig);   /* takes the removed figure's slot */
+    float there[3] = {-4, 1, 2};
+    an_place(w, p2, there, an_qid);
+    for (int i = 0; i < 5; i++) an_update(w, 1.0f / 60);
+    const float *m = an_matrices(w, c);
+    int same = 1;
+    for (int i = 0; i < 36; i++) if (!near(m[i], keep[i], 1e-6f)) same = 0;
+    CHECK(same, "removing the parent detaches the child, which keeps its last world placement");
+    m = an_matrices(w, g);
+    same = 1;
+    for (int i = 0; i < 36; i++) if (!near(m[i], keep_g[i], 1e-6f)) same = 0;
+    CHECK(same, "and the grandchild stays on the child");
+    CHECK(an_attach(w, c, p, s, off, an_qid) == 0 && an_stat(w, 5) == AN_R_FIGURE, "attaching to a removed figure is refused");
+    an_close(w);
+}
+
+/* a blocky rig for the hit tests: four parts with grids, one pure joint */
+#define BK_PARTS 5
+static const int bk_parent[BK_PARTS] = {-1, 0, 0, 2, 3};
+static const int bk_size[BK_PARTS][3] = {{6, 4, 3}, {2, 5, 2}, {3, 3, 3}, {0, 0, 0}, {4, 1, 1}};
+static const float bk_anchor[BK_PARTS][3] = {{3, 0, 1.5f}, {1, 5, 1}, {1.5f, 0, 1.5f}, {0, 0, 0}, {0, 0.5f, 0.5f}};
+static const float bk_pivot[BK_PARTS][3] = {{0, 0, 0}, {1, 0, 1.5f}, {3, 4, 1.5f}, {3, 1.5f, 1.5f}, {0, 0, 0}};   /* in the parent's grid */
+#define BK_V 0.25f
+static uint8_t bk_grid[BK_PARTS][72];
+static int blocky(AnWorld *w, unsigned *seed) {
+    int32_t parent[BK_PARTS]; float pivot[BK_PARTS * 3], rest[BK_PARTS * 4], box[BK_PARTS * 6];
+    for (int p = 0; p < BK_PARTS; p++) {
+        parent[p] = bk_parent[p];
+        for (int k = 0; k < 3; k++) {
+            float pa = p == 0 ? 0 : bk_anchor[bk_parent[p]][k];
+            pivot[p * 3 + k] = (bk_pivot[p][k] - pa) * BK_V;
+            box[p * 6 + k] = -bk_anchor[p][k] * BK_V;
+            box[p * 6 + 3 + k] = (bk_size[p][k] - bk_anchor[p][k]) * BK_V;
+        }
+        rest[p * 4] = rest[p * 4 + 1] = rest[p * 4 + 2] = 0; rest[p * 4 + 3] = 1;
+    }
+    int rig = an_rig(w, BK_PARTS, parent, pivot, rest, box);
+    for (int p = 0; p < BK_PARTS; p++) {
+        int n = bk_size[p][0] * bk_size[p][1] * bk_size[p][2];
+        for (int i = 0; i < n; i++) {
+            *seed = *seed * 1664525u + 1013904223u;
+            unsigned r = (*seed >> 16) % 100;
+            bk_grid[p][i] = r < 45 ? 0 : (uint8_t)(1 + r % 5);
+        }
+        CHECK(an_shape(w, rig, p, bk_size[p][0], bk_size[p][1], bk_size[p][2], BK_V, n ? bk_grid[p] : NULL) >= 0, "a blocky part's grid is accepted");
+    }
+    return rig;
+}
+static float frand(unsigned *s) { *s = *s * 1664525u + 1013904223u; return (float)(*s >> 8) / 16777216.0f; }
+static void qrand(unsigned *s, float q[4]) {
+    for (int i = 0; i < 4; i++) q[i] = frand(s) * 2 - 1;
+    float l = sqrtf(q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]);
+    for (int i = 0; i < 4; i++) q[i] /= l;
+}
+
+typedef struct { int fig, part, x, y, z, colour; float dist, n[3]; } Ref;
+/* is figure i (of the test's figures) the ignored one or carried by it? par: the test's own attachment table */
+static int ref_ignored(const int *par, int i, int ign) {
+    for (; i >= 0; i = par[i]) if (i == ign) return 1;
+    return 0;
+}
+/* every voxel of every part of every figure, by brute force: the nearest entry along unit d within max */
+static int ref_ray(AnWorld *w, const int *figs, const int *par, int nf, const float o[3], const float d[3], float max, int ign, Ref *out) {
+    int found = 0;
+    float best = max;
+    for (int i = 0; i < nf; i++) {
+        if (ign >= 0 && ref_ignored(par, i, ign)) continue;
+        const float *M = an_matrices(w, figs[i]);
+        for (int p = 0; p < BK_PARTS; p++) {
+            const float *m = M + p * 12;
+            float rel[3] = {o[0] - m[9], o[1] - m[10], o[2] - m[11]}, lo[3], ld[3];
+            for (int k = 0; k < 3; k++) { lo[k] = dot3(m + 3 * k, rel); ld[k] = dot3(m + 3 * k, d); }
+            for (int z = 0; z < bk_size[p][2]; z++)
+                for (int y = 0; y < bk_size[p][1]; y++)
+                    for (int x = 0; x < bk_size[p][0]; x++) {
+                        int c = bk_grid[p][x + bk_size[p][0] * (y + bk_size[p][1] * z)];
+                        if (!c) continue;
+                        int v[3] = {x, y, z}, ax = -1, miss = 0;
+                        float tn = -INFINITY, tf = INFINITY;
+                        for (int k = 0; k < 3; k++) {
+                            float a = (v[k] - bk_anchor[p][k]) * BK_V, b = a + BK_V;
+                            if (ld[k] == 0) { if (lo[k] < a || lo[k] > b) miss = 1; continue; }
+                            float t1 = (a - lo[k]) / ld[k], t2 = (b - lo[k]) / ld[k];
+                            if (t1 > t2) { float t = t1; t1 = t2; t2 = t; }
+                            if (t1 > tn) { tn = t1; ax = k; }
+                            if (t2 < tf) tf = t2;
+                        }
+                        float t = tn < 0 ? 0 : tn;
+                        if (miss || tf < t || t > best || (found && t == best)) continue;
+                        best = t; found = 1;
+                        Ref r = {i, p, x, y, z, c, t, {0, 0, 0}};
+                        if (ax >= 0 && tn >= 0) {
+                            float sgn = ld[ax] > 0 ? -1.0f : 1.0f;
+                            for (int k = 0; k < 3; k++) r.n[k] = m[3 * ax + k] * sgn;
+                        }
+                        *out = r;
+                    }
+        }
+    }
+    return found;
+}
+
+static void test_hit_ray(void) {
+    unsigned seed = 12345;
+    AnWorld *w = an_open(64);
+    int rig = blocky(w, &seed);
+    float sp[3] = {1, 0, 0};
+    int s = an_socket_def(w, rig, 4, sp, an_qid);
+    CHECK(rig >= 0 && s == 0, "the blocky rig and its socket");
+    int figs[50], par[50];
+    for (int i = 0; i < 50; i++) {
+        figs[i] = an_spawn(w, rig);
+        par[i] = -1;
+        float pos[3] = {frand(&seed) * 20 - 10, frand(&seed) * 20 - 10, frand(&seed) * 20 - 10}, q[4];
+        qrand(&seed, q);
+        an_place(w, figs[i], pos, q);
+        for (int p = 1; p < BK_PARTS; p++) { qrand(&seed, q); an_override(w, figs[i], p, q, NULL, 1); }
+    }
+    float off[3] = {0.3f, 0, 0};
+    CHECK(an_attach(w, figs[1], figs[0], s, off, an_qid) == 1 && an_attach(w, figs[2], figs[1], s, off, an_qid) == 1, "two figures carried");
+    par[1] = 0; par[2] = 1;
+    an_update(w, 0);
+    int agree = 0, hits = 0, ties = 0, normals = 1, colours = 1, ignored = 0;
+    for (int r = 0; r < 1000; r++) {
+        float o[3] = {frand(&seed) * 32 - 16, frand(&seed) * 32 - 16, frand(&seed) * 32 - 16};
+        const float *tm = an_matrices(w, figs[(int)(frand(&seed) * 50) % 50]);
+        float d[3], dl;
+        for (int k = 0; k < 3; k++) d[k] = tm[9 + k] + frand(&seed) * 2 - 1 - o[k];
+        dl = an_len(d);
+        float u[3] = {d[0] / dl, d[1] / dl, d[2] / dl}, d3[3] = {u[0] * 3, u[1] * 3, u[2] * 3};
+        float max = r % 10 == 9 ? 5.0f : 60.0f;
+        int ign = r % 7 == 6 ? (int)(frand(&seed) * 50) % 50 : -1;
+        if (r % 7 == 6) ign = r % 2 ? 0 : ign;   /* half of these ignore the carrier of two */
+        Ref ref;
+        AnHit h;
+        int want = ref_ray(w, figs, par, 50, o, u, max, ign, &ref);
+        int got = an_hit_ray(w, o, d3, max, ign >= 0 ? figs[ign] : -1, &h);
+        if (ign >= 0) ignored++;
+        if (want != got) continue;
+        if (!want) { agree++; continue; }
+        hits++;
+        if (h.fig == figs[ref.fig] && h.part == ref.part && h.x == ref.x && h.y == ref.y && h.z == ref.z) {
+            if (near(h.dist, ref.dist, 1e-4f)) agree++;
+            if (h.colour != ref.colour) colours = 0;
+            if (ref.dist > 0 && !(near(h.nx, ref.n[0], 1e-4f) && near(h.ny, ref.n[1], 1e-4f) && near(h.nz, ref.n[2], 1e-4f))) normals = 0;
+        } else if (near(h.dist, ref.dist, 1e-5f)) { ties++; agree++; }
+    }
+    printf("  hit_ray: %d of 1000 agree, %d hits, %d ties, %d with an ignored figure\n", agree, hits, ties, ignored);
+    CHECK(agree == 1000, "1000 random rays agree with a brute-force test of every voxel (figure, part, voxel, distance within 1e-4)");
+    CHECK(hits > 300, "and most of them hit something");
+    CHECK(colours, "the colour is the voxel's palette index");
+    CHECK(normals, "the normal is the struck face's, in world space");
+    CHECK(ties == 0, "no ties between voxels");
+    an_close(w);
+}
+
+/* do two boxes overlap? corners projected on the 15 axes (independent of the kernel's test) */
+static int ref_obb(const float ca[3], const float A[3][3], const float ha[3], const float cb[3], const float B[3][3], const float hb[3]) {
+    float pa[8][3], pb[8][3], axes[15][3];
+    for (int i = 0; i < 8; i++)
+        for (int k = 0; k < 3; k++) {
+            pa[i][k] = ca[k]; pb[i][k] = cb[k];
+            for (int j = 0; j < 3; j++) {
+                float sg = (i >> j & 1) ? 1.0f : -1.0f;
+                pa[i][k] += sg * ha[j] * A[j][k];
+                pb[i][k] += sg * hb[j] * B[j][k];
+            }
+        }
+    int n = 0;
+    for (int i = 0; i < 3; i++) { memcpy(axes[n++], A[i], sizeof axes[0]); memcpy(axes[n++], B[i], sizeof axes[0]); }
+    for (int i = 0; i < 3; i++)
+        for (int j = 0; j < 3; j++) {
+            an_cross(A[i], B[j], axes[n]);
+            if (an_len(axes[n]) > 1e-6f) n++;
+        }
+    for (int a = 0; a < n; a++) {
+        float amin = INFINITY, amax = -INFINITY, bmin = INFINITY, bmax = -INFINITY;
+        for (int i = 0; i < 8; i++) {
+            float x = dot3(pa[i], axes[a]), y = dot3(pb[i], axes[a]);
+            if (x < amin) amin = x; if (x > amax) amax = x;
+            if (y < bmin) bmin = y; if (y > bmax) bmax = y;
+        }
+        if (amax < bmin || bmax < amin) return 0;
+    }
+    return 1;
+}
+
+static void test_hit_box(void) {
+    unsigned seed = 777;
+    AnWorld *w = an_open(64);
+    int rig = blocky(w, &seed);
+    float sp[3] = {1, 0, 0};
+    int s = an_socket_def(w, rig, 4, sp, an_qid);
+    int figs[50], par[50];
+    for (int i = 0; i < 50; i++) {
+        figs[i] = an_spawn(w, rig);
+        par[i] = -1;
+        float pos[3] = {frand(&seed) * 16 - 8, frand(&seed) * 16 - 8, frand(&seed) * 16 - 8}, q[4];
+        qrand(&seed, q);
+        an_place(w, figs[i], pos, q);
+        for (int p = 1; p < BK_PARTS; p++) { qrand(&seed, q); an_override(w, figs[i], p, q, NULL, 1); }
+    }
+    float off[3] = {0, 0, 0};
+    an_attach(w, figs[3], figs[4], s, off, an_qid);
+    par[3] = 4;
+    an_update(w, 1.0f / 60);
+    static int32_t got[2 * 4096];
+    int agree = 0, pairs = 0;
+    for (int r = 0; r < 200; r++) {
+        float c[3] = {frand(&seed) * 16 - 8, frand(&seed) * 16 - 8, frand(&seed) * 16 - 8};
+        float half[3] = {0.05f + frand(&seed) * 2.5f, 0.05f + frand(&seed) * 2.5f, 0.05f + frand(&seed) * 2.5f}, q[4], Q[3][3];
+        qrand(&seed, q);
+        for (int k = 0; k < 3; k++) { float e[3] = {0, 0, 0}; e[k] = 1; an_qrot(q, e, Q[k]); }
+        int ign = r % 5 == 4 ? (r % 2 ? 4 : (int)(frand(&seed) * 50) % 50) : -1;
+        int want[2 * 4096], nw = 0;
+        for (int i = 0; i < 50; i++) {
+            if (ign >= 0 && ref_ignored(par, i, ign)) continue;
+            const float *M = an_matrices(w, figs[i]);
+            for (int p = 0; p < BK_PARTS; p++) {
+                if (bk_size[p][0] * bk_size[p][1] * bk_size[p][2] == 0) continue;   /* a pure joint has no box */
+                const float *m = M + p * 12;
+                float lc[3], h[3], wc[3], A[3][3];
+                for (int k = 0; k < 3; k++) { h[k] = bk_size[p][k] * BK_V / 2; lc[k] = h[k] - bk_anchor[p][k] * BK_V; }
+                for (int k = 0; k < 3; k++) {
+                    wc[k] = m[9 + k] + m[k] * lc[0] + m[3 + k] * lc[1] + m[6 + k] * lc[2];
+                    for (int j = 0; j < 3; j++) A[j][k] = m[3 * j + k];
+                }
+                if (ref_obb(c, Q, half, wc, A, h)) { want[nw * 2] = figs[i]; want[nw * 2 + 1] = p; nw++; }
+            }
+        }
+        int n = an_hit_box(w, c, half, q, ign >= 0 ? figs[ign] : -1, 4096, got);
+        pairs += nw;
+        if (n == nw && memcmp(got, want, (size_t)nw * 2 * sizeof(int32_t)) == 0) agree++;
+    }
+    printf("  hit_box: %d of 200 agree, %d pairs in all\n", agree, pairs);
+    CHECK(agree == 200, "200 random boxes return exactly the pairs whose part boxes overlap (brute force)");
+    CHECK(pairs > 200, "and they find many");
+    int32_t few[4];
+    float c0[3] = {0, 0, 0}, big[3] = {50, 50, 50};
+    int all = an_hit_box(w, c0, big, an_qid, -1, 2, few);
+    CHECK(all == 50 * 4, "a box over everything counts every part with a box, though it writes only max");
+    CHECK(few[0] == figs[0] && few[1] == 0 && few[2] == figs[0] && few[3] == 1, "in figure then part order");
+    an_close(w);
+}
+
+static void test_hit_ignore(void) {
+    AnWorld *w = an_open(8);
+    int rig = chain(w, 0);
+    shape_chain(w, rig);
+    float back[3] = {0, 0, -1};
+    int s = an_socket_def(w, rig, 0, back, an_qid);
+    int sh = an_spawn(w, rig), gun = an_spawn(w, rig), t = an_spawn(w, rig);
+    float off[3] = {0, 0, 0}, tp[3] = {0, 0, -5};
+    an_place(w, t, tp, an_qid);
+    CHECK(an_attach(w, gun, sh, s, off, an_qid) == 1, "the shooter carries a gun 1 m behind");
+    an_update(w, 1.0f / 60);
+    float o[3] = {0, 0.5f, 5}, d[3] = {0, 0, -1};
+    AnHit h;
+    CHECK(an_hit_ray(w, o, d, 100, -1, &h) == 1 && h.fig == sh && near(h.dist, 4.9f, 1e-5f), "the shooter is hit first");
+    CHECK(h.part == 0 && h.colour == 1 && near(h.nz, 1, 1e-5f), "on its root's +z face, colour 1");
+    CHECK(an_hit_ray(w, o, d, 100, sh, &h) == 1 && h.fig == t && near(h.dist, 9.9f, 1e-5f), "ignoring the shooter skips it and the gun it carries");
+    CHECK(an_hit_ray(w, o, d, 100, gun, &h) == 1 && h.fig == sh, "ignoring the gun still hits the shooter");
+    CHECK(an_hit_ray(w, o, d, 4.8f, -1, &h) == 0, "nothing within 4.8 m");
+    float side[3] = {0, 0.5f, 5}, sd[3] = {1, 0, 0};
+    CHECK(an_hit_ray(w, side, sd, 100, -1, &h) == 0, "a ray past everything misses");
+    an_close(w);
+}
+
+static void test_stale_query(void) {
+    AnWorld *w = an_open(8);
+    int rig = chain(w, 0);
+    shape_chain(w, rig);
+    float sp[3] = {0, 0.5f, 0};
+    int s = an_socket_def(w, rig, 2, sp, an_qid);
+    int f = an_spawn(w, rig), c = an_spawn(w, rig);
+    float off[3] = {0, 0, 0};
+    an_attach(w, c, f, s, off, an_qid);
+    an_update(w, 1.0f / 60);
+    float at[3] = {10, 0, 0};
+    an_place(w, f, at, an_qid);   /* not updated since: stale */
+    CHECK(an_stat(w, 2) == 1, "the moved figure is stale");
+    AnHit h;
+    float o[3] = {10, 0.5f, 5}, d[3] = {0, 0, -1};
+    CHECK(an_hit_ray(w, o, d, 100, -1, &h) == 1 && h.fig == f && h.part == 0 && near(h.dist, 4.9f, 1e-5f), "a hit test poses the stale figure first");
+    CHECK(an_stat(w, 2) == 0, "and it is stale no more");
+    float oc[3] = {10, 3.2f, 5};
+    CHECK(an_hit_ray(w, oc, d, 100, -1, &h) == 1 && h.fig == c, "the child it carries is posed with it");
+    float at2[3] = {20, 0, 0}, pos[3], q[4];
+    an_place(w, f, at2, an_qid);
+    CHECK(an_socket(w, f, s, pos, q) == 1 && near(pos[0], 20, 1e-5f) && near(pos[1], 2.5f, 1e-5f), "a socket query poses the stale figure first");
+    TK k[1] = {{1, 0, 0, 90}};
+    int clip = turns(w, rig, 1, 0, 1, k, 0, NULL, NULL);
+    an_play(w, f, 0, clip, 0, 1, 1, -1, 0);
+    CHECK(an_socket(w, f, s, pos, q) == 1 && near(pos[0], 18.5f, 1e-5f) && near(pos[1], 1, 1e-5f), "a newly played clip is posed before the socket answers");
+    float box_c[3] = {18.5f, 1, 0}, half[3] = {0.05f, 0.05f, 0.05f};
+    int32_t pairs[8];
+    int np = an_hit_box(w, box_c, half, an_qid, -1, 4, pairs), has_c = 0;
+    for (int i = 0; i < np && i < 4; i++) if (pairs[i * 2] == c && pairs[i * 2 + 1] == 0) has_c = 1;
+    CHECK(has_c, "a box finds the child at the moved socket");
+    an_close(w);
+}
+
+static void test_presprings(void) {
+    AnWorld *w = an_open(4);
+    int rig = chain(w, 0);
+    shape_chain(w, rig);
+    float sp[3] = {0, 0.5f, 0};
+    int s = an_socket_def(w, rig, 2, sp, an_qid);
+    int f = an_spawn(w, rig);
+    an_spring(w, f, 1, 20, 2);
+    an_update(w, 1.0f / 60);
+    float zero[3] = {0, 0, 0}, q90[4], pos[3], q[4];
+    qz(90, q90);
+    an_place(w, f, zero, q90);
+    an_update(w, 1.0f / 60);
+    const float *m = an_matrices(w, f);
+    float drawn[3] = {m[24 + 9], m[24 + 10], m[24 + 11]}, pre[3] = {-2, 0, 0};
+    CHECK(dist3(drawn, pre) > 0.5f, "the springy arm lags: the drawn hand is not where the pose puts it");
+    CHECK(an_socket(w, f, s, pos, q) == 1 && near(pos[0], -2.5f, 1e-5f) && near(pos[1], 0, 1e-5f), "the socket answers the pose before springs");
+    AnHit h;
+    float o[3] = {-2.5f, 0, 5}, d[3] = {0, 0, -1};
+    CHECK(an_hit_ray(w, o, d, 100, -1, &h) == 1 && h.part == 2 && near(h.dist, 4.9f, 1e-5f), "a ray hits the hand where the pose before springs has it");
+    float od[3] = {drawn[0], drawn[1] + 0.05f, 5};
+    CHECK(an_hit_ray(w, od, d, 100, -1, &h) == 0 || h.part != 2, "not where it is drawn");
+    an_close(w);
+}
+
+static uint64_t attach_script(int socket) {
+    AnWorld *w = an_open(4);
+    int rig = chain(w, 0);
+    float sp[3] = {0, 0.5f, 0};
+    an_socket_def(w, rig, 2, sp, an_qid);
+    an_socket_def(w, rig, 2, sp, an_qid);   /* the same place */
+    int c = an_spawn(w, rig), p = an_spawn(w, rig);
+    float off[3] = {0, 0.1f, 0};
+    an_attach(w, c, p, socket, off, an_qid);
+    for (int i = 0; i < 5; i++) an_update(w, 1.0f / 60);
+    uint64_t h = an_hash(w);
+    an_close(w);
+    return h;
+}
+static void test_attach_hash(void) {
+    CHECK(attach_script(0) == attach_script(0), "a run with attachments repeats");
+    CHECK(attach_script(0) != attach_script(1), "the link is in the hash, though the matrices match");
+}
+
+/* a springy figure moved, then (or not) queried before the next update */
+static uint64_t query_script(int query) {
+    AnWorld *w = an_open(4);
+    int rig = chain(w, 0);
+    shape_chain(w, rig);
+    float sp[3] = {0, 0.5f, 0};
+    int s = an_socket_def(w, rig, 2, sp, an_qid);
+    int f = an_spawn(w, rig), c = an_spawn(w, rig);
+    float off[3] = {0, 0, 0};
+    an_attach(w, c, f, s, off, an_qid);
+    an_update(w, 1.0f / 60);
+    an_spring(w, f, 1, 30, 3);   /* fresh until the next update */
+    float at[3] = {1, 0, 0}, q90[4], pos[3], q[4], o[3] = {1, 0.5f, 5}, d[3] = {0, 0, -1};
+    qz(90, q90);
+    an_place(w, f, at, q90);
+    if (query) {
+        AnHit h;
+        an_hit_ray(w, o, d, 100, -1, &h);
+        an_socket(w, c, s, pos, q);
+    }
+    an_update(w, 1.0f / 60);
+    an_update(w, 1.0f / 60);
+    uint64_t hash = an_hash(w);
+    an_close(w);
+    return hash;
+}
+static void test_query_no_trace(void) {
+    CHECK(query_script(0) == query_script(1), "posing stale figures for a query changes nothing the next update carries");
+}
+
+/* f -> c -> g; f moved after an update, then (or not) a query, then a child let go:
+ * mode 0 detach c, 1 remove f, 2 detach g, 3 remove c (2 and 3: the parent itself hangs from a moved root) */
+static uint64_t letgo_script(int query, int mode) {
+    AnWorld *w = an_open(4);
+    int rig = chain(w, 0);
+    shape_chain(w, rig);
+    float sp[3] = {0, 0.5f, 0};
+    int s = an_socket_def(w, rig, 2, sp, an_qid);
+    int f = an_spawn(w, rig), c = an_spawn(w, rig), g = an_spawn(w, rig);
+    float off[3] = {0, 0, 0.3f}, at[3] = {4, 1, -2}, q90[4], pos[3], q[4];
+    an_attach(w, c, f, s, off, an_qid);
+    an_attach(w, g, c, s, off, an_qid);
+    an_update(w, 1.0f / 60);
+    qz(90, q90);
+    an_place(w, f, at, q90);
+    if (query == 1) { AnHit h; float o[3] = {4, 1.5f, 5}, d[3] = {0, 0, -1}; an_hit_ray(w, o, d, 100, -1, &h); }
+    if (query == 2) an_socket(w, c, s, pos, q);
+    if (mode == 0) an_detach(w, c);
+    else if (mode == 1) an_remove(w, f);
+    else if (mode == 2) an_detach(w, g);
+    else an_remove(w, c);
+    an_update(w, 1.0f / 60);
+    uint64_t hash = an_hash(w);
+    an_close(w);
+    return hash;
+}
+static void test_letgo_no_trace(void) {
+    uint64_t d = letgo_script(0, 0), r = letgo_script(0, 1);
+    CHECK(d == letgo_script(1, 0) && d == letgo_script(2, 0), "a hit or socket query before a detach leaves the next update's hash unchanged");
+    CHECK(r == letgo_script(1, 1) && r == letgo_script(2, 1), "and before removing the parent");
+    uint64_t d2 = letgo_script(0, 2), r2 = letgo_script(0, 3);
+    CHECK(d2 == letgo_script(1, 2) && d2 == letgo_script(2, 2), "detaching a grandchild whose chain's root moved: no trace of a query");
+    CHECK(r2 == letgo_script(1, 3) && r2 == letgo_script(2, 3), "removing a parent that itself hangs from a moved root: no trace of a query");
+    AnWorld *w = an_open(4);
+    int rig = chain(w, 0);
+    float sp[3] = {0, 0.5f, 0};
+    int s = an_socket_def(w, rig, 2, sp, an_qid);
+    int f = an_spawn(w, rig), c = an_spawn(w, rig);
+    float off[3] = {0, 0, 0}, at[3] = {4, 0, 0};
+    an_attach(w, c, f, s, off, an_qid);
+    an_update(w, 1.0f / 60);
+    an_place(w, f, at, an_qid);
+    an_detach(w, c);
+    an_update(w, 1.0f / 60);
+    const float *m = an_matrices(w, c);
+    CHECK(near(m[9], 4, 1e-5f) && near(m[10], 2.5f, 1e-5f), "a detached child is left at its parent's socket as the parent stands at the detach");
+    an_close(w);
+}
+
+static void test_clean_query(void) {
+    AnWorld *w = an_open(64);
+    int rig = chain(w, 0);
+    shape_chain(w, rig);
+    for (int i = 0; i < 40; i++) { int f = an_spawn(w, rig); float at[3] = {(float)i, 0, 0}; an_place(w, f, at, an_qid); }
+    an_update(w, 1.0f / 60);
+    CHECK(an_stat(w, 2) == 0, "after an update nothing is stale");
+    double scans = an_stat(w, 8);
+    AnHit h;
+    float o[3] = {3, 0.5f, 5}, d[3] = {0, 0, -1}, c[3] = {3, 0.5f, 0}, half[3] = {0.5f, 0.5f, 0.5f}, pos[3], q[4];
+    int32_t pairs[16];
+    for (int i = 0; i < 10; i++) { an_hit_ray(w, o, d, 100, -1, &h); an_hit_box(w, c, half, an_qid, -1, 8, pairs); }
+    CHECK(an_stat(w, 8) == scans, "queries on a clean world make no pass over the figures");
+    float at[3] = {3, 0, 1};
+    an_place(w, 3, at, an_qid);
+    CHECK(an_stat(w, 2) == 1, "a placed figure is counted stale");
+    CHECK(an_hit_ray(w, o, d, 100, -1, &h) == 1 && h.fig == 3 && near(h.dist, 3.9f, 1e-5f), "and posed by the next query");
+    CHECK(an_stat(w, 8) == scans + 1 && an_stat(w, 2) == 0, "in one pass, after which nothing is stale");
+    an_socket_def(w, rig, 0, an_qid, an_qid);
+    an_socket(w, 5, 0, pos, q);
+    CHECK(an_stat(w, 8) == scans + 1, "a socket query on a clean figure poses nothing");
+    an_remove(w, 3);
+    an_place(w, 4, at, an_qid);
+    an_remove(w, 4);
+    CHECK(an_stat(w, 2) == 0, "removing a stale figure takes it off the count");
+    an_close(w);
+}
+
+static void test_shape_refusals(void) {
+    AnWorld *w = an_open(4);
+    int rig = chain(w, 0);
+    static uint8_t pal[129 * 10 * 2];
+    memset(pal, 1, sizeof pal);
+    CHECK(an_shape(w, rig, 0, 3, 10, 2, 0.1f, pal) == -1 && an_stat(w, 5) == AN_R_VALUE, "a grid that does not fill the part's box is refused");
+    CHECK(an_shape(w, rig, 5, 2, 10, 2, 0.1f, pal) == -1 && an_stat(w, 5) == AN_R_PART, "a part the rig lacks is refused");
+    CHECK(an_shape(w, rig, 0, 129, 10, 2, 0.1f, pal) == -1, "129 voxels a side is refused");
+    CHECK(an_shape(w, 99, 0, 2, 10, 2, 0.1f, pal) == -1 && an_stat(w, 5) == AN_R_RIG, "a rig that does not exist is refused");
+    CHECK(an_socket_def(w, rig, 3, an_qid, an_qid) == -1 && an_stat(w, 5) == AN_R_PART, "a socket on a part the rig lacks is refused");
+    float zq[4] = {0, 0, 0, 0};
+    CHECK(an_socket_def(w, rig, 0, an_qid, zq) == -1 && an_stat(w, 5) == AN_R_VALUE, "a socket with a zero rotation is refused");
+    int n = 0;
+    for (int i = 0; i < AN_SOCKETS + 1; i++) if (an_socket_def(w, rig, 0, an_qid, an_qid) >= 0) n++;
+    CHECK(n == AN_SOCKETS && an_stat(w, 5) == AN_R_FULL, "a rig holds AN_SOCKETS sockets");
+    an_close(w);
+}
+
 int main(void) {
     test_sampling();
     test_antipodal();
@@ -793,6 +1368,19 @@ int main(void) {
     test_proc_removed();
     test_carried_hash();
     test_drop_to();
+    test_attach_follows();
+    test_attach_limits();
+    test_attach_removed();
+    test_hit_ray();
+    test_hit_box();
+    test_hit_ignore();
+    test_stale_query();
+    test_presprings();
+    test_attach_hash();
+    test_query_no_trace();
+    test_letgo_no_trace();
+    test_clean_query();
+    test_shape_refusals();
     if (fails == 0) printf("anim_test: ok\n");
     return fails == 0 ? 0 : 1;
 }
