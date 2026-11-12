@@ -5,8 +5,8 @@
 #
 # A scene is a line "name:environment" below. Every scene renders 60 frames
 # at 1280x800 pixels with radius 6 and writes the frame three before the end.
-# Scenes run on the old noise terrain (STRATA_ISLAND=0) unless their line
-# says STRATA_ISLAND=1: the island, its atlas cached in .march/atlas.
+# Every scene is on the island, its atlas cached in .march/atlas, generated
+# from viewer/assets/island.gen.
 cd "$(dirname "$0")/.." || exit 1
 . scripts/env.sh
 UPDATE=0; [ "$1" = "--update" ] && UPDATE=1
@@ -64,19 +64,21 @@ full-forest:STRATA_SCENE=3 STRATA_LIGHT=4
 full-cave:STRATA_SCENE=16 STRATA_LIGHT=4
 full-lantern:STRATA_SCENE=17 STRATA_LIGHT=4 STRATA_SUN=-5
 full-overview:STRATA_SCENE=1 STRATA_LIGHT=4 STRATA_SUN=35
-lake-breached:STRATA_SCENE=18 STRATA_ISLAND=1 STRATA_LIGHT=4 STRATA_BREACH=30 STRATA_FRAMES=63 DRAWS=6
-lake-draining:STRATA_SCENE=18 STRATA_ISLAND=1 STRATA_LIGHT=4 STRATA_BREACH=30 STRATA_FRAMES=363 DRAWS=6
-lake-later:STRATA_SCENE=18 STRATA_ISLAND=1 STRATA_LIGHT=4 STRATA_BREACH=30 STRATA_FRAMES=1203 DRAWS=6
-valley-later:STRATA_SCENE=19 STRATA_ISLAND=1 STRATA_LIGHT=4 STRATA_BREACH=30 STRATA_FRAMES=1203 DRAWS=6
+lake-breached:STRATA_SCENE=18 STRATA_LIGHT=4 STRATA_BREACH=30 STRATA_FRAMES=63 DRAWS=6
+lake-draining:STRATA_SCENE=18 STRATA_LIGHT=4 STRATA_BREACH=30 STRATA_FRAMES=363 DRAWS=6
+lake-later:STRATA_SCENE=18 STRATA_LIGHT=4 STRATA_BREACH=30 STRATA_FRAMES=1203 DRAWS=6
+valley-later:STRATA_SCENE=19 STRATA_LIGHT=4 STRATA_BREACH=30 STRATA_FRAMES=1203 DRAWS=6
 water-levels:STRATA_SCENE=20 STRATA_LIGHT=4 STRATA_FLUID=0
 splash-early:STRATA_SCENE=21 STRATA_LIGHT=4 STRATA_SPLASH=30 STRATA_FRAMES=57 DRAWS=6
 splash-late:STRATA_SCENE=21 STRATA_LIGHT=4 STRATA_SPLASH=30 STRATA_FRAMES=69 DRAWS=6
-island-mouth:STRATA_SCENE=22 STRATA_ISLAND=1 STRATA_LIGHT=4
-island-lake:STRATA_SCENE=23 STRATA_ISLAND=1 STRATA_LIGHT=4
-island-cliff:STRATA_SCENE=24 STRATA_ISLAND=1 STRATA_LIGHT=4
-island-cave:STRATA_SCENE=25 STRATA_ISLAND=1 STRATA_LIGHT=4
-forest-border:STRATA_SCENE=26 STRATA_ISLAND=1 STRATA_LIGHT=4
-ruin-slope:STRATA_SCENE=27 STRATA_ISLAND=1 STRATA_LIGHT=4
+island-mouth:STRATA_SCENE=22 STRATA_LIGHT=4
+island-lake:STRATA_SCENE=23 STRATA_LIGHT=4
+island-cliff:STRATA_SCENE=24 STRATA_LIGHT=4
+island-cave:STRATA_SCENE=25 STRATA_LIGHT=4
+forest-border:STRATA_SCENE=26 STRATA_LIGHT=4
+ruin-slope:STRATA_SCENE=27 STRATA_LIGHT=4
+crater-ruin:STRATA_SCENE=28 STRATA_LIGHT=4 DRAWS=6
+overview-regenerated:STRATA_SCENE=1 STRATA_REGEN=1 GOLDEN_AS=overview
 '
 # indirect draw calls a frame must issue, whatever the scene holds; a scene
 # with a kind of geometry nowhere in it says DRAWS=n
@@ -88,7 +90,7 @@ for line in $(echo "$SCENES" | tr ' ' ','); do
   draws=$EXPECT_DRAWS
   for kv in $envs; do case "$kv" in GOLDEN_AS=*) stored="${kv#GOLDEN_AS=}";; DRAWS=*) draws="${kv#DRAWS=}";; esac; done
   shot="$OUT/$name.ppm"
-  if ! env MARCH_PIN_MAIN=1 STRATA_RADIUS=6 STRATA_PIXELS=1 STRATA_SIZE=1280x800 STRATA_FRAMES=60 STRATA_LIGHT=0 STRATA_ISLAND=0 STRATA_SHOT="$shot" $envs \
+  if ! env MARCH_PIN_MAIN=1 STRATA_RADIUS=6 STRATA_PIXELS=1 STRATA_SIZE=1280x800 STRATA_FRAMES=60 STRATA_LIGHT=0 STRATA_SHOT="$shot" $envs \
        ./viewer/.march/build/release/strata_viewer > "$OUT/$name.log" 2>&1 || [ ! -s "$shot" ]; then
     echo "FAIL: $name did not render"; tail -5 "$OUT/$name.log"; FAILED=1; continue
   fi
@@ -115,21 +117,25 @@ done
 if [ $UPDATE -eq 0 ]; then
   for mode in 2 4; do
     for n in 121 122; do
-      env MARCH_PIN_MAIN=1 STRATA_RADIUS=6 STRATA_PIXELS=1 STRATA_SIZE=1280x800 STRATA_ISLAND=0 STRATA_SCENE=1 STRATA_LIGHT=$mode STRATA_FRAMES=$n STRATA_SHOT="$OUT/still$n.ppm" ./viewer/.march/build/release/strata_viewer > /dev/null 2>&1
+      env MARCH_PIN_MAIN=1 STRATA_RADIUS=6 STRATA_PIXELS=1 STRATA_SIZE=1280x800 STRATA_SCENE=1 STRATA_LIGHT=$mode STRATA_FRAMES=$n STRATA_SHOT="$OUT/still$n.ppm" ./viewer/.march/build/release/strata_viewer > /dev/null 2>&1
     done
     if res=$($DIFF "$OUT/still121.ppm" "$OUT/still122.ppm" 4 0.05 2>&1); then echo "ok   stillness, light mode $mode: $res"
     else echo "FAIL stillness, light mode $mode (frames 118 and 119): $res"; FAILED=1; fi
   done
 fi
-# A nearly full quad buffer: a carve's new meshes are refused while the old
-# ones are still held, and must land on a later frame. The capacity is the
-# scene's own need plus a little, so the check follows the terrain.
+# A nearly full quad buffer: a chunk emptied ahead (scene 4, at frame 10)
+# makes its neighbours' new meshes larger, and they are refused while the old
+# ones are still held, and must land on a later frame once the emptied chunk's
+# mesh is freed. The capacity is the scene's own need plus 40 000 quads (on
+# the island at seed 7: 35 000 to 45 000 give refusals that all land; a
+# blast's remesh alone is one or two chunks that only grow, so it either fits
+# or never does), so the check follows the terrain.
 if [ $UPDATE -eq 0 ]; then
-  RUN="env MARCH_PIN_MAIN=1 STRATA_ISLAND=0 STRATA_LIGHT=0 STRATA_RADIUS=6 STRATA_PIXELS=1 STRATA_SIZE=1280x800 STRATA_SCENE=1 STRATA_DIG=1 STRATA_FRAMES=60 STRATA_SHOT=/dev/null ./viewer/.march/build/release/strata_viewer"
+  RUN="env MARCH_PIN_MAIN=1 STRATA_LIGHT=0 STRATA_RADIUS=6 STRATA_PIXELS=1 STRATA_SIZE=1280x800 STRATA_SCENE=4 STRATA_FRAMES=60 STRATA_SHOT=/dev/null ./viewer/.march/build/release/strata_viewer"
   need=$($RUN 2>&1 | sed -n 's/.*; \([0-9]*\) quads,.*/\1/p' | head -1)
-  line=$(STRATA_QUADS=$((need + 4000)) $RUN 2>&1 | grep 'done after')
+  line=$(STRATA_QUADS=$((need + 40000)) $RUN 2>&1 | grep 'done after')
   refused=$(echo "$line" | sed -n 's/.*uploads refused \([0-9]*\),.*/\1/p')
   if echo "$line" | grep -q 'still waiting 0;' && [ "${refused:-0}" -gt 0 ]; then echo "ok   retry: $refused uploads refused, none left waiting"
-  else echo "FAIL retry (capacity $((need + 4000))): $line"; FAILED=1; fi
+  else echo "FAIL retry (capacity $((need + 40000))): $line"; FAILED=1; fi
 fi
 [ $FAILED -eq 0 ] && echo "golden: PASS" || { echo "golden: FAIL (actual images left in test/golden/*.actual.ppm)"; exit 1; }

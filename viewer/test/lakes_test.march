@@ -1,6 +1,5 @@
--- The viewer's lakes: terrain stays a pure function, a lake's rim holds its
--- water, and the sea is not a fluid. Then the island read from an atlas:
--- lakes, rivers, the damped detail.
+-- The viewer's lakes: the island read from an atlas, its lakes, rivers and
+-- damped detail, and the sea is not a fluid.
 mod StrataViewer.Test.Lakes do
   -- the app's capabilities are charged to its test module too (GAPS S3)
   needs IO.Console
@@ -17,26 +16,6 @@ mod StrataViewer.Test.Lakes do
 
   pfn same_go(a : Strata.Chunk.Chunk, b : Strata.Chunk.Chunk, i : Int) : Bool do
     if i >= 32768 do true else if Chl2.get_or(a, i % 32, i / 1024, (i / 32) % 32, -1) != Chl2.get_or(b, i % 32, i / 1024, (i / 32) % 32, -1) do false else same_go(a, b, i + 97) end end
-  end
-
-  -- load the chunks covering x0..x1, z0..z1 (chunk coordinates) at heights cy 0..2
-  pfn load_go(w : Strata.World.World, x0 : Int, x1 : Int, z0 : Int, z1 : Int, x : Int, y : Int, z : Int) : Strata.World.World do
-    if y > 2 do w
-    else if z > z1 do load_go(w, x0, x1, z0, z1, x0, y + 1, z0)
-    else if x > x1 do load_go(w, x0, x1, z0, z1, x0, y, z + 1)
-    else load_go(Wl2.insert(w, Cl2.key(x, y, z), Vw.terrain(1.0, x, y, z, 7)), x0, x1, z0, z1, x + 1, y, z) end end end
-  end
-
-  -- every lake-water cell at the water line has no air beside it; the count of water cells seen, or -1 at the first leak
-  pfn held(w : Strata.World.World, cx : Int, cz : Int, rad : Int, line : Int, i : Int, n : Int, seen : Int) : Int do
-    if i >= n * n do seen
-    else
-      let x = cx - rad - 4 + i % n
-      let z = cz - rad - 4 + i / n
-      if !Bl2.is_fluid(Vw.registry(), Wl2.get_block(w, x, line, z)) do held(w, cx, cz, rad, line, i + 1, n, seen)
-      else if Wl2.get_block(w, x - 1, line, z) == 0 || Wl2.get_block(w, x + 1, line, z) == 0 || Wl2.get_block(w, x, line, z - 1) == 0 || Wl2.get_block(w, x, line, z + 1) == 0 do -1
-      else held(w, cx, cz, rad, line, i + 1, n, seen + 1) end end
-    end
   end
 
 
@@ -79,26 +58,26 @@ mod StrataViewer.Test.Lakes do
   pfn col_river(c : (Int, Int, Int)) : Int do match c do (_, _, r) -> r end end
 
   -- the island columns of the (2 half + 1)^2 box about (x0, z0), as ground, lake line and river line arrays
-  type Box = Box(Int, Int, Int, NativeIntArr, NativeIntArr, NativeIntArr)
-  pfn box_go(a : Strata.Atlas.Atlas, x0 : Int, z0 : Int, half : Int, k : Int, hs : NativeIntArr, ls : NativeIntArr, rs : NativeIntArr) : Box do
+  type LakeBox = LakeBox(Int, Int, Int, NativeIntArr, NativeIntArr, NativeIntArr)
+  pfn box_go(a : Strata.Atlas.Atlas, x0 : Int, z0 : Int, half : Int, k : Int, hs : NativeIntArr, ls : NativeIntArr, rs : NativeIntArr) : LakeBox do
     let side = 2 * half + 1
-    if k >= side * side do Box(x0, z0, half, hs, ls, rs)
+    if k >= side * side do LakeBox(x0, z0, half, hs, ls, rs)
     else
       let c = Vw.island_column(a, x0 - half + k % side, z0 - half + k / side, 7, 1.0)
       box_go(a, x0, z0, half, k + 1, NativeArray.set_int(hs, k, col_h(c)), NativeArray.set_int(ls, k, col_lake(c)), NativeArray.set_int(rs, k, col_river(c)))
     end
   end
-  pfn box(a : Strata.Atlas.Atlas, x0 : Int, z0 : Int, half : Int) : Box do
+  pfn box(a : Strata.Atlas.Atlas, x0 : Int, z0 : Int, half : Int) : LakeBox do
     let n = (2 * half + 1) * (2 * half + 1)
     box_go(a, x0, z0, half, 0, NativeArray.make_int(n, 0), NativeArray.make_int(n, 0), NativeArray.make_int(n, 0))
   end
 
   -- a lake column within 3 m of box cell k: its lake line, or 0
-  pfn lake_near(b : Box, k : Int, t : Int) : Int do
+  pfn lake_near(b : LakeBox, k : Int, t : Int) : Int do
     if t >= 49 do 0
     else
       match b do
-        Box(_, _, half, _, ls, _) ->
+        LakeBox(_, _, half, _, ls, _) ->
           let side = 2 * half + 1
           let dx = t % 7 - 3
           let dz = t / 7 - 3
@@ -111,9 +90,9 @@ mod StrataViewer.Test.Lakes do
   end
 
   -- land columns (no lake, no river) within 3 m of a lake column standing under its line + 1: their count, and how many were checked
-  pfn rim_go(b : Box, k : Int, bad : Int, seen : Int) : (Int, Int) do
+  pfn rim_go(b : LakeBox, k : Int, bad : Int, seen : Int) : (Int, Int) do
     match b do
-      Box(_, _, half, hs, ls, rs) ->
+      LakeBox(_, _, half, hs, ls, rs) ->
         let side = 2 * half + 1
         if k >= side * side do (bad, seen)
         else if NativeArray.get_int(ls, k) > 0 || NativeArray.get_int(rs, k) > 0 do rim_go(b, k + 1, bad, seen)
@@ -479,11 +458,11 @@ mod StrataViewer.Test.Lakes do
   -- The lake rim: around each lake, every land column within 4 m of a lake
   -- column has no air or water from 4 m under the nearby bed up to the line.
   -- (columns checked, bad voxels)
-  pfn near4(b : Box, k : Int, t : Int, line : Int, bed : Int) : (Int, Int) do
+  pfn near4(b : LakeBox, k : Int, t : Int, line : Int, bed : Int) : (Int, Int) do
     if t >= 81 do (line, bed)
     else
       match b do
-        Box(_, _, half, hs, ls, _) ->
+        LakeBox(_, _, half, hs, ls, _) ->
           let side = 2 * half + 1
           let dx = t % 9 - 4
           let dz = t / 9 - 4
@@ -496,9 +475,9 @@ mod StrataViewer.Test.Lakes do
       end
     end
   end
-  pfn rim4_go(a : Strata.Atlas.Atlas, ca : Cache, b : Box, k : Int, cols : Int, bad : Int) : (Int, Int, Cache) do
+  pfn rim4_go(a : Strata.Atlas.Atlas, ca : Cache, b : LakeBox, k : Int, cols : Int, bad : Int) : (Int, Int, Cache) do
     match b do
-      Box(x0, z0, half, _, ls, rs) ->
+      LakeBox(x0, z0, half, _, ls, rs) ->
         let side = 2 * half + 1
         if k >= side * side do (cols, bad, ca)
         else if NativeArray.get_int(ls, k) > 0 || NativeArray.get_int(rs, k) > 0 do rim4_go(a, ca, b, k + 1, cols, bad)
@@ -599,25 +578,6 @@ mod StrataViewer.Test.Lakes do
   end
 
   describe "Viewer lakes" do
-    test "terrain with lakes is still a pure function" do
-      match Vw.test_lake(7) do
-        (cx, cz, rad, line, _) ->
-          Test.assert_true(rad > 0, "seed 7 has a lake near the origin")
-          let kx = Cl2.chunk_of(cx)
-          let kz = Cl2.chunk_of(cz)
-          Test.assert_true(same_go(Vw.terrain(1.0, kx, Cl2.chunk_of(line), kz, 7), Vw.terrain(1.0, kx, Cl2.chunk_of(line), kz, 7), 0), "the same chunk twice")
-      end
-    end
-    test "a lake's rim holds its water" do
-      match Vw.test_lake(7) do
-        (cx, cz, rad, line, _) ->
-          let w = load_go(Wl2.new(Vw.registry(), Strata.Terrain.gen(fn (k, seed) -> Chl2.uniform(0)), 7, 1.0), Cl2.chunk_of(cx - rad - 5), Cl2.chunk_of(cx + rad + 5), Cl2.chunk_of(cz - rad - 5), Cl2.chunk_of(cz + rad + 5), Cl2.chunk_of(cx - rad - 5), 0, Cl2.chunk_of(cz - rad - 5))
-          let n = held(w, cx, cz, rad, line, 0, 2 * rad + 9, 0)
-          Test.assert_true(n > 0, "the lake has water at its line, and none of it stands beside air")
-          Test.assert_true(Bl2.is_fluid(Vw.registry(), Wl2.get_block(w, cx, line, cz)), "its middle is lake water")
-          Test.assert_eq_int(Wl2.get_block(w, cx, line + 1, cz), 0, "with air over it")
-      end
-    end
     test "a column inside an atlas lake holds lake water to the lake level over sand" do
       let a = atlas()
       match wet_lake(Strata.Atlas.lakes(a)) do
