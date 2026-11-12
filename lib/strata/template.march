@@ -1,5 +1,5 @@
--- Template — a small block of voxels a generator stamps into chunks: a
--- tree, a ruin. Index x + sx * (y + sy * z), y up.
+-- Template — a small block of voxels a generator stamps into chunks. Index
+-- x + sx * (y + sy * z), y up.
 --
 -- Id 0 is a hole: it is never written, so what was there stays. Each voxel
 -- has a probability (0..255) and each y row another; a voxel is written
@@ -22,6 +22,12 @@
 --
 -- from_vox reads a MagicaVoxel file through Strata.Ffi.Vox, its scene
 -- flattened (Y up) in C, and maps palette indices to block ids.
+--
+-- A template carries the voxel size it was authored at. fit puts it into a
+-- world of another voxel size, so it is as many metres across there: kept
+-- as it is at its own size, each voxel made k x k x k (its probability and
+-- its row's carried to each copy) when its size is a whole k times the
+-- world's, and refused otherwise.
 mod Strata.Template do
 
   needs IO.Foreign -- from_vox reads the file through native/strata_vox.cpp
@@ -159,5 +165,45 @@ mod Strata.Template do
         Some(make(sx, sy, sz, map_go(pal, palette_to_id, m, NativeArray.make_i32(vol, 0), 0, vol), voxel_size))
       end
     end
+  end
+
+  -- the fine template's arrays: voxel i (x + sx k (y + sy k z)) copies source voxel (x / k, y / k, z / k)
+  pfn rep_go(t : Template, k : Int, ids : NativeI32Arr, pr : NativeU8Arr, i : Int, n : Int) : (NativeI32Arr, NativeU8Arr) do
+    if i >= n do (ids, pr)
+    else
+      let fx = t_sx(t) * k
+      let fy = t_sy(t) * k
+      let x = i % fx
+      let y = (i / fx) % fy
+      let z = i / (fx * fy)
+      let src = x / k + t_sx(t) * (y / k + t_sy(t) * (z / k))
+      rep_go(t, k, NativeArray.set_i32(ids, i, NativeArray.get_i32(t_ids(t), src)), NativeArray.set_u8(pr, i, NativeArray.get_u8(t_prob(t), src)), i + 1, n)
+    end
+  end
+  pfn rows_go(t : Template, k : Int, ys : NativeU8Arr, y : Int, n : Int) : NativeU8Arr do
+    if y >= n do ys else rows_go(t, k, NativeArray.set_u8(ys, y, NativeArray.get_u8(t_yslice(t), y / k)), y + 1, n) end
+  end
+
+  -- each voxel of t made k x k x k, at voxel size vs
+  pfn replicate(t : Template, k : Int, vs : Float) : Template do
+    let n = Strata.Size.of(t_sx(t) * t_sy(t) * t_sz(t) * k * k * k)
+    let ny = Strata.Size.of(t_sy(t) * k)
+    match rep_go(t, k, NativeArray.make_i32(n, 0), NativeArray.make_u8(n, 0), 0, n) do
+      (ids, pr) -> Template(t_sx(t) * k, ny, t_sz(t) * k, ids, pr, rows_go(t, k, NativeArray.make_u8(ny, 0), 0, ny), vs)
+    end
+  end
+
+  doc "Template t put into a world of world_scale metres a voxel, as many metres across there as it was authored: t unchanged when its voxel size is world_scale; each voxel made k x k x k (its probability, and its row's, carried to every copy), at voxel size world_scale, when its voxel size is a whole k times world_scale; None otherwise (a world coarser than the template, or no whole ratio)."
+  fn fit(t : Template, world_scale : Float) : Option(Template) do
+    let vs = t_voxel_size(t)
+    if vs == world_scale do Some(t)
+    else if world_scale <= 0.0 do None
+    else
+      let k = float_to_int(Math.floor(vs /. world_scale +. 0.5))
+      if k < 1 do None
+      else if Math.abs(int_to_float(k) *. world_scale -. vs) > 0.000001 *. vs do None
+      else if k == 1 do Some(t)
+      else Some(replicate(t, k, world_scale)) end end end
+    end end
   end
 end

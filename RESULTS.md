@@ -861,8 +861,11 @@ Release builds, one task for the chunk timings, on the shared development
 machine (14 cores). Every row gives the load average it was measured at.
 The load never fell under 28 during the task and the timings below were all
 taken between 37 and 58; the chunk numbers move by half again between runs
-at the same load, so they are ranges, not points. A target missed at a load
-over 8 is not judged: on this machine at that load a number says more about
+at the same load, so they are ranges, not points. Wall-clock time missed at
+a load over 8 is not judged; the chunk targets were also judged in CPU
+time (user seconds against a baseline run that generates nothing, which
+the load does not inflate), and on that measure they are missed by about
+twelve times. A wall-clock number at a load over 8 is not judged: on this machine at that load a number says more about
 the other sessions than about the code. Nothing was cut to meet a number.
 
 | target | result | load | |
@@ -870,10 +873,10 @@ the other sessions than about the code. Nothing was cut to meet a number.
 | atlas build, 512 x 512: under 60 s | 13.5 s (built fresh into an empty cache) | 46 | met |
 | atlas build, 256 x 256: under 15 s | 2.0 s (the demo, fresh cache) | 53 | met |
 | atlas read from the cache | 41 to 47 ms | 40 to 55 | |
-| surface chunk at 1 m, median: 1 ms | 25.9 to 41.7 ms | 37 to 56 | not judged (load 37 to 56) |
-| surface chunk at 1 m, worst: 3 ms | 57.8 to 72.3 ms | 37 to 56 | not judged (load 37 to 56) |
-| surface chunk at 0.5 m, median / worst | 27.3 to 41.7 ms / 59.1 to 92.6 ms | 43 to 56 | not judged (load 43 to 56) |
-| surface chunk at 0.25 m, median / worst: 1 ms / 3 ms | 37.3 to 43.3 ms / 84.9 to 107.2 ms | 43 to 56 | not judged (load 43 to 56) |
+| surface chunk at 1 m, median: 1 ms | about 12 ms of CPU a chunk (25.70 s user against a 0.77 s baseline for 2000 generations); wall clock 25.9 to 41.7 ms, not judged (load 37 to 56) | 37 to 56 | missed |
+| surface chunk at 1 m, worst: 3 ms | the mean alone is about 12 ms of CPU; wall clock 57.8 to 72.3 ms, not judged (load 37 to 56) | 37 to 56 | missed |
+| surface chunk at 0.5 m, median / worst | CPU time measured at 1 m only; a chunk is the same 32-cubed chain at every scale, so about 12 ms by inference; wall clock 27.3 to 41.7 ms / 59.1 to 92.6 ms, not judged (load 43 to 56) | 43 to 56 | missed (inferred from 1 m) |
+| surface chunk at 0.25 m, median / worst: 1 ms / 3 ms | CPU time measured at 1 m only; about 12 ms by inference, as at 0.5 m; wall clock 37.3 to 43.3 ms / 84.9 to 107.2 ms, not judged (load 43 to 56) | 43 to 56 | missed (inferred from 1 m) |
 | air chunk: under 20 us | 54 to 114 us at 1 m, 39 to 57 us at 0.5 m, 34 us at 0.25 m | 37 to 56 | not judged (load 37 to 56) |
 | solid chunk: under 20 us | 59 to 112 us at 1 m, 41 to 56 us at 0.5 m, 23 us at 0.25 m | 37 to 56 | not judged (load 37 to 56) |
 | soak worst frame: 16.7 ms (the soak allows 20) | 294 to 399 ms at 0.25 m (mean 30.5 to 38.9 ms); 146 ms at 1 m (mean 7.7 ms) | 55 to 67 | not judged (load 55 to 67) |
@@ -918,8 +921,8 @@ above a load average of 8 are not judged.
 | time to settle, scene 135, radius 10 | 2997 ticks, 12.0 and 13.8 s (two runs), generation and meshing on 4 workers | 37 to 41 | not judged (load 37 to 41) |
 | time to settle, scene 135 at the goldens' radius 6 | 9667 chunks, 2421 ticks, 10.1 to 12.7 s | 12 to 16 | not judged (load 12 to 16) |
 | GPU quads, scene 135, radius 10 | 1.88 million (14.7 MB) | | under Part F's 64 MB |
-| level-1 surface chunk at 1 m: under 1 ms | median 8.5 ms, worst 12.4 ms (level 0 in the same minute: 10.4 / 25.5 ms) | 33 | not judged (load 33) |
-| far shore visible from the highest hill (scene 135) | yes: the land runs to the shore and the sea to the horizon | | met |
+| level-1 surface chunk at 1 m: under 1 ms | about 10.9 ms of CPU a coarse chunk (119.6 s user against a 22.9 s baseline for the 8,884 coarse chunks of scene 135); wall clock median 8.5 ms, worst 12.4 ms (level 0 in the same minute: 10.4 / 25.5 ms), not judged (load 33) | 33 | missed |
+| far shore visible from the highest hill (scene 135) | yes at 1 m a voxel: the land runs to the shore and the sea to the horizon; the design's target is at 0.25 m, not measured there | | met at 1 m; not measured at 0.25 m |
 | ring boundary (scene 136): no holes, no double drawing | none seen: past the level-0 edge, about 100 m out at radius 4, the trees go on coarsened (2 m voxels, then 4 m) on their trunks, the hills keep their green and their terraces coarsen | | met |
 | the soak at 0.25 m with four levels: chunks at the start | 12 939 (3872 / 2904 / 2904 / 1936 / 1323), settled after 3239 ticks in 34.7 s | 21 | not judged (load 21) |
 | the soak: worst frame against 16.7 ms (the soak allows 20) | 165.6 ms, mean 21.3 ms over 6010 frames; the near field alone in the next minutes: 205.1 ms, mean 18.7 ms | 21 to 41 | not judged (load 21 to 41) |
@@ -957,5 +960,53 @@ The soak's other misses (sound underruns: 2 with the far field, 4
 without; an acoustics update over 2 ms; the fluid step over 6 ms without
 the far field) came in both runs, minutes apart at loads of 21 to 41, and
 are the machine's, not judged. The soak's ceiling on quads held is 64 MB
-with the far field (3 million quads for the near field alone, as before). It is the generator's, not
-the renderer's; left for the generator's owner.
+with the far field (3 million quads for the near field alone, as before).
+
+The design's budget asks that the soak pass. No PASS of the soak is
+recorded on this work: its frame-time assertions fail under the machine's
+load (the worst frames above), so the soak has been read for its other
+checks (refused, waiting, leaked, retained, the lake at rest), which held.
+
+# The match
+
+On branch `combat`: a free-for-all in the viewer behind `STRATA_COMBAT=1`
+(`docs/2026-11-12-combat-design.md`, plan and ledger beside it).
+
+What is checked, hidden, each scene run twice for equal output
+(`scripts/combat_check.sh`):
+
+| scene | what it shows |
+|---|---|
+| field | twelve fighters on dry ground about a middle, 53 of 64 sample columns dry; they walk; none leaves the field |
+| duel | two shooters: a kill, flinches, a fall, 15 loose pieces that are gone 8 s on, 12 shirts |
+| trap | a pit dug under one fighter, a block set in another's place: no one ends inside a block; the idle rule puts both back |
+| fire | a fireball at a trunk: 3 wood and 13 grass burned; a shooter a metre off loses 40 of 60 |
+| channel | a rusher swims 6 m of water no deeper than 54 cm under the surface, climbs out, strikes |
+| archer | a scripted player fells a still rusher 20 m off with three arrows |
+| victim | a player who stands is killed, lies 180 frames, and is stood at a spawn point |
+| far | 200 m from the field, the match does not change |
+| ten matches | ten matches to 3 in a row: 10 entities and 17 figures live after the tenth |
+| match | no player: a winner at 30 after 56,993 frames (15.8 minutes of play) |
+
+Cost, hidden, 1280 x 800, light mode 4, the shore start, the viewer's own
+once-a-second lines over 30 s, two runs each (load average about 20):
+
+| | March and shim, median | GPU, median |
+|---|---|---|
+| a match, twelve fighting | 0.70 to 0.76 ms | 1.9 to 2.0 ms |
+| twelve walkers (`STRATA_FIGURES=12`), no match | 0.51 to 0.56 ms | 2.1 ms |
+
+Misses and what is not known:
+
+- No flash on a hit. It needs a per-figure tint in the animation work's
+  files; that work is unmerged and asked that the tint wait for it.
+- With support on (it is, in a match), a tree whose trunk burns through is
+  gone from the terrain six frames later and nothing is seen falling or
+  lying there in the scripted pictures. Not resolved.
+- The fireball's light with four in the air was not measured.
+- No path finding: a blocked fighter sidesteps for longer each time, left
+  then right. In the bots-only match the idle rule still fired a few times.
+- A player under water cannot be shot, and swimmers cannot attack.
+- The bots-only match takes 15.8 minutes; the design gave no length.
+- Nothing here was played by hand yet.
+
