@@ -53,3 +53,10 @@ Task 8: Ruling: a killed fighter's entity is removed at once and its figure play
 Task 8: Ruling: shirt-coloured loose parts are rigs per fighter (15 a fighter, 180 in all, of AN_RIGS 256 with the twelve humanoids and four props: 196). Simpler than sharing the unshirted shapes; room is the cost.
 Task 8: Ruling: knockback from a swing is 1 m (the design gives arrows 1.5 m and fire up to 3 m; it names none for a swing).
 Task 8: Measured: bots-only match, winner at frame 56,993 (15.8 minutes): pushed fighters take longer to finish.
+Task 7: complete (commit 8e3b1b4, tests: forge test -> 81/81; combat_check.sh archer, victim, far ok)
+Task 8: complete but for the flash (commit 37eb2e4, tests: combat_check.sh all nine ok; scripts/verify.sh -> PASS on this commit)
+Task 9: Ruling: the bow and the flame on the hotbar are drawn from rectangles; the plan added two pictures to the interface atlas. The atlas's free pixels are the white the display's plain rectangles sample, so it is left alone.
+Task 9: Ruling: `Hud.build_bar` takes the nine icons; the match's display is `StrataViewer.MatchHud` (a file of its own).
+Task 9: Ruling: STRATA_COMBAT_HOLD=1 keeps a scripted run going to its last frame after a win, for the end screen's picture (a scripted run otherwise ends at the win, before the shot is taken).
+Task 9: Ruling: `again` takes no world; the ten-match check allows 28 live entities and 60 figures after the tenth (measured: 10 and 17).
+Task 9: Mistake: three runs of the viewer went out without STRATA_HIDDEN (the settings were in one shell variable, which zsh passes as a single word): a window was open on the user's screen for about ten minutes, then twice briefly. Scripted runs are launched through a shell function now.

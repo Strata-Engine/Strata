@@ -80,6 +80,12 @@ if twice far STRATA_COMBAT_SCRIPT=far STRATA_FRAMES=600; then
   if [ "$h60" -ge 0 ] && [ "$h60" = "$h600" ]; then echo "ok   far: the match stood still from frame 60 to 600"
   else echo "FAIL far: fingerprint $h60 at frame 60, $h600 at 600 (want equal)"; cat "$OUT/far.txt"; FAILED=1; fi
 fi
+# Ten short matches in a row: each has its winner, and nothing of an earlier match is left in the world.
+if twice ten STRATA_COMBAT_PLAYER=0 STRATA_COMBAT_WIN=3 STRATA_COMBAT_REPEAT=9 STRATA_FRAMES=90000; then
+  wins=$(grep -c '^combat: winner [A-Za-z]* 3 at frame' "$OUT/ten.txt"); ents=$(num ten '^combat: matches 10, live entities \([0-9]*\), figures [0-9]*$'); figs=$(num ten '^combat: matches 10, live entities [0-9]*, figures \([0-9]*\)$')
+  if [ "$wins" -eq 10 ] && [ "$ents" -ge 0 ] && [ "$ents" -le 28 ] && [ "$figs" -ge 0 ] && [ "$figs" -le 60 ]; then echo "ok   ten matches: ten winners; $ents entities and $figs figures live after the tenth"
+  else echo "FAIL ten matches: $wins winners (want 10), live entities $ents (want 28 or fewer), figures $figs (want 60 or fewer)"; cat "$OUT/ten.txt"; FAILED=1; fi
+fi
 # The match with no player: someone reaches 30, and the same someone the second time.
 if twice match STRATA_COMBAT_PLAYER=0 STRATA_FRAMES=90000; then
   if grep -q '^combat: winner [A-Za-z]* 30 at frame [0-9]*$' "$OUT/match.txt" && [ "$(grep -c '^combat: table ' "$OUT/match.txt")" -eq 12 ]; then echo "ok   match: $(grep '^combat: winner' "$OUT/match.txt" | sed 's/^combat: //')"
