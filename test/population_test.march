@@ -79,6 +79,31 @@ mod Strata.Test.Population do
     frozen(Pn.layer_site(Pn.layer_scatter(p3, "canopy", "trees", plain(0.02), 6.0, 0.5, 12), "camps", "grass", [camp], 2.0, 13))
   end
 
+  -- ── Reach and fitting helpers ────────────────────────────────────────────
+  pfn block_of(sx : Int, sy : Int, sz : Int, vs : Float) : Strata.Template.Template do
+    Strata.Template.make(sx, sy, sz, NativeArray.make_i32(sx * sy * sz, 1), vs)
+  end
+  pfn scatter_of(ts : List(Strata.Template.Template)) : Strata.Population.Pop do
+    Pn.layer_scatter(Pn.shapes_templates(Pn.new(), "stamps", ts), "trees", "stamps", plain(0.1), 8.0, 0.5, 1)
+  end
+  pfn reach_of(p : Strata.Population.Pop) : Float do
+    match Pn.freeze(p) do
+      Ok(f) -> Pn.reach(f)
+      Err(_) -> 0.0 -. 1.0
+    end
+  end
+  -- "sx,sz@voxel" of each template of shape set 0 after fit_all, or the Err
+  pfn fitted_str(p : Strata.Population.Pop, scale : Float) : String do
+    match Pn.freeze(p) do
+      Err(m) -> m
+      Ok(f) ->
+        match Pn.fit_all(f, scale) do
+          Err(m) -> "Err: " ++ m
+          Ok(f2) -> string_join(List.map(Pn.shape_set_templates(f2, 0), fn t -> int_to_string(Strata.Template.t_sx(t)) ++ "," ++ int_to_string(Strata.Template.t_sz(t)) ++ "@" ++ float_to_string(Strata.Template.t_voxel_size(t))), " ") ++ " reach " ++ float_to_string(Pn.reach(f2))
+        end
+    end
+  end
+
   describe "Population" do
     test "an empty population freezes, with no layers" do
       Test.assert_eq_str(names_str(names(Pn.new())), "", "no layers")
@@ -150,6 +175,20 @@ mod Strata.Test.Population do
     test "a shape set with no variants is refused" do
       rejects(Pn.shapes_blocks(Pn.new(), "nothing_blocks", Nil), ["nothing_blocks"], "no blocks")
       rejects(Pn.shapes_templates(Pn.new(), "nothing_templates", Nil), ["nothing_templates"], "no templates")
+    end
+
+    test "a block id of 0 or below, or above 65535, in a block shape set is refused, naming the shape set" do
+      rejects(Pn.shapes_blocks(Pn.new(), "airy", [7, 0]), ["airy", "0 or below"], "id 0")
+      rejects(Pn.shapes_blocks(Pn.new(), "sunk", [-3]), ["sunk", "0 or below"], "id -3")
+      rejects(Pn.shapes_blocks(Pn.new(), "huge", [7, 65536]), ["huge", "above 65535"], "id 65536")
+      Test.assert_eq_str(failure(Pn.shapes_blocks(Pn.new(), "fine", [1, 65535])), "", "ids 1 and 65535")
+    end
+
+    test "a cover layer on a shape set of templates is refused, naming the layer; a scatter layer on it is not" do
+      let tree = Strata.Template.make(1, 2, 1, NativeArray.make_i32(2, 5), 1.0)
+      let trees = Pn.shapes_templates(Pn.new(), "trees", [tree])
+      rejects(Pn.layer_cover(trees, "lawn", "trees", plain(0.1), 1), ["lawn", "trees", "templates"], "cover on templates")
+      Test.assert_eq_str(failure(Pn.layer_scatter(trees, "canopy", "trees", plain(0.02), 6.0, 0.5, 12)), "", "scatter on templates")
     end
 
     test "a ground slot outside 0..9 is refused" do
@@ -378,6 +417,35 @@ mod Strata.Test.Population do
       Test.assert_true(Pn.curve_at(v, 2.0) == 0.5, "points are taken in order of x")
       Test.assert_true(Pn.curve_at(v, 6.0) == 0.5, "the falling side")
       Test.assert_true(Pn.curve_at(Pn.curve([(3.0, 0.7)]), -100.0) == 0.7, "one point is a constant")
+    end
+
+    test "reach: the widest scatter or site template's half-width plus half a voxel, in metres" do
+      Test.assert_true(reach_of(scatter_of([block_of(15, 3, 15, 1.0)])) == 7.5, "15 voxels at 1 m: half-width 7, reach 7.5")
+      Test.assert_true(reach_of(scatter_of([block_of(3, 3, 3, 1.0), block_of(5, 2, 9, 1.0)])) == 4.5, "the widest side of any variant: 9, reach 4.5")
+      Test.assert_true(reach_of(scatter_of([block_of(15, 3, 15, 1.0), block_of(5, 3, 5, 2.0)])) == 8.0, "the largest half-width (7 m) plus half the largest voxel (2 m)")
+      Test.assert_true(reach_of(scatter_of([block_of(60, 3, 60, 0.25)])) == 7.5, "60 voxels at 0.25 m reach as far as 15 at 1 m")
+      Test.assert_true(reach_of(Pn.new()) == 0.0, "nothing declared: 0")
+      Test.assert_true(reach_of(Pn.layer_scatter(grass(), "tufts", "grass", plain(0.1), 2.0, 0.5, 1)) == 0.0, "a scatter layer of blocks: 0")
+      Test.assert_true(reach_of(Pn.shapes_templates(scatter_of([block_of(3, 3, 3, 1.0)]), "unused", [block_of(21, 3, 21, 1.0)])) == 1.5, "a shape set no layer places does not count")
+      Test.assert_true(reach_of(Pn.layer_site(Pn.shapes_templates(Pn.new(), "halls", [block_of(9, 3, 11, 1.0)]), "ruins", "halls", [Pn.site(0.0, 0.0, 0.0, 5.0, 0)], 2.0, 1)) == 5.5, "a site layer's templates count")
+    end
+
+    test "fit_all: every template fitted to the world's voxel, or Err naming the shape set" do
+      let p = scatter_of([block_of(15, 3, 15, 1.0), block_of(4, 2, 6, 0.5)])
+      Test.assert_eq_str(fitted_str(p, 0.25), "60,60@0.25 8,12@0.25 reach 7.5", "at 0.25 m: 4 and 2 voxels a side for each voxel; the reach in metres is unchanged")
+      let e = fitted_str(p, 0.3)
+      Test.assert_true(string_starts_with(e, "Err: population:"), "0.3 m is refused (" ++ e ++ ")")
+      Test.assert_true(string_contains(e, "'stamps'"), "naming the shape set (" ++ e ++ ")")
+      Test.assert_true(string_starts_with(fitted_str(p, 1.0), "Err: "), "a world coarser than a template is refused")
+      Test.assert_eq_str(fitted_str(scatter_of([block_of(15, 3, 15, 1.0)]), 1.0), "15,15@1. reach 7.5", "at its own size a template is kept")
+      match Pn.freeze(Pn.layer_scatter(grass(), "tufts", "grass", plain(0.1), 2.0, 0.5, 1)) do
+        Err(m) -> Test.assert_true(false, m)
+        Ok(f) ->
+          match Pn.fit_all(f, 0.3) do
+            Err(m) -> Test.assert_true(false, "blocks need no fitting: " ++ m)
+            Ok(f2) -> Test.assert_eq_str(ints_str(Pn.shape_set_blocks(f2, 0)), "7,8", "block sets pass through")
+          end
+      end
     end
   end
 end

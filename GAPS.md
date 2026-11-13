@@ -406,3 +406,38 @@ keyword: "This `mod` has no matching `end`", reported at the module's
 first line. `linear` (S22) is refused as a parameter too. Workaround:
 `wants`, `steady`.
 
+## S43: a small function answering a tuple, called per voxel, allocates; across a module boundary an accessor owns its argument
+
+`Strata.Template.blit` undoes the quarter turn per voxel with
+`unturn(t, rot, rx, rz) : (Int, Int)` and reads the template (a seven-field
+constructor holding three arrays) through `t_sx(t)`, `t_ids(t)` and the
+like. Two costs, both in `bench/march/stamp_loop` against C (14 instructions
+a template voxel):
+
+- The tuple is allocated and freed every voxel: 160 to 190 instructions.
+  The loop is 545 to 591 instructions a voxel with it and 386 to 395 with
+  the turn as two Int-valued functions.
+- Compiled in the program's own module, an accessor borrows the template
+  and touches no reference count. Compiled as a second module, as every
+  library function is, the same accessor takes it owned and adjusts the
+  counts of the template and its three arrays (seven `rc_` calls in its
+  IR). The same loop is then 815 to 836 instructions a voxel, 245 to 290
+  more. That gap is the three size accessors (`t_sx`, `t_sy`, `t_sz`) the
+  loop calls a voxel: with them written as constants in a scratch build,
+  the two builds measure the same (376 to 416 with the tuple, 246 to 248
+  without), so each read costs about 85 to 92 instructions more across the
+  boundary, as executed. In a bare loop that keeps the template
+  (`acc_one`/`acc_two` in the same bench) a `t_sx` call adds about 5
+  instructions in one module and 127 in a second; the cost depends on the
+  caller. `t_ids` costs nothing measurable across the boundary. (An earlier
+  figure of 157 against 24 for one accessor was not from instructions run
+  and is withdrawn.) Making the accessors private to their module was
+  tried and changed nothing measurable (834), though that build was
+  reported as cached and is not relied on.
+
+Met measuring scatter layers (`bench/populate_fields` mode 8: 11.8 M of
+24.1 M instructions a chunk with 27 stamps are this loop, 781 a voxel
+visited; mode 12 is blit alone). The Strata code is left plain; wanted from
+March: a tuple answered by a small function kept out of the heap (or the
+function inlined), and a constructor argument that is only read borrowed
+across modules as it is within one.
