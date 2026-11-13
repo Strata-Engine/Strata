@@ -276,6 +276,14 @@ linear congruential generator in the test) asserted with `Test.assert_*`;
 existing properties (chunk, slots under random traffic, and others) are
 left as they are, and are worth rewriting the same way.
 
+Met again in the entity layer (entities Task 9): `Check.try_prop(fn n -> n > 100, 3)`
+answers `Ok(true)`, so a returned `false` never reaches `Check`. A property
+that raises does fail, with its counterexample shrunk:
+`fn n -> if n > 5 do panic("over five") else true end` reports 6. So a
+second workaround keeps shrinking: end the property in
+`if <cond> do true else panic("<what failed>") end`, as
+`entcheck/test/snapshot_test.march` does.
+
 ## S32: `by` cannot be a parameter name; `1.0e12` is not a number
 
 `pfn hits(fs, victim : Int, by : Int, ...)` is "I got stuck here" at `by`:
@@ -299,14 +307,102 @@ way and opened a window. Workaround: a shell function that lists the
 settings and takes the rest as "$@" (`scripts/combat_check.sh`'s `run`).
 
 
-## S35: an alias leaks across modules in a compiled test build
+## S35: on March main a lambda that prints or reads a file fails the capability check
 
-Met merging `combat` into main: `viewer/test/blast_test.march` says
-`alias Strata.Coord as Cb`, and `viewer/test/combat_test.march` and
-`viewer/lib/match.march` say `alias StrataViewer.Combat as Cb`. Each file
-typechecks, but `forge test` in `viewer/` (March 0.7.0, the test binary
-holding every test module) fails in clang: `use of undefined value
-'@StrataViewer.Combat.chunk_of'` from `blast_test`, its `Cb.chunk_of`
-resolved to the other module's `Cb`. An alias should name its target in
-its own module only. Workaround: no two modules of one build alias
-different modules by the same name (`blast_test` now says `Cco`).
+Met moving the viewer to March main (`f6481bbe6`): `List.find(ds, fn p ->
+Authority.must(File.exists(p)))` and a `List.fold_left` whose lambda prints,
+both inside a module that declares `needs IO` and `IO.FileSystem`, fail the
+build with "Module `LibCheck` uses `IO.FileRead` but does not declare `needs
+IO.FileRead`" (and the same for `IO.Console`), at no file and line 0:0.
+`LibCheck` is the module forge wraps a multi-file build in; the lambda's code
+is charged to it, not to the module it was written in. Workaround: a named
+private function in place of the lambda (`first_there` and `say_lines` in
+the viewer).
+
+## S36: `on` cannot be a parameter name
+
+`fn with_nav(m : MtMatch, on : Bool)` is "I got stuck here" at `on`: it is
+the actor keyword. Workaround: another name. (With `by`, S32.)
+
+## S37: what moving from March 0.5.0 to main (`f6481bbe6`) took
+
+Recorded so the next toolchain step is cheaper, and because each is a
+change a March user meets with no pointer from the old behaviour.
+
+- **Capability results.** `File.*`, `Dir.*`, `Env.get*`, `println`,
+  `Process.pid` now answer `Result(_, CapError)`; every call was wrapped in
+  `Authority.must` (about 150 sites, by script). `File.read` answers a
+  result inside that result.
+- **Integers are 63 bits and overflow panics.** `attempt to multiply with
+  overflow` stopped 197 of the library's tests, all through one function:
+  `Strata.Coord.key_hash` multiplies a 32-bit value by a 31-bit constant.
+  Under 0.5.0 that wrapped silently. Fixed with `int_wrapping_mul` there and
+  in `Strata.Stream`'s and `Strata.Physics`'s hashes and one test's; the
+  low 32 bits, which are all those hashes keep, are the same as before. A
+  panic of this kind names no file or line.
+- **A panic in one test can end the run.** With the hash panicking, the test
+  binary died with SIGSEGV or SIGBUS part of the way through and printed no
+  list of failures; `--verbose` on the binary was the way to see them.
+- **One-line matches.** `match o do Some(p) -> a  None -> b end`
+  on one line is a parse error; each arm needs its own line.
+- **Test aliases share one space.** `alias Strata.Steer as Sr` in a test
+  collided with `alias Strata.Store as Sr` in another ("`Strata.Store.seek`
+  is not a function in scope"); as before, a test's aliases must be its own.
+
+## S38: on March main the suite's properties really run, from a seed taken off the clock
+
+S31 said a `Check.all` never fails under `forge test`. That was March 0.5.0.
+On main (`f6481bbe6`) a false property fails, with the run, the shrunk input
+and the seed. Strata has 148 `Check.all` calls that had therefore never
+checked anything, and they now run 100 cases each from a seed that differs
+every run (`MARCH_PROP_SEED`, or `forge test --seed=N`, fixes it). Two
+things followed on the first full run:
+
+- `Query.raycast agrees with a fine sampler` failed on run 69: a ray that
+  passes through the very edge of a voxel. The ray cast reports the hit; the
+  test's own check that the ray is inside the voxel 0.002 past the hit is
+  false, because it has already left. The test was wrong, not the ray cast;
+  it now accepts a hit whose point lies on the voxel when the 1/64 sampler
+  saw nothing.
+- `Fluid properties: the amount is conserved...` runs a 400-step simulation
+  a hundred times and takes minutes.
+
+The properties are worth having. What is owed: a fixed seed in the gate so a
+failure can be replayed, and a pass over the slow ones.
+
+## S39: a match with two arms on one line does not parse
+
+`fn slot(o : Option(Int)) : Int do match o do Some(s) -> s _ -> -1 end end`
+is "parse error: I was expecting `end` to close the match here" at the
+second arm (met writing `Strata.Population`'s readers). The same match
+with each arm on its own line parses. A one-line match with one arm
+(`match a do (x, _) -> x end`) is fine. Workaround: put each arm on its own
+line.
+
+## S40: on March main a bare `println` as a statement still builds and prints
+
+Met moving the animation onto March main (`07b58d065`). `println` answers
+`Result(Unit, CapError)` (S37), but one standing as a statement in a block,
+its result unused, compiles with no word and prints:
+`test/erosion_test.march` and `test/lattice_test.march` still have one each,
+and the library's `forge test` builds them and prints their lines. So the
+compiler is no help in finding the prints a move like S37's left unwrapped.
+Workaround: a scan for effect calls not inside `Authority.must(` (the
+animation's merge used one; it found 31 in the viewer, none in `lib/`).
+
+## S41: a module alias is not private to its module in a test build
+
+`alias StrataViewer.Combat as Cb` in `viewer/lib/match.march` and
+`alias Strata.Coord as Cb` in `viewer/test/blast_test.march`: the test build
+resolved the test's `Cb.chunk_of` to `StrataViewer.Combat.chunk_of`, which
+clang then could not find ("use of undefined value"). The same family as
+S27. Workaround: aliases unique across the app (`Rules` in the match, `Cmb`
+in its test).
+
+## S42: `needs` cannot be a parameter name, nor `linear` (again)
+
+`fn unsupported(..., needs : Int -> Bool, ...)` reads as the capability
+keyword: "This `mod` has no matching `end`", reported at the module's
+first line. `linear` (S22) is refused as a parameter too. Workaround:
+`wants`, `steady`.
+

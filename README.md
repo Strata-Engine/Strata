@@ -10,15 +10,17 @@ Design: `docs/2026-11-10-strata-design.md`. Build plan:
 
 ## Toolchain
 
-Strata is meant to compile against March `origin/main`, and
-`scripts/env.sh` puts a build of it first on the path (at
+Strata compiles against March `origin/main` (as of `f6481bbe6`, march
+0.7.0). `scripts/env.sh` puts a build of it first on the path (at
 `~/code/march-main`, a git worktree of the March repository built with
-`dune build`; set `STRATA_MARCH_HOME` to point elsewhere). In practice the
-builds on the development machine have used March 0.5.0: forge takes the
-toolchain `~/.march/current` names (0.5.0 there) ahead of the one
-`scripts/env.sh` puts on the path, so the gate and every number in
-`RESULTS.md` come from 0.5.0. A switch to March main is planned; it was
-last tried at commit `1a4251bc8` (march 0.7.0).
+`dune build`; set `STRATA_MARCH_HOME` to point elsewhere) and sets
+`MARCH_HOME` to an empty directory there, because forge otherwise takes the
+toolchain `~/.march/current` names (0.5.0 on the development machine) ahead
+of the one on the path. March 0.5.0 no longer builds Strata: file, settings
+and print calls answer a capability result (`Authority.must`), and hashes
+use `int_wrapping_mul`, neither of which 0.5.0 has. The numbers in
+`RESULTS.md` up to the island's are from 0.5.0; those of path finding are
+from main.
 
 The renderer needs Vulkan and GLFW. On macOS:
 
@@ -440,6 +442,66 @@ let poses = Strata.Anim.matrices(a5, fig)     -- 12 floats a part: a 3x4 in worl
 let steps = Strata.Anim.marks(a5)             -- (figure, layer, tag, weight), in time order
 ```
 
+The frame loop. A game moves its figures, asks for feet, gives the camera,
+updates once, asks its questions, then draws; the renderer was handed the
+rigs once and reads every listed figure's pose itself:
+
+```march
+-- once, after the rigs are finished: meshes, ray shapes and palettes, shared by every figure of a rig
+let sl1 = Strata.Render.figures(sl0, a4, [rig])
+
+-- every frame, in this order
+let b1 = Strata.Anim.place(a4, fig, x, y, z, facing)          -- where the game puts it (no physics)
+let b2 = Strata.Anim.ground(b1, fig, world, 1.0)              -- foot placement for a rig with legs: before update
+let b3 = Strata.Anim.view(b2, planes, ex, ey, ez, 0.0)        -- the camera's six planes: out of view poses 1 update in 4; give it every drawn frame
+let b4 = Strata.Anim.update(b3, dt)
+let hit = Strata.Anim.hit_ray(b4, ex, ey, ez, dx, dy, dz, 100.0, -1)   -- figure, part, voxel, distance
+let shown = Strata.Render.draw(1.0)                           -- each figure 1.0 of the way to its last pose
+```
+
+Answers (marks, sockets, hits) never depend on the camera: a query poses
+a stale figure first. Give `view` every frame you draw, even one with no
+`update` (a 60 Hz update under a 120 Hz display): the renderer lists figures
+against the last view given. A hit ray every frame, as above, poses every
+figure the update skipped, which gives back culling's CPU saving until the
+kernel poses only the figures along the ray. `Strata.Anim.open` again
+voids every rig and clip id (they start at 0 again; hand the new rigs to
+`Strata.Render.figures`, which re-uploads them), and figure ids start at 0
+again too, so drop every id held from the old world. `Strata.Anim.traced(a, fig, true)` puts up to 64
+figures among what the light pass's rays hit (their shadows, reflections,
+sky darkening and glow); the rest are drawn plain and cast their sun
+shadow from a shadow map. `attach` hangs one figure from another's socket
+(a torch, a sword). `override`, `aim`, `reach` and `spring` work after the
+layers, in that order.
+
+A game links the kernel beside the renderer (forge does not build a
+dependency's C sources). A game that draws lists both:
+
+    [ffi]
+    sources = ["../strata/native/strata_vk.c", "../strata/native/strata_anim.c"]
+    link = ["-I../strata/native", "-I/opt/homebrew/include", "-L/opt/homebrew/lib",
+            "-lglfw", "-lvulkan", "-Wl,-rpath,/opt/homebrew/lib"]
+
+`strata_anim.c` includes nothing from Vulkan or GLFW and needs no library;
+one that animates without drawing lists it alone:
+
+    [ffi]
+    sources = ["../strata/native/strata_anim.c"]
+    link = ["-I../strata/native"]
+
+In the viewer (`viewer/lib/figures.march` holds its example rigs and clips:
+the humanoid with seven clips, a torch, a sword, a bird, a fish and a cart):
+`G` spawns 64 wandering humanoids (opening a figure world if none is),
+`K` switches foot placement and springs, `T` switches the 8 nearest
+humanoids between plain and traced, `V` hands the nearest a lit torch, and
+the crosshair's hit ray outlines the part it meets. `STRATA_ANIM_METER=1`
+prints once a second
+`anim: figures f posed p stale s parts d traced t update u ms`. Scenes 31
+to 41 show the figures (`STRATA_SCENE=n`): 37 the stairs, 38 the sword
+mid-swing, 39 the creatures by the lake, 40 the arena (512 runners; for
+timing, `STRATA_ARENA_LOG=1`, `STRATA_ARENA_RAYS=n`), 41 figure shadows
+under leaves. Measurements are in `RESULTS.md`.
+
 `scripts/anim_check.sh` builds `animcheck/` and runs its scenes; to see the
 chain's matrices at t = 0, 0.25 and 0.5:
 
@@ -475,6 +537,27 @@ let vel = Strata.Entities.column(e2, 0, Strata.Entities.col_velocity())        -
 let e3 = Strata.Entities.set_column(e2, 0, Strata.Entities.col_velocity(), vel)
 ```
 
+| Call | Does |
+|---|---|
+| `Strata.Entities.blocks(e, stream)` | hands the kernel the chunks loaded, edited and unloaded since the last call; once a frame after `Strata.Stream.tick` |
+| `Strata.Entities.tick(e, w, p, a, s, focus, dt)` | the frame's step (ages, lifetimes, movement, seen and unseen, the grid, touches), then figures, bodies and voices given, placed and freed |
+| `Strata.Entities.step(e, focus, dt)` | the step alone, without parts |
+| `Strata.Entities.events(e, w)` | what the last step reported: touches, block hits, entered and left view, routes finished, removals, bodies lost, blocked walkers |
+| `Strata.Entities.route(e, points)`, `follow(e, id, route, speed, loops)` | a shared route of up to 256 points, and a walker following it |
+| `Strata.Entities.touching(e, a, b)`, `near(...)`, `raycast(...)` | touch events between two kinds; entities within a radius; the first entity on a ray |
+| `Strata.Entities.snapshot(e)`, `restore(e, s)` | the whole entity world as three native arrays, and a world rebuilt from them, every entity unseen |
+| `Strata.Entities.restore_with(e, s, p, a, snd)`, `close_with(e, p, a, s)` | restore or close after freeing every figure, body and voice the entities hold |
+
+An entity is **seen** within its kind's seen distance of a focus, measured
+across the ground, and stays seen until it is a chunk's side beyond it.
+Only seen entities touch blocks, get figures, bodies and voices, and are
+swept as walkers; becoming seen sets a walker on the ground first, once the
+chunks around it are loaded. An **unseen** entity is cheap: by its kind's
+rule it lives on (a walker follows its route through everything, a flyer
+flies on, every nth tick for a tick divisor of n), freezes until seen
+again, or is removed. A snapshot keeps no seen state; a restored world
+gives the near entities their parts back at the next tick.
+
 `scripts/ent_check.sh` builds `entcheck/` and runs its scenes:
 
     (cd entcheck && forge build --release) && ENTCHECK_SCENE=basics entcheck/.march/build/release/entcheck
@@ -496,20 +579,57 @@ MARCH_PIN_MAIN=1 STRATA_SHORE=1 STRATA_COMBAT=1 STRATA_LIGHT=4 ./viewer/.march/b
   wood, leaves, tall grass and ice within 2 m and turns grass to dirt.
 - **They**: seven rushers (100 health, a swing for 25) and four shooters (60
   health, arrows). Each goes for the nearest fighter it can see, whoever that
-  is. They swim, climb out at a low bank, and cannot attack from the water.
-  They do not dig, place or burn.
+  is. They find their way (`Strata.Nav`): round a wall, a pit or a cliff when
+  the straight way is shut, through water if that is the way, and a rusher
+  goes on for 6 s after a target that steps out of sight. They swim, climb
+  out at a low bank, and cannot attack from the water. They do not dig,
+  place or burn. `STRATA_COMBAT_NAV=0` plays the match without path finding.
 - **Keys**: Tab the table, Enter another match once one is won. Flight is off.
   More than 150 m from the field the match is paused.
 - A fighter is an entity (`Strata.Entities`) drawn as a figure (`Strata.Anim`)
   the match places each frame; shots are flying entities; the rules are pure
   March in `viewer/lib/combat.march`, the rest in `viewer/lib/match.march` and
-  `match_hud.march`. `scripts/combat_check.sh` plays ten scripted scenes
+  `match_hud.march`. `scripts/combat_check.sh` plays eleven scripted scenes
   hidden, each twice, and the gate runs it.
 
-Not in it: melee for the player, path finding (a blocked fighter sidesteps;
-one stuck 20 s is put back at a spawn point), enemies that dig or burn, fire
+Not in it: melee for the player, fighters that keep clear of each other (one
+blocked by another sidesteps; one stuck 20 s is put back at a spawn point),
+enemies that dig or burn, fire
 that spreads, drowning, new sounds, a flash on a hit (waiting on a per-figure
 tint in the animation work).
+
+## Finding the way
+
+`Strata.Nav` answers where a walker can stand and how it gets from one
+place to another; `Strata.Steer` which way a mover should head
+(`docs/2026-11-12-nav-design.md`). Neither knows what a walker is in a game.
+
+```march
+-- a walker from its box in metres: 0.6 m wide, 1.8 m tall, climbs 1.05 m, drops 4 m
+let k = Strata.Nav.with_swim(Strata.Nav.walker_of(Strata.World.scale(w), 0.3, 1.8, 1.05, 4.0), true)
+
+-- the cell under a place, then the way from one to another: at most 1200 cells expanded
+match Strata.Nav.foot(w, k, x, y, z, 2) do
+  Some((ax, ay, az)) ->
+    let p = Strata.Nav.find(w, k, ax, ay, az, gx, gy, gz, 1200)
+    -- its corners, in metres; drop those reached as the mover goes
+    let corners = Strata.Nav.points(Strata.Nav.smooth(w, k, Strata.Nav.cells(p), 10), Strata.World.scale(w))
+    Strata.Nav.advance(corners, px, pz, 0.5)
+  None -> Nil
+end
+
+-- no path needed when the walker can go straight
+Strata.Nav.straight(w, k, ax, ay, az, gx, gy, gz)
+
+-- the cheapest way to any cell a game's own test accepts: here, one out of a threat's sight
+Strata.Nav.nearest(w, k, ax, ay, az, fn (x, y, z) -> hidden_from(threat, x, y, z), 600)
+```
+
+A path that is not `arrived` ends at the cell nearest the goal that the
+search reached: walk it and ask again. A search reads the world as it is, so
+an edit is seen by the next one; there is nothing to rebuild. It works in a
+window of at most 96 cells across (and 40 and twice the walker's height up
+and down) and on loaded chunks only.
 
 ## Using it from a game
 
@@ -656,6 +776,7 @@ boundary over the ground; their numbers are in `RESULTS.md`.
 | Module | Holds |
 |---|---|
 | `Strata.Coord` | chunk, local and world coordinates; chunk keys; voxel scale |
+| `Strata.Ballistics` | thrown and shot things: aim within a spread, lead a moving target, drag in air and water, where a step enters something, a bounce off a face |
 | `Strata.Blocks` | the block registry: definitions, state families, models |
 | `Strata.Chunk` | 32-cubed chunks in uniform, paletted and direct forms |
 | `Strata.Store` | the persistent chunk map |
@@ -664,10 +785,13 @@ boundary over the ground; their numbers are in `RESULTS.md`.
 | `Strata.Mesh` | the greedy mesher |
 | `Strata.Terrain` | the generator contract; a generator's stamps (its structure layer) |
 | `Strata.World` | loaded chunks, the edited-chunk cache, queued edits |
-| `Strata.Edit` | single, list, box and sphere edits; blasts |
+| `Strata.Edit` | single, list, box and sphere edits; blasts; `unsupported`: what an edit left hanging (plants over dug ground) |
 | `Strata.Stream` | loading around focus points; task-built chunks and meshes |
 | `Strata.Query` | raycast and swept box collision |
+| `Strata.Nav` | where a walker stands; A* paths over the voxels, nearest-by-test, straight lines, corners |
+| `Strata.Steer` | directions over the ground for a mover: seek, flee, arrive, keep apart, blend, turn |
 | `Strata.Fluid` | finite fluids: fall, run to a drop, stay level, sink, rest |
+| `Strata.Falls` | spray where still water (a generated river) steps down: found on a worker, thrown each frame |
 | `Strata.Slots`, `Strata.Render` | renderer slot bookkeeping; keeping the renderer in step with a stream |
 | `Strata.Model` | a model block's drawing geometry |
 | `Strata.Rig`, `Strata.Clip` | a jointed figure's description and part meshes; its animations |

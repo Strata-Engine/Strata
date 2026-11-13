@@ -1304,6 +1304,7 @@ static struct {
     int fsm_off;                          /* STRATA_FIG_SHADOWS=0: no figure casts a shadow */
     int fsm_fresh;                        /* the map has not yet been put in its sampled layout */
     int64_t sparts, sdraws; double shadow_ms;
+    double cpu_worst, shadow_worst;       /* the worst of cpu_us and shadow_ms since the start (stats 20, 21: the cost with no figures) */
 } fg;
 
 /* The shadow map: SV_FSM_RES texels a side over a square SV_FSM_HALF x 2
@@ -1457,6 +1458,29 @@ int64_t sv_rig_shape(int64_t rig, int64_t part, void *bytes, int64_t n, int64_t 
     sh->first = first; sh->nwords = words; sh->dims[0] = (int32_t)sx; sh->dims[1] = (int32_t)sy; sh->dims[2] = (int32_t)sz;
     sh->shaped = 1;
     fg.glow[rig * SV_FIG_PARTS + part] = -1.0f;
+    return 1;
+}
+/* Forget rig [rig] whole: every part's pieces, ray shape, anchor and glow,
+ * so a rig uploaded again under the same id (a figure world opened again
+ * starts its rig ids at 0) keeps nothing of the last one's. Ranges frames in
+ * flight may still draw are held two frames, as a replaced piece's are. */
+int64_t sv_rig_clear(int64_t rig) {
+    if (!g.ok || !fg.pieces || !fg.shape || rig < 0 || rig >= SV_FIG_RIGS) return 0;
+    for (int p = 0; p < SV_FIG_PARTS; p++) {
+        int32_t rp = (int32_t)(rig * SV_FIG_PARTS + p);
+        for (int32_t i = fg.head[rp], nx; i >= 0; i = nx) {
+            nx = fg.pieces[i].next;
+            sa_release(&g_quads, (Range){ fg.pieces[i].first, fg.pieces[i].count }, g.frame_no);
+            fg.pieces[i].next = fg.free_head; fg.free_head = i;
+        }
+        fg.head[rp] = -1;
+        struct FigShape *sh = &fg.shape[rp];
+        if (sh->shaped) sa_release(&g_bbytes, (SaRange){ sh->first, sh->nwords }, g.frame_no);
+        sh->shaped = 0;
+        fg.anchor[rp][0] = fg.anchor[rp][1] = fg.anchor[rp][2] = 0.0f; fg.anchor[rp][3] = 1.0f;
+        fg.sphere[rp][3] = -1.0f;
+        if (fg.glow) fg.glow[rp] = -1.0f;
+    }
     return 1;
 }
 /* how far (metres) rig part rp's glowing voxels light their surroundings above
@@ -2362,13 +2386,17 @@ void sv_set_vsync(int64_t on) { int off = on ? 0 : 1; if (g.ok && off != g.vsync
  * figure shadow map's pass (0 when it did not run or there are no
  * timestamps), 15 parts drawn into it, 16 its draws, 17 traced figures in
  * the rays' list, 18 their parts placed there, 19 figures flagged traced
- * past the first SV_FIG_TRACED, drawn plain. 20 particles written over a
- * slot still in the live span, since the start (a full ring). */
+ * past the first SV_FIG_TRACED, drawn plain. Since the start: 20 the worst
+ * of stat 12, 21 the worst of stat 14 (what figures cost a run with none).
+ * The light volume: 22 pages in use, 23 chunks that found no page, 24 bytes
+ * its pool holds (they were 10 to 12, which the figures' stats already used).
+ * 25 particles written over a slot still in the live span, since the start
+ * (a full ring). */
 double sv_stat(int64_t which) {
     if (which == 6) return (double)g.rebuilds;
-    if (which == 10) return (double)(g.npages - g.nfree_pages);   /* light pages in use */
-    if (which == 11) return (double)g.pages_refused;               /* chunks that found no light page */
-    if (which == 12) return (double)g.npages * 32768.0;          /* bytes the light volume's pool holds */
+    if (which == 22) return (double)(g.npages - g.nfree_pages);   /* light pages in use */
+    if (which == 23) return (double)g.pages_refused;               /* chunks that found no light page */
+    if (which == 24) return (double)g.npages * 32768.0;          /* bytes the light volume's pool holds */
     if (which == 7) return (double)g_quads.leaked + (double)g_loose.leaked;
     if (which == 8) return g.spray_births ? (double)sp_count(&g.ring) : 0.0;
     if (which == 9) return (double)g.ui_dropped;
@@ -2382,7 +2410,9 @@ double sv_stat(int64_t which) {
     if (which == 17) return (double)fg.traced_figs;
     if (which == 18) return (double)fg.traced_parts;
     if (which == 19) return (double)fg.traced_over;
-    if (which == 20) return g.spray_births ? (double)g.ring.overwritten : 0.0;
+    if (which == 20) return fg.cpu_worst;
+    if (which == 21) return fg.shadow_worst;
+    if (which == 25) return g.spray_births ? (double)g.ring.overwritten : 0.0;
     return (which >= 0 && which < 6) ? g.stat[which] : -1.0;
 }
 int64_t sv_drawn_chunks(void) { return g.drawn_chunks; }
@@ -3050,6 +3080,7 @@ int64_t sv_frame(void) {
         fg.shadow_ms = 0.0;
         if (F->fsm_ts && vkGetQueryPoolResults(g.dev, g.qpool, q0 + 2, 2, sizeof ts, ts, sizeof ts[0], VK_QUERY_RESULT_64_BIT) == VK_SUCCESS)
             fg.shadow_ms = (double)(ts[1] - ts[0]) * (double)g.ts_period / 1.0e6;
+        if (fg.shadow_ms > fg.shadow_worst) fg.shadow_worst = fg.shadow_ms;
     }
     uint32_t idx = 0;
     int offscreen = g.offscreen;
@@ -3106,6 +3137,7 @@ int64_t sv_frame(void) {
      * copies: bring them up to date. From here to the next time this Frame
      * comes round, nothing the CPU does can change what it draws. */
     fig_prepare(F);               /* first: it chooses the traced figures' rows bodies_to_frame appends */
+    if (fg.cpu_us > fg.cpu_worst) fg.cpu_worst = fg.cpu_us;
     bodies_to_frame(F);
     lamps_to_frame(F);
     g.ubo_map[UBO_WATER + 5] = g.water_mem ? 1.0f : 0.0f;

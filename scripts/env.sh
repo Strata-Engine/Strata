@@ -6,9 +6,8 @@ mkdir -p "$STRATA_MARCH_HOME/.strata-bin"
 ln -sf "$STRATA_MARCH_HOME/_build/default/bin/main.exe" "$STRATA_MARCH_HOME/.strata-bin/march"
 ln -sf "$STRATA_MARCH_HOME/_build/default/forge/bin/main.exe" "$STRATA_MARCH_HOME/.strata-bin/forge"
 export PATH="$STRATA_MARCH_HOME/.strata-bin:$PATH"
-# forge does not run the `march` on PATH if it can resolve a toolchain: it
-# puts the one ~/.march/current names (or a .march-version pin) ahead of PATH,
-# which built Strata with March 0.5.0 until 12 November 2026. A MARCH_HOME
-# with no `current` link makes forge resolve nothing and fall back to PATH.
-mkdir -p "$STRATA_MARCH_HOME/.strata-march-home"
-export MARCH_HOME="$STRATA_MARCH_HOME/.strata-march-home"
+# forge takes the toolchain ~/.march/current names (0.5.0 on the development
+# machine) ahead of PATH; an empty MARCH_HOME leaves it none to find, so it
+# compiles with the March above.
+mkdir -p "$STRATA_MARCH_HOME/.strata-home"
+export MARCH_HOME="$STRATA_MARCH_HOME/.strata-home"

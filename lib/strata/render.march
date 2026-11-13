@@ -15,29 +15,34 @@ mod Strata.Render do
 
   alias Strata.Slots as Sr2
 
-  -- the slot table, an empty mesh to stand in where one is required, and the rig ids whose meshes the renderer holds
-  type Render = Render(Strata.Slots.Slots, Strata.Mesh.Meshed, List(Int))
+  -- the slot table, an empty mesh to stand in where one is required, the rig ids whose meshes the renderer holds
+  -- with the figure world's generation they were finished in (Strata.Anim.generation: a reopened world starts its rig ids at 0 again),
+  -- and the keys of the body parts it has been given (kept here so that `bodies` need not look through every slot each frame: a streamed
+  -- world holds thousands, a handful of them bodies')
+  type Render = Render(Strata.Slots.Slots, Strata.Mesh.Meshed, (Int, List(Int)), List(Strata.Coord.Key))
+
 
   pfn no_mesh() : Strata.Mesh.Meshed do
     Strata.Mesh.build(Strata.Blocks.empty(), Strata.Mesh.around_from(fn (dx, dy, dz) -> Strata.Chunk.uniform(0)))
   end
 
   doc "A renderer-side table of [capacity] chunk slots. The shim holds 16384."
-  fn new(capacity : Int) : Render do Render(Sr2.new(capacity), no_mesh(), Nil) end
+  fn new(capacity : Int) : Render do Render(Sr2.new(capacity), no_mesh(), (-1, Nil), Nil) end
+
 
   doc "Chunk slots in use."
-  fn used(r : Render) : Int do match r do Render(sl, _, _) -> Sr2.used(sl) end end
+  fn used(r : Render) : Int do match r do Render(sl, _, _, _) -> Sr2.used(sl) end end
   doc "Meshes waiting for a slot or for room in the quad buffer."
-  fn waiting(r : Render) : Int do match r do Render(sl, _, _) -> Sr2.waiting(sl) end end
+  fn waiting(r : Render) : Int do match r do Render(sl, _, _, _) -> Sr2.waiting(sl) end end
   doc "The slot a chunk's mesh is in, or -1."
-  fn slot_of(r : Render, k : Strata.Coord.Key) : Int do match r do Render(sl, _, _) -> Sr2.slot_of(sl, k) end end
+  fn slot_of(r : Render, k : Strata.Coord.Key) : Int do match r do Render(sl, _, _, _) -> Sr2.slot_of(sl, k) end end
 
   doc "How many blocks could not have a light class of their own and share the nearest of their kind: 0 unless the registry holds more than 255 blocks that differ in what they are to light. Such a block is lit and reflected with another block's texture, smoothness or glow."
   fn light_overflow(r : Strata.Blocks.Registry) : Int do Strata.Blocks.light_overflow(r) end
 
   doc "The light volume's pool: (pages in use, pages it has, chunks that found no page). A chunk whose voxels are all one class takes no page; a chunk that finds none is seen by light rays as outside the world."
   fn light_pages() : (Int, Int, Int) do
-    (float_to_int(Strata.Ffi.Vk.stat(10)), float_to_int(Strata.Ffi.Vk.stat(12) /. 32768.0), float_to_int(Strata.Ffi.Vk.stat(11)))
+    (float_to_int(Strata.Ffi.Vk.stat(22)), float_to_int(Strata.Ffi.Vk.stat(24) /. 32768.0), float_to_int(Strata.Ffi.Vk.stat(23)))
   end
 
   doc "Give the renderer the registry's per-block data (textures, flags, emission). Call once the registry is built, and again if it changes."
@@ -163,7 +168,8 @@ mod Strata.Render do
     match ks do
       Nil -> ()
       Cons(k, rest) ->
-        if !Strata.Physics.is_part_key(k) do pose_parts(sl, p, t, rest)
+        -- a part still waiting for a slot has nothing to pose yet
+        if !Strata.Physics.is_part_key(k) || Sr2.slot_of(sl, k) < 0 do pose_parts(sl, p, t, rest)
         else
           let id = Strata.Coord.kx(k)
           let (ox, oy, oz) = Strata.Physics.part_offset(p, id, Strata.Coord.ky(k))
@@ -180,14 +186,21 @@ mod Strata.Render do
     end
   end
 
+  -- the part keys held, with those just meshed that are not among them
+  pfn with_parts(parts : List(Strata.Coord.Key), keyed : List((Strata.Coord.Key, Strata.Mesh.Meshed))) : List(Strata.Coord.Key) do
+    match keyed do
+      Nil -> parts
+      Cons((k, _), rest) -> with_parts(if List.any(parts, fn h -> Strata.Coord.key_eq(h, k)) do parts else Cons(k, parts) end, rest)
+    end
+  end
+
   doc "Keep the renderer in step with the bodies: upload parts meshed since the last call, free the parts of bodies that are gone, and draw every body where it is at clock [t] (seconds; see `Strata.Physics.pose`)."
   fn bodies(r : Render, p : Strata.Physics.Physics, t : Float) : (Render, Strata.Physics.Physics) do
     match Strata.Physics.take_meshes(p) do
       (p2, made) ->
         match r do
-          Render(sl, none, rg) ->
-            let held = Sr2.keys(sl)
-            let gone = List.filter(held, fn k -> Strata.Physics.is_part_key(k) && !Strata.Physics.exists(p2, Strata.Coord.kx(k)))
+          Render(sl, none, rg, parts) ->
+            let gone = List.filter(parts, fn k -> !Strata.Physics.exists(p2, Strata.Coord.kx(k)))
             let keyed = List.map(made, fn m -> keyed_part(m))
             -- a body that is gone leaves the rays before its slots are freed
             drop_shapes(sl, gone)
@@ -195,8 +208,9 @@ mod Strata.Render do
               (sl2, acts) ->
                 let sl3 = perform(sl2, acts, none)
                 give_shapes(sl3, p2, made)
-                pose_parts(sl3, p2, t, Sr2.keys(sl3))
-                (Render(sl3, none, rg), p2)
+                let parts2 = with_parts(List.filter(parts, fn k -> Strata.Physics.exists(p2, Strata.Coord.kx(k))), keyed)
+                pose_parts(sl3, p2, t, parts2)
+                (Render(sl3, none, rg, parts2), p2)
             end
         end
     end
@@ -234,14 +248,14 @@ mod Strata.Render do
         match Strata.Stream.take_unloads(s2) do
           (s3, gone) ->
             match r do
-              Render(sl, none, rg) ->
+              Render(sl, none, rg, parts) ->
                 let top = Strata.Stream.top_level(s3)
                 let sl1 = if Sr2.levels(sl) == top do sl else match Sr2.with_levels(sl, top) do (sl0, acts0) -> perform(sl0, acts0, none) end end
                 -- uploads first; a refused one is reported before the draw rule settles, so it frees nothing
                 match Sr2.place(sl1, meshes, gone) do
                   (sl2, acts) ->
                     match Sr2.settle(perform(sl2, acts, none)) do
-                      (sl3, acts2) -> (Render(perform(sl3, acts2, none), none, rg), s3)
+                      (sl3, acts2) -> (Render(perform(sl3, acts2, none), none, rg, parts), s3)
                     end
                 end
             end
@@ -250,9 +264,9 @@ mod Strata.Render do
   end
 
   doc "Chunks unloaded by the stream whose slots are kept, and drawn, until the chunk above each holds a mesh."
-  fn retained(r : Render) : Int do match r do Render(sl, _, _) -> Sr2.retained(sl) end end
+  fn retained(r : Render) : Int do match r do Render(sl, _, _, _) -> Sr2.retained(sl) end end
   doc "Is [k]'s mesh held and drawn (not kept undrawn by the which-chunk-draws rule)?"
-  fn drawn(r : Render, k : Strata.Coord.Key) : Bool do match r do Render(sl, _, _) -> Sr2.drawn(sl, k) end end
+  fn drawn(r : Render, k : Strata.Coord.Key) : Bool do match r do Render(sl, _, _, _) -> Sr2.drawn(sl, k) end end
   -- ── Figures ────────────────────────────────────────────────────────────────
   -- a rig's palette as the renderer takes it: 256 x (red, green, blue, roughness, emission)
   pfn palette_go(out : NativeF32Arr, cs : List((Int, Float, Float, Float, Float, Float))) : NativeF32Arr do
@@ -296,10 +310,12 @@ mod Strata.Render do
     end
   end
   pfn upload_rig(id : Int, rg : Strata.Rig.Rig) : Bool do
+    -- whatever was held under this id (a rig of an older world, or a part-made upload) goes first
+    let cleared = Strata.Ffi.Vk.rig_clear(id)
     let pal = Strata.Ffi.Vk.rig_palette(id, palette_go(NativeArray.make_f32(256 * 5, 0.0), Strata.Rig.palette(rg)))
     let anc = anchors_go(id, rg, 0, Strata.Rig.part_count(rg), true)
     let shp = shapes_go(id, rg, 0, Strata.Rig.part_count(rg), true)
-    pal && anc && shp && pieces_go(id, Strata.Rig.meshes(rg), true)
+    cleared && pal && anc && shp && pieces_go(id, Strata.Rig.meshes(rg), true)
   end
   pfn figures_go(a : Strata.Anim.Anim, rigs : List(Strata.Rig.Rig), held : List(Int)) : List(Int) do
     match rigs do
@@ -313,13 +329,19 @@ mod Strata.Render do
     end
   end
 
-  doc "Give the renderer the meshes, ray shapes and palettes of these rigs, each finished in [a] (Strata.Anim.finish_rig): uploaded once per rig, shared by every figure made from it; a rig already held, or not finished in [a], is passed over. A rig the renderer had no room for is tried again at the next call. From then on every figure of those rigs that the animation lists is drawn at each frame, at its pose: a game calls nothing per figure."
-  fn figures(r : Render, a : Strata.Anim.Anim, rigs : List(Strata.Rig.Rig)) : Render do
-    match r do Render(sl, none, held) -> Render(sl, none, figures_go(a, rigs, held)) end
+  doc "The rig ids held for generation [gen]: those held now if they were finished in it, none if the world was opened again since (its rig ids start at 0 again, so every one must be uploaded anew)."
+  fn held_for(held : (Int, List(Int)), gen : Int) : List(Int) do
+    match held do (g, ids) -> if g == gen do ids else Nil end end
   end
 
-  doc "Rigs whose meshes the renderer holds."
-  fn figure_rigs(r : Render) : Int do match r do Render(_, _, held) -> List.length(held) end end
+  doc "Give the renderer the meshes, ray shapes and palettes of these rigs, each finished in [a] (Strata.Anim.finish_rig): uploaded once per rig, shared by every figure made from it; a rig already held, or not finished in [a], is passed over. A rig the renderer had no room for is tried again at the next call. From then on every figure of those rigs that the animation lists is drawn at each frame, at its pose: a game calls nothing per figure. After `Strata.Anim.open` makes a new world, the rigs held from the old one are forgotten and these are uploaded anew, over the old meshes under the same ids."
+  fn figures(r : Render, a : Strata.Anim.Anim, rigs : List(Strata.Rig.Rig)) : Render do
+    let gen = Strata.Anim.generation(a)
+    match r do Render(sl, none, held, parts) -> Render(sl, none, (gen, figures_go(a, rigs, held_for(held, gen))), parts) end
+  end
+
+  doc "Rigs whose meshes the renderer holds for the figure world opened last."
+  fn figure_rigs(r : Render) : Int do match r do Render(_, _, (_, ids), _) -> List.length(ids) end end
 
   doc "Draw and present one frame, figures drawn [blend] (0..1) of the way from each one's pose before last to its last: the fraction of an animation step that has passed since the last `Strata.Anim.update`. False when the frame was skipped."
   fn draw(blend : Float) : Bool do

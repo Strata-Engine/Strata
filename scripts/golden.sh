@@ -118,6 +118,12 @@ traced-shadow-walk-4s:STRATA_SCENE=34 STRATA_LIGHT=4 STRATA_SUN=18 STRATA_FRAMES
 figure-reflection:STRATA_SCENE=35 STRATA_LIGHT=3 STRATA_SUN=12 STRATA_FRAMES=90 DRAWS=20
 glowing-figure:STRATA_SCENE=36 STRATA_LIGHT=4 STRATA_SUN=2 STRATA_FRAMES=123 DRAWS=21
 glowing-figure-4s:STRATA_SCENE=36 STRATA_LIGHT=4 STRATA_SUN=2 STRATA_FRAMES=243 DRAWS=21
+stairs-2s:STRATA_SCENE=37 STRATA_LIGHT=4 STRATA_SUN=30 STRATA_FRAMES=123 DRAWS=35
+stairs-4s:STRATA_SCENE=37 STRATA_LIGHT=4 STRATA_SUN=30 STRATA_FRAMES=243 DRAWS=35
+sword-swing:STRATA_SCENE=38 STRATA_LIGHT=4 STRATA_SUN=30 DRAWS=37
+creatures:STRATA_SCENE=39 STRATA_LIGHT=4 STRATA_SUN=30 DRAWS=37
+figure-shadow-canopy-1s:STRATA_SCENE=41 STRATA_LIGHT=4 STRATA_SUN=35 DRAWS=35
+figure-shadow-canopy-4s:STRATA_SCENE=41 STRATA_LIGHT=4 STRATA_SUN=35 STRATA_FRAMES=243 DRAWS=35
 island-cliff:STRATA_SCENE=24 STRATA_LIGHT=4
 island-cave:STRATA_SCENE=29 STRATA_LIGHT=4
 forest-border:STRATA_SCENE=128 STRATA_LIGHT=4
@@ -135,7 +141,11 @@ far-ring-boundary:STRATA_SCENE=136 STRATA_LEVELS=4 STRATA_RADIUS=4 STRATA_LIGHT=
 # 31 and 32 were stored before figures cast shadows and keep them off with
 # STRATA_FIG_SHADOWS=0, scene 33 shows them; a traced figure is left out of
 # the map: scene 34 maps its one plain runner, 35 and 36 map none, 36 adds the
-# torch's one piece; 36 walks its torch-bearer in, shot at 2 s and 4 s). STRICT=1 holds a scene
+# torch's one piece; 36 walks its torch-bearer in, shot at 2 s and 4 s; 37 climbs the stairs
+# with foot placement, 38 adds the sword's one piece, 39 draws the bird's 7, the fish's 4 and the
+# cart's 5 (its knuckles have no voxels); 41 is 33's pair under a roof of leaves, the plain walker's
+# map shadow among the leaves' traced ones, shot at 1 s and 4 s for a trail; scene 40, the arena,
+# is for timing and stored nowhere). STRICT=1 holds a scene
 # to a difference of 4 in 0.05% of pixels: small text is few pixels. Line 9's note stands:
 # a new scene's first picture is left as test/golden/name.actual.ppm to be
 # looked at and stored by hand (gzip -9 -c it to test/golden/name.ppm.gz)
