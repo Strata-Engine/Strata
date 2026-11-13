@@ -124,7 +124,9 @@ Rejected.
   later; it is not designed here.
 - Compression beyond the chunk's own compact forms (uniform, paletted).
   Room is left (a per-region encoding byte).
-- Concurrent access: one store is open by one game process at a time.
+- Concurrent access: one store is open by one game process at a time. A
+  lock file makes a second `open` refuse instead of corrupting the store
+  (designer's call, added while planning).
 
 ## Anti-goals
 
@@ -199,7 +201,7 @@ region's sections: name to bytes.
 
 ### 4. Saving as it plays
 
-`Strata.Save.tick(store, stream)` is called once a frame, after
+`Strata.Save.tick(store, stream, dt)` is called once a frame, after
 `Strata.Stream.tick`:
 
 - It takes the keys of chunks edited, unloaded edited, or queued since the
@@ -256,7 +258,7 @@ the player disturbed starts moving again.
 ### 6. Settling
 
 The store saves continuously, so it does not settle anything on its own.
-`Strata.Save.flush(store, world, physics, entities)` is what a game calls
+`Strata.Save.flush(store, stream, physics, snapshot)` is what a game calls
 when it quits or leaves a world: it writes every loose physics body into the
 world as blocks (`Strata.Physics.to_blocks`), takes a final entity snapshot,
 writes every dirty region and the header, and waits for the writes. A game
@@ -280,12 +282,12 @@ the game's.
     Strata.Save.identity(dir)                        -- Option((seed, scale, generator_version)), read before building the generator
     Strata.Save.open(dir, world, generator_version)  -- Result((Store, World), String)
     Strata.Save.set_generator_version(store, v)      -- after Strata.World.regenerate
-    Strata.Save.tick(store, stream)                  -- once a frame
+    Strata.Save.tick(store, stream, dt)              -- once a frame; dt drives the quiet time and header interval
     Strata.Save.set_entities(store, snapshot)        -- the game hands a snapshot when it likes; tick writes it on the header interval
     Strata.Save.entities(store)                      -- Option(Snapshot), for restore
     Strata.Save.edited_keys(store)                   -- for waking the fluid after a load
-    Strata.Save.flush(store, world, physics, entities)
-    Strata.Save.close(store)                         -- flush, then release
+    Strata.Save.flush(store, stream, physics, snapshot)
+    Strata.Save.close(store, stream, physics, snapshot)   -- flush, then release
     Strata.Save.stats(store)                         -- dirty regions, writes in flight, writes failed, damaged regions set aside
     sections, region sections, players: section 7
 
