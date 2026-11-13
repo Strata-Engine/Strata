@@ -58,16 +58,16 @@ static int an_x_mask_id(int64_t fig, int64_t m) {
 
 /* The world's generation and next figure id, carried across open and close:
  * each open is one generation on (the renderer re-uploads rigs held from an
- * older one, since rig ids start again at 0), and figure ids carry on, so an
- * id held from a closed world does not name a figure of the new one. */
+ * older one, since rig ids start again at 0). Figure ids start again at 0 too,
+ * as rig and clip ids do: a game's run hashes alike whichever world it ran in
+ * (the entity layer hashes the figure ids its entities hold). */
 static uint32_t g_gen;
-static int32_t g_next_id;
-static void an_x_keep(void) { if (g_w) { g_gen = g_w->generation; g_next_id = g_w->next_id; } }
+static void an_x_keep(void) { if (g_w) g_gen = g_w->generation; }
 
 int64_t an_x_open(int64_t capacity) {
     an_x_keep();
     an_close(g_w);
-    g_w = an_open_next((int)capacity, g_gen, g_next_id);
+    g_w = an_open_next((int)capacity, g_gen, 0);
     g_gen += 1;                                /* a failed open is a generation too: nothing of the last is held */
     for (int i = 0; i < AN_RIGS; i++) { g_mask_base[i] = 0; g_mask_n[i] = 0; }
     return g_w ? 1 : 0;
