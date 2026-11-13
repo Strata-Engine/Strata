@@ -804,7 +804,8 @@ mod Strata.Test.Populate do
   pfn index_for_rot(seed : Int, salt : Int, rot : Int, i : Int) : Int do
     if site_rot(seed, salt, i) == rot do i else index_for_rot(seed, salt, rot, i + 1) end
   end
-  -- A 9 x 12 x 9 lump authored at 1 m, fitted to s, on one site across
+  -- A 9 x 12 x 5 lump (its footprint not square, so a quarter turn swaps
+  -- its sides) authored at 1 m, fitted to s, on one site across
   -- x = 32 (8 m at 0.25 m) and y = 32 voxels, turned rot (its index found by
   -- search): every chunk its box meets, each from a Ground of its own 32 x
   -- 32 columns, is the test's own stamp, and together they hold the
@@ -812,7 +813,7 @@ mod Strata.Test.Populate do
   pfn site_border_case(s : Float, rot : Int) : String do
     let index = index_for_rot(5, 9, rot, 0)
     let st = Pn.site(32.0 *. s -. 0.3 *. s, 10.2 *. s, 25.3 *. s, 9.0, index)
-    let f = fit_of(site_pop([lump(9, 12, 9, 1.0)], [st], 2.0, 9), s)
+    let f = fit_of(site_pop([lump(9, 12, 5, 1.0)], [st], 2.0, 9), s)
     match Pn.shape_set_templates(f, 0) do
       Nil -> "no template"
       Cons(t, _) ->
@@ -1566,6 +1567,7 @@ mod Strata.Test.Populate do
       Test.assert_eq_str(float_to_string(NativeArray.get_f32(big, (42 + 16) + 96 * (40 + 16))), "1.", "(42, 40) is in both radii, nearer P: P's floor")
       Test.assert_eq_str(float_to_string(NativeArray.get_f32(big, (45 + 16) + 96 * (40 + 16))), "9.", "(45, 40) is nearer Q: Q's floor")
       Test.assert_eq_str(float_to_string(NativeArray.get_f32(big, (40 + 16) + 96 * (44 + 16))), "1.", "(40, 44) is in P's radius alone")
+      Test.assert_eq_str(float_to_string(NativeArray.get_f32(big, (43 + 16) + 96 * (40 + 16))), "9.", "(43, 40) is 3 m from both: the tie goes to Q, first in run order")
       Test.assert_eq_str(float_to_string(NativeArray.get_f32(big, (70 + 16) + 96 * (70 + 16))), "20.", "C, far off, holds its floor")
     end
 
@@ -1599,6 +1601,42 @@ mod Strata.Test.Populate do
       Test.assert_eq_int(List.length(List.filter(List.range(0, 64), fn c -> NativeArray.get_u8(Pq.adapted(none, 6, 8, 8, 1.0), c) != 0)), 0, "and no marks")
       Test.assert_eq_int(NativeArray.length_u8(Pq.adapted(f, 0, 0, 0, 1.0)), 0, "n of 0: no marks")
       Test.assert_eq_int(List.length(List.filter(List.range(0, 64), fn c -> NativeArray.get_u8(Pq.adapted(f, 6, 8, 8, 0.0), c) != 0)), 0, "a scale of 0: no marks")
+    end
+
+    test "adapt: a site beyond an area's last column whose margin reaches that column's centre by under half a column is counted, east and north" do
+      let p0 = Pn.shapes_templates(Pn.new(), "halls", [solid(1, 1, 1, 5, 1.0)])
+      let f = frozen_of(Pn.layer_site(p0, "ruins", "halls", [Pn.site(30.0, 5.5, 3.0, 2.0, 0), Pn.site(21.5, 16.0, 4.0, 2.0, 1)], 2.6, 3))
+      let big = Pq.adapt(f, -16, -16, 96, 1.0, plane_heights(-16, -16, 96, 0.3, 0.1))
+      let small = Pq.adapt(f, 17, 3, 9, 1.0, plane_heights(17, 3, 9, 0.3, 0.1))
+      Test.assert_eq_str(crop_diff(small, big, 17, 3, 9), "", "9 x 9 at (17, 3) is the large area cropped")
+      Test.assert_true(NativeArray.get_f32(small, 8 + 9 * 2) != 0.3 *. 25.0 +. 0.1 *. 5.0, "column (25, 5), 4.5 m from the east site (reach 4.6), is drawn")
+      Test.assert_true(NativeArray.get_f32(small, 4 + 9 * 8) != f32_of(0.3 *. 21.0 +. 0.1 *. 11.0), "column (21, 11), 4.5 m from the north site, is drawn")
+      Test.assert_eq_int(NativeArray.get_u8(Pq.adapted(f, 17, 3, 9, 1.0), 8 + 9 * 2), 1, "and marked")
+      Test.assert_eq_int(NativeArray.get_u8(Pq.adapted(f, 17, 3, 9, 1.0), 4 + 9 * 8), 1, "the north one too")
+    end
+
+    test "adapt: a margin so wide that t underflows still gives a finite height at the floor's blend (t is held at 10^-9 or more)" do
+      let f = frozen_of(site_pop([solid(1, 1, 1, 5, 1.0)], [Pn.site(4.5, 4.5, 3.0, 2.9999999999, 0)], Math.pow(10.0, 300.0), 3))
+      let out = Pq.adapt(f, 0, 0, 8, 1.0, NativeArray.make_f32(64, 50.0))
+      -- column (7, 4) is 3 m from the centre, 10^-10 outside the radius: t would be about 10^-310
+      let h = NativeArray.get_f32(out, 7 + 8 * 4)
+      Test.assert_true(near(h, 3.0, 0.000001), "the height is the floor's blend, " ++ float_to_string(h))
+      Test.assert_true(NativeArray.get_f32(out, 4 + 8 * 4) == 3.0, "the centre is at the floor")
+    end
+
+    test "adapt and adapted: a corner beyond 2^40 either way is refused, the heights back unchanged, the marks 0" do
+      let f = frozen_of(site_pop([solid(1, 1, 1, 5, 1.0)], [Pn.site(0.5, 0.5, 3.0, 2.0, 0)], 2.0, 3))
+      let hs = NativeArray.make_f32(4, 7.0)
+      List.fold_left([(4611686018427387903, 0), (0, 4611686018427387903), (0 - 4611686018427387903 - 1, 0), (1099511627777, 0), (0, 0 - 1099511627777)], (), fn (_, xz) ->
+        match xz do
+          (x0, z0) ->
+            let out = Pq.adapt(f, x0, z0, 2, 1.0, hs)
+            Test.assert_true(List.all(List.range(0, 4), fn c -> NativeArray.get_f32(out, c) == 7.0), "corner " ++ int_to_string(x0) ++ ", " ++ int_to_string(z0) ++ ": heights unchanged")
+            let m = Pq.adapted(f, x0, z0, 2, 1.0)
+            Test.assert_eq_int(NativeArray.length_u8(m), 4, "a mark a column")
+            Test.assert_true(List.all(List.range(0, 4), fn c -> NativeArray.get_u8(m, c) == 0), "all 0")
+        end)
+      Test.assert_true(NativeArray.get_f32(Pq.adapt(f, 0, 0, 2, 1.0, hs), 0) == 3.0, "at (0, 0) the site holds column 0 at its floor")
     end
 
     test "place: a site's template stands with its lowest row on the voxel above its floor, every footprint column with ground directly under it once tops are re-derived from adapt" do
