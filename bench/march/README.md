@@ -33,7 +33,7 @@ and calls a runtime helper for `/` and `%` (`divmod`).
 | `short_circuit` | `&&` runs its right side (S16) | 18.2 ns | 0.28 ns | 65 |
 | `list_walk` | a List of Float tuples walked per column | 11.0 ns | 2.2 ns | 5 |
 | `divmod` | `/` and `%` by a constant | 2.44 ns | 0.85 ns | 2.9 |
-| `stamp_loop` | `Strata.Template.blit`'s loop: a tuple answered, two calls and the template's reference count per voxel | 31 to 50 ns | 1.3 ns | 41 (instructions) |
+| `stamp_loop` | `Strata.Template.blit`'s loop: a tuple answered per voxel, and accessors that own their argument across a module boundary | 829 instructions (545 in one module) | 14.4 instructions | 58 (38) |
 | `stage_thermal` | Strata.Thermal.relax, whole stage | 110 ns | 3.2 ns | 34 |
 | `stage_density` | the viewer's per-voxel density, whole stage | 71 to 85 ns | 2.7 ns | 26 to 31 |
 

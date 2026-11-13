@@ -371,18 +371,30 @@ with each arm on its own line parses. A one-line match with one arm
 (`match a do (x, _) -> x end`) is fine. Workaround: put each arm on its own
 line.
 
-## S40: a small function answering a tuple, called per voxel, allocates; a constructor read through accessors is counted per call
+## S40: a small function answering a tuple, called per voxel, allocates; across a module boundary an accessor owns its argument
 
 `Strata.Template.blit` undoes the quarter turn per voxel with
 `unturn(t, rot, rx, rz) : (Int, Int)` and reads the template (a seven-field
-constructor) through `t_sx(t)`, `t_ids(t)` and the like. Compiled, the tuple
-is allocated and freed every voxel (about 190 instructions), `unturn` and
-`drawn` are real calls, and the template's reference count is raised and
-lowered around them. `bench/march/stamp_loop` is the loop alone against C:
-582 instructions a template voxel against 14 (395 with the turn as two
-Int-valued functions). Met measuring scatter layers
-(`bench/populate_fields` mode 8: 13.7 M of 23.9 M instructions a chunk with
-27 stamps in reach). The Strata code is left plain; wanted from March: a
-tuple answered by a small function kept out of the heap (or the function
-inlined), and a borrowed constructor argument not counted per call.
+constructor holding three arrays) through `t_sx(t)`, `t_ids(t)` and the
+like. Two costs, both in `bench/march/stamp_loop` against C (14 instructions
+a template voxel):
 
+- The tuple is allocated and freed every voxel: 160 to 190 instructions.
+  The loop is 545 to 587 instructions a voxel with it and 386 to 395 with
+  the turn as two Int-valued functions.
+- Compiled in the program's own module, an accessor borrows the template
+  (`t_sx`: 24 instructions, no reference count touched). Compiled as a
+  second module, as every library function is, the same accessor takes it
+  owned: the caller raises the template's count, the accessor lowers it,
+  raises the count of each array field and lowers them again (157
+  instructions, seven reference-count calls). The same loop is then 829 to
+  834 instructions a voxel. Making the accessors private to their module
+  was tried and changed nothing measurable (834), though that build was
+  reported as cached and is not relied on.
+
+Met measuring scatter layers (`bench/populate_fields` mode 8: 11.8 M of
+24.1 M instructions a chunk with 27 stamps are this loop, 781 a voxel
+visited; mode 12 is blit alone). The Strata code is left plain; wanted from
+March: a tuple answered by a small function kept out of the heap (or the
+function inlined), and a constructor argument that is only read borrowed
+across modules as it is within one.

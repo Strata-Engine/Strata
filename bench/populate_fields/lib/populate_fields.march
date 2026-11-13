@@ -31,18 +31,29 @@
 --            half the columns), then "moss" of block 9 at 0.2
 --   MODE=8   place_with, one scatter layer of a 9 x 12 x 9 template (a
 --            quarter of it holes) at 1 m, one instance in every 8 m cell
---            (jitter 0.6), on a flat floor at y 10: about 20 instances
---            reach the chunk (the count is printed), each blitted through
+--            (jitter 0.6), on a flat floor at y 10: 27 stamps meet the
+--            chunk, 15144 voxels of them inside it, 11358 not holes (all
+--            three printed, worked out from the instance list), each
+--            blitted through
 --            Strata.Template.blit; the Ground is the chunk and pad (6)
 --            columns a side, the Table built once outside the loop
 --   MODE=9   the same population fitted to 0.25 m (the template 36 x 48 x
---            36, the chunk 8 m across, pad 19): the instances of up to
---            nine cells reach the chunk, each covering most of it
+--            36, the chunk 8 m across, pad 19): 4 stamps meet the chunk,
+--            26964 voxels of them inside it, 20217 not holes
 --   MODE=10  mode 8's population over a Ground whose tops are 1000 voxels
 --            below the chunk but for one corner column of the pad: the
 --            cells are walked and the instances listed as in mode 8, and
 --            no stamp meets the chunk, so mode 8 less this is what the
 --            blits cost
+--   MODE=11  a cover layer (block 7 at 0.3) and a scatter layer of 1 x 30 x
+--            1 posts on that floor, for the chunk above (y 32..63): no
+--            floor is in it, only the posts' tops reach it, so no cover
+--            layer should make a pass
+--   MODE=12  Strata.Template.blit alone: the 9 x 12 x 9 lump blitted whole
+--            into a chunk with a floor at y 10, at (10, 11, 10), the turn
+--            going round with the call: 972 voxels visited a call, 729 of
+--            them not holes. bench/march/stamp_loop is this loop outside
+--            the library, without the draws and the chunk
 --   REPS=n   calls
 mod PopulateFields do
 
@@ -168,12 +179,16 @@ mod PopulateFields do
   end
 
   pfn lump_id(x : Int, y : Int, z : Int) : Int do if (3 * x + y + 5 * z) % 4 == 0 do 0 else 2 + (x + 2 * y + 3 * z) % 5 end end
-  pfn lump_go(a : NativeI32Arr, i : Int) : NativeI32Arr do
-    if i >= 972 do a else lump_go(NativeArray.set_i32(a, i, lump_id(i % 9, (i / 9) % 12, i / 108)), i + 1) end
+  pfn lump_fill(a : NativeI32Arr, sx : Int, sy : Int, i : Int, n : Int) : NativeI32Arr do
+    if i >= n do a else lump_fill(NativeArray.set_i32(a, i, lump_id(i % sx, (i / sx) % sy, i / (sx * sy))), sx, sy, i + 1, n) end
   end
-  pfn scatter_frozen(scale : Float) : Strata.Population.Frozen do
-    let t = Strata.Template.make(9, 12, 9, lump_go(NativeArray.make_i32(972, 0), 0), 1.0)
-    let p = Pb.layer_scatter(Pb.shapes_templates(Pb.new(), "s", [t]), "trees", "s", Pb.rule(0.015625, Nil, Nil, Nil), 8.0, 0.6, 5)
+  -- one scatter layer "trees" of an sx x sy x sz lump authored at 1 m, one a cell of 8 m, fitted to scale; with_cover: a cover layer of block 7 at 0.3 before it
+  pfn scatter_frozen(scale : Float, sx : Int, sy : Int, sz : Int, with_cover : Bool) : Strata.Population.Frozen do
+    let n = sx * sy * sz
+    let t = Strata.Template.make(sx, sy, sz, lump_fill(NativeArray.make_i32(n, 0), sx, sy, 0, n), 1.0)
+    let p0 = Pb.shapes_blocks(Pb.shapes_templates(Pb.new(), "s", [t]), "g", [7])
+    let p1 = if with_cover do Pb.layer_cover(p0, "grass", "g", Pb.rule(0.3, Nil, Nil, Nil), 3) else p0 end
+    let p = Pb.layer_scatter(p1, "trees", "s", Pb.rule(0.015625, Nil, Nil, Nil), 8.0, 0.6, 5)
     match Pb.freeze(p) do
       Err(m) -> panic(m)
       Ok(f) ->
@@ -192,18 +207,83 @@ mod PopulateFields do
     let n = 32 + 2 * m
     Strata.Populate.ground(0 - m, 0 - m, n, scale, 0, NativeArray.set_int(NativeArray.make_int(n * n, -1000), 0, 10), NativeArray.make_int(n * n, -1))
   end
-  -- MODE 8, 9, 10: one scatter layer; the checksum's millions are how many instances stand within the template's half-width of the chunk
+
+  -- What the stamps of a chunk at ky amount to, from the instance list: how
+  -- many instances' boxes meet the chunk (0, ky, 0), how many voxels of
+  -- those boxes lie in it (what blit visits), and how many of them are not
+  -- holes. The box and the turn are Strata.Populate's and Strata.Template's
+  -- rules written out again.
+  pfn clip_lo(a : Int, q : Int) : Int do if a > q do a else q end end
+  pfn clip_hi(a : Int, q : Int) : Int do if a < q + 31 do a else q + 31 end end
+  pfn solid_at(t : Strata.Template.Template, rot : Int, rx : Int, y : Int, rz : Int) : Int do
+    let sx = Strata.Template.t_sx(t)
+    let sz = Strata.Template.t_sz(t)
+    let r = int_and(rot, 3)
+    let tx = if r == 0 do rx else if r == 1 do rz else if r == 2 do sx - 1 - rx else sx - 1 - rz end end end
+    let tz = if r == 0 do rz else if r == 1 do sz - 1 - rx else if r == 2 do sz - 1 - rz else rx end end end
+    if NativeArray.get_i32(Strata.Template.t_ids(t), tx + sx * (y + Strata.Template.t_sy(t) * tz)) == 0 do 0 else 1 end
+  end
+  pfn solid_go(t : Strata.Template.Template, rot : Int, ox : Int, oy : Int, oz : Int, x0 : Int, x1 : Int, y1 : Int, z0 : Int, z1 : Int, x : Int, y : Int, z : Int, acc : Int) : Int do
+    if y > y1 do acc
+    else if z > z1 do solid_go(t, rot, ox, oy, oz, x0, x1, y1, z0, z1, x0, y + 1, z0, acc)
+    else if x > x1 do solid_go(t, rot, ox, oy, oz, x0, x1, y1, z0, z1, x0, y, z + 1, acc)
+    else solid_go(t, rot, ox, oy, oz, x0, x1, y1, z0, z1, x + 1, y, z, acc + solid_at(t, rot, x - ox, y - oy, z - oz)) end end end
+  end
+  pfn stats_go(t : Strata.Template.Template, voxel : Float, qy : Int, xs : List(Strata.Populate.PopInstance), n : Int, visited : Int, solid : Int) : (Int, Int, Int) do
+    match xs do
+      Nil -> (n, visited, solid)
+      Cons(i, rest) ->
+        let rot = Strata.Populate.i_rot(i)
+        match Strata.Template.bounds(t, 0, 0, 0, rot) do
+          (_, _, _, w1, h1, d1) ->
+            let ox = float_to_int(Math.floor(Strata.Populate.i_xm(i) /. voxel)) - (w1 + 1) / 2
+            let oz = float_to_int(Math.floor(Strata.Populate.i_zm(i) /. voxel)) - (d1 + 1) / 2
+            let oy = Strata.Populate.i_top(i) + 1
+            let x0 = clip_lo(ox, 0)
+            let x1 = clip_hi(ox + w1, 0)
+            let y0 = clip_lo(oy, qy)
+            let y1 = clip_hi(oy + h1, qy)
+            let z0 = clip_lo(oz, 0)
+            let z1 = clip_hi(oz + d1, 0)
+            let hit = if x0 <= x1 do (if y0 <= y1 do z0 <= z1 else false end) else false end
+            if hit do stats_go(t, voxel, qy, rest, n + 1, visited + (x1 - x0 + 1) * (y1 - y0 + 1) * (z1 - z0 + 1), solid + solid_go(t, rot, ox, oy, oz, x0, x1, y1, z0, z1, x0, y0, z0, 0))
+            else stats_go(t, voxel, qy, rest, n, visited, solid) end
+        end
+    end
+  end
+
+  -- MODE 8 to 11: scatter; prints how many instances' stamps meet the chunk, the voxels blit visits and how many of them are not holes
   pfn scatter_mode(mode : Int, reps : Int) : Float do
     let scale = if mode == 9 do 0.25 else 1.0 end
-    let f = scatter_frozen(scale)
+    let f = if mode == 11 do scatter_frozen(scale, 1, 30, 1, true) else scatter_frozen(scale, 9, 12, 9, false) end
     let p = Strata.Populate.plan(f)
     let g = if mode == 10 do sunk(Strata.Populate.plan_pad(p, scale), scale) else flat(Strata.Populate.plan_pad(p, scale), scale) end
     let t = Strata.Populate.fields_with(p, 5, g)
-    let near = flat(if mode == 9 do 18 else 4 end, scale)
-    let count = List.length(Strata.Populate.instances(f, 5, Strata.Populate.fields(f, 5, near), near, "trees"))
+    let ky = if mode == 11 do 1 else 0 end
+    let c = if mode == 11 do Strata.Chunk.uniform(0) else Strata.Chunk.fill_box(Strata.Chunk.uniform(0), 0, 0, 0, 31, 10, 31, 1) end
+    let stats = match Strata.Population.shape_set_templates(f, 0) do
+      Cons(tp, _) -> stats_go(tp, scale, 32 * ky, Strata.Populate.instances(f, 5, Strata.Populate.fields(f, 5, g), g, "trees"), 0, 0, 0)
+      Nil -> (0, 0, 0)
+    end
+    match stats do
+      (n, visited, solid) ->
+        let _ = Authority.must(println("populate_fields: mode " ++ int_to_string(mode) ++ ": " ++ int_to_string(n) ++ " stamps meet the chunk, " ++ int_to_string(visited) ++ " voxels visited, " ++ int_to_string(solid) ++ " not holes"))
+        int_to_float(place_go(p, Strata.Coord.key(0, ky, 0), c, g, t, reps, 0))
+    end
+  end
+
+  pfn blit_go(c : Strata.Chunk.Chunk, k : Strata.Coord.Key, t : Strata.Template.Template, n : Int, acc : Int) : Int do
+    if n <= 0 do acc
+    else
+      let out = Strata.Template.blit(c, k, t, 10, 11, 10, n, 77 + n)
+      blit_go(c, k, t, n - 1, acc + Strata.Chunk.get_or(out, 14, 13, 15, 0))
+    end
+  end
+  -- MODE 12: Strata.Template.blit alone
+  pfn blit_mode(reps : Int) : Float do
+    let t = Strata.Template.make(9, 12, 9, lump_fill(NativeArray.make_i32(972, 0), 9, 12, 0, 972), 1.0)
     let c = Strata.Chunk.fill_box(Strata.Chunk.uniform(0), 0, 0, 0, 31, 10, 31, 1)
-    let sum = place_go(p, Strata.Coord.key(0, 0, 0), c, g, t, reps, 0)
-    int_to_float(sum + 1000000 * count)
+    int_to_float(blit_go(c, Strata.Coord.key(0, 0, 0), t, reps, 0))
   end
 
   -- MODE 4, 5, 6: place_with reps times; a checksum of voxels read back
@@ -224,7 +304,7 @@ mod PopulateFields do
     let g = ground()
     let a = random_go(NativeArray.make_f32(1024, 0.0), 3, 0.0, 100.0, 0)
     let b = random_go(NativeArray.make_f32(1024, 0.0), 4, 0.0, 1.0, 0)
-    let sum = if mode == 1 do fields_go(p, g, reps, 0.0) else if mode == 7 do two_mode(reps) else if mode >= 8 do scatter_mode(mode, reps) else if mode >= 4 do place_mode(mode, reps) else curves_go(a, b, pts(), mode == 2, reps, 0.0) end end end end
+    let sum = if mode == 1 do fields_go(p, g, reps, 0.0) else if mode == 7 do two_mode(reps) else if mode == 12 do blit_mode(reps) else if mode >= 8 do scatter_mode(mode, reps) else if mode >= 4 do place_mode(mode, reps) else curves_go(a, b, pts(), mode == 2, reps, 0.0) end end end end end
     Authority.must(println("populate_fields: mode " ++ int_to_string(mode) ++ " reps " ++ int_to_string(reps) ++ " checksum " ++ float_to_string(sum)))
   end
 end

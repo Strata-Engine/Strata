@@ -917,13 +917,18 @@ mod Strata.Populate do
 
   -- a0..a1 meets the 32 voxels from b0
   pfn meets(a0 : Int, a1 : Int, b0 : Int) : Bool do if a0 <= b0 + 31 do a1 >= b0 else false end end
+  -- the h1 + 1 voxels standing on a top (top + 1 .. top + 1 + h1) meet the 32
+  -- voxels from b0; the top is compared before anything is added to it, so a
+  -- top at either end of Int traps nothing (as the cover placer compares)
+  pfn stands_in(top : Int, h1 : Int, b0 : Int) : Bool do if top <= b0 + 30 do top >= b0 - 1 - h1 else false end end
 
   -- The instances xs of one layer stamped into chunk k in order. A template
   -- (variant v of ts) turned rot is w x h x d; it starts w / 2 and d / 2
   -- columns before the instance's column and one voxel above its top, and
   -- Strata.Template.blit writes the part of it inside the chunk. A layer of
   -- blocks (nb of them, at ids[vat ..]) writes its variant's block at that
-  -- one voxel. Returns the chunk and how many instances met it.
+  -- one voxel. top + 1 is worked out only for an instance stands_in found
+  -- in the chunk. Returns the chunk and how many instances met it.
   pfn stamp_go(c : Strata.Chunk.Chunk, k : Strata.Coord.Key, ts : List(Strata.Template.Template), ids : NativeIntArr, vat : Int, nb : Int, voxel : Float, xs : List(PopInstance), wrote : Int) : (Strata.Chunk.Chunk, Int) do
     match xs do
       Nil -> (c, wrote)
@@ -933,20 +938,19 @@ mod Strata.Populate do
         let qx = 32 * Strata.Coord.kx(k)
         let qy = 32 * Strata.Coord.ky(k)
         let qz = 32 * Strata.Coord.kz(k)
-        let oy = top + 1
         match List.nth_opt(ts, v) do
           Some(tp) ->
             match Strata.Template.bounds(tp, 0, 0, 0, rot) do
               (_, _, _, w1, h1, d1) ->
                 let ox = wx - (w1 + 1) / 2
                 let oz = wz - (d1 + 1) / 2
-                let hit = if meets(ox, ox + w1, qx) do (if meets(oy, oy + h1, qy) do meets(oz, oz + d1, qz) else false end) else false end
-                if hit do stamp_go(Strata.Template.blit(c, k, tp, ox, oy, oz, rot, stream), k, ts, ids, vat, nb, voxel, rest, wrote + 1)
+                let hit = if stands_in(top, h1, qy) do (if meets(ox, ox + w1, qx) do meets(oz, oz + d1, qz) else false end) else false end
+                if hit do stamp_go(Strata.Template.blit(c, k, tp, ox, top + 1, oz, rot, stream), k, ts, ids, vat, nb, voxel, rest, wrote + 1)
                 else stamp_go(c, k, ts, ids, vat, nb, voxel, rest, wrote) end
             end
           None ->
-            let hit = if v < nb do (if meets(wx, wx, qx) do (if meets(oy, oy, qy) do meets(wz, wz, qz) else false end) else false end) else false end
-            if hit do stamp_go(Strata.Chunk.set_idx(c, Strata.Chunk.index((wx - qx) + 32 * ((wz - qz) + 32 * (oy - qy))), NativeArray.get_int(ids, vat + v)), k, ts, ids, vat, nb, voxel, rest, wrote + 1)
+            let hit = if v < nb do (if stands_in(top, 0, qy) do (if meets(wx, wx, qx) do meets(wz, wz, qz) else false end) else false end) else false end
+            if hit do stamp_go(Strata.Chunk.set_idx(c, Strata.Chunk.index((wx - qx) + 32 * ((wz - qz) + 32 * (top + 1 - qy))), NativeArray.get_int(ids, vat + v)), k, ts, ids, vat, nb, voxel, rest, wrote + 1)
             else stamp_go(c, k, ts, ids, vat, nb, voxel, rest, wrote) end
         end
     end
@@ -967,23 +971,28 @@ mod Strata.Populate do
 
   -- ── Placing a chunk ───────────────────────────────────────────────────────
 
-  -- the layers from l in run order, each dispatched on its kind (scatter: whether some top of the Ground can put a stamp in the chunk)
-  pfn layers_place(p : PopPlan, base : CoverRun, seed : Int, k : Strata.Coord.Key, g : Ground, t : Table, scatter : Bool, c : Strata.Chunk.Chunk, wrote : Int, l : Int) : (Strata.Chunk.Chunk, Int) do
+  -- the layers from l in run order, each dispatched on its kind. cover:
+  -- whether some floor of the Ground lies in the chunk's reach (without one
+  -- no cover layer makes its pass); scatter: whether some top of the Ground
+  -- can put a stamp in the chunk.
+  pfn layers_place(p : PopPlan, base : CoverRun, seed : Int, k : Strata.Coord.Key, g : Ground, t : Table, cover : Bool, scatter : Bool, c : Strata.Chunk.Chunk, wrote : Int, l : Int) : (Strata.Chunk.Chunk, Int) do
     if l >= p.pl_nl do (c, wrote)
     else
       let kind = NativeArray.get_int(p.pl_lkind, l)
       if kind == 0 do
-        match cover_layer(p, base, c, l) do
-          (c2, w) -> layers_place(p, base, seed, k, g, t, scatter, c2, wrote + w, l + 1)
-        end
+        if cover do
+          match cover_layer(p, base, c, l) do
+            (c2, w) -> layers_place(p, base, seed, k, g, t, cover, scatter, c2, wrote + w, l + 1)
+          end
+        else layers_place(p, base, seed, k, g, t, cover, scatter, c, wrote, l + 1) end
       else if kind == 1 do
         if scatter do
           match scatter_layer(p, seed, k, g, t, c, l) do
-            (c2, w) -> layers_place(p, base, seed, k, g, t, scatter, c2, wrote + w, l + 1)
+            (c2, w) -> layers_place(p, base, seed, k, g, t, cover, scatter, c2, wrote + w, l + 1)
           end
-        else layers_place(p, base, seed, k, g, t, scatter, c, wrote, l + 1) end
+        else layers_place(p, base, seed, k, g, t, cover, scatter, c, wrote, l + 1) end
       -- site layers: the chunk passes through
-      else layers_place(p, base, seed, k, g, t, scatter, c, wrote, l + 1) end end
+      else layers_place(p, base, seed, k, g, t, cover, scatter, c, wrote, l + 1) end end
     end
   end
 
@@ -1029,7 +1038,7 @@ mod Strata.Populate do
     else List.append(gp, level) end
   end
 
-  doc "The chunk at key k with plan p's layers placed, in run order, over Ground g, whose fields t holds (t = fields_with(p, seed, g)). Cover and scatter layers, at level 0 only; site layers pass the chunk through. A cover layer visits each floor of each of the chunk's columns (g's surfaces, or one floor at tops[col]); where the voxel above the floor is air and inside the chunk it rolls Strata.Seed.unit(Strata.Seed.cell(seed, salt, wx, y, wz)) at the floor's world voxel against the layer's density times the column's area (voxel size squared), and on success writes a variant's block id there: the variant comes from Strata.Seed.next of the same hash, against the weights of the first weighted zone (declaration order) the column is in, else uniformly. A written block is not air, so a later cover layer never overwrites it. A scatter layer is Strata.Feature cells of its cell size, jitter and salt: a cell holds an instance with probability density * cell * cell (at most 1), the density read at the column the candidate stands on; its variant comes from the candidate's index against the same weights; a template variant, turned the candidate's quarter turn (w x d columns), is blitted with the candidate's stream from w / 2 and d / 2 columns (rounded down) before that column and one voxel above its top (tops, whatever the surfaces), the part inside the chunk written over whatever is there (holes leave it); a block variant is written at that one voxel. Instances of one layer are stamped in cell order (rows of z, x increasing), layers in run order, so where stamps overlap the later is on top, the same from every chunk. Every voxel is a function of its world position, the seed and the ground under the instances that reach it: any g that covers what is needed gives the same chunk. g may be larger than the chunk; its corner and the key's 32 * kx, 32 * kz place the chunk's columns in it. The chunk comes back unchanged (the same value) when nothing is written: at a level above 0, with no cover or scatter layer, when no floor of g reaches the chunk and no top of g can put a stamp in it, or when something is wrong, which place_problems words: g does not cover the chunk's 32 x 32 columns (and, with a scatter layer, plan_pad more on each side), has problems or is at another level than k, t is not n * n columns or holds another layer or zone count than p, or a scatter layer's template is not at g's voxel size. A layer whose density is 0 at every column of g costs no pass. The chunk handed in is never changed."
+  doc "The chunk at key k with plan p's layers placed, in run order, over Ground g, whose fields t holds (t = fields_with(p, seed, g)). Cover and scatter layers, at level 0 only; site layers pass the chunk through. A cover layer visits each floor of each of the chunk's columns (g's surfaces, or one floor at tops[col]); where the voxel above the floor is air and inside the chunk it rolls Strata.Seed.unit(Strata.Seed.cell(seed, salt, wx, y, wz)) at the floor's world voxel against the layer's density times the column's area (voxel size squared), and on success writes a variant's block id there: the variant comes from Strata.Seed.next of the same hash, against the weights of the first weighted zone (declaration order) the column is in, else uniformly. A written block is not air, so a later cover layer never overwrites it. A scatter layer is Strata.Feature cells of its cell size, jitter and salt: a cell holds an instance with probability density * cell * cell (at most 1), the density read at the column the candidate stands on; its variant comes from the candidate's index against the same weights; a template variant, turned the candidate's quarter turn (w x d columns), is blitted with the candidate's stream from w / 2 and d / 2 columns (rounded down) before that column and one voxel above its top (tops, whatever the surfaces), the part inside the chunk written over whatever is there (holes leave it); a block variant is written at that one voxel. Instances of one layer are stamped in cell order (rows of z, x increasing), layers in run order, so where stamps overlap the later is on top, the same from every chunk. Every voxel is a function of its world position, the seed and the ground under the instances that reach it: any g that covers what is needed gives the same chunk. g may be larger than the chunk; its corner and the key's 32 * kx, 32 * kz place the chunk's columns in it. The chunk comes back unchanged (the same value) when nothing is written: at a level above 0, with no cover or scatter layer, when no floor of g reaches the chunk and no top of g can put a stamp in it, or when something is wrong, which place_problems words: g does not cover the chunk's 32 x 32 columns (and, with a scatter layer, plan_pad more on each side), has problems or is at another level than k, t is not n * n columns or holds another layer or zone count than p, or a scatter layer's template is not at g's voxel size. A layer whose density is 0 at every column of g costs no pass, and no cover layer makes a pass over a chunk that only stamps reach. A top or floor at either end of Int traps nothing. The chunk handed in is never changed."
   fn place_with(p : PopPlan, seed : Int, k : Strata.Coord.Key, c : Strata.Chunk.Chunk, g : Ground, t : Table) : Strata.Chunk.Chunk do
     let has_cover = p.pl_ncover > 0
     let has_scatter = p.pl_nscatter > 0
@@ -1051,7 +1060,7 @@ mod Strata.Populate do
                        cr_ids: p.pl_lids, cr_vat: 0, cr_vn: 0, cr_wzone: p.pl_wzone, cr_wbase: p.pl_wbase, cr_wcum: p.pl_wcum, cr_wat: 0, cr_wend: 0,
                        cr_n: g.pg_n, cr_ci: wx0 - g.pg_x0, cr_cj: wz0 - g.pg_z0, cr_wx0: wx0, cr_wz0: wz0, cr_ylo: ylo, cr_surf: g.pg_surf, cr_tops: g.pg_tops, cr_sat: g.pg_sat, cr_sys: g.pg_sys, cr_skind: g.pg_skind }
           -- set_idx writes into arrays the chunk handed in still holds, so they are copied on the first write (GAPS S30) and c is never changed
-          match layers_place(p, base, seed, k, g, t, scatter_reach, c, 0, 0) do
+          match layers_place(p, base, seed, k, g, t, cover_reach, scatter_reach, c, 0, 0) do
             (out, wrote) -> if wrote > 0 do out else c end
           end
         else c end

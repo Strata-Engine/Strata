@@ -423,19 +423,25 @@ mod Strata.Test.Populate do
   -- x = 32; every chunk its box meets is placed from that chunk's own Ground
   -- (the chunk and pad columns a side) and compared with the test's stamp of
   -- every instance of a 192 x 192 Ground. "" or what went wrong.
-  pfn crosses(i : Strata.Populate.PopInstance, t : Strata.Template.Template, voxel : Float, rot : Int) : Bool do
+  pfn crosses(i : Strata.Populate.PopInstance, t : Strata.Template.Template, voxel : Float, rot : Int, corner : Bool) : Bool do
     if Pq.i_rot(i) == rot do
       if between(vox(Pq.i_xm(i), voxel), 0, 63) do
-        if between(vox(Pq.i_zm(i), voxel), 0, 31) do
-          (if inst_ox(i, t, voxel) <= 31 do inst_ox(i, t, voxel) + turned_w(t, rot) - 1 >= 32 else false end)
+        if between(vox(Pq.i_zm(i), voxel), 0, if corner do 63 else 31 end) do
+          let over_x = if inst_ox(i, t, voxel) <= 31 do inst_ox(i, t, voxel) + turned_w(t, rot) - 1 >= 32 else false end
+          let over_z = if inst_oz(i, t, voxel) <= 31 do inst_oz(i, t, voxel) + turned_d(t, rot) - 1 >= 32 else false end
+          if over_x do (if corner do over_z else true end) else false end
         else false end
       else false end
     else false end
   end
-  pfn border_seed(f : Strata.Population.Frozen, big : Strata.Populate.Ground, t : Strata.Template.Template, voxel : Float, rot : Int, seed : Int, last : Int) : Int do
+  -- tops of an n x n Ground at (x0, z0): top_at of the world column, plus lift
+  pfn lifted_ground(x0 : Int, z0 : Int, n : Int, scale : Float, lift : Int) : Strata.Populate.Ground do
+    Pq.ground(x0, z0, n, scale, 0, List.fold_left(List.range(0, n * n), NativeArray.make_int(n * n, 0), fn (a, i) -> NativeArray.set_int(a, i, lift + top_at(x0 + i % n, z0 + i / n))), NativeArray.make_int(n * n, -1))
+  end
+  pfn border_seed(f : Strata.Population.Frozen, big : Strata.Populate.Ground, t : Strata.Template.Template, voxel : Float, rot : Int, corner : Bool, seed : Int, last : Int) : Int do
     if seed > last do -1
-    else if List.any(Pq.instances(f, seed, Pq.fields(f, seed, big), big, "trees"), fn i -> crosses(i, t, voxel, rot)) do seed
-    else border_seed(f, big, t, voxel, rot, seed + 1, last) end end
+    else if List.any(Pq.instances(f, seed, Pq.fields(f, seed, big), big, "trees"), fn i -> crosses(i, t, voxel, rot, corner)) do seed
+    else border_seed(f, big, t, voxel, rot, corner, seed + 1, last) end end
   end
   pfn keys_over(x0 : Int, y0 : Int, z0 : Int, x1 : Int, y1 : Int, z1 : Int) : List(Strata.Coord.Key) do
     List.flat_map(List.range(Strata.Coord.chunk_of(x0), Strata.Coord.chunk_of(x1) + 1), fn kx ->
@@ -444,28 +450,31 @@ mod Strata.Test.Populate do
   end
   pfn key_str(k : Strata.Coord.Key) : String do "(" ++ int_to_string(Strata.Coord.kx(k)) ++ ", " ++ int_to_string(Strata.Coord.ky(k)) ++ ", " ++ int_to_string(Strata.Coord.kz(k)) ++ ")" end
   -- over keys: (the first failure or "", non-air voxels found inside the box)
-  pfn border_keys(f : Strata.Population.Frozen, seed : Int, scale : Float, m : Int, ts : List(Strata.Template.Template), all : List(Strata.Populate.PopInstance), ks : List(Strata.Coord.Key), x0 : Int, y0 : Int, z0 : Int, x1 : Int, y1 : Int, z1 : Int, found : Int) : (String, Int) do
+  pfn border_keys(f : Strata.Population.Frozen, seed : Int, scale : Float, m : Int, lift : Int, ts : List(Strata.Template.Template), all : List(Strata.Populate.PopInstance), ks : List(Strata.Coord.Key), x0 : Int, y0 : Int, z0 : Int, x1 : Int, y1 : Int, z1 : Int, found : Int) : (String, Int) do
     match ks do
       Nil -> ("", found)
       Cons(k, rest) ->
-        let got = Pq.place(f, seed, k, air(), key_ground(k, m, scale))
+        let got = Pq.place(f, seed, k, air(), lifted_ground(32 * Strata.Coord.kx(k) - m, 32 * Strata.Coord.kz(k) - m, 32 + 2 * m, scale, lift))
         let want = stamp_all(air(), k, ts, scale, all)
-        if hash_of(got) == hash_of(want) do border_keys(f, seed, scale, m, ts, all, rest, x0, y0, z0, x1, y1, z1, found + filled_in(got, k, x0, y0, z0, x1, y1, z1))
+        if hash_of(got) == hash_of(want) do border_keys(f, seed, scale, m, lift, ts, all, rest, x0, y0, z0, x1, y1, z1, found + filled_in(got, k, x0, y0, z0, x1, y1, z1))
         else ("chunk " ++ key_str(k) ++ " is not the stamp of the instances (" ++ int_to_string(count_filled(got)) ++ " voxels for " ++ int_to_string(count_filled(want)) ++ ")", found) end
     end
   end
-  pfn border_case(scale : Float, rot : Int) : String do
+  -- corner: the stamp must cross z = 32 as well, and at least four chunks in
+  -- xz hold it; lift raises every top (15 puts tops at 20..30, so a 12-high
+  -- stamp crosses y = 32 and at least two chunks in y hold it).
+  pfn border_case(scale : Float, rot : Int, corner : Bool, lift : Int) : String do
     let f = fit_of(scatter_pop([lump(9, 12, 9, 1.0)], 1.0, 24.0, 0.6, 5), scale)
     let ts = Pn.shape_set_templates(f, 0)
-    let big = world_ground(-64, -64, 192, scale)
+    let big = lifted_ground(-64, -64, 192, scale, lift)
     match ts do
       Nil -> "no template"
       Cons(t, _) ->
-        let seed = border_seed(f, big, t, scale, rot, 1, 4000)
-        if seed < 0 do "no seed up to 4000 puts an instance across the border"
+        let seed = border_seed(f, big, t, scale, rot, corner, 1, 6000)
+        if seed < 0 do "no seed up to 6000 puts an instance across the border"
         else
           let all = Pq.instances(f, seed, Pq.fields(f, seed, big), big, "trees")
-          match List.find(all, fn i -> crosses(i, t, scale, rot)) do
+          match List.find(all, fn i -> crosses(i, t, scale, rot, corner)) do
             None -> "the instance was lost"
             Some(i) ->
               let x0 = inst_ox(i, t, scale)
@@ -475,15 +484,64 @@ mod Strata.Test.Populate do
               let y1 = y0 + Strata.Template.t_sy(t) - 1
               let z1 = z0 + turned_d(t, rot) - 1
               let ks = keys_over(x0, y0, z0, x1, y1, z1)
-              match border_keys(f, seed, scale, Pq.pad(f, scale), ts, all, ks, x0, y0, z0, x1, y1, z1, 0) do
+              let nxz = (Strata.Coord.chunk_of(x1) - Strata.Coord.chunk_of(x0) + 1) * (Strata.Coord.chunk_of(z1) - Strata.Coord.chunk_of(z0) + 1)
+              let ny = Strata.Coord.chunk_of(y1) - Strata.Coord.chunk_of(y0) + 1
+              match border_keys(f, seed, scale, Pq.pad(f, scale), lift, ts, all, ks, x0, y0, z0, x1, y1, z1, 0) do
                 (msg, found) ->
                   if msg != "" do "seed " ++ int_to_string(seed) ++ ": " ++ msg
-                  else if List.length(ks) < 2 do "the instance is in one chunk"
+                  else if nxz < (if corner do 4 else 2 end) do "the instance is in " ++ int_to_string(nxz) ++ " chunks in xz"
+                  else if ny < (if lift > 0 do 2 else 1 end) do "the instance is in " ++ int_to_string(ny) ++ " chunks in y"
                   else if found != filled(t) do "seed " ++ int_to_string(seed) ++ ": " ++ int_to_string(List.length(ks)) ++ " chunks hold " ++ int_to_string(found) ++ " voxels of the instance; its template has " ++ int_to_string(filled(t))
-                  else "" end end end
+                  else "" end end end end
               end
           end
         end
+    end
+  end
+
+  -- a 5 x 5 x 5 template with a different id on every voxel (1..125), no holes
+  pfn numbered() : Strata.Template.Template do
+    Strata.Template.make(5, 5, 5, List.fold_left(List.range(0, 125), NativeArray.make_i32(125, 0), fn (a, i) -> NativeArray.set_i32(a, i, i + 1)), 1.0)
+  end
+  -- region slot 7 of an n x n Ground at (x0, z0): 1 where world x is in 0..14, else 0
+  pfn strip_regions(x0 : Int, n : Int) : NativeF32Arr do
+    List.fold_left(List.range(0, n * n), NativeArray.make_f32(n * n, 0.0), fn (a, i) -> if between(x0 + i % n, 0, 14) do NativeArray.set_f32(a, i, 1.0) else a end)
+  end
+  -- the first seed from `seed` whose instances of f over g hold one standing on world column x 15
+  pfn seed_on_15(f : Strata.Population.Frozen, g : Strata.Populate.Ground, seed : Int, last : Int) : Int do
+    if seed > last do -1
+    else if List.any(Pq.instances(f, seed, Pq.fields(f, seed, g), g, "trees"), fn i -> vox(Pq.i_xm(i), 1.0) == 15) do seed
+    else seed_on_15(f, g, seed + 1, last) end end
+  end
+  pfn same_place(a : Strata.Populate.PopInstance, b : Strata.Populate.PopInstance) : Bool do
+    if Pq.i_xm(a) == Pq.i_xm(b) do Pq.i_zm(a) == Pq.i_zm(b) else false end
+  end
+  -- A flat Ground of chunk (0, 0, 0) and pad m at top 10, with the column of
+  -- one instance (the first standing on x 8..23, z 8..23) at `odd`: chunks
+  -- (0, 0, 0) and (0, 1, 0) hold the stamps of every other instance, as on
+  -- the flat Ground. "" or what went wrong.
+  pfn odd_top_case(odd : Int) : String do
+    let f = frozen_of(scatter_pop([lump(9, 12, 9, 1.0)], 0.0625, 4.0, 0.6, 5))
+    let ts = Pn.shape_set_templates(f, 0)
+    let m = Pq.pad(f, 1.0)
+    let n = 32 + 2 * m
+    let level = flat_ground(0 - m, 0 - m, n, 1.0, 10)
+    let all = Pq.instances(f, 3, Pq.fields(f, 3, level), level, "trees")
+    match List.find(all, fn i -> if between(vox(Pq.i_xm(i), 1.0), 8, 23) do between(vox(Pq.i_zm(i), 1.0), 8, 23) else false end) do
+      None -> "no instance in the middle of the chunk"
+      Some(v) ->
+        let col = (vox(Pq.i_xm(v), 1.0) + m) + n * (vox(Pq.i_zm(v), 1.0) + m)
+        let g = Pq.ground(0 - m, 0 - m, n, 1.0, 0, NativeArray.set_int(NativeArray.make_int(n * n, 10), col, odd), NativeArray.make_int(n * n, -1))
+        let rest = List.filter(all, fn i -> !same_place(i, v))
+        let listed = Pq.instances(f, 3, Pq.fields(f, 3, g), g, "trees")
+        let k0 = Strata.Coord.key(0, 0, 0)
+        let k1 = Strata.Coord.key(0, 1, 0)
+        if List.length(rest) != List.length(all) - 1 do "the instance was not singled out"
+        else if !List.any(listed, fn i -> if same_place(i, v) do Pq.i_top(i) == odd else false end) do "instances does not list it with its top"
+        else if hash_of(Pq.place(f, 3, k0, air(), g)) != hash_of(stamp_all(air(), k0, ts, 1.0, rest)) do "chunk (0, 0, 0) is not the stamps of the others"
+        else if hash_of(Pq.place(f, 3, k1, air(), g)) != hash_of(stamp_all(air(), k1, ts, 1.0, rest)) do "chunk (0, 1, 0) is not the stamps of the others"
+        else if count_filled(Pq.place(f, 3, k0, air(), g)) < 2000 do "nothing much was placed"
+        else "" end end end end end
     end
   end
 
@@ -903,18 +961,19 @@ mod Strata.Test.Populate do
       Test.assert_eq_int(Pq.pad(cover_pop(1.0), 1.0), 1, "no templates: one column")
     end
 
-    test "instances: over an area they are the instances of its four quarters, in order" do
+    test "instances: over an area they are the instances of its parts, cut inside cells, in order" do
       let f = frozen_of(scatter_pop([lump(3, 3, 3, 1.0)], 0.03, 4.0, 0.6, 7))
       let whole = world_ground(-32, -32, 64, 1.0)
       let all = Pq.instances(f, 11, Pq.fields(f, 11, whole), whole, "trees")
       Test.assert_true(List.length(all) > 60, "about half of 256 cells hold one (" ++ int_to_string(List.length(all)) ++ ")")
       Test.assert_true(List.length(all) < 190, "and not all (" ++ int_to_string(List.length(all)) ++ ")")
       Test.assert_eq_int(List.length(insts_in(all, 1.0, -32, -32, 64)), List.length(all), "every one stands on a column of the Ground")
-      List.fold_left([(-32, -32), (0, -32), (-32, 0), (0, 0)], (), fn (_, q) ->
+      -- cut at x = 2 and z = 2, inside cells (a cell is 4 m), not on their edges
+      List.fold_left([(-32, -32, 34), (2, -32, 30), (-32, 2, 30), (2, 2, 30)], (), fn (_, q) ->
         match q do
-          (x0, z0) ->
-            let g = world_ground(x0, z0, 32, 1.0)
-            Test.assert_eq_str(insts_str(Pq.instances(f, 11, Pq.fields(f, 11, g), g, "trees")), insts_str(insts_in(all, 1.0, x0, z0, 32)), "the quarter at " ++ int_to_string(x0) ++ ", " ++ int_to_string(z0))
+          (x0, z0, n) ->
+            let g = world_ground(x0, z0, n, 1.0)
+            Test.assert_eq_str(insts_str(Pq.instances(f, 11, Pq.fields(f, 11, g), g, "trees")), insts_str(insts_in(all, 1.0, x0, z0, n)), "the part at " ++ int_to_string(x0) ++ ", " ++ int_to_string(z0))
         end)
       Test.assert_true(cell_order(all, 4.0, -1000, -1000), "in cell order: rows of increasing z, x increasing within a row")
       let i0 = List.head(all)
@@ -969,7 +1028,92 @@ mod Strata.Test.Populate do
     test "place: an instance across a chunk border, at 1 m, 0.5 m and 0.25 m and every quarter turn: the chunks hold its template's voxels exactly (Review Focus 3)" do
       List.fold_left([1.0, 0.5, 0.25], (), fn (_, scale) ->
         List.fold_left([0, 1, 2, 3], (), fn (_, rot) ->
-          Test.assert_eq_str(border_case(scale, rot), "", "scale " ++ float_to_string(scale) ++ ", turn " ++ int_to_string(rot))))
+          Test.assert_eq_str(border_case(scale, rot, false, 0), "", "scale " ++ float_to_string(scale) ++ ", turn " ++ int_to_string(rot))))
+    end
+
+    test "place: an instance across a chunk corner, x and z borders both, at 1 m, 0.5 m and 0.25 m and every quarter turn: four or more chunks in xz hold it exactly" do
+      List.fold_left([1.0, 0.5, 0.25], (), fn (_, scale) ->
+        List.fold_left([0, 1, 2, 3], (), fn (_, rot) ->
+          Test.assert_eq_str(border_case(scale, rot, true, 0), "", "scale " ++ float_to_string(scale) ++ ", turn " ++ int_to_string(rot))))
+    end
+
+    test "place: an instance across x = 32 and y = 32 at 1 m (tops 20..30): the chunks of both heights hold it exactly" do
+      List.fold_left([0, 1, 2, 3], (), fn (_, rot) -> Test.assert_eq_str(border_case(1.0, rot, false, 15), "", "turn " ++ int_to_string(rot)))
+      Test.assert_eq_str(border_case(1.0, 0, true, 15), "", "and across the corner as well: eight chunks")
+    end
+
+    test "place: a top at the smallest Int traps nothing: its instance meets no chunk and the others are placed" do
+      Test.assert_eq_str(odd_top_case(0 - 4611686018427387903), "", "a top of -(2^62 - 1)")
+      Test.assert_eq_str(odd_top_case(0 - 4611686018427387903 - 1), "", "a top of -2^62")
+    end
+
+    test "place: a top at the largest Int traps nothing: its instance meets no chunk and the others are placed" do
+      Test.assert_eq_str(odd_top_case(4611686018427387902), "", "a top of 2^62 - 2")
+      Test.assert_eq_str(odd_top_case(4611686018427387903), "", "a top of 2^62 - 1")
+    end
+
+    test "place: a stamp's bottom row at a chunk's last voxel and its top row at a chunk's first are placed; one lower is not" do
+      let t = solid(9, 12, 9, 3, 1.0)
+      let f = frozen_of(scatter_pop([t], 0.0625, 4.0, 0.6, 5))
+      let m = Pq.pad(f, 1.0)
+      let n = 32 + 2 * m
+      let k0 = Strata.Coord.key(0, 0, 0)
+      let k1 = Strata.Coord.key(0, 1, 0)
+      let g30 = flat_ground(0 - m, 0 - m, n, 1.0, 30)
+      let a = Pq.place(f, 3, k0, air(), g30)
+      Test.assert_eq_int(hash_of(a), hash_of(stamp_all(air(), k0, [t], 1.0, Pq.instances(f, 3, Pq.fields(f, 3, g30), g30, "trees"))), "tops at 30: chunk y 0 holds each stamp's bottom row")
+      Test.assert_true(count_layer(a, 3, 31) > 500, "at y 31 (" ++ int_to_string(count_layer(a, 3, 31)) ++ ")")
+      Test.assert_eq_int(count_all(a, 3), count_layer(a, 3, 31), "and nothing else")
+      let g20 = flat_ground(0 - m, 0 - m, n, 1.0, 20)
+      let b = Pq.place(f, 3, k1, air(), g20)
+      Test.assert_eq_int(hash_of(b), hash_of(stamp_all(air(), k1, [t], 1.0, Pq.instances(f, 3, Pq.fields(f, 3, g20), g20, "trees"))), "tops at 20: chunk y 1 holds each stamp's top row")
+      Test.assert_true(count_layer(b, 3, 0) > 500, "at world y 32 (" ++ int_to_string(count_layer(b, 3, 0)) ++ ")")
+      Test.assert_eq_int(count_all(b, 3), count_layer(b, 3, 0), "and nothing else")
+      Test.assert_eq_int(hash_of(Pq.place(f, 3, k1, air(), flat_ground(0 - m, 0 - m, n, 1.0, 19))), hash_of(air()), "tops at 19: the stamps end at y 31 and chunk y 1 stays air")
+      Test.assert_eq_int(hash_of(Pq.place(f, 3, k0, air(), flat_ground(0 - m, 0 - m, n, 1.0, 31))), hash_of(air()), "tops at 31: the stamps start at y 32 and chunk y 0 stays air")
+    end
+
+    test "instances: the density is read at the column the instance stands on, not at its cell's centre" do
+      -- zone "strip" is world x 0..14; the cell x 12..16 has its centre (x 14) inside and its last column (x 15) outside
+      let g = Pq.with_field(world_ground(-16, -16, 32, 1.0), 7, strip_regions(-16, 32))
+      let ts = [lump(3, 3, 3, 1.0)]
+      let loose = frozen_of(scatter_pop(ts, 0.0625, 4.0, 0.6, 7))
+      let seed = seed_on_15(loose, g, 1, 400)
+      Test.assert_true(seed > 0, "some seed puts a candidate on column 15")
+      let all = Pq.instances(loose, seed, Pq.fields(loose, seed, g), g, "trees")
+      let zoned = frozen_of(Pn.layer_scatter(Pn.shapes_templates(Pn.zone_regions(Pn.new(), "strip", [1]), "s", ts), "trees", "s", Pn.rule(0.0625, Nil, ["strip"], Nil), 4.0, 0.6, 7))
+      let zi = Pq.instances(zoned, seed, Pq.fields(zoned, seed, g), g, "trees")
+      Test.assert_eq_int(List.length(List.filter(zi, fn i -> vox(Pq.i_xm(i), 1.0) == 15)), 0, "no instance stands on column 15, outside the zone")
+      Test.assert_eq_str(insts_str(zi), insts_str(List.filter(all, fn i -> between(vox(Pq.i_xm(i), 1.0), 0, 14))), "the zoned layer's instances are exactly the candidates standing on x 0..14")
+      Test.assert_true(List.length(zi) < 32, "fewer than the 32 cells whose centres are in the zone (" ++ int_to_string(List.length(zi)) ++ ")")
+    end
+
+    test "place: overlapping stamps of one layer are written in the order of instances, the later over the earlier" do
+      let t = numbered()
+      let f = frozen_of(scatter_pop([t], 0.0625, 4.0, 0.6, 5))
+      let m = Pq.pad(f, 1.0)
+      let big = world_ground(-64, -64, 160, 1.0)
+      let all = Pq.instances(f, 3, Pq.fields(f, 3, big), big, "trees")
+      List.fold_left([Strata.Coord.key(0, 0, 0), Strata.Coord.key(-1, 0, 1)], (), fn (_, k) ->
+        let got = Pq.place(f, 3, k, air(), key_ground(k, m, 1.0))
+        Test.assert_eq_int(hash_of(got), hash_of(stamp_all(air(), k, [t], 1.0, all)), "chunk " ++ key_str(k) ++ ": every voxel holds the id of the last instance, in cell order, that covers it")
+        Test.assert_true(hash_of(got) != hash_of(stamp_all(air(), k, [t], 1.0, List.reverse(all))), "and not that of the first: the stamps do overlap"))
+    end
+
+    test "place: a chunk only stamps reach gets no cover, and the chunk with the floors gets both" do
+      let t = solid(1, 30, 1, 3, 1.0)
+      let p0 = Pn.shapes_blocks(Pn.shapes_templates(Pn.new(), "s", [t]), "g", [7])
+      let f = frozen_of(Pn.layer_scatter(Pn.layer_cover(p0, "grass", "g", Pn.rule(1.0, Nil, Nil, Nil), 3), "posts", "s", Pn.rule(0.0625, Nil, Nil, Nil), 4.0, 0.6, 5))
+      let g = flat_ground(-8, -8, 48, 1.0, 10)
+      let all = Pq.instances(f, 3, Pq.fields(f, 3, g), g, "posts")
+      let k1 = Strata.Coord.key(0, 1, 0)
+      let up = Pq.place(f, 3, k1, air(), g)
+      Test.assert_eq_int(hash_of(up), hash_of(stamp_all(air(), k1, [t], 1.0, all)), "chunk y 1 holds the posts' tops (y 32..40) and nothing else")
+      Test.assert_eq_int(count_all(up, 3), 64 * 9, "64 posts, 9 voxels each")
+      Test.assert_eq_int(count_all(up, 7), 0, "no cover")
+      let down = Pq.place(f, 3, Strata.Coord.key(0, 0, 0), floor_chunk(10), g)
+      Test.assert_eq_int(count_layer(down, 3, 11), 64, "chunk y 0: 64 posts stand on the floor")
+      Test.assert_eq_int(count_layer(down, 7, 11), 1024 - 64, "and cover everywhere else")
     end
 
     test "place: scatter is the same from any Ground that covers the chunk and its pad, and refused from one a column short" do
