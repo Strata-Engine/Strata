@@ -370,3 +370,19 @@ second arm (met writing `Strata.Population`'s readers). The same match
 with each arm on its own line parses. A one-line match with one arm
 (`match a do (x, _) -> x end`) is fine. Workaround: put each arm on its own
 line.
+
+## S40: a small function answering a tuple, called per voxel, allocates; a constructor read through accessors is counted per call
+
+`Strata.Template.blit` undoes the quarter turn per voxel with
+`unturn(t, rot, rx, rz) : (Int, Int)` and reads the template (a seven-field
+constructor) through `t_sx(t)`, `t_ids(t)` and the like. Compiled, the tuple
+is allocated and freed every voxel (about 190 instructions), `unturn` and
+`drawn` are real calls, and the template's reference count is raised and
+lowered around them. `bench/march/stamp_loop` is the loop alone against C:
+582 instructions a template voxel against 14 (395 with the turn as two
+Int-valued functions). Met measuring scatter layers
+(`bench/populate_fields` mode 8: 13.7 M of 23.9 M instructions a chunk with
+27 stamps in reach). The Strata code is left plain; wanted from March: a
+tuple answered by a small function kept out of the heap (or the function
+inlined), and a borrowed constructor argument not counted per call.
+

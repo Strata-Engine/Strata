@@ -944,4 +944,73 @@ mod Strata.Population do
       _ -> 0.0
     end
   end
+
+  -- Reach and fitting (scatter and site layers place templates)
+
+  pfn fmax(a : Float, b : Float) : Float do if a > b do a else b end end
+  -- metres from the centre of a template's middle voxel to the centre of its outermost, along its wider side
+  pfn half_width(t : Strata.Template.Template) : Float do
+    int_to_float(Math.max_int(Strata.Template.t_sx(t), Strata.Template.t_sz(t)) - 1) *. 0.5 *. Strata.Template.t_voxel_size(t)
+  end
+  -- the largest half-width plus half the largest voxel; 0 for no templates
+  pfn reach_of(ts : List(Strata.Template.Template)) : Float do
+    List.fold_left(ts, 0.0, fn (m, t) -> fmax(m, half_width(t))) +. 0.5 *. List.fold_left(ts, 0.0, fn (m, t) -> fmax(m, Strata.Template.t_voxel_size(t)))
+  end
+
+  doc "How far, in metres, a template of shape set i reaches from the column it stands on: the largest half-width of its templates (half of one less than the wider side, in voxels, times the voxel size) plus half its largest voxel; 0 for a set of blocks. A template s voxels wide of size v reaches s * v / 2, whatever voxel size it is fitted to."
+  fn shape_set_reach(f : Frozen, i : Int) : Float do reach_of(shape_set_templates(f, i)) end
+
+  doc "How far, in metres, anything a scatter or site layer places reaches from the column it stands on: the largest half-width of any template of any such layer plus half the largest voxel size among them; 0 when they place no templates. A shape set no scatter or site layer uses does not count. Strata.Populate.pad turns it into columns of Ground."
+  fn reach(f : Frozen) : Float do
+    reach_of(List.flat_map(List.range(0, layer_count(f)), fn l -> if layer_kind(f, l) == 0 do Nil else shape_set_templates(f, layer_shape_set(f, l)) end))
+  end
+
+  pfn fit_templates(ts : List(Strata.Template.Template), scale : Float) : Option(List(Strata.Template.Template)) do
+    match ts do
+      Nil -> Some(Nil)
+      Cons(t, rest) ->
+        match Strata.Template.fit(t, scale) do
+          None -> None
+          Some(t2) ->
+            match fit_templates(rest, scale) do
+              None -> None
+              Some(rest2) -> Some(Cons(t2, rest2))
+            end
+        end
+    end
+  end
+  pfn fit_sets(names : List(String), sets : List(PopShapes), scale : Float) : Result(List(PopShapes), String) do
+    match sets do
+      Nil -> Ok(Nil)
+      Cons(s, rest) ->
+        let name = match names do
+          Cons(n, _) -> n
+          Nil -> ""
+        end
+        let fitted = match s do
+          PfBlocks(_, _) -> Some(s)
+          PfTemplates(ts, ws) ->
+            match fit_templates(ts, scale) do
+              Some(ts2) -> Some(PfTemplates(ts2, ws))
+              None -> None
+            end
+        end
+        match fitted do
+          None -> Err("population: shape set " ++ q(name) ++ " holds a template that cannot be fitted to a world of " ++ float_to_string(scale) ++ " m a voxel: its voxel size must be a whole number of the world's")
+          Some(s2) ->
+            match fit_sets(List.drop(names, 1), rest, scale) do
+              Err(e) -> Err(e)
+              Ok(rest2) -> Ok(Cons(s2, rest2))
+            end
+        end
+    end
+  end
+
+  doc "f with every template of every shape set put through Strata.Template.fit at a world of `scale` metres a voxel, so each is as many metres across as it was authored; or Err naming the first shape set holding a template that cannot be fitted (a voxel size that is not a whole number of the world's, or a world coarser than the template). Block sets pass through. Strata.Populate.place refuses a population whose scatter templates are not at its Ground's voxel size: fit it first."
+  fn fit_all(f : Frozen, scale : Float) : Result(Frozen, String) do
+    match fit_sets(f.fz_shape_names, f.fz_shapes, scale) do
+      Ok(sets) -> Ok({ f with fz_shapes: sets })
+      Err(e) -> Err(e)
+    end
+  end
 end
