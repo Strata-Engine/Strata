@@ -20,11 +20,14 @@
  * shorter than 24 means no planes. The renderer reads the draw list through
  * an_x_draw_list (an_draw_list on this world), C to C, never through March.
  *
+ * Generations: each an_x_open is one on from the last (an_x_generation),
+ * and figure ids carry on across worlds (an_open_next).
+ *
  * Timing, for measurements only: an_x_update and an_x_hit_ray time
  * themselves on the monotonic clock (an_x_timing). The kernel never reads a
  * clock, so no answer depends on it. */
 /* Rewritten by stamp_anim.sh whenever strata_anim.h changes (GAPS S14). */
-#define STRATA_ANIM_STAMP "2e2d1d055752d99c"
+#define STRATA_ANIM_STAMP "346baf8a9b2c3499"
 #include <stdint.h>
 #include <time.h>
 #include "strata_anim.h"
@@ -53,13 +56,25 @@ static int an_x_mask_id(int64_t fig, int64_t m) {
     return g_mask_base[f->rig] + (int)m;
 }
 
+/* The world's generation and next figure id, carried across open and close:
+ * each open is one generation on (the renderer re-uploads rigs held from an
+ * older one, since rig ids start again at 0), and figure ids carry on, so an
+ * id held from a closed world does not name a figure of the new one. */
+static uint32_t g_gen;
+static int32_t g_next_id;
+static void an_x_keep(void) { if (g_w) { g_gen = g_w->generation; g_next_id = g_w->next_id; } }
+
 int64_t an_x_open(int64_t capacity) {
-    if (g_w) an_close(g_w);
-    g_w = an_open((int)capacity);
+    an_x_keep();
+    an_close(g_w);
+    g_w = an_open_next((int)capacity, g_gen, g_next_id);
+    g_gen += 1;                                /* a failed open is a generation too: nothing of the last is held */
     for (int i = 0; i < AN_RIGS; i++) { g_mask_base[i] = 0; g_mask_n[i] = 0; }
     return g_w ? 1 : 0;
 }
-void an_x_close(void) { an_close(g_w); g_w = NULL; }
+void an_x_close(void) { an_x_keep(); an_close(g_w); g_w = NULL; }
+/* the generation of the world opened last: 0 before any, one more each open */
+int64_t an_x_generation(void) { return (int64_t)g_gen; }
 
 /* parent: n i32; floats: 13 a part (pivot 3, rest 4, box 6) */
 int64_t an_x_rig(int64_t n, void *parent, void *floats) {

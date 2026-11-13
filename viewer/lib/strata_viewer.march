@@ -73,6 +73,10 @@
 -- STRATA_TRACED=k  the first k of those walkers traced (seen by the light pass's rays; 64 at most at once)
 -- STRATA_FIG_BOXES=0  traced figures that move unsettle no light history round them (read by the renderer: to show the trail they prevent)
 -- STRATA_FIG_SHADOWS=0  plain figures cast no sun shadow (read by the renderer; the stored figure scenes 31 and 32 predate the shadows)
+-- STRATA_ANIM_METER=1  once a second: anim: figures f posed p stale s parts d traced t update u ms
+-- STRATA_PRESS=GKTV  a scripted run presses those figure keys at frame 10 (G 64 wanderers, K feet and springs, T trace the 8 nearest, V a torch); the figure keys do nothing during a match
+-- STRATA_ARENA=n, STRATA_ARENA_FEET=k, STRATA_ARENA_TRACED=t  scene 40: n runners (512), the first k with foot placement (128), t traced (32)
+-- STRATA_ARENA_RAYS=n  n figure hit rays a frame across the view, timed in the shim;  STRATA_ARENA_LOG=1  a timing line a frame
 --
 -- With STRATA_FRAMES or STRATA_SOAK set the run is scripted: keyboard and mouse are ignored.
 mod StrataViewer do
@@ -138,11 +142,25 @@ mod StrataViewer do
         let post = Bk.with_emission(Bk.with_style(Bk.with_opacity(Bk.def(), Strata.Blocks.Clear), Strata.Blocks.Model(m)), 255, 176, 96, 255)
         let r13 = add(add(add(add(add(add(add(add(add(add(add(add(add(r0, stone), dirt), grass), sand), water), snow), wood), leaves), bad), glass), tall), post), ice)
         match Bk.register_fluid(r13, water) do
-          Ok((r21, _)) -> r21
+          Ok((r21, _)) -> steps(r21, 1)
           Err(_) -> r13
         end
     end
   end
+
+  -- 22..24 stone steps a quarter, a half and three quarters of a voxel high, for the stairs
+  -- scene (37): models of one box, colliding by it; added last so no other id moves
+  pfn steps(r : Strata.Blocks.Registry, k : Int) : Strata.Blocks.Registry do
+    if k > 3 do r
+    else
+      let h = int_to_float(k) *. 0.25
+      match Bk.add_model(r, Strata.Model.floats(Strata.Model.box(Strata.Model.empty(), 0.0, 0.0, 0.0, 1.0, h, 1.0, 1)), Cons(Strata.Blocks.Box(0.0, 0.0, 0.0, 1.0, h, 1.0), Nil)) do
+        (r1, m) -> steps(add(r1, Bk.with_style(Bk.with_opacity(Bk.def(), Strata.Blocks.Clear), Strata.Blocks.Model(m))), k + 1)
+      end
+    end
+  end
+  doc "The id of the stone step [k] quarters of a voxel high (1..3)."
+  fn step_id(k : Int) : Int do lake_base() + 7 + k end
 
   -- Upload the viewer's painted tiles and the registry's block table.
   pfn tiles_go(i : Int, ok : Bool) : Bool do
@@ -2153,6 +2171,12 @@ mod StrataViewer do
   end
 
   pfn ms2(v : Float) : String do float_to_string(Math.round(v *. 100.0) /. 100.0) end
+  -- [v] with exactly two decimals: 0.05, 1.20
+  pfn fix2(v : Float) : String do
+    let n = float_to_int(Math.round((if v < 0.0 do 0.0 -. v else v end) *. 100.0))
+    let f = n % 100
+    (if v < 0.0 do "-" else "" end) ++ int_to_string(n / 100) ++ "." ++ (if f < 10 do "0" else "" end) ++ int_to_string(f)
+  end
 
   -- eye position, yaw, pitch, the chunk the camera was last in, mouse buttons
   -- last frame, flying or walking, vertical speed, on the ground, F last frame
@@ -2274,6 +2298,115 @@ mod StrataViewer do
     end
   end
 
+  -- ── Figures each frame ───────────────────────────────────────────────────
+  -- A figure key: held down when playing; in a scripted run, pressed at frame 10 if STRATA_PRESS names its letter.
+  pfn fig_key(scripted : Bool, frame : Int, code : Int, letter : String) : Bool do
+    if scripted do (if frame == 10 do String.contains(Authority.must(Env.get("STRATA_PRESS", "")), letter) else false end) else Strata.Ffi.Vk.key(code) end
+  end
+
+  -- G spawns 64 wanderers (opening a figure world of 1024 if none is open, and handing the renderer its rigs);
+  -- K switches foot placement and springs; T the 8 nearest humanoids between plain and traced; V a torch for the nearest
+  pfn figure_keys(c : StrataViewer.Figures.Crowd, sl : Strata.Render.Render, w : Strata.World.World, ex : Float, ey : Float, ez : Float, yaw : Float, g : Bool, k : Bool, t : Bool, v : Bool) : (StrataViewer.Figures.Crowd, Strata.Render.Render) do
+    let c1 = if !g do c
+      else
+        let opened = if StrataViewer.Figures.is_open(c) do c else StrataViewer.Figures.with_creatures(StrataViewer.Figures.open(1024)) end
+        let c0 = StrataViewer.Figures.wander(opened, w, ex, ey, ez, yaw, 64)
+        Authority.must(println("strata_viewer: 64 wanderers; " ++ int_to_string(StrataViewer.Figures.walking(c0)) ++ " figures walk"))
+        c0
+      end
+    let c2 = if k do
+        let c3 = StrataViewer.Figures.toggle_feet(c1, w)
+        Authority.must(println("strata_viewer: foot placement and springs " ++ (if c3.feet_on do "on" else "off" end)))
+        c3
+      else c1 end
+    let c4 = if t do StrataViewer.Figures.toggle_near(c2, ex, ez) else c2 end
+    let c5 = if v do StrataViewer.Figures.torch_nearest(c4, ex, ez) else c4 end
+    if g || v do (c5, Strata.Render.figures(sl, StrataViewer.Figures.anim(c5), StrataViewer.Figures.rigs(c5))) else (c5, sl) end
+  end
+
+  -- the camera for the animation's culling: the six planes of the view-projection [vp] (column-major, OpenGL clip volume, as
+  -- Strata.Math.Mat4.perspective makes it), normalised; were depth 0..1 the near plane would lie behind the eye: conservative
+  pfn plane(vp : NativeF32Arr, axis : Int, sgn : Float) : List(Float) do
+    let a = NativeArray.get_f32(vp, 3) +. sgn *. NativeArray.get_f32(vp, axis)
+    let b = NativeArray.get_f32(vp, 7) +. sgn *. NativeArray.get_f32(vp, 4 + axis)
+    let c = NativeArray.get_f32(vp, 11) +. sgn *. NativeArray.get_f32(vp, 8 + axis)
+    let d = NativeArray.get_f32(vp, 15) +. sgn *. NativeArray.get_f32(vp, 12 + axis)
+    let l = Math.sqrt(a *. a +. b *. b +. c *. c)
+    let k = if l > 0.0 do 1.0 /. l else 1.0 end
+    [a *. k, b *. k, c *. k, d *. k]
+  end
+  pfn figure_view(c : StrataViewer.Figures.Crowd, vp : NativeF32Arr, ex : Float, ey : Float, ez : Float) : StrataViewer.Figures.Crowd do
+    let ps = List.append(List.append(List.append(plane(vp, 0, 1.0), plane(vp, 0, -1.0)), List.append(plane(vp, 1, 1.0), plane(vp, 1, -1.0))), List.append(plane(vp, 2, 1.0), plane(vp, 2, -1.0)))
+    StrataViewer.Figures.with_view(c, NativeArray.from_list_f32(ps), ex, ey, ez)
+  end
+
+  -- where world point (x, y, z) falls on the screen, in points of a [wpt] x [hpt] display; none behind the eye
+  pfn on_screen(vp : NativeF32Arr, x : Float, y : Float, z : Float, wpt : Float, hpt : Float) : Option((Float, Float)) do
+    let cx = NativeArray.get_f32(vp, 0) *. x +. NativeArray.get_f32(vp, 4) *. y +. NativeArray.get_f32(vp, 8) *. z +. NativeArray.get_f32(vp, 12)
+    let cy = NativeArray.get_f32(vp, 1) *. x +. NativeArray.get_f32(vp, 5) *. y +. NativeArray.get_f32(vp, 9) *. z +. NativeArray.get_f32(vp, 13)
+    let cw = NativeArray.get_f32(vp, 3) *. x +. NativeArray.get_f32(vp, 7) *. y +. NativeArray.get_f32(vp, 11) *. z +. NativeArray.get_f32(vp, 15)
+    if cw < 0.05 do None else Some(((cx /. cw *. 0.5 +. 0.5) *. wpt, (0.5 -. cy /. cw *. 0.5) *. hpt)) end
+  end
+  -- the screen box round the eight corners of part p's grid as figure f is posed: (x0, y0, x1, y1) in points
+  pfn corners_go(vp : NativeF32Arr, m : NativeF32Arr, o : Int, lo : (Float, Float, Float), hi : (Float, Float, Float), i : Int, wpt : Float, hpt : Float, acc : (Float, Float, Float, Float)) : Option((Float, Float, Float, Float)) do
+    if i >= 8 do Some(acc)
+    else
+      match (lo, hi) do
+        ((lx, ly, lz), (hx, hy, hz)) ->
+          let px = if i % 2 == 0 do lx else hx end
+          let py = if (i / 2) % 2 == 0 do ly else hy end
+          let pz = if i / 4 == 0 do lz else hz end
+          let wx = NativeArray.get_f32(m, o + 9) +. NativeArray.get_f32(m, o) *. px +. NativeArray.get_f32(m, o + 3) *. py +. NativeArray.get_f32(m, o + 6) *. pz
+          let wy = NativeArray.get_f32(m, o + 10) +. NativeArray.get_f32(m, o + 1) *. px +. NativeArray.get_f32(m, o + 4) *. py +. NativeArray.get_f32(m, o + 7) *. pz
+          let wz = NativeArray.get_f32(m, o + 11) +. NativeArray.get_f32(m, o + 2) *. px +. NativeArray.get_f32(m, o + 5) *. py +. NativeArray.get_f32(m, o + 8) *. pz
+          match on_screen(vp, wx, wy, wz, wpt, hpt) do
+            None -> None
+            Some((sx, sy)) ->
+              match acc do
+                (x0, y0, x1, y1) -> corners_go(vp, m, o, lo, hi, i + 1, wpt, hpt, (fmin(x0, sx), fmin(y0, sy), fmax(x1, sx), fmax(y1, sy)))
+              end
+          end
+      end
+    end
+  end
+  -- the crosshair's hit ray: the part of the nearest figure it meets before the world, as a box on the screen.
+  -- The hit is from the pose before springs, the box from `matrices` (after them): on a springy part it can sit a little off
+  pfn hit_outline(c : StrataViewer.Figures.Crowd, w : Strata.World.World, ex : Float, ey : Float, ez : Float, fx : Float, fy : Float, fz : Float, vp : NativeF32Arr, wpt : Float, hpt : Float) : Option((Float, Float, Float, Float)) do
+    let a = StrataViewer.Figures.anim(c)
+    match Strata.Anim.hit_ray(a, ex, ey, ez, fx, fy, fz, 100.0, -1) do
+      None -> None
+      Some(h) ->
+        let reg = Strata.World.registry(w)
+        let wh = Strata.Query.raycast(w, ex, ey, ez, fx, fy, fz, h.dist, fn id -> id != 0 && Strata.Blocks.collides(reg, id))
+        if Strata.Query.is_hit(wh) do None
+        else
+          match Strata.Anim.rig(a, Strata.Ffi.Anim.fig_rig(h.fig)) do
+            None -> None
+            Some(r) ->
+              match (Strata.Rig.size(r, h.part), Strata.Rig.anchor_at(r, h.part)) do
+                ((sx, sy, sz), (ax, ay, az)) ->
+                  let v = Strata.Rig.voxel_size(r)
+                  corners_go(vp, Strata.Anim.matrices(a, h.fig), 12 * h.part, (0.0 -. ax *. v, 0.0 -. ay *. v, 0.0 -. az *. v), ((int_to_float(sx) -. ax) *. v, (int_to_float(sy) -. ay) *. v, (int_to_float(sz) -. az) *. v), 0, wpt, hpt, (1000000.0, 1000000.0, -1000000.0, -1000000.0))
+              end
+          end
+        end
+    end
+  end
+  -- [n] rays from the eye across the middle of the view (a square grid), for timing the hit test; answers how many hit
+  pfn rays_go(a : Strata.Anim.Anim, ex : Float, ey : Float, ez : Float, fx : Float, fy : Float, fz : Float, yaw : Float, i : Int, n : Int, side : Int, hits : Int) : Int do
+    if i >= n do hits
+    else
+      let u = (int_to_float(i % side) /. int_to_float(side) -. 0.5) *. 0.8
+      let v = (int_to_float(i / side) /. int_to_float(side) -. 0.5) *. 0.5
+      let hit = match Strata.Anim.hit_ray(a, ex, ey, ez, fx +. Math.cos(yaw) *. u, fy +. v, fz +. Math.sin(yaw) *. u, 150.0, -1) do
+          Some(_) -> 1
+          None -> 0
+        end
+      rays_go(a, ex, ey, ez, fx, fy, fz, yaw, i + 1, n, side, hits + hit)
+    end
+  end
+
+
   doc "Read the settings at [path] and say what they leave to default, set wrongly or could not read."
   fn load_params(path : String) : StrataViewer.Params.Params do
     let p = StrataViewer.Params.read(path)
@@ -2320,10 +2453,15 @@ mod StrataViewer do
       match Strata.Render.light_pages() do (pu, pn, pr) -> Authority.must(println("strata_viewer: light pages " ++ int_to_string(pu) ++ " of " ++ int_to_string(pn) ++ " in use (" ++ int_to_string(pn / 32) ++ " MB), " ++ int_to_string(pr) ++ " chunks found none")) end
       Authority.must(println("strata_viewer: done after " ++ int_to_string(frame) ++ " frames; uploads refused " ++ int_to_string(Strata.Ffi.Vk.refused()) ++ ", still waiting " ++ int_to_string(Strata.Render.waiting(sl)) ++ "; rebuilds " ++ int_to_string(float_to_int(Strata.Ffi.Vk.stat(6))) ++ "; draw calls " ++ int_to_string(float_to_int(Strata.Ffi.Vk.stat(2)))))
       if Strata.Render.ui_dropped() > 0 do Authority.must(println("ui: dropped " ++ int_to_string(Strata.Render.ui_dropped()) ++ " quads")) else () end
+      if StrataViewer.Figures.is_open(cr) do
+        let nu = Strata.Ffi.Anim.timing(3)
+        let nr = Strata.Ffi.Anim.timing(5)
+        Authority.must(println("figures: update mean " ++ ms2(Strata.Ffi.Anim.timing(2) *. 1000.0 /. (if nu > 0.0 do nu else 1.0 end)) ++ " ms, worst " ++ ms2(Strata.Ffi.Anim.timing(1) *. 1000.0) ++ " ms over " ++ int_to_string(float_to_int(nu)) ++ " updates; hit rays mean " ++ float_to_string(Math.round(Strata.Ffi.Anim.timing(4) *. 10000000.0 /. (if nr > 0.0 do nr else 1.0 end)) /. 10.0) ++ " us over " ++ int_to_string(float_to_int(nr))))
+      else () end
       if StrataViewer.Match.is_on(mt) do Authority.must(println(StrataViewer.Match.report(mt, Strata.Stream.world(s)))) else () end
       if StrataViewer.Falls.count(falls) > 0 || Authority.must(Env.get_int("STRATA_FALLS", 0)) == 1 do Authority.must(println("strata_viewer: " ++ int_to_string(StrataViewer.Falls.count(falls)) ++ " river drops known")) else () end
       if script == 2 do
-        Authority.must(println("soak: frames=" ++ int_to_string(frame) ++ " worst_ms=" ++ ms2(worst *. 1000.0) ++ " mean_ms=" ++ ms2(total *. 1000.0 /. int_to_float(if frame > 10 do frame - 10 else 1 end)) ++ " refused=" ++ int_to_string(Strata.Ffi.Vk.refused()) ++ " waiting=" ++ int_to_string(Strata.Render.waiting(sl)) ++ " slots=" ++ int_to_string(Strata.Render.used(sl)) ++ " live_quads=" ++ int_to_string(Strata.Ffi.Vk.live_quads()) ++ " leaked=" ++ int_to_string(float_to_int(Strata.Ffi.Vk.stat(7))) ++ " loaded=" ++ int_to_string(Strata.Stream.loaded_count(s)) ++ " levels=" ++ int_to_string(Strata.Stream.top_level(s)) ++ " retained=" ++ int_to_string(Strata.Render.retained(sl)) ++ " fluid_worst_ms=" ++ ms2(fworst) ++ " fluid_active=" ++ int_to_string(Strata.Fluid.active_count(fl)) ++ " fluid_waiting=" ++ int_to_string(Strata.Fluid.waiting_count(fl)) ++ " ui_dropped=" ++ int_to_string(Strata.Render.ui_dropped()) ++ " text_waiting=" ++ int_to_string(Strata.Text.waited_last_frame()) ++ " atlas_bytes=" ++ int_to_string(Strata.Text.atlas_bytes()) ++ audio_summary(s, reg, cam, aworst)))
+        Authority.must(println("soak: frames=" ++ int_to_string(frame) ++ " worst_ms=" ++ ms2(worst *. 1000.0) ++ " mean_ms=" ++ ms2(total *. 1000.0 /. int_to_float(if frame > 10 do frame - 10 else 1 end)) ++ " refused=" ++ int_to_string(Strata.Ffi.Vk.refused()) ++ " waiting=" ++ int_to_string(Strata.Render.waiting(sl)) ++ " slots=" ++ int_to_string(Strata.Render.used(sl)) ++ " live_quads=" ++ int_to_string(Strata.Ffi.Vk.live_quads()) ++ " leaked=" ++ int_to_string(float_to_int(Strata.Ffi.Vk.stat(7))) ++ " loaded=" ++ int_to_string(Strata.Stream.loaded_count(s)) ++ " levels=" ++ int_to_string(Strata.Stream.top_level(s)) ++ " retained=" ++ int_to_string(Strata.Render.retained(sl)) ++ " fluid_worst_ms=" ++ ms2(fworst) ++ " fluid_active=" ++ int_to_string(Strata.Fluid.active_count(fl)) ++ " fluid_waiting=" ++ int_to_string(Strata.Fluid.waiting_count(fl)) ++ " ui_dropped=" ++ int_to_string(Strata.Render.ui_dropped()) ++ " text_waiting=" ++ int_to_string(Strata.Text.waited_last_frame()) ++ " atlas_bytes=" ++ int_to_string(Strata.Text.atlas_bytes()) ++ " fig_prep_us=" ++ float_to_string(Strata.Ffi.Vk.stat(20)) ++ " fig_shadow_ms=" ++ float_to_string(Strata.Ffi.Vk.stat(21)) ++ " fig_updates=" ++ int_to_string(float_to_int(Strata.Ffi.Anim.timing(3))) ++ audio_summary(s, reg, cam, aworst)))
         match cx do Ctx(_, _, bs, starts, _) -> lake_lines(0, starts, lake_amounts(Strata.Stream.world(s), reg, bs)) end
       else () end
       Strata.Stream.stop(s)
@@ -2534,7 +2672,15 @@ mod StrataViewer do
                 let fps = if scripted do 60.0 else Math.round(1.0 /. (if now -. t_prev > 0.0005 do now -. t_prev else 0.0005 end)) end
                 let readout = (if script == 2 do "frame " ++ int_to_string(frame) ++ "\n" else "" end) ++ int_to_string(float_to_int(fps)) ++ " fps\n" ++ ms2(x2) ++ ", " ++ ms2(y2) ++ ", " ++ ms2(z2) ++ "\nlight mode " ++ int_to_string(mode)
                 let u1 = if shown == 1 do StrataViewer.Hud.flood(u0, 0, 20000) else if shown == 2 do StrataViewer.Hud.frames(u0) else if shown == 3 do StrataViewer.Hud.sheet(u0) else if shown == 4 do StrataViewer.Hud.styles(u0) else if shown == 5 do StrataViewer.Hud.busy(u0, ":") else if shown == 6 do StrataViewer.Hud.busy(u0, int_to_string(frame)) else if shown == 7 do StrataViewer.Hud.scripts(u0) else if StrataViewer.Match.is_on(mt2) do StrataViewer.MatchHud.draw(StrataViewer.Hud.build_bar(u0, slot, readout, StrataViewer.MatchHud.icons()), mt2, !scripted && Strata.Ffi.Vk.key(258)) else StrataViewer.Hud.build(u0, slot, readout) end end end end end end end end
-                if Strata.Render.draw_ui(u1) do () else () end
+                -- the part the crosshair's hit ray meets, outlined
+                let u2 = if !StrataViewer.Figures.is_open(cr) || StrataViewer.Match.is_on(mt2) do u1
+                  else
+                    match hit_outline(cr, Strata.Stream.world(s3), x2, y2, z2, fx, fy, fz, vp2, Strata.Ui.width(u1), Strata.Ui.height(u1)) do
+                      None -> u1
+                      Some(box) -> StrataViewer.Hud.outline(u1, box)
+                    end
+                  end
+                if Strata.Render.draw_ui(u2) do () else () end
                 if Authority.must(Env.get_int("STRATA_TEXT_LOG", 0)) == 1 && frame < 12 do Authority.must(println("text: frame " ++ int_to_string(frame) ++ ", " ++ int_to_string(Strata.Text.waiting()) ++ " glyph requests waited, " ++ int_to_string(float_to_int(Strata.Ffi.Text.stat(5))) ++ " us spent drawing glyphs, " ++ int_to_string(float_to_int(Strata.Ffi.Text.stat(0))) ++ " in the atlas")) else () end
                 if (shown == 5 || shown == 6) && frame % 60 == 59 do Authority.must(println("ui: " ++ int_to_string(Strata.Ui.quad_count(u1)) ++ " quads built and handed over in " ++ int_to_string(float_to_int((Strata.Ffi.Vk.time() -. t_ui) *. 1000000.0)) ++ " us")) else () end
               else () end
@@ -2554,7 +2700,32 @@ mod StrataViewer do
               -- nested, not &&: both sides of && are evaluated (GAPS S16 on main), and frame % 0 panics
               if stall > 0 do (if frame % stall == stall - 1 do Strata.Ffi.Audio.debug_stall(100) else () end) else () end
               -- the figures: walkers moved and every figure advanced, then drawn at their last pose
-              let cr2 = StrataViewer.Figures.step(cr, Strata.Stream.world(s3), tphys, dt, frame)
+              -- G, K, T and V, once per press (their last state in keys' bits 12 to 15)
+              let gk = fig_key(scripted, frame, 71, "G")
+              let kk = fig_key(scripted, frame, 75, "K")
+              let tk = fig_key(scripted, frame, 84, "T")
+              let vk = fig_key(scripted, frame, 86, "V")
+              let figbits = (if gk do 4096 else 0 end) + (if kk do 8192 else 0 end) + (if tk do 16384 else 0 end) + (if vk do 32768 else 0 end)
+              -- off during a match: its figures, not the crowd's, are the ones drawn
+              let fon = !StrataViewer.Match.is_on(mt2)
+              let (cr1, sl4) = figure_keys(cr, sl3, Strata.Stream.world(s3), x2, y2, z2, yaw2, fon && gk && int_and(keys0, 4096) == 0, fon && kk && int_and(keys0, 8192) == 0, fon && tk && int_and(keys0, 16384) == 0, fon && vk && int_and(keys0, 32768) == 0)
+              -- the camera culls figures when playing and in the scenes from 37 on (the stored scenes before them pose every figure)
+              let fscene = Authority.must(Env.get_int("STRATA_SCENE", 0))
+              let cr1v = if StrataViewer.Figures.is_open(cr1) && (!scripted || fscene >= 37) do figure_view(cr1, vp2, x2, y2, z2) else cr1 end
+              let cr2 = StrataViewer.Figures.step(cr1v, Strata.Stream.world(s3), tphys, dt, frame)
+              -- STRATA_ARENA_RAYS=n: n hit rays a frame across the view after the update, timed in the shim (Strata.Ffi.Anim.timing 4 and 5)
+              let nrays = Authority.must(Env.get_int("STRATA_ARENA_RAYS", 0))
+              let _hits = if nrays > 0 && StrataViewer.Figures.is_open(cr2) do rays_go(StrataViewer.Figures.anim(cr2), x2, y2, z2, fx, fy, fz, yaw2, 0, nrays, float_to_int(Math.ceil(Math.sqrt(int_to_float(nrays)))), 0) else 0 end
+              -- STRATA_ANIM_METER=1: once a second, the figures
+              let second = if scripted do frame % 60 == 59 else Math.floor(now) != Math.floor(t_prev) end
+              if second && StrataViewer.Figures.is_open(cr2) && Authority.must(Env.get_int("STRATA_ANIM_METER", 0)) == 1 do
+                match Strata.Anim.stats(StrataViewer.Figures.anim(cr2)) do
+                  -- stale: the figures the last update left at an older pose (out of view or far)
+                  (nf, np, ns, _) -> Authority.must(println("anim: figures " ++ int_to_string(nf) ++ " posed " ++ int_to_string(np) ++ " stale " ++ int_to_string(ns) ++ " parts " ++ int_to_string(float_to_int(Strata.Ffi.Vk.stat(10))) ++ " traced " ++ int_to_string(float_to_int(Strata.Ffi.Vk.stat(17))) ++ " update " ++ fix2(Strata.Ffi.Anim.timing(0) *. 1000.0) ++ " ms"))
+                end
+              else () end
+              -- STRATA_ARENA_LOG=1: a line a frame for timing (the GPU figures are the last finished frame's)
+              if Authority.must(Env.get_int("STRATA_ARENA_LOG", 0)) == 1 do Authority.must(println("arena: frame " ++ int_to_string(frame) ++ " gpu " ++ float_to_string(Strata.Ffi.Vk.stat(3)) ++ " shadow " ++ float_to_string(Strata.Ffi.Vk.stat(14)) ++ " prep_us " ++ float_to_string(Strata.Ffi.Vk.stat(12)) ++ " update " ++ float_to_string(Strata.Ffi.Anim.timing(0) *. 1000.0) ++ " ground " ++ float_to_string(cr2.ground_ms) ++ " cpu " ++ float_to_string(Strata.Ffi.Vk.stat(0)) ++ " march " ++ float_to_string(march_ms) ++ " parts " ++ int_to_string(float_to_int(Strata.Ffi.Vk.stat(10))) ++ " traced " ++ int_to_string(float_to_int(Strata.Ffi.Vk.stat(17))))) else () end
               -- spray where the island's rivers drop (StrataViewer.Falls): on when playing, off in scripted runs unless STRATA_FALLS=1
               let falls2 = if sc == 1.0 && Authority.must(Env.get_int("STRATA_FALLS", if scripted do 0 else 1 end)) == 1 do StrataViewer.Falls.step(falls, Strata.Stream.world(s3), 5, sea(), x2, z2, frame) else falls end
               let next = if Strata.Render.draw(1.0) do frame + 1 else frame end
@@ -2564,7 +2735,7 @@ mod StrataViewer do
               let worst2 = if frame >= 10 && spent > worst do spent else worst end
               let fworst2 = if fluid_ms > fworst do fluid_ms else fworst end
               let total2 = if frame >= 10 do total +. spent else total end
-              let cam2 = Cam(x2, y2, z2, yaw2, pitch2, kx, ky, kz, lb, rb, fly, StrataViewer.Walker.speed_y(moved), StrataViewer.Walker.grounded(moved), fkey, sun, mode, lkey, keys, stride, slot, rkey)
+              let cam2 = Cam(x2, y2, z2, yaw2, pitch2, kx, ky, kz, lb, rb, fly, StrataViewer.Walker.speed_y(moved), StrataViewer.Walker.grounded(moved), fkey, sun, mode, lkey, keys + figbits, stride, slot, rkey)
               if next != frame && frame % 240 == 239 do
                 Authority.must(println("  " ++ float_to_string(Math.round(240.0 /. (now -. t_mark))) ++ " fps; march " ++ ms2(march_ms) ++ " ms, shim " ++ ms2(Strata.Ffi.Vk.stat(0)) ++ " ms, waiting " ++ ms2(Strata.Ffi.Vk.stat(1)) ++ " ms, gpu " ++ ms2(Strata.Ffi.Vk.stat(3)) ++ " ms; " ++ int_to_string(float_to_int(Strata.Ffi.Vk.stat(2))) ++ " draw calls, " ++ int_to_string(float_to_int(Strata.Ffi.Vk.stat(4))) ++ " see-through chunks ordered in " ++ int_to_string(float_to_int(Strata.Ffi.Vk.stat(5))) ++ " us, " ++ int_to_string(Strata.Ffi.Vk.drawn_chunks()) ++ " chunks, " ++ int_to_string(Strata.Ffi.Vk.drawn_quads()) ++ " quads; " ++ int_to_string(Strata.Stream.loaded_count(s3)) ++ " chunks loaded"))
                 if scripted && script != 2 && (Authority.must(Env.get_int("STRATA_BREACH", -1)) >= 0 || Authority.must(Env.get_int("STRATA_DRAIN", -1)) >= 0) do
@@ -2574,8 +2745,8 @@ mod StrataViewer do
                 else () end
                 if StrataViewer.Figures.walking(cr2) > 0 || Strata.Render.figure_rigs(sl3) > 0 do Authority.must(println("  figures: " ++ int_to_string(float_to_int(Strata.Ffi.Vk.stat(10))) ++ " parts drawn in " ++ int_to_string(float_to_int(Strata.Ffi.Vk.stat(11))) ++ " draws; " ++ int_to_string(float_to_int(Strata.Ffi.Vk.stat(12))) ++ " us preparing them, " ++ int_to_string(float_to_int(Strata.Ffi.Vk.stat(13))) ++ " us of it the draw list; update " ++ ms2(Strata.Ffi.Anim.timing(0) *. 1000.0) ++ " ms; shadow map " ++ int_to_string(float_to_int(Strata.Ffi.Vk.stat(15))) ++ " parts in " ++ int_to_string(float_to_int(Strata.Ffi.Vk.stat(16))) ++ " draws, gpu " ++ ms2(Strata.Ffi.Vk.stat(14)) ++ " ms; traced " ++ int_to_string(float_to_int(Strata.Ffi.Vk.stat(17))) ++ " figures, " ++ int_to_string(float_to_int(Strata.Ffi.Vk.stat(18))) ++ " parts")) else () end
                 if Strata.Fluid.active_count(fl2) + Strata.Fluid.dormant_count(fl2) > 0 do Authority.must(println("  fluid: active " ++ int_to_string(Strata.Fluid.active_count(fl2)) ++ ", waiting " ++ int_to_string(Strata.Fluid.waiting_count(fl2)) ++ ", dormant " ++ int_to_string(Strata.Fluid.dormant_count(fl2)) ++ "; last step " ++ ms2(fluid_ms) ++ " ms")) else () end
-                frame_loop(s3, fl2, job2, sl3, reg, cx, cam2, rig2, next, frames, script, hole, tl, worst2, total2, fworst2, now, now, vp2, snd2, aworst2, cr2, mt2, falls2)
-              else frame_loop(s3, fl2, job2, sl3, reg, cx, cam2, rig2, next, frames, script, hole, tl, worst2, total2, fworst2, now, t_mark, vp2, snd2, aworst2, cr2, mt2, falls2) end
+                frame_loop(s3, fl2, job2, sl4, reg, cx, cam2, rig2, next, frames, script, hole, tl, worst2, total2, fworst2, now, now, vp2, snd2, aworst2, cr2, mt2, falls2)
+              else frame_loop(s3, fl2, job2, sl4, reg, cx, cam2, rig2, next, frames, script, hole, tl, worst2, total2, fworst2, now, t_mark, vp2, snd2, aworst2, cr2, mt2, falls2) end
           end
       end
     end
@@ -2617,10 +2788,12 @@ mod StrataViewer do
   --   27 ruin slope   the ruin on the steepest site, from down its slope
   --   28 crater       the same ruin close up; a scripted run blasts a crater in it at frame 10
   --   32..35 trees    an oak, a birch, a pine and a willow close up
+  --   37..41      the animation's: stairs climbed (37), a sword swing (38), creatures in the sea off the coast (39),
+  --                   the arena of runners (40), figures under a roof of leaves (41)
   --   0  (the default) the same spot, for playing: walking, with the keyboard and mouse
   -- Scenes 18, 19 and 23 use the lake scene_lake picks (the island's deepest
-  -- lake near the origin); 2, 8, 13 and 14 the sea off the coast toward the sun (`coast`). Scenes 5, 9, 10, 12, 16, 17, 20
-  -- and 21 stand on the meadow (`meadow`): their edits are built on its ground.
+  -- lake near the origin); 2, 8, 13 and 14 the sea off the coast toward the sun (`coast`). The scenes `on_meadow` names
+  -- stand on the meadow (`meadow`): their edits are built on its ground.
   -- Any other number is the overview.
 
   -- The meadow, (144, 224) at seed 7: the first column, on a grid 16 m apart
@@ -2801,6 +2974,23 @@ mod StrataViewer do
     (int_to_float(cx) +. 0.5, ey, int_to_float(cz) +. 0.5, int_to_float((d + 8) % 16) *. 0.39269908, 0.0 -. Math.atan2(ey -. (int_to_float(y) +. 5.0), 12.0))
   end
 
+  -- the arena's floor (scene 40): the first air above the land 30 m ahead of the origin
+  pfn arena_floor(land : Land, seed : Int) : Int do land_height(land, 0, -30, seed) + 1 end
+
+  -- scene 37's stairs on scene 31's pad (its floor at y) on the meadow (mx, mz): eight steps a quarter metre high and a metre deep
+  -- rising toward +x from x mx - 7 to mx, 5 m wide (z mz - 2 to mz + 2), stone, then a landing 2 m up to x mx + 3
+  pfn stairs_go(s : Strata.Stream.Stream, mx : Int, mz : Int, y : Int, i : Int) : Strata.Stream.Stream do
+    if i >= 8 do Strata.Stream.apply(s, Strata.Edit.fill_box(Strata.Stream.world(s), mx + 1, y, mz - 2, mx + 3, y + 1, mz + 2, 1))
+    else
+      let full = (i + 1) / 4
+      let part = (i + 1) % 4
+      let x = mx - 7 + i
+      let s1 = if full > 0 do Strata.Stream.apply(s, Strata.Edit.fill_box(Strata.Stream.world(s), x, y, mz - 2, x, y + full - 1, mz + 2, 1)) else s end
+      let s2 = if part > 0 do Strata.Stream.apply(s1, Strata.Edit.fill_box(Strata.Stream.world(s1), x, y + full, mz - 2, x, y + full, mz + 2, step_id(part))) else s1 end
+      stairs_go(s2, mx, mz, y, i + 1)
+    end
+  end
+
   doc "Scene 134's blast: the voxel of the slope site's ruin nearest the middle of its footprint, 3 voxels over its floor row; the site's centre there if the ruin is not found."
   fn crater_target(land : Land, d : Decor, seed : Int) : (Int, Int, Int) do
     match land do
@@ -2847,7 +3037,7 @@ mod StrataViewer do
   end
 
   -- Scenes on the meadow (mw is the meadow's column) were placed about (-35, 53) on the old noise terrain;
-  -- main's scenes from there (25, 26, 31, 33, 34, 36, 126, 127) keep their offsets from it.
+  -- main's scenes from there (25, 26, 31, 33, 34, 36, 126, 127) and the animation's (37, 38, 41) keep their offsets from it.
   pfn pose(scene : Int, seed : Int, land : Land, tl : (Int, Int, Int, Int, Int, Int, Int), mw : (Int, Int), hole : (Int, Int, Int)) : (Float, Float, Float, Float, Float) do
     let (mx, mz) = mw
     if scene == 0 && Authority.must(Env.get_int("STRATA_SHORE", 0)) == 1 do
@@ -2855,15 +3045,15 @@ mod StrataViewer do
         (x, z, dx, dz) -> (int_to_float(x) +. 0.5, int_to_float(land_height(land, x, z, seed)) +. 2.7, int_to_float(z) +. 0.5, Math.atan2(int_to_float(dz), int_to_float(dx)), -0.1)
       end
     else if scene == 0 || scene == 11 do (0.5, int_to_float(land_height(land, 0, 0, seed)) +. 2.7, 0.5, 0.62, -0.1)
-    else if scene == 2 || scene == 8 || scene == 13 || scene == 14 || scene == 28 || scene == 35 || scene == 124 do
+    else if scene == 2 || scene == 8 || scene == 13 || scene == 14 || scene == 28 || scene == 35 || scene == 39 || scene == 124 do
       -- the sea off the coast toward the sun: low over it along the shore (2, and 28 with its crate), just under its
       -- surface looking back at the land (8) or steeply up at the surface (124), across it toward the sun to catch
-      -- its glints (13), steeply down at it (14); 35 is scene 2's camera turned 0.32 rad left, toward the beach
+      -- its glints (13), steeply down at it (14); 35 is scene 2's camera turned 0.32 rad left, toward the beach, and so is 39 (its creatures)
       match coast(land, seed, 6, 0) do
         (wx, wz) ->
           let sea = gen_sea(gp_default())
           let y = if scene == 8 do sea -. 1.4 else if scene == 124 do sea -. 2.4 else sea +. 3.5 end end
-          let yaw = if scene == 2 || scene == 28 do 11.0 *. 0.39269908 else if scene == 35 do 11.0 *. 0.39269908 -. 0.32 else if scene == 8 || scene == 124 do 14.0 *. 0.39269908 else 2.23 end end end
+          let yaw = if scene == 2 || scene == 28 do 11.0 *. 0.39269908 else if scene == 35 || scene == 39 do 11.0 *. 0.39269908 -. 0.32 else if scene == 8 || scene == 124 do 14.0 *. 0.39269908 else 2.23 end end end
           let pitch = if scene == 13 do -0.12 else if scene == 14 do -0.75 else if scene == 8 do 0.22 else if scene == 124 do 1.05 else -0.15 end end end end
           let fwd = 0.0
           (int_to_float(wx) +. 0.5 +. Math.sin(yaw) *. fwd, y, int_to_float(wz) +. 0.5 -. Math.cos(yaw) *. fwd, yaw, pitch)
@@ -2894,7 +3084,10 @@ mod StrataViewer do
     else if scene == 126 do (int_to_float(mx) -. 5.5, int_to_float(ground_top(land, mx, mz, seed)) +. 6.0, int_to_float(mz) +. 0.5, 1.5708, -0.3)
     else if scene == 21 || scene == 127 do (int_to_float(mx - 10), int_to_float(ground_top(land, mx, mz, seed)) +. 10.0, int_to_float(mz - 13), 2.5, -0.4)
     else if scene == 25 || scene == 26 do (int_to_float(mx - 5), int_to_float(ground_top(land, mx - 5, mz + 7, seed)) +. 3.5, int_to_float(mz + 7), 0.0, -0.3)
-    else if scene == 31 do (int_to_float(mx - 3), int_to_float(ground_top(land, mx - 8, mz - 1, seed)) +. 2.9, int_to_float(mz + 6), 0.0, -0.14)
+    else if scene == 31 || scene == 38 do (int_to_float(mx - 3), int_to_float(ground_top(land, mx - 8, mz - 1, seed)) +. 2.9, int_to_float(mz + 6), 0.0, -0.14)
+    else if scene == 41 do (int_to_float(mx - 3), int_to_float(ground_top(land, mx - 8, mz - 1, seed)) +. 3.5, int_to_float(mz) +. 7.5, 0.661, -0.35)
+    else if scene == 37 do (int_to_float(mx) -. 4.5, int_to_float(ground_top(land, mx - 8, mz - 1, seed)) +. 3.6, int_to_float(mz + 7), 0.0, -0.2)
+    else if scene == 40 do (0.5, int_to_float(arena_floor(land, seed)) +. 5.0, 8.0, 0.0, -0.2)
     else if scene == 33 || scene == 34 do (int_to_float(mx - 3), int_to_float(ground_top(land, mx - 8, mz - 1, seed)) +. 7.0, int_to_float(mz) +. 7.5, 0.661, -0.7)
     else if scene == 20 do (int_to_float(mx) -. 0.5, int_to_float(ground_top(land, mx, mz, seed)) +. 12.0, int_to_float(mz) +. 7.5, 0.0, -0.95)
     else if scene == 16 || scene == 36 do (int_to_float(mx) +. 0.5, int_to_float(ground_top(land, mx, mz, seed)) -. 1.3, int_to_float(mz) +. 5.2, 0.0, -0.03)
@@ -2960,7 +3153,7 @@ mod StrataViewer do
           let ey = int_to_float(land_height(land, bx, bz, seed)) +. 5.0
           (int_to_float(bx) +. 0.5, ey, int_to_float(bz) +. 0.5, int_to_float(d) *. 0.39269908, 0.0 -. Math.atan2(ey -. int_to_float(line), int_to_float(2 * rad + 8)))
       end
-    else overview_pose(land, seed) end end end end end end end end end end end end end end end end end end end end end end end end end end end end end end end end
+    else overview_pose(land, seed) end end end end end end end end end end end end end end end end end end end end end end end end end end end end end end end end end end end
   end
 
   -- ── Timing the generator ─────────────────────────────────────────────────
@@ -3020,6 +3213,7 @@ mod StrataViewer do
   pfn on_meadow(scene : Int) : Bool do
     scene == 5 || scene == 9 || scene == 10 || scene == 12 || scene == 16 || scene == 17 || scene == 20 || scene == 21
       || scene == 25 || scene == 26 || scene == 31 || scene == 33 || scene == 34 || scene == 36 || scene == 126 || scene == 127 || scene == 136
+      || scene == 37 || scene == 38 || scene == 41
   end
   pfn settle(s : Strata.Stream.Stream, o : Strata.Edit.Outcome) : Strata.Stream.Stream do Strata.Stream.run_until_settled(Strata.Stream.apply(s, o), 1000000) end
 
@@ -3106,8 +3300,58 @@ mod StrataViewer do
     -- ground_at answers 1.5 m under where it searched from when it found none (open water)
     if (y >= int_to_float(sea() + 1) && y < ey +. 0.4) || d > 60.0 do (x, y, z) else shore_spot(w, ex, ey, ez, yaw, d +. 0.5) end
   end
+  -- the arena: [n] runners in rows of 32, 3.5 m apart, from 10 m ahead, 4 m between rows, each round its own
+  -- circle of 1.5 m (circles never meet), the first [feet] (the nearest rows) with foot placement, and the [traced]
+  -- of rows 4 on, columns 12 to 19, traced (in view); all aiming at the eye
+  pfn arena_go(c : StrataViewer.Figures.Crowd, y : Float, ex : Float, ey : Float, ez : Float, i : Int, n : Int, feet : Int, traced : Int) : StrataViewer.Figures.Crowd do
+    if i >= n do c
+    else
+      let row = i / 32
+      let col = i % 32
+      let cx = ex -. 0.5 +. (int_to_float(col) -. 15.5) *. 3.5
+      let cz = ez -. 10.0 -. int_to_float(row) *. 4.0
+      let c2 = StrataViewer.Figures.add_runner(c, cx, cz, 1.5, int_to_float(i) *. 0.7, y, 1.0, ex, ey, ez, i < feet)
+      let lit = if col >= 12 && col < 20 && row >= 4 do (row - 4) * 8 + (col - 12) < traced else false end
+      arena_go(if lit do StrataViewer.Figures.trace_last(c2) else c2 end, y, ex, ey, ez, i + 1, n, feet, traced)
+    end
+  end
+  -- STRATA_ARENA: the arena's runners (512; -1 opens no figure world at all, for timing without one)
+  pfn n_arena() : Int do Authority.must(Env.get_int("STRATA_ARENA", 512)) end
   pfn crowd_for(scene : Int, n : Int, w : Strata.World.World, ex : Float, ey : Float, ez : Float, yaw : Float) : StrataViewer.Figures.Crowd do
     if scene == 31 do posed_go(StrataViewer.Figures.open(16), w, ex, ey, ez, yaw, 0)
+    else if scene == 37 do
+      -- across the stairs on the meadow (x mx - 7 to mx at z mz - 2 to mz + 2, a quarter metre a step), from 0.3 m
+      -- before the first, walking +x at 1.12 m/s (the walk at rate 0.8) with foot placement
+      let (mx, mz) = meadow()
+      let x = int_to_float(mx) -. 7.3
+      let z = int_to_float(mz)
+      StrataViewer.Figures.add_climber(StrataViewer.Figures.open(16), x, z, 0.0, 1.5707963, StrataViewer.Figures.ground_at(w, x, z, ey), 0.8)
+    else if scene == 38 do
+      -- 5 m ahead on scene 31's pad, facing right (+x) so its sword arm is toward the camera, frozen in the swing at 0.4 s, the blade mid-arc
+      let x = ex +. Math.sin(yaw) *. 5.0
+      let z = ez -. Math.cos(yaw) *. 5.0
+      StrataViewer.Figures.add_sword(StrataViewer.Figures.add_posed_at(StrataViewer.Figures.with_creatures(StrataViewer.Figures.open(16)), 6, 0.4, x, StrataViewer.Figures.ground_at(w, x, z, ey), z, 1.5707963))
+    else if scene == 39 do
+      -- the creatures by the sea off the coast (scene 35's view): the cart circling on the beach beyond the first dry ground ahead, the fish
+      -- circling in the water 6 m ahead, just under its top, the bird circling 9 m ahead and 1.5 m above the eye
+      let c0 = StrataViewer.Figures.with_creatures(StrataViewer.Figures.open(16))
+      match shore_spot(w, ex, ey, ez, yaw, 4.0) do
+        (sx, sy, sz) ->
+          let c1 = StrataViewer.Figures.add_cart(c0, sx +. Math.sin(yaw) *. 2.5, sz -. Math.cos(yaw) *. 2.5, 2.0, 0.0, sy)
+          let c2 = StrataViewer.Figures.add_fish(c1, ex +. Math.sin(yaw) *. 6.0, ez -. Math.cos(yaw) *. 6.0, 1.2, 0.0, int_to_float(sea()) +. 0.85)
+          StrataViewer.Figures.add_bird(c2, ex +. Math.sin(yaw) *. 9.0, ez -. Math.cos(yaw) *. 9.0, 4.0, 0.0, ey +. 1.5)
+      end
+    else if scene == 41 do
+      -- scene 33's runner and walker under scene 41's roof of leaves: plain figures, their map shadows among the leaves' traced, dappled ones
+      let px = ex +. Math.sin(yaw) *. 7.0 +. Math.cos(yaw) *. 1.5
+      let pz = ez -. Math.cos(yaw) *. 7.0 +. Math.sin(yaw) *. 1.5
+      let posed = StrataViewer.Figures.add_posed(StrataViewer.Figures.open(16), 2, px, StrataViewer.Figures.ground_at(w, px, pz, ey), pz, 0.35 -. yaw)
+      let wx = ex +. Math.sin(yaw) *. 4.0 -. Math.cos(yaw) *. 1.0
+      let wz = ez -. Math.cos(yaw) *. 4.0 -. Math.sin(yaw) *. 1.0
+      StrataViewer.Figures.add_walker(posed, wx, wz, 0.0, Math.atan2(Math.cos(yaw), Math.sin(yaw)), StrataViewer.Figures.ground_at(w, wx, wz, ey), 0.6)
+    else if scene == 40 && n_arena() < 0 do StrataViewer.Figures.none()
+    else if scene == 40 do
+      arena_go(StrataViewer.Figures.with_creatures(StrataViewer.Figures.open(1024)), StrataViewer.Figures.ground_at(w, ex, ez -. 10.0, ey), ex, ey, ez, 0, n_arena(), Authority.must(Env.get_int("STRATA_ARENA_FEET", 128)), Authority.must(Env.get_int("STRATA_ARENA_TRACED", 32)))
     else if scene == 34 do
       -- scene 33 with a second runner, traced, 4 m left of the plain one, and the walker traced: the
       -- traced shadows are soft-edged, the plain one's sharper; the walker's moving shadow leaves no trail
@@ -3148,7 +3392,7 @@ mod StrataViewer do
       let z = ez -. Math.cos(yaw) *. 5.0 +. Math.sin(yaw) *. 1.0
       StrataViewer.Figures.add_walker(StrataViewer.Figures.open(16), x, z, 0.0, Math.atan2(Math.cos(yaw), Math.sin(yaw)), StrataViewer.Figures.ground_at(w, x, z, ey +. 1.0), 0.6)
     else if n > 0 do crowd_go(StrataViewer.Figures.open(if n < 16 do 16 else n end), w, ex, ey, ez, yaw, 0, n)
-    else StrataViewer.Figures.none() end end end end end end end
+    else StrataViewer.Figures.none() end end end end end end end end end end end end end
   end
 
   -- ── The far field ────────────────────────────────────────────────────────
@@ -3257,13 +3501,20 @@ mod StrataViewer do
       let hole = if soak > 0 do mid else if scene == 134 do target else hole0 end end
       let s0i = scene_edits(scene, land, seed, s0, mx, mz, gy)
       -- scenes 25 and 26 level a pad 14 x 10 m ahead for their crates and slab: clear above the ground there, fill below; scene 31 one for its figures
-      let pad = if scene == 31 do (mx - 10, ground_top(land, mx - 8, mz - 1, seed) + 1, mz - 5) else (float_to_int(Math.floor(ex)) - 5, ground_top(land, float_to_int(Math.floor(ex)) - 3, float_to_int(Math.floor(ez)) - 8, seed) + 1, float_to_int(Math.floor(ez)) - 12) end
-      let s0e = if (scene != 25 && scene != 26 && scene != 31 && scene != 32 && scene != 33 && scene != 34) || fine do s0i
-        else if scene == 33 || scene == 34 do
-          -- scene 31's ground, levelled 32 m on toward the sun (+x, +z) and cleared 14 m up, so a low sun reaches the figures' grass
+      let pad = if scene == 31 || scene == 37 || scene == 38 do (mx - 10, ground_top(land, mx - 8, mz - 1, seed) + 1, mz - 5) else (float_to_int(Math.floor(ex)) - 5, ground_top(land, float_to_int(Math.floor(ex)) - 3, float_to_int(Math.floor(ez)) - 8, seed) + 1, float_to_int(Math.floor(ez)) - 12) end
+      let s0e = if (scene != 25 && scene != 26 && scene != 31 && scene != 32 && scene != 33 && scene != 34 && scene != 37 && scene != 38 && scene != 40 && scene != 41) || fine do s0i
+        else if scene == 40 do
+          -- the arena: 120 x 80 m levelled at the floor, cleared 30 m up and filled 4 m down with grass
+          let py = arena_floor(land, seed)
+          let cleared = Strata.Stream.apply(s0i, Strata.Edit.fill_box(Strata.Stream.world(s0i), -60, py, -70, 60, py + 30, 12, 0))
+          Strata.Stream.run_until_settled(Strata.Stream.apply(cleared, Strata.Edit.fill_box(Strata.Stream.world(cleared), -60, py - 4, -70, 60, py - 1, 12, 3)), 1000000)
+        else if scene == 33 || scene == 34 || scene == 41 do
+          -- scene 31's ground, levelled 32 m on toward the sun (+x, +z) and cleared 14 m up, so a low sun reaches the figures' grass;
+          -- scene 41 roofs it with a layer of leaves 5 m up, 22 m a side, over the camera and the figures
           let py = ground_top(land, mx - 8, mz - 1, seed) + 1
           let cleared = Strata.Stream.apply(s0i, Strata.Edit.fill_box(Strata.Stream.world(s0i), mx - 11, py, mz - 9, mx + 21, py + 14, mz + 23, 0))
-          Strata.Stream.run_until_settled(Strata.Stream.apply(cleared, Strata.Edit.fill_box(Strata.Stream.world(cleared), mx - 11, py - 4, mz - 9, mx + 21, py - 1, mz + 23, 3)), 1000000)
+          let levelled = Strata.Stream.apply(cleared, Strata.Edit.fill_box(Strata.Stream.world(cleared), mx - 11, py - 4, mz - 9, mx + 21, py - 1, mz + 23, 3))
+          Strata.Stream.run_until_settled(if scene == 41 do Strata.Stream.apply(levelled, Strata.Edit.fill_box(Strata.Stream.world(levelled), mx - 11, py + 5, mz - 9, mx + 11, py + 5, mz + 13, 8)) else levelled end, 1000000)
         else if scene == 32 do
           -- the ground the forest camera stands on, levelled under the figure's path (5 m ahead, 1 to 5 m right): cleared 4 m up, filled 2 m down
           let py = ground_top(land, mx, mz, seed) + 1
@@ -3273,9 +3524,10 @@ mod StrataViewer do
           match pad do
             (px, py, pz) ->
               let cleared = Strata.Stream.apply(s0i, Strata.Edit.fill_box(Strata.Stream.world(s0i), px, py, pz, px + 14, py + 8, pz + 10, 0))
-              Strata.Stream.run_until_settled(Strata.Stream.apply(cleared, Strata.Edit.fill_box(Strata.Stream.world(cleared), px, py - 4, pz, px + 14, py - 1, pz + 10, 3)), 1000000)
+              let levelled = Strata.Stream.apply(cleared, Strata.Edit.fill_box(Strata.Stream.world(cleared), px, py - 4, pz, px + 14, py - 1, pz + 10, 3))
+              Strata.Stream.run_until_settled(if scene == 37 do stairs_go(levelled, mx, mz, py, 0) else levelled end, 1000000)
           end
-        end end end
+        end end end end
       let boxes = if soak > 0 do lake_boxes(a, scale) else Nil end
       let starts = lake_amounts(Strata.Stream.world(s0e), reg, boxes)
       let cx = Ctx(scale, seed, boxes, starts, (mx, mz, gy))
@@ -3310,10 +3562,11 @@ mod StrataViewer do
           -- figures: scene 31 the humanoid's seven clips side by side, 32 one walking across the forest floor, STRATA_FIGURES=n a crowd
           let crowd = crowd_for(scene, Authority.must(Env.get_int("STRATA_FIGURES", 0)), Strata.Stream.world(s1), ex, ey, ez, yaw0)
           let _ = if Authority.must(Env.get_int("STRATA_FIGURES", 0)) > 0 do Authority.must(println("strata_viewer: " ++ int_to_string(StrataViewer.Figures.walking(crowd)) ++ " of " ++ int_to_string(Authority.must(Env.get_int("STRATA_FIGURES", 0))) ++ " figures on dry ground")) else () end
+          if scene == 40 && StrataViewer.Figures.is_open(crowd) do Authority.must(println("arena: " ++ int_to_string(StrataViewer.Figures.walking(crowd)) ++ " runners; figure quads " ++ int_to_string(StrataViewer.Figures.quads(crowd)) ++ " (" ++ int_to_string(StrataViewer.Figures.quads(crowd) * 8) ++ " bytes) for every rig, held once")) else () end
           -- STRATA_COMBAT=1: the free-for-all (StrataViewer.Match); its figures take the crowd's place
           let mt0 = if Authority.must(Env.get_int("STRATA_COMBAT", 0)) == 1 && !fine do StrataViewer.Match.with_nav(StrataViewer.Match.start(seed, Strata.Stream.world(s1), ex, ey, ez, r, Authority.must(Env.get_int("STRATA_COMBAT_PLAYER", 1)) == 1, combat_scene(Authority.must(Env.get("STRATA_COMBAT_SCENE", ""))), combat_script(Authority.must(Env.get("STRATA_COMBAT_SCRIPT", ""))), Authority.must(Env.get_int("STRATA_COMBAT_WIN", 30)), Authority.must(Env.get_int("STRATA_COMBAT_REPEAT", 0))), Authority.must(Env.get_int("STRATA_COMBAT_NAV", 1)) == 1) else StrataViewer.Match.off() end
           let sl_f = if StrataViewer.Match.is_on(mt0) do Strata.Render.figures(sl, StrataViewer.Match.anim(mt0), StrataViewer.Match.rigs(mt0))
-            else if StrataViewer.Figures.walking(crowd) > 0 || scene == 31 || scene == 35 do Strata.Render.figures(sl, StrataViewer.Figures.anim(crowd), StrataViewer.Figures.rigs(crowd)) else sl end end
+            else if StrataViewer.Figures.any(crowd) do Strata.Render.figures(sl, StrataViewer.Figures.anim(crowd), StrataViewer.Figures.rigs(crowd)) else sl end end
           frame_loop(s1, new_fluid(reg, g, scale), None, sl_f, reg, cx, cam, rig, 0, frames, if soak > 0 do 2 else if scene == 11 && frames > 0 do 1 else if scene == 4 && frames > 0 do 3 else if scene == 134 && frames > 0 do 4 else 0 end end end end, hole, tl, 0.0, 0.0, 0.0, Strata.Ffi.Vk.time(), Strata.Ffi.Vk.time(), NativeArray.make_f32(16, 0.0), audio_start(frames), 0.0, crowd, mt0, StrataViewer.Falls.none())
       end
       Strata.Ffi.Vk.close()
