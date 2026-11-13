@@ -689,6 +689,51 @@ chunk has the edited level-0 chunks under it coarsened over it
 the chunk), and an edit makes its ancestors stale (`Strata.World.stale`),
 which the stream puts through its generation queue again without waiting.
 
+## Particles
+
+Design: `docs/2026-11-12-particles-design.md`. A game describes an effect
+as data and emits it; the GPU flies every particle on a closed form from a
+64-byte record written once at its birth, so a particle costs the CPU
+nothing after it is born. Particles meet nothing.
+
+```march
+alias Strata.Particles as Pt
+
+-- an effect: glowing (added, not lit) or shaded (blended, lit by sun and sky)
+let flame = Pt.effect() |> Pt.glowing() |> Pt.layer(13) |> Pt.spin(2.0)
+  |> Pt.colour([(0.0, 1.0, 0.9, 0.5, 0.0), (0.15, 1.0, 0.6, 0.15, 0.9), (1.0, 0.6, 0.1, 0.0, 0.0)])
+  |> Pt.size([(0.0, 0.25), (1.0, 0.05)])          -- (age, metres)
+  |> Pt.accel(0.0, 3.0, 0.0) |> Pt.drag(2.0) |> Pt.wobble(0.08, 1.5)
+let (fx, flame_id) = Pt.define(Pt.new(seed), flame) -- ids 1 to 63; -1 past that
+
+-- a burst now, and an emitter the game moves each frame
+let fx2 = Pt.burst(fx, flame_id, Pt.sphere(x, y, z, 0.5), (0.0, 1.0, 0.0), 1.5, 60, 0.6, 0.3)
+let (fx3, e) = Pt.emitter(fx2, flame_id, Pt.point(x, y, z), (0.0, 0.3, 0.0), 0.4, 200.0, 0.5, 0.3)
+
+-- each frame: move, step, and hand the bursts to the renderer
+let fx4 = Strata.Render.particles(Pt.step(Pt.move(fx3, e, Pt.point(x2, y2, z2)), dt))
+```
+
+A particle is drawn as a tiny cube, tumbling at the effect's `spin`, each
+face lit by its own direction and textured with the effect's layer
+(`Pt.sprite()` draws a square facing the eye instead). Colour and size
+follow up to four keys over a particle's life; it moves
+under a constant acceleration with linear drag and a sideways sway. A
+moving emitter spreads a frame's particles along its path, so a fast one
+leaves an unbroken trail (past 4 m a frame it has jumped, and leaves none).
+A burst holds at most 512, an emitter spawns at most 4096 a frame, and the
+ring holds 65 536 live particles, overwriting its oldest when full. A
+shaded effect is lit once a particle unless `Pt.lit_per_pixel` asks for
+spray's per-pixel lighting. `Strata.Render.spray` is the built-in effect 0:
+tumbling cubes in the texture of the block they were thrown from.
+
+In the viewer, `STRATA_FX=1` shows the six effects side by side at frame
+10. In a match (`STRATA_COMBAT=1`) a fireball trails flame, smoke and
+embers and bursts in sparks; what it reaches catches over half a second
+and burns for seconds (grass 1 to 2, leaves 2 to 3, wood 4 to 6) as glowing
+embers blocks that light the ground, before it is gone. Cost: `RESULTS.md`,
+Particles.
+
 ## The far field
 
 Past the near chunks the world goes on in rings of coarser chunks (Part F
@@ -754,6 +799,7 @@ boundary over the ground; their numbers are in `RESULTS.md`.
 | `Strata.Feature` | scattering features by hashed cells: the same placements however an area is cut |
 | `Strata.Template`, `Strata.Ffi.Vox` | voxel templates (holes, probabilities, turns) blitted into chunks; MagicaVoxel `.vox` import (`native/strata_vox.cpp`, link with `-fno-exceptions`) |
 | `Strata.Entities`, `Strata.Ffi.Ent` | entity kinds, and entities kept as rows by the C kernel in `native/strata_ent.h` |
+| `Strata.Particles` | particle effects as data, emitters, the bursts a frame hands the renderer |
 | `Strata.Ffi.Vk` | window, input and the Vulkan renderer |
 | `Strata.Math.*`, `Strata.Noise`, `Strata.Tree` | vectors, matrices, noise, a persistent tree |
 

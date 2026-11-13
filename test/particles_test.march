@@ -1,0 +1,149 @@
+-- Particles: effects as data, emitters that owe particles by their rate and
+-- carry the fraction, trails along a moving emitter's path, and the queue of
+-- bursts a frame hands the renderer.
+mod ParticlesTest do
+  needs IO.Clock      -- charged to every test module once any uses Check.all (GAPS S3)
+  needs IO.Process
+  needs IO.Spawn
+
+  alias Strata.Particles as Pt
+
+  pfn queued_count(p : Strata.Particles.Particles) : Int do List.fold_left(Pt.queued(p), 0, fn (a, s) -> a + Pt.sp_count(s)) end
+  pfn steps(p : Strata.Particles.Particles, dt : Float, n : Int) : Strata.Particles.Particles do
+    if n <= 0 do p else steps(Pt.step(p, dt), dt, n - 1) end
+  end
+  -- a run with one emitter at [rate] a second, effect 1
+  pfn one(rate : Float) : (Strata.Particles.Particles, Int) do
+    match Pt.define(Pt.new(7), Pt.effect()) do
+      (p1, fx) -> Pt.emitter(p1, fx, Pt.point(0.0, 0.0, 0.0), (0.0, 1.0, 0.0), 0.5, rate, 1.0, 0.2)
+    end
+  end
+  pfn near(a : Float, b : Float) : Bool do a -. b <= 0.0001 && b -. a <= 0.0001 end
+  pfn same3(a : (Float, Float, Float), b : (Float, Float, Float)) : Bool do
+    match (a, b) do ((ax, ay, az), (qx, qy, qz)) -> near(ax, qx) && near(ay, qy) && near(az, qz) end
+  end
+  pfn define_n(p : Strata.Particles.Particles, n : Int, last : Int) : (Strata.Particles.Particles, Int) do
+    if n <= 0 do (p, last) else match Pt.define(p, Pt.effect()) do (p2, id) -> define_n(p2, n - 1, id) end end
+  end
+  pfn seeds(p : Strata.Particles.Particles) : List(Int) do List.map(Pt.queued(p), fn s -> Pt.sp_seed(s)) end
+
+  describe "Strata.Particles" do
+    test "an emitter at 120 a second for 1/60 s queues 2" do
+      match one(120.0) do (p, _) -> Test.assert_eq_int(queued_count(Pt.step(p, 1.0 /. 60.0)), 2, "two") end
+    end
+    test "fractions carry: 50 a second, ten frames queue 8, the eleventh one more" do
+      match one(50.0) do
+        (p, _) ->
+          let p10 = steps(p, 1.0 /. 60.0, 10)
+          Test.assert_eq_int(queued_count(p10), 8, "8.33 owed, 8 spawned")
+          Test.assert_eq_int(queued_count(Pt.step(p10, 1.0 /. 60.0)), 9, "9.17 owed, 9 spawned")
+      end
+    end
+    test "step with no time spawns nothing and keeps the carry" do
+      match one(60.0) do
+        (p, _) ->
+          let p0 = Pt.step(steps(p, 1.0 /. 120.0, 1), 0.0)
+          Test.assert_eq_int(queued_count(p0), 0, "half a particle owed, none spawned, none at dt 0")
+          Test.assert_eq_int(queued_count(Pt.step(p0, 1.0 /. 120.0)), 1, "the carried half and another make one")
+      end
+    end
+    test "a stopped emitter spawns nothing" do
+      match one(600.0) do
+        (p, e) ->
+          let s = Pt.stop(p, e)
+          Test.assert_eq_int(Pt.live_emitters(p), 1, "one before")
+          Test.assert_eq_int(Pt.live_emitters(s), 0, "none after")
+          Test.assert_eq_int(queued_count(Pt.step(s, 0.1)), 0, "nothing queued")
+      end
+    end
+    test "a moving emitter spawns along its path" do
+      match one(600.0) do
+        (p, e) ->
+          match Pt.queued(Pt.step(Pt.move(p, e, Pt.point(1.0, 0.0, 0.0)), 0.1)) do
+            Cons(s, _) ->
+              Test.assert_true(same3(Pt.sp_from(s), (0.0, 0.0, 0.0)), "from where it was")
+              Test.assert_true(same3(Pt.sp_to(s), (1.0, 0.0, 0.0)), "to where it is")
+            Nil -> Test.fail("nothing queued")
+          end
+      end
+    end
+    test "a jump past four metres draws no trail" do
+      match one(600.0) do
+        (p, e) ->
+          match Pt.queued(Pt.step(Pt.move(p, e, Pt.point(10.0, 0.0, 0.0)), 0.1)) do
+            Cons(s, _) ->
+              Test.assert_true(same3(Pt.sp_from(s), (10.0, 0.0, 0.0)), "from the new place")
+              Test.assert_true(same3(Pt.sp_to(s), (10.0, 0.0, 0.0)), "to the new place")
+            Nil -> Test.fail("nothing queued")
+          end
+      end
+    end
+    test "a huge rate is capped a frame, in bursts of at most 512, with no backlog" do
+      match one(100000.0) do
+        (p, _) ->
+          let p1 = Pt.step(p, 0.1)
+          Test.assert_eq_int(queued_count(p1), 4096, "4096 at most a frame")
+          Test.assert_true(List.all(Pt.queued(p1), fn s -> Pt.sp_count(s) <= 512), "bursts of at most 512")
+          let p2 = Pt.step(Pt.drain(p1), 1.0 /. 60.0)
+          Test.assert_true(queued_count(p2) <= 4096, "the next frame is capped again")
+          Test.assert_true(queued_count(p2) >= 1666, "and owes its own 1666, not the dropped backlog only")
+      end
+    end
+    test "the same calls give the same seeds, another seed others" do
+      match (one(300.0), one(300.0)) do
+        ((a, _), (b, _)) -> Test.assert_true(seeds(steps(a, 0.1, 3)) == seeds(steps(b, 0.1, 3)), "equal seeds")
+      end
+      match Pt.define(Pt.new(8), Pt.effect()) do
+        (p8, fx) ->
+          match Pt.emitter(p8, fx, Pt.point(0.0, 0.0, 0.0), (0.0, 1.0, 0.0), 0.5, 300.0, 1.0, 0.2) do
+            (c, _) -> match one(300.0) do (a, _) -> Test.assert_false(seeds(steps(c, 0.1, 3)) == seeds(steps(a, 0.1, 3)), "seed 8 differs from seed 7") end
+          end
+      end
+    end
+    test "define gives 1 to 63 and refuses the 64th" do
+      match define_n(Pt.new(1), 63, 0) do
+        (p, last) ->
+          Test.assert_eq_int(last, 63, "the 63rd is 63")
+          match Pt.define(p, Pt.effect()) do (_, id) -> Test.assert_eq_int(id, -1, "the 64th is refused") end
+      end
+    end
+    test "floats is 44 long and holds the look, layer and keys" do
+      let e = Pt.effect() |> Pt.glowing() |> Pt.layer(14)
+        |> Pt.colour([(0.0, 1.0, 0.0, 0.0, 1.0), (0.2, 0.0, 1.0, 0.0, 1.0), (0.4, 0.0, 0.0, 1.0, 1.0), (0.6, 1.0, 1.0, 1.0, 1.0), (1.0, 0.0, 0.0, 0.0, 0.0)])
+        |> Pt.size([(0.0, 0.25), (1.0, 0.05)]) |> Pt.accel(0.0, 3.0, 0.0) |> Pt.drag(2.0)
+      let f = Pt.floats(e)
+      Test.assert_eq_int(List.length(f), 44, "forty-four floats")
+      Test.assert_true(near(List.nth(f, 0), 1.0), "glowing")
+      Test.assert_true(near(List.nth(f, 1), 14.0), "layer 14")
+      Test.assert_true(near(List.nth(f, 3), 4.0), "four colour keys kept of five")
+      Test.assert_true(near(List.nth(f, 32), 2.0), "two size keys")
+      Test.assert_true(near(List.nth(f, 33), 2.0), "drag 2")
+      Test.assert_true(near(List.nth(f, 37), 3.0), "ay 3")
+      Test.assert_true(near(List.nth(Pt.floats(Pt.effect()), 2), 1.0), "an effect is lit once a particle unless told")
+      Test.assert_true(near(List.nth(f, 40), 1.0), "an effect is drawn as cubes unless told")
+      Test.assert_true(near(List.nth(Pt.floats(Pt.sprite(Pt.effect())), 40), 0.0), "sprite: a square facing the eye")
+      Test.assert_true(near(List.nth(Pt.floats(Pt.cube(Pt.sprite(Pt.effect()))), 40), 1.0), "and cube again")
+    end
+    test "a burst queues at once, from a point to itself" do
+      match Pt.define(Pt.new(3), Pt.effect()) do
+        (p, fx) ->
+          match Pt.queued(Pt.burst(p, fx, Pt.sphere(1.0, 2.0, 3.0, 0.5), (0.0, 1.0, 0.0), 1.0, 30, 0.8, 0.3)) do
+            Cons(s, Nil) ->
+              Test.assert_eq_int(Pt.sp_count(s), 30, "thirty")
+              Test.assert_true(same3(Pt.sp_from(s), Pt.sp_to(s)), "no trail")
+            _ -> Test.fail("one burst")
+          end
+      end
+    end
+    test "drain empties the queue and the pending effects" do
+      match one(600.0) do
+        (p, _) ->
+          let s = Pt.step(p, 0.1)
+          Test.assert_eq_int(List.length(Pt.pending_effects(s)), 1, "one effect to send")
+          let d = Pt.drain(s)
+          Test.assert_eq_int(queued_count(d), 0, "no bursts")
+          Test.assert_eq_int(List.length(Pt.pending_effects(d)), 0, "nothing to send")
+      end
+    end
+  end
+end
