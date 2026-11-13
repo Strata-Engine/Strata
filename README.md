@@ -466,8 +466,8 @@ against the last view given. A hit ray every frame, as above, poses every
 figure the update skipped, which gives back culling's CPU saving until the
 kernel poses only the figures along the ray. `Strata.Anim.open` again
 voids every rig and clip id (they start at 0 again; hand the new rigs to
-`Strata.Render.figures`, which re-uploads them); figure ids carry on, so an
-old one names no new figure. `Strata.Anim.traced(a, fig, true)` puts up to 64
+`Strata.Render.figures`, which re-uploads them), and figure ids start at 0
+again too, so drop every id held from the old world. `Strata.Anim.traced(a, fig, true)` puts up to 64
 figures among what the light pass's rays hit (their shadows, reflections,
 sky darkening and glow); the rest are drawn plain and cast their sun
 shadow from a shadow map. `attach` hangs one figure from another's socket
