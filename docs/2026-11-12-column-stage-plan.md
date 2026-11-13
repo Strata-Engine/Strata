@@ -35,7 +35,7 @@
 
 **Files:** `bench/column_batches/` (new: `forge.toml`, `lib/column_batches.march`, `run.sh`, `README.md`). No library or viewer file changes.
 
-A small app on the viewer's island generator (the copy-with-`pfn`-made-`fn` trick of `bench/chunk_stages/build.sh` is not needed: it uses only `StrataViewer.island_gen`, `load_atlas`, `decor_of` and `Strata.Stream`'s public API). It drives a stream with the viewer's configuration (`config_levels(10, 3, 32, 8, 10, 1, 4)`, read the viewer's `main` for the exact call) through three scripts and, at each tick, reads `Strata.Stream`'s public queue and loaded set to count, for the keys a tick would start, how many share a column and level with the key at the head.
+A small app on the viewer's island generator (the copy-with-`pfn`-made-`fn` trick of `bench/chunk_stages/build.sh` is not needed: it uses only `StrataViewer.island_gen`, `load_atlas`, `decor_of` and `Strata.Stream`'s public API). It drives a stream with the viewer's configuration (the call in the viewer's `main`: `config_levels(r, 3, 8, 4, far_radius(), 1, levels)` with levels, `config(r, 3, 32, 8)` without) through three scripts and, at each tick, reads `Strata.Stream`'s public queue and loaded set to count, for the keys a tick would start, how many share a column and level with the key at the head.
 
 - [ ] Read `Strata.Stream`'s public functions; if the queue is not readable from outside, the count is taken instead from the order chunks arrive in (`take_loads` or the chunk log): group consecutive arrivals within a tick by column. Say in the README which was used.
 - [ ] Scripts: (a) start-up at the origin until settled; (b) level flight, 400 m along +x at 8 m a tick; (c) a climb, 96 m up at 2 m a tick.
