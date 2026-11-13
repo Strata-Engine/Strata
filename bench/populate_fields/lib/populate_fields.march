@@ -1,0 +1,110 @@
+-- populate_fields: Strata.Populate.fields_with over one 32 x 32 Ground,
+-- repeated. run.sh takes a REPS=n run minus a REPS=0 run (the set-up alone)
+-- of CPU time and instructions retired, which load disturbs far less than
+-- the wall clock.
+--
+-- The population: 4 fields (alt from slot 0, a noise, the noise through a
+-- curve, wet from slot 6), 1 band zone, 3 layers whose rules apply 4
+-- curves; with the curve field that is 5 curve evaluations per column. The
+-- Ground's corner is (96, 192), on a tile boundary, so the noise is one
+-- tile, as for a chunk.
+--
+--   MODE=1   fields_with (the whole call)
+--   MODE=2   the curve code alone: 5 passes over 1024 columns of
+--            d[k] = d[k] * curve(v[k]), with the module's curve code copied
+--            here (it is private), on curves of 2 to 3 points
+--   MODE=3   the same passes with a factor that has no branch (v * 0.5):
+--            MODE=2 minus MODE=3 is what the curve's Float-valued branches
+--            cost (march-language/march#1263)
+--   REPS=n   calls
+mod PopulateFields do
+
+  needs IO
+  needs IO.Process
+
+  alias Strata.Population as Pb
+
+  pfn lin() : Strata.Population.PopCurve do Pb.curve([(0.0, 0.0), (1.0, 1.0)]) end
+
+  pfn frozen() : Strata.Population.Frozen do
+    let p0 = Pb.field_ground(Pb.field_curve(Pb.field_noise(Pb.field_ground(Pb.new(), "alt", 0), "hills", 0, 3, 40.0, 5), "hc", "hills", lin()), "wet", 6)
+    let p1 = Pb.shapes_blocks(Pb.zone_band(p0, "low", "alt", 0.0, 50.0), "g", [1])
+    let p2 = Pb.layer_cover(p1, "a", "g", Pb.rule(1.0, [("hc", lin()), ("alt", Pb.curve([(0.0, 1.0), (50.0, 0.7), (100.0, 0.0)]))], ["low"], Nil), 1)
+    let p3 = Pb.layer_cover(p2, "b", "g", Pb.rule(0.5, [("wet", lin())], Nil, ["low"]), 2)
+    match Pb.freeze(Pb.layer_scatter(p3, "c", "g", Pb.rule(0.1, [("hills", Pb.curve([(0.3, 0.0), (0.7, 1.0)]))], Nil, Nil), 4.0, 0.5, 3)) do
+      Ok(f) -> f
+      Err(m) -> panic(m)
+    end
+  end
+
+  pfn lcg(s : Int) : Int do int_and(s * 1103515245 + 12345, 2147483647) end
+  pfn random_go(a : NativeF32Arr, s : Int, lo : Float, hi : Float, i : Int) : NativeF32Arr do
+    if i >= 1024 do a
+    else
+      let s2 = lcg(s)
+      random_go(NativeArray.set_f32(a, i, lo +. (hi -. lo) *. int_to_float(int_and(int_shr(s2, 8), 65535)) /. 65536.0), s2, lo, hi, i + 1)
+    end
+  end
+
+  pfn ground() : Strata.Populate.Ground do
+    let g = Strata.Populate.ground(96, 192, 32, 1.0, 0, NativeArray.make_int(1024, 10), NativeArray.make_int(1024, -1))
+    Strata.Populate.with_field(Strata.Populate.with_field(g, 0, random_go(NativeArray.make_f32(1024, 0.0), 1, 0.0, 100.0, 0)), 6, random_go(NativeArray.make_f32(1024, 0.0), 2, 0.0, 1.0, 0))
+  end
+
+  pfn fields_go(p : Strata.Populate.PopPlan, g : Strata.Populate.Ground, k : Int, acc : Float) : Float do
+    if k <= 0 do acc
+    else
+      let t = Strata.Populate.fields_with(p, k, g)
+      fields_go(p, g, k - 1, acc +. Strata.Populate.density(t, 0, k % 1024) +. Strata.Populate.density(t, 2, 7))
+    end
+  end
+
+  -- a copy of Strata.Populate's curve code (private there)
+  pfn curve_go(num : NativeFloatArr, off : Int, k : Int, cnt : Int, x : Float) : Float do
+    let yk = NativeArray.get_float(num, off + 2 * k + 1)
+    if k + 1 >= cnt do yk
+    else
+      let x1 = NativeArray.get_float(num, off + 2 * k + 2)
+      if x < x1 do
+        let xk = NativeArray.get_float(num, off + 2 * k)
+        let y1 = NativeArray.get_float(num, off + 2 * k + 3)
+        yk +. (y1 -. yk) *. (x -. xk) /. (x1 -. xk)
+      else curve_go(num, off, k + 1, cnt, x) end
+    end
+  end
+  pfn curve_eval(num : NativeFloatArr, off : Int, cnt : Int, x : Float) : Float do
+    if cnt <= 0 do 0.0
+    else if x < NativeArray.get_float(num, off) do NativeArray.get_float(num, off + 1)
+    else curve_go(num, off, 0, cnt, x) end end
+  end
+  pfn times_curve(d : NativeF32Arr, v : NativeF32Arr, num : NativeFloatArr, at : Int, cnt : Int, k : Int) : NativeF32Arr do
+    if k >= 1024 do d else times_curve(NativeArray.set_f32(d, k, NativeArray.get_f32(d, k) *. curve_eval(num, at, cnt, NativeArray.get_f32(v, k))), v, num, at, cnt, k + 1) end
+  end
+  pfn times_plain(d : NativeF32Arr, v : NativeF32Arr, k : Int) : NativeF32Arr do
+    if k >= 1024 do d else times_plain(NativeArray.set_f32(d, k, NativeArray.get_f32(d, k) *. (NativeArray.get_f32(v, k) *. 0.5)), v, k + 1) end
+  end
+  -- curves as (x, factor) pairs: [0, 1] at 0, a 3-point curve at 4, [0.3, 0.7] at 10
+  pfn pts() : NativeFloatArr do NativeArray.from_list_float([0.0, 0.0, 1.0, 1.0, 0.0, 1.0, 50.0, 0.7, 100.0, 0.0, 0.3, 0.0, 0.7, 1.0]) end
+  pfn five(d : NativeF32Arr, a : NativeF32Arr, b : NativeF32Arr, num : NativeFloatArr, curved : Bool) : NativeF32Arr do
+    if curved do times_curve(times_curve(times_curve(times_curve(times_curve(d, b, num, 0, 2, 0), b, num, 0, 2, 0), a, num, 4, 3, 0), b, num, 0, 2, 0), b, num, 10, 2, 0)
+    else times_plain(times_plain(times_plain(times_plain(times_plain(d, b, 0), b, 0), a, 0), b, 0), b, 0) end
+  end
+  pfn curves_go(a : NativeF32Arr, b : NativeF32Arr, num : NativeFloatArr, curved : Bool, k : Int, acc : Float) : Float do
+    if k <= 0 do acc
+    else
+      let d = five(NativeArray.make_f32(1024, 1.0), a, b, num, curved)
+      curves_go(a, b, num, curved, k - 1, acc +. NativeArray.get_f32(d, k % 1024))
+    end
+  end
+
+  fn main(_cap : Cap(IO)) : Unit do
+    let mode = Authority.must(Env.get_int("MODE", 1))
+    let reps = Authority.must(Env.get_int("REPS", 1000))
+    let p = Strata.Populate.plan(frozen())
+    let g = ground()
+    let a = random_go(NativeArray.make_f32(1024, 0.0), 3, 0.0, 100.0, 0)
+    let b = random_go(NativeArray.make_f32(1024, 0.0), 4, 0.0, 1.0, 0)
+    let sum = if mode == 1 do fields_go(p, g, reps, 0.0) else curves_go(a, b, pts(), mode == 2, reps, 0.0) end
+    Authority.must(println("populate_fields: mode " ++ int_to_string(mode) ++ " reps " ++ int_to_string(reps) ++ " checksum " ++ float_to_string(sum)))
+  end
+end

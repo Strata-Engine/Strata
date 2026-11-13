@@ -1,0 +1,51 @@
+-- A read-only record used in a hot loop from several tasks (GAPS S15).
+-- The record holds an array and two numbers; the loop reads a field of it
+-- through an accessor on every iteration, as Strata.Mesh read the registry and
+-- the island read the atlas.
+-- VARIANT 0: every task is handed the one record (shared).
+-- VARIANT 1: every task builds its own record, with its own copy of the array, first.
+-- VARIANT 2: shared record, but the task unpacks the field once, outside the loop.
+-- TASKS: how many tasks run the loop at once (default 8). CPU time is summed
+-- over the tasks, so a row is the cost of one read whichever task made it.
+mod SharedTasks do
+  needs IO
+  needs IO.Spawn
+
+  type Reg = Reg(NativeIntArr, Int, Int)
+  pfn r_arr(r : Reg) : NativeIntArr do match r do Reg(a, _, _) -> a end end
+  pfn r_mask(r : Reg) : Int do match r do Reg(_, m, _) -> m end end
+
+  pfn through(r : Reg, i : Int, n : Int, acc : Int) : Int do
+    if i >= n do acc else through(r, i + 1, n, acc + NativeArray.get_int(r_arr(r), int_and(i, r_mask(r)))) end
+  end
+
+  pfn unpacked(a : NativeIntArr, m : Int, i : Int, n : Int, acc : Int) : Int do
+    if i >= n do acc else unpacked(a, m, i + 1, n, acc + NativeArray.get_int(a, int_and(i, m))) end
+  end
+
+  pfn copy_go(src : NativeIntArr, dst : NativeIntArr, k : Int, n : Int) : NativeIntArr do
+    if k >= n do dst else copy_go(src, NativeArray.set_int(dst, k, NativeArray.get_int(src, k)), k + 1, n) end
+  end
+  pfn own(r : Reg) : Reg do Reg(copy_go(r_arr(r), NativeArray.make_int(1024, 0), 0, 1024), r_mask(r), 0) end
+
+  pfn work(r : Reg, variant : Int, reps : Int) : Int do
+    if variant == 0 do through(r, 0, reps * 4096, 0)
+    else if variant == 1 do through(own(r), 0, reps * 4096, 0)
+    else unpacked(r_arr(r), r_mask(r), 0, reps * 4096, 0) end end
+  end
+
+  pfn spawn_go(r : Reg, variant : Int, reps : Int, left : Int, acc : List(Task(Int))) : List(Task(Int)) do
+    if left <= 0 do acc else spawn_go(r, variant, reps, left - 1, Cons(task_spawn(fn _ -> work(r, variant, reps)), acc)) end
+  end
+  pfn await_go(ts : List(Task(Int)), acc : Int) : Int do
+    match ts do
+      Nil -> acc
+      Cons(t, rest) -> await_go(rest, acc + Result.unwrap_or(task_await(t), 0))
+    end
+  end
+
+  fn main(_cap : Cap(IO)) : Unit do
+    let r = Reg(NativeArray.make_int(1024, 1), 1023, 0)
+    Authority.must(println(int_to_string(await_go(spawn_go(r, Authority.must(Env.get_int("VARIANT", 0)), Authority.must(Env.get_int("REPS", 1)), Authority.must(Env.get_int("TASKS", 8)), Nil), 0))))
+  end
+end

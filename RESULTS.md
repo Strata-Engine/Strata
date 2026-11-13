@@ -679,7 +679,7 @@ animcheck/.march/build/release/animcheck` on a quiet machine to judge them.
 - **Rays.** These rays run from 0.2-2.6 m up in front of the crowd toward a
   figure 0-2 m up, and 9 562 of 10 000 hit. Most stop at the first figure in
   their way, which is why they are cheap.
-- **Memory** at 4 096 figures (sizeof, decimal MB), rigs excluded: 46.34 MB,
+- **Memory** at 4 096 figures (sizeof, decimal MB), rig sockets and part grids excluded: 46.34 MB,
   leaving 1.66 MB under 48 MB.
   - Figures 7.90 (AnFig 1 928 B), matrices 12.58, previous matrices 12.58.
   - Keys 5.51, clips 2.21, rigs 0.87, masks 0.07, marks 0.26, events 1.31.
@@ -689,16 +689,129 @@ animcheck/.march/build/release/animcheck` on a quiet machine to judge them.
 - **Drawing.** A figure posed every few updates is drawn with its blend
   stretched over that period, one period behind its pose (review fix I1).
 
+## Task 9: the arena drawn, measured against every target
+
+Scene 40: 512 humanoids on a levelled floor 120 x 80 m, each running its
+own 1.5 m circle at 4 m/s, a looping sword stroke over the right arm,
+spine and head aiming at the eye, foot placement for the 128 nearest, 32
+traced. 2560 x 1600 pixels, offscreen, vsync off, light mode 4, sun 40,
+view radius 10. Each configuration runs 600 frames; the figures are means
+over frames 120-599 from `STRATA_ARENA_LOG=1`. GPU times come from the
+renderer's timestamps (stat 3 for the frame, 14 for the figure shadow
+pass). The update and hit-ray times come from the C shim's clock.
+
+**Nothing here is judged.** The plan trusts a timing only at a load
+average under 8. The load was checked every 10 minutes for an hour
+(10:22 to 11:22). It read 33, 15, 10, 14, 76, 30 and 23, and never fell
+under 8. Both sets below were taken anyway: set 1 at load 20-32 (10:21),
+set 2 at load 25-42 (11:23). The design's order of what gives way (the
+stale-pose rate, fewer foot-placement figures, a cap of 32 then 16,
+reflections skipping figures) was **not applied**: it is to act on
+trusted numbers only.
+
+| | target | set 1 | set 2 | verdict |
+|---|---|---|---|---|
+| `Strata.Anim.update`, arena (C) | 1.0 ms | 0.88-0.94 ms | 0.92-1.04 ms | not judged; at the target |
+| `Strata.Anim.ground`, 128 figures (March) | 0.5 ms | 0.98-1.06 ms | 1.02-1.16 ms | not judged; a likely miss |
+| figure pass, arena, GPU (B - A) | 1.5 ms | 2.16 ms | 2.61 ms | not judged; above the target |
+| figure shadow map, arena, GPU (stat 14) | 1.0 ms | 0.05-0.08 ms | 0.04-0.07 ms | not judged; far under |
+| traced, 64 in view, GPU (D - C) | 1.5 ms | 4.51 ms | 5.14 ms | not judged; a likely miss |
+| traced, none opted in, GPU (A - A0) | under 0.1 ms | -2.0 ms (noise) | +0.01 ms | not judged |
+| hit ray, arena, mean of 100 a frame (C) | 10 µs | 2.6-2.7 µs | 2.8 µs | not judged; far under |
+| frame rate, arena, everything on | 120 fps | 92-95 fps | 87-89 fps | not judged; a likely miss (GPU) |
+| figures / layers / parts | 4096 / 8 / 64 | `AN_FIGURES`, `AN_LAYERS`, `AN_PARTS` in `strata_anim.h` | | met (the kernel's limits) |
+| C memory, 4096 figures, two poses | 48 MB | 46.34 MB (Task 5, sizeof) | | met |
+| GPU memory for figure quads | 64 MB | 708 quads, 5.7 KB, for all six rigs; 2 MB of instance buffers | | met |
+| added to the soak's worst frame, no figures | under 0.1 ms | CPU: the figure path's worst 0.021 ms (stat 20); GPU: no figure shadow pass ran (stat 21, 0 ms); 0 updates; load 37-54 | | not judged; both parts under the target even at this load, but the light pass's share with no figures is unmeasured (see "traced, none opted in") |
+
+The configurations: A0 is the arena with no figure world (`STRATA_ARENA=-1`).
+A is the world open with no figures. B is 512 runners, none traced, no
+figure shadows. C is B with shadows. E is C with 32 traced (the arena as
+specified). D is C with 64 traced. R is E with 100 hit rays a frame. GPU
+frame means:
+
+| | A0 | A | B | C | E | D | R |
+|---|---|---|---|---|---|---|---|
+| set 1 | 7.40 | 5.39 | 7.56 | 7.42 | 10.51 | 11.93 | 10.09 |
+| set 2 | 5.30 | 5.31 | 7.91 | 8.12 | 11.32 | 13.26 | 11.45 |
+
+- **Noise.** A0 and A should be nearly equal; in set 1 they differ by
+  2 ms. Differences under about 2 ms are not readable at this load. That
+  covers the figure pass, the "none traced" row, and the shadow map
+  checked as C - B (-0.13 and +0.21 ms).
+- **Update.** About 95 of the 512 skip each update (out of view, posed
+  one in four).
+- **Ground.** Its mean is about 1.0-1.1 ms for 256 rays through
+  `Strata.Query.raycast` and the calls round them. This is the same cause
+  measured headless in Task 5: March's per-ray and per-call cost. The
+  design's fallbacks (one ray per leg every other frame, then fewer
+  figures) are the second rung of the ladder and were not applied.
+- **Traced.** 32 traced add about 3.1 ms, and 64 add 4.5-5.1 ms. That is
+  more than Task 8's 2.1 ms for 64 because the pixels are four times as
+  many (2560 x 1600 against 1280 x 800): the rays are paid per pixel.
+- **Frame rate.** These runs were scripted with the display off
+  (`STRATA_UI` is 0 by default), so the HUD and the crosshair's hit ray
+  are not in their frames. The frame is GPU-bound: the CPU spends 1.1-1.4 ms in
+  the shim and March (the update and ground included), then waits 6-8 ms
+  for the GPU. At about 10.5-11.3 ms of GPU it runs at 87-95 fps. Where
+  the time goes: the world alone (A) about 5.3 ms, the figure pass about
+  2.2-2.6 ms, the 32 traced about 3.1 ms.
+- **Hit rays.** The 100 rays a frame run across the middle of the view,
+  after the update. The first of each frame poses the figures the update
+  skipped; that cost is in the mean.
+- **GPU memory.** The rigs' meshes are held once: 708 quads of 8 bytes
+  across the humanoid, torch, sword, bird, fish and cart. The per-frame
+  instance buffers hold 16 384 parts x 2 (camera and shadow) x 32 bytes x
+  2 frames in flight, which is 2 MB.
+
+- **The soak with no figures** (`scripts/soak.sh`, 11:24, load 37-54).
+  The animation was never updated. The renderer's figure path took at
+  most 21 µs of CPU in any of 3000 frames (the draw-list call that finds
+  nothing) and ran no shadow pass. The soak now checks these (stats 20 and
+  21). That is CPU time and the figure shadow pass only: the light pass's
+  figure code with none traced (the traced-figure list check, the movers
+  buffer of 144 boxes) and the G-buffer's empty figure path are not timed
+  by them, so the row is not judged. The worst frame itself cannot show a
+  0.1 ms difference at this load: it was 94 ms. The same load failed the soak's own frame-time,
+  fluid-step and mixer checks, which have nothing to do with figures (see
+  the soak notes above).
+
+- **A hit ray every frame forfeits culling's CPU saving** (final review). The
+  first query after an update poses every figure the update skipped, and
+  README's frame loop casts a hit ray every frame, so a game written from it
+  poses every figure every frame until the kernel poses only the figures
+  along the ray; the update row above assumes no per-frame query.
+- **The far tier is unmeasured on the drawn arena** (final review): neither
+  the viewer nor the arena passes a far distance, so the stale-pose rate for
+  distant figures, the cost ladder's first rung, is exercised only by the C
+  tests. Say so when the arena is re-measured on a quiet machine.
+
+Rerun on a quiet machine to judge:
+`STRATA_SCENE=40 STRATA_SIZE=2560x1600 STRATA_PIXELS=1 STRATA_OFFSCREEN=1 STRATA_VSYNC=0 STRATA_LIGHT=4 STRATA_ARENA_LOG=1`,
+with `STRATA_ARENA`, `STRATA_ARENA_TRACED`, `STRATA_FIG_SHADOWS` and
+`STRATA_ARENA_RAYS` as above.
+
 # Entities
 
 Measured on the same M3 Max, release builds, headless (`entcheck`). The
 plan trusts a timing only under load 8; every figure here was taken while
-other sessions kept the load far above it, so none is judged.
+other sessions kept the load far above it, so none is judged. The design's
+budget, row by row: the latest run (Task 9, 2026-11-12 09:38, load 24 to 25)
+first, earlier runs in brackets.
 
-| scene | median | worst | target | verdict |
-|---|---|---|---|---|
-| storm: 20,000 flying bullets, all seen, one touch pair against 200 targets; `step` over ticks 200 to 600 | 2.47 ms (2.57 in the run before) | 40.2 ms (97.1) | 2 ms | not judged (load 20 to 35) |
-| 5,000 removed and 5,000 added between two ticks, then the step | 1.11 ms for the 10,000 calls from March; 2.76 ms the step after | one run | 1 ms | not judged (load 20 to 35) |
+| design row | target for one tick | measured | verdict |
+|---|---|---|---|
+| storm: 20,000 flying entities, all seen, one touch pair against 200 targets; `step` over ticks 200 to 600 | 2 ms | median 2.16 ms (2.39 the second run; Task 4: 2.47, 2.57); worst 20.7 ms (24.7; 40.2, 97.1) | not judged (load 24; Task 4 load 20 to 35) |
+| arena: 2,000 walkers, all seen, each with a 6-part figure walking; `Strata.Entities.tick` over 600 ticks, `Strata.Anim.update` apart | 4 ms | median 0.32 ms (0.33; Task 7: 0.34, 0.35); worst 28.8 ms (25.1; 6.62, 7.74) | not judged (load 24; Task 7 load 40) |
+| city: 10,000 walkers on 200 looping routes, all unseen, divisor 4; `step` over 600 ticks | 0.5 ms | median 0.23 ms (0.23 the second run); worst 1.23 ms (0.50) | not judged (load 25) |
+| 5,000 removed and 5,000 added between two ticks, then the step | 1 ms | 2.13 ms for the 10,000 calls from March, 1.99 ms the step after (Task 4: 1.11 and 2.76) | not judged (load 24; Task 4 load 20 to 35) |
+| camera jump: 500 walkers become seen at once | no tick over 8 ms; all on the ground within 30 ticks of their chunks loading | worst step 0.94 ms over 137 frames, mean 0.1 ms (Task 6: worst 3.0 to 22.9 ms); all 500 set down grounded on solid as they came into view, within the 30 frames after the stream settled | not judged (load 24; Task 6 load 54 to 64) |
+
+Under the load these ran at, the city's and the arena's medians sit well
+under their targets and the storm's just over its own; the spawn-and-remove
+figure is twice its target. A quiet machine is needed to judge any of them.
+
+Voiced entities: not measured; each voice move is O(placed voices), so a tick is O(V^2) in voiced seen entities, until Strata.Sound gains a batched move.
 
 The storm fires its bullets from four emitters 50 m from the centre in rings
 of 64 at 40 m/s; each falls to the floor or meets a target within about a
@@ -707,10 +820,34 @@ second, and the game replaces every bullet named in a touch or a block hit
 events equal a brute-force count on ticks 150 (59) and 300 (60), and two runs
 end on one hash.
 
+The arena's `tick` is the step, the releases, the figures and voices wanted,
+and one `Strata.Anim.place_many` for the 2,000 figures. `Strata.Anim.update`
+is timed apart, in the animation shim: mean 1.29 ms, worst 21.73 ms (1.51 ms
+mean in the second run), posing all 2,000 six-part figures every update with
+no view set. Two runs end on one hash of the entities and the figures.
+
 Where the step goes, from a C bench of a like scene (best of 20 ticks, cc -O2,
 same machine, load about 50): 1.12 ms a tick, of which 0.87 ms is the 20,000
 bullets' rays through the voxel copy (0.25 ms with all unseen, so no rays),
 0.18 ms building the grid and 0.01 ms the touch pairs.
+
+The city (`ENTCHECK_SCENE=city`) streams the viewer's island: its atlas
+(512 x 512 samples 4 m apart, seed 7), built in 4.8 to 5.4 s the first time
+and read from `.march/atlas` in 38 ms after, as plain stone below the atlas
+height at 1 m voxels. Ten districts are found on flat land at least 250 m
+from the start and 160 m apart; the first takes 56 routes, the others 16 each,
+4 to 7 points 8 to 38 m from the centre at the ground's height, and 50
+walkers a route at 1 to 1.5 m/s. A drawing with a point or a leg over the sea
+(sampled every 2 m) is dropped and the next drawn; none was. The stream settles
+in 106 frames, then 600 frames are timed with the focus 250 m or more from
+every walker. One run takes about 0.6 s, so `scripts/ent_check.sh` runs the
+whole scene. The focus then jumps to the densest district (2,800 walkers):
+the stream settles on frame 106, every one of the 2,800 comes into view set
+down grounded on solid with its box clear, and 30 frames later all are seen
+with clear boxes, 2,623 grounded on solid and 177 stepping down a ledge
+(walked off it this tick, or falling to solid within 3 m). The worst step
+of those frames, which ground 2,800 walkers, is 2.72 ms. Two runs end on one
+hash.
 
 # The fluid step in flat arrays
 

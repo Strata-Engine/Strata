@@ -1,0 +1,103 @@
+-- Falls — spray where still water steps down. A generated river is often
+-- still water (blocks that never move, set above the sea): no fluid flows
+-- in it, so Strata.Fluid's own splashes never happen there. This finds the
+-- places such water's surface steps down and keeps spray rising at each.
+--
+-- A drop: a surface cell of the water (none of it above) with, beside it at
+-- its own height, a cell that is neither that water nor solid, and the
+-- water again 1 to 8 cells lower in that neighbouring column. The foot of
+-- the fall is the top of that lower water.
+--
+-- Finding them reads many blocks, so `step` does it on a worker: every 300
+-- frames a search of the 128 x 128 columns about the eye, over the heights
+-- given, is begun on the world as it stands; 120 frames later its answer is
+-- taken. Each frame a twelfth of the drops found (those within 96 voxels)
+-- throw a little spray (Strata.Render.spray). Positions are in voxels: at a
+-- world scale other than 1 the caller scales what it draws.
+mod Strata.Falls do
+
+  needs IO.Spawn
+
+  -- The search in flight, the drops known (x, y, z of the foot in metres, the height fallen in cells), and the frame the last search began.
+  type FlFalls = FlFalls(Option(Task(List((Float, Float, Float, Int)))), List((Float, Float, Float, Int)), Int)
+
+  doc "No drops known, no search begun."
+  fn none() : FlFalls do FlFalls(None, Nil, -100000) end
+  doc "How many drops are known."
+  fn count(f : FlFalls) : Int do match f do FlFalls(_, ds, _) -> List.length(ds) end end
+
+  -- water [water] 1 to 8 cells under (x, y, z): the y of its top cell, or -1000000
+  pfn water_below(w : Strata.World.World, water : Int -> Bool, x : Int, y : Int, z : Int, k : Int) : Int do
+    if k > 8 do -1000000
+    else
+      let id = Strata.World.get_block(w, x, y - k, z)
+      if water(id) do y - k
+      else if id != 0 && Strata.Blocks.collides(Strata.World.registry(w), id) do -1000000
+      else water_below(w, water, x, y, z, k + 1) end end
+    end
+  end
+  -- a drop from a surface cell at height y into the neighbouring column (nx, nz), added to acc
+  pfn drop_to(w : Strata.World.World, water : Int -> Bool, y : Int, nx : Int, nz : Int, acc : List((Float, Float, Float, Int))) : List((Float, Float, Float, Int)) do
+    let side = Strata.World.get_block(w, nx, y, nz)
+    if water(side) do acc
+    else if side != 0 && Strata.Blocks.collides(Strata.World.registry(w), side) do acc
+    else
+      let foot = water_below(w, water, nx, y, nz, 1)
+      if foot < -999999 do acc else Cons((int_to_float(nx) +. 0.5, int_to_float(foot) +. 1.0, int_to_float(nz) +. 0.5, y - foot), acc) end
+    end end
+  end
+  pfn column(w : Strata.World.World, water : Int -> Bool, x : Int, z : Int, y : Int, y1 : Int, acc : List((Float, Float, Float, Int))) : List((Float, Float, Float, Int)) do
+    if y > y1 do acc
+    else if !water(Strata.World.get_block(w, x, y, z)) do column(w, water, x, z, y + 1, y1, acc)
+    else if water(Strata.World.get_block(w, x, y + 1, z)) do column(w, water, x, z, y + 1, y1, acc)
+    else column(w, water, x, z, y + 1, y1, drop_to(w, water, y, x + 1, z, drop_to(w, water, y, x - 1, z, drop_to(w, water, y, x, z + 1, drop_to(w, water, y, x, z - 1, acc))))) end end end
+  end
+  pfn search(w : Strata.World.World, water : Int -> Bool, y0 : Int, y1 : Int, x0 : Int, z0 : Int, i : Int, acc : List((Float, Float, Float, Int))) : List((Float, Float, Float, Int)) do
+    if i >= 128 * 128 do acc
+    else if List.length(acc) >= 512 do acc
+    else search(w, water, y0, y1, x0, z0, i + 1, column(w, water, x0 + i % 128, z0 + i / 128, y0, y1, acc)) end end
+  end
+
+  doc "Every drop of the water (blocks [water] is true of) in the 128 x 128 columns about (cx, cz) of world [w], among surface cells from height y0 to y1: (the foot's x, y, z, the cells fallen), 512 at most."
+  fn find(w : Strata.World.World, water : Int -> Bool, y0 : Int, y1 : Int, cx : Int, cz : Int) : List((Float, Float, Float, Int)) do
+    search(w, water, y0, y1, cx - 64, cz - 64, 0, Nil)
+  end
+
+  -- the drops' spray: each drop within 96 m throws some every twelfth frame, the drops taking turns
+  pfn throw(ds : List((Float, Float, Float, Int)), ex : Float, ez : Float, frame : Int, tex : Int, i : Int) : Unit do
+    match ds do
+      Nil -> ()
+      Cons((x, y, z, h), rest) ->
+        if (frame + i) % 12 == 0 && (x -. ex) *. (x -. ex) +. (z -. ez) *. (z -. ez) < 9216.0 do
+          let speed = 1.2 +. 0.8 *. Math.sqrt(int_to_float(h))
+          let _ = Strata.Render.spray(x, y +. 0.2, z, 0.0, speed *. 0.5, 0.0, 3 + 2 * h, speed *. 0.45, 0.7, tex)
+          throw(rest, ex, ez, frame, tex, i + 1)
+        else throw(rest, ex, ez, frame, tex, i + 1) end
+    end
+  end
+
+  doc "One frame: this frame's spray thrown from the drops known, drawn with texture layer [tex]; a search begun every 300 frames on world [w] about the eye (ex, ez), over heights y0 to y1 for blocks [water] is true of, and taken 120 frames later."
+  fn step(f : FlFalls, w : Strata.World.World, water : Int -> Bool, y0 : Int, y1 : Int, ex : Float, ez : Float, frame : Int, tex : Int) : FlFalls do
+    match f do
+      FlFalls(job, ds, begun) ->
+        throw(ds, ex, ez, frame, tex, 0)
+        match job do
+          Some(t) ->
+            if frame - begun < 120 do f
+            else
+              match task_await(t) do
+                Ok(found) -> FlFalls(None, found, begun)
+                Err(_) -> FlFalls(None, ds, begun)
+              end
+            end
+          None ->
+            if frame - begun < 300 do f
+            else
+              let cx = float_to_int(Math.floor(ex))
+              let cz = float_to_int(Math.floor(ez))
+              FlFalls(Some(task_spawn(fn _ -> find(w, water, y0, y1, cx, cz))), ds, frame)
+            end
+        end
+    end
+  end
+end
