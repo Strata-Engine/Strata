@@ -310,15 +310,20 @@ aiming at and walking on rubble work with the calls a game already uses.
 
 ### 7. Water
 
-- **Walls.** Each fluid step, every body marks the grid cells whose
-  centre lies inside one of its solid voxels. `Strata.Fluid.begin` gains
-  the marks as an input; the fluid treats a marked cell as a wall. A cell
-  that holds water when it becomes marked has its water moved to the
-  nearest open cells above and beside it, in the same fluid edit, so the
-  amount is kept exactly. A cell that is unmarked wakes its fluid
-  neighbours.
-- **Sinking.** A body's voxels in fluid cells feel drag, scaled by the
-  eighths those cells hold. It slows and settles on the bed.
+- **Walls.** Before each fluid step, every body marks the grid cells whose
+  centre lies inside one of its colliding voxels (`Strata.Physics.marks`),
+  and the game hands the marks to `Strata.Fluid.set_marks`; from then on
+  the fluid treats a marked cell as a wall. A cell that holds water when it
+  becomes marked has its water moved to the nearest cells with room above
+  and beside it (searched through air, the same water and other marked
+  cells), in one edit, so the amount is kept exactly; water that finds no
+  room within 512 cells stays where it was. A cell that is unmarked wakes
+  its fluid neighbours. Water edits wake no body: water does not collide.
+- **Sinking.** A body under water feels drag: velocity and spin lose a
+  share 4 x wet x dt a step (taken implicitly), where wet (0 to 1) is, over
+  the layers its voxels fill, the share of eighths in the free cells of
+  that layer of its box grown a cell sideways, its own cells left out. It
+  slows and settles on the bed. Nothing lifts it.
 - **Splash.** A body entering water makes an event: where, how fast, how
   big. The viewer turns it into spray, as it does falling water.
 - **Physics edits and fluid steps.** A fluid step is dropped only if a
@@ -379,7 +384,8 @@ aiming at and walking on rubble work with the calls a game already uses.
     Strata.Physics.pose(p, id, t)                 -- position and rotation, interpolated to clock t
     Strata.Physics.events(p)                      -- impacts, breaks, loose pieces, splashes, deferred edits
     Strata.Physics.contacts(p, id)                -- a driven body's contacts last step
-    Strata.Physics.marks(p)                       -- the cells bodies fill, for Strata.Fluid.begin
+    Strata.Physics.marks(p)                       -- the cells bodies fill, for Strata.Fluid.set_marks
+    Strata.Fluid.set_marks(f, w, marks)           -- marked cells are walls; their water pushed aside, never lost: (Fluid, Outcome)
     Strata.Render.bodies(r, p, t)                 -- keep the renderer in step with the bodies
 
 ### 11. Fine bodies and pinned bodies
