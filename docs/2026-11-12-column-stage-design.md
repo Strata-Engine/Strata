@@ -82,9 +82,13 @@ Cost and risk:
   focus rising one chunk asks for one new layer, one key a column. Then a
   chunk costs what it does today.
 
-Saving, where a column arrives whole (start-up, and columns entering the
-box at its edge, which is all of horizontal flight): 4.05 to about 2.1 ms a
-full chunk at k = 4.9; 2.3 ms at k = 3.5.
+Saving, measured (plan Task 1, `bench/chunk_stages` stage 32): at level 0 a
+column of the viewer's box holds 3.4 full chunks at start-up and 2.5
+entering in flight toward the coast, so a full chunk goes from 4.05 ms to
+2.45 / 3.4 + 1.6 = 2.3 ms at start-up and 2.6 ms in that flight. The layer
+a climb adds is all early-outs, so the one-key-a-column case costs nothing
+there. Coarse levels share little (1.1 full chunks a column at levels 1 and
+2). A cap of 4 keys a batch covers 97% of start-up columns whole.
 
 ## Shape B: a column cache in the stream
 

@@ -186,6 +186,71 @@ mod ChunkStages do
     end
   end
 
+  -- ── Stage 32: how many keys of a column would start together ────────────
+  -- With batching, when the first key of a chunk column starts, every other
+  -- key of that column that is wanted and not loaded goes with it. So a
+  -- batch is the keys of a column that become wanted at once: a whole
+  -- column of the box (2 radius_v + 1 keys) at start-up and for a column
+  -- entering the box in level flight; one key a column when the focus
+  -- climbs a chunk. This counts, per column, how many of those keys are
+  -- generated in full (not early-outs, not open sea).
+  pfn fdiv32(v : Int, side : Int) : Int do if v >= 0 do v / side else 0 - ((side - 1 - v) / side) end end
+  pfn full_key(g : StrataViewer.Gp, a : Strata.Atlas.Atlas, scale : Float, lvl : Int, cx : Int, cy : Int, cz : Int) : Bool do
+    let sc = scale *. StrataViewer.pow2f(lvl)
+    if StrataViewer.beyond(g, a, sc, cx, cz) do false
+    else StrataViewer.island_early_lift(g, a, sc, if lvl == 0 do 0.0 else StrataViewer.level_lift(sc) end, cx, cy, cz) < 0 end
+  end
+  pfn col_full(g : StrataViewer.Gp, a : Strata.Atlas.Atlas, scale : Float, lvl : Int, cx : Int, cz : Int, cy : Int, cy1 : Int, acc : Int) : Int do
+    if cy > cy1 do acc else col_full(g, a, scale, lvl, cx, cz, cy + 1, cy1, if full_key(g, a, scale, lvl, cx, cy, cz) do acc + 1 else acc end) end
+  end
+  -- the columns x0..x1, z0..z1 of level lvl, keys cyf - rv .. cyf + rv: hist[n] counts the columns with n full keys
+  pfn hist_go(g : StrataViewer.Gp, a : Strata.Atlas.Atlas, scale : Float, lvl : Int, x0 : Int, x1 : Int, z0 : Int, z1 : Int, cyf : Int, rv : Int, x : Int, z : Int, h : NativeIntArr) : NativeIntArr do
+    if z > z1 do h
+    else if x > x1 do hist_go(g, a, scale, lvl, x0, x1, z0, z1, cyf, rv, x0, z + 1, h)
+    else
+      let n = col_full(g, a, scale, lvl, x, z, cyf - rv, cyf + rv, 0)
+      hist_go(g, a, scale, lvl, x0, x1, z0, z1, cyf, rv, x + 1, z, NativeArray.set_int(h, n, NativeArray.get_int(h, n) + 1))
+    end end
+  end
+  pfn hist_line(name : String, h : NativeIntArr, keys : Int) : String do
+    let cols = hist_sum(h, 0, 0, false)
+    let full = hist_sum(h, 0, 0, true)
+    let with_full = cols - NativeArray.get_int(h, 0)
+    name ++ ": " ++ int_to_string(cols) ++ " columns of " ++ int_to_string(keys) ++ " keys; full keys a column 0.." ++ int_to_string(keys) ++ ":" ++ hist_text(h, 0, keys) ++ "; " ++ int_to_string(full) ++ " full keys in " ++ int_to_string(with_full) ++ " columns that hold any"
+  end
+  pfn hist_sum(h : NativeIntArr, i : Int, acc : Int, weighted : Bool) : Int do
+    if i >= NativeArray.length_int(h) do acc else hist_sum(h, i + 1, acc + NativeArray.get_int(h, i) * (if weighted do i else 1 end), weighted) end
+  end
+  pfn hist_text(h : NativeIntArr, i : Int, keys : Int) : String do hist_acc(h, i, keys, "") end
+  pfn hist_acc(h : NativeIntArr, i : Int, keys : Int, acc : String) : String do
+    if i > keys do acc else hist_acc(h, i + 1, keys, acc ++ " " ++ int_to_string(NativeArray.get_int(h, i))) end
+  end
+  -- the viewer's boxes about its overview pose (-70, ground + 46, 96): level 0 radius 10 x 3, levels 1..4 radius 10 x 1
+  pfn batches(g : StrataViewer.Gp, a : Strata.Atlas.Atlas, scale : Float, seed : Int, lvl : Int) : Unit do
+    let side = 32 * float_to_int(StrataViewer.pow2f(lvl))
+    let fy = StrataViewer.land_height(StrataViewer.Island(a), 0, 0, seed) + 46
+    let cxf = fdiv32(0 - 70, side)
+    let cyf = fdiv32(fy, side)
+    let czf = fdiv32(96, side)
+    let rv = if lvl == 0 do 3 else 1 end
+    let keys = 2 * rv + 1
+    let start = hist_go(g, a, scale, lvl, cxf - 10, cxf + 10, czf - 10, czf + 10, cyf, rv, cxf - 10, czf - 10, NativeArray.make_int(keys + 1, 0))
+    Authority.must(println(hist_line("level " ++ int_to_string(lvl) ++ " start-up", start, keys)))
+    -- level flight: 13 chunks along +x, the columns that enter the box
+    let flight = hist_go(g, a, scale, lvl, cxf + 11, cxf + 23, czf - 10, czf + 10, cyf, rv, cxf + 11, czf - 10, NativeArray.make_int(keys + 1, 0))
+    Authority.must(println(hist_line("level " ++ int_to_string(lvl) ++ " flight +x 13 chunks", flight, keys)))
+    -- a climb of one chunk: each column gets one new key, the layer cyf + rv + 1
+    let climb = hist_go(g, a, scale, lvl, cxf - 10, cxf + 10, czf - 10, czf + 10, cyf + rv + 1, 0, cxf - 10, czf - 10, NativeArray.make_int(2, 0))
+    Authority.must(println(hist_line("level " ++ int_to_string(lvl) ++ " climb one chunk", climb, 1)))
+  end
+  pfn batches_all(g : StrataViewer.Gp, a : Strata.Atlas.Atlas, scale : Float, seed : Int, lvl : Int) : Unit do
+    if lvl > 4 do ()
+    else
+      batches(g, a, scale, seed, lvl)
+      batches_all(g, a, scale, seed, lvl + 1)
+    end
+  end
+
   fn main(_cap : Cap(IO)) : Unit do
     let mode = Authority.must(Env.get_int("STAGE", 1))
     let reps = Authority.must(Env.get_int("REPS", 10))
@@ -196,7 +261,8 @@ mod ChunkStages do
     let d = StrataViewer.decor_of(g, scale, seed)
     let pad = StrataViewer.tree_pad(d, scale)
     Authority.must(println("chunk_stages: stage " ++ int_to_string(mode) ++ " reps " ++ int_to_string(reps) ++ "; pad " ++ int_to_string(pad) ++ ", halo " ++ int_to_string(StrataViewer.halo(g)) ++ ", patch side " ++ int_to_string(32 + 2 * pad + 2 * StrataViewer.halo(g))))
-    let sum = keys_go(mode, a, d, scale, seed, reps, 0, 0)
+    let sum = if mode == 32 do 0 else keys_go(mode, a, d, scale, seed, reps, 0, 0) end
+    if mode == 32 do batches_all(g, a, scale, seed, 0) else () end
     if mode == 30 do Authority.must(println("chunk_stages: over 200 chunks, river samples in the window " ++ int_to_string(sum / 1000) ++ " in all; windows holding a lake sample " ++ int_to_string(sum % 1000)))
     else if mode == 31 do Authority.must(println("chunk_stages: over 200 chunk columns, " ++ int_to_string(sum) ++ " chunks are generated in full (not early-outs)"))
     else Authority.must(println("chunk_stages: checksum " ++ int_to_string(sum))) end end
