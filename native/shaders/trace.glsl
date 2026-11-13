@@ -39,6 +39,7 @@ vec3 class_emission(uint c) {
 // Traced figures (Strata.Anim) are listed the same way, one group row a
 // figure (pos.w -1; dims: its first part row, how many, its rig): each part
 // row is a grid of its rig's palette indices at its own voxel size (pos.w).
+#define SHAPE_BLOCK 4   // strata_vk.c SV_SHAPE_BLOCK: the coarse layer's block, in the shape's own voxels
 struct BodyRow { vec4 pos; vec4 rot; ivec4 dims; vec4 sphere; };   // low corner (metres) and voxel size (0: the world's), rotation, size and first word of its classes, bounding sphere (voxels)
 layout(std430, set = 0, binding = 17) readonly buffer BodyTable { BodyRow rows[]; } body_table;
 layout(std430, set = 0, binding = 18) readonly buffer BodyBytes { uint words[]; } body_bytes;
@@ -122,26 +123,52 @@ void body_ray(uint bi, vec3 ro, vec3 rd, float tmax, bool stop_glass, uint pal, 
     if (tin >= tout) return;
     // a ray that starts on the body's own surface does not stop on it at once
     int axis = tlo.x >= tlo.y && tlo.x >= tlo.z ? 0 : (tlo.y >= tlo.z ? 1 : 2);
-    vec3 p = o + d * (tin + 1.0e-4);
-    ivec3 v = clamp(ivec3(floor(p)), ivec3(0), b.dims.xyz - 1);
     ivec3 stp = ivec3(sign(d));
-    vec3 tnext = (vec3(v) + step(0.0, d) - o) * inv;
     vec3 tstep = abs(inv);
+    // Two levels: the blocks of SHAPE_BLOCK^3 voxels first (the coarse layer
+    // after the voxels: 1 where a block holds anything), voxel by voxel only
+    // inside a block that does. t is in the grid's voxels throughout.
+    const int B = SHAPE_BLOCK;
+    ivec3 bd = (b.dims.xyz + B - 1) / B;
+    uint n = uint(b.dims.x * b.dims.y * b.dims.z);
+    uint cw = uint(b.dims.w) + ((n + 3u) >> 2);
+    vec3 p0 = o + d * (tin + 1.0e-4);
+    ivec3 vb = clamp(ivec3(floor(p0 / float(B))), ivec3(0), bd - 1);
+    vec3 tnb = ((vec3(vb) + step(0.0, d)) * float(B) - o) * inv;
+    vec3 tsb = tstep * float(B);
     float t = tin;
-    for (int k = 0; k < 400; k++) {
-        if (t > tout || any(lessThan(v, ivec3(0))) || any(greaterThanEqual(v, b.dims.xyz))) return;
-        int idx = v.x + b.dims.x * (v.y + b.dims.y * v.z);
-        uint c = (body_bytes.words[uint(b.dims.w) + uint(idx >> 2)] >> (8u * uint(idx & 3))) & 255u;
-        if (c != 0u && t > 0.05) {
-            if (pal != 0u || class_kind(c) == 1 || class_kind(c) == 2 || (class_kind(c) == 3 && stop_glass)) {
-                vec3 nl = vec3(0.0); nl[axis] = -float(stp[axis]);
-                best = t * kv; bcls = pal != 0u ? pal | c : c; bface = nearest_face(qrot(b.rot, nl));
-                return;
+    for (int kb = 0; kb < 200; kb++) {
+        if (t > tout || any(lessThan(vb, ivec3(0))) || any(greaterThanEqual(vb, bd))) return;
+        float tbo = min(min(tnb.x, tnb.y), min(tnb.z, tout));
+        int bi2 = vb.x + bd.x * (vb.y + bd.y * vb.z);
+        uint occ = (body_bytes.words[cw + uint(bi2 >> 2)] >> (8u * uint(bi2 & 3))) & 255u;
+        if (occ != 0u) {
+            // the voxels of this block the ray crosses, from t to tbo
+            ivec3 lo = vb * B, hi = min(lo + B, b.dims.xyz) - 1;
+            vec3 p = o + d * (t + 1.0e-4);
+            ivec3 v = clamp(ivec3(floor(p)), lo, hi);
+            vec3 tnext = (vec3(v) + step(0.0, d) - o) * inv;
+            float tf = t;
+            int ax = axis;
+            for (int k = 0; k < 3 * SHAPE_BLOCK + 3; k++) {
+                if (tf > tbo || any(lessThan(v, lo)) || any(greaterThan(v, hi))) break;
+                int idx = v.x + b.dims.x * (v.y + b.dims.y * v.z);
+                uint c = (body_bytes.words[uint(b.dims.w) + uint(idx >> 2)] >> (8u * uint(idx & 3))) & 255u;
+                if (c != 0u && tf > 0.05) {
+                    if (pal != 0u || class_kind(c) == 1 || class_kind(c) == 2 || (class_kind(c) == 3 && stop_glass)) {
+                        vec3 nl = vec3(0.0); nl[ax] = -float(stp[ax]);
+                        best = tf * kv; bcls = pal != 0u ? pal | c : c; bface = nearest_face(qrot(b.rot, nl));
+                        return;
+                    }
+                }
+                if (tnext.x < tnext.y && tnext.x < tnext.z) { v.x += stp.x; tf = tnext.x; tnext.x += tstep.x; ax = 0; }
+                else if (tnext.y < tnext.z) { v.y += stp.y; tf = tnext.y; tnext.y += tstep.y; ax = 1; }
+                else { v.z += stp.z; tf = tnext.z; tnext.z += tstep.z; ax = 2; }
             }
         }
-        if (tnext.x < tnext.y && tnext.x < tnext.z) { v.x += stp.x; t = tnext.x; tnext.x += tstep.x; axis = 0; }
-        else if (tnext.y < tnext.z) { v.y += stp.y; t = tnext.y; tnext.y += tstep.y; axis = 1; }
-        else { v.z += stp.z; t = tnext.z; tnext.z += tstep.z; axis = 2; }
+        if (tnb.x < tnb.y && tnb.x < tnb.z) { vb.x += stp.x; t = tnb.x; tnb.x += tsb.x; axis = 0; }
+        else if (tnb.y < tnb.z) { vb.y += stp.y; t = tnb.y; tnb.y += tsb.y; axis = 1; }
+        else { vb.z += stp.z; t = tnb.z; tnb.z += tsb.z; axis = 2; }
     }
 }
 

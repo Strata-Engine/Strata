@@ -158,25 +158,43 @@ mod Strata.Body do
   end
 
   -- ── Corners ──────────────────────────────────────────────────────────────
-  -- lattice corner (i, j, k), 0..sx etc.: how many of the eight voxels round it collide
-  pfn around_count(r : Strata.Blocks.Registry, g : Grid, i : Int, j : Int, k : Int) : Int do
-    let c = fn (x, y, z) -> if solid_at(r, g, x, y, z) do 1 else 0 end
-    c(i - 1, j - 1, k - 1) + c(i, j - 1, k - 1) + c(i - 1, j, k - 1) + c(i, j, k - 1) + c(i - 1, j - 1, k) + c(i, j - 1, k) + c(i - 1, j, k) + c(i, j, k)
-  end
-  pfn corner_on(r : Strata.Blocks.Registry, g : Grid, v : Int) : Bool do
+  -- The grid's colliding voxels as bytes (1 collides), with a border of air
+  -- one voxel wide all round: voxel (x, y, z) is at (x + 1) + (sx + 2) *
+  -- ((y + 1) + (sy + 2) * (z + 1)). Read once, so each corner's eight voxels
+  -- are eight byte reads.
+  pfn solid_mask(r : Strata.Blocks.Registry, g : Grid) : NativeU8Arr do
     match g do
-      Grid(sx, sy, _, _) ->
-        let n = around_count(r, g, v % (sx + 1), (v / (sx + 1)) % (sy + 1), v / ((sx + 1) * (sy + 1)))
-        n > 0 && n < 8
+      Grid(sx, sy, sz, a) -> mask_go(r, a, sx, sy, NativeArray.make_u8(Strata.Size.of((sx + 2) * (sy + 2) * (sz + 2)), 0), 0, sx * sy * sz)
     end
   end
-  pfn corner_count(r : Strata.Blocks.Registry, g : Grid, v : Int, n : Int, acc : Int) : Int do
-    if v >= n do acc else corner_count(r, g, v + 1, n, if corner_on(r, g, v) do acc + 1 else acc end) end
+  pfn mask_go(r : Strata.Blocks.Registry, a : NativeI32Arr, sx : Int, sy : Int, m : NativeU8Arr, i : Int, n : Int) : NativeU8Arr do
+    if i >= n do m
+    else if !B.collides(r, NativeArray.get_i32(a, i)) do mask_go(r, a, sx, sy, m, i + 1, n)
+    else
+      let x = i % sx
+      let y = (i / sx) % sy
+      let z = i / (sx * sy)
+      mask_go(r, a, sx, sy, NativeArray.set_u8(m, (x + 1) + (sx + 2) * ((y + 1) + (sy + 2) * (z + 1)), 1), i + 1, n)
+    end end
   end
-  pfn corner_fill(r : Strata.Blocks.Registry, g : Grid, v : Int, n : Int, out : NativeIntArr, k : Int) : NativeIntArr do
+  -- lattice corner (i, j, k), 0..sx etc.: how many of the eight voxels round it collide
+  pfn around_m(m : NativeU8Arr, px : Int, pxy : Int, i : Int, j : Int, k : Int) : Int do
+    -- voxel (i - 1, j - 1, k - 1) is mask index i + px * j + pxy * k
+    let o = i + px * j + pxy * k
+    NativeArray.get_u8(m, o) + NativeArray.get_u8(m, o + 1) + NativeArray.get_u8(m, o + px) + NativeArray.get_u8(m, o + px + 1)
+      + NativeArray.get_u8(m, o + pxy) + NativeArray.get_u8(m, o + pxy + 1) + NativeArray.get_u8(m, o + pxy + px) + NativeArray.get_u8(m, o + pxy + px + 1)
+  end
+  pfn corner_on_m(m : NativeU8Arr, sx : Int, sy : Int, v : Int) : Bool do
+    let n = around_m(m, sx + 2, (sx + 2) * (sy + 2), v % (sx + 1), (v / (sx + 1)) % (sy + 1), v / ((sx + 1) * (sy + 1)))
+    n > 0 && n < 8
+  end
+  pfn corner_count(m : NativeU8Arr, sx : Int, sy : Int, v : Int, n : Int, acc : Int) : Int do
+    if v >= n do acc else corner_count(m, sx, sy, v + 1, n, if corner_on_m(m, sx, sy, v) do acc + 1 else acc end) end
+  end
+  pfn corner_fill(m : NativeU8Arr, sx : Int, sy : Int, v : Int, n : Int, out : NativeIntArr, k : Int) : NativeIntArr do
     if v >= n do out
-    else if corner_on(r, g, v) do corner_fill(r, g, v + 1, n, NativeArray.set_int(out, k, v), k + 1)
-    else corner_fill(r, g, v + 1, n, out, k) end end
+    else if corner_on_m(m, sx, sy, v) do corner_fill(m, sx, sy, v + 1, n, NativeArray.set_int(out, k, v), k + 1)
+    else corner_fill(m, sx, sy, v + 1, n, out, k) end end
   end
 
   doc "The lattice corners on the grid's surface: corners (i, j, k), each 0 .. size, with both a colliding and a non-colliding voxel (or the outside) among the eight round them, as indices i + (sx + 1) * (j + (sy + 1) * k), in index order. These are the points a body touches things with."
@@ -184,7 +202,8 @@ mod Strata.Body do
     match g do
       Grid(sx, sy, sz, _) ->
         let n = (sx + 1) * (sy + 1) * (sz + 1)
-        corner_fill(r, g, 0, n, NativeArray.make_int(Strata.Size.of(corner_count(r, g, 0, n, 0)), 0), 0)
+        let m = solid_mask(r, g)
+        corner_fill(m, sx, sy, 0, n, NativeArray.make_int(Strata.Size.of(corner_count(m, sx, sy, 0, n, 0)), 0), 0)
     end
   end
 
