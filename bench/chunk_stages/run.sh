@@ -27,6 +27,7 @@ name() {
     24) echo "any_cut alone";;
     26) echo "columns, no river list";; 27) echo "columns, no lake-rim search";;
     28) echo "columns, neither";;
+    33) echo "a column's full chunks, one by one";; 34) echo "a column's full chunks, one call";;
   esac
 }
 measure() { # stage reps -> "cpu_seconds instructions cycles"
@@ -36,7 +37,7 @@ measure() { # stage reps -> "cpu_seconds instructions cycles"
     /cycles elapsed/ { cyc = $1 }
     END { printf "%s %s %s\n", cpu, ins, cyc }'
 }
-STAGES=${*:-"1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 22 23 24 26 27 28 20 21"}
+STAGES=${*:-"1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 22 23 24 26 27 28 33 34 20 21"}
 printf "%-5s %-38s %10s %12s %12s\n" stage what "cpu us" "instr (k)" "cycles (k)"
 for s in $STAGES; do
   r=$REPS; case $s in 20|21|24) r=$((REPS * 100));; esac  # cheap stages need more runs
