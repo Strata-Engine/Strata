@@ -415,16 +415,24 @@ like. Two costs, both in `bench/march/stamp_loop` against C (14 instructions
 a template voxel):
 
 - The tuple is allocated and freed every voxel: 160 to 190 instructions.
-  The loop is 545 to 587 instructions a voxel with it and 386 to 395 with
+  The loop is 545 to 591 instructions a voxel with it and 386 to 395 with
   the turn as two Int-valued functions.
 - Compiled in the program's own module, an accessor borrows the template
-  (`t_sx`: 24 instructions, no reference count touched). Compiled as a
-  second module, as every library function is, the same accessor takes it
-  owned: the caller raises the template's count, the accessor lowers it,
-  raises the count of each array field and lowers them again (157
-  instructions, seven reference-count calls). The same loop is then 829 to
-  834 instructions a voxel. Making the accessors private to their module
-  was tried and changed nothing measurable (834), though that build was
+  and touches no reference count. Compiled as a second module, as every
+  library function is, the same accessor takes it owned and adjusts the
+  counts of the template and its three arrays (seven `rc_` calls in its
+  IR). The same loop is then 815 to 836 instructions a voxel, 245 to 290
+  more. That gap is the three size accessors (`t_sx`, `t_sy`, `t_sz`) the
+  loop calls a voxel: with them written as constants in a scratch build,
+  the two builds measure the same (376 to 416 with the tuple, 246 to 248
+  without), so each read costs about 85 to 92 instructions more across the
+  boundary, as executed. In a bare loop that keeps the template
+  (`acc_one`/`acc_two` in the same bench) a `t_sx` call adds about 5
+  instructions in one module and 127 in a second; the cost depends on the
+  caller. `t_ids` costs nothing measurable across the boundary. (An earlier
+  figure of 157 against 24 for one accessor was not from instructions run
+  and is withdrawn.) Making the accessors private to their module was
+  tried and changed nothing measurable (834), though that build was
   reported as cached and is not relied on.
 
 Met measuring scatter layers (`bench/populate_fields` mode 8: 11.8 M of

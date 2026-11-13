@@ -545,6 +545,79 @@ mod Strata.Test.Populate do
     end
   end
 
+  -- one scatter layer "pebbles" of blocks 7 and 8 (no template), one a 4 m cell
+  pfn pebbles_pop() : Strata.Population.Frozen do
+    frozen_of(Pn.layer_scatter(Pn.shapes_blocks(Pn.new(), "g", [7, 8]), "pebbles", "g", Pn.rule(0.0625, Nil, Nil, Nil), 4.0, 0.6, 5))
+  end
+  -- the test's own stamp of blocks: each instance's block (7 or 8 by its
+  -- variant) on its column, one above its top, when that voxel is in chunk k
+  pfn block_stamp(c : Strata.Chunk.Chunk, k : Strata.Coord.Key, xs : List(Strata.Populate.PopInstance)) : Strata.Chunk.Chunk do
+    List.fold_left(xs, c, fn (acc, i) ->
+      let x = vox(Pq.i_xm(i), 1.0) - 32 * Strata.Coord.kx(k)
+      let y = Pq.i_top(i) + 1 - 32 * Strata.Coord.ky(k)
+      let z = vox(Pq.i_zm(i), 1.0) - 32 * Strata.Coord.kz(k)
+      if between(x, 0, 31) do (if between(y, 0, 31) do (if between(z, 0, 31) do Strata.Chunk.set(acc, x, y, z, 7 + Pq.i_variant(i)) else acc end) else acc end) else acc end)
+  end
+  -- pebbles on the flat Ground of chunk (0, 0, 0) and a pad of 1 at `top`:
+  -- chunk k holds 64 blocks, all at local y, exactly the test's own stamp,
+  -- and chunk `empty` holds none. "" or what went wrong.
+  pfn block_edge_case(top : Int, k : Strata.Coord.Key, y : Int, empty : Strata.Coord.Key) : String do
+    let f = pebbles_pop()
+    let g = flat_ground(-1, -1, 34, 1.0, top)
+    let all = Pq.instances(f, 3, Pq.fields(f, 3, g), g, "pebbles")
+    let got = Pq.place(f, 3, k, air(), g)
+    let pre = "top " ++ int_to_string(top) ++ ": "
+    if hash_of(got) != hash_of(block_stamp(air(), k, all)) do pre ++ "chunk " ++ key_str(k) ++ " is not the test's stamp"
+    else if count_filled(got) != 64 do pre ++ int_to_string(count_filled(got)) ++ " blocks, not 64"
+    else if count_layer(got, 7, y) + count_layer(got, 8, y) != 64 do pre ++ "not all at local y " ++ int_to_string(y)
+    else if hash_of(Pq.place(f, 3, empty, air(), g)) != hash_of(air()) do pre ++ "chunk " ++ key_str(empty) ++ " is not air"
+    else "" end end end end
+  end
+  -- pebbles on the Ground of chunk (0, 0, 0) and a pad of 1 whose tops are lo
+  -- where world x < 16 and hi from 16 on (so the chunk's height gate lets
+  -- both through): chunks y -1, 0 and 1 are exactly the test's own stamp,
+  -- and chunk y `ky` holds `want` blocks. "" or what went wrong.
+  pfn block_step_case(lo : Int, hi : Int, ky : Int, want : Int) : String do
+    let f = pebbles_pop()
+    let g = Pq.ground(-1, -1, 34, 1.0, 0, List.fold_left(List.range(0, 34 * 34), NativeArray.make_int(34 * 34, lo), fn (a, i) -> if i % 34 - 1 >= 16 do NativeArray.set_int(a, i, hi) else a end), NativeArray.make_int(34 * 34, -1))
+    let all = Pq.instances(f, 3, Pq.fields(f, 3, g), g, "pebbles")
+    let pre = "tops " ++ int_to_string(lo) ++ " | " ++ int_to_string(hi) ++ ": "
+    let bad = List.filter([-1, 0, 1], fn y ->
+      let k = Strata.Coord.key(0, y, 0)
+      hash_of(Pq.place(f, 3, k, air(), g)) != hash_of(block_stamp(air(), k, all)))
+    let n = count_filled(Pq.place(f, 3, Strata.Coord.key(0, ky, 0), air(), g))
+    match bad do
+      Cons(y, _) -> pre ++ "chunk y " ++ int_to_string(y) ++ " is not the test's stamp"
+      Nil -> if n != want do pre ++ int_to_string(n) ++ " blocks in chunk y " ++ int_to_string(ky) ++ ", not " ++ int_to_string(want) else "" end
+    end
+  end
+  -- pebbles on a flat Ground at top 10 with the column of one instance (the
+  -- first standing on x 8..23, z 8..23) at `odd`: chunk (0, 0, 0) holds the
+  -- other 63 blocks as on the flat Ground and chunks y 1 and -1 none. "" or
+  -- what went wrong.
+  pfn block_odd_case(odd : Int) : String do
+    let f = pebbles_pop()
+    let level = flat_ground(-1, -1, 34, 1.0, 10)
+    let all = Pq.instances(f, 3, Pq.fields(f, 3, level), level, "pebbles")
+    match List.find(all, fn i -> if between(vox(Pq.i_xm(i), 1.0), 8, 23) do between(vox(Pq.i_zm(i), 1.0), 8, 23) else false end) do
+      None -> "no instance in the middle of the chunk"
+      Some(v) ->
+        let col = (vox(Pq.i_xm(v), 1.0) + 1) + 34 * (vox(Pq.i_zm(v), 1.0) + 1)
+        let g = Pq.ground(-1, -1, 34, 1.0, 0, NativeArray.set_int(NativeArray.make_int(34 * 34, 10), col, odd), NativeArray.make_int(34 * 34, -1))
+        let rest = List.filter(all, fn i -> !same_place(i, v))
+        let listed = Pq.instances(f, 3, Pq.fields(f, 3, g), g, "pebbles")
+        let k0 = Strata.Coord.key(0, 0, 0)
+        let got = Pq.place(f, 3, k0, air(), g)
+        if List.length(rest) != List.length(all) - 1 do "the instance was not singled out"
+        else if !List.any(listed, fn i -> if same_place(i, v) do Pq.i_top(i) == odd else false end) do "instances does not list it with its top"
+        else if hash_of(got) != hash_of(block_stamp(air(), k0, rest)) do "chunk (0, 0, 0) is not the blocks of the others"
+        else if count_filled(got) != 63 do int_to_string(count_filled(got)) ++ " blocks in chunk (0, 0, 0), not 63"
+        else if hash_of(Pq.place(f, 3, Strata.Coord.key(0, 1, 0), air(), g)) != hash_of(air()) do "chunk (0, 1, 0) is not air"
+        else if hash_of(Pq.place(f, 3, Strata.Coord.key(0, -1, 0), air(), g)) != hash_of(air()) do "chunk (0, -1, 0) is not air"
+        else "" end end end end end end
+    end
+  end
+
   -- two scatter layers, 7 x 5 x 3 of block 3 then 3 x 4 x 5 of block 4 (neither square, so a quarter turn swaps their sides), one a 4 m cell each
   pfn two_scatter_pop() : Strata.Population.Frozen do
     let p0 = Pn.shapes_templates(Pn.shapes_templates(Pn.new(), "sa", [solid(7, 5, 3, 3, 1.0)]), "sb", [solid(3, 4, 5, 4, 1.0)])
@@ -1100,7 +1173,7 @@ mod Strata.Test.Populate do
         Test.assert_true(hash_of(got) != hash_of(stamp_all(air(), k, [t], 1.0, List.reverse(all))), "and not that of the first: the stamps do overlap"))
     end
 
-    test "place: a chunk only stamps reach gets no cover, and the chunk with the floors gets both" do
+    test "place: skipping cover where no floor is in reach changes nothing: a chunk only stamps reach holds the stamps alone, the chunk with the floors holds both (the saving is bench mode 11's, not tested here)" do
       let t = solid(1, 30, 1, 3, 1.0)
       let p0 = Pn.shapes_blocks(Pn.shapes_templates(Pn.new(), "s", [t]), "g", [7])
       let f = frozen_of(Pn.layer_scatter(Pn.layer_cover(p0, "grass", "g", Pn.rule(1.0, Nil, Nil, Nil), 3), "posts", "s", Pn.rule(0.0625, Nil, Nil, Nil), 4.0, 0.6, 5))
@@ -1228,6 +1301,29 @@ mod Strata.Test.Populate do
       Test.assert_eq_int(List.length(here), 64, "64 cells of the chunk")
       Test.assert_eq_int(count_filled(got), 64, "64 voxels written")
       Test.assert_true(List.all(here, fn i -> Strata.Chunk.get_or(got, vox(Pq.i_xm(i), 1.0) + 32, Pq.i_top(i) + 1, vox(Pq.i_zm(i), 1.0), -1) == 8), "each the weighted variant's block, one above its column's top")
+    end
+
+    test "place: blocks at a chunk's height borders: tops 30 and -1 put them in chunk y 0, tops 31 and -2 in the chunks above and below" do
+      let k0 = Strata.Coord.key(0, 0, 0)
+      let k1 = Strata.Coord.key(0, 1, 0)
+      let km = Strata.Coord.key(0, -1, 0)
+      Test.assert_eq_str(block_edge_case(30, k0, 31, k1), "", "tops at 30: the blocks at y 31, chunk y 0's last row")
+      Test.assert_eq_str(block_edge_case(31, k1, 0, k0), "", "tops at 31: the blocks at y 32, in chunk y 1")
+      Test.assert_eq_str(block_edge_case(-1, k0, 0, km), "", "tops at -1: the blocks at y 0, chunk y 0's first row")
+      Test.assert_eq_str(block_edge_case(-2, km, 31, k0), "", "tops at -2: the blocks at y -1, in chunk y -1")
+    end
+
+    test "place: blocks where tops either side of a chunk's height border share one Ground: each column's block goes to its own chunk" do
+      Test.assert_eq_str(block_step_case(30, 31, 0, 32), "", "tops 30 and 31: chunk y 0 holds the 32 on the tops at 30")
+      Test.assert_eq_str(block_step_case(30, 31, 1, 32), "", "and chunk y 1 the 32 on the tops at 31")
+      Test.assert_eq_str(block_step_case(-2, -1, 0, 32), "", "tops -2 and -1: chunk y 0 holds the 32 on the tops at -1")
+      Test.assert_eq_str(block_step_case(-2, -1, -1, 32), "", "and chunk y -1 the 32 on the tops at -2")
+    end
+
+    test "place: blocks on a top at either end of Int trap nothing: that column gets none and the others are placed" do
+      Test.assert_eq_str(block_odd_case(4611686018427387903), "", "a top of 2^62 - 1")
+      Test.assert_eq_str(block_odd_case(4611686018427387902), "", "a top of 2^62 - 2")
+      Test.assert_eq_str(block_odd_case(0 - 4611686018427387903 - 1), "", "a top of -2^62")
     end
   end
 end
