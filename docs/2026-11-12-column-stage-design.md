@@ -1,8 +1,9 @@
 # The column stage: making a chunk column's shared work once
 
 12 November 2026. A design for the first restructuring in
-`docs/2026-11-12-chunk-performance-findings.md`. Not started; one decision
-is open (which of two shapes) and is marked below.
+`docs/2026-11-12-chunk-performance-findings.md`. Not started. The owner
+chose shape A on 12 November; the plan is
+`docs/2026-11-12-column-stage-plan.md`.
 
 ## The problem
 
@@ -114,8 +115,8 @@ real flight before deciding whether B's extra case is worth its machinery.
 A's viewer split (`island_column` / `island_chunk`) is exactly the split B
 needs, so nothing done for A is thrown away.
 
-**Open decision for the owner:** A now and B only if the measurement asks
-for it (recommended), or B directly.
+**Decided (owner, 12 November):** shape A now; B only if the plan's
+measurements ask for it.
 
 ## Independent of the shape
 
