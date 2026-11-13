@@ -100,7 +100,7 @@ mod Strata.Physics do
 
   type Physics = { reg : Strata.Blocks.Registry, cfg : PhysConfig, bodies : List(Rigid), next : Int, steps : Int, view : Sight, waiting : Int, over : Int, touches : List(Touch), driving : List(Touch), unmeshed : List(Int), meshes : List((Int, Int, Strata.Mesh.Meshed)), fills : Int,
                    loosed : List((Int, (Int, Int, Int, Int, Int, Int), List((Int, Int, Int, Int)), List(Strata.Edit.Change))),
-                   pushes : List(PhPush), wakes : List(Strata.Edit.Change), events : List(PhysEvent),
+                   pushes : List(PhPush), wakes : List(Strata.Edit.Change), events : List(PhysEvent),   -- events newest first; `events` reverses them
                    cuts : List((Float, Float, Float, Float)) }
 
   doc "No bodies yet."
@@ -280,7 +280,7 @@ mod Strata.Physics do
   doc "Steps taken."
   fn steps(p : Physics) : Int do p.steps end
   doc "What the last step did."
-  fn events(p : Physics) : List(PhysEvent) do p.events end
+  fn events(p : Physics) : List(PhysEvent) do List.reverse(p.events) end
 
   doc "Give body [id] an impulse of (ix, iy, iz) N s at world point (x, y, z), at the next step. It wakes."
   fn push(p : Physics, id : Int, x : Float, y : Float, z : Float, ix : Float, iy : Float, iz : Float) : Physics do
@@ -1049,16 +1049,33 @@ mod Strata.Physics do
     if da != db do da > db else a.id < b.id end
   end
 
+  -- Bodies are meshed in the step after they change, at most mesh_budget()
+  -- grid cells' worth a step (always at least one body): eight trees planted
+  -- at once are meshed over several steps, not in one long one. The rest wait
+  -- in `unmeshed`, in order.
+  pfn mesh_budget() : Int do 60000 end
+  pfn mesh_some(p : Physics, ids : List(Int), spent : Int, acc : List((Int, Int, Strata.Mesh.Meshed))) : (List((Int, Int, Strata.Mesh.Meshed)), List(Int)) do
+    match ids do
+      Nil -> (acc, Nil)
+      Cons(id, rest) ->
+        if spent >= mesh_budget() do (acc, ids)
+        else
+          match find(p, id) do
+            Some(b) -> mesh_some(p, rest, spent + Bg.size_x(b.grid) * Bg.size_y(b.grid) * Bg.size_z(b.grid), List.append(acc, body_meshes(p.reg, b)))
+            None -> mesh_some(p, rest, spent, acc)
+          end
+        end
+    end
+  end
   pfn finish_step(p00 : Physics, w : Strata.World.World, focus : List((Float, Float, Float)), w0 : Strata.World.World, removals : List((Int, Int, Int, Int))) : (Physics, Strata.Edit.Outcome) do
     match fragments(p00, w) do
       (p0, written) ->
-        let made = List.fold_left(p0.unmeshed, Nil, fn (acc, id) -> match find(p0, id) do
-            Some(b) -> List.append(acc, body_meshes(p0.reg, b))
-            None -> acc
-          end)
-        let p = { p0 with unmeshed: Nil, meshes: List.append(p0.meshes, made) }
+        match mesh_some(p0, p0.unmeshed, 0, Nil) do
+          (made, left) ->
+        let p = { p0 with unmeshed: left, meshes: List.append(p0.meshes, made) }
         match capped(p, w, focus) do
           (p2, cells) -> (p2, Strata.Edit.set_many(w0, List.append(List.append(removals, written), cells)))
+        end
         end
     end
   end
@@ -1121,7 +1138,7 @@ mod Strata.Physics do
       (left, taken) ->
         if taken == 0 do p
         else
-          let p1 = { p with events: List.append(p.events, Cons(PhEvent(6, b.id, -1, x, y, z, int_to_float(taken)), Nil)) }
+          let p1 = { p with events: Cons(PhEvent(6, b.id, -1, x, y, z, int_to_float(taken)), p.events) }
           let parts = Bg.split(p.reg, left)
           if List.is_empty(parts) do remove(p1, b.id)
           else
@@ -1131,7 +1148,9 @@ mod Strata.Physics do
             let keep = keeper(p.reg, w, b, cands, ws)
             match List.find(List.zip(List.range(0, List.length(cands)), cands), fn kc -> match kc do (k, _) -> k == keep end) do
               Some((_, (_, kb))) ->
-                let kept = if b.kind != pinned() do awaken(kb) else if held(p.reg, w, kb, ws) do kb else { awaken(kb) with kind: dynamic() } end end
+                -- its corners are found only now: every part is weighed, only the kept one touches things as b
+                let kc = { kb with surf: Bg.corners(p.reg, kb.grid) }
+                let kept = if b.kind != pinned() do awaken(kc) else if held(p.reg, w, kc, ws) do kc else { awaken(kc) with kind: dynamic() } end end
                 let p2 = { p1 with bodies: List.map(p1.bodies, fn o -> if o.id == b.id do kept else o end), unmeshed: List.append(p1.unmeshed, Cons(b.id, Nil)) }
                 -- what rested on it wakes
                 let bx = bounds(b, ws)
@@ -1183,7 +1202,8 @@ mod Strata.Physics do
           if id == 0 do acc else Bg.grid_set(acc, ox + i % px, oy + (i / px) % py, oz + i / (px * py), id) end)
     end
   end
-  -- [b] with grid [g] (the same size, its low corner where b's is): mass, centre, inertia, corners and weakest block worked out again; it moves as that part of b did
+  -- [b] with grid [g] (the same size, its low corner where b's is): mass, centre, inertia and weakest block worked out again; it moves as that part of b did.
+  -- Its corners are left empty: the caller finds them (Bg.corners) for the part it keeps.
   pfn regrid(r : Strata.Blocks.Registry, b : Rigid, g : Strata.Body.Grid) : Rigid do
     let mass = Bg.mass_of(r, g, b.vs)
     match (Bg.centre(mass), Bg.inertia(mass)) do
@@ -1196,7 +1216,7 @@ mod Strata.Physics do
             let rx = px -. b.px
             let ry = py -. b.py
             let rz = pz -. b.pz
-            { b with grid: g, surf: Bg.corners(r, g), m: Bg.mass_kg(mass), lx: lx, ly: ly, lz: lz, ii: inverse_sym(a, bb, c, d, e, f),
+            { b with grid: g, surf: NativeArray.make_int(0, 0), m: Bg.mass_kg(mass), lx: lx, ly: ly, lz: lz, ii: inverse_sym(a, bb, c, d, e, f),
                      px: px, py: py, pz: pz, ppx: px, ppy: py, ppz: pz,
                      vx: b.vx +. b.wy *. rz -. b.wz *. ry, vy: b.vy +. b.wz *. rx -. b.wx *. rz, vz: b.vz +. b.wx *. ry -. b.wy *. rx, weak: weakest(r, g) }
         end
@@ -1249,10 +1269,10 @@ mod Strata.Physics do
   end
   pfn clampi(v : Int, lo : Int, hi : Int) : Int do if v < lo do lo else if v > hi do hi else v end end end
   pfn spray(p : Physics, id : Int, x : Float, y : Float, z : Float, voxels : Int) : Physics do
-    { p with events: List.append(p.events, Cons(PhEvent(5, id, -1, x, y, z, int_to_float(voxels)), Nil)) }
+    { p with events: Cons(PhEvent(5, id, -1, x, y, z, int_to_float(voxels)), p.events) }
   end
   pfn break_event(p : Physics, id : Int, other : Int, x : Float, y : Float, z : Float, voxels : Int) : Physics do
-    { p with events: List.append(p.events, Cons(PhEvent(1, id, other, x, y, z, int_to_float(voxels)), Nil)) }
+    { p with events: Cons(PhEvent(1, id, other, x, y, z, int_to_float(voxels)), p.events) }
   end
   -- body [id] moves at (vx, vy, vz) and spins at (wx, wy, wz); a fragment or not
   pfn set_motion(p : Physics, id : Int, vx : Float, vy : Float, vz : Float, wx : Float, wy : Float, wz : Float, frag : Bool) : Physics do
@@ -1276,6 +1296,23 @@ mod Strata.Physics do
         let cy = clampi(float_to_int(Math.floor(inward(ly, b.ly) /. scale)), 0, Bg.size_y(b.grid) - 1)
         let cz = clampi(float_to_int(Math.floor(inward(lz, b.lz) /. scale)), 0, Bg.size_z(b.grid) - 1)
         let excess = if b.weak > 0.0 do i /. b.weak else 1.0 end
+        -- a fine body whose pieces would all be spray: what is in reach is spray at once, the rest its parts
+        let pv = Strata.Fracture.piece_voxels(p.reg, b.grid, cx, cy, cz, scale)
+        let fine_k = c_scale(p.cfg) /. scale
+        if fine_k > 1.001 && pv < fine_k do
+          match Strata.Fracture.shatter(p.reg, b.grid, cx, cy, cz, excess, scale) do
+            (parts, dropped) ->
+              if dropped == 0 do p
+              else
+                match turn(b.q, b.lx, b.ly, b.lz) do
+                  (ox, oy, oz) ->
+                    let corner = (b.px -. ox, b.py -. oy, b.pz -. oz)
+                    let p1 = spray(break_event(remove(p, b.id), b.id, -1, b.px +. ax, b.py +. ay, b.pz +. az, Bg.solid_count(p.reg, b.grid)), b.id, b.px +. ax, b.py +. ay, b.pz +. az, dropped)
+                    List.fold_left(parts, p1, fn (q, pc) -> body_piece(q, b, corner, pc, scale))
+                end
+              end
+          end
+        else
         let pieces = Strata.Fracture.pieces(p.reg, b.grid, cx, cy, cz, excess, scale, mix(mix(11, b.id), p.steps))
         if List.length(pieces) <= 1 do p
         else
@@ -1286,6 +1323,19 @@ mod Strata.Physics do
               List.fold_left(pieces, p1, fn (q, pc) -> body_piece(q, b, corner, pc, scale))
           end
         end
+        end
+    end
+  end
+  -- A piece with fewer voxels than this is spray, not a body: a single voxel
+  -- at the world's size; for a fine body, less than one world voxel's worth
+  -- (k^3 of its voxels), so a fine tree that breaks up makes a few bodies and
+  -- spray, not thousands of tiny bodies.
+  pfn spray_below(p : Physics, scale : Float) : Int do
+    let world = c_scale(p.cfg)
+    if scale >= world *. 0.999 do 2
+    else
+      let k = float_to_int(Math.floor(world /. scale +. 0.5))
+      k * k * k
     end
   end
   -- one piece of body [b], its grid's low corner at [corner] in the world: it moves as that part of [b] did
@@ -1302,9 +1352,10 @@ mod Strata.Physics do
                 vx : Float, vy : Float, vz : Float, wx : Float, wy : Float, wz : Float, from : Int) : Physics do
     let nv = Bg.solid_count(p.reg, g)
     if nv == 0 do p
-    else if nv == 1 do
-      match turn(q, 0.5 *. scale, 0.5 *. scale, 0.5 *. scale) do
-        (hx, hy, hz) -> spray(p, from, x +. hx, y +. hy, z +. hz, 1)
+    else if nv < spray_below(p, scale) do
+      -- spray from the piece's middle
+      match turn(q, 0.5 *. scale *. int_to_float(Bg.size_x(g)), 0.5 *. scale *. int_to_float(Bg.size_y(g)), 0.5 *. scale *. int_to_float(Bg.size_z(g))) do
+        (hx, hy, hz) -> spray(p, from, x +. hx, y +. hy, z +. hz, nv)
       end
     else
       match add_sized(p, g, scale, x, y, z, q, dynamic()) do
@@ -1501,7 +1552,7 @@ mod Strata.Physics do
               (bx0, by0, bz0, bx1, by1, bz1) ->
                 let entry = (id, (bx0 - 1, by0 - 1, bz0 - 1, bx1 + 1, by1 + 1, bz1 + 1), leaving(p.reg, w, cells), p.wakes)
                 let ev = PhEvent(2, id, -1, (int_to_float(bx0 + bx1) /. 2.0 +. 0.5) *. scale, (int_to_float(by0 + by1) /. 2.0 +. 0.5) *. scale, (int_to_float(bz0 + bz1) /. 2.0 +. 0.5) *. scale, int_to_float(List.length(cells)))
-                { p2 with loosed: List.append(p2.loosed, Cons(entry, Nil)), events: List.append(p2.events, Cons(ev, Nil)) }
+                { p2 with loosed: List.append(p2.loosed, Cons(entry, Nil)), events: Cons(ev, p2.events) }
             end
         end
     end
@@ -1559,7 +1610,7 @@ mod Strata.Physics do
           -- a wall that took more than half a metre a second's worth of its own momentum wakes
           let woke = woken_statics(statics, push, n, Nil)
           let changed = by_id(List.append(moved, woke))
-          match breaks({ p1 with bodies: driven_seen(merge(bs1, changed, Nil)), events: List.append(p1.events, evs), touches: tch }, w, hits, ids, 0, n, Nil) do
+          match breaks({ p1 with bodies: driven_seen(merge(bs1, changed, Nil)), events: List.append(List.reverse(evs), p1.events), touches: tch }, w, hits, ids, 0, n, Nil) do
             (p2, broken) -> finish_step(p2, w, focus, w0, List.append(removals, broken))
           end
       end
@@ -2052,7 +2103,7 @@ mod Strata.Physics do
             let evs = List.map(stale, fn e -> deferred_event(e, c_scale(p.cfg)))
             let kept = List.filter(reconcile(r.bodies, p.bodies, n0, Nil), fn b -> !List.member(gone, b.id))
             let cells = List.filter(as_cells(Strata.Edit.changes(o), Nil), fn c -> !undone(undo, c))
-            let p2 = { p with bodies: by_id(kept), next: r.next, steps: r.steps, events: List.append(r.events, evs), waiting: r.waiting, over: r.over, touches: r.touches, fills: r.fills,
+            let p2 = { p with bodies: by_id(kept), next: r.next, steps: r.steps, events: List.append(List.reverse(evs), r.events), waiting: r.waiting, over: r.over, touches: r.touches, fills: r.fills,
                               unmeshed: List.append(p.unmeshed, List.filter(r.unmeshed, fn i -> !List.member(gone, i))),
                               meshes: List.append(p.meshes, List.filter(r.meshes, fn m -> match m do (id, _, _) -> !List.member(gone, id) end)), wakes: List.append(p.wakes, again) }
             with_outcome(p2, Strata.Edit.set_many(w, cells))
