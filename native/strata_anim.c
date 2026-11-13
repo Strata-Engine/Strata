@@ -122,6 +122,16 @@ void an_x_place(int64_t fig, double x, double y, double z, double qx, double qy,
     float pos[3] = {(float)x, (float)y, (float)z}, q[4] = {(float)qx, (float)qy, (float)qz, (float)qw};
     an_place(g_w, (int)fig, pos, q);
 }
+/* n figures placed at once: figs n i32, poses 7 floats a figure (x, y, z, then the turn x, y, z, w), as n an_x_place
+ * calls in order; a dead figure is refused and counted as an_place refuses it, the rest still placed. Arrays shorter
+ * than n are refused whole. */
+void an_x_place_many(int64_t n, void *figs, void *poses) {
+    if (!g_w || n <= 0) return;
+    if (an_x_len(figs) < n || an_x_len(poses) < 7 * n) { an_refuse(g_w, AN_R_VALUE); return; }
+    const int32_t *f = an_x_i32(figs);
+    const float *p = an_x_f32(poses);
+    for (int64_t i = 0; i < n; i++) an_place(g_w, f[i], p + 7 * i, p + 7 * i + 3);
+}
 void an_x_play(int64_t fig, int64_t layer, int64_t clip, double fade, double rate, double weight, int64_t mask, int64_t additive) {
     if (!g_w) return;
     an_play(g_w, (int)fig, (int)layer, (int)clip, (float)fade, (float)rate, (float)weight, an_x_mask_id(fig, mask), additive != 0);

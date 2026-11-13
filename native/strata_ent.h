@@ -2,10 +2,22 @@
  * whole columns. Plain C: no Vulkan, no GLFW, no physics or audio, no
  * globals, so it is tested headless (native/tests/ent_test.c).
  *
+ * STOPGAP. The per-entity loops (movement, the ray and sweep against the
+ * blocks, the grid, touches, the seen switch, snapshots) are in C only
+ * because March cannot yet run them inside the design's budget: a shared
+ * value passed around a hot loop costs a reference-count update on every
+ * call (GAPS S15), and 20,000 entities must tick in 2 ms. They belong in
+ * March. When March can meet that budget, move them back, with a March
+ * reproducer of the slowness as the first step; Strata.Entities' interface
+ * need not change.
+ *
  * Threads: one. Every call on an EnWorld runs on the same thread, in order.
  * Nothing here allocates after en_open except the block masks: 4,096 bytes
- * for each held chunk that is neither all solid nor all clear, and the chunk
- * table, which doubles as it fills (section "blocks").
+ * for each held chunk that is neither all solid nor all clear, the chunk
+ * table, which doubles as it fills (section "blocks"), and the copy of the
+ * focus points, which grows to the most a tick has been given (section "parts
+ * of seen entities"), and a restore's check, which borrows a scratch array for
+ * the length of the call (strata_ent_snap.h).
  *
  * Storage. An entity is a row in packed columns, one array per column, each
  * capacity long. A row keeps its index for its whole life; removing it raises
@@ -30,7 +42,9 @@
  * the ray; events; the grid, near, the entity ray and touch pairs (in
  * strata_ent_grid.h, included here); the sweep, walking and routes (in
  * strata_ent_move.h, included here); seen and unseen, and setting on the
- * ground (in strata_ent_seen.h, included here); the tick. */
+ * ground (in strata_ent_seen.h, included here); the tick; parts of seen
+ * entities (what the game gives a figure or voices, and places each tick);
+ * snapshot and restore (in strata_ent_snap.h, included last). */
 #ifndef STRATA_ENT_H
 #define STRATA_ENT_H
 #include <stdint.h>
@@ -58,12 +72,15 @@
 #define EN_CELL 4.0                /* the grid's cell, metres */
 #define EN_CELL_MAX 1000000000.0   /* |grid cell coordinate| at most; farther positions share the last cell */
 #define EN_ROUTE_MAX 256           /* points a route at most */
+#define EN_DIVISOR_MAX 65536       /* a kind's unseen divisor at most, so the step test (due + r % n) cannot overflow */
 
 /* a row's flags */
 /* seen (strata_ent_seen.h); a flyer that hit a block, still until the game moves it; a walker standing on something; a
  * follower whose route loops; a follower that has reported event 8 for its present stall; an unseen walker waiting to
- * be set on the ground; an unseen entity frozen by its kind's rule */
-enum { EN_F_SEEN = 1, EN_F_STUCK = 2, EN_F_GROUNDED = 4, EN_F_LOOPS = 8, EN_F_BLOCKED = 16, EN_F_WAITING = 32, EN_F_FROZEN = 64 };
+ * be set on the ground; an unseen entity frozen by its kind's rule; a seen entity whose body was lost (en_body_lost),
+ * wanting no other until it has left view */
+enum { EN_F_SEEN = 1, EN_F_STUCK = 2, EN_F_GROUNDED = 4, EN_F_LOOPS = 8, EN_F_BLOCKED = 16, EN_F_WAITING = 32, EN_F_FROZEN = 64,
+       EN_F_LOST = 128 };
 /* event codes */
 enum { EN_E_TOUCH = 1, EN_E_BLOCK = 2, EN_E_ENTERED = 3, EN_E_LEFT = 4, EN_E_ROUTE = 5, EN_E_REMOVED = 6, EN_E_BODY_LOST = 7, EN_E_BLOCKED = 8 };
 
@@ -76,13 +93,14 @@ enum {
     EN_R_FULL = 4,      /* the kind table or the world is full */
     EN_R_MOVER = 5,     /* a mover outside 0..3 */
     EN_R_UNSEEN = 6,    /* an unseen rule outside 0..2 */
-    EN_R_DIVISOR = 7,   /* a tick divisor below 1 */
+    EN_R_DIVISOR = 7,   /* a tick divisor below 1 or above EN_DIVISOR_MAX */
     EN_R_SLOTS = 8,     /* a slot count outside 0..EN_SLOTS, or a slot past the kind's */
     EN_R_BODY = 9,      /* a body on a mover other than Body, or a Body mover without one */
     EN_R_PART = 10,     /* a part outside 0..3, a flag not 0/1, too many voices, or a part the kind lacks */
     EN_R_WHICH = 11,    /* en_set or a column: no such field, or one a game may not set (age) */
     EN_R_ROWS = 12,     /* en_set_column: rows not the kind's live count */
-    EN_R_ROUTE = 13     /* no such route, or one freed (strata_ent_move.h) */
+    EN_R_ROUTE = 13,    /* no such route, or one freed (strata_ent_move.h) */
+    EN_R_SNAPSHOT = 14  /* a snapshot that does not fit the world (strata_ent_snap.h) */
 };
 
 /* kind ints, in en_kind's order */
@@ -109,6 +127,10 @@ typedef struct { int32_t start, n, users, state; } EnRoute;
 
 /* a removal made between ticks, written as event 6 at the start of the next tick */
 typedef struct { int64_t id; int32_t reason; double pos[3]; } EnRemoval;
+
+/* an entity wanting a part: its horizontal distance squared to the nearest focus, and its id (section "parts of seen
+ * entities") */
+typedef struct { double d2; int64_t id; } EnWant;
 
 typedef struct {
     int32_t ints[EN_K_INTS];
@@ -169,6 +191,12 @@ struct EnWorld {
     float *rt_speed;             /* a row: metres a second along its route */
     float *rt_best, *rt_stall;   /* a row: distance to the waypoint at the last progress, seconds since */
     int64_t tick_count;          /* ticks begun; spreads divisor stepping across ticks */
+    /* parts */
+    int32_t *rel_code; int64_t *rel_id; int nrel;   /* capacity x EN_PARTS: (part, id) pairs cleared and not yet drained */
+    double fig_refused[EN_KINDS];   /* figures the game could not make for each kind (en_figure_refused) */
+    int body_over;               /* entities wanting a body left over by the game's last tick (en_body_over) */
+    double *focus; int nfocus, focus_cap;   /* the last tick's focus points, 3 doubles each */
+    EnWant *want;                /* capacity: en_wanting's scratch */
 };
 typedef struct EnWorld EnWorld;
 
@@ -183,6 +211,7 @@ static inline void en_close(EnWorld *w) {
     free(w->from); free(w->g_ent); free(w->g_start); free(w->g_bucket); free(w->g_byk);
     free(w->rpts); free(w->routes); free(w->route_free); free(w->fx_start); free(w->fx_len);
     free(w->rt_route); free(w->rt_next); free(w->rt_speed); free(w->rt_best); free(w->rt_stall);
+    free(w->rel_code); free(w->rel_id); free(w->focus); free(w->want);
     if (w->chunks) for (int i = 0; i < w->chunk_cap; i++) free(w->chunks[i].mask);
     free(w->chunks);
     free(w);
@@ -238,11 +267,16 @@ static inline EnWorld *en_open(int capacity, int route_points, int bodies, doubl
     w->rt_speed = (float *)calloc(n, sizeof *w->rt_speed);
     w->rt_best = (float *)calloc(n, sizeof *w->rt_best);
     w->rt_stall = (float *)calloc(n, sizeof *w->rt_stall);
+    w->rel_code = (int32_t *)malloc(n * EN_PARTS * sizeof *w->rel_code);
+    w->rel_id = (int64_t *)malloc(n * EN_PARTS * sizeof *w->rel_id);
+    w->want = (EnWant *)malloc(n * sizeof *w->want);
     if (!w->kind || !w->gen || !w->dense_at || !w->dense || !w->pos || !w->vel || !w->facing || !w->age ||
         !w->fslot || !w->islot || !w->part || !w->free_rows || !w->flags || !w->stops || !w->chunks ||
         !w->ev_ints || !w->ev_floats || !w->removed || !w->from || !w->g_ent || !w->g_start || !w->g_bucket ||
         !w->g_byk || !w->rpts || !w->routes || !w->route_free || !w->fx_start || !w->fx_len || !w->rt_route ||
-        !w->rt_next || !w->rt_speed || !w->rt_best || !w->rt_stall) { en_close(w); return NULL; }
+        !w->rt_next || !w->rt_speed || !w->rt_best || !w->rt_stall || !w->rel_code || !w->rel_id || !w->want) {
+        en_close(w); return NULL;
+    }
     w->fx_start[0] = 0; w->fx_len[0] = route_points; w->nfx = 1;
     for (int r = 0; r < capacity; r++) {
         w->kind[r] = -1; w->gen[r] = 1; w->rt_route[r] = -1;
@@ -254,7 +288,7 @@ static inline EnWorld *en_open(int capacity, int route_points, int bodies, doubl
 }
 
 /* ---- kinds ---- */
-/* ints: mover (0 placed, 1 flying, 2 walking, 3 body), unseen (0 live, 1 freeze, 2 remove), divisor >= 1,
+/* ints: mover (0 placed, 1 flying, 2 walking, 3 body), unseen (0 live, 1 freeze, 2 remove), divisor 1..EN_DIVISOR_MAX,
  * float slots, int slots, gravity 0/1, has figure 0/1, has body 0/1, voices 0..2.
  * floats: hx, hy, hz (half extents, metres, >= 0), step height (>= 0), lifetime (<= 0 none),
  * seen distance (<= 0: the seen cap; at most the seen cap), gravity m/s2. The kind's index, or -1. */
@@ -262,7 +296,7 @@ static inline int en_kind(EnWorld *w, const int32_t ints[9], const float floats[
     if (!ints || !floats) return en_refuse(w, EN_R_VALUE);
     if (ints[EN_K_MOVER] < 0 || ints[EN_K_MOVER] > 3) return en_refuse(w, EN_R_MOVER);
     if (ints[EN_K_UNSEEN] < 0 || ints[EN_K_UNSEEN] > 2) return en_refuse(w, EN_R_UNSEEN);
-    if (ints[EN_K_DIVISOR] < 1) return en_refuse(w, EN_R_DIVISOR);
+    if (ints[EN_K_DIVISOR] < 1 || ints[EN_K_DIVISOR] > EN_DIVISOR_MAX) return en_refuse(w, EN_R_DIVISOR);
     if (ints[EN_K_FSLOTS] < 0 || ints[EN_K_FSLOTS] > EN_SLOTS || ints[EN_K_ISLOTS] < 0 || ints[EN_K_ISLOTS] > EN_SLOTS)
         return en_refuse(w, EN_R_SLOTS);
     if ((ints[EN_K_GRAVITY] | 1) != 1) return en_refuse(w, EN_R_VALUE);
@@ -328,10 +362,23 @@ static inline void en_event(EnWorld *w, int code, int64_t a, int64_t b, int64_t 
                             double x, double y, double z);
 static inline void en_unfollow(EnWorld *w, int r);
 
+/* Row r's parts are cleared: each it held (part 0 figure, 1 body, 2 and 3 voices) goes on the release list as (part,
+ * id), for the game to free (en_releases); past capacity x EN_PARTS pairs waiting, the rest are dropped and counted
+ * in en_stat(5). Called when an entity is removed (any reason) and when it becomes unseen (strata_ent_seen.h). */
+static inline void en_release_parts(EnWorld *w, int r) {
+    int64_t *pt = w->part + (size_t)r * EN_PARTS;
+    for (int p = 0; p < EN_PARTS; p++) {
+        if (pt[p] < 0) continue;
+        if (w->nrel >= w->capacity * EN_PARTS) w->dropped += 1;
+        else { w->rel_code[w->nrel] = p; w->rel_id[w->nrel] = pt[p]; w->nrel++; }
+        pt[p] = -1;
+    }
+}
+
 /* reason: 0 the game, 1 lifetime, 2 the unseen rule. Each removal is reported as event 6 (i0 the reason, the
  * point its last position): one made inside en_tick in that tick's events; one made between ticks is queued
  * (the id and position copied, so the row can be reused at once) and written first by the next en_tick.
- * A follower stops following its route (strata_ent_move.h). */
+ * A follower stops following its route (strata_ent_move.h). Its parts are released (en_release_parts). */
 static inline void en_remove(EnWorld *w, int64_t id, int reason) {
     int r = en_row(w, id);
     if (r < 0) { en_refuse(w, EN_R_ENTITY); return; }
@@ -344,6 +391,7 @@ static inline void en_remove(EnWorld *w, int64_t id, int reason) {
         q->id = id; q->reason = reason; q->pos[0] = p[0]; q->pos[1] = p[1]; q->pos[2] = p[2];
     }
     en_unfollow(w, r);
+    en_release_parts(w, r);
     EnKind *k = &w->kinds[w->kind[r]];
     int32_t *dense = w->dense + (size_t)w->kind[r] * w->capacity;
     int last = dense[--k->live];   /* the kind's last entry fills the hole */
@@ -443,6 +491,25 @@ static inline void en_set_part(EnWorld *w, int64_t id, int part, int64_t v) {
     w->part[(size_t)r * EN_PARTS + part] = v;
 }
 
+/* Drains the release list: copies at most max (part, id) pairs, oldest first, into codes and ids and takes them off
+ * the list; how many copied. With codes or ids NULL, copies nothing and answers how many wait. */
+static inline int en_releases(EnWorld *w, int max, int32_t *codes, int64_t *ids) {
+    if (!codes || !ids) return w->nrel;
+    int n = max < w->nrel ? (max < 0 ? 0 : max) : w->nrel;
+    memcpy(codes, w->rel_code, (size_t)n * sizeof *codes);
+    memcpy(ids, w->rel_id, (size_t)n * sizeof *ids);
+    memmove(w->rel_code, w->rel_code + n, (size_t)(w->nrel - n) * sizeof *w->rel_code);
+    memmove(w->rel_id, w->rel_id + n, (size_t)(w->nrel - n) * sizeof *w->rel_id);
+    w->nrel -= n;
+    return n;
+}
+
+/* the game could not make a figure for an entity of kind: counted for the kind in en_stat(10 + kind) */
+static inline void en_figure_refused(EnWorld *w, int kind) {
+    if (kind < 0 || kind >= w->nkinds) { en_refuse(w, EN_R_KIND); return; }
+    w->fig_refused[kind] += 1;
+}
+
 /* ---- each and columns ---- */
 /* the live ids of a kind in dense order, at most max; how many written */
 static inline int en_each(const EnWorld *w, int kind, int max, int64_t *ids) {
@@ -511,9 +578,13 @@ static inline uint64_t en_fnv(uint64_t h, const void *data, size_t len) {
     return h;
 }
 
-/* FNV-1a over each live row, kind by kind in en_each order: id, kind, position, velocity, facing, age,
- * the kind's slots, the parts, whether a block has stopped it, whether it is grounded, and its route, waypoint,
- * speed, looping and stall; then each held route in id order: id, state, followers and points. */
+/* FNV-1a over what a snapshot holds (strata_ent_snap.h) and the parts: each live row, kind by kind in en_each order:
+ * id, kind, position, velocity, facing, age, the kind's slots, the parts (part ids: a snapshot holds none, and a
+ * restore needs none held, so a restored world and its original hash alike when neither holds parts), whether a
+ * block has stopped it, whether it is grounded, frozen or waiting for ground, and its route, waypoint, speed,
+ * looping, blocked state and stall; then the free-row stack bottom first, each free row with its generation; then
+ * each held route in id order: id, state, followers and points; then the tick counter. Not covered (as a snapshot
+ * does not hold them): the seen flag, the block table and chunks, touch pairs, events, stats and the grid. */
 static inline uint64_t en_hash(const EnWorld *w) {
     uint64_t h = 1469598103934665603ull;
     for (int k = 0; k < w->nkinds; k++) {
@@ -531,7 +602,7 @@ static inline uint64_t en_hash(const EnWorld *w) {
             h = en_fnv(h, w->fslot + (size_t)r * EN_SLOTS, (size_t)kd->ints[EN_K_FSLOTS] * sizeof *w->fslot);
             h = en_fnv(h, w->islot + (size_t)r * EN_SLOTS, (size_t)kd->ints[EN_K_ISLOTS] * sizeof *w->islot);
             h = en_fnv(h, w->part + (size_t)r * EN_PARTS, EN_PARTS * sizeof *w->part);
-            uint8_t kept = w->flags[r] & (EN_F_STUCK | EN_F_GROUNDED | EN_F_LOOPS | EN_F_BLOCKED);
+            uint8_t kept = w->flags[r] & (EN_F_STUCK | EN_F_GROUNDED | EN_F_LOOPS | EN_F_BLOCKED | EN_F_WAITING | EN_F_FROZEN);
             h = en_fnv(h, &kept, 1);
             h = en_fnv(h, w->rt_route + r, sizeof *w->rt_route);
             if (w->rt_route[r] >= 0) {
@@ -542,6 +613,11 @@ static inline uint64_t en_hash(const EnWorld *w) {
             }
         }
     }
+    for (int i = 0; i < w->nfree; i++) {
+        int r = w->free_rows[i];
+        h = en_fnv(h, &r, sizeof r);
+        h = en_fnv(h, w->gen + r, sizeof *w->gen);
+    }
     for (int i = 0; i < w->routes_hw; i++) {
         const EnRoute *rt = &w->routes[i];
         if (rt->state == 0) continue;
@@ -550,14 +626,17 @@ static inline uint64_t en_hash(const EnWorld *w) {
         h = en_fnv(h, &rt->users, sizeof rt->users);
         h = en_fnv(h, w->rpts + (size_t)rt->start * 3, (size_t)rt->n * 3 * sizeof *w->rpts);
     }
+    h = en_fnv(h, &w->tick_count, sizeof w->tick_count);
     return h;
 }
 
 /* 0 live, 1 seen at the end of the last tick, 2 walkers waiting there to be set on the ground (strata_ent_seen.h),
  * 3 refused calls, 4 ticks given a dt negative or not finite, 5 events dropped (past EN_EVENTS in a tick, or removals
  * queued between ticks), 6 last refusal reason (EN_R_*), 7 entities over the body budget, 8 route points held, 9 routes
- * held (a freed route still followed is held). Bodies come in a later task; until then 7 reads 0. */
+ * held (a freed route still followed is held), 10 + k figures the game could not make for kind k (en_figure_refused).
+ * Releases dropped (en_release_parts) are counted in 5 too. 7 is what the game last said (en_body_over). */
 static inline double en_stat(const EnWorld *w, int which) {
+    if (which >= 10 && which < 10 + EN_KINDS) return w->fig_refused[which - 10];
     switch (which) {
     case 0: return w->live;
     case 1: return w->seen;
@@ -566,6 +645,7 @@ static inline double en_stat(const EnWorld *w, int which) {
     case 4: return w->bad_dt;
     case 5: return w->dropped;
     case 6: return w->reason;
+    case 7: return w->body_over;
     case 8: return w->route_pts_held;
     case 9: return w->routes_held;
     default: return 0;
@@ -804,6 +884,12 @@ static inline void en_fly(EnWorld *w, int r, const EnKind *kd, double dt) {
 static inline void en_tick(EnWorld *w, int nfocus, const double *focus, double dt) {
     if (!isfinite(dt) || dt < 0) { w->bad_dt += 1; dt = 0; }
     if (nfocus < 0 || !focus) nfocus = 0;
+    if (nfocus > w->focus_cap) {   /* kept for en_wanting; on no memory, the first focus_cap are kept */
+        double *f = (double *)realloc(w->focus, (size_t)nfocus * 3 * sizeof *f);
+        if (f) { w->focus = f; w->focus_cap = nfocus; }
+    }
+    w->nfocus = nfocus < w->focus_cap ? nfocus : w->focus_cap;
+    if (w->nfocus > 0) memcpy(w->focus, focus, (size_t)w->nfocus * 3 * sizeof *focus);
     w->nev = 0;
     for (int i = 0; i < w->nremoved; i++) {
         const EnRemoval *q = &w->removed[i];
@@ -858,5 +944,128 @@ static inline void en_tick(EnWorld *w, int nfocus, const double *focus, double d
     en_touches(w);
     w->in_tick = 0;
 }
+
+/* ---- parts of seen entities ---- */
+/* What a game hangs on an entity (a figure, a body, voices) is its own; the kernel keeps the ids (en_set_part), says
+ * which seen entities want one and which hold one, and releases them when the entity is removed or leaves view. */
+
+/* 1 if kind k's entities may hold part (0 figure, 1 body, 2 voice 0, 3 voice 1) */
+static inline int en_kind_has_part(const EnKind *kd, int part) {
+    if (part == 0) return kd->ints[EN_K_FIGURE];
+    if (part == 1) return kd->ints[EN_K_BODY];
+    return part >= 2 && part < EN_PARTS && part - 2 < kd->ints[EN_K_VOICES];
+}
+
+/* The seen entities holding part, kind by kind in dense order: their part ids (as int32) into part_ids and their poses
+ * into poses, 7 floats each: the position, then the facing as a turn about +y (0, sin a/2, 0, cos a/2). Writes at most
+ * max and answers how many it wrote; with part_ids or poses NULL, answers how many there are. */
+static inline int en_seen_parts(const EnWorld *w, int part, int max, int32_t *part_ids, float *poses) {
+    if (part < 0 || part >= EN_PARTS) return 0;
+    int counting = !part_ids || !poses, n = 0;
+    for (int k = 0; k < w->nkinds; k++) {
+        const EnKind *kd = &w->kinds[k];
+        if (!en_kind_has_part(kd, part)) continue;
+        const int32_t *dense = w->dense + (size_t)k * w->capacity;
+        for (int i = 0; i < kd->live; i++) {
+            int r = dense[i];
+            int64_t v = w->part[(size_t)r * EN_PARTS + part];
+            if (!(w->flags[r] & EN_F_SEEN) || v < 0) continue;
+            if (!counting) {
+                if (n >= max) return n;
+                const double *p = w->pos + r * 3;
+                double h = (double)w->facing[r] * 0.5;
+                float *o = poses + (size_t)n * 7;
+                part_ids[n] = (int32_t)v;
+                o[0] = (float)p[0]; o[1] = (float)p[1]; o[2] = (float)p[2];
+                o[3] = 0; o[4] = (float)sin(h); o[5] = 0; o[6] = (float)cos(h);
+            }
+            n++;
+        }
+    }
+    return n;
+}
+
+static inline int en_want_order(const void *a, const void *b) {
+    const EnWant *x = (const EnWant *)a, *y = (const EnWant *)b;
+    if (x->d2 != y->d2) return x->d2 < y->d2 ? -1 : 1;
+    return x->id < y->id ? -1 : x->id > y->id;
+}
+
+/* The seen entities whose kind has part but that hold none, nearest a focus of the last tick first (measured
+ * horizontally, to the nearest focus), equal distances by id: their ids into ids, at most max; how many written. With ids
+ * NULL, answers how many there are. An entity whose body was lost (en_body_lost) does not want another while seen. */
+static inline int en_wanting(EnWorld *w, int part, int max, int64_t *ids) {
+    if (part < 0 || part >= EN_PARTS) return 0;
+    int n = 0;
+    for (int k = 0; k < w->nkinds; k++) {
+        const EnKind *kd = &w->kinds[k];
+        if (!en_kind_has_part(kd, part)) continue;
+        const int32_t *dense = w->dense + (size_t)k * w->capacity;
+        for (int i = 0; i < kd->live; i++) {
+            int r = dense[i];
+            if (!(w->flags[r] & EN_F_SEEN) || w->part[(size_t)r * EN_PARTS + part] >= 0) continue;
+            if (part == 1 && (w->flags[r] & EN_F_LOST)) continue;   /* its body was lost: none again until it leaves view */
+            if (ids) {
+                const double *p = w->pos + r * 3;
+                double best = INFINITY;
+                for (int f = 0; f < w->nfocus; f++) {
+                    double dx = p[0] - w->focus[f * 3], dz = p[2] - w->focus[f * 3 + 2], d2 = dx * dx + dz * dz;
+                    if (d2 < best) best = d2;
+                }
+                w->want[n].d2 = best; w->want[n].id = en_id(w, r);
+            }
+            n++;
+        }
+    }
+    if (!ids) return n;
+    qsort(w->want, (size_t)n, sizeof *w->want, en_want_order);
+    int m = max < n ? (max < 0 ? 0 : max) : n;
+    for (int i = 0; i < m; i++) ids[i] = w->want[i].id;
+    return m;
+}
+
+/* The seen entities holding part, kind by kind in dense order: their entity ids into ids, at most max; how many
+ * written. With ids NULL, answers how many there are. */
+static inline int en_holding(const EnWorld *w, int part, int max, int64_t *ids) {
+    if (part < 0 || part >= EN_PARTS) return 0;
+    int n = 0;
+    for (int k = 0; k < w->nkinds; k++) {
+        const EnKind *kd = &w->kinds[k];
+        if (!en_kind_has_part(kd, part)) continue;
+        const int32_t *dense = w->dense + (size_t)k * w->capacity;
+        for (int i = 0; i < kd->live; i++) {
+            int r = dense[i];
+            if (!(w->flags[r] & EN_F_SEEN) || w->part[(size_t)r * EN_PARTS + part] < 0) continue;
+            if (ids) { if (n >= max) return n; ids[n] = en_id(w, r); }
+            n++;
+        }
+    }
+    return n;
+}
+
+/* The game found entity id's body gone (Strata.Physics.exists false: removed, or written into the world as blocks):
+ * the body part is cleared without going on the release list (there is nothing left to free) and event 7 is appended
+ * to the last tick's events (a the id, i0 the body's id, the point its position). While it stays seen it wants no
+ * other body (en_wanting skips it); leaving view clears that. Refused for a dead id (EN_R_ENTITY) or one holding no
+ * body (EN_R_PART). */
+static inline void en_body_lost(EnWorld *w, int64_t id) {
+    int r = en_row(w, id);
+    if (r < 0) { en_refuse(w, EN_R_ENTITY); return; }
+    int64_t *b = w->part + (size_t)r * EN_PARTS + 1;
+    if (*b < 0) { en_refuse(w, EN_R_PART); return; }
+    const double *p = w->pos + r * 3;
+    en_event(w, EN_E_BODY_LOST, id, 0, *b, 0, 0, 0, p[0], p[1], p[2]);
+    *b = -1;
+    w->flags[r] |= EN_F_LOST;
+}
+
+/* the game's count of entities wanting a body that its budget left without one this tick: en_stat(7). Refused (EN_R_VALUE)
+ * below 0. */
+static inline void en_body_over(EnWorld *w, int n) {
+    if (n < 0) { en_refuse(w, EN_R_VALUE); return; }
+    w->body_over = n;
+}
+
+#include "strata_ent_snap.h"
 
 #endif
