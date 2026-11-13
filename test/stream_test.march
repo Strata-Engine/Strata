@@ -443,4 +443,105 @@ mod Strata.Test.Stream do
       end
     end
   end
+  -- ── Batches: the keys of a chunk column in one task ──────────────────────
+  -- a generator whose column function is honest: the chunks `run` gives
+  pfn honest() : Strata.Terrain.Gen do
+    Strata.Terrain.with_column(layered(), Strata.Terrain.Column(fn (ks, seed) -> List.map(ks, fn k -> Strata.Terrain.run(layered(), k, seed))))
+  end
+  -- one that tells how it was called (not honest: a probe): every chunk of a call is uniform, id 100 + the keys in the call
+  pfn probe() : Strata.Terrain.Gen do
+    Strata.Terrain.with_column(terrain(), Strata.Terrain.Column(fn (ks, seed) -> List.map(ks, fn k -> C.uniform(100 + List.length(ks)))))
+  end
+  pfn begin_with(g : Strata.Terrain.Gen, cap : Int) : Strata.Stream.Stream do
+    Sm.start(Wd.new(reg(), g, 7, 1.0), Sm.with_batch(Sm.config_levels(2, 1, 8, 4, 2, 1, 2), cap))
+  end
+  -- (the lowest uniform id, the highest, how many chunks) over the loaded level-0 chunks
+  pfn id_span(s : Strata.Stream.Stream) : (Int, Int, Int) do
+    Strata.Store.fold(Wd.chunks(Sm.world(s)), (1000000, 0, 0), fn (acc, _k, c) ->
+      match acc do (lo, hi, n) ->
+        let id = C.uniform_id(c)
+        (if id < lo do id else lo end, if id > hi do id else hi end, n + 1)
+      end)
+  end
+  -- the walk the batch runs take, ending in a hash
+  pfn batch_walk(g : Strata.Terrain.Gen, cap : Int) : Int do
+    let a = at(at(at(begin_with(g, cap), 0.5, 0.5, 0.5), 3200.5, 0.5, 0.5), 300.5, 40.5, -200.5)
+    let h = Sm.world_hash(a)
+    Sm.stop(a)
+    h
+  end
+  pfn two_focus(g : Strata.Terrain.Gen, cap : Int) : Int do
+    let a = Sm.run_until_settled(Sm.set_focus(begin_with(g, cap), Cons((0.5, 0.5, 0.5), Cons((400.5, 0.5, 0.5), Nil))), 20000)
+    let h = Sm.world_hash(a)
+    Sm.stop(a)
+    h
+  end
+
+  describe "Stream batches" do
+    test "the default is one key a task, and with_batch clamps below 1" do
+      Test.assert_eq_int(Sm.batch(Sm.config(2, 1, 8, 4)), 1, "one key a task")
+      Test.assert_eq_int(Sm.batch(Sm.with_batch(Sm.config(2, 1, 8, 4), 0)), 1, "below 1 is 1")
+      Test.assert_eq_int(Sm.batch(Sm.with_batch(Sm.config(2, 1, 8, 4), 4)), 4, "as asked")
+    end
+    test "at cap 1 the column function is given single keys; at cap 4 whole columns go in one call" do
+      let one = at(Sm.start(Wd.new(reg(), probe(), 7, 1.0), Sm.with_batch(Sm.config(2, 3, 8, 8), 1)), 0.5, 0.5, 0.5)
+      let four = at(Sm.start(Wd.new(reg(), probe(), 7, 1.0), Sm.with_batch(Sm.config(2, 3, 8, 8), 4)), 0.5, 0.5, 0.5)
+      match id_span(one) do
+        (lo, hi, n) ->
+          Test.assert_eq_int(lo, 101, "cap 1: every call held one key")
+          Test.assert_eq_int(hi, 101, "none more")
+          match id_span(four) do
+            (lo4, hi4, n4) ->
+              Test.assert_eq_int(n4, n, "the same chunks are loaded either way")
+              Test.assert_true(lo4 >= 101, "cap 4: every chunk came from the column function")
+              Test.assert_eq_int(hi4, 104, "and some calls held four keys of a column, never more")
+          end
+      end
+      Sm.stop(one)
+      Sm.stop(four)
+    end
+    test "the world is the same at caps 1, 4 and 8, with one focus and with two" do
+      let h1 = batch_walk(honest(), 1)
+      Test.assert_eq_int(batch_walk(honest(), 4), h1, "cap 4 as cap 1")
+      Test.assert_eq_int(batch_walk(honest(), 8), h1, "cap 8 as cap 1")
+      Test.assert_eq_int(batch_walk(layered(), 4), h1, "and as a generator with no column function")
+      let t1 = two_focus(honest(), 1)
+      Test.assert_eq_int(two_focus(honest(), 4), t1, "two focus points, cap 4")
+      Test.assert_eq_int(two_focus(honest(), 8), t1, "two focus points, cap 8")
+    end
+    test "at cap 4 an edit's stale ancestors still regenerate with the edit coarsened in" do
+      let s = at(begin_with(honest(), 4), 0.5, 0.5, 0.5)
+      let s1 = Sm.run_until_settled(Sm.tick(Sm.apply(s, Ed.fill_box(Sm.world(s), 4, -6, 4, 5, -5, 5, 0))), 20000)
+      let c1 = Strata.Store.get(Wd.chunks(Sm.world(s1)), Cd.key_at(0, -1, 0, 1))
+      Test.assert_eq_int(C.get(c1, 2, 29, 2), 0, "the carve is one air voxel at level 1")
+      Test.assert_eq_int(C.get(c1, 3, 29, 2), 1, "its neighbour is stone")
+      let r = at(begin_with(honest(), 1), 0.5, 0.5, 0.5)
+      let r1 = Sm.run_until_settled(Sm.tick(Sm.apply(r, Ed.fill_box(Sm.world(r), 4, -6, 4, 5, -5, 5, 0))), 20000)
+      Test.assert_eq_int(Sm.world_hash(s1), Sm.world_hash(r1), "the same world as at cap 1")
+      Sm.stop(s1)
+      Sm.stop(r1)
+    end
+    test "a focus moved away while batches run: none of their chunks stays, and the world is as going straight there" do
+      let s = Sm.tick(Sm.set_focus(begin_with(honest(), 4), Cons((0.5, 0.5, 0.5), Nil)))
+      match Sm.pending(s) do
+        (_, gens, _, _) -> Test.assert_true(gens > 0, "batches are running")
+      end
+      let far = at(s, 3200.5, 0.5, 0.5)
+      let straight = at(begin_with(honest(), 4), 3200.5, 0.5, 0.5)
+      Test.assert_false(Wd.is_loaded(Sm.world(far), Cd.key(0, 0, 0)), "nothing of the first place is loaded")
+      Test.assert_eq_int(Sm.loaded_count(far), Sm.loaded_count(straight), "the same chunks")
+      Test.assert_eq_int(Sm.world_hash(far), Sm.world_hash(straight), "the same world")
+      Test.assert_true(Sm.settled(far), "and nothing is left waiting")
+      Sm.stop(far)
+      Sm.stop(straight)
+    end
+    test "regenerate while batches run drops them: every chunk is the new generator's" do
+      let s = Sm.tick(Sm.set_focus(begin_with(honest(), 4), Cons((0.5, 0.5, 0.5), Nil)))
+      let s1 = Sm.run_until_settled(Sm.regenerate(s, probe()), 20000)
+      match id_span(s1) do
+        (lo, _, _) -> Test.assert_true(lo >= 101, "no chunk of the old generator is left")
+      end
+      Sm.stop(s1)
+    end
+  end
 end
