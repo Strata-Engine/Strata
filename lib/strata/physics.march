@@ -60,12 +60,13 @@ mod Strata.Physics do
   -- inverse inertia in its own frame (row-major); how many steps it has been
   -- still; asleep; asleep because it touches a chunk that is not loaded;
   -- a fragment (written into the world or sprayed once it rests); the
-  -- strength (N s/m2) of its weakest block; metres a voxel of its grid
+  -- strength (N s/m2) of its weakest block; metres a voxel of its grid; how
+  -- much of it was under water at its last step (0 to 1)
   type Rigid = { id : Int, kind : Int, grid : Strata.Body.Grid, surf : NativeIntArr, m : Float, lx : Float, ly : Float, lz : Float,
                 ii : NativeFloatArr, px : Float, py : Float, pz : Float, q : Strata.Math.Quat.Quat,
                 vx : Float, vy : Float, vz : Float, wx : Float, wy : Float, wz : Float, still : Int, asleep : Bool, edge : Bool, waited : Int,
                 hx : Float, hy : Float, hz : Float, ground : Int, ppx : Float, ppy : Float, ppz : Float, pq : Strata.Math.Quat.Quat,
-                frag : Bool, weak : Float, vs : Float }
+                frag : Bool, weak : Float, vs : Float, wet : Float }
 
   -- kind (0 impact, 1 break, 2 loose, 3 splash, 4 deferred, 5 spray, 6 cut), body, other (-1 the world), where, size
   type PhysEvent = PhEvent(Int, Int, Int, Float, Float, Float, Float)
@@ -170,7 +171,7 @@ mod Strata.Physics do
                          ii: inverse_sym(a, b, c, d, e, f), px: x +. ox, py: y +. oy, pz: z +. oz, q: qn,
                          vx: 0.0, vy: 0.0, vz: 0.0, wx: 0.0, wy: 0.0, wz: 0.0, still: 0, asleep: kind == pinned(), edge: false, waited: 0,
                          hx: 0.0, hy: 0.0, hz: 0.0, ground: -1, ppx: x +. ox, ppy: y +. oy, ppz: z +. oz, pq: qn,
-                         frag: false, weak: weakest(p.reg, g), vs: vs }
+                         frag: false, weak: weakest(p.reg, g), vs: vs, wet: 0.0 }
             let p2 = { p with bodies: List.append(p.bodies, Cons(body, Nil)), next: p.next + 1, unmeshed: List.append(p.unmeshed, Cons(p.next, Nil)) }
             with_id(p2, p.next)
         end
@@ -748,11 +749,118 @@ mod Strata.Physics do
     end
   end
 
+  -- ── Water ────────────────────────────────────────────────────────────────
+  -- A body under water is slowed: its velocity and spin lose a share
+  -- water_drag() x wet x dt a second (taken implicitly, so it never turns
+  -- them round). Nothing lifts it: no buoyancy.
+  pfn water_drag() : Float do 4.0 end
+  pfn drag(st : NativeFloatArr, wets : NativeFloatArr, k : Int, n : Int, dt : Float) : NativeFloatArr do
+    if k >= n do st
+    else
+      let s = pget(wets, k)
+      if s <= 0.0 do drag(st, wets, k + 1, n, dt)
+      else
+        let f = 1.0 /. (1.0 +. water_drag() *. s *. dt)
+        let o = k * 32
+        let s1 = pset(pset(pset(st, o + 7, pget(st, o + 7) *. f), o + 8, pget(st, o + 8) *. f), o + 9, pget(st, o + 9) *. f)
+        drag(pset(pset(pset(s1, o + 10, pget(s1, o + 10) *. f), o + 11, pget(s1, o + 11) *. f), o + 12, pget(s1, o + 12) *. f), wets, k + 1, n, dt)
+      end
+    end
+  end
+  -- How much of body b is under water, 0 to 1: over the layers of world cells
+  -- that hold one of its voxels' centres, the mean share of eighths in the
+  -- free cells of that layer of its box grown one cell sideways, its own
+  -- cells left out (they are empty once the fluid has its marks).
+  pfn wet_of(r : Strata.Blocks.Registry, w : Strata.World.World, t : NativeU8Arr, b : Rigid, scale : Float) : Float do
+    match grid_bounds(b, scale) do
+      (x0, y0, z0, x1, y1, z1) ->
+        if !any_fluid(r, w, x0 - 1, y0, z0 - 1, x1 - x0 + 3, y1 - y0 + 1, z1 - z0 + 3, 0) do 0.0
+        else
+          match wet_layers(r, w, t, b, scale, x0 - 1, z0 - 1, x1 - x0 + 3, z1 - z0 + 3, y0, y1, 0.0, 0) do
+            (sum, layers) -> if layers == 0 do 0.0 else sum /. int_to_float(layers) end
+          end
+        end
+    end
+  end
+  pfn any_fluid(r : Strata.Blocks.Registry, w : Strata.World.World, x0 : Int, y0 : Int, z0 : Int, nx : Int, ny : Int, nz : Int, i : Int) : Bool do
+    if i >= nx * ny * nz do false
+    else if Strata.Blocks.is_fluid(r, Strata.World.get_block(w, x0 + i % nx, y0 + (i / nx) % ny, z0 + i / (nx * ny))) do true
+    else any_fluid(r, w, x0, y0, z0, nx, ny, nz, i + 1) end end
+  end
+  pfn wet_layers(r : Strata.Blocks.Registry, w : Strata.World.World, t : NativeU8Arr, b : Rigid, scale : Float, x0 : Int, z0 : Int, nx : Int, nz : Int, y : Int, y1 : Int, sum : Float, layers : Int) : (Float, Int) do
+    if y > y1 do (sum, layers)
+    else
+      match wet_layer(r, w, t, b, scale, x0, y, z0, nx, nz, 0, 0, 0, 0) do
+        (mine, eighths, free) ->
+          if mine == 0 do wet_layers(r, w, t, b, scale, x0, z0, nx, nz, y + 1, y1, sum, layers)
+          else wet_layers(r, w, t, b, scale, x0, z0, nx, nz, y + 1, y1, sum +. (if free == 0 do 0.0 else int_to_float(eighths) /. int_to_float(8 * free) end), layers + 1) end
+      end
+    end
+  end
+  -- one layer: the body's cells, the eighths and the free cells about them
+  pfn wet_layer(r : Strata.Blocks.Registry, w : Strata.World.World, t : NativeU8Arr, b : Rigid, scale : Float, x0 : Int, y : Int, z0 : Int, nx : Int, nz : Int, i : Int, mine : Int, eighths : Int, free : Int) : (Int, Int, Int) do
+    if i >= nx * nz do (mine, eighths, free)
+    else
+      let x = x0 + i % nx
+      let z = z0 + i / nx
+      if in_grid(t, b, scale, (int_to_float(x) +. 0.5) *. scale, (int_to_float(y) +. 0.5) *. scale, (int_to_float(z) +. 0.5) *. scale) do wet_layer(r, w, t, b, scale, x0, y, z0, nx, nz, i + 1, mine + 1, eighths, free)
+      else
+        let id = Strata.World.get_block(w, x, y, z)
+        if id == 0 do wet_layer(r, w, t, b, scale, x0, y, z0, nx, nz, i + 1, mine, eighths, free + 1)
+        else if Strata.Blocks.is_fluid(r, id) do wet_layer(r, w, t, b, scale, x0, y, z0, nx, nz, i + 1, mine, eighths + Strata.Blocks.fill(r, id), free + 1)
+        else wet_layer(r, w, t, b, scale, x0, y, z0, nx, nz, i + 1, mine, eighths, free) end end
+      end
+    end
+  end
+  pfn wets_of(r : Strata.Blocks.Registry, w : Strata.World.World, t : NativeU8Arr, bs : List(Rigid), scale : Float, out : NativeFloatArr, k : Int) : NativeFloatArr do
+    match bs do
+      Nil -> out
+      Cons(b, rest) -> wets_of(r, w, t, rest, scale, pset(out, k, wet_of(r, w, t, b, scale)), k + 1)
+    end
+  end
+  -- a splash (kind 3, its speed in m/s) for each body dry at its last step and wet at this one
+  pfn splashes(bs : List(Rigid), wets : NativeFloatArr, k : Int, acc : List(PhysEvent)) : List(PhysEvent) do
+    match bs do
+      Nil -> reverse(acc)
+      Cons(b, rest) ->
+        if b.wet <= 0.0 && pget(wets, k) > 0.0 do splashes(rest, wets, k + 1, Cons(PhEvent(3, b.id, -1, b.px, b.py, b.pz, Math.sqrt(b.vx *. b.vx +. b.vy *. b.vy +. b.vz *. b.vz)), acc))
+        else splashes(rest, wets, k + 1, acc) end
+    end
+  end
+  pfn wet_all(bs : List(Rigid), wets : NativeFloatArr, k : Int, acc : List(Rigid)) : List(Rigid) do
+    match bs do
+      Nil -> reverse(acc)
+      Cons(b, rest) -> wet_all(rest, wets, k + 1, Cons({ b with wet: pget(wets, k) }, acc))
+    end
+  end
+
+  doc "The cells bodies fill, for `Strata.Fluid.set_marks`: every world cell whose centre lies inside a colliding voxel of a grid body (dynamic or pinned, fine or not; driven boxes are not marked), at the bodies' latest poses."
+  fn marks(p : Physics) : Strata.Store.Store(NativeU8Arr) do
+    let scale = c_scale(p.cfg)
+    let t = Ct.collide_table(p.reg)
+    List.fold_left(p.bodies, Strata.Fluid.mark_cells(Nil), fn (m, b) -> if b.kind == driven() do m else mark_body(m, t, b, scale) end)
+  end
+  pfn mark_body(m : Strata.Store.Store(NativeU8Arr), t : NativeU8Arr, b : Rigid, scale : Float) : Strata.Store.Store(NativeU8Arr) do
+    match grid_bounds(b, scale) do
+      (x0, y0, z0, x1, y1, z1) -> mark_go(m, t, b, scale, x0, y0, z0, x1 - x0 + 1, y1 - y0 + 1, z1 - z0 + 1, 0)
+    end
+  end
+  pfn mark_go(m : Strata.Store.Store(NativeU8Arr), t : NativeU8Arr, b : Rigid, scale : Float, x0 : Int, y0 : Int, z0 : Int, nx : Int, ny : Int, nz : Int, i : Int) : Strata.Store.Store(NativeU8Arr) do
+    if i >= nx * ny * nz do m
+    else
+      let x = x0 + i % nx
+      let y = y0 + (i / nx) % ny
+      let z = z0 + i / (nx * ny)
+      let m2 = if in_grid(t, b, scale, (int_to_float(x) +. 0.5) *. scale, (int_to_float(y) +. 0.5) *. scale, (int_to_float(z) +. 0.5) *. scale) do Strata.Fluid.mark(m, x, y, z) else m end
+      mark_go(m2, t, b, scale, x0, y0, z0, nx, ny, nz, i + 1)
+    end
+  end
+
   pfn sub_go(st : NativeFloatArr, mv : List(Rigid), wins : List(Strata.Contact.Win3), prs : List((Part, Part)), n : Int, total : Int, ids : NativeIntArr, cap : Int,
-             scale : Float, dt : Float, g : Float, iters : Int, i : Int, evs : List(PhysEvent), push : NativeFloatArr, tch : List(Touch), hits : NativeFloatArr) : (NativeFloatArr, List(PhysEvent), NativeFloatArr, List(Touch), NativeFloatArr) do
+             scale : Float, dt : Float, g : Float, iters : Int, i : Int, evs : List(PhysEvent), push : NativeFloatArr, tch : List(Touch), hits : NativeFloatArr, wets : NativeFloatArr) : (NativeFloatArr, List(PhysEvent), NativeFloatArr, List(Touch), NativeFloatArr) do
     if i <= 0 do (st, evs, push, tch, hits)
     else
-      let s1 = fall(st, 0, n, g *. dt)
+      let s1 = drag(fall(st, 0, n, g *. dt), wets, 0, n, dt)
       match gen_all(NativeArray.make_float(Strata.Size.of(cap * 28 + 1), 0.0), 0, s1, mv, wins, 0, scale, dt) do
         (cs0, nw) ->
           match gen_pairs(cs0, nw, s1, prs, scale, dt) do
@@ -763,7 +871,7 @@ mod Strata.Physics do
                   let ps = Ct.push_out(cs3, nc, s2, total, iters)
                   let s3 = integrate(s2, ps, mv, 0, dt)
                   let tl = tally_of(cs3, nc, n)
-                  sub_go(s3, mv, wins, prs, n, total, ids, cap, scale, dt, g, iters, i - 1, List.append(evs, impacts_go(tl, n, ids, s2, n - 1, Nil)), took(cs3, nc, push, 0), driven_touches(cs3, nc, ids, prs, s2), hits_go(hits, tl, n, scale, 0))
+                  sub_go(s3, mv, wins, prs, n, total, ids, cap, scale, dt, g, iters, i - 1, List.append(evs, impacts_go(tl, n, ids, s2, n - 1, Nil)), took(cs3, nc, push, 0), driven_touches(cs3, nc, ids, prs, s2), hits_go(hits, tl, n, scale, 0), wets)
               end
           end
       end
@@ -1443,9 +1551,11 @@ mod Strata.Physics do
       let st0 = load_others(load_all(NativeArray.make_float(Strata.Size.of(total * 32 + 1), 0.0), mv, 0, false), statics, n, dt0)
       let wins = List.map(boxes, fn bx -> window_at(w, t, bx))
       let cap = corner_total(mv, 0) + pair_total(prs, 0)
-      match sub_go(st0, mv, wins, prs, n, total, ids, cap, scale, dt, g, c_iters(p.cfg), nsub, Nil, NativeArray.make_float(Strata.Size.of(total + 1), 0.0), Nil, NativeArray.make_float(Strata.Size.of(n * 9 + 1), 0.0)) do
-        (st, evs, push, tch, hits) ->
-          let moved = List.map(read_all(st, mv, 0, Nil), fn b -> settle({ b with waited: 0 }))
+      let wets = wets_of(p.reg, w, t, mv, scale, NativeArray.make_float(Strata.Size.of(n + 1), 0.0), 0)
+      match sub_go(st0, mv, wins, prs, n, total, ids, cap, scale, dt, g, c_iters(p.cfg), nsub, Nil, NativeArray.make_float(Strata.Size.of(total + 1), 0.0), Nil, NativeArray.make_float(Strata.Size.of(n * 9 + 1), 0.0), wets) do
+        (st, evs0, push, tch, hits) ->
+          let evs = List.append(evs0, splashes(mv, wets, 0, Nil))
+          let moved = List.map(wet_all(read_all(st, mv, 0, Nil), wets, 0, Nil), fn b -> settle({ b with waited: 0 }))
           -- a wall that took more than half a metre a second's worth of its own momentum wakes
           let woke = woken_statics(statics, push, n, Nil)
           let changed = by_id(List.append(moved, woke))
@@ -1477,7 +1587,7 @@ mod Strata.Physics do
       Cons(b, _) -> b
       Nil -> { id: 0, kind: 0, grid: Bg.grid(1, 1, 1), surf: NativeArray.make_int(0, 0), m: 0.0, lx: 0.0, ly: 0.0, lz: 0.0, ii: NativeArray.make_float(9, 0.0),
                px: 0.0, py: 0.0, pz: 0.0, q: Qt.identity(), vx: 0.0, vy: 0.0, vz: 0.0, wx: 0.0, wy: 0.0, wz: 0.0, still: 0, asleep: true, edge: false, waited: 0,
-               hx: 0.0, hy: 0.0, hz: 0.0, ground: -1, ppx: 0.0, ppy: 0.0, ppz: 0.0, pq: Qt.identity(), frag: false, weak: 1000000000000.0, vs: 1.0 }
+               hx: 0.0, hy: 0.0, hz: 0.0, ground: -1, ppx: 0.0, ppy: 0.0, ppz: 0.0, pq: Qt.identity(), frag: false, weak: 1000000000000.0, vs: 1.0, wet: 0.0 }
     end
   end
   -- boxes laid out six ints an item: x0 y0 z0 x1 y1 z1
@@ -1538,7 +1648,7 @@ mod Strata.Physics do
     let body = { id: p.next, kind: driven(), grid: Bg.grid(1, 1, 1), surf: NativeArray.make_int(0, 0), m: 80.0, lx: 0.0, ly: 0.0, lz: 0.0,
                  ii: NativeArray.make_float(9, 0.0), px: x, py: y, pz: z, q: Qt.identity(),
                  vx: 0.0, vy: 0.0, vz: 0.0, wx: 0.0, wy: 0.0, wz: 0.0, still: 0, asleep: false, edge: false, waited: 0,
-                 hx: hx, hy: hy, hz: hz, ground: -1, ppx: x, ppy: y, ppz: z, pq: Qt.identity(), frag: false, weak: 1000000000000.0, vs: 1.0 }
+                 hx: hx, hy: hy, hz: hz, ground: -1, ppx: x, ppy: y, ppz: z, pq: Qt.identity(), frag: false, weak: 1000000000000.0, vs: 1.0, wet: 0.0 }
     let p2 = { p with bodies: List.append(p.bodies, Cons(body, Nil)), next: p.next + 1 }
     with_id(p2, p.next)
   end

@@ -1,6 +1,7 @@
 -- Physics: rigid voxel bodies stepped against the world. Worlds here are
 -- stone below y = 0 and air above, with the chunks x -2..1, y -1..2,
--- z -2..1 loaded (voxels x -64..63, y -32..95, z -64..63). Block 1 stone.
+-- z -2..1 loaded (voxels x -64..63, y -32..95, z -64..63). Block 1 stone;
+-- 5..12 water.
 mod Strata.Test.Physics do
 
   needs IO.Clock      -- charged to every test module once any uses Check.all (GAPS S3)
@@ -22,7 +23,12 @@ mod Strata.Test.Physics do
         Ok((r2, _)) -> r2
         Err(_) -> r
       end
-    add(add(add(add(B.empty(), B.def()), B.with_physics(B.def(), 2000, 2000, 400, 50, false)), B.with_physics(B.def(), 1000, 50000, 400, 50, false)), B.with_physics(B.def(), 2000, 1000000000, 400, 50, false))
+    let r4 = add(add(add(add(B.empty(), B.def()), B.with_physics(B.def(), 2000, 2000, 400, 50, false)), B.with_physics(B.def(), 1000, 50000, 400, 50, false)), B.with_physics(B.def(), 2000, 1000000000, 400, 50, false))
+    -- 5..12 water, one eighth .. full
+    match B.register_fluid(r4, B.with_collide(B.with_layer(B.with_opacity(B.def(), Strata.Blocks.SeeThrough), Strata.Blocks.Translucent), false)) do
+      Ok((r5, _)) -> r5
+      Err(_) -> r4
+    end
   end
   pfn flat() : Strata.Terrain.Gen do
     Strata.Terrain.gen(fn (k, seed) -> if Cd.ky(k) < 0 do C.uniform(1) else C.uniform(0) end)
@@ -1115,6 +1121,124 @@ mod Strata.Test.Physics do
   describe "Physics determinism" do
     test "two runs give equal hashes at every step" do
       Check.all_with(Gen.tuple2(Gen.list(Gen.int(0, 6)), Gen.list(Gen.tuple2(Gen.tuple2(Gen.int(0, 13), Gen.int(0, 13)), Gen.tuple2(Gen.int(0, 3), Gen.int(1, 3))))), fn c -> det_prop(c), { Check.default_config() with num_runs: 8 })
+    end
+  end
+
+  -- ── Water ────────────────────────────────────────────────────────────────
+  pfn water(level : Int) : Int do 4 + level end
+  pfn fluid() : Strata.Fluid.Fluid do Strata.Fluid.new(reg(), Cons((5, Strata.Fluid.flowing()), Nil)) end
+  pfn wet_total(w : Strata.World.World) : Int do Strata.Fluid.amount(w, reg(), -40, -8, -40, 40, 30, 40) end
+  -- a pit dug from the ground, x x0..x1, y -d..-1, z z0..z1; full of water or not
+  pfn pit(x0 : Int, z0 : Int, x1 : Int, z1 : Int, d : Int, full : Bool) : Strata.World.World do
+    Ed.world(Ed.fill_box(world(), x0, 0 - d, z0, x1, -1, z1, if full do water(8) else 0 end))
+  end
+
+  type Wet = Wet(Strata.Physics.Physics, Strata.Fluid.Fluid, Strata.World.World)
+  -- marks set, then one fluid step (water edits do not wake bodies: water does not collide)
+  pfn fluid_step(p : Strata.Physics.Physics, f : Strata.Fluid.Fluid, w : Strata.World.World) : Wet do
+    match Strata.Fluid.set_marks(f, w, Ph.marks(p)) do
+      (f1, o1) ->
+        match Strata.Fluid.step_world(f1, Ed.world(o1), Nil) do
+          (f2, o2) -> Wet(p, f2, Ed.world(o2))
+        end
+    end
+  end
+  -- n physics steps, the fluid stepped every 6; true while the water's amount stays [amt]
+  pfn wet_run(p : Strata.Physics.Physics, f : Strata.Fluid.Fluid, w : Strata.World.World, n : Int, i : Int, amt : Int, ok : Bool) : (Wet, Bool) do
+    if i >= n do (Wet(p, f, w), ok)
+    else
+      match Ph.step_world(p, w, Nil) do
+        (p1, o) ->
+          let w1 = Ed.world(o)
+          if i % 6 == 5 do
+            match fluid_step(p1, f, w1) do
+              Wet(p2, f2, w2) -> wet_run(p2, f2, w2, n, i + 1, amt, ok && wet_total(w2) == amt)
+            end
+          else wet_run(p1, f, w1, n, i + 1, amt, ok) end
+      end
+    end
+  end
+  -- fluid steps alone, the marks set before each
+  pfn fluid_steps(p : Strata.Physics.Physics, f : Strata.Fluid.Fluid, w : Strata.World.World, n : Int) : Wet do
+    if n <= 0 do Wet(p, f, w) else match fluid_step(p, f, w) do Wet(p2, f2, w2) -> fluid_steps(p2, f2, w2, n - 1) end end
+  end
+  pfn wet_world(r : Wet) : Strata.World.World do match r do Wet(_, _, w) -> w end end
+  pfn wet_fluid(r : Wet) : Strata.Fluid.Fluid do match r do Wet(_, f, _) -> f end end
+  pfn wet_phys(r : Wet) : Strata.Physics.Physics do match r do Wet(p, _, _) -> p end end
+  -- the body's falling speed when its centre first gets down to [y], within n steps (-1 if never)
+  pfn speed_at(s : Sim, id : Int, y : Float, n : Int) : Float do
+    if n <= 0 do -1.0
+    else
+      let s2 = run(s, 1)
+      if py(s2, id) <= y do (match Ph.velocity(sp(s2), id) do (_, vy, _) -> absf(vy) end)
+      else speed_at(s2, id, y, n - 1) end
+    end
+  end
+  -- events of kind [k] over n steps
+  pfn count_kind(s : Sim, k : Int, n : Int, acc : Int) : (Sim, Int) do
+    if n <= 0 do (s, acc)
+    else
+      let s2 = run(s, 1)
+      count_kind(s2, k, n - 1, acc + List.length(List.filter(Ph.events(sp(s2)), fn e -> Ph.ev_kind(e) == k)))
+    end
+  end
+  -- a channel along z, one cell wide at x = 0: stone walls x = -1 and 1, y 0..3, z -1..20, closed at both ends
+  pfn channel() : Strata.World.World do
+    let walls = Ed.world(Ed.fill_box(Ed.world(Ed.fill_box(world(), -1, 0, -1, -1, 3, 20, 1)), 1, 0, -1, 1, 3, 20, 1))
+    Ed.world(Ed.fill_box(Ed.world(Ed.fill_box(walls, 0, 0, -1, 0, 3, -1, 1)), 0, 0, 20, 0, 3, 20, 1))
+  end
+
+  describe "Physics in water" do
+    test "a crate dropped into a pool: the water is pushed aside, never lost" do
+      let w0 = pit(-3, -3, 2, 2, 4, true)
+      match add(phys(), block(2, 2, 2), -1.0, 3.0, -1.0, Qt.identity()) do
+        (p, _) ->
+          let amt = wet_total(w0)
+          Test.assert_eq_int(amt, 6 * 4 * 6 * 8, "the pool")
+          match wet_run(p, fluid(), w0, 600, 0, amt, true) do
+            (r, ok) ->
+              Test.assert_true(ok, "the same amount at every fluid step")
+              Test.assert_eq_int(wet_total(wet_world(r)), amt, "and at the end")
+          end
+      end
+    end
+
+    test "a body resting across a stream dams it; taken away, the water passes" do
+      let o = Ed.fill_box(channel(), 0, 0, 0, 0, 2, 3, water(8))
+      let w0 = Ed.world(o)
+      match Ph.add(phys(), block(1, 2, 3), 0.0, 0.0, 8.0, Qt.identity(), Ph.pinned()) do
+        (p, id) ->
+          let up = fn w -> Strata.Fluid.amount(w, reg(), 0, 0, 4, 0, 3, 7)
+          let down = fn w -> Strata.Fluid.amount(w, reg(), 0, 0, 11, 0, 3, 19)
+          let r = fluid_steps(p, Strata.Fluid.wake(fluid(), w0, o), w0, 100)
+          Test.assert_eq_int(down(wet_world(r)), 0, "nothing below the dam")
+          Test.assert_true(up(wet_world(r)) > 0, "the water rose above it")
+          let r2 = fluid_steps(Ph.remove(wet_phys(r), id), wet_fluid(r), wet_world(r), 20)
+          Test.assert_true(down(wet_world(r2)) > 0, "the water passes once it is gone")
+          Test.assert_eq_int(wet_total(wet_world(r2)), 12 * 8, "none lost")
+      end
+    end
+
+    test "a crate dropped into deep water sinks slower than through air, and rests on the bed" do
+      match add(phys(), block(2, 2, 2), -1.0, 2.0, -1.0, Qt.identity()) do
+        (p, id) ->
+          let in_air = speed_at(Sim(p, pit(-4, -4, 3, 3, 4, false)), id, -1.5, 300)
+          let in_water = speed_at(Sim(p, pit(-4, -4, 3, 3, 4, true)), id, -1.5, 300)
+          Test.assert_true(in_air > 0.0 && in_water > 0.0, "both get there")
+          Test.assert_true(in_water < in_air, "slower in water")
+          let s = run(Sim(p, pit(-4, -4, 3, 3, 4, true)), 900)
+          Test.assert_true(near(py(s, id), -3.0, 0.05), "on the bed")
+          Test.assert_true(Ph.is_asleep(sp(s), id), "asleep")
+      end
+    end
+
+    test "a body entering water splashes once" do
+      match add(phys(), block(2, 2, 2), -1.0, 2.0, -1.0, Qt.identity()) do
+        (p, _) ->
+          match count_kind(Sim(p, pit(-4, -4, 3, 3, 4, true)), 3, 600, 0) do
+            (_, n) -> Test.assert_eq_int(n, 1, "one splash")
+          end
+      end
     end
   end
 

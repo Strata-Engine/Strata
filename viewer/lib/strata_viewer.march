@@ -1982,6 +1982,30 @@ mod StrataViewer do
     end
   end
 
+  -- Spray where a body went into water (a physics event of kind 3): more and
+  -- higher the faster it was going.
+  pfn splash_events(es : List(Strata.Physics.PhysEvent), n : Int) : Int do
+    match es do
+      Nil -> n
+      Cons(e, t) ->
+        if Strata.Physics.ev_kind(e) != 3 do splash_events(t, n)
+        else
+          let speed = Strata.Physics.ev_size(e)
+          let count = if speed *. 8.0 > 64.0 do 64 else 8 + float_to_int(speed *. 8.0) end
+          splash_events(t, if Strata.Render.spray(Strata.Physics.ev_x(e), Strata.Physics.ev_y(e) +. 0.3, Strata.Physics.ev_z(e), 0.0, 1.0 +. speed *. 0.5, 0.0, count, 0.5 +. speed *. 0.4, 0.8, 13) do n + count else n end)
+        end
+    end
+  end
+
+  -- The cells bodies fill set as walls in the fluid, the water in them
+  -- pushed aside (an edit, applied to the stream as a fluid step's is).
+  -- Water does not collide, so it wakes no body.
+  pfn with_marks(m : Sim) : Sim do
+    match Strata.Fluid.set_marks(sim_fluid(m), Strata.Stream.world(sim_stream(m)), Strata.Physics.marks(sim_phys(m))) do
+      (f, o) -> Sim(Strata.Stream.apply(sim_stream(m), o), f, sim_phys(m))
+    end
+  end
+
   -- (id, count) of the blocks a list of changes removed, an id once
   pfn tally(cs : List(Strata.Edit.Change), acc : List((Int, Int))) : List((Int, Int)) do
     match cs do
@@ -2604,6 +2628,10 @@ mod StrataViewer do
             end
           let owed = Strata.Physics.due(pa, tphys)
           let (pb, sb) = if owed >= 2 do Strata.Physics.step(pa, sa, focus) else (pa, sa) end
+          -- a splash where a body went into water, for each step that just ended
+          let spray_on = Authority.must(Env.get_int("STRATA_SPRAY", 1)) != 0
+          let _splashed = if spray_on && Option.is_some(pjob) do splash_events(Strata.Physics.events(pa), 0) else 0 end
+          let _splashed2 = if spray_on && owed >= 2 do splash_events(Strata.Physics.events(pb), 0) else 0 end
           let (pc, pjob2) = if owed >= 1 do
               match Strata.Physics.begin(pb, Strata.Stream.world(sb), focus) do (p4, j4) -> (p4, Some(j4)) end
             else (pb, None) end
@@ -2615,18 +2643,21 @@ mod StrataViewer do
           -- a step is worked out on a worker: the one begun last time is finished here, then the next begins
           let m5 = if !due do m4
             else if Authority.must(Env.get_int("STRATA_FLUID_SYNC", 0)) == 1 do
-              match Strata.Fluid.step(sim_fluid(m4), sim_stream(m4), Cons((x2, y2, z2), Nil)) do (f2, sf) -> Sim(sf, f2, sim_phys(m4)) end
+              let m4w = with_marks(m4)
+              match Strata.Fluid.step(sim_fluid(m4w), sim_stream(m4w), Cons((x2, y2, z2), Nil)) do (f2, sf) -> Sim(sf, f2, sim_phys(m4w)) end
             else
               match job0 do
                 Some(j) -> match Strata.Fluid.finish(j, sim_fluid(m4), sim_stream(m4)) do (f2, sf) -> Sim(sf, f2, sim_phys(m4)) end
                 None -> m4
               end
             end end
+          -- the cells bodies fill are walls to the step about to begin, their water pushed aside first
+          let m5w = if due && Authority.must(Env.get_int("STRATA_FLUID_SYNC", 0)) != 1 do with_marks(m5) else m5 end
           let begun = if due && Authority.must(Env.get_int("STRATA_FLUID_SYNC", 0)) != 1 do
-              match Strata.Fluid.begin(sim_fluid(m5), Strata.Stream.world(sim_stream(m5)), Cons((x2, y2, z2), Nil)) do
+              match Strata.Fluid.begin(sim_fluid(m5w), Strata.Stream.world(sim_stream(m5w)), Cons((x2, y2, z2), Nil)) do
                 (f3, j2) -> (f3, Some(j2))
               end
-            else (sim_fluid(m5), job0) end
+            else (sim_fluid(m5w), job0) end
           -- spray for what the step that just ended did, and a fountain if a timing run asks for one
           let _sprayed = if due && Authority.must(Env.get_int("STRATA_SPRAY", 1)) != 0 do spray_events(Strata.Fluid.events(sim_fluid(m5)), 0) else 0 end
           let fountain = Authority.must(Env.get_int("STRATA_FOUNTAIN", 0))
@@ -2641,12 +2672,12 @@ mod StrataViewer do
           -- 0, every frame, in scripted runs, which stay as they were): its tasks then have 32 ms and more, and a frame that does not tick costs nothing.
           let tick_gap = int_to_float(Authority.must(Env.get_int("STRATA_TICK_MS", if scripted do 0 else 16 end))) /. 1000.0
           let ticks_now = tick_gap <= 0.0 || Math.floor(now /. tick_gap) != Math.floor(t_prev /. tick_gap)
-          let s2 = if ticks_now do Strata.Stream.tick(sim_stream(m5)) else sim_stream(m5) end
+          let s2 = if ticks_now do Strata.Stream.tick(sim_stream(m5w)) else sim_stream(m5w) end
           let tick_ms = (Strata.Ffi.Vk.time() -. t_tick) *. 1000.0
           match Strata.Render.sync(sl, s2) do
             (sl2, s3) ->
               let sync_ms = (Strata.Ffi.Vk.time() -. t_tick) *. 1000.0 -. tick_ms
-              let (sl3, pd) = Strata.Render.bodies(sl2, sim_phys(m5), tphys -. 1.0 /. 60.0)
+              let (sl3, pd) = Strata.Render.bodies(sl2, sim_phys(m5w), tphys -. 1.0 /. 60.0)
               let bodies_ms = (Strata.Ffi.Vk.time() -. t_tick) *. 1000.0 -. tick_ms -. sync_ms
               let rig2 = PhysRig(pd, pjob2, me, ckey, sc, tz)
               let march_ms = (Strata.Ffi.Vk.time() -. t_march) *. 1000.0
