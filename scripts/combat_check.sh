@@ -11,7 +11,7 @@ FAILED=0
 run() {
   name="$1"; shift
   env MARCH_PIN_MAIN=1 STRATA_HIDDEN=1 STRATA_OFFSCREEN=1 STRATA_PIXELS=1 STRATA_AUDIO=0 STRATA_SIZE=640x400 STRATA_ISLAND=1 \
-      STRATA_SHORE=1 STRATA_COMBAT=1 STRATA_LIGHT=0 STRATA_SHOT=/dev/null "$@" \
+      STRATA_SHORE=1 STRATA_COMBAT=1 STRATA_LIGHT=0 STRATA_LEVELS=0 STRATA_SHOT=/dev/null "$@" \
       ./viewer/.march/build/release/strata_viewer > "$OUT/$name.log" 2>&1
   grep '^combat:' "$OUT/$name.log" > "$OUT/$name.txt"
 }
@@ -39,7 +39,7 @@ if twice duel STRATA_COMBAT_SCENE=duel STRATA_FRAMES=1200; then
   a=$(num duel '^combat: duel kills \([0-9]*\) [0-9]*$'); b=$(num duel '^combat: duel kills [0-9]* \([0-9]*\)$')
   fl=$(num duel '^combat: duel flinches \([0-9]*\), .*$'); fa=$(num duel '^combat: duel flinches [0-9]*, falls \([0-9]*\), .*$')
   most=$(num duel '^combat: duel .*, pieces at most \([0-9]*\), .*$'); now=$(num duel '^combat: duel .*, pieces now \([0-9]*\), .*$'); rigs=$(num duel '^combat: duel .*, rigs \([0-9]*\)$')
-  if [ "$a" -ge 0 ] && [ $((a + b)) -ge 1 ] && [ "$fl" -ge 1 ] && [ "$fa" -ge 1 ] && [ "$most" -ge 15 ] && [ "$most" -le $((15 * fa)) ] && [ "$rigs" -eq 12 ] && [ "$(num duel '^combat: duel arrows stuck \([0-9]*\), upright [0-9]*$')" -ge 1 ] && [ $(( $(num duel '^combat: duel arrows stuck [0-9]*, upright \([0-9]*\)$') * 2 )) -le "$(num duel '^combat: duel arrows stuck \([0-9]*\), upright [0-9]*$')" ]; then echo "ok   duel: kills $a and $b; $fl flinches, $fa falls, $most loose pieces at most ($now left), 12 shirts"
+  if [ "$a" -ge 0 ] && [ $((a + b)) -ge 1 ] && [ "$fl" -ge 1 ] && [ "$fa" -ge 1 ] && [ "$most" -ge 15 ] && [ "$most" -le $((15 * fa)) ] && [ "$rigs" -eq 12 ] && [ "$(num duel '^combat: duel arrows stuck \([0-9]*\), upright [0-9]*, .*$')" -ge 1 ] && [ $(( $(num duel '^combat: duel arrows stuck [0-9]*, upright \([0-9]*\), .*$') * 2 )) -le "$(num duel '^combat: duel arrows stuck \([0-9]*\), upright [0-9]*, .*$')" ]; then echo "ok   duel: kills $a and $b; $fl flinches, $fa falls, $most loose pieces at most ($now left), 12 shirts"
   else echo "FAIL duel: kills $a and $b (want one at least), flinches $fl, falls $fa (want one of each), pieces at most $most (want 15 to 15 a fall), rigs $rigs (want 12), or its stuck arrows stand upright"; cat "$OUT/duel.txt"; FAILED=1; fi
 fi
 # A trap: the ground dug from under a rusher, a block set where a shooter stands. The rusher falls into the pit; no one ends inside a block; the idle rule frees the stuck.

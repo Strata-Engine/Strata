@@ -20,11 +20,14 @@
  * shorter than 24 means no planes. The renderer reads the draw list through
  * an_x_draw_list (an_draw_list on this world), C to C, never through March.
  *
+ * Generations: each an_x_open is one on from the last (an_x_generation),
+ * and figure ids carry on across worlds (an_open_next).
+ *
  * Timing, for measurements only: an_x_update and an_x_hit_ray time
  * themselves on the monotonic clock (an_x_timing). The kernel never reads a
  * clock, so no answer depends on it. */
 /* Rewritten by stamp_anim.sh whenever strata_anim.h changes (GAPS S14). */
-#define STRATA_ANIM_STAMP "2e2d1d055752d99c"
+#define STRATA_ANIM_STAMP "346baf8a9b2c3499"
 #include <stdint.h>
 #include <time.h>
 #include "strata_anim.h"
@@ -53,13 +56,25 @@ static int an_x_mask_id(int64_t fig, int64_t m) {
     return g_mask_base[f->rig] + (int)m;
 }
 
+/* The world's generation and next figure id, carried across open and close:
+ * each open is one generation on (the renderer re-uploads rigs held from an
+ * older one, since rig ids start again at 0). Figure ids start again at 0 too,
+ * as rig and clip ids do: a game's run hashes alike whichever world it ran in
+ * (the entity layer hashes the figure ids its entities hold). */
+static uint32_t g_gen;
+static void an_x_keep(void) { if (g_w) g_gen = g_w->generation; }
+
 int64_t an_x_open(int64_t capacity) {
-    if (g_w) an_close(g_w);
-    g_w = an_open((int)capacity);
+    an_x_keep();
+    an_close(g_w);
+    g_w = an_open_next((int)capacity, g_gen, 0);
+    g_gen += 1;                                /* a failed open is a generation too: nothing of the last is held */
     for (int i = 0; i < AN_RIGS; i++) { g_mask_base[i] = 0; g_mask_n[i] = 0; }
     return g_w ? 1 : 0;
 }
-void an_x_close(void) { an_close(g_w); g_w = NULL; }
+void an_x_close(void) { an_x_keep(); an_close(g_w); g_w = NULL; }
+/* the generation of the world opened last: 0 before any, one more each open */
+int64_t an_x_generation(void) { return (int64_t)g_gen; }
 
 /* parent: n i32; floats: 13 a part (pivot 3, rest 4, box 6) */
 int64_t an_x_rig(int64_t n, void *parent, void *floats) {
@@ -121,6 +136,16 @@ void an_x_place(int64_t fig, double x, double y, double z, double qx, double qy,
     if (!g_w) return;
     float pos[3] = {(float)x, (float)y, (float)z}, q[4] = {(float)qx, (float)qy, (float)qz, (float)qw};
     an_place(g_w, (int)fig, pos, q);
+}
+/* n figures placed at once: figs n i32, poses 7 floats a figure (x, y, z, then the turn x, y, z, w), as n an_x_place
+ * calls in order; a dead figure is refused and counted as an_place refuses it, the rest still placed. Arrays shorter
+ * than n are refused whole. */
+void an_x_place_many(int64_t n, void *figs, void *poses) {
+    if (!g_w || n <= 0) return;
+    if (an_x_len(figs) < n || an_x_len(poses) < 7 * n) { an_refuse(g_w, AN_R_VALUE); return; }
+    const int32_t *f = an_x_i32(figs);
+    const float *p = an_x_f32(poses);
+    for (int64_t i = 0; i < n; i++) an_place(g_w, f[i], p + 7 * i, p + 7 * i + 3);
 }
 void an_x_play(int64_t fig, int64_t layer, int64_t clip, double fade, double rate, double weight, int64_t mask, int64_t additive) {
     if (!g_w) return;

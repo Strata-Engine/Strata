@@ -264,74 +264,62 @@ mod StrataViewer.Combat do
     end end end
   end
 
-  doc "How far ahead of its muzzle a shot of [speed] m/s is tested for a block before it is let go, [dt] seconds a frame: its first step and a quarter metre. (An entity's first tick passes through blocks.)"
-  fn muzzle_reach(speed : Float, dt : Float) : Float do speed *. dt +. 0.25 end
-
   doc "Fighter [i] healed where it stands: full health, its idle count started again, nothing else changed. For a fighter put back at a spawn point by the idle rule."
   fn restore(fs : List(CbFighter), i : Int) : List(CbFighter) do
     let f = at(fs, i)
     put(fs, i, { f with cb_health: max_health(f.cb_kind), cb_idle: 0.0 })
   end
 
+  doc "Fighter [i] given [n] of health back, to no more than its kind's most. The dead are left dead."
+  fn heal(fs : List(CbFighter), i : Int, n : Int) : List(CbFighter) do
+    let f = at(fs, i)
+    if !f.cb_alive do fs
+    else put(fs, i, { f with cb_health: if f.cb_health + n > max_health(f.cb_kind) do max_health(f.cb_kind) else f.cb_health + n end }) end
+  end
+  doc "What a pickup of [kind] (0 health, 1 fire, 2 ice) gives: 50 of health, 25 fireballs, 10 iceballs."
+  fn pickup_gives(kind : Int) : Int do if kind == 1 do 25 else if kind == 2 do 10 else 50 end end end
+  doc "The most of a kind's charges a fighter holds: 50 fireballs, 20 iceballs."
+  fn holds_most(kind : Int) : Int do if kind == 1 do 50 else 20 end end
+  doc "Does a fighter with [health] of [most] holding [charges] of the pickup's kind take one it stands on: health when hurt at all, fire or ice while it holds fewer than the most."
+  fn takes(kind : Int, health : Int, most : Int, charges : Int) : Bool do if kind == 0 do health < most else charges < holds_most(kind) end end
+  doc "Does it go looking for one: health when hurt at all, fire under ten held, ice under five."
+  fn wants(kind : Int, health : Int, most : Int, charges : Int) : Bool do if kind == 0 do health < most else if kind == 1 do charges < 10 else charges < 5 end end end
+  doc "Is a fighter hurt enough to leave a fight for health: at half or under."
+  fn badly_hurt(health : Int, most : Int) : Bool do health * 2 <= most end
+  doc "Where the match's pickups lie about the arena's middle, as (kind, x, z): fire at the middle, ice 15 m east and west of it on the arena's floor, and health out in the field, 32 m off each way on the diagonals (45 m from the middle)."
+  fn pickup_sites(cx : Float, cz : Float) : List((Int, Float, Float)) do
+    [(1, cx, cz), (2, cx -. 15.0, cz), (2, cx +. 15.0, cz), (0, cx -. 32.0, cz -. 32.0), (0, cx +. 32.0, cz -. 32.0), (0, cx -. 32.0, cz +. 32.0), (0, cx +. 32.0, cz +. 32.0)]
+  end
+
+  doc "An iceball's damage [metres] from where it landed: 15 at the centre, falling evenly to 5 at 3 m, nothing beyond."
+  fn ice_damage(metres : Float) : Int do
+    if metres > 3.0 do 0 else if metres <= 0.0 do 15 else 15 - float_to_int(Math.round(metres *. 10.0 /. 3.0)) end end
+  end
+  doc "What an iceball leaves of a block: ice 13 for water (the sea 5, a lake 14 to 21); -1 for anything else."
+  fn freezes(block : Int) : Int do if block == 5 do 13 else if block >= 14 && block <= 21 do 13 else -1 end end end
+  pfn ice_cells_go(x : Float, y : Float, z : Float, x0 : Int, y0 : Int, z0 : Int, i : Int, read : Int -> Int -> Int -> Int, acc : List((Int, Int, Int, Int))) : List((Int, Int, Int, Int)) do
+    if i >= 343 do acc
+    else
+      let cx = x0 + i % 7
+      let cy = y0 + (i / 7) % 7
+      let cz = z0 + i / 49
+      let dx = int_to_float(cx) +. 0.5 -. x
+      let dy = int_to_float(cy) +. 0.5 -. y
+      let dz = int_to_float(cz) +. 0.5 -. z
+      let near = dx *. dx +. dy *. dy +. dz *. dz <= 9.0
+      let left = if near do freezes(read(cx, cy, cz)) else -1 end
+      ice_cells_go(x, y, z, x0, y0, z0, i + 1, read, if left < 0 do acc else Cons((cx, cy, cz, left), acc) end)
+    end
+  end
+  doc "What an iceball landing at (x, y, z) changes, as (x, y, z, block) each: every cell of water whose centre is within 3 m becomes ice. [read] answers a cell's block."
+  fn ice_changes(read : Int -> Int -> Int -> Int, x : Float, y : Float, z : Float) : List((Int, Int, Int, Int)) do
+    ice_cells_go(x, y, z, float_to_int(Math.floor(x -. 3.0)), float_to_int(Math.floor(y -. 3.0)), float_to_int(Math.floor(z -. 3.0)), 0, read, Nil)
+  end
+
   doc "Fighter [i] taken out of the match: not alive, and never back. For scenes with fewer than twelve."
   fn bench(fs : List(CbFighter), i : Int) : List(CbFighter) do
     let f = at(fs, i)
     put(fs, i, { f with cb_alive: false, cb_back_in: 1000000000000.0 })
-  end
-
-  -- ── Aiming ───────────────────────────────────────────────────────────────
-  doc "Shot number [n] of a match seeded [seed], aimed along [yaw] (radians about the vertical, 0 toward +z) and [pitch] (radians up): a unit direction within [spread_deg] degrees of that axis, spread evenly over the cone's disc. The same seed and number give the same direction."
-  fn aim(seed : Int, n : Int, yaw : Float, pitch : Float, spread_deg : Float) : (Float, Float, Float) do
-    let off = spread_deg *. 3.14159265 /. 180.0 *. Math.sqrt(Strata.Seed.unit(Strata.Seed.mix(seed, 2 * n)))
-    let round_ = 6.2831853 *. Strata.Seed.unit(Strata.Seed.mix(seed, 2 * n + 1))
-    -- the axis, and two unit vectors across it: to the right, and up
-    let ax = Math.sin(yaw) *. Math.cos(pitch)
-    let ay = Math.sin(pitch)
-    let az = Math.cos(yaw) *. Math.cos(pitch)
-    let rx = Math.cos(yaw)
-    let rz = 0.0 -. Math.sin(yaw)
-    let ux = 0.0 -. Math.sin(yaw) *. Math.sin(pitch)
-    let uy = Math.cos(pitch)
-    let uz = 0.0 -. Math.cos(yaw) *. Math.sin(pitch)
-    let c = Math.cos(off)
-    let s = Math.sin(off)
-    (ax *. c +. (rx *. Math.cos(round_) +. ux *. Math.sin(round_)) *. s, ay *. c +. uy *. Math.sin(round_) *. s, az *. c +. (rz *. Math.cos(round_) +. uz *. Math.sin(round_)) *. s)
-  end
-
-  pfn lead_go(src : (Float, Float, Float), dst : (Float, Float, Float), v : (Float, Float, Float), speed : Float, t : Float, n : Int) : Float do
-    if n <= 0 do t
-    else
-      match src do
-        (fx, fy, fz) ->
-          match dst do
-            (tx, ty, tz) ->
-              match v do
-                (vx, vy, vz) ->
-                  let dx = tx +. vx *. t -. fx
-                  let dy = ty +. vy *. t -. fy
-                  let dz = tz +. vz *. t -. fz
-                  lead_go(src, dst, v, speed, Math.sqrt(dx *. dx +. dy *. dy +. dz *. dz) /. speed, n - 1)
-              end
-          end
-      end
-    end
-  end
-  doc "Where dst aim a shot of [speed] m/s, falling at [gravity] m/s2, from [src] at a target now at [dst] moving at [velocity]: (yaw, pitch, seconds in flight). The yaw and pitch point ahead of the target by its travel in that time and above it by the shot's fall."
-  fn lead(src : (Float, Float, Float), dst : (Float, Float, Float), velocity : (Float, Float, Float), speed : Float, gravity : Float) : (Float, Float, Float) do
-    let t = lead_go(src, dst, velocity, speed, 0.0, 4)
-    match src do
-      (fx, fy, fz) ->
-        match dst do
-          (tx, ty, tz) ->
-            match velocity do
-              (vx, vy, vz) ->
-                let dx = tx +. vx *. t -. fx
-                let dy = ty +. vy *. t -. fy +. 0.5 *. gravity *. t *. t
-                let dz = tz +. vz *. t -. fz
-                (Math.atan2(dx, dz), Math.atan2(dy, Math.sqrt(dx *. dx +. dz *. dz)), t)
-            end
-        end
-    end
   end
 
   pfn ring_go(cx : Float, cz : Float, i : Int) : List((Float, Float)) do
@@ -397,36 +385,16 @@ mod StrataViewer.Combat do
     changes_go(read, burn_cells(x, y, z), Nil)
   end
 
-  pfn water_go(wet : Int -> Int -> Int -> Bool, x0 : Float, y0 : Float, z0 : Float, dx : Float, dy : Float, dz : Float, i : Int, n : Int) : (Bool, Float, Float, Float) do
-    if i > n do (false, 0.0, 0.0, 0.0)
-    else
-      let k = int_to_float(i) /. int_to_float(n)
-      let x = x0 +. dx *. k
-      let y = y0 +. dy *. k
-      let z = z0 +. dz *. k
-      if wet(float_to_int(Math.floor(x)), float_to_int(Math.floor(y)), float_to_int(Math.floor(z))) do (true, x, y, z)
-      else water_go(wet, x0, y0, z0, dx, dy, dz, i + 1, n) end
-    end
-  end
-  doc "Where a shot's step from (x0, y0, z0) to (x1, y1, z1) first enters a wet cell, sampled every eighth of a metre: (true, the point), or (false, ...) for a dry step. [wet] says whether a cell holds liquid."
-  fn water_point(wet : Int -> Int -> Int -> Bool, x0 : Float, y0 : Float, z0 : Float, x1 : Float, y1 : Float, z1 : Float) : (Bool, Float, Float, Float) do
-    let dx = x1 -. x0
-    let dy = y1 -. y0
-    let dz = z1 -. z0
-    let n = float_to_int(Math.sqrt(dx *. dx +. dy *. dy +. dz *. dz) *. 8.0) + 1
-    water_go(wet, x0, y0, z0, dx, dy, dz, 0, n)
-  end
-
-  doc "What hotbar slot [slot] (0 to 8) holds in a match: 0 the bow, 1 fire, else 2 + a block's id: stone, dirt, sand, wood, leaves, glass, ice."
+  doc "What hotbar slot [slot] (0 to 8) holds in a match: 0 the bow, 1 fire, 2 ice, else 2 + a block's id: stone, dirt, sand, wood, leaves, glass."
   fn tool(slot : Int) : Int do
     if slot == 0 do 0
     else if slot == 1 do 1
-    else if slot == 2 do 2 + 1
-    else if slot == 3 do 2 + 2
-    else if slot == 4 do 2 + 4
-    else if slot == 5 do 2 + 7
-    else if slot == 6 do 2 + 8
-    else if slot == 7 do 2 + 10
-    else 2 + 13 end end end end end end end end
+    else if slot == 2 do 2
+    else if slot == 3 do 2 + 1
+    else if slot == 4 do 2 + 2
+    else if slot == 5 do 2 + 4
+    else if slot == 6 do 2 + 7
+    else if slot == 7 do 2 + 8
+    else 2 + 10 end end end end end end end end
   end
 end

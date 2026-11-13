@@ -1,0 +1,152 @@
+-- Fracture — cutting a body's grid into pieces round where it was struck.
+--
+-- Seed points lie one to a cube of the struck material's piece size,
+-- jittered by a hash of the seed, so the same inputs always give the same
+-- pieces. Every voxel within reach of the contact (the piece size times the
+-- excess of the impact over the material's strength) goes to its nearest
+-- seed; the voxels beyond reach stay together. Each of these groups is then
+-- split into its face-connected parts, so no piece is two things. A harder
+-- impact reaches further and leaves more of the body in pieces.
+mod Strata.Fracture do
+
+  alias Strata.Body as Bg
+
+  -- a hash of four ints to [0, 1)
+  pfn h01(seed : Int, i : Int, j : Int, k : Int) : Float do
+    -- wrapping on purpose: the seed is up to 2^62
+    let m = fn (x, y) -> int_wrapping_mul(x, y)
+    let s = int_wrapping_add(int_wrapping_add(m(seed, 73856093), m(i, 19349663)), int_wrapping_add(m(j, 83492791), m(k, 50331653)))
+    let a = int_and(int_wrapping_add(s, 12345), 2147483647)
+    let b = int_and(m(int_xor(a, a / 65536), 2246822519), 2147483647)
+    let c = int_and(m(int_xor(b, b / 8192), 3266489917), 2147483647)
+    int_to_float(int_and(int_xor(c, c / 65536), 65535)) /. 65536.0
+  end
+
+  -- the seed in lattice cell (i, j, k), in voxels
+  pfn seed_at(seed : Int, p : Float, i : Int, j : Int, k : Int, axis : Int) : Float do
+    let base = if axis == 0 do i else if axis == 1 do j else k end end
+    (int_to_float(base) +. h01(seed + axis * 7919, i, j, k)) *. p
+  end
+
+  -- the nearest seed to voxel centre (x, y, z): its lattice index
+  pfn nearest(seed : Int, p : Float, nx : Int, ny : Int, nz : Int, x : Float, y : Float, z : Float) : Int do
+    let ci = float_to_int(Math.floor(x /. p))
+    let cj = float_to_int(Math.floor(y /. p))
+    let ck = float_to_int(Math.floor(z /. p))
+    near_go(seed, p, nx, ny, nz, x, y, z, ci, cj, ck, 0, -1, 1000000000.0)
+  end
+  pfn near_go(seed : Int, p : Float, nx : Int, ny : Int, nz : Int, x : Float, y : Float, z : Float, ci : Int, cj : Int, ck : Int, n : Int, best : Int, bd : Float) : Int do
+    if n >= 27 do best
+    else
+      let i = ci + n % 3 - 1
+      let j = cj + (n / 3) % 3 - 1
+      let k = ck + n / 9 - 1
+      if i < 0 || j < 0 || k < 0 || i >= nx || j >= ny || k >= nz do near_go(seed, p, nx, ny, nz, x, y, z, ci, cj, ck, n + 1, best, bd)
+      else
+        let dx = seed_at(seed, p, i, j, k, 0) -. x
+        let dy = seed_at(seed, p, i, j, k, 1) -. y
+        let dz = seed_at(seed, p, i, j, k, 2) -. z
+        let d = dx *. dx +. dy *. dy +. dz *. dz
+        let idx = i + nx * (j + ny * k)
+        if d < bd do near_go(seed, p, nx, ny, nz, x, y, z, ci, cj, ck, n + 1, idx, d) else near_go(seed, p, nx, ny, nz, x, y, z, ci, cj, ck, n + 1, best, bd) end
+      end
+    end
+  end
+
+  -- each voxel's group (0 the voxels beyond reach, else 1 + its seed) and each group's box
+  type Cut = Cut(NativeIntArr, NativeIntArr)
+
+  pfn label_go(r : Strata.Blocks.Registry, g : Strata.Body.Grid, seed : Int, p : Float, reach2 : Float, cx : Float, cy : Float, cz : Float, nx : Int, ny : Int, nz : Int, c : Cut, i : Int, n : Int) : Cut do
+    if i >= n do c
+    else
+      let sx = Bg.size_x(g)
+      let sy = Bg.size_y(g)
+      let x = i % sx
+      let y = (i / sx) % sy
+      let z = i / (sx * sy)
+      if !Strata.Blocks.collides(r, Bg.grid_get(g, x, y, z)) do label_go(r, g, seed, p, reach2, cx, cy, cz, nx, ny, nz, c, i + 1, n)
+      else
+        let fx = int_to_float(x) +. 0.5
+        let fy = int_to_float(y) +. 0.5
+        let fz = int_to_float(z) +. 0.5
+        let d2 = (fx -. cx) *. (fx -. cx) +. (fy -. cy) *. (fy -. cy) +. (fz -. cz) *. (fz -. cz)
+        let lab = if d2 <= reach2 do 1 + nearest(seed, p, nx, ny, nz, fx, fy, fz) else 0 end
+        match c do
+          Cut(labs, boxes) ->
+            let o = lab * 6
+            let b1 = if NativeArray.get_int(boxes, o) > x do NativeArray.set_int(boxes, o, x) else boxes end
+            let b2 = if NativeArray.get_int(b1, o + 1) > y do NativeArray.set_int(b1, o + 1, y) else b1 end
+            let b3 = if NativeArray.get_int(b2, o + 2) > z do NativeArray.set_int(b2, o + 2, z) else b2 end
+            let b4 = if NativeArray.get_int(b3, o + 3) < x do NativeArray.set_int(b3, o + 3, x) else b3 end
+            let b5 = if NativeArray.get_int(b4, o + 4) < y do NativeArray.set_int(b4, o + 4, y) else b4 end
+            let b6 = if NativeArray.get_int(b5, o + 5) < z do NativeArray.set_int(b5, o + 5, z) else b5 end
+            label_go(r, g, seed, p, reach2, cx, cy, cz, nx, ny, nz, Cut(NativeArray.set_int(labs, i, lab), b6), i + 1, n)
+        end
+      end
+    end
+  end
+
+  pfn boxes_init(b : NativeIntArr, k : Int, n : Int) : NativeIntArr do
+    if k >= n do b
+    else
+      let o = k * 6
+      boxes_init(NativeArray.set_int(NativeArray.set_int(NativeArray.set_int(NativeArray.set_int(NativeArray.set_int(NativeArray.set_int(b, o, 1000000), o + 1, 1000000), o + 2, 1000000), o + 3, -1), o + 4, -1), o + 5, -1), k + 1, n)
+    end
+  end
+
+  -- group [lab]'s voxels as a grid over its box
+  pfn group_grid(g : Strata.Body.Grid, labs : NativeIntArr, lab : Int, x0 : Int, y0 : Int, z0 : Int, out : Strata.Body.Grid, i : Int) : Strata.Body.Grid do
+    let ox = Bg.size_x(out)
+    let oy = Bg.size_y(out)
+    if i >= ox * oy * Bg.size_z(out) do out
+    else
+      let x = x0 + i % ox
+      let y = y0 + (i / ox) % oy
+      let z = z0 + i / (ox * oy)
+      let j = x + Bg.size_x(g) * (y + Bg.size_y(g) * z)
+      let o2 = if NativeArray.get_int(labs, j) == lab do Bg.grid_set(out, x - x0, y - y0, z - z0, Bg.grid_get(g, x, y, z)) else out end
+      group_grid(g, labs, lab, x0, y0, z0, o2, i + 1)
+    end
+  end
+
+  pfn groups(r : Strata.Blocks.Registry, g : Strata.Body.Grid, labs : NativeIntArr, boxes : NativeIntArr, lab : Int, nl : Int, acc : List((Strata.Body.Grid, Int, Int, Int))) : List((Strata.Body.Grid, Int, Int, Int)) do
+    if lab >= nl do acc
+    else
+      let o = lab * 6
+      let x0 = NativeArray.get_int(boxes, o)
+      if NativeArray.get_int(boxes, o + 3) < x0 do groups(r, g, labs, boxes, lab + 1, nl, acc)
+      else
+        let y0 = NativeArray.get_int(boxes, o + 1)
+        let z0 = NativeArray.get_int(boxes, o + 2)
+        let gg = group_grid(g, labs, lab, x0, y0, z0, Bg.grid(NativeArray.get_int(boxes, o + 3) - x0 + 1, NativeArray.get_int(boxes, o + 4) - y0 + 1, NativeArray.get_int(boxes, o + 5) - z0 + 1), 0)
+        let parts = List.map(Bg.split(r, gg), fn pr -> shifted(pr, x0, y0, z0))
+        groups(r, g, labs, boxes, lab + 1, nl, List.append(acc, parts))
+      end
+    end
+  end
+  pfn shifted(pr : (Strata.Body.Grid, Int, Int, Int), x0 : Int, y0 : Int, z0 : Int) : (Strata.Body.Grid, Int, Int, Int) do
+    match pr do (pg, a, b, c) -> (pg, a + x0, b + y0, c + z0) end
+  end
+
+  doc "Cut grid [g] round voxel (cx, cy, cz), where it was struck, into pieces about the struck material's piece size across, at [scale] metres a voxel. [excess] (the impact over the material's strength, taken as at least 1) sets how far from the contact the cutting reaches: the piece size times the excess. Returns every colliding voxel exactly once, as pieces with their low corners in [g]: the voxels beyond reach first (as many parts as they make), then the pieces, each one face-connected. [seed] picks where the cuts fall."
+  fn pieces(r : Strata.Blocks.Registry, g : Strata.Body.Grid, cx : Int, cy : Int, cz : Int, excess : Float, scale : Float, seed : Int) : List((Strata.Body.Grid, Int, Int, Int)) do
+    let sx = Bg.size_x(g)
+    let sy = Bg.size_y(g)
+    let sz = Bg.size_z(g)
+    let n = sx * sy * sz
+    let struck = Bg.grid_get(g, cx, cy, cz)
+    let pcm = if struck > 0 do Strata.Blocks.piece_cm(r, struck) else 50 end
+    let p0 = int_to_float(pcm) /. (scale *. 100.0)
+    let p = if p0 < 1.0 do 1.0 else p0 end
+    let ex = if excess < 1.0 do 1.0 else excess end
+    let reach = p *. ex
+    let nx = float_to_int(Math.ceil(int_to_float(sx) /. p)) + 1
+    let ny = float_to_int(Math.ceil(int_to_float(sy) /. p)) + 1
+    let nz = float_to_int(Math.ceil(int_to_float(sz) /. p)) + 1
+    let nl = nx * ny * nz + 1
+    match label_go(r, g, seed, p, reach *. reach, int_to_float(cx) +. 0.5, int_to_float(cy) +. 0.5, int_to_float(cz) +. 0.5, nx, ny, nz,
+                   Cut(NativeArray.make_int(Strata.Size.of(n), 0), boxes_init(NativeArray.make_int(Strata.Size.of(nl * 6), 0), 0, nl)), 0, n) do
+      Cut(labs, boxes) -> groups(r, g, labs, boxes, 0, nl, Nil)
+    end
+  end
+end

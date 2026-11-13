@@ -153,7 +153,7 @@ emission are set today (`Strata.Blocks.with_physics`):
 | field | meaning | default |
 |---|---|---|
 | density | kg per cubic metre | 2000 |
-| strength | the impact a block survives, in joules per square metre of contact | 50 000 |
+| strength | the impact a block survives, as normal impulse per square metre of contact (N s/m²) | 50 000 |
 | span | how far, in metres, the block can reach sideways from support | 4.0 |
 | piece size | the typical size, in metres, of the pieces it breaks into | 0.5 |
 | anchor | the block holds up anything joined to it (bedrock) | no |
@@ -218,17 +218,25 @@ Physics advances in fixed steps of 1/60 s. Each step, in order:
    when an edit changes a cell inside its bounding box, or when the game
    pushes it.
 7. **Break.** A contact whose impulse, spread over its contact area,
-   exceeds the strength of the block it struck breaks the body there: the
+   exceeds the strength of the body's weakest block breaks the body there
+   (the area is what the impacting contact points span: the smaller of
+   their box across the normal and twice their furthest distance from
+   their mean squared, so a face's corners give its area however it is
+   turned; never less than one voxel face; a step takes the hardest hit
+   of its sub-steps): the
    grid near the contact is cut into pieces of about the material's piece
    size (cells grown from seed points placed by a hash of body id and
    step, so it is deterministic), more of the body breaking for a greater
    excess. Each piece becomes a body carrying the velocity of where it
-   was. World blocks a body strikes break the same way: the broken cells
+   was. World blocks a body strikes break the same way, if they are no
+   stronger than the body's weakest block (glass does not break stone): the broken cells
    leave the world by an edit and become bodies. So a falling tower
    arrives as one or a few bodies and crumbles into many when it hits.
-8. **Fragments.** A body of fewer than 8 voxels is a fragment. A fragment
+8. **Fragments.** A piece of a break with fewer than 8 voxels is a
+   fragment, as is a body the game adds with `add_fragment`; other small
+   bodies a game adds stay bodies. A fragment
    that falls asleep with world ground (not a body) under its nearest
-   aligned spot, and that spot empty, is written into the grid there and
+   aligned spot (or another of its own voxels), and that spot empty, is written into the grid there and
    stops being a body. Any other fragment that falls asleep is removed and
    a burst of spray marks it. A fragment of one voxel turns to spray at
    once.

@@ -1,0 +1,781 @@
+-- Savefile — every save file's contents as bytes and back.
+--
+-- A file is a frame:
+--
+--   magic       u32   which file this is (magic_header, magic_region, magic_player)
+--   version     u8    the format version, 1
+--   body length u64   the bytes of body that follow
+--   body              the file's contents, written with put_*
+--   checksum    u32   CRC-32 (IEEE) of every byte before it, magic first
+--
+-- Little-endian throughout. A Writer appends to a growable native byte
+-- array and converts it to Bytes once, at `finish`. A SaveReader is the checked
+-- frame: `reader` refuses a wrong magic, another version, a length that is
+-- not the file's, and a bad checksum before anything is read.
+--
+-- Nothing here panics on bad input. Every read checks it has the bytes it
+-- needs; a length or a count is checked against the bytes left before
+-- anything is allocated for it; and the decoders answer Err with a reason.
+-- Inside, decoding runs on a "sticky" reader: the first failure is kept
+-- and every read after it answers zero without reading, so a decoder is
+-- written straight through and its error is looked at once, at the end.
+--
+-- The byte layouts of the three files are in docs/save-ledger.md.
+mod Strata.Savefile do
+
+  alias Strata.Chunk as Ck
+  alias Strata.Coord as Kd
+  alias Strata.World as Wd
+
+  doc "\"STRH\" read as a little-endian u32: the header file (store.bin)."
+  fn magic_header() : Int do 1213355091 end
+  doc "\"STRR\" read as a little-endian u32: a region file."
+  fn magic_region() : Int do 1381127251 end
+  doc "\"STRP\" read as a little-endian u32: a player file."
+  fn magic_player() : Int do 1347572819 end
+
+  pfn version() : Int do 1 end
+  -- magic, version and body length
+  pfn front() : Int do 13 end
+  pfn mask32() : Int do 4294967295 end
+  pfn two32() : Int do 4294967296 end
+
+  -- ── CRC-32 ───────────────────────────────────────────────────────────────
+  -- The reflected IEEE polynomial 0xEDB88320, table-driven. Every value
+  -- stays within 32 bits, so nothing can overflow.
+
+  pfn crc_entry(c : Int, k : Int) : Int do
+    if k >= 8 do c
+    else if int_and(c, 1) == 1 do crc_entry(int_xor(3988292384, int_shr(c, 1)), k + 1)
+    else crc_entry(int_shr(c, 1), k + 1) end end
+  end
+  pfn crc_table_go(t : NativeIntArr, i : Int) : NativeIntArr do
+    if i >= 256 do t else crc_table_go(NativeArray.set_int(t, i, crc_entry(i, 0)), i + 1) end
+  end
+  pfn crc_table() : NativeIntArr do crc_table_go(NativeArray.make_int(256, 0), 0) end
+
+  pfn crc_go(a : NativeU8Arr, t : NativeIntArr, i : Int, stop : Int, c : Int) : Int do
+    if i >= stop do c
+    else crc_go(a, t, i + 1, stop, int_xor(NativeArray.get_int(t, int_and(int_xor(c, NativeArray.get_u8(a, i)), 255)), int_shr(c, 8))) end
+  end
+  -- CRC-32 of bytes [0, n) of a, n at most a's length
+  pfn crc_arr(a : NativeU8Arr, n : Int) : Int do
+    int_xor(crc_go(a, crc_table(), 0, n, mask32()), mask32())
+  end
+
+  doc "CRC-32 (IEEE 802.3, the zlib and PNG checksum) of b."
+  fn crc32(b : Bytes) : Int do
+    let a = Bytes.to_u8_arr(b)
+    crc_arr(a, NativeArray.length_u8(a))
+  end
+
+  -- ── IEEE 754 bits ────────────────────────────────────────────────────────
+  -- March has no way to see a Float's bits, so they are worked out from the
+  -- value. Every step is exact: scaling by a power of two (pow(2, n) is
+  -- exact) and a mantissa of at most 52 bits converted to and from an Int.
+
+  pfn pow2(e : Int) : Float do math_pow(2.0, int_to_float(e)) end
+
+  -- floor(log2(a)) for a finite a > 0, corrected for rounding in log2
+  pfn exponent(a : Float) : Int do
+    let e0 = float_floor(math_log2(a))
+    if pow2(e0) > a do e0 - 1 else if pow2(e0 + 1) <= a do e0 + 1 else e0 end end
+  end
+
+  -- 1 for a negative number and for -0.0 (atan2(0, -0.0) is pi), else 0
+  pfn sign_of(v : Float) : Int do
+    if v < 0.0 do 1
+    else if v != 0.0 do 0
+    else if math_atan2(0.0, v) > 1.0 do 1
+    else 0 end end end
+  end
+
+  -- (sign, exponent field, mantissa field) of v in a format of [mbits]
+  -- mantissa bits and exponent bias [bias]; a NaN is the quiet NaN
+  pfn ieee_fields(v : Float, mbits : Int, bias : Int) : (Int, Int, Int) do
+    let top = 2 * bias + 1
+    if float_is_nan(v) do (0, top, int_shl(1, mbits - 1))
+    else
+      let sign = sign_of(v)
+      let a = float_abs(v)
+      if float_is_infinite(v) do (sign, top, 0)
+      else if a == 0.0 do (sign, 0, 0)
+      else if a < pow2(1 - bias) do (sign, 0, float_to_int(a *. pow2(bias - 1) *. pow2(mbits)))
+      else
+        let e = exponent(a)
+        if e > bias do (sign, top, 0)
+        else (sign, e + bias, float_to_int((a /. pow2(e) -. 1.0) *. pow2(mbits))) end
+      end end end
+    end
+  end
+
+  pfn special(m : Int) : Float do if m == 0 do float_infinity() else float_nan() end end
+
+  pfn ieee_value(sign : Int, ex : Int, m : Int, mbits : Int, bias : Int) : Float do
+    let mag = if ex == 2 * bias + 1 do special(m)
+      else if ex == 0 do int_to_float(m) *. pow2(0 - mbits) *. pow2(1 - bias)
+      else (1.0 +. int_to_float(m) *. pow2(0 - mbits)) *. pow2(ex - bias) end end
+    if sign == 1 do mag *. -1.0 else mag end
+  end
+
+  -- a double's bits as (low 32, high 32)
+  pfn f64_bits(v : Float) : (Int, Int) do
+    let (s, ex, m) = ieee_fields(v, 52, 1023)
+    (int_and(m, mask32()), s * 2147483648 + ex * 1048576 + m / two32())
+  end
+  pfn f64_of(lo : Int, hi : Int) : Float do
+    ieee_value(hi / 2147483648, int_and(hi / 1048576, 2047), int_and(hi, 1048575) * two32() + lo, 52, 1023)
+  end
+  -- a float32's bits (v must be a float32 value, as NativeF32Arr reads)
+  pfn f32_bits(v : Float) : Int do
+    let (s, ex, m) = ieee_fields(v, 23, 127)
+    s * 2147483648 + ex * 8388608 + m
+  end
+  pfn f32_of(b : Int) : Float do ieee_value(b / 2147483648, int_and(b / 8388608, 255), int_and(b, 8388607), 23, 127) end
+
+  -- ── Writer ───────────────────────────────────────────────────────────────
+
+  -- the buffer and the bytes used; the first 13 are kept for the frame's front
+  type Writer = SfWriter(NativeU8Arr, Int)
+
+  doc "An empty writer."
+  fn writer() : Writer do sized(1024) end
+
+  -- an empty writer with room for n bytes of body and the checksum, so a
+  -- caller that knows its size is not copied as the buffer doubles
+  pfn sized(n : Int) : Writer do SfWriter(NativeArray.make_u8(Strata.Size.of(front() + n + 4), 0), front()) end
+
+  pfn copy_go(dst : NativeU8Arr, src : NativeU8Arr, i : Int, n : Int) : NativeU8Arr do
+    if i >= n do dst else copy_go(NativeArray.set_u8(dst, i, NativeArray.get_u8(src, i)), src, i + 1, n) end
+  end
+
+  -- room for k more bytes, doubling the buffer when it is short
+  pfn ensure(w : Writer, k : Int) : Writer do
+    match w do
+      SfWriter(a, n) ->
+        let cap = NativeArray.length_u8(a)
+        if n + k <= cap do w
+        else
+          let want = if 2 * cap > n + k do 2 * cap else n + k end
+          SfWriter(copy_go(NativeArray.make_u8(Strata.Size.of(want), 0), a, 0, n), n)
+        end
+    end
+  end
+
+  -- v's low [k] bytes, little-endian, at p
+  pfn set_le(a : NativeU8Arr, p : Int, v : Int, k : Int) : NativeU8Arr do
+    if k <= 0 do a else set_le(NativeArray.set_u8(a, p, int_and(v, 255)), p + 1, int_shr(v, 8), k - 1) end
+  end
+
+  pfn put_le(w0 : Writer, v : Int, k : Int) : Writer do
+    match ensure(w0, k) do
+      SfWriter(a, n) -> SfWriter(set_le(a, n, v, k), n + k)
+    end
+  end
+
+  doc "Append v's low byte."
+  fn put_u8(w : Writer, v : Int) : Writer do put_le(w, int_and(v, 255), 1) end
+  pfn put_u16(w : Writer, v : Int) : Writer do put_le(w, int_and(v, 65535), 2) end
+  doc "Append v's low 32 bits, little-endian (a negative v as two's complement)."
+  fn put_u32(w : Writer, v : Int) : Writer do put_le(w, int_and(v, mask32()), 4) end
+  doc "Append v as a 64-bit two's complement integer, little-endian."
+  fn put_i64(w : Writer, v : Int) : Writer do
+    put_le(put_le(w, int_and(v, mask32()), 4), int_and(int_shr(v, 32), mask32()), 4)
+  end
+  doc "Append v's IEEE 754 double bits, little-endian. A NaN is written as the quiet NaN."
+  fn put_f64(w : Writer, v : Float) : Writer do
+    let (lo, hi) = f64_bits(v)
+    put_le(put_le(w, lo, 4), hi, 4)
+  end
+
+  pfn blit_go(dst : NativeU8Arr, p : Int, src : NativeU8Arr, i : Int, n : Int) : NativeU8Arr do
+    if i >= n do dst else blit_go(NativeArray.set_u8(dst, p + i, NativeArray.get_u8(src, i)), p, src, i + 1, n) end
+  end
+  -- the first n bytes of src, unprefixed
+  pfn put_arr(w0 : Writer, src : NativeU8Arr, n : Int) : Writer do
+    match ensure(w0, n) do
+      SfWriter(a, p) -> SfWriter(blit_go(a, p, src, 0, n), p + n)
+    end
+  end
+
+  doc "Append b's length (as put_i64) and its bytes."
+  fn put_bytes(w : Writer, b : Bytes) : Writer do
+    let src = Bytes.to_u8_arr(b)
+    let n = NativeArray.length_u8(src)
+    put_arr(put_i64(w, n), src, n)
+  end
+
+  doc "Append s's length in bytes (as put_i64) and its UTF-8 bytes."
+  fn put_string(w : Writer, s : String) : Writer do put_bytes(w, Bytes.from_string(s)) end
+
+  doc "The file: magic (u32), format version (u8), body length (u64), the body, then a CRC-32 (u32) of every byte before it."
+  fn finish(w0 : Writer, magic : Int) : Bytes do
+    match ensure(w0, 4) do
+      SfWriter(a0, n) ->
+        let a1 = set_le(set_le(set_le(a0, 0, int_and(magic, mask32()), 4), 4, version(), 1), 5, n - front(), 8)
+        let a2 = set_le(a1, n, crc_arr(a1, n), 4)
+        Bytes.slice(Bytes.from_u8_arr(a2), 0, n + 4)
+    end
+  end
+
+  -- ── Reader ───────────────────────────────────────────────────────────────
+
+  -- the file, its bytes, the read position, the end of the body, and the
+  -- first failure ("" while there is none)
+  type SaveReader = SfReader(Bytes, NativeU8Arr, Int, Int, String)
+
+  -- the unsigned little-endian value of bytes [p, p + k) of a (in range)
+  pfn get_le(a : NativeU8Arr, p : Int, k : Int) : Int do
+    if k <= 0 do 0 else NativeArray.get_u8(a, p) + 256 * get_le(a, p + 1, k - 1) end
+  end
+
+  doc "The body of file b, if it is a whole, unchanged file of format version 1 with this magic; else the reason it is not."
+  fn reader(b : Bytes, magic : Int) : Result(SaveReader, String) do
+    let a = Bytes.to_u8_arr(b)
+    let len = NativeArray.length_u8(a)
+    if len < 4 do Err("truncated: " ++ int_to_string(len) ++ " bytes is too short for a file")
+    else if get_le(a, 0, 4) != int_and(magic, mask32()) do Err("not a Strata file of this kind (wrong magic number)")
+    else if len < 5 do Err("truncated: the file ends before its format version")
+    else if NativeArray.get_u8(a, 4) > version() do Err("newer format: version " ++ int_to_string(NativeArray.get_u8(a, 4)) ++ "; this build reads version " ++ int_to_string(version()))
+    else if NativeArray.get_u8(a, 4) != version() do Err("unknown format version " ++ int_to_string(NativeArray.get_u8(a, 4)))
+    else if len < front() + 4 do Err("truncated: the file ends inside its frame")
+    else
+      let lo = get_le(a, 5, 4)
+      let hi = get_le(a, 9, 4)
+      -- a body of 2^32 bytes or more is more than any file here holds
+      if hi != 0 do Err("truncated: the file claims a body of at least 4 GB")
+      else if front() + lo + 4 > len do Err("truncated: the file claims a body of " ++ int_to_string(lo) ++ " bytes and holds " ++ int_to_string(len - front() - 4))
+      else if front() + lo + 4 != len do Err("length: " ++ int_to_string(len - front() - lo - 4) ++ " bytes after the end of the file")
+      else if crc_arr(a, front() + lo) != get_le(a, front() + lo, 4) do Err("checksum mismatch: the file is damaged")
+      else Ok(SfReader(b, a, front(), front() + lo, "")) end end end end
+    end end end end end end
+  end
+
+  pfn r_err(r : SaveReader) : String do match r do SfReader(_, _, _, _, e) -> e end end
+  pfn left(r : SaveReader) : Int do match r do SfReader(_, _, p, stop, _) -> stop - p end end
+
+  -- r with failure [why], unless it has one already
+  pfn failed(r : SaveReader, why : String) : SaveReader do
+    match r do
+      SfReader(b, a, p, stop, e) -> if string_is_empty(e) do SfReader(b, a, p, stop, why) else r end
+    end
+  end
+
+  doc "True when every byte of the body has been read."
+  fn at_end(r : SaveReader) : Bool do
+    match r do
+      SfReader(_, _, p, stop, e) -> if string_is_empty(e) do p == stop else false end
+    end
+  end
+
+  -- k bytes as an unsigned little-endian value (k <= 4)
+  pfn rd_le(r : SaveReader, k : Int) : (SaveReader, Int) do
+    match r do
+      SfReader(b, a, p, stop, e) ->
+        if not string_is_empty(e) do (r, 0)
+        else if p + k > stop do (failed(r, "truncated: the body ends inside a value"), 0)
+        else (SfReader(b, a, p + k, stop, e), get_le(a, p, k)) end end
+    end
+  end
+  pfn rd_u8(r : SaveReader) : (SaveReader, Int) do rd_le(r, 1) end
+  pfn rd_u16(r : SaveReader) : (SaveReader, Int) do rd_le(r, 2) end
+  pfn rd_u32(r : SaveReader) : (SaveReader, Int) do rd_le(r, 4) end
+
+  -- a 64-bit integer; one outside March's 63-bit Int is a failure
+  pfn rd_i64(r0 : SaveReader) : (SaveReader, Int) do
+    let (r1, lo) = rd_le(r0, 4)
+    let (r2, hi) = rd_le(r1, 4)
+    let shi = if hi >= 2147483648 do hi - two32() else hi end
+    if shi > 1073741823 do (failed(r2, "an integer is beyond 2^62 - 1"), 0)
+    else if shi < -1073741824 do (failed(r2, "an integer is below -2^62"), 0)
+    else (r2, shi * two32() + lo) end end
+  end
+
+  pfn rd_f64(r0 : SaveReader) : (SaveReader, Float) do
+    let (r1, lo) = rd_le(r0, 4)
+    let (r2, hi) = rd_le(r1, 4)
+    (r2, f64_of(lo, hi))
+  end
+
+  -- a byte length: a failure when it is negative or more than the bytes left
+  pfn rd_len(r0 : SaveReader) : (SaveReader, Int) do
+    let (r1, n) = rd_i64(r0)
+    if n < 0 do (failed(r1, "a negative length"), 0)
+    else if n > left(r1) do (failed(r1, "truncated: a length of " ++ int_to_string(n) ++ " bytes, and " ++ int_to_string(left(r1)) ++ " are left"), 0)
+    else (r1, n) end end
+  end
+
+  -- a count of items each at least [each] bytes long: a failure when that
+  -- many could not fit in the bytes left (so nothing is allocated for it)
+  pfn rd_count(r0 : SaveReader, each : Int) : (SaveReader, Int) do
+    let (r1, n) = rd_u32(r0)
+    if n > left(r1) / each do (failed(r1, "truncated: a count of " ++ int_to_string(n) ++ " cannot fit in the " ++ int_to_string(left(r1)) ++ " bytes left"), 0)
+    else (r1, n) end
+  end
+
+  pfn rd_bytes(r0 : SaveReader) : (SaveReader, Bytes) do
+    let (r1, n) = rd_len(r0)
+    match r1 do
+      SfReader(b, a, p, stop, e) ->
+        if not string_is_empty(e) do (r1, Bytes.empty())
+        else (SfReader(b, a, p + n, stop, e), Bytes.slice(b, p, n)) end
+    end
+  end
+  pfn rd_string(r0 : SaveReader) : (SaveReader, String) do
+    let (r1, b) = rd_bytes(r0)
+    (r1, Bytes.to_string(b))
+  end
+
+  -- skip n bytes, answering where they start
+  pfn rd_skip(r : SaveReader, n : Int) : (SaveReader, Int) do
+    match r do
+      SfReader(b, a, p, stop, e) ->
+        if not string_is_empty(e) do (r, 0)
+        else if n > stop - p do (failed(r, "truncated: the body ends inside a chunk"), 0)
+        else (SfReader(b, a, p + n, stop, e), p) end end
+    end
+  end
+
+  pfn answer(r : SaveReader, v : a) : Result((SaveReader, a), String) do
+    if string_is_empty(r_err(r)) do Ok((r, v)) else Err(r_err(r)) end
+  end
+
+  doc "A byte, 0..255."
+  fn get_u8(r : SaveReader) : Result((SaveReader, Int), String) do
+    let (r1, v) = rd_u8(r)
+    answer(r1, v)
+  end
+  doc "An unsigned 32-bit integer, 0..2^32 - 1."
+  fn get_u32(r : SaveReader) : Result((SaveReader, Int), String) do
+    let (r1, v) = rd_u32(r)
+    answer(r1, v)
+  end
+  doc "A 64-bit integer; one outside March's Int (-2^62..2^62 - 1) is an error."
+  fn get_i64(r : SaveReader) : Result((SaveReader, Int), String) do
+    let (r1, v) = rd_i64(r)
+    answer(r1, v)
+  end
+  doc "A double, bit for bit (the sign of zero kept; any NaN reads as NaN)."
+  fn get_f64(r : SaveReader) : Result((SaveReader, Float), String) do
+    let (r1, v) = rd_f64(r)
+    answer(r1, v)
+  end
+  doc "Bytes written by put_bytes: a fresh value. A length beyond the bytes left is an error."
+  fn get_bytes(r : SaveReader) : Result((SaveReader, Bytes), String) do
+    let (r1, v) = rd_bytes(r)
+    answer(r1, v)
+  end
+  doc "A string written by put_string. A length beyond the bytes left is an error."
+  fn get_string(r : SaveReader) : Result((SaveReader, String), String) do
+    let (r1, v) = rd_string(r)
+    answer(r1, v)
+  end
+
+  -- v, if r failed nowhere and read the whole body
+  pfn settle(r : SaveReader, v : a) : Result(a, String) do
+    if not string_is_empty(r_err(r)) do Err(r_err(r))
+    else if not at_end(r) do Err("length: " ++ int_to_string(left(r)) ++ " bytes left over after the contents")
+    else Ok(v) end end
+  end
+
+  -- ── Shared pieces ────────────────────────────────────────────────────────
+
+  pfn put_sections(w : Writer, ss : List((String, Bytes))) : Writer do
+    match ss do
+      Nil -> w
+      Cons((name, b), rest) -> put_sections(put_bytes(put_string(w, name), b), rest)
+    end
+  end
+  pfn put_section_list(w : Writer, ss : List((String, Bytes))) : Writer do put_sections(put_u32(w, List.length(ss)), ss) end
+
+  pfn rd_sections_go(r : SaveReader, n : Int, acc : List((String, Bytes))) : (SaveReader, List((String, Bytes))) do
+    if n <= 0 do (r, List.reverse(acc))
+    else if not string_is_empty(r_err(r)) do (r, Nil)
+    else
+      let (r1, name) = rd_string(r)
+      let (r2, b) = rd_bytes(r1)
+      rd_sections_go(r2, n - 1, Cons((name, b), acc))
+    end end
+  end
+  -- a section is at least two 8-byte lengths
+  pfn rd_sections(r0 : SaveReader) : (SaveReader, List((String, Bytes))) do
+    let (r1, n) = rd_count(r0, 16)
+    rd_sections_go(r1, n, Nil)
+  end
+
+  pfn put_key(w : Writer, k : Strata.Coord.Key) : Writer do
+    put_i64(put_i64(put_i64(put_i64(w, Kd.kx(k)), Kd.ky(k)), Kd.kz(k)), Kd.level(k))
+  end
+  pfn rd_key(r0 : SaveReader) : (SaveReader, Strata.Coord.Key) do
+    let (r1, x) = rd_i64(r0)
+    let (r2, y) = rd_i64(r1)
+    let (r3, z) = rd_i64(r2)
+    let (r4, l) = rd_i64(r3)
+    (r4, Kd.key_at(x, y, z, l))
+  end
+
+  -- ── Chunks ───────────────────────────────────────────────────────────────
+  -- A chunk is its form byte (Strata.Chunk.form) and that form's content:
+  --   0 uniform   id (u16)
+  --   1 paletted  32768 palette indices (u8, by flat index), the palette's
+  --               size n (u16, 1..256), n ids (u16)
+  --   2 direct    32768 ids (u16, by flat index)
+  -- Ids are 0..65535 (Strata.Chunk stores anything else as air). The
+  -- palette is rebuilt from the content in first-use order, through a
+  -- table from id to palette slot that the whole region shares.
+
+  -- id -> palette slot (-1 none, 65536 entries), and the palette
+  type Scratch = SfScratch(NativeIntArr, NativeIntArr)
+
+  pfn scratch() : Scratch do SfScratch(NativeArray.make_int(65536, -1), NativeArray.make_int(257, 0)) end
+
+  type PalScan = SfPalScan(NativeIntArr, NativeU8Arr, NativeIntArr, Int)
+
+  -- every voxel's palette slot, written straight into the writer's buffer
+  -- at p; stops with n = 257 at a 257th id
+  pfn pal_scan(c : Strata.Chunk.Chunk, lut : NativeIntArr, a : NativeU8Arr, p : Int, pal : NativeIntArr, n : Int, i : Int) : PalScan do
+    if i >= 32768 do SfPalScan(lut, a, pal, n)
+    else
+      let id = Ck.get_idx(c, Ck.index(i))
+      let k = NativeArray.get_int(lut, id)
+      if k >= 0 do pal_scan(c, lut, NativeArray.set_u8(a, p + i, k), p, pal, n, i + 1)
+      else if n >= 256 do SfPalScan(lut, a, pal, 257)
+      else pal_scan(c, NativeArray.set_int(lut, id, n), NativeArray.set_u8(a, p + i, n), p, NativeArray.set_int(pal, n, id), n + 1, i + 1) end end
+    end
+  end
+  -- the table back to all -1, touching only the slots the palette used
+  pfn lut_clear(lut : NativeIntArr, pal : NativeIntArr, i : Int, n : Int) : NativeIntArr do
+    if i >= n do lut else lut_clear(NativeArray.set_int(lut, NativeArray.get_int(pal, i), -1), pal, i + 1, n) end
+  end
+  pfn put_pal(w : Writer, pal : NativeIntArr, i : Int, n : Int) : Writer do
+    if i >= n do w else put_pal(put_u16(w, NativeArray.get_int(pal, i)), pal, i + 1, n) end
+  end
+
+  pfn direct_go(a : NativeU8Arr, p : Int, c : Strata.Chunk.Chunk, i : Int) : NativeU8Arr do
+    if i >= 32768 do a else direct_go(set_le(a, p + 2 * i, Ck.get_idx(c, Ck.index(i)), 2), p, c, i + 1) end
+  end
+  pfn put_direct(w0 : Writer, c : Strata.Chunk.Chunk) : Writer do
+    match ensure(put_u8(w0, 2), 65536) do
+      SfWriter(a, p) -> SfWriter(direct_go(a, p, c, 0), p + 65536)
+    end
+  end
+
+  pfn put_paletted(w0 : Writer, sc : Scratch, c : Strata.Chunk.Chunk) : (Writer, Scratch) do
+    match sc do
+      SfScratch(lut0, pal0) ->
+        match ensure(put_u8(w0, 1), 32768) do
+          SfWriter(a0, p) ->
+            match pal_scan(c, lut0, a0, p, pal0, 0, 0) do
+              SfPalScan(lut1, a1, pal1, n) ->
+                let used = if n > 256 do 256 else n end
+                let sc1 = SfScratch(lut_clear(lut1, pal1, 0, used), pal1)
+                -- a paletted chunk holds at most 256 ids; should it not, it
+                -- goes direct, over the indices and its form byte
+                if n > 256 do (put_direct(SfWriter(a1, p - 1), c), sc1)
+                else (put_pal(put_u16(SfWriter(a1, p + 32768), n), pal1, 0, n), sc1) end
+            end
+        end
+    end
+  end
+
+  pfn put_chunk(w : Writer, sc : Scratch, c : Strata.Chunk.Chunk) : (Writer, Scratch) do
+    let f = Ck.form(c)
+    if f == 0 do (put_u16(put_u8(w, 0), Ck.uniform_id(c)), sc)
+    else if f == 2 do (put_direct(w, c), sc)
+    else put_paletted(w, sc, c) end end
+  end
+
+  pfn rd_ids_go(r : SaveReader, flat : NativeI32Arr, i : Int) : (SaveReader, NativeI32Arr) do
+    if i >= 32768 do (r, flat) else
+      let (r1, id) = rd_u16(r)
+      rd_ids_go(r1, NativeArray.set_i32(flat, i, id), i + 1)
+    end
+  end
+  pfn rd_pal_go(r : SaveReader, pal : NativeIntArr, i : Int, n : Int) : (SaveReader, NativeIntArr) do
+    if i >= n do (r, pal) else
+      let (r1, id) = rd_u16(r)
+      rd_pal_go(r1, NativeArray.set_int(pal, i, id), i + 1, n)
+    end
+  end
+  -- the ids of 32768 palette indices at p; -1 at the first index past n
+  pfn unpal_go(a : NativeU8Arr, p : Int, pal : NativeIntArr, n : Int, flat : NativeI32Arr, i : Int) : (NativeI32Arr, Int) do
+    if i >= 32768 do (flat, 0)
+    else
+      let k = NativeArray.get_u8(a, p + i)
+      if k >= n do (flat, -1) else unpal_go(a, p, pal, n, NativeArray.set_i32(flat, i, NativeArray.get_int(pal, k)), i + 1) end
+    end
+  end
+
+  -- a chunk in its smallest form: Strata.Chunk.from_flat is what compact does
+  pfn rd_chunk(r0 : SaveReader) : (SaveReader, Strata.Chunk.Chunk) do
+    let (r1, f) = rd_u8(r0)
+    if not string_is_empty(r_err(r1)) do (r1, Ck.uniform(0))
+    else if f == 0 do
+      let (r2, id) = rd_u16(r1)
+      (r2, Ck.uniform(id))
+    else if f == 2 do
+      if left(r1) < 65536 do (failed(r1, "truncated: the body ends inside a chunk"), Ck.uniform(0))
+      else
+        let (r2, flat) = rd_ids_go(r1, NativeArray.make_i32(32768, 0), 0)
+        (r2, Ck.from_flat(flat))
+      end
+    else if f == 1 do
+      let (r2, at) = rd_skip(r1, 32768)
+      let (r3, n) = rd_u16(r2)
+      if not string_is_empty(r_err(r3)) do (r3, Ck.uniform(0))
+      else if n < 1 do (failed(r3, "a chunk's palette is empty"), Ck.uniform(0))
+      else if n > 256 do (failed(r3, "a chunk's palette has " ++ int_to_string(n) ++ " ids, over 256"), Ck.uniform(0))
+      else
+        let (r4, pal) = rd_pal_go(r3, NativeArray.make_int(256, 0), 0, n)
+        if not string_is_empty(r_err(r4)) do (r4, Ck.uniform(0))
+        else
+          match r4 do
+            SfReader(_, a, _, _, _) ->
+              let (flat, bad) = unpal_go(a, at, pal, n, NativeArray.make_i32(32768, 0), 0)
+              if bad < 0 do (failed(r4, "a chunk's palette index is past its palette"), Ck.uniform(0))
+              else (r4, Ck.from_flat(flat)) end
+          end
+        end
+      end end end
+    else (failed(r1, "unknown chunk form " ++ int_to_string(f)), Ck.uniform(0)) end end end end
+  end
+
+  -- ── Ops ──────────────────────────────────────────────────────────────────
+  -- An op is its tag (u8: 0 cell, 1 box, 2 sphere) and its Ints (i64) in
+  -- constructor order, as Strata.World.op_fields gives them.
+
+  pfn put_ints(w : Writer, xs : List(Int)) : Writer do
+    match xs do
+      Nil -> w
+      Cons(x, rest) -> put_ints(put_i64(w, x), rest)
+    end
+  end
+  pfn put_op(w : Writer, o : Strata.World.Op) : Writer do
+    let (tag, xs) = Wd.op_fields(o)
+    put_ints(put_u8(w, tag), xs)
+  end
+  pfn put_ops(w : Writer, os : List(Strata.World.Op)) : Writer do
+    match os do
+      Nil -> w
+      Cons(o, rest) -> put_ops(put_op(w, o), rest)
+    end
+  end
+
+  pfn rd_ints(r : SaveReader, n : Int, acc : List(Int)) : (SaveReader, List(Int)) do
+    if n <= 0 do (r, List.reverse(acc)) else
+      let (r1, x) = rd_i64(r)
+      rd_ints(r1, n - 1, Cons(x, acc))
+    end
+  end
+  pfn nth_int(xs : List(Int), i : Int) : Int do
+    match xs do
+      Nil -> 0
+      Cons(x, rest) -> if i <= 0 do x else nth_int(rest, i - 1) end
+    end
+  end
+  pfn rd_op(r0 : SaveReader) : (SaveReader, Strata.World.Op) do
+    let (r1, tag) = rd_u8(r0)
+    let none = Wd.op_cell(0, 0, 0, 0)
+    if not string_is_empty(r_err(r1)) do (r1, none)
+    else if tag == 0 do
+      let (r2, v) = rd_ints(r1, 4, Nil)
+      (r2, Wd.op_cell(nth_int(v, 0), nth_int(v, 1), nth_int(v, 2), nth_int(v, 3)))
+    else if tag == 1 do
+      let (r2, v) = rd_ints(r1, 7, Nil)
+      (r2, Wd.op_box(nth_int(v, 0), nth_int(v, 1), nth_int(v, 2), nth_int(v, 3), nth_int(v, 4), nth_int(v, 5), nth_int(v, 6)))
+    else if tag == 2 do
+      let (r2, v) = rd_ints(r1, 5, Nil)
+      (r2, Wd.op_sphere(nth_int(v, 0), nth_int(v, 1), nth_int(v, 2), nth_int(v, 3), nth_int(v, 4)))
+    else (failed(r1, "unknown op tag " ++ int_to_string(tag)), none) end end end end
+  end
+  pfn rd_ops_go(r : SaveReader, n : Int, acc : List(Strata.World.Op)) : (SaveReader, List(Strata.World.Op)) do
+    if n <= 0 do (r, List.reverse(acc))
+    else if not string_is_empty(r_err(r)) do (r, Nil)
+    else
+      let (r1, o) = rd_op(r)
+      rd_ops_go(r1, n - 1, Cons(o, acc))
+    end end
+  end
+
+  -- ── Region ───────────────────────────────────────────────────────────────
+
+  -- A region file's contents: the generator version and save counter that wrote it, its chunks that differ from their generation, its chunks' queued edits in order, and its sections.
+  type Region = { sr_generator : Int, sr_counter : Int, sr_chunks : List((Strata.Coord.Key, Strata.Chunk.Chunk)),
+                  sr_ops : List((Strata.Coord.Key, List(Strata.World.Op))), sr_sections : List((String, Bytes)) }
+
+  -- the bytes a region's chunks take: a key and the chunk's form
+  pfn chunks_size(cs : List((Strata.Coord.Key, Strata.Chunk.Chunk)), acc : Int) : Int do
+    match cs do
+      Nil -> acc
+      Cons((_, c), rest) ->
+        let f = Ck.form(c)
+        let each = if f == 0 do 3 else if f == 1 do 1 + 32768 + 2 + 512 else 1 + 65536 end end
+        chunks_size(rest, acc + 32 + each)
+    end
+  end
+
+  pfn put_chunks(w : Writer, sc : Scratch, cs : List((Strata.Coord.Key, Strata.Chunk.Chunk))) : Writer do
+    match cs do
+      Nil -> w
+      Cons((k, c), rest) ->
+        let (w1, sc1) = put_chunk(put_key(w, k), sc, c)
+        put_chunks(w1, sc1, rest)
+    end
+  end
+  pfn put_queued(w : Writer, qs : List((Strata.Coord.Key, List(Strata.World.Op)))) : Writer do
+    match qs do
+      Nil -> w
+      Cons((k, os), rest) -> put_queued(put_ops(put_u32(put_key(w, k), List.length(os)), os), rest)
+    end
+  end
+
+  doc "A region file: generator (i64), counter (i64), the chunks (u32 count; key, chunk each), the queued ops (u32 count; key, u32 count, ops each), the sections (u32 count; name, bytes each)."
+  fn encode_region(g : Region) : Bytes do
+    let w1 = put_i64(put_i64(sized(chunks_size(g.sr_chunks, 1024)), g.sr_generator), g.sr_counter)
+    let w2 = put_chunks(put_u32(w1, List.length(g.sr_chunks)), scratch(), g.sr_chunks)
+    let w3 = put_queued(put_u32(w2, List.length(g.sr_ops)), g.sr_ops)
+    finish(put_section_list(w3, g.sr_sections), magic_region())
+  end
+
+  pfn rd_chunks_go(r : SaveReader, n : Int, acc : List((Strata.Coord.Key, Strata.Chunk.Chunk))) : (SaveReader, List((Strata.Coord.Key, Strata.Chunk.Chunk))) do
+    if n <= 0 do (r, List.reverse(acc))
+    else if not string_is_empty(r_err(r)) do (r, Nil)
+    else
+      let (r1, k) = rd_key(r)
+      let (r2, c) = rd_chunk(r1)
+      rd_chunks_go(r2, n - 1, Cons((k, c), acc))
+    end end
+  end
+  pfn rd_queued_go(r : SaveReader, n : Int, acc : List((Strata.Coord.Key, List(Strata.World.Op)))) : (SaveReader, List((Strata.Coord.Key, List(Strata.World.Op)))) do
+    if n <= 0 do (r, List.reverse(acc))
+    else if not string_is_empty(r_err(r)) do (r, Nil)
+    else
+      let (r1, k) = rd_key(r)
+      -- an op is at least its tag and four i64s
+      let (r2, cnt) = rd_count(r1, 33)
+      let (r3, os) = rd_ops_go(r2, cnt, Nil)
+      rd_queued_go(r3, n - 1, Cons((k, os), acc))
+    end end
+  end
+
+  doc "The region file encode_region wrote, or the reason the bytes are not one."
+  fn decode_region(b : Bytes) : Result(Region, String) do
+    match reader(b, magic_region()) do
+      Err(e) -> Err(e)
+      Ok(r0) ->
+        let (r1, gen) = rd_i64(r0)
+        let (r2, counter) = rd_i64(r1)
+        -- a chunk is at least a key (32 bytes) and a uniform chunk (3)
+        let (r3, nc) = rd_count(r2, 35)
+        let (r4, cs) = rd_chunks_go(r3, nc, Nil)
+        -- a queued entry is at least a key and a count
+        let (r5, nq) = rd_count(r4, 36)
+        let (r6, qs) = rd_queued_go(r5, nq, Nil)
+        let (r7, ss) = rd_sections(r6)
+        settle(r7, { sr_generator: gen, sr_counter: counter, sr_chunks: cs, sr_ops: qs, sr_sections: ss })
+    end
+  end
+
+  -- ── Header ───────────────────────────────────────────────────────────────
+
+  -- The header file's contents: identity (seed, scale, registry fingerprint), the generator version, the save counter, the world sections, and the entity snapshot's three arrays (opaque here), or none.
+  type SaveHeader = { sh_seed : Int, sh_scale : Float, sh_fingerprint : Int, sh_generator : Int, sh_counter : Int,
+                  sh_sections : List((String, Bytes)), sh_entities : Option((NativeI32Arr, NativeF32Arr, NativeFloatArr)) }
+
+  pfn put_i32s(w : Writer, a : NativeI32Arr, i : Int, n : Int) : Writer do
+    if i >= n do w else put_i32s(put_u32(w, NativeArray.get_i32(a, i)), a, i + 1, n) end
+  end
+  pfn put_f32s(w : Writer, a : NativeF32Arr, i : Int, n : Int) : Writer do
+    if i >= n do w else put_f32s(put_u32(w, f32_bits(NativeArray.get_f32(a, i))), a, i + 1, n) end
+  end
+  pfn put_f64s(w : Writer, a : NativeFloatArr, i : Int, n : Int) : Writer do
+    if i >= n do w else put_f64s(put_f64(w, NativeArray.get_float(a, i)), a, i + 1, n) end
+  end
+
+  pfn put_snapshot(w : Writer, s : Option((NativeI32Arr, NativeF32Arr, NativeFloatArr))) : Writer do
+    match s do
+      None -> put_u8(w, 0)
+      Some((ia, fa, da)) ->
+        let ni = NativeArray.length_i32(ia)
+        let nf = NativeArray.length_f32(fa)
+        let nd = NativeArray.length_float(da)
+        let w1 = put_i32s(put_u32(put_u8(w, 1), ni), ia, 0, ni)
+        let w2 = put_f32s(put_u32(w1, nf), fa, 0, nf)
+        put_f64s(put_u32(w2, nd), da, 0, nd)
+    end
+  end
+
+  doc "The header file: seed (i64), scale (f64), fingerprint (i64), generator (i64), counter (i64), the sections (u32 count; name, bytes each), then 0 (u8) for no snapshot or 1 and its int32, float32 and double arrays, each a u32 count and its values."
+  fn encode_header(h : SaveHeader) : Bytes do
+    let w1 = put_i64(put_i64(put_i64(put_f64(put_i64(writer(), h.sh_seed), h.sh_scale), h.sh_fingerprint), h.sh_generator), h.sh_counter)
+    finish(put_snapshot(put_section_list(w1, h.sh_sections), h.sh_entities), magic_header())
+  end
+
+  pfn rd_i32s(r : SaveReader, a : NativeI32Arr, i : Int, n : Int) : (SaveReader, NativeI32Arr) do
+    if i >= n do (r, a) else
+      let (r1, v) = rd_u32(r)
+      let sv = if v >= 2147483648 do v - two32() else v end
+      rd_i32s(r1, NativeArray.set_i32(a, i, sv), i + 1, n)
+    end
+  end
+  pfn rd_f32s(r : SaveReader, a : NativeF32Arr, i : Int, n : Int) : (SaveReader, NativeF32Arr) do
+    if i >= n do (r, a) else
+      let (r1, v) = rd_u32(r)
+      rd_f32s(r1, NativeArray.set_f32(a, i, f32_of(v)), i + 1, n)
+    end
+  end
+  pfn rd_f64s(r : SaveReader, a : NativeFloatArr, i : Int, n : Int) : (SaveReader, NativeFloatArr) do
+    if i >= n do (r, a) else
+      let (r1, v) = rd_f64(r)
+      rd_f64s(r1, NativeArray.set_float(a, i, v), i + 1, n)
+    end
+  end
+
+  pfn rd_snapshot(r0 : SaveReader) : (SaveReader, Option((NativeI32Arr, NativeF32Arr, NativeFloatArr))) do
+    let (r1, flag) = rd_u8(r0)
+    if not string_is_empty(r_err(r1)) do (r1, None)
+    else if flag == 0 do (r1, None)
+    else if flag != 1 do (failed(r1, "an entity snapshot flag of " ++ int_to_string(flag)), None)
+    else
+      let (r2, ni) = rd_count(r1, 4)
+      let (r3, ia) = rd_i32s(r2, NativeArray.make_i32(Strata.Size.of(ni), 0), 0, ni)
+      let (r4, nf) = rd_count(r3, 4)
+      let (r5, fa) = rd_f32s(r4, NativeArray.make_f32(Strata.Size.of(nf), 0.0), 0, nf)
+      let (r6, nd) = rd_count(r5, 8)
+      let (r7, da) = rd_f64s(r6, NativeArray.make_float(Strata.Size.of(nd), 0.0), 0, nd)
+      (r7, Some((ia, fa, da)))
+    end end end
+  end
+
+  doc "The header file encode_header wrote, or the reason the bytes are not one."
+  fn decode_header(b : Bytes) : Result(SaveHeader, String) do
+    match reader(b, magic_header()) do
+      Err(e) -> Err(e)
+      Ok(r0) ->
+        let (r1, seed) = rd_i64(r0)
+        let (r2, scale) = rd_f64(r1)
+        let (r3, fp) = rd_i64(r2)
+        let (r4, gen) = rd_i64(r3)
+        let (r5, counter) = rd_i64(r4)
+        let (r6, ss) = rd_sections(r5)
+        let (r7, snap) = rd_snapshot(r6)
+        settle(r7, { sh_seed: seed, sh_scale: scale, sh_fingerprint: fp, sh_generator: gen, sh_counter: counter,
+                     sh_sections: ss, sh_entities: snap })
+    end
+  end
+
+  -- ── Player ───────────────────────────────────────────────────────────────
+
+  doc "A player file: the game's bytes for one player, as put_bytes writes them."
+  fn encode_player(b : Bytes) : Bytes do finish(put_bytes(writer(), b), magic_player()) end
+
+  doc "The player bytes encode_player wrote (a fresh value), or the reason the file is not one."
+  fn decode_player(b : Bytes) : Result(Bytes, String) do
+    match reader(b, magic_player()) do
+      Err(e) -> Err(e)
+      Ok(r0) ->
+        let (r1, v) = rd_bytes(r0)
+        settle(r1, v)
+    end
+  end
+end
