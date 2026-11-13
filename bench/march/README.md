@@ -36,4 +36,7 @@ and calls a runtime helper for `/` and `%` (`divmod`).
 | `stage_thermal` | Strata.Thermal.relax, whole stage | 110 ns | 3.2 ns | 34 |
 | `stage_density` | the viewer's per-voxel density, whole stage | 71 to 85 ns | 2.7 ns | 26 to 31 |
 
+`task_shared_list` is different: a crash, not a ratio. A list captured by a
+task and still read by its spawner kills the program in 18 of 20 runs.
+
 The findings are in `docs/2026-11-12-chunk-performance-findings.md`.
