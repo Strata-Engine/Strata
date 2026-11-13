@@ -15,4 +15,7 @@ touching the list after the spawn. Until March fixes it, the rule in
 Strata is: whatever a task's closure captures is not used again by the
 spawning thread, except values it only compares or passes on whole.
 
+Still reproduces on March c35e682c3: 18 of 20 die. Reported as
+march-language/march#1266.
+
 Run `./run.sh`.

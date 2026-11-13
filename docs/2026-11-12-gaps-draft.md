@@ -107,6 +107,10 @@ touch the value again. (Captured values the spawner later only passes on
 or compares, as the stream's keys and the generator are, have not been seen
 to fail.)
 
+Still reproduces on March c35e682c3 (after 65c0f5a8b, which fixed a related
+capture crash): 18 of 20 runs die. Reported as
+march-language/march#1266.
+
 ## Revisions to existing entries
 
 **S15** (a value shared by worker tasks is slow in a hot loop). Mechanism
