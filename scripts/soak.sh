@@ -59,6 +59,12 @@ fi
 qmax=3000000; [ "$(get levels)" != "0" ] && qmax=8388608
 [ "$(get live_quads)" -le $qmax ] || { echo "FAIL: the quad buffer grew without bound"; fail=1; }
 awk "BEGIN { exit !($(get worst_ms) <= 20.0) }" || { echo "FAIL: a frame took over 20 ms"; fail=1; }
+# no figures: the animation is never updated, and the renderer's figure path (its draw list, culling
+# and shadow map) costs under 0.1 ms, CPU and shadow pass together, in the worst of each (a regression guard;
+# the light pass's share with no figures is not timed here)
+[ "$(get fig_updates)" = "0" ] || { echo "FAIL: figures were updated in a run with none"; fail=1; }
+echo "figures with none: worst preparation $(get fig_prep_us) us, worst shadow pass $(get fig_shadow_ms) ms"
+awk "BEGIN { exit !($(get fig_prep_us) / 1000.0 + $(get fig_shadow_ms) < 0.1) }" || { echo "FAIL: with no figures the figure path took 0.1 ms or more in a frame"; fail=1; }
 [ "$(get fluid_waiting)" = "0" ] || { echo "FAIL: fluid cells were left waiting at the end: the cap was exceeded"; fail=1; }
 # offscreen a frame is about 3 ms, so six frames can be less than the worker needs and the main thread waits for it
 awk "BEGIN { exit !($(get fluid_worst_ms) <= 6.0) }" || { echo "FAIL: a fluid step held the main thread for over 6 ms"; fail=1; }

@@ -1499,6 +1499,50 @@ static void test_cull_hash(void) {
     CHECK(ht[0] != ht[1], "a skipped figure's clip time is in the hash");
 }
 
+/* a skipped figure's placement is in the hash: two worlds that differ only in
+ * where an out-of-view figure was put hash differently, before and after the
+ * next update, though neither poses it */
+static void test_skipped_place_hash(void) {
+    int f, c, s;
+    AnWorld *a = cull_world(1, &f, &c, &s), *b = cull_world(1, &f, &c, &s);
+    an_update(a, 1.0f / 60); an_update(b, 1.0f / 60);
+    float pa[3] = {0, 0, 0}, pb[3] = {0.01f, 0, 0};
+    an_place(a, f, pa, an_qid); an_place(b, f, pb, an_qid);
+    CHECK(an_hash(a) != an_hash(b), "a skipped figure's placement is in the hash");
+    an_update(a, 1.0f / 60); an_update(b, 1.0f / 60);
+    CHECK(an_stat(a, 1) == 0 && an_stat(b, 1) == 0, "neither update poses the culled figures");
+    CHECK(an_hash(a) != an_hash(b), "and stays in it after an update that skips the figure");
+    an_close(a); an_close(b);
+}
+
+/* a world opened in another's place is a generation on, and its figure ids
+ * carry on: an id from the old world names nothing in the new one */
+static void test_reopen(void) {
+    AnWorld *w = an_reopen(NULL, 4);
+    CHECK(w && w->generation == 1, "the first world is generation 1");
+    int rig = chain(w, 0);
+    int f0 = an_spawn(w, rig), f1 = an_spawn(w, rig);
+    w = an_reopen(w, 4);
+    CHECK(w && w->generation == 2, "a reopened world is one generation on");
+    int32_t parent[1] = {-1};
+    float pivot[3] = {0, 0, 0}, rest[4] = {0, 0, 0, 1}, box[6] = {-1, 0, -1, 1, 1, 1};
+    int rig2 = an_rig(w, 1, parent, pivot, rest, box);
+    CHECK(rig2 == rig, "rig ids start again at 0, so a renderer must tell worlds apart by generation");
+    int g = an_spawn(w, rig2);
+    CHECK(g >= 0 && g != f0 && g != f1, "figure ids carry on across a reopen");
+    CHECK(an_fig(w, f0) == NULL && an_fig(w, f1) == NULL, "the old world's ids name no figure");
+    /* the same calls hash the same in a fresh world and in one opened after another */
+    AnWorld *fresh = an_open(4);
+    an_rig(fresh, 1, parent, pivot, rest, box);
+    an_spawn(fresh, 0);
+    CHECK(an_hash(fresh) == an_hash(w), "ids are hashed from the world's first, so a reopened world hashes as a fresh one");
+    an_close(fresh);
+    an_close(w);
+    AnWorld *v = an_open_next(4, 7, AN_IDS - 1);
+    CHECK(v && v->generation == 8 && an_spawn(v, -1) < 0, "an_open_next is one generation past the one given");
+    an_close(v);
+}
+
 static void test_far_springs(void) {
     AnWorld *w = an_open(4);
     int rig = tail(w);
@@ -1811,6 +1855,8 @@ int main(void) {
     test_cull_marks();
     test_cull_answers();
     test_cull_hash();
+    test_skipped_place_hash();
+    test_reopen();
     test_far_springs();
     test_two_poses();
     test_drawn_steady();

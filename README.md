@@ -442,6 +442,66 @@ let poses = Strata.Anim.matrices(a5, fig)     -- 12 floats a part: a 3x4 in worl
 let steps = Strata.Anim.marks(a5)             -- (figure, layer, tag, weight), in time order
 ```
 
+The frame loop. A game moves its figures, asks for feet, gives the camera,
+updates once, asks its questions, then draws; the renderer was handed the
+rigs once and reads every listed figure's pose itself:
+
+```march
+-- once, after the rigs are finished: meshes, ray shapes and palettes, shared by every figure of a rig
+let sl1 = Strata.Render.figures(sl0, a4, [rig])
+
+-- every frame, in this order
+let b1 = Strata.Anim.place(a4, fig, x, y, z, facing)          -- where the game puts it (no physics)
+let b2 = Strata.Anim.ground(b1, fig, world, 1.0)              -- foot placement for a rig with legs: before update
+let b3 = Strata.Anim.view(b2, planes, ex, ey, ez, 0.0)        -- the camera's six planes: out of view poses 1 update in 4; give it every drawn frame
+let b4 = Strata.Anim.update(b3, dt)
+let hit = Strata.Anim.hit_ray(b4, ex, ey, ez, dx, dy, dz, 100.0, -1)   -- figure, part, voxel, distance
+let shown = Strata.Render.draw(1.0)                           -- each figure 1.0 of the way to its last pose
+```
+
+Answers (marks, sockets, hits) never depend on the camera: a query poses
+a stale figure first. Give `view` every frame you draw, even one with no
+`update` (a 60 Hz update under a 120 Hz display): the renderer lists figures
+against the last view given. A hit ray every frame, as above, poses every
+figure the update skipped, which gives back culling's CPU saving until the
+kernel poses only the figures along the ray. `Strata.Anim.open` again
+voids every rig and clip id (they start at 0 again; hand the new rigs to
+`Strata.Render.figures`, which re-uploads them); figure ids carry on, so an
+old one names no new figure. `Strata.Anim.traced(a, fig, true)` puts up to 64
+figures among what the light pass's rays hit (their shadows, reflections,
+sky darkening and glow); the rest are drawn plain and cast their sun
+shadow from a shadow map. `attach` hangs one figure from another's socket
+(a torch, a sword). `override`, `aim`, `reach` and `spring` work after the
+layers, in that order.
+
+A game links the kernel beside the renderer (forge does not build a
+dependency's C sources). A game that draws lists both:
+
+    [ffi]
+    sources = ["../strata/native/strata_vk.c", "../strata/native/strata_anim.c"]
+    link = ["-I../strata/native", "-I/opt/homebrew/include", "-L/opt/homebrew/lib",
+            "-lglfw", "-lvulkan", "-Wl,-rpath,/opt/homebrew/lib"]
+
+`strata_anim.c` includes nothing from Vulkan or GLFW and needs no library;
+one that animates without drawing lists it alone:
+
+    [ffi]
+    sources = ["../strata/native/strata_anim.c"]
+    link = ["-I../strata/native"]
+
+In the viewer (`viewer/lib/figures.march` holds its example rigs and clips:
+the humanoid with seven clips, a torch, a sword, a bird, a fish and a cart):
+`G` spawns 64 wandering humanoids (opening a figure world if none is),
+`K` switches foot placement and springs, `T` switches the 8 nearest
+humanoids between plain and traced, `V` hands the nearest a lit torch, and
+the crosshair's hit ray outlines the part it meets. `STRATA_ANIM_METER=1`
+prints once a second
+`anim: figures f posed p stale s parts d traced t update u ms`. Scenes 31
+to 41 show the figures (`STRATA_SCENE=n`): 37 the stairs, 38 the sword
+mid-swing, 39 the creatures by the lake, 40 the arena (512 runners; for
+timing, `STRATA_ARENA_LOG=1`, `STRATA_ARENA_RAYS=n`), 41 figure shadows
+under leaves. Measurements are in `RESULTS.md`.
+
 `scripts/anim_check.sh` builds `animcheck/` and runs its scenes; to see the
 chain's matrices at t = 0, 0.25 and 0.5:
 

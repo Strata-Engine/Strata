@@ -38,7 +38,7 @@ mod Strata.Anim do
   -- takes it), its palette index, the distance in metres and the struck face's normal in world space.
   type FigureHit = { fig : Int, part : Int, x : Int, y : Int, z : Int, colour : Int, dist : Float, normal : (Float, Float, Float) }
 
-  doc "Open the figure world for up to [capacity] figures (1..4096), closing any open one."
+  doc "Open the figure world for up to [capacity] figures (1..4096), closing any open one. Every rig and clip id of the old world is void: they start again at 0, so finish rigs and clips anew (and hand them to `Strata.Render.figures` again; it re-uploads, telling worlds apart by `generation`). Figure ids carry on from the old world's, so an old figure id names no new figure: a call on it is refused."
   fn open(capacity : Int) : Anim do
     let ok = Strata.Ffi.Anim.open(capacity)
     { rigs: Nil, capacity: if ok do capacity else 0 end }
@@ -49,6 +49,9 @@ mod Strata.Anim do
     Strata.Ffi.Anim.close()
     { a with rigs: Nil, capacity: 0 }
   end
+
+  doc "The generation of the world: 0 before any `open`, one more at each. A rig id means something only with its generation."
+  fn generation(_a : Anim) : Int do Strata.Ffi.Anim.generation() end
 
   doc "How many figures the world was opened for; 0 when it could not be opened or is closed."
   fn capacity(a : Anim) : Int do a.capacity end
@@ -326,7 +329,12 @@ mod Strata.Anim do
 
   doc "Hang figure [child] from figure [parent]'s socket [socket] (a socket number of the parent's rig), placed at (x, y, z) metres turned by [q] in the socket's frame. It is posed after its parent in every update, and moves with it. Chains go four deep; a cycle, a deeper chain, or no such figure or socket is refused (counted in `stats`). A figure already hanging moves to the new socket. A figure whose parent is removed is detached where it stands."
   fn attach(a : Anim, child : Int, parent : Int, socket : Int, x : Float, y : Float, z : Float, q : Strata.Math.Quat.Quat) : Anim do
-    if Strata.Ffi.Anim.attach(child, parent, socket, x, y, z, Qt.x(q), Qt.y(q), Qt.z(q), Qt.w(q)) do a else a end
+    match try_attach(a, child, parent, socket, x, y, z, q) do (a2, _) -> a2 end
+  end
+
+  doc "`attach`, answering whether it was taken: false when refused (a cycle, a chain past four deep, no such figure or socket), which changes nothing."
+  fn try_attach(a : Anim, child : Int, parent : Int, socket : Int, x : Float, y : Float, z : Float, q : Strata.Math.Quat.Quat) : (Anim, Bool) do
+    (a, Strata.Ffi.Anim.attach(child, parent, socket, x, y, z, Qt.x(q), Qt.y(q), Qt.z(q), Qt.w(q)))
   end
 
   doc "Figure [child] no longer hangs; it is left at its parent's socket as the parent stands now."
@@ -368,7 +376,7 @@ mod Strata.Anim do
     end
   end
 
-  doc "The camera, used from the next update: [planes] holds 24 floats, six planes (a, b, c, d) with ax + by + cz + d >= 0 inside (fewer than 24 floats: no planes, every figure in view); the eye at (ex, ey, ez); [far] metres past which a figure is far (0 for none). A figure whose bounds lie more than 2 m outside a plane, and not `always`, is posed one update in four; a far one every other update with its springs frozen. Marks, sockets and hits are the same whatever the camera sees."
+  doc "The camera, used from the next update: [planes] holds 24 floats, six planes (a, b, c, d) with ax + by + cz + d >= 0 inside (fewer than 24 floats: no planes, every figure in view); the eye at (ex, ey, ez); [far] metres past which a figure is far (0 for none). A figure whose bounds lie more than 2 m outside a plane, and not `always`, is posed one update in four; a far one every other update with its springs frozen. Marks, sockets and hits are the same whatever the camera sees. Give it every drawn frame, not only before `update`: the renderer lists figures against the last view given, so a frame drawn between updates (a 60 Hz update under a 120 Hz display) with an older camera can leave a figure just come into view undrawn for that frame."
   fn view(a : Anim, planes : NativeF32Arr, ex : Float, ey : Float, ez : Float, far : Float) : Anim do
     Strata.Ffi.Anim.view(planes, ex, ey, ez, far)
     a
@@ -406,12 +414,12 @@ mod Strata.Anim do
     if copied > 0 do out else NativeArray.make_f32(0, 0.0) end
   end
 
-  doc "A hash of every live figure's pose: equal runs give equal hashes."
+  doc "A hash of every live figure's carried state: layers, placement, the drop, procedural records, attachments, and the schedule (which figures the camera left unposed, and their poses only when posed). Equal calls give equal hashes; since it covers the schedule, compare runs given the same `view` calls (a run with a camera and one without hash differently, though every mark, socket and hit agrees)."
   fn hash(_a : Anim) : Int do Strata.Ffi.Anim.hash() end
 
-  doc "(figures, posed by the last update, stale since it, refused calls)."
+  doc "(figures, posed by the last update, left unposed by the last update (out of view or far: stat 11), refused calls). Parts drawn are `Strata.Ffi.Vk.stat(10)`; update time is measured only by animcheck (`Strata.Ffi.Anim.timing`)."
   fn stats(_a : Anim) : (Int, Int, Int, Int) do
-    (float_to_int(Strata.Ffi.Anim.stat(0)), float_to_int(Strata.Ffi.Anim.stat(1)), float_to_int(Strata.Ffi.Anim.stat(2)), float_to_int(Strata.Ffi.Anim.stat(3)))
+    (float_to_int(Strata.Ffi.Anim.stat(0)), float_to_int(Strata.Ffi.Anim.stat(1)), float_to_int(Strata.Ffi.Anim.stat(11)), float_to_int(Strata.Ffi.Anim.stat(3)))
   end
   doc "A figure of the kernel's: 0 figures, 1 posed, 2 stale, 3 refused calls, 4 negative dt, 5 the last refusal's reason (AN_R_* in strata_anim.h), 6 marks dropped, 7 procedural records in use, 8 passes queries made over the figures to pose stale ones, 9 figures traced past the cap of 64, 10 parts left out of the last draw list, 11 figures the last update did not pose (out of view or far)."
   fn stat(_a : Anim, which : Int) : Float do Strata.Ffi.Anim.stat(which) end

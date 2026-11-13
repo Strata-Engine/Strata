@@ -679,7 +679,7 @@ animcheck/.march/build/release/animcheck` on a quiet machine to judge them.
 - **Rays.** These rays run from 0.2-2.6 m up in front of the crowd toward a
   figure 0-2 m up, and 9 562 of 10 000 hit. Most stop at the first figure in
   their way, which is why they are cheap.
-- **Memory** at 4 096 figures (sizeof, decimal MB), rigs excluded: 46.34 MB,
+- **Memory** at 4 096 figures (sizeof, decimal MB), rig sockets and part grids excluded: 46.34 MB,
   leaving 1.66 MB under 48 MB.
   - Figures 7.90 (AnFig 1 928 B), matrices 12.58, previous matrices 12.58.
   - Keys 5.51, clips 2.21, rigs 0.87, masks 0.07, marks 0.26, events 1.31.
@@ -688,6 +688,108 @@ animcheck/.march/build/release/animcheck` on a quiet machine to judge them.
   - Counting the rig data too (sockets 0.26, part grids 2.51) gives 49.11 MB.
 - **Drawing.** A figure posed every few updates is drawn with its blend
   stretched over that period, one period behind its pose (review fix I1).
+
+## Task 9: the arena drawn, measured against every target
+
+Scene 40: 512 humanoids on a levelled floor 120 x 80 m, each running its
+own 1.5 m circle at 4 m/s, a looping sword stroke over the right arm,
+spine and head aiming at the eye, foot placement for the 128 nearest, 32
+traced. 2560 x 1600 pixels, offscreen, vsync off, light mode 4, sun 40,
+view radius 10. Each configuration runs 600 frames; the figures are means
+over frames 120-599 from `STRATA_ARENA_LOG=1`. GPU times come from the
+renderer's timestamps (stat 3 for the frame, 14 for the figure shadow
+pass). The update and hit-ray times come from the C shim's clock.
+
+**Nothing here is judged.** The plan trusts a timing only at a load
+average under 8. The load was checked every 10 minutes for an hour
+(10:22 to 11:22). It read 33, 15, 10, 14, 76, 30 and 23, and never fell
+under 8. Both sets below were taken anyway: set 1 at load 20-32 (10:21),
+set 2 at load 25-42 (11:23). The design's order of what gives way (the
+stale-pose rate, fewer foot-placement figures, a cap of 32 then 16,
+reflections skipping figures) was **not applied**: it is to act on
+trusted numbers only.
+
+| | target | set 1 | set 2 | verdict |
+|---|---|---|---|---|
+| `Strata.Anim.update`, arena (C) | 1.0 ms | 0.88-0.94 ms | 0.92-1.04 ms | not judged; at the target |
+| `Strata.Anim.ground`, 128 figures (March) | 0.5 ms | 0.98-1.06 ms | 1.02-1.16 ms | not judged; a likely miss |
+| figure pass, arena, GPU (B - A) | 1.5 ms | 2.16 ms | 2.61 ms | not judged; above the target |
+| figure shadow map, arena, GPU (stat 14) | 1.0 ms | 0.05-0.08 ms | 0.04-0.07 ms | not judged; far under |
+| traced, 64 in view, GPU (D - C) | 1.5 ms | 4.51 ms | 5.14 ms | not judged; a likely miss |
+| traced, none opted in, GPU (A - A0) | under 0.1 ms | -2.0 ms (noise) | +0.01 ms | not judged |
+| hit ray, arena, mean of 100 a frame (C) | 10 µs | 2.6-2.7 µs | 2.8 µs | not judged; far under |
+| frame rate, arena, everything on | 120 fps | 92-95 fps | 87-89 fps | not judged; a likely miss (GPU) |
+| figures / layers / parts | 4096 / 8 / 64 | `AN_FIGURES`, `AN_LAYERS`, `AN_PARTS` in `strata_anim.h` | | met (the kernel's limits) |
+| C memory, 4096 figures, two poses | 48 MB | 46.34 MB (Task 5, sizeof) | | met |
+| GPU memory for figure quads | 64 MB | 708 quads, 5.7 KB, for all six rigs; 2 MB of instance buffers | | met |
+| added to the soak's worst frame, no figures | under 0.1 ms | CPU: the figure path's worst 0.021 ms (stat 20); GPU: no figure shadow pass ran (stat 21, 0 ms); 0 updates; load 37-54 | | not judged; both parts under the target even at this load, but the light pass's share with no figures is unmeasured (see "traced, none opted in") |
+
+The configurations: A0 is the arena with no figure world (`STRATA_ARENA=-1`).
+A is the world open with no figures. B is 512 runners, none traced, no
+figure shadows. C is B with shadows. E is C with 32 traced (the arena as
+specified). D is C with 64 traced. R is E with 100 hit rays a frame. GPU
+frame means:
+
+| | A0 | A | B | C | E | D | R |
+|---|---|---|---|---|---|---|---|
+| set 1 | 7.40 | 5.39 | 7.56 | 7.42 | 10.51 | 11.93 | 10.09 |
+| set 2 | 5.30 | 5.31 | 7.91 | 8.12 | 11.32 | 13.26 | 11.45 |
+
+- **Noise.** A0 and A should be nearly equal; in set 1 they differ by
+  2 ms. Differences under about 2 ms are not readable at this load. That
+  covers the figure pass, the "none traced" row, and the shadow map
+  checked as C - B (-0.13 and +0.21 ms).
+- **Update.** About 95 of the 512 skip each update (out of view, posed
+  one in four).
+- **Ground.** Its mean is about 1.0-1.1 ms for 256 rays through
+  `Strata.Query.raycast` and the calls round them. This is the same cause
+  measured headless in Task 5: March's per-ray and per-call cost. The
+  design's fallbacks (one ray per leg every other frame, then fewer
+  figures) are the second rung of the ladder and were not applied.
+- **Traced.** 32 traced add about 3.1 ms, and 64 add 4.5-5.1 ms. That is
+  more than Task 8's 2.1 ms for 64 because the pixels are four times as
+  many (2560 x 1600 against 1280 x 800): the rays are paid per pixel.
+- **Frame rate.** These runs were scripted with the display off
+  (`STRATA_UI` is 0 by default), so the HUD and the crosshair's hit ray
+  are not in their frames. The frame is GPU-bound: the CPU spends 1.1-1.4 ms in
+  the shim and March (the update and ground included), then waits 6-8 ms
+  for the GPU. At about 10.5-11.3 ms of GPU it runs at 87-95 fps. Where
+  the time goes: the world alone (A) about 5.3 ms, the figure pass about
+  2.2-2.6 ms, the 32 traced about 3.1 ms.
+- **Hit rays.** The 100 rays a frame run across the middle of the view,
+  after the update. The first of each frame poses the figures the update
+  skipped; that cost is in the mean.
+- **GPU memory.** The rigs' meshes are held once: 708 quads of 8 bytes
+  across the humanoid, torch, sword, bird, fish and cart. The per-frame
+  instance buffers hold 16 384 parts x 2 (camera and shadow) x 32 bytes x
+  2 frames in flight, which is 2 MB.
+
+- **The soak with no figures** (`scripts/soak.sh`, 11:24, load 37-54).
+  The animation was never updated. The renderer's figure path took at
+  most 21 µs of CPU in any of 3000 frames (the draw-list call that finds
+  nothing) and ran no shadow pass. The soak now checks these (stats 20 and
+  21). That is CPU time and the figure shadow pass only: the light pass's
+  figure code with none traced (the traced-figure list check, the movers
+  buffer of 144 boxes) and the G-buffer's empty figure path are not timed
+  by them, so the row is not judged. The worst frame itself cannot show a
+  0.1 ms difference at this load: it was 94 ms. The same load failed the soak's own frame-time,
+  fluid-step and mixer checks, which have nothing to do with figures (see
+  the soak notes above).
+
+- **A hit ray every frame forfeits culling's CPU saving** (final review). The
+  first query after an update poses every figure the update skipped, and
+  README's frame loop casts a hit ray every frame, so a game written from it
+  poses every figure every frame until the kernel poses only the figures
+  along the ray; the update row above assumes no per-frame query.
+- **The far tier is unmeasured on the drawn arena** (final review): neither
+  the viewer nor the arena passes a far distance, so the stale-pose rate for
+  distant figures, the cost ladder's first rung, is exercised only by the C
+  tests. Say so when the arena is re-measured on a quiet machine.
+
+Rerun on a quiet machine to judge:
+`STRATA_SCENE=40 STRATA_SIZE=2560x1600 STRATA_PIXELS=1 STRATA_OFFSCREEN=1 STRATA_VSYNC=0 STRATA_LIGHT=4 STRATA_ARENA_LOG=1`,
+with `STRATA_ARENA`, `STRATA_ARENA_TRACED`, `STRATA_FIG_SHADOWS` and
+`STRATA_ARENA_RAYS` as above.
 
 # Entities
 
