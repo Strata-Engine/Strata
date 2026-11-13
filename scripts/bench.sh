@@ -8,7 +8,7 @@ cd "$(dirname "$0")/.." || exit 1
 name=${1:-bench}; [ $# -gt 0 ] && shift
 out="${TMPDIR:-/tmp}/strata-bench-$name.log"
 env MARCH_PIN_MAIN=1 STRATA_HIDDEN=1 STRATA_OFFSCREEN=1 STRATA_SIZE=1280x800 STRATA_SHORE=1 STRATA_COMBAT=1 STRATA_LIGHT=4 \
-    STRATA_FRAMES=2400 STRATA_SLOT=0 STRATA_BENCH=1 STRATA_SHOT=/dev/null "$@" ./viewer/.march/build/release/strata_viewer > "$out" 2>&1
+    STRATA_FRAMES=2400 STRATA_SLOT=0 STRATA_BENCH=1 STRATA_SHOT=/dev/null "$@" "${STRATA_BIN:-./viewer/.march/build/release/strata_viewer}" > "$out" 2>&1
 grep '^bench: ' "$out" | awk -v name="$name" '
   NR > 590 { for (i = 2; i <= 8; i++) v[i, ++n[i]] = $i; if ($2 > 8.33) over++ ; if ($4 > 8.33) gover++; m++ }
   function pct(i, p,   k, a, j) { for (k = 1; k <= n[i]; k++) a[k] = v[i, k]; asort_(a, n[i]); j = int(p * n[i]); if (j < 1) j = 1; return a[j] }

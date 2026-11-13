@@ -91,10 +91,14 @@ void main() {
     bool sample_now = kept < 4.0 || settling || (((px.x >> 3) & 1) + 2 * ((px.y >> 3) & 1)) == (frame & 3);
     // sky light changes slowly and costs most (its rays go far): a settled pixel traces it one frame in sixteen, in a pattern that moves round each
     // 4 x 4 block of 8-pixel tiles, against the sun's one in four
-    bool sky_now = kept < 4.0 || settling || (((px.x >> 3) & 3) + 4 * ((px.y >> 3) & 3)) == (frame & 15);
+    // A pixel with little memory, or one settling, traces sky light one frame in four, a pixel of each 2 x 2 block in turn (so a quarter of the
+    // pixels newly in view trace it each frame, not all of them: turning the view had made the light pass three times as slow); until its first
+    // sample it is lit by the flat sky term. The sun's ray, which is cheaper, it still traces every frame.
+    bool fresh = kept < 4.0 || settling;
+    bool sky_now = fresh ? ((px.x & 1) + 2 * (px.y & 1)) == (frame & 3) : (((px.x >> 3) & 3) + 4 * ((px.y >> 3) & 3)) == (frame & 15);
     float sun_vis = old.a;
     int rays = mode >= 4 ? int(u.light.w) : 0;
-    vec3 sky = rays > 0 ? old.rgb : sky_flat(n);
+    vec3 sky = rays > 0 ? (kept > 0.0 ? old.rgb : sky_flat(n)) : sky_flat(n);
     float count = kept;
     if (sample_now || shade_moves) {
         float sun_now = sun_visible(at, n, sun_toward(rand2(px, frame, 0)));
