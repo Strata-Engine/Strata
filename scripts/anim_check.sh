@@ -9,7 +9,7 @@ OUT="${TMPDIR:-/tmp}/strata-anim.$$"; mkdir -p "$OUT"
 trap 'rm -rf "$OUT"' EXIT
 (cd animcheck && forge build --release > "$OUT/build.log" 2>&1) || { echo "FAIL: animcheck build"; tail -20 "$OUT/build.log"; exit 1; }
 AC=animcheck/.march/build/release/animcheck
-for s in chain determinism marks mask empty table stairs hits arena ground128; do
+for s in chain determinism marks mask empty reopen table stairs hits arena ground128 place_many; do
   if ! ANIMCHECK_SCENE=$s $AC > "$OUT/$s.log" 2>&1; then echo "FAIL: animcheck scene $s"; cat "$OUT/$s.log"; exit 1; fi
   tail -1 "$OUT/$s.log"
 done

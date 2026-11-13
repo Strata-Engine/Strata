@@ -1,0 +1,135 @@
+-- Snapshot and restore against the entity kernel. The library's own tests
+-- (test/) do not link C, so the kernel-backed property lives here, in the
+-- app that lists native/strata_ent.c in its [ffi] sources.
+mod Entcheck.Test.Snapshot do
+
+  needs IO.Clock      -- charged to every test module once any uses Check.all (GAPS S3)
+  needs IO.Process
+  needs IO.Console
+  needs IO.FileRead   -- the city scene's atlas cache, charged to the test module too (as GAPS S3)
+  needs IO.FileWrite
+  needs IO.Foreign
+  needs Ent
+  needs Anim
+  import Test
+  alias Strata.Entities as En
+
+  -- kinds: 0 a walker with 3 float and 2 int slots, freezing unseen at divisor 4; 1 a flyer with gravity, living unseen
+  -- at divisor 2, a 1 s lifetime; 2 a placed kind
+  pfn kinds() : List(Strata.Entities.Kind) do
+    [En.with_unseen(En.with_slots(En.with_mover(En.kind(), En.walking(), 0.3, 0.9, 0.3, 0.6, 9.8), 3, 2), En.freezes(), 4),
+     En.with_lifetime(En.with_unseen(En.with_slots(En.with_mover(En.kind(), En.flying(), 0.1, 0.1, 0.1, 0.0, 9.8), 1, 1), En.lives(), 2), 1.0),
+     En.kind()]
+  end
+  pfn fresh() : Strata.Entities.Entities do En.open(kinds(), 256, 128, 6, 32.0, 1.0) end
+
+  -- one scripted call: (what, a, b); ids and routes as the script has made them
+  type SnapRun = SnapRun(Strata.Entities.Entities, List(Int), List(Int))
+
+  pfn nth_or(xs : List(Int), i : Int) : Int do unwrap_or(List.nth_opt(xs, i), -1) end
+  pfn without(xs : List(Int), i : Int) : List(Int) do List.append(List.take(xs, i), List.drop(xs, i + 1)) end
+
+  pfn op(r : SnapRun, what : Int, a : Int, b : Int) : SnapRun do
+    match r do
+      SnapRun(e, ids, routes) ->
+        let n = List.length(ids)
+        let x = int_to_float(a % 200) *. 0.5
+        let z = int_to_float(b % 200) *. 0.5
+        if what == 0 || n == 0 do
+          let k = a % 3
+          let (e1, id) = En.add(e, k, x, int_to_float(b % 7), z, int_to_float(a % 628) *. 0.01)
+          let nr = List.length(routes)
+          let e2 = if k == 0 && nr > 0 do En.follow(e1, id, nth_or(routes, b % nr), 0.5 +. int_to_float(a % 5) *. 0.5, b % 2 == 0)
+            else if k == 1 do En.set_velocity(e1, id, int_to_float(a % 9) -. 4.0, int_to_float(b % 5), int_to_float(b % 9) -. 4.0) else e1 end end
+          SnapRun(e2, if id >= 0 do Cons(id, ids) else ids end, routes)
+        else if what == 1 do SnapRun(En.remove(e, nth_or(ids, a % n)), without(ids, a % n), routes)
+        else if what == 2 do
+          let id = nth_or(ids, a % n)
+          SnapRun(En.set_int(En.set_float(En.set_position(e, id, x, 1.0, z), id, 0, int_to_float(b) *. 0.01), id, 1, a * 1000003 - b), ids, routes)
+        else if what == 3 do
+          let (e1, rt) = En.route(e, [(x, 0.0, z), (x +. 6.0, 1.0, z), (x +. 6.0, 0.5, z +. 4.0)])
+          SnapRun(e1, ids, if rt >= 0 do Cons(rt, routes) else routes end)
+        else if what == 4 do
+          let nr = List.length(routes)
+          if nr == 0 do r else SnapRun(En.free_route(e, nth_or(routes, a % nr)), ids, without(routes, a % nr)) end
+        else SnapRun(En.step(e, Nil, 1.0 /. 60.0), ids, routes) end end end end end
+    end
+  end
+  pfn script(r : SnapRun, ops : List((Int, Int, Int))) : SnapRun do
+    match ops do
+      Nil -> r
+      Cons((what, a, b), t) -> script(op(r, what, a, b), t)
+    end
+  end
+  pfn run_of(r : SnapRun) : Strata.Entities.Entities do match r do SnapRun(e, _, _) -> e end end
+
+  -- the hash after each of [n] ticks with no focus, first tick first
+  pfn hashes(e : Strata.Entities.Entities, n : Int, acc : List(Int)) : (Strata.Entities.Entities, List(Int)) do
+    if n <= 0 do (e, List.reverse(acc))
+    else
+      let e1 = En.step(e, Nil, 1.0 /. 60.0)
+      hashes(e1, n - 1, Cons(En.hash(e1), acc))
+    end
+  end
+
+  -- the script up to [at], a snapshot, the rest of the script and 60 ticks; then a second world restored from the
+  -- snapshot runs the rest and the 60 ticks: the two runs' hashes, tick by tick
+  pfn two_runs(ops : List((Int, Int, Int)), at : Int) : (Bool, List(Int), List(Int)) do
+    let k = at % (List.length(ops) + 1)
+    let r1 = script(SnapRun(fresh(), Nil, Nil), List.take(ops, k))
+    let snap = En.snapshot(run_of(r1))
+    let (e1, h1) = hashes(run_of(r1), 60, Nil)
+    let e1c = En.close(e1)
+    let (e2, restored) = En.restore(fresh(), snap)
+    let (e3, h2) = hashes(e2, 60, Nil)
+    let e3c = En.close(e3)
+    (restored && !En.is_open(e1c) && !En.is_open(e3c), h1, h2)
+  end
+
+  pfn op_gen() : Generator((Int, Int, Int)) do Gen.tuple3(Gen.frequency([(4, Gen.int(0, 0)), (1, Gen.int(1, 1)), (2, Gen.int(2, 2)), (1, Gen.int(3, 3)), (1, Gen.int(4, 4)), (3, Gen.int(5, 5))]), Gen.int(0, 100000), Gen.int(0, 100000)) end
+
+  describe "Snapshot and restore" do
+    test "with no focus, a world restored from a snapshot at a random tick hashes as the original for the next 60 ticks" do
+      Check.all(Gen.tuple2(Gen.list(op_gen()), Gen.int(0, 1000)), fn p ->
+        match p do
+          (ops, at) ->
+            match two_runs(ops, at) do
+              -- a property returning false does not fail under forge test (GAPS S31): it raises instead
+              (ok, h1, h2) -> if ok && List.length(h1) == 60 && h1 == h2 do true else panic("the restored run's hashes differ from the original's (or the restore was refused)") end
+            end
+        end
+      )
+    end
+
+    test "a snapshot restored and snapshotted again gives equal arrays" do
+      let r = script(SnapRun(fresh(), Nil, Nil), [(3, 1, 2), (0, 3, 4), (0, 6, 1), (0, 4, 9), (5, 0, 0), (1, 1, 0), (0, 7, 7), (5, 0, 0), (2, 0, 33)])
+      let s1 = En.snapshot(run_of(r))
+      let (e2, ok) = En.restore(fresh(), s1)
+      let s2 = En.snapshot(e2)
+      let (i1, f1, d1) = En.snapshot_arrays(s1)
+      let (i2, f2, d2) = En.snapshot_arrays(s2)
+      Test.assert_true(ok, "the restore is accepted")
+      Test.assert_true(NativeArray.length_i32(i1) > 20, "the snapshot holds the rows")
+      Test.assert_true(NativeArray.to_list_i32(i1) == NativeArray.to_list_i32(i2), "the ints are equal")
+      Test.assert_true(NativeArray.to_list_f32(f1) == NativeArray.to_list_f32(f2), "the floats are equal")
+      Test.assert_true(NativeArray.to_list_float(d1) == NativeArray.to_list_float(d2), "the doubles are equal")
+      Test.assert_true(!En.is_open(En.close(e2)), "closed")
+    end
+
+    test "a snapshot of another capacity, or cut short, is refused and changes nothing" do
+      let r = script(SnapRun(fresh(), Nil, Nil), [(0, 3, 4), (0, 6, 1), (5, 0, 0)])
+      let s = En.snapshot(run_of(r))
+      let wide = En.open(kinds(), 512, 128, 6, 32.0, 1.0)
+      let (wide1, id) = En.add(wide, 2, 1.0, 2.0, 3.0, 0.0)
+      let before = En.hash(wide1)
+      let (wide2, ok) = En.restore(wide1, s)
+      Test.assert_true(!ok && En.hash(wide2) == before && En.alive(wide2, id), "capacity 512 refuses a snapshot of capacity 256")
+      let (i, f, d) = En.snapshot_arrays(s)
+      let cut = En.snapshot_of(NativeArray.from_list_i32(List.take(NativeArray.to_list_i32(i), NativeArray.length_i32(i) - 1)), f, d)
+      let small = En.close(wide2)
+      let (e3, ok3) = En.restore(En.open(kinds(), 256, 128, 6, 32.0, 1.0), cut)
+      Test.assert_true(!ok3 && !En.is_open(small), "a snapshot cut short is refused")
+      Test.assert_true(!En.is_open(En.close(e3)), "closed")
+    end
+  end
+end
