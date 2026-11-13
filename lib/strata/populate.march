@@ -685,7 +685,7 @@ mod Strata.Populate do
   -- ── Placers ───────────────────────────────────────────────────────────────
   --
   -- place_with runs the layers in run order over one chunk, each placer
-  -- writing into one flat copy of the chunk's ids. A cover layer visits every
+  -- writing through Strata.Chunk.set_idx. A cover layer visits every
   -- floor of every column of the chunk: where the voxel above lies in the
   -- chunk and is air (id 0), it rolls the hash of the floor's world voxel
   -- against the column's density times the column's area, and on success
@@ -723,25 +723,25 @@ mod Strata.Populate do
       let e = weighted_entry(r.cr_wzone, r.cr_zs, r.cr_nn, col, r.cr_wat, r.cr_wend)
       let k = if e >= 0 do cum_pick(r.cr_wcum, NativeArray.get_int(r.cr_wbase, e), 0, nv, u) else Math.min_int(nv - 1, float_to_int(u *. int_to_float(nv))) end
       let id = NativeArray.get_int(r.cr_ids, r.cr_vat + k)
-      -- an id the chunk cannot hold would read back as air: it places nothing
-      if id > 0 do (if id <= 65535 do id else 0 end) else 0 end
+      -- freeze refuses ids of 0 or below; an id above 65535 the chunk would store as air, so it places nothing
+      if id <= 65535 do id else 0 end
     else 0 end
   end
 
   -- One pass over (column, surface) pairs: surface s of s_end of chunk column
   -- i (Ground column col, chance ph); past the last surface, the next column.
-  -- Returns the ids and how many voxels were written.
-  pfn cover_go(r : CoverRun, flat : NativeI32Arr, wrote : Int, i : Int, col : Int, ph : Float, s : Int, s_end : Int) : (NativeI32Arr, Int) do
+  -- Returns the chunk and how many voxels were written.
+  pfn cover_go(r : CoverRun, c : Strata.Chunk.Chunk, wrote : Int, i : Int, col : Int, ph : Float, s : Int, s_end : Int) : (Strata.Chunk.Chunk, Int) do
     if s >= s_end do
       let i2 = i + 1
-      if i2 >= 1024 do (flat, wrote)
+      if i2 >= 1024 do (c, wrote)
       else
         let col2 = (r.cr_ci + i2 % 32) + r.cr_n * (r.cr_cj + i2 / 32)
         let ph2 = NativeArray.get_f32(r.cr_dens, r.cr_doff + col2) *. r.cr_area
         if ph2 > 0.0 do
-          if r.cr_surf do cover_go(r, flat, wrote, i2, col2, ph2, NativeArray.get_int(r.cr_sat, col2), NativeArray.get_int(r.cr_sat, col2 + 1))
-          else cover_go(r, flat, wrote, i2, col2, ph2, 0, 1) end
-        else cover_go(r, flat, wrote, i2, col2, ph2, 0, 0) end
+          if r.cr_surf do cover_go(r, c, wrote, i2, col2, ph2, NativeArray.get_int(r.cr_sat, col2), NativeArray.get_int(r.cr_sat, col2 + 1))
+          else cover_go(r, c, wrote, i2, col2, ph2, 0, 1) end
+        else cover_go(r, c, wrote, i2, col2, ph2, 0, 0) end
       end
     else
       let is_floor = if r.cr_surf do NativeArray.get_int(r.cr_skind, s) == 0 else true end
@@ -751,38 +751,38 @@ mod Strata.Populate do
       if inside do
         let cx = i % 32
         let cz = i / 32
-        let idx = cx + 32 * (cz + 32 * (y - r.cr_ylo))
-        if NativeArray.get_i32(flat, idx) == 0 do
+        let idx = Strata.Chunk.index(cx + 32 * (cz + 32 * (y - r.cr_ylo)))
+        if Strata.Chunk.get_idx(c, idx) == 0 do
           let id = cover_roll(r, col, ph, r.cr_wx0 + cx, y, r.cr_wz0 + cz)
-          if id > 0 do cover_go(r, NativeArray.set_i32(flat, idx, id), wrote + 1, i, col, ph, s + 1, s_end)
-          else cover_go(r, flat, wrote, i, col, ph, s + 1, s_end) end
-        else cover_go(r, flat, wrote, i, col, ph, s + 1, s_end) end
-      else cover_go(r, flat, wrote, i, col, ph, s + 1, s_end) end
+          if id > 0 do cover_go(r, Strata.Chunk.set_idx(c, idx, id), wrote + 1, i, col, ph, s + 1, s_end)
+          else cover_go(r, c, wrote, i, col, ph, s + 1, s_end) end
+        else cover_go(r, c, wrote, i, col, ph, s + 1, s_end) end
+      else cover_go(r, c, wrote, i, col, ph, s + 1, s_end) end
     end
   end
 
   -- layer l of the plan as a cover layer over the chunk r was set up for
-  pfn cover_layer(p : PopPlan, base : CoverRun, flat : NativeI32Arr, l : Int) : (NativeI32Arr, Int) do
+  pfn cover_layer(p : PopPlan, base : CoverRun, c : Strata.Chunk.Chunk, l : Int) : (Strata.Chunk.Chunk, Int) do
     let nv = NativeArray.get_int(p.pl_lvn, l)
-    if nv <= 0 do (flat, 0)
+    if nv <= 0 do (c, 0)
     else
       let wat = NativeArray.get_int(p.pl_lwat, l)
       let r = { base with cr_salt: NativeArray.get_int(p.pl_lsalt, l), cr_doff: l * base.cr_nn, cr_vat: NativeArray.get_int(p.pl_lvat, l), cr_vn: nv, cr_wat: wat, cr_wend: wat + NativeArray.get_int(p.pl_lwn, l) }
-      cover_go(r, flat, 0, -1, 0, 0.0, 0, 0)
+      cover_go(r, c, 0, -1, 0, 0.0, 0, 0)
     end
   end
 
   -- the layers from l in run order, each dispatched on its kind
-  pfn layers_place(p : PopPlan, base : CoverRun, flat : NativeI32Arr, wrote : Int, l : Int) : (NativeI32Arr, Int) do
-    if l >= p.pl_nl do (flat, wrote)
+  pfn layers_place(p : PopPlan, base : CoverRun, c : Strata.Chunk.Chunk, wrote : Int, l : Int) : (Strata.Chunk.Chunk, Int) do
+    if l >= p.pl_nl do (c, wrote)
     else
       let kind = NativeArray.get_int(p.pl_lkind, l)
       if kind == 0 do
-        match cover_layer(p, base, flat, l) do
-          (flat2, w) -> layers_place(p, base, flat2, wrote + w, l + 1)
+        match cover_layer(p, base, c, l) do
+          (c2, w) -> layers_place(p, base, c2, wrote + w, l + 1)
         end
       -- scatter (Task 4) and site layers: the chunk passes through
-      else layers_place(p, base, flat, wrote, l + 1) end
+      else layers_place(p, base, c, wrote, l + 1) end
     end
   end
 
@@ -807,9 +807,9 @@ mod Strata.Populate do
           let base = { cr_seed: seed, cr_salt: 0, cr_area: g.pg_voxel *. g.pg_voxel, cr_dens: t.pt_dens, cr_doff: 0, cr_zs: t.pt_zones, cr_nn: t.pt_nn,
                        cr_ids: p.pl_lids, cr_vat: 0, cr_vn: 0, cr_wzone: p.pl_wzone, cr_wbase: p.pl_wbase, cr_wcum: p.pl_wcum, cr_wat: 0, cr_wend: 0,
                        cr_n: n, cr_ci: ci, cr_cj: cj, cr_wx0: wx0, cr_wz0: wz0, cr_ylo: ylo, cr_surf: g.pg_surf, cr_tops: g.pg_tops, cr_sat: g.pg_sat, cr_sys: g.pg_sys, cr_skind: g.pg_skind }
-          -- to_flat's array may be the chunk's own: set_i32 copies it on the first write (GAPS S30), so c is never changed
-          match layers_place(p, base, Strata.Chunk.to_flat(c), 0, 0) do
-            (flat, wrote) -> if wrote > 0 do Strata.Chunk.from_flat(flat) else c end
+          -- set_idx writes into arrays the chunk handed in still holds, so they are copied on the first write (GAPS S30) and c is never changed
+          match layers_place(p, base, c, 0, 0) do
+            (out, wrote) -> if wrote > 0 do out else c end
           end
         else c end
       else c end
