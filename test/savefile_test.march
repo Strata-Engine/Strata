@@ -1,0 +1,529 @@
+-- Savefile: every save file's contents to bytes and back, with a checksum,
+-- and no panic on bad input.
+mod Strata.Test.Savefile do
+
+  needs IO.Clock      -- charged to every test module once any uses Check.all (GAPS S3)
+  needs IO.Process
+  import Test
+  alias Strata.Savefile as Svf    -- `Sf` is Strata.Surface's alias (GAPS S6)
+  alias Strata.Chunk as Ck
+  alias Strata.Coord as Kd
+  alias Strata.World as Wd
+
+  -- ── Helpers ──────────────────────────────────────────────────────────────
+
+  -- properties raise on failure rather than answer false
+  pfn check(cond : Bool, what : String) : Bool do if cond do true else panic(what) end end
+
+  -- a linear congruential step: 31-bit state, no product past 2^62
+  pfn lcg(s : Int) : Int do (s * 1103515245 + 12345) % 2147483648 end
+  -- a draw in [lo, hi] from state s
+  pfn pick(s : Int, lo : Int, hi : Int) : Int do lo + (s / 65536) % (hi - lo + 1) end
+
+  pfn bytes_go(a : NativeU8Arr, i : Int, n : Int, s : Int) : NativeU8Arr do
+    if i >= n do a else bytes_go(NativeArray.set_u8(a, i, pick(lcg(s), 0, 255)), i + 1, n, lcg(s)) end
+  end
+  doc "n pseudo-random bytes from seed s."
+  pfn rand_bytes(n : Int, s : Int) : Bytes do
+    Bytes.from_u8_arr(bytes_go(NativeArray.make_u8(Strata.Size.of(n), 0), 0, n, s))
+  end
+
+  pfn same_bytes(a : Bytes, b : Bytes) : Bool do Bytes.to_string(a) == Bytes.to_string(b) end
+
+  -- b with byte i set to v
+  pfn poke(b : Bytes, i : Int, v : Int) : Bytes do Bytes.from_u8_arr(NativeArray.set_u8(Bytes.to_u8_arr(b), i, v)) end
+
+  pfn err_has(r : Result(a, String), want : String, what : String) : Unit do
+    match r do
+      Ok(_) -> Test.fail(what ++ ": answered Ok, wanted an error naming " ++ want)
+      Err(e) -> Test.assert_true(string_contains(e, want), what ++ ": the error \"" ++ e ++ "\" names " ++ want)
+    end
+  end
+
+  pfn is_err(r : Result(a, String)) : Bool do
+    match r do
+      Ok(_) -> false
+      Err(_) -> true
+    end
+  end
+  -- Ok or Err, nothing else: reaching here is the point
+  pfn answered(r : Result(a, String)) : Bool do
+    match r do
+      Ok(_) -> true
+      Err(_) -> true
+    end
+  end
+
+  pfn rdr(b : Bytes, magic : Int) : Strata.Savefile.SaveReader do
+    match Svf.reader(b, magic) do
+      Ok(r) -> r
+      Err(e) -> panic("reader refused a valid frame: " ++ e)
+    end
+  end
+  pfn u8_of(r : Strata.Savefile.SaveReader) : (Strata.Savefile.SaveReader, Int) do
+    match Svf.get_u8(r) do
+      Ok(p) -> p
+      Err(e) -> panic("get_u8: " ++ e)
+    end
+  end
+  pfn u32_of(r : Strata.Savefile.SaveReader) : (Strata.Savefile.SaveReader, Int) do
+    match Svf.get_u32(r) do
+      Ok(p) -> p
+      Err(e) -> panic("get_u32: " ++ e)
+    end
+  end
+  pfn i64_of(r : Strata.Savefile.SaveReader) : (Strata.Savefile.SaveReader, Int) do
+    match Svf.get_i64(r) do
+      Ok(p) -> p
+      Err(e) -> panic("get_i64: " ++ e)
+    end
+  end
+  pfn f64_of(r : Strata.Savefile.SaveReader) : (Strata.Savefile.SaveReader, Float) do
+    match Svf.get_f64(r) do
+      Ok(p) -> p
+      Err(e) -> panic("get_f64: " ++ e)
+    end
+  end
+  pfn str_of(r : Strata.Savefile.SaveReader) : (Strata.Savefile.SaveReader, String) do
+    match Svf.get_string(r) do
+      Ok(p) -> p
+      Err(e) -> panic("get_string: " ++ e)
+    end
+  end
+
+  -- 10^n by multiplication (GAPS S13: no exponent literals)
+  pfn ten_to(n : Int, acc : Float) : Float do if n <= 0 do acc else ten_to(n - 1, acc *. 10.0) end end
+  -- 2^-n by halving
+  pfn half_to(n : Int, acc : Float) : Float do if n <= 0 do acc else half_to(n - 1, acc *. 0.5) end end
+  -- true for -0.0 (and any negative number): atan2(0, -0.0) is pi
+  pfn neg_zero(v : Float) : Bool do if v == 0.0 do math_atan2(0.0, v) > 1.0 else false end end
+
+  -- ── Values ───────────────────────────────────────────────────────────────
+
+  pfn sections_go(n : Int, s : Int, maxlen : Int, acc : List((String, Bytes))) : List((String, Bytes)) do
+    if n <= 0 do List.reverse(acc)
+    else
+      let s1 = lcg(s)
+      let s2 = lcg(s1)
+      let tail = if pick(s1, 0, 3) == 0 do "-é" else "" end
+      let name = "sec-" ++ int_to_string(pick(s1, 0, 99999)) ++ tail
+      sections_go(n - 1, lcg(s2), maxlen, Cons((name, rand_bytes(pick(s2, 0, maxlen), s2)), acc))
+    end
+  end
+
+  pfn i32s_go(a : NativeI32Arr, i : Int, n : Int, s : Int) : NativeI32Arr do
+    if i >= n do a else i32s_go(NativeArray.set_i32(a, i, pick(lcg(s), -2147483648, 2147483647)), i + 1, n, lcg(lcg(s))) end
+  end
+  pfn f32s_go(a : NativeF32Arr, i : Int, n : Int, s : Int) : NativeF32Arr do
+    if i >= n do a else f32s_go(NativeArray.set_f32(a, i, int_to_float(pick(lcg(s), -1000000, 1000000)) /. 7.0), i + 1, n, lcg(s)) end
+  end
+  pfn fs_go(a : NativeFloatArr, i : Int, n : Int, s : Int) : NativeFloatArr do
+    if i >= n do a else fs_go(NativeArray.set_float(a, i, int_to_float(pick(lcg(s), -1000000, 1000000)) /. 3.0), i + 1, n, lcg(s)) end
+  end
+
+  pfn rand_header(s0 : Int) : Strata.Savefile.SaveHeader do
+    let s1 = lcg(s0)
+    let s2 = lcg(s1)
+    let s3 = lcg(s2)
+    let s4 = lcg(s3)
+    let snap = if pick(s4, 0, 1) == 0 do None
+      else
+        let n1 = pick(lcg(s4), 0, 40)
+        let n2 = pick(lcg(lcg(s4)), 0, 40)
+        let n3 = pick(lcg(lcg(lcg(s4))), 0, 40)
+        Some((i32s_go(NativeArray.make_i32(Strata.Size.of(n1), 0), 0, n1, s4),
+              f32s_go(NativeArray.make_f32(Strata.Size.of(n2), 0.0), 0, n2, s3),
+              fs_go(NativeArray.make_float(Strata.Size.of(n3), 0.0), 0, n3, s2)))
+      end
+    { sh_seed: pick(s1, -1000000000, 1000000000) * 4096, sh_scale: int_to_float(pick(s2, 1, 1000)) /. 100.0,
+      sh_fingerprint: pick(s3, 0, 2147483647) * 65536, sh_generator: pick(s1, 0, 1000), sh_counter: pick(s2, 0, 100000),
+      sh_sections: sections_go(pick(s3, 0, 5), s3, 1024, Nil), sh_entities: snap }
+  end
+
+  -- distinct ids into voxels 0..n-1: over 256 of them makes a direct chunk
+  pfn distinct_go(c : Strata.Chunk.Chunk, i : Int, n : Int) : Strata.Chunk.Chunk do
+    if i >= n do c else distinct_go(Ck.set_idx(c, Ck.index(i * 97), 1000 + i), i + 1, n) end
+  end
+  pfn sets_go(c : Strata.Chunk.Chunk, n : Int, s : Int) : Strata.Chunk.Chunk do
+    if n <= 0 do c
+    else sets_go(Ck.set(c, Ck.coord(pick(lcg(s), 0, 31)), Ck.coord(pick(lcg(lcg(s)), 0, 31)), Ck.coord(pick(s, 0, 31)), pick(lcg(lcg(lcg(s))), 0, 40)), n - 1, lcg(lcg(lcg(s)))) end
+  end
+
+  -- a chunk in form f (0 uniform, 1 paletted, 2 direct) from state s
+  pfn rand_chunk(f : Int, s : Int) : Strata.Chunk.Chunk do
+    if f == 0 do Ck.uniform(pick(s, 0, 65535))
+    else
+      let b = Ck.fill_box(Ck.uniform(pick(s, 0, 9)), pick(lcg(s), 0, 31), pick(lcg(s), 0, 20), 3, 31, 31, pick(lcg(lcg(s)), 3, 31), pick(lcg(s), 0, 300))
+      let p = sets_go(b, pick(lcg(lcg(s)), 1, 30), s)
+      if f == 1 do p else distinct_go(p, 0, 300) end
+    end
+  end
+
+  pfn rand_key(s : Int) : Strata.Coord.Key do
+    Kd.key_at(pick(s, -5000, 5000), pick(lcg(s), -300, 300), pick(lcg(lcg(s)), -5000, 5000), pick(lcg(lcg(lcg(s))), 0, 4))
+  end
+
+  pfn chunks_go(n : Int, s : Int, acc : List((Strata.Coord.Key, Strata.Chunk.Chunk))) : List((Strata.Coord.Key, Strata.Chunk.Chunk)) do
+    if n <= 0 do List.reverse(acc)
+    else chunks_go(n - 1, lcg(lcg(s)), Cons((rand_key(s), rand_chunk(pick(lcg(s), 0, 2), lcg(s))), acc)) end
+  end
+
+  pfn rand_op(s : Int) : Strata.World.Op do
+    let a = pick(s, -100000, 100000)
+    let b = pick(lcg(s), -300, 300)
+    let c = pick(lcg(lcg(s)), -100000, 100000)
+    let k = pick(lcg(lcg(lcg(s))), 0, 2)
+    if k == 0 do Wd.op_cell(a, b, c, pick(s, 0, 65535))
+    else if k == 1 do Wd.op_box(a, b, c, a + pick(lcg(s), 0, 40), b + 3, c + 7, pick(lcg(s), 0, 65535))
+    else Wd.op_sphere(a, b, c, pick(lcg(s), 0, 30), pick(lcg(lcg(s)), 0, 65535)) end end
+  end
+  pfn op_list(n : Int, s : Int, acc : List(Strata.World.Op)) : List(Strata.World.Op) do
+    if n <= 0 do List.reverse(acc) else op_list(n - 1, lcg(lcg(lcg(lcg(s)))), Cons(rand_op(s), acc)) end
+  end
+  pfn ops_go(n : Int, s : Int, acc : List((Strata.Coord.Key, List(Strata.World.Op)))) : List((Strata.Coord.Key, List(Strata.World.Op))) do
+    if n <= 0 do List.reverse(acc)
+    else ops_go(n - 1, lcg(lcg(lcg(s))), Cons((rand_key(s), op_list(pick(lcg(s), 1, 4), lcg(lcg(s)), Nil)), acc)) end
+  end
+
+  pfn rand_region(s0 : Int, max_chunks : Int) : Strata.Savefile.Region do
+    let s1 = lcg(s0)
+    let s2 = lcg(s1)
+    let s3 = lcg(s2)
+    { sr_generator: pick(s1, 0, 1000000), sr_counter: pick(s2, 0, 1000000),
+      sr_chunks: chunks_go(pick(s3, 0, max_chunks), s3, Nil), sr_ops: ops_go(pick(s2, 0, 5), s2, Nil),
+      sr_sections: sections_go(pick(s1, 0, 3), s1, 300, Nil) }
+  end
+
+  -- ── Comparisons (raise on a difference) ──────────────────────────────────
+
+  pfn same_sections(a : List((String, Bytes)), b : List((String, Bytes))) : Bool do
+    match (a, b) do
+      (Nil, Nil) -> true
+      (Cons((na, ba), ra), Cons((nb, bb), rb)) ->
+        let _n = check(na == nb, "section name " ++ na ++ " came back as " ++ nb)
+        let _b = check(same_bytes(ba, bb), "section " ++ na ++ "'s bytes differ")
+        same_sections(ra, rb)
+      _ -> panic("section lists differ in length")
+    end
+  end
+
+  pfn same_key(a : Strata.Coord.Key, b : Strata.Coord.Key) : Bool do check(Kd.key_eq(a, b), "a key came back changed") end
+
+  pfn same_chunks(a : List((Strata.Coord.Key, Strata.Chunk.Chunk)), b : List((Strata.Coord.Key, Strata.Chunk.Chunk))) : Bool do
+    match (a, b) do
+      (Nil, Nil) -> true
+      (Cons((ka, ca), ra), Cons((kb, cb), rb)) ->
+        let _k = same_key(ka, kb)
+        let _h = check(Ck.hash(ca) == Ck.hash(cb), "a chunk's content came back changed")
+        let _f = check(Ck.form(cb) == Ck.form(Ck.compact(ca)), "a decoded chunk is not in its compact form")
+        same_chunks(ra, rb)
+      _ -> panic("chunk lists differ in length")
+    end
+  end
+
+  pfn same_ops(a : List(Strata.World.Op), b : List(Strata.World.Op)) : Bool do
+    match (a, b) do
+      (Nil, Nil) -> true
+      (Cons(oa, ra), Cons(ob, rb)) ->
+        let _o = check(Wd.op_fields(oa) == Wd.op_fields(ob), "an op came back changed")
+        same_ops(ra, rb)
+      _ -> panic("op lists differ in length")
+    end
+  end
+  pfn same_queued(a : List((Strata.Coord.Key, List(Strata.World.Op))), b : List((Strata.Coord.Key, List(Strata.World.Op)))) : Bool do
+    match (a, b) do
+      (Nil, Nil) -> true
+      (Cons((ka, oa), ra), Cons((kb, ob), rb)) ->
+        let _k = same_key(ka, kb)
+        let _o = same_ops(oa, ob)
+        same_queued(ra, rb)
+      _ -> panic("queued-op lists differ in length")
+    end
+  end
+
+  pfn same_i32(a : NativeI32Arr, b : NativeI32Arr, i : Int) : Bool do
+    if i >= NativeArray.length_i32(a) do true
+    else
+      let _v = check(NativeArray.get_i32(a, i) == NativeArray.get_i32(b, i), "an int array value differs")
+      same_i32(a, b, i + 1)
+    end
+  end
+  pfn same_f32(a : NativeF32Arr, b : NativeF32Arr, i : Int) : Bool do
+    if i >= NativeArray.length_f32(a) do true
+    else
+      let _v = check(NativeArray.get_f32(a, i) == NativeArray.get_f32(b, i), "a float32 array value differs")
+      same_f32(a, b, i + 1)
+    end
+  end
+  pfn same_f64(a : NativeFloatArr, b : NativeFloatArr, i : Int) : Bool do
+    if i >= NativeArray.length_float(a) do true
+    else
+      let _v = check(NativeArray.get_float(a, i) == NativeArray.get_float(b, i), "a float array value differs")
+      same_f64(a, b, i + 1)
+    end
+  end
+
+  pfn same_snapshot(a : Option((NativeI32Arr, NativeF32Arr, NativeFloatArr)), b : Option((NativeI32Arr, NativeF32Arr, NativeFloatArr))) : Bool do
+    match (a, b) do
+      (None, None) -> true
+      (Some((ia, fa, da)), Some((ib, fb, db))) ->
+        let _l = check(NativeArray.length_i32(ia) == NativeArray.length_i32(ib), "the int array's length differs")
+        let _m = check(NativeArray.length_f32(fa) == NativeArray.length_f32(fb), "the float32 array's length differs")
+        let _n = check(NativeArray.length_float(da) == NativeArray.length_float(db), "the float array's length differs")
+        let _i = same_i32(ia, ib, 0)
+        let _f = same_f32(fa, fb, 0)
+        same_f64(da, db, 0)
+      _ -> panic("a snapshot appeared or vanished")
+    end
+  end
+
+  pfn same_header(a : Strata.Savefile.SaveHeader, b : Strata.Savefile.SaveHeader) : Bool do
+    let _s = check(a.sh_seed == b.sh_seed, "seed")
+    let _c = check(a.sh_scale == b.sh_scale, "scale")
+    let _f = check(a.sh_fingerprint == b.sh_fingerprint, "fingerprint")
+    let _g = check(a.sh_generator == b.sh_generator, "generator")
+    let _n = check(a.sh_counter == b.sh_counter, "counter")
+    let _x = same_sections(a.sh_sections, b.sh_sections)
+    same_snapshot(a.sh_entities, b.sh_entities)
+  end
+
+  pfn same_region(a : Strata.Savefile.Region, b : Strata.Savefile.Region) : Bool do
+    let _g = check(a.sr_generator == b.sr_generator, "region generator")
+    let _n = check(a.sr_counter == b.sr_counter, "region counter")
+    let _c = same_chunks(a.sr_chunks, b.sr_chunks)
+    let _o = same_queued(a.sr_ops, b.sr_ops)
+    same_sections(a.sr_sections, b.sr_sections)
+  end
+
+  -- every decoder on b: each answers, none panics
+  pfn all_answer(b : Bytes) : Bool do
+    let _h = answered(Svf.decode_header(b))
+    let _r = answered(Svf.decode_region(b))
+    answered(Svf.decode_player(b))
+  end
+
+  -- the frame's body (between the 13-byte front and the 4-byte checksum)
+  -- written again byte by byte, cut to n bytes, in a fresh valid frame
+  pfn put_range(w : Strata.Savefile.Writer, b : Bytes, i : Int, n : Int) : Strata.Savefile.Writer do
+    if i >= n do w else put_range(Svf.put_u8(w, Bytes.get(b, i)), b, i + 1, n) end
+  end
+  pfn reframe(b : Bytes, n : Int, magic : Int) : Bytes do
+    Svf.finish(put_range(Svf.writer(), Bytes.slice(b, 13, Bytes.length(b) - 17), 0, n), magic)
+  end
+
+  -- every cut of a valid file is refused; every cut of its body, framed
+  -- again, answers without a panic. Cuts at [step] apart.
+  pfn cuts_go(b : Bytes, magic : Int, n : Int, step : Int) : Bool do
+    let body = Bytes.length(b) - 17
+    if n >= Bytes.length(b) do true
+    else
+      let _raw = check(is_err(Svf.decode_region(Bytes.slice(b, 0, n))), "a cut region file decoded")
+      let _rh = check(is_err(Svf.decode_header(Bytes.slice(b, 0, n))), "a cut file decoded as a header")
+      let _rp = check(is_err(Svf.decode_player(Bytes.slice(b, 0, n))), "a cut file decoded as a player")
+      let _framed = if n < body do all_answer(reframe(b, n, magic)) else true end
+      let _framed_ok = if n < body && magic == Svf.magic_region() do check(is_err(Svf.decode_region(reframe(b, n, Svf.magic_region()))), "a cut region body decoded") else true end
+      cuts_go(b, magic, n + step, step)
+    end
+  end
+
+  -- ── Tests ────────────────────────────────────────────────────────────────
+
+  describe "Savefile primitives" do
+    test "the three magic numbers differ" do
+      Test.assert_true(Svf.magic_header() != Svf.magic_region(), "header and region")
+      Test.assert_true(Svf.magic_header() != Svf.magic_player(), "header and player")
+      Test.assert_true(Svf.magic_region() != Svf.magic_player(), "region and player")
+    end
+
+    test "CRC-32 of \"123456789\" is cbf43926, the IEEE check value" do
+      Test.assert_eq_int(Svf.crc32(Bytes.from_string("123456789")), 3421780262, "check value")
+      Test.assert_eq_int(Svf.crc32(Bytes.empty()), 0, "empty")
+    end
+
+    test "every primitive reads back in order and the reader ends" do
+      let big = ten_to(300, 1.0)
+      let tiny = half_to(1074, 1.0)
+      let nz = 0.0 *. -1.0
+      let multi = "aé✓"
+      let w0 = Svf.put_u32(Svf.put_u32(Svf.put_u8(Svf.put_u8(Svf.writer(), 0), 255), 0), 4294967295)
+      let w1 = Svf.put_i64(Svf.put_i64(Svf.put_i64(Svf.put_i64(w0, -1), 0), 4611686018427387903), 0 - 4611686018427387903 - 1)
+      let w2 = Svf.put_f64(Svf.put_f64(Svf.put_f64(Svf.put_f64(Svf.put_f64(Svf.put_f64(w1, 0.0), nz), big), float_nan()), tiny), float_neg_infinity())
+      let w3 = Svf.put_bytes(Svf.put_string(Svf.put_string(w2, ""), multi), rand_bytes(300, 7))
+      let r0 = rdr(Svf.finish(w3, Svf.magic_region()), Svf.magic_region())
+      let (r1, a) = u8_of(r0)
+      let (r2, b) = u8_of(r1)
+      let (r3, c) = u32_of(r2)
+      let (r4, d) = u32_of(r3)
+      Test.assert_eq_int(a, 0, "u8 0")
+      Test.assert_eq_int(b, 255, "u8 255")
+      Test.assert_eq_int(c, 0, "u32 0")
+      Test.assert_eq_int(d, 4294967295, "u32 2^32 - 1")
+      let (r5, e) = i64_of(r4)
+      let (r6, f) = i64_of(r5)
+      let (r7, g) = i64_of(r6)
+      let (r8, h) = i64_of(r7)
+      Test.assert_eq_int(e, -1, "i64 -1")
+      Test.assert_eq_int(f, 0, "i64 0")
+      Test.assert_eq_int(g, 4611686018427387903, "i64 2^62 - 1, the largest Int")
+      Test.assert_eq_int(h, 0 - 4611686018427387903 - 1, "i64 -2^62")
+      let (r9, x0) = f64_of(r8)
+      let (r10, x1) = f64_of(r9)
+      let (r11, x2) = f64_of(r10)
+      let (r12, x3) = f64_of(r11)
+      let (r13, x4) = f64_of(r12)
+      let (r14, x5) = f64_of(r13)
+      Test.assert_true(x0 == 0.0, "0.0")
+      Test.assert_false(neg_zero(x0), "0.0 stays positive")
+      Test.assert_true(neg_zero(x1), "-0.0 keeps its sign")
+      Test.assert_true(x2 == big, "1e300")
+      Test.assert_true(float_is_nan(x3), "NaN")
+      Test.assert_true(x4 == tiny, "the smallest subnormal")
+      Test.assert_true(x5 == float_neg_infinity(), "minus infinity")
+      let (r15, s0) = str_of(r14)
+      let (r16, s1) = str_of(r15)
+      Test.assert_eq_str(s0, "", "empty string")
+      Test.assert_eq_str(s1, multi, "multi-byte string")
+      Test.assert_false(Svf.at_end(r16), "the bytes are still to read")
+      match Svf.get_bytes(r16) do
+        Ok((r17, bs)) ->
+          Test.assert_true(same_bytes(bs, rand_bytes(300, 7)), "bytes")
+          Test.assert_true(Svf.at_end(r17), "at the end")
+          Test.assert_true(is_err(Svf.get_u8(r17)), "a read past the end is an error")
+        Err(e) -> Test.fail("get_bytes: " ++ e)
+      end
+    end
+
+    test "floats round-trip exactly across the whole exponent range" do
+      Check.all(Gen.tuple2(Gen.float(-1.0, 1.0), Gen.int(-1100, 1030)), fn me ->
+        let (m, e) = me
+        let v = m *. math_pow(2.0, int_to_float(e))
+        let r = rdr(Svf.finish(Svf.put_f64(Svf.writer(), v), Svf.magic_player()), Svf.magic_player())
+        let (_r, back) = f64_of(r)
+        check(back == v, "f64 " ++ float_to_string(v) ++ " came back as " ++ float_to_string(back))
+      )
+    end
+
+    test "an i64 beyond March's 63-bit Int is an error" do
+      let r = rdr(Svf.finish(Svf.put_u32(Svf.put_u32(Svf.writer(), 0), 2147483648), Svf.magic_player()), Svf.magic_player())
+      Test.assert_true(is_err(Svf.get_i64(r)), "-2^63")
+      let r2 = rdr(Svf.finish(Svf.put_u32(Svf.put_u32(Svf.writer(), 0), 1073741824), Svf.magic_player()), Svf.magic_player())
+      Test.assert_true(is_err(Svf.get_i64(r2)), "2^62")
+    end
+  end
+
+  describe "Savefile reader refusals" do
+    test "a wrong magic, a newer version, a flipped byte, a cut file" do
+      let good = Svf.finish(Svf.put_string(Svf.put_u32(Svf.writer(), 77), "hello"), Svf.magic_region())
+      Test.assert_true(answered(Svf.reader(good, Svf.magic_region())), "the frame itself reads")
+      Test.assert_false(is_err(Svf.reader(good, Svf.magic_region())), "the frame itself is accepted")
+      err_has(Svf.reader(good, Svf.magic_header()), "not a Strata file", "wrong magic")
+      err_has(Svf.reader(poke(good, 4, 2), Svf.magic_region()), "newer format", "version 2")
+      err_has(Svf.reader(poke(good, 14, int_xor(Bytes.get(good, 14), 1)), Svf.magic_region()), "checksum", "one flipped body byte")
+      err_has(Svf.reader(Bytes.slice(good, 0, Bytes.length(good) - 1), Svf.magic_region()), "truncated", "cut short by one byte")
+      err_has(Svf.reader(Bytes.empty(), Svf.magic_region()), "truncated", "empty")
+      Test.assert_true(is_err(Svf.reader(Bytes.concat(good, Bytes.from_string("x")), Svf.magic_region())), "a trailing byte")
+      Test.assert_true(is_err(Svf.reader(poke(good, 4, 0), Svf.magic_region())), "version 0")
+    end
+  end
+
+  describe "Savefile garbage decodes safely" do
+    test "random byte strings of 0 to 4096 bytes: every decoder answers" do
+      Check.all(Gen.tuple2(Gen.int(0, 4096), Gen.int(0, 2000000000)), fn ns ->
+        let (n, s) = ns
+        let b = rand_bytes(n, s)
+        let _raw = all_answer(b)
+        -- the same garbage as the body of a valid frame, for each kind of file
+        let _h = answered(Svf.decode_header(reframe_raw(b, Svf.magic_header())))
+        let _r = answered(Svf.decode_region(reframe_raw(b, Svf.magic_region())))
+        answered(Svf.decode_player(reframe_raw(b, Svf.magic_player())))
+      )
+    end
+
+    test "every cut of a valid region, header and player file" do
+      let g = { sr_generator: 3, sr_counter: 9, sr_chunks: [(Kd.key(1, -2, 3), Ck.uniform(5)), (Kd.key_at(-7, 0, 2, 2), Ck.uniform(0))],
+                sr_ops: [(Kd.key(4, 4, 4), [Wd.op_cell(1, 2, 3, 4), Wd.op_box(0, 0, 0, 9, 9, 9, 7)]), (Kd.key(-1, 0, 0), [Wd.op_sphere(-5, 6, -7, 3, 2)])],
+                sr_sections: [("roads", Bytes.from_string("abc")), ("", Bytes.empty())] }
+      let rb = Svf.encode_region(g)
+      Test.assert_true(cuts_go(rb, Svf.magic_region(), 0, 1), "region cuts")
+      let h = rand_header(12345)
+      let hb = Svf.encode_header({ h with sh_entities: Some((NativeArray.make_i32(3, -4), NativeArray.make_f32(2, 1.5), NativeArray.make_float(2, 2.25))) })
+      Test.assert_true(cuts_go(hb, Svf.magic_header(), 0, 7), "header cuts")
+      let pb = Svf.encode_player(rand_bytes(100, 3))
+      Test.assert_true(cuts_go(pb, Svf.magic_player(), 0, 1), "player cuts")
+    end
+
+    test "cuts through a paletted and a direct chunk" do
+      let g = { sr_generator: 1, sr_counter: 2, sr_chunks: [(Kd.key(0, 0, 0), rand_chunk(1, 99)), (Kd.key(1, 0, 0), rand_chunk(2, 98))],
+                sr_ops: Nil, sr_sections: Nil }
+      let rb = Svf.encode_region(g)
+      Test.assert_true(cuts_go(rb, Svf.magic_region(), 0, 2311), "region cuts")
+    end
+
+    test "a length field claiming 2^40 bytes is an error, not an allocation" do
+      let huge = 1099511627776
+      let b = Svf.finish(Svf.put_u8(Svf.put_i64(Svf.writer(), huge), 1), Svf.magic_player())
+      Test.assert_true(is_err(Svf.get_bytes(rdr(b, Svf.magic_player()))), "get_bytes")
+      Test.assert_true(is_err(Svf.get_string(rdr(b, Svf.magic_player()))), "get_string")
+      Test.assert_true(is_err(Svf.decode_player(b)), "decode_player")
+      -- a header whose first section's name claims 2^40 bytes
+      let w = Svf.put_i64(Svf.put_i64(Svf.put_i64(Svf.put_i64(Svf.put_f64(Svf.put_i64(Svf.writer(), 1), 1.0), 2), 3), 4), 0)
+      Test.assert_true(is_err(Svf.decode_header(Svf.finish(Svf.put_i64(Svf.put_u32(w, 1), huge), Svf.magic_header()))), "decode_header")
+      -- a region claiming 2^32 - 1 chunks
+      let wr = Svf.put_u32(Svf.put_i64(Svf.put_i64(Svf.writer(), 1), 2), 4294967295)
+      Test.assert_true(is_err(Svf.decode_region(Svf.finish(wr, Svf.magic_region()))), "decode_region")
+      -- a frame whose own length field claims 2^40 bytes
+      let framed = Svf.finish(Svf.put_u8(Svf.writer(), 9), Svf.magic_player())
+      let lied = poke(poke(framed, 5, 0), 10, 1)
+      err_has(Svf.reader(lied, Svf.magic_player()), "truncated", "frame length 2^40")
+    end
+  end
+
+  describe "Savefile round trips" do
+    test "random headers decode to what was encoded" do
+      Check.all(Gen.int(0, 2000000000), fn s ->
+        let h = rand_header(s)
+        match Svf.decode_header(Svf.encode_header(h)) do
+          Ok(back) -> same_header(h, back)
+          Err(e) -> panic("decode_header: " ++ e)
+        end
+      )
+    end
+
+    test "random regions decode to what was encoded" do
+      let cfg = { Check.default_config() with num_runs: 30 }
+      Check.all_with(Gen.int(0, 2000000000), fn s ->
+        let g = rand_region(s, 20)
+        match Svf.decode_region(Svf.encode_region(g)) do
+          Ok(back) -> same_region(g, back)
+          Err(e) -> panic("decode_region: " ++ e)
+        end
+      , cfg)
+    end
+
+    test "the region generator makes all three forms" do
+      Test.assert_eq_int(Ck.form(rand_chunk(0, 5)), 0, "uniform")
+      Test.assert_eq_int(Ck.form(rand_chunk(1, 5)), 1, "paletted")
+      Test.assert_eq_int(Ck.form(rand_chunk(2, 5)), 2, "direct")
+    end
+
+    test "player bytes decode to what was encoded" do
+      Check.all(Gen.tuple2(Gen.int(0, 5000), Gen.int(0, 2000000000)), fn ns ->
+        let (n, s) = ns
+        let b = rand_bytes(n, s)
+        match Svf.decode_player(Svf.encode_player(b)) do
+          Ok(back) -> check(same_bytes(b, back), "player bytes differ")
+          Err(e) -> panic("decode_player: " ++ e)
+        end
+      )
+    end
+
+    test "a file of one kind is refused as another" do
+      let pb = Svf.encode_player(Bytes.from_string("me"))
+      err_has(Svf.decode_header(pb), "not a Strata file", "player as header")
+      err_has(Svf.decode_region(pb), "not a Strata file", "player as region")
+    end
+  end
+
+  -- b written byte by byte as the whole body of a frame
+  pfn reframe_raw(b : Bytes, magic : Int) : Bytes do Svf.finish(put_range(Svf.writer(), b, 0, Bytes.length(b)), magic) end
+end
