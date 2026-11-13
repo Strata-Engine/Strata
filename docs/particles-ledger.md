@@ -96,7 +96,11 @@ scenes with spray passed unchanged until the cubes and pass with them.
   commit before it (075114e), it matched its golden exactly; after it,
   15.7% of pixels differ, every one lighting noise in whole chunks (light
   mode 4 still converging at frame 150), the scene's blocks, fire and
-  figures unchanged. Physics now writes its outcome through
-  `Strata.Edit.set_many` each step, which may be resetting those chunks'
-  light. Not investigated here: physics is another session's work. Cost if
-  wrong: a re-lighting regression in physics hides behind this golden.
+  figures unchanged. The cause, found after landing: at frame 76 the fire's
+  edits wake physics, which finds one leaves voxel over the burning trunk
+  unsupported (509, 51, -13) and loosens it (event kind 2), before and
+  after Task 8 alike. Before it, the worker step's `reconcile` dropped the
+  bodies a step made, so the leaf left the world but never fell; Task 8
+  keeps them, so it falls now, and light mode 4 is still settling about it
+  at frame 150. Physics edits the world once in the scene's 150 frames, not
+  every step. The golden shows the fixed behaviour.

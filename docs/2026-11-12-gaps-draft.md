@@ -91,6 +91,26 @@ ns an element against 2.29 ns calling the same function by name
 captured values each call. Small (under 1% of an island chunk). Workaround:
 none worth the API; noted for `Strata.Surface.scan_wet`.
 
+## G: a list captured by a task and still used by its spawner crashes the program
+
+`let t = task_spawn(fn _ -> walk(items, 0))` followed by
+`List.length(items)` on the spawning thread dies with a segmentation fault
+or bus error in 18 of 20 runs (`bench/march/task_shared_list`, March
+07b58d065); with the length taken before the spawn, 0 of 20. It is memory
+corruption in a language without unsafe code, so a March bug; the
+behaviour fits unsynchronised reference-count updates on the list's cells
+from two threads. Met when `Strata.Stream` first gave a generation task a
+list of keys (the stream tests died in 6 of 14 runs). Workaround, now a
+rule for any code that spawns tasks: take everything the spawning thread
+needs from a value before the `task_spawn` that captures it, and do not
+touch the value again. (Captured values the spawner later only passes on
+or compares, as the stream's keys and the generator are, have not been seen
+to fail.)
+
+Still reproduces on March c35e682c3 (after 65c0f5a8b, which fixed a related
+capture crash): 18 of 20 runs die. Reported as
+march-language/march#1266.
+
 ## Revisions to existing entries
 
 **S15** (a value shared by worker tasks is slow in a hot loop). Mechanism

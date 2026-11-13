@@ -18,31 +18,44 @@
 -- solid where any fine voxel it stands for would be. A key above the
 -- declared level is air; a generator made with `gen` declares level 0, the
 -- near field only. Stamps are a level-0 notion: a coarser key has none.
+--
+-- A generator may also carry a column function: the keys of one chunk
+-- column (the same x, z and level) in, their chunks out in the same order.
+-- Much of a chunk's work often depends on its column alone (the ground's
+-- height, what stands on it), and a caller that needs several chunks of a
+-- column at once can have that work done once. The contract is that
+-- `run_column(g, ks, seed)` gives, key for key, the chunks
+-- `run(g, k, seed)` gives: the column function is a faster way to the
+-- same chunks and never another answer. `run_column` falls back to the
+-- single runs whenever it is not given one column, or the column function
+-- answers another number of chunks than it was asked for.
 mod Strata.Terrain do
 
   type Stamps = Stamps(Strata.Coord.Key -> Int -> NativeI32Arr)
 
-  -- the chunk function, the stamps function if any, and the highest level
-  type Gen = Gen(Strata.Coord.Key -> Int -> Strata.Chunk.Chunk, Option(Stamps), Int)
+  type Column = Column(List(Strata.Coord.Key) -> Int -> List(Strata.Chunk.Chunk))
+
+  -- the chunk function, the stamps function if any, the highest level, and the column function if any
+  type Gen = Gen(Strata.Coord.Key -> Int -> Strata.Chunk.Chunk, Option(Stamps), Int, Option(Column))
 
   doc "Wrap a generator function: (chunk key, seed) -> chunk. It has no stamps and declares level 0: `gen_levels(f, 0)`."
-  fn gen(f : Strata.Coord.Key -> Int -> Strata.Chunk.Chunk) : Gen do Gen(f, None, 0) end
+  fn gen(f : Strata.Coord.Key -> Int -> Strata.Chunk.Chunk) : Gen do Gen(f, None, 0, None) end
 
   doc "Wrap a generator function that makes chunks of every level 0..[max_level] (it reads the key's level). It has no stamps."
-  fn gen_levels(f : Strata.Coord.Key -> Int -> Strata.Chunk.Chunk, max_level : Int) : Gen do Gen(f, None, if max_level < 0 do 0 else max_level end) end
+  fn gen_levels(f : Strata.Coord.Key -> Int -> Strata.Chunk.Chunk, max_level : Int) : Gen do Gen(f, None, if max_level < 0 do 0 else max_level end, None) end
 
   doc "The highest level of detail [g] generates."
-  fn max_level(g : Gen) : Int do match g do Gen(_, _, l) -> l end end
+  fn max_level(g : Gen) : Int do match g do Gen(_, _, l, _) -> l end end
 
   doc "The generator [g] with the stamps function [s]: (chunk key, seed) -> 32768 values in a chunk's voxel order (x + 32 z + 1024 y), the structure index + 1 a voxel, 0 for none."
   fn with_stamps(g : Gen, s : Stamps) : Gen do
-    match g do Gen(f, _, l) -> Gen(f, Some(s), l) end
+    match g do Gen(f, _, l, c) -> Gen(f, Some(s), l, c) end
   end
 
   doc "Generate the chunk at [k] for [seed]: air for a key above the generator's level (or below 0)."
   fn run(g : Gen, k : Strata.Coord.Key, seed : Int) : Strata.Chunk.Chunk do
     match g do
-      Gen(f, _, l) ->
+      Gen(f, _, l, _) ->
         let kl = Strata.Coord.level(k)
         if kl > l || kl < 0 do Strata.Chunk.uniform(0) else f(k, seed) end
     end
@@ -53,9 +66,69 @@ mod Strata.Terrain do
     if Strata.Coord.level(k) != 0 do NativeArray.make_i32(32768, 0)
     else
       match g do
-        Gen(_, Some(Stamps(s)), _) -> s(k, seed)
-        Gen(_, None, _) -> NativeArray.make_i32(32768, 0)
+        Gen(_, Some(Stamps(s)), _, _) -> s(k, seed)
+        Gen(_, None, _, _) -> NativeArray.make_i32(32768, 0)
       end
+    end
+  end
+  doc "The generator [g] with the column function [c]: keys of one chunk column and level -> their chunks in the same order, equal to `run` key for key."
+  fn with_column(g : Gen, c : Column) : Gen do
+    match g do Gen(f, s, l, _) -> Gen(f, s, l, Some(c)) end
+  end
+
+  doc "Whether two keys are of one chunk column: the same x, z and level."
+  fn same_column(a : Strata.Coord.Key, b : Strata.Coord.Key) : Bool do
+    if Strata.Coord.kx(a) != Strata.Coord.kx(b) do false
+    else if Strata.Coord.kz(a) != Strata.Coord.kz(b) do false
+    else Strata.Coord.level(a) == Strata.Coord.level(b) end end
+  end
+
+  pfn one_column(first : Strata.Coord.Key, ks : List(Strata.Coord.Key)) : Bool do
+    match ks do
+      Nil -> true
+      Cons(k, t) -> if same_column(first, k) do one_column(first, t) else false end
+    end
+  end
+
+  pfn singly(g : Gen, ks : List(Strata.Coord.Key), seed : Int) : List(Strata.Chunk.Chunk) do
+    List.map(ks, fn k -> run(g, k, seed))
+  end
+
+  -- the chunks for ks: air for a key outside the levels, else the next of made
+  pfn weave(ks : List(Strata.Coord.Key), inside : Bool, made : List(Strata.Chunk.Chunk), acc : List(Strata.Chunk.Chunk)) : List(Strata.Chunk.Chunk) do
+    match ks do
+      Nil -> List.reverse(acc)
+      Cons(_, t) ->
+        if !inside do weave(t, inside, made, Cons(Strata.Chunk.uniform(0), acc))
+        else
+          match made do
+            Cons(c, rest) -> weave(t, inside, rest, Cons(c, acc))
+            Nil -> List.reverse(acc)
+          end
+        end
+    end
+  end
+
+  doc "Generate the chunks at [ks] for [seed], in order: what `run` gives for each. Keys of one chunk column and level go to the generator's column function in one call, if it has one; anything else (no column function, keys of several columns, a column function answering another number of chunks) is run key by key."
+  fn run_column(g : Gen, ks : List(Strata.Coord.Key), seed : Int) : List(Strata.Chunk.Chunk) do
+    match ks do
+      Nil -> Nil
+      Cons(first, _) ->
+        match g do
+          Gen(_, _, _, None) -> singly(g, ks, seed)
+          Gen(_, _, l, Some(Column(c))) ->
+            if !one_column(first, ks) do singly(g, ks, seed)
+            else
+              -- one column is one level: its keys are all inside the generator's levels or all outside
+              let kl = Strata.Coord.level(first)
+              let inside = if kl > l do false else kl >= 0 end
+              if !inside do weave(ks, false, Nil, Nil)
+              else
+                let made = c(ks, seed)
+                if List.length(made) != List.length(ks) do singly(g, ks, seed) else made end
+              end
+            end
+        end
     end
   end
 end

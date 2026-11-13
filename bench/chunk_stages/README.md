@@ -31,4 +31,28 @@ generated in full.
 November 2026 forge silently used March 0.5.0 from `~/.march/current`; the
 findings' first tables compare the two.)
 
+`STAGE=32` (run the binary directly, `REPS=0`) counts how many keys of a
+chunk column would be generated together if the stream batched a column
+(`docs/2026-11-12-column-stage-plan.md`, Task 1): for the viewer's boxes
+about its overview pose, per column, the keys that are generated in full.
+A batch is the keys of a column that become wanted at once: a whole column
+of the box at start-up or entering it in level flight, one key a column
+when the focus climbs or sinks a chunk. Measured on 12 November 2026:
+
+| level | case | columns | full keys a column (0, 1, 2, ...) | mean where any |
+|---|---|---:|---|---:|
+| 0 | start-up, 7 keys a column | 441 | 0 0 8 265 153 15 0 0 | 3.40 |
+| 0 | flight, 13 chunks along +x | 273 | 0 0 147 126 0 0 0 0 | 2.46 |
+| 0 | climb one chunk (1 new key) | 441 | 441 0 | none full |
+| 1 | start-up, 3 keys a column | 441 | 2 375 64 0 | 1.15 |
+| 2 | start-up | 441 | 117 297 27 0 | 1.08 |
+| 3 | start-up | 441 | 341 0 100 0 | 2.00 |
+| 4 | start-up | 441 | 405 0 36 0 | 2.00 |
+
+So at level 0 a batch holds 3.4 full chunks at start-up and 2.5 in flight
+toward the coast; a cap of 4 keys covers 97% of the start-up columns whole.
+The layer a climb adds is all air (early-outs), so the one-key-a-column case
+costs nothing there; a descent was not counted. Coarse levels have little to
+share (1.1 full chunks a column at levels 1 and 2).
+
 Results and what they mean: `docs/2026-11-12-chunk-performance-findings.md`.
