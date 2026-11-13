@@ -16,6 +16,18 @@
 --   MODE=3   the same passes with a factor that has no branch (v * 0.5):
 --            MODE=2 minus MODE=3 is what the curve's Float-valued branches
 --            cost (march-language/march#1263)
+--   MODE=4   place_with, a population with no layers, on a chunk with a
+--            floor at y 10 (the Table built once, outside the loop)
+--   MODE=5   place_with, one cover layer at 0.3 per square metre on that
+--            flat floor (about 300 of 1024 columns written, so from_flat
+--            runs every call)
+--   MODE=6   place_with, the same layer on the chunk above (y 32..63, air),
+--            which no floor reaches
+--   MODE=7   the chunk round trip alone, as place_with does it when it
+--            writes: to_flat of the floor chunk, one set_i32, from_flat
+--   MODE=8   for comparison: 300 Strata.Chunk.set_idx writes (every
+--            third voxel of the layer above the floor) straight on the
+--            floor chunk, no flat form
 --   REPS=n   calls
 mod PopulateFields do
 
@@ -97,6 +109,53 @@ mod PopulateFields do
     end
   end
 
+  pfn cover_frozen(layers : Bool) : Strata.Population.Frozen do
+    let p0 = Pb.shapes_blocks(Pb.new(), "g", [7])
+    let p1 = if layers do Pb.layer_cover(p0, "grass", "g", Pb.rule(0.3, Nil, Nil, Nil), 3) else p0 end
+    match Pb.freeze(p1) do
+      Ok(f) -> f
+      Err(m) -> panic(m)
+    end
+  end
+
+  pfn place_go(p : Strata.Populate.PopPlan, k : Strata.Coord.Key, c : Strata.Chunk.Chunk, g : Strata.Populate.Ground, t : Strata.Populate.Table, n : Int, acc : Int) : Int do
+    if n <= 0 do acc
+    else
+      let out = Strata.Populate.place_with(p, 5, k, c, g, t)
+      place_go(p, k, c, g, t, n - 1, acc + Strata.Chunk.get_or(out, n % 32, 11, 3, 0))
+    end
+  end
+
+  pfn trip_go(c : Strata.Chunk.Chunk, n : Int, acc : Int) : Int do
+    if n <= 0 do acc
+    else
+      let out = Strata.Chunk.from_flat(NativeArray.set_i32(Strata.Chunk.to_flat(c), 11 * 1024 + n % 1024, 7))
+      trip_go(c, n - 1, acc + Strata.Chunk.get_or(out, n % 32, 11, 3, 0))
+    end
+  end
+
+  pfn sets_go(c : Strata.Chunk.Chunk, i : Int) : Strata.Chunk.Chunk do
+    if i >= 900 do c else sets_go(Strata.Chunk.set_idx(c, Strata.Chunk.index(11 * 1024 + i), 7), i + 3) end
+  end
+  pfn direct_go(c : Strata.Chunk.Chunk, n : Int, acc : Int) : Int do
+    if n <= 0 do acc
+    else
+      let out = sets_go(c, n % 3)
+      direct_go(c, n - 1, acc + Strata.Chunk.get_or(out, n % 32, 11, 3, 0))
+    end
+  end
+
+  -- MODE 4, 5, 6: place_with reps times; a checksum of voxels read back
+  pfn place_mode(mode : Int, reps : Int) : Float do
+    let f = cover_frozen(mode != 4)
+    let p = Strata.Populate.plan(f)
+    let g = Strata.Populate.ground(0, 0, 32, 1.0, 0, NativeArray.make_int(1024, 10), NativeArray.make_int(1024, -1))
+    let t = Strata.Populate.fields_with(p, 5, g)
+    let c = Strata.Chunk.fill_box(Strata.Chunk.uniform(0), 0, 0, 0, 31, 10, 31, 1)
+    let k = if mode == 6 do Strata.Coord.key(0, 1, 0) else Strata.Coord.key(0, 0, 0) end
+    int_to_float(place_go(p, k, if mode == 6 do Strata.Chunk.uniform(0) else c end, g, t, reps, 0))
+  end
+
   fn main(_cap : Cap(IO)) : Unit do
     let mode = Authority.must(Env.get_int("MODE", 1))
     let reps = Authority.must(Env.get_int("REPS", 1000))
@@ -104,7 +163,7 @@ mod PopulateFields do
     let g = ground()
     let a = random_go(NativeArray.make_f32(1024, 0.0), 3, 0.0, 100.0, 0)
     let b = random_go(NativeArray.make_f32(1024, 0.0), 4, 0.0, 1.0, 0)
-    let sum = if mode == 1 do fields_go(p, g, reps, 0.0) else curves_go(a, b, pts(), mode == 2, reps, 0.0) end
+    let sum = if mode == 1 do fields_go(p, g, reps, 0.0) else if mode == 8 do int_to_float(direct_go(Strata.Chunk.fill_box(Strata.Chunk.uniform(0), 0, 0, 0, 31, 10, 31, 1), reps, 0)) else if mode == 7 do int_to_float(trip_go(Strata.Chunk.fill_box(Strata.Chunk.uniform(0), 0, 0, 0, 31, 10, 31, 1), reps, 0)) else if mode >= 4 do place_mode(mode, reps) else curves_go(a, b, pts(), mode == 2, reps, 0.0) end end end end
     Authority.must(println("populate_fields: mode " ++ int_to_string(mode) ++ " reps " ++ int_to_string(reps) ++ " checksum " ++ float_to_string(sum)))
   end
 end
