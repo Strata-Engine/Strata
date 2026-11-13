@@ -24,6 +24,7 @@
 mod StrataViewer.Match do
 
   needs IO.Foreign
+  needs IO.Spawn      -- path plans are worked out on worker tasks
   needs IO.Console
   needs Anim
   needs Ent
@@ -50,7 +51,7 @@ mod StrataViewer.Match do
   type MtBody = { mb_ent : Int, mb_fig : Int, mb_bow : Int, mb_cool : Float, mb_tgt : Int, mb_intent : Int, mb_clip : Int, mb_act : Float, mb_blow : Float,
                   mb_stall : Float, mb_side : Float, mb_ax : Float, mb_az : Float, mb_ix : Float, mb_iz : Float, mb_fought : Bool, mb_swim : Bool, mb_tries : Int, mb_patrol : Bool, mb_hunt : Int, mb_fire : Int, mb_ice : Int, mb_shield : Bool, mb_aim : Float, mb_slow : Float, mb_fetch : Int, mb_dying : Float, mb_air : Float, mb_px : Float, mb_pz : Float, mb_pt : Float,
                   mb_x : Float, mb_y : Float, mb_z : Float,
-                  mb_path : List((Float, Float, Float)), mb_goal : (Int, Int, Int), mb_plan : Float, mb_lost : Float }
+                  mb_path : List((Float, Float, Float)), mb_goal : (Int, Int, Int), mb_plan : Float, mb_lost : Float, mb_job : Option(Task((List((Float, Float, Float)), Bool, Int, Float))) }
 
   -- A shot: its entity while it flies (-1 once it has landed), its figure,
   -- who loosed it, whether it is fire, seconds in the air, and for an arrow
@@ -631,7 +632,7 @@ mod StrataViewer.Match do
 
   pfn no_body() : MtBody do
     { mb_ent: -1, mb_fig: -1, mb_bow: -1, mb_cool: 0.0, mb_tgt: -1, mb_intent: 1, mb_clip: -1, mb_act: 0.0, mb_blow: 0.0,
-      mb_stall: 0.0, mb_side: 0.0, mb_ax: 0.0, mb_az: 0.0, mb_ix: 0.0, mb_iz: 0.0, mb_fought: false, mb_swim: false, mb_tries: 0, mb_patrol: false, mb_hunt: -1, mb_fire: 0, mb_ice: 0, mb_shield: false, mb_aim: 0.0, mb_slow: 0.0, mb_fetch: -1, mb_dying: 0.0, mb_air: 0.0, mb_px: 0.0, mb_pz: 0.0, mb_pt: 0.0, mb_x: 0.0, mb_y: 0.0, mb_z: 0.0, mb_path: Nil, mb_goal: (0, 0, 0), mb_plan: 0.0, mb_lost: 0.0 }
+      mb_stall: 0.0, mb_side: 0.0, mb_ax: 0.0, mb_az: 0.0, mb_ix: 0.0, mb_iz: 0.0, mb_fought: false, mb_swim: false, mb_tries: 0, mb_patrol: false, mb_hunt: -1, mb_fire: 0, mb_ice: 0, mb_shield: false, mb_aim: 0.0, mb_slow: 0.0, mb_fetch: -1, mb_dying: 0.0, mb_air: 0.0, mb_px: 0.0, mb_pz: 0.0, mb_pt: 0.0, mb_x: 0.0, mb_y: 0.0, mb_z: 0.0, mb_path: Nil, mb_goal: (0, 0, 0), mb_plan: 0.0, mb_lost: 0.0, mb_job: None }
   end
   pfn body(bs : List(MtBody), i : Int) : MtBody do
     match bs do
@@ -1347,7 +1348,24 @@ mod StrataViewer.Match do
   end
 
   -- What fighter [i] decides: its target and intent, kept in its body. A shooter that means to shoot looses its arrow now; a rusher that means to swing begins.
-  pfn decide(m : MtMatch, w : Strata.World.World, ps : List((Float, Float, Float)), alive_ : List(Bool), i : Int, dt : Float) : MtMatch do
+  -- a fighter's path plan begun on a worker at its last decision, taken up now
+  pfn plan_back(m : MtMatch, i : Int) : MtMatch do
+    let b = body(m.mt_bodies, i)
+    match b.mb_job do
+      None -> m
+      Some(job) ->
+        match task_await(job) do
+          Ok((corners, arrived, expanded, took)) ->
+            with_body({ m with mt_plans: m.mt_plans + 1, mt_arrived: if arrived do m.mt_arrived + 1 else m.mt_arrived end, mt_expanded: m.mt_expanded + expanded,
+                        mt_plan_s: m.mt_plan_s +. took, mt_plan_worst: if took > m.mt_plan_worst do took else m.mt_plan_worst end },
+                      i, { b with mb_job: None, mb_path: corners, mb_plan: if arrived do 1.0 else 2.0 end })
+          Err(_) -> with_body(m, i, { b with mb_job: None, mb_plan: 0.0 })
+        end
+    end
+  end
+
+  pfn decide(m_ : MtMatch, w : Strata.World.World, ps : List((Float, Float, Float)), alive_ : List(Bool), i : Int, dt : Float) : MtMatch do
+    let m = plan_back(m_, i)
     let b0 = body(m.mt_bodies, i)
     let me = point(ps, i)
     let seen = if Rules.winner_at(m.mt_fs, m.mt_goal) >= 0 do -1 else Rules.target(i, ps, foes_of(m, alive_, i, 0), fn j -> clear_line(w, me, point(ps, j))) end
@@ -1454,13 +1472,17 @@ mod StrataViewer.Match do
                           if Nv.straight(w, k, ax, ay, az, bx, by0, bz) do with_body(m, i, { b with mb_path: if code == 7 do Nv.points(Cons((bx, by0, bz), Nil), sc) else Nil end, mb_plan: 0.0 })
                           else if wait > 0.0 && near_goal(b.mb_goal, bx, by0, bz) do with_body(m, i, { b with mb_plan: wait })
                           else
-                            let t0 = Strata.Ffi.Vk.time()
-                            let p = Nv.find(w, k, ax, ay, az, bx, by0, bz, 1200)
-                            let corners = List.drop(Nv.points(Nv.smooth(w, k, Nv.cells(p), 10), sc), 1)
-                            let took = Strata.Ffi.Vk.time() -. t0
-                            with_body({ m with mt_plans: m.mt_plans + 1, mt_arrived: if Nv.arrived(p) do m.mt_arrived + 1 else m.mt_arrived end, mt_expanded: m.mt_expanded + Nv.expanded(p),
-                                        mt_plan_s: m.mt_plan_s +. took, mt_plan_worst: if took > m.mt_plan_worst do took else m.mt_plan_worst end },
-                                      i, { b with mb_path: corners, mb_goal: (bx, by0, bz), mb_plan: if Nv.arrived(p) do 1.0 else 2.0 end })
+                            -- the search runs on a worker (a plan took up to 42 ms on the main thread); its path is taken up at the fighter's next
+                            -- decision, a quarter of a second on, and until then it keeps the way it had. One plan at a time a fighter.
+                            if Option.is_some(b.mb_job) do m
+                            else
+                              let job = task_spawn(fn _ ->
+                                let t0 = Strata.Ffi.Vk.time()
+                                let p = Nv.find(w, k, ax, ay, az, bx, by0, bz, 1200)
+                                let corners = List.drop(Nv.points(Nv.smooth(w, k, Nv.cells(p), 10), sc), 1)
+                                (corners, Nv.arrived(p), Nv.expanded(p), Strata.Ffi.Vk.time() -. t0))
+                              with_body(m, i, { b with mb_job: Some(job), mb_goal: (bx, by0, bz), mb_plan: 1.0 })
+                            end
                           end end
                       end
                   end
