@@ -89,6 +89,9 @@ void main() {
     if (figure && (fcode & 64) != 0) settling = true;
     if (settling) kept = min(kept, 2.0);
     bool sample_now = kept < 4.0 || settling || (((px.x >> 3) & 1) + 2 * ((px.y >> 3) & 1)) == (frame & 3);
+    // sky light changes slowly and costs most (its rays go far): a settled pixel traces it one frame in sixteen, in a pattern that moves round each
+    // 4 x 4 block of 8-pixel tiles, against the sun's one in four
+    bool sky_now = kept < 4.0 || settling || (((px.x >> 3) & 3) + 4 * ((px.y >> 3) & 3)) == (frame & 15);
     float sun_vis = old.a;
     int rays = mode >= 4 ? int(u.light.w) : 0;
     vec3 sky = rays > 0 ? old.rgb : sky_flat(n);
@@ -103,7 +106,7 @@ void main() {
         // shadows lean on 64 past samples at most, so they follow a moving sun; sky light on all of them, since a small bright thing is found by few rays
         sun_vis = mix(old.a, sun_now, 1.0 / (min(ks, 64.0) + 1.0));
         if (sample_now) {
-            if (rays > 0) sky = mix(old.rgb, sky_light(at, n, px, frame, rays), 1.0 / (kept + 1.0));
+            if (rays > 0 && sky_now) sky = mix(old.rgb, sky_light(at, n, px, frame, rays), 1.0 / (min(kept, 255.0) / 4.0 + 1.0));
             count = kept + 1.0;
         }
     }
