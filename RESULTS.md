@@ -693,12 +693,23 @@ animcheck/.march/build/release/animcheck` on a quiet machine to judge them.
 
 Measured on the same M3 Max, release builds, headless (`entcheck`). The
 plan trusts a timing only under load 8; every figure here was taken while
-other sessions kept the load far above it, so none is judged.
+other sessions kept the load far above it, so none is judged. The design's
+budget, row by row: the latest run (Task 9, 2026-11-12 09:38, load 24 to 25)
+first, earlier runs in brackets.
 
-| scene | median | worst | target | verdict |
-|---|---|---|---|---|
-| storm: 20,000 flying bullets, all seen, one touch pair against 200 targets; `step` over ticks 200 to 600 | 2.47 ms (2.57 in the run before) | 40.2 ms (97.1) | 2 ms | not judged (load 20 to 35) |
-| 5,000 removed and 5,000 added between two ticks, then the step | 1.11 ms for the 10,000 calls from March; 2.76 ms the step after | one run | 1 ms | not judged (load 20 to 35) |
+| design row | target for one tick | measured | verdict |
+|---|---|---|---|
+| storm: 20,000 flying entities, all seen, one touch pair against 200 targets; `step` over ticks 200 to 600 | 2 ms | median 2.16 ms (2.39 the second run; Task 4: 2.47, 2.57); worst 20.7 ms (24.7; 40.2, 97.1) | not judged (load 24; Task 4 load 20 to 35) |
+| arena: 2,000 walkers, all seen, each with a 6-part figure walking; `Strata.Entities.tick` over 600 ticks, `Strata.Anim.update` apart | 4 ms | median 0.32 ms (0.33; Task 7: 0.34, 0.35); worst 28.8 ms (25.1; 6.62, 7.74) | not judged (load 24; Task 7 load 40) |
+| city: 10,000 walkers on 200 looping routes, all unseen, divisor 4; `step` over 600 ticks | 0.5 ms | median 0.23 ms (0.23 the second run); worst 1.23 ms (0.50) | not judged (load 25) |
+| 5,000 removed and 5,000 added between two ticks, then the step | 1 ms | 2.13 ms for the 10,000 calls from March, 1.99 ms the step after (Task 4: 1.11 and 2.76) | not judged (load 24; Task 4 load 20 to 35) |
+| camera jump: 500 walkers become seen at once | no tick over 8 ms; all on the ground within 30 ticks of their chunks loading | worst step 0.94 ms over 137 frames, mean 0.1 ms (Task 6: worst 3.0 to 22.9 ms); all 500 set down grounded on solid as they came into view, within the 30 frames after the stream settled | not judged (load 24; Task 6 load 54 to 64) |
+
+Under the load these ran at, the city's and the arena's medians sit well
+under their targets and the storm's just over its own; the spawn-and-remove
+figure is twice its target. A quiet machine is needed to judge any of them.
+
+Voiced entities: not measured; each voice move is O(placed voices), so a tick is O(V^2) in voiced seen entities, until Strata.Sound gains a batched move.
 
 The storm fires its bullets from four emitters 50 m from the centre in rings
 of 64 at 40 m/s; each falls to the floor or meets a target within about a
@@ -707,10 +718,34 @@ second, and the game replaces every bullet named in a touch or a block hit
 events equal a brute-force count on ticks 150 (59) and 300 (60), and two runs
 end on one hash.
 
+The arena's `tick` is the step, the releases, the figures and voices wanted,
+and one `Strata.Anim.place_many` for the 2,000 figures. `Strata.Anim.update`
+is timed apart, in the animation shim: mean 1.29 ms, worst 21.73 ms (1.51 ms
+mean in the second run), posing all 2,000 six-part figures every update with
+no view set. Two runs end on one hash of the entities and the figures.
+
 Where the step goes, from a C bench of a like scene (best of 20 ticks, cc -O2,
 same machine, load about 50): 1.12 ms a tick, of which 0.87 ms is the 20,000
 bullets' rays through the voxel copy (0.25 ms with all unseen, so no rays),
 0.18 ms building the grid and 0.01 ms the touch pairs.
+
+The city (`ENTCHECK_SCENE=city`) streams the viewer's island: its atlas
+(512 x 512 samples 4 m apart, seed 7), built in 4.8 to 5.4 s the first time
+and read from `.march/atlas` in 38 ms after, as plain stone below the atlas
+height at 1 m voxels. Ten districts are found on flat land at least 250 m
+from the start and 160 m apart; the first takes 56 routes, the others 16 each,
+4 to 7 points 8 to 38 m from the centre at the ground's height, and 50
+walkers a route at 1 to 1.5 m/s. A drawing with a point or a leg over the sea
+(sampled every 2 m) is dropped and the next drawn; none was. The stream settles
+in 106 frames, then 600 frames are timed with the focus 250 m or more from
+every walker. One run takes about 0.6 s, so `scripts/ent_check.sh` runs the
+whole scene. The focus then jumps to the densest district (2,800 walkers):
+the stream settles on frame 106, every one of the 2,800 comes into view set
+down grounded on solid with its box clear, and 30 frames later all are seen
+with clear boxes, 2,623 grounded on solid and 177 stepping down a ledge
+(walked off it this tick, or falling to solid within 3 m). The worst step
+of those frames, which ground 2,800 walkers, is 2.72 ms. Two runs end on one
+hash.
 
 # The fluid step in flat arrays
 

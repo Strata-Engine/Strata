@@ -276,6 +276,14 @@ linear congruential generator in the test) asserted with `Test.assert_*`;
 existing properties (chunk, slots under random traffic, and others) are
 left as they are, and are worth rewriting the same way.
 
+Met again in the entity layer (entities Task 9): `Check.try_prop(fn n -> n > 100, 3)`
+answers `Ok(true)`, so a returned `false` never reaches `Check`. A property
+that raises does fail, with its counterexample shrunk:
+`fn n -> if n > 5 do panic("over five") else true end` reports 6. So a
+second workaround keeps shrinking: end the property in
+`if <cond> do true else panic("<what failed>") end`, as
+`entcheck/test/snapshot_test.march` does.
+
 ## S32: `by` cannot be a parameter name; `1.0e12` is not a number
 
 `pfn hits(fs, victim : Int, by : Int, ...)` is "I got stuck here" at `by`:
