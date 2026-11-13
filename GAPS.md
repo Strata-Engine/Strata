@@ -370,3 +370,13 @@ second arm (met writing `Strata.Population`'s readers). The same match
 with each arm on its own line parses. A one-line match with one arm
 (`match a do (x, _) -> x end`) is fine. Workaround: put each arm on its own
 line.
+
+## S40: `IO.Random` in a library module is charged to every test module
+
+Met writing `Strata.Save`'s lock (save Task 2): a module declaring `needs
+IO.Random` and calling `Crypto.random_hex` built alone, but the test build
+then stopped at an unrelated test module: "Module `AcousticsTest` uses
+`IO.Random` but does not declare `needs IO.Random`" (the S3 charge, for
+another capability). Workaround: the lock's token is the process id and the
+clock's microseconds (`IO.Process` and `IO.Clock`, which every test module
+declares already for S3), not random bytes.

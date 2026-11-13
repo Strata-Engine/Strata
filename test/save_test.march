@@ -1,0 +1,314 @@
+-- Save: the store's folder on disk — atomic writes, opening and its
+-- refusals, the lock two games meet, regions, the registry's fingerprint.
+--
+-- Each test works in a fresh folder of its own under test/.scratch (made
+-- here, removed at the end of the test; test/.scratch is ignored by git).
+mod Strata.Test.Save do
+
+  needs IO.Clock      -- charged to every test module once any uses Check.all (GAPS S3)
+  needs IO.Process
+  needs IO.FileSystem -- the stores are folders under test/.scratch
+  import Test
+  alias Strata.Save as Sv
+  alias Strata.Blocks as Bsv
+  alias Strata.World as Wsv
+  alias Strata.Coord as Ksv
+  alias Strata.Chunk as Cksv
+
+  -- ── Helpers ──────────────────────────────────────────────────────────────
+
+  -- a fresh, empty folder path for one test: test/.scratch/<name>-<pid>-<ms>
+  pfn scratch(name : String) : String do
+    let base = "test/.scratch"
+    let _made = Authority.must(Dir.mkdir_p(base))
+    let tag = int_to_string(Authority.must(Process.pid())) ++ "-" ++ int_to_string(Authority.must(System.now_ms()))
+    let dir = base ++ "/" ++ name ++ "-" ++ tag
+    let _clean = Authority.must(Dir.rm_rf(dir))
+    dir
+  end
+  pfn tidy(dir : String) : Unit do
+    let _gone = Authority.must(Dir.rm_rf(dir))
+    ()
+  end
+  pfn there(path : String) : Bool do Authority.must(File.exists(path)) end
+
+  pfn reg_with(r : Strata.Blocks.Registry, d : Strata.Blocks.Def) : Strata.Blocks.Registry do
+    match Bsv.register(r, d) do
+      Ok((r2, _)) -> r2
+      Err(_) -> r
+    end
+  end
+  -- air and one stone
+  pfn reg() : Strata.Blocks.Registry do reg_with(Bsv.empty(), Bsv.def()) end
+  pfn flat() : Strata.Terrain.Gen do
+    Strata.Terrain.gen(fn (k, seed) -> if Ksv.ky(k) < 0 do Cksv.uniform(1) else Cksv.uniform(0) end)
+  end
+  pfn world_of(r : Strata.Blocks.Registry, seed : Int, scale : Float) : Strata.World.World do Wsv.new(r, flat(), seed, scale) end
+  pfn world() : Strata.World.World do world_of(reg(), 7, 1.0) end
+
+  pfn opened(r : Result((Strata.Save.SaveStore, Strata.World.World), String)) : Option(Strata.Save.SaveStore) do
+    match r do
+      Ok((s, _)) -> Some(s)
+      Err(_) -> None
+    end
+  end
+  pfn refusal(r : Result((Strata.Save.SaveStore, Strata.World.World), String)) : String do
+    match r do
+      Ok((s, _)) ->
+        let _shut = Sv.close(s)
+        "opened"
+      Err(e) -> e
+    end
+  end
+  -- open a new store in dir with the default world and close it at once
+  pfn made(dir : String, gv : Int) : Bool do
+    match opened(Sv.open(dir, world(), gv)) do
+      Some(s) ->
+        let _shut = Sv.close(s)
+        true
+      None -> false
+    end
+  end
+
+  -- bytes 0, 1, ..., 255, 0, 1, ... (n of them)
+  pfn ramp(n : Int) : Bytes do
+    Bytes.from_u8_arr(ramp_go(NativeArray.make_u8(Strata.Size.of(n), 0), 0, n))
+  end
+  pfn ramp_go(a : NativeU8Arr, i : Int, n : Int) : NativeU8Arr do
+    if i >= n do a else ramp_go(NativeArray.set_u8(a, i, i % 256), i + 1, n) end
+  end
+  pfn same_bytes(a : Bytes, b : Bytes) : Bool do
+    let x = Bytes.to_u8_arr(a)
+    let y = Bytes.to_u8_arr(b)
+    if NativeArray.length_u8(x) != NativeArray.length_u8(y) do false else same_go(x, y, 0, NativeArray.length_u8(x)) end
+  end
+  pfn same_go(x : NativeU8Arr, y : NativeU8Arr, i : Int, n : Int) : Bool do
+    if i >= n do true
+    else if NativeArray.get_u8(x, i) != NativeArray.get_u8(y, i) do false
+    else same_go(x, y, i + 1, n) end end
+  end
+  pfn flipped(b : Bytes, i : Int) : Bytes do
+    let a = Bytes.to_u8_arr(b)
+    Bytes.from_u8_arr(NativeArray.set_u8(a, i, int_xor(NativeArray.get_u8(a, i), 255)))
+  end
+
+  -- does the store in dir name this seed, scale and generator version?
+  pfn ident_is(dir : String, seed : Int, scale : Float, gv : Int) : Bool do
+    match Sv.identity(dir) do
+      Some((s, sc, g)) -> if s != seed do false else if sc != scale do false else g == gv end end
+      None -> false
+    end
+  end
+
+  pfn region_is(k : Strata.Coord.Key, x : Int, y : Int, z : Int) : Bool do
+    let (rx, ry, rz) = Sv.region_of_key(k)
+    if rx != x do false else if ry != y do false else rz == z end end
+  end
+
+  -- ── Files ────────────────────────────────────────────────────────────────
+
+  describe "Save files" do
+    test "write_atomic then read_file gives the same bytes, and leaves no .tmp" do
+      let dir = scratch("atomic")
+      let _made = Authority.must(Dir.mkdir_p(dir))
+      let path = dir ++ "/f.bin"
+      let b = ramp(1000)
+      Test.assert_true(Sv.write_atomic(path, b), "written")
+      Test.assert_false(there(path ++ ".tmp"), "no .tmp left")
+      Test.assert_true(match Sv.read_file(path) do
+          Some(back) -> same_bytes(back, b)
+          None -> false
+        end, "the same 1000 bytes, zeros and 255s included")
+      Test.assert_true(Sv.write_atomic(path, ramp(3)), "rewritten")
+      Test.assert_true(match Sv.read_file(path) do
+          Some(back) -> same_bytes(back, ramp(3))
+          None -> false
+        end, "the new bytes replace the old")
+      Test.assert_true(Option.is_none(Sv.read_file(dir ++ "/missing.bin")), "a missing file reads as None")
+      Test.assert_false(Sv.write_atomic(dir ++ "/no/such/folder/f.bin", b), "a write into a missing folder answers false")
+      Sv.set_aside(path)
+      Test.assert_true(there(path ++ ".bad"), "set_aside renames to .bad")
+      Test.assert_false(there(path), "and the file is gone")
+      tidy(dir)
+    end
+    test "a .tmp left beside a store is gone after open" do
+      let dir = scratch("leftover")
+      Test.assert_true(made(dir, 1), "a store")
+      let _a = Sv.write_atomic(dir ++ "/store.bin.tmp", ramp(10))
+      let _b = Authority.must(File.write(dir ++ "/regions/r.0.0.0.bin.tmp", "half a region"))
+      let _c = Authority.must(File.write(dir ++ "/players/p1.bin.tmp", "half a player"))
+      Test.assert_true(there(dir ++ "/store.bin.tmp"), "the leftover is there")
+      match opened(Sv.open(dir, world(), 1)) do
+        Some(s) ->
+          Test.assert_false(there(dir ++ "/store.bin.tmp"), "the store's leftover is gone")
+          Test.assert_false(there(dir ++ "/regions/r.0.0.0.bin.tmp"), "a region's leftover is gone")
+          Test.assert_false(there(dir ++ "/players/p1.bin.tmp"), "a player's leftover is gone")
+          Sv.close(s)
+        None -> Test.fail("reopened")
+      end
+      tidy(dir)
+    end
+  end
+
+  -- ── Opening ──────────────────────────────────────────────────────────────
+
+  describe "Save.open" do
+    test "a new store: open on a missing folder makes store.bin and store.lock; close removes the lock" do
+      let dir = scratch("new")
+      Test.assert_true(Option.is_none(Sv.identity(dir)), "no identity before")
+      match opened(Sv.open(dir, world(), 3)) do
+        Some(s) ->
+          Test.assert_true(there(dir ++ "/store.bin"), "store.bin")
+          Test.assert_true(there(dir ++ "/store.lock"), "store.lock")
+          Test.assert_true(Authority.must(Dir.exists(dir ++ "/regions")), "regions/")
+          Test.assert_true(Authority.must(Dir.exists(dir ++ "/players")), "players/")
+          Test.assert_eq_str(Sv.dir(s), dir, "dir")
+          Test.assert_eq_str(Sv.reason(s), "", "no reason")
+          let (d, f, x, a) = Sv.stats(s)
+          Test.assert_eq_int(d + f + x + a, 0, "stats all zero")
+          Test.assert_true(ident_is(dir, 7, 1.0, 3 * 65536 + Strata.Terrain.generation_version()), "identity: the world's seed, scale and the combined version")
+          Sv.close(s)
+          Test.assert_false(there(dir ++ "/store.lock"), "close removes the lock")
+          Test.assert_true(there(dir ++ "/store.bin"), "and keeps the header")
+        None -> Test.fail("opened")
+      end
+      tidy(dir)
+    end
+    test "open hands back the world unchanged" do
+      let dir = scratch("same-world")
+      match Sv.open(dir, world(), 1) do
+        Ok((s, w)) ->
+          Test.assert_eq_int(Wsv.seed(w), 7, "seed")
+          Test.assert_eq_int(Bsv.count(Wsv.registry(w)), 2, "registry")
+          Sv.close(s)
+        Err(e) -> Test.fail("opened: " ++ e)
+      end
+      tidy(dir)
+    end
+    test "refusals: another registry, seed or voxel scale" do
+      let dir = scratch("refusals")
+      Test.assert_true(made(dir, 1), "a store")
+      let more = reg_with(reg(), Bsv.with_collide(Bsv.def(), false))
+      Test.assert_eq_str(refusal(Sv.open(dir, world_of(more, 7, 1.0), 1)), "different block registry", "one more block")
+      Test.assert_eq_str(refusal(Sv.open(dir, world_of(reg(), 8, 1.0), 1)), "different seed", "seed + 1")
+      Test.assert_eq_str(refusal(Sv.open(dir, world_of(reg(), 7, 0.1), 1)), "different voxel scale", "scale 0.1")
+      Test.assert_false(there(dir ++ "/store.lock"), "a refusal leaves no lock")
+      Test.assert_true(Option.is_some(opened(Sv.open(dir, world(), 1))), "the right world still opens")
+      tidy(dir)
+    end
+    test "a store.bin with one flipped byte refuses as a damaged header and is set aside" do
+      let dir = scratch("damaged")
+      Test.assert_true(made(dir, 1), "a store")
+      let path = dir ++ "/store.bin"
+      match Sv.read_file(path) do
+        Some(b) ->
+          Test.assert_true(Sv.write_atomic(path, flipped(b, 20)), "one byte flipped")
+          Test.assert_eq_str(refusal(Sv.open(dir, world(), 1)), "damaged header", "refused")
+          Test.assert_true(there(path ++ ".bad"), "store.bin.bad")
+          Test.assert_false(there(dir ++ "/store.lock"), "no lock")
+          Test.assert_true(Option.is_none(Sv.identity(dir)), "no identity")
+          Test.assert_false(Option.is_some(opened(Sv.open(dir, world(), 1))), "a folder with a set-aside header is not taken for a new store")
+        None -> Test.fail("store.bin read")
+      end
+      tidy(dir)
+    end
+    test "a folder of other files is not a store: refused as no header, and left untouched" do
+      let dir = scratch("not-a-store")
+      let _made = Authority.must(Dir.mkdir_p(dir))
+      let _notes = Authority.must(File.write(dir ++ "/notes.txt", "mine"))
+      let _half = Authority.must(File.write(dir ++ "/draft.tmp", "mine too"))
+      Test.assert_eq_str(refusal(Sv.open(dir, world(), 1)), "no header", "refused")
+      Test.assert_false(Authority.must(Dir.exists(dir ++ "/regions")), "no regions/ made")
+      Test.assert_true(there(dir ++ "/draft.tmp"), "its .tmp file kept")
+      Test.assert_false(there(dir ++ "/store.lock"), "no lock")
+      tidy(dir)
+    end
+    test "seams: a different generator version opens, and is recorded at the next header write" do
+      let dir = scratch("seams")
+      Test.assert_true(made(dir, 1), "a store at version 1")
+      match opened(Sv.open(dir, world(), 2)) do
+        Some(s) ->
+          Test.assert_true(ident_is(dir, 7, 1.0, 65536 + Strata.Terrain.generation_version()), "the stored version is kept while open")
+          Sv.close(s)
+          Test.assert_true(ident_is(dir, 7, 1.0, 2 * 65536 + Strata.Terrain.generation_version()), "and the new one is written at close")
+        None -> Test.fail("version 2 opens")
+      end
+      tidy(dir)
+    end
+  end
+
+  -- ── The lock (Review Focus 3) ────────────────────────────────────────────
+
+  describe "Save lock" do
+    test "a second open refuses while the first holds the folder; open_forcing takes over; the first close leaves the second's lock" do
+      let dir = scratch("lock")
+      match opened(Sv.open(dir, world(), 1)) do
+        Some(first) ->
+          Test.assert_eq_str(refusal(Sv.open(dir, world(), 1)), "open in another game", "the second open refuses")
+          Test.assert_true(there(dir ++ "/store.lock"), "the first's lock is untouched")
+          match opened(Sv.open_forcing(dir, world(), 1)) do
+            Some(second) ->
+              Sv.close(first)
+              Test.assert_true(there(dir ++ "/store.lock"), "the first's close leaves the second's lock")
+              Test.assert_eq_str(refusal(Sv.open(dir, world(), 1)), "open in another game", "still held, by the second")
+              Sv.close(second)
+              Test.assert_false(there(dir ++ "/store.lock"), "the second's close removes it")
+              Test.assert_true(Option.is_some(opened(Sv.open(dir, world(), 1))), "and the folder opens again")
+            None -> Test.fail("open_forcing")
+          end
+        None -> Test.fail("first open")
+      end
+      tidy(dir)
+    end
+    test "a stale lock (a crashed game) refuses open and is taken over by open_forcing" do
+      let dir = scratch("stale")
+      Test.assert_true(made(dir, 1), "a store")
+      let _crashed = Authority.must(File.write(dir ++ "/store.lock", "a token from a game that crashed"))
+      Test.assert_eq_str(refusal(Sv.open(dir, world(), 1)), "open in another game", "refused")
+      match opened(Sv.open_forcing(dir, world(), 1)) do
+        Some(s) ->
+          Sv.close(s)
+          Test.assert_false(there(dir ++ "/store.lock"), "the taken-over lock is this store's, and close removes it")
+        None -> Test.fail("open_forcing")
+      end
+      tidy(dir)
+    end
+  end
+
+  -- ── Regions ──────────────────────────────────────────────────────────────
+
+  describe "Save regions" do
+    test "region_of_key floor-divides level-0 keys by 8, negative keys included" do
+      Test.assert_true(region_is(Ksv.key(0, 0, 0), 0, 0, 0), "(0,0,0)")
+      Test.assert_true(region_is(Ksv.key(7, 7, 7), 0, 0, 0), "(7,7,7)")
+      Test.assert_true(region_is(Ksv.key(8, 0, 0), 1, 0, 0), "(8,0,0)")
+      Test.assert_true(region_is(Ksv.key(-1, 0, 0), -1, 0, 0), "(-1,0,0)")
+      Test.assert_true(region_is(Ksv.key(-8, 0, 0), -1, 0, 0), "(-8,0,0)")
+      Test.assert_true(region_is(Ksv.key(-9, 0, 0), -2, 0, 0), "(-9,0,0)")
+      Test.assert_true(region_is(Ksv.key(3, -9, 16), 0, -2, 2), "each axis")
+    end
+    test "region_of takes metres and the voxel scale: 256 voxels a side" do
+      let (a, b, c) = Sv.region_of(255.9, -0.1, 256.0, 1.0)
+      Test.assert_true(if a != 0 do false else if b != -1 do false else c == 1 end end, "at 1 m voxels")
+      let (d, e, f) = Sv.region_of(25.7, 0.0, -25.7, 0.1)
+      Test.assert_true(if d != 1 do false else if e != 0 do false else f == -2 end end, "at 10 cm voxels")
+      let (g, h, i) = Sv.region_of(float_nan(), float_infinity(), 1.0, 0.0)
+      Test.assert_true(if g != 0 do false else if h != 0 do false else i == 0 end end, "no panic on NaN, infinity or a zero scale")
+    end
+  end
+
+  -- ── Fingerprint and versions ─────────────────────────────────────────────
+
+  describe "Save identity values" do
+    test "fingerprint changes with a block's flags, not with its textures" do
+      let base = Bsv.fingerprint(reg())
+      Test.assert_true(Bsv.fingerprint(reg()) == base, "the same registry, the same fingerprint")
+      Test.assert_true(Bsv.fingerprint(reg_with(Bsv.empty(), Bsv.with_collide(Bsv.def(), false))) != base, "flags changed")
+      Test.assert_true(Bsv.fingerprint(reg_with(Bsv.empty(), Bsv.with_faces(Bsv.def(), 3, 4, 5))) == base, "only textures changed")
+      Test.assert_true(Bsv.fingerprint(reg_with(reg(), Bsv.def())) != base, "one more block")
+    end
+    test "Strata's own generation version is 1" do
+      Test.assert_eq_int(Strata.Terrain.generation_version(), 1, "1")
+    end
+  end
+end

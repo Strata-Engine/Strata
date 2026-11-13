@@ -1,0 +1,315 @@
+-- Save — a world kept in a folder on disk, saved as it plays.
+--
+-- A store is a folder:
+--
+--   <dir>/store.bin                   the header (Strata.Savefile.encode_header)
+--   <dir>/store.lock                  a token (process id and clock) while a game has it open
+--   <dir>/players/<id>.bin            one file per player record
+--   <dir>/regions/r.<x>.<y>.<z>.bin   one file per region that holds anything
+--
+-- A region is 8 x 8 x 8 level-0 chunks, 256 voxels a side.
+--
+-- Every file is written whole: to <name>.tmp, then renamed over <name>, so
+-- a crash leaves the old file or the new one, never half of one. Leftover
+-- .tmp files are deleted when a store opens. A file that does not decode
+-- is renamed to <name>.bad and treated as absent.
+--
+-- Opening checks the folder is this world's: the same block registry
+-- (Strata.Blocks.fingerprint), seed and voxel scale, and nobody else's
+-- lock. A different generator version does not refuse: regions keep the
+-- version that wrote them, and the store records the new one at its next
+-- header write. Nothing here panics on a missing, unreadable or damaged
+-- file; refusals answer Err with a reason.
+--
+-- File access goes through the standard library only, every call wrapped
+-- in Authority.must where it is made, never inside a lambda (GAPS S35).
+mod Strata.Save do
+
+  needs IO.FileSystem -- the store is a folder
+  needs IO.Clock      -- the lock's token: the clock's microseconds and the process id
+  needs IO.Process    -- (IO.Random would be charged to every test module: GAPS S40)
+
+  alias Strata.Savefile as Svf
+
+  -- the folder; this store's lock token; the header as read or made (its
+  -- generator version is the stored one); the combined generator version
+  -- the game opened with, written at the next header write; dirty regions,
+  -- writes in flight, writes failed, files set aside; the last refusal or
+  -- failure
+  type SaveStore = { sv_dir : String, sv_token : String, sv_header : Strata.Savefile.SaveHeader, sv_generator : Int,
+                 sv_dirty : Int, sv_flight : Int, sv_failed : Int, sv_aside : Int, sv_reason : String }
+
+  pfn header_path(d : String) : String do d ++ "/store.bin" end
+  pfn lock_path(d : String) : String do d ++ "/store.lock" end
+  pfn regions_dir(d : String) : String do d ++ "/regions" end
+  pfn players_dir(d : String) : String do d ++ "/players" end
+
+  -- ── Files ────────────────────────────────────────────────────────────────
+
+  pfn exists_at(path : String) : Bool do Authority.must(File.exists(path)) end
+
+  pfn delete_file(path : String) : Bool do
+    match Authority.must(File.delete(path)) do
+      Ok(_) -> true
+      Err(_) -> false
+    end
+  end
+
+  pfn names_in(d : String) : List(String) do
+    match Authority.must(Dir.list(d)) do
+      Ok(ns) -> ns
+      Err(_) -> Nil
+    end
+  end
+
+  pfn make_dir(d : String) : Bool do
+    match Authority.must(Dir.mkdir_p(d)) do
+      Ok(_) -> true
+      Err(_) -> false
+    end
+  end
+
+  doc "Write [b] to [path] whole: to <path>.tmp, then renamed over [path]. False on any failure (the .tmp is removed if it was made); [path] then holds what it held before."
+  fn write_atomic(path : String, b : Bytes) : Bool do
+    let tmp = path ++ ".tmp"
+    match Authority.must(File.write(tmp, Bytes.to_string(b))) do
+      Err(_) ->
+        let _gone = delete_file(tmp)
+        false
+      Ok(_) ->
+        match Authority.must(File.rename(tmp, path)) do
+          Ok(_) -> true
+          Err(_) ->
+            let _gone = delete_file(tmp)
+            false
+        end
+    end
+  end
+
+  doc "The bytes of the file at [path]; None when it is missing or cannot be read."
+  fn read_file(path : String) : Option(Bytes) do
+    match Authority.must(File.read(path)) do
+      Ok(s) -> Some(Bytes.from_string(s))
+      Err(_) -> None
+    end
+  end
+
+  doc "Rename the file at [path] to <path>.bad, replacing an older .bad; nothing happens if it cannot be renamed."
+  fn set_aside(path : String) : Unit do
+    let _moved = Authority.must(File.rename(path, path ++ ".bad"))
+    ()
+  end
+
+  -- delete every name in [ns] ending ".tmp", in folder d
+  pfn remove_tmps_in(d : String, ns : List(String)) : Unit do
+    match ns do
+      Nil -> ()
+      Cons(n, t) ->
+        let _gone = if string_ends_with(n, ".tmp") do delete_file(d ++ "/" ++ n) else false end
+        remove_tmps_in(d, t)
+    end
+  end
+  pfn remove_tmps(d : String) : Unit do
+    let _top = remove_tmps_in(d, names_in(d))
+    let _regions = remove_tmps_in(regions_dir(d), names_in(regions_dir(d)))
+    remove_tmps_in(players_dir(d), names_in(players_dir(d)))
+  end
+
+  -- names other than the two folders and leftover .tmp files
+  pfn others(ns : List(String)) : Int do
+    match ns do
+      Nil -> 0
+      Cons(n, t) ->
+        if n == "regions" do others(t)
+        else if n == "players" do others(t)
+        else if string_ends_with(n, ".tmp") do others(t)
+        else 1 + others(t) end end end
+    end
+  end
+  -- nothing in the folder but empty regions/ and players/ and leftover
+  -- .tmp files (a missing folder is empty)
+  pfn is_empty(d : String) : Bool do
+    if others(names_in(d)) != 0 do false
+    else if List.length(names_in(regions_dir(d))) != 0 do false
+    else List.length(names_in(players_dir(d))) == 0 end end
+  end
+
+  -- ── Identity ─────────────────────────────────────────────────────────────
+
+  -- the store's generator version: the game's in the high bits, Strata's
+  -- own (Strata.Terrain.generation_version) in the low 16
+  pfn combined(generator_version : Int) : Int do
+    int_wrapping_add(int_wrapping_mul(generator_version, 65536), Strata.Terrain.generation_version())
+  end
+
+  doc "The identity in the header of the store in [dir]: (seed, voxel scale, generator version as stored, the game's version times 65536 plus Strata's own). None when there is no store there or its header is unreadable or damaged. Reads only; a game whose generator needs the seed reads it here before building the generator and opening."
+  fn identity(dir : String) : Option((Int, Float, Int)) do
+    match read_file(header_path(dir)) do
+      None -> None
+      Some(b) ->
+        match Svf.decode_header(b) do
+          Ok(h) -> Some((h.sh_seed, h.sh_scale, h.sh_generator))
+          Err(_) -> None
+        end
+    end
+  end
+
+  -- ── Opening ──────────────────────────────────────────────────────────────
+
+  pfn header_for(w : Strata.World.World, gv : Int) : Strata.Savefile.SaveHeader do
+    { sh_seed: Strata.World.seed(w), sh_scale: Strata.World.scale(w), sh_fingerprint: Strata.Blocks.fingerprint(Strata.World.registry(w)),
+      sh_generator: gv, sh_counter: 0, sh_sections: Nil, sh_entities: None }
+  end
+
+  -- write h, its counter raised; the header written, or None
+  pfn write_header(d : String, h : Strata.Savefile.SaveHeader) : Option(Strata.Savefile.SaveHeader) do
+    let h2 = { h with sh_counter: int_wrapping_add(h.sh_counter, 1) }
+    if write_atomic(header_path(d), Svf.encode_header(h2)) do Some(h2) else None end
+  end
+
+  pfn lock_holds(d : String, token : String) : Bool do
+    match read_file(lock_path(d)) do
+      Some(b) -> Bytes.to_string(b) == token
+      None -> false
+    end
+  end
+
+  -- the existing header's verdict on world w: the header, or the refusal
+  pfn check_header(d : String, w : Strata.World.World) : Result(Strata.Savefile.SaveHeader, String) do
+    match read_file(header_path(d)) do
+      None -> Err("unreadable header")
+      Some(b) ->
+        match Svf.decode_header(b) do
+          Err(e) ->
+            if string_starts_with(e, "newer format") do Err("newer format")
+            else
+              let _aside = set_aside(header_path(d))
+              Err("damaged header")
+            end
+          Ok(h) ->
+            if h.sh_fingerprint != Strata.Blocks.fingerprint(Strata.World.registry(w)) do Err("different block registry")
+            else if h.sh_seed != Strata.World.seed(w) do Err("different seed")
+            else if h.sh_scale != Strata.World.scale(w) do Err("different voxel scale")
+            else Ok(h) end end end
+        end
+    end
+  end
+
+  -- the folders made and leftover .tmp files deleted
+  pfn prepared(d : String) : Bool do
+    if !make_dir(regions_dir(d)) do false
+    else if !make_dir(players_dir(d)) do false
+    else
+      let _swept = remove_tmps(d)
+      true
+    end end
+  end
+
+  -- the header to open with: the existing one checked, or a new one
+  -- written; a folder that is neither a store nor empty is left untouched
+  pfn header_of(d : String, w : Strata.World.World, gv : Int) : Result(Strata.Savefile.SaveHeader, String) do
+    let have = exists_at(header_path(d))
+    if !have do
+      if !is_empty(d) do Err("no header")
+      else if !prepared(d) do Err("cannot make the store's folders")
+      else
+        match write_header(d, header_for(w, gv)) do
+          Some(h) -> Ok(h)
+          None -> Err("cannot write the header")
+        end
+      end end
+    else if !prepared(d) do Err("cannot make the store's folders")
+    else check_header(d, w) end end
+  end
+
+  -- a token for this opening: the process id and the clock in
+  -- microseconds, made to differ from whatever lock the folder holds now
+  pfn fresh_token(d : String) : String do
+    let micros = floor_safe(Authority.must(System.now()) *. 1000000.0)
+    let t = int_to_string(Authority.must(Process.pid())) ++ "-" ++ int_to_string(micros)
+    if lock_holds(d, t) do t ++ "+" else t end
+  end
+
+  pfn take_lock(d : String, token : String) : Result(Unit, String) do
+    if write_atomic(lock_path(d), Bytes.from_string(token)) do
+      if lock_holds(d, token) do Ok(()) else Err("open in another game") end
+    else Err("cannot write the lock") end
+  end
+
+  pfn open_with(dir : String, w : Strata.World.World, generator_version : Int, forcing : Bool) : Result((SaveStore, Strata.World.World), String) do
+    let gv = combined(generator_version)
+    let held = if forcing do false else exists_at(lock_path(dir)) end
+    if held do Err("open in another game")
+    else
+      match header_of(dir, w, gv) do
+        Err(e) -> Err(e)
+        Ok(h) ->
+          let token = fresh_token(dir)
+          match take_lock(dir, token) do
+            Err(e) -> Err(e)
+            Ok(_) ->
+              Ok(({ sv_dir: dir, sv_token: token, sv_header: h, sv_generator: gv,
+                    sv_dirty: 0, sv_flight: 0, sv_failed: 0, sv_aside: 0, sv_reason: "" }, w))
+          end
+      end
+    end
+  end
+
+  doc "Open the store in [dir] for world [w], whose generator is at the game's [generator_version]. A missing or empty folder becomes a new store: its folders and a header from the world (seed, scale, registry fingerprint, the generator version) are written. An existing store is refused, with the reason, when its header is damaged (\"damaged header\"; the file is set aside as store.bin.bad), unreadable (\"unreadable header\"), of a newer format (\"newer format\"), or names another registry (\"different block registry\"), seed (\"different seed\") or voxel scale (\"different voxel scale\"); a folder holding other files but no header is refused (\"no header\") and left untouched. A store another game holds is refused (\"open in another game\"), before anything in the folder is touched. A different generator version opens: the new one is recorded at the next header write. On opening, leftover .tmp files are deleted and a lock with a fresh token (the process id and the clock's microseconds) is written. The world is handed back unchanged."
+  fn open(dir : String, w : Strata.World.World, generator_version : Int) : Result((SaveStore, Strata.World.World), String) do
+    open_with(dir, w, generator_version, false)
+  end
+
+  doc "`open`, taking over a lock left in the folder: for a game that crashed with the store open. The game it is taken from, if it is still running, no longer holds the store: its `close` writes nothing and leaves the new lock."
+  fn open_forcing(dir : String, w : Strata.World.World, generator_version : Int) : Result((SaveStore, Strata.World.World), String) do
+    open_with(dir, w, generator_version, true)
+  end
+
+  doc "Release the store: if its lock still holds this store's token, write the header (its counter raised, the generator version the game opened with) and remove the lock. A store whose lock another game has taken over (`open_forcing`) writes nothing and leaves that lock in place."
+  fn close(s : SaveStore) : Unit do
+    if lock_holds(s.sv_dir, s.sv_token) do
+      let _written = write_header(s.sv_dir, { s.sv_header with sh_generator: s.sv_generator })
+      let _unlocked = delete_file(lock_path(s.sv_dir))
+      ()
+    else () end
+  end
+
+  doc "The store's folder."
+  fn dir(s : SaveStore) : String do s.sv_dir end
+
+  doc "(dirty regions, writes in flight, writes failed, files set aside)."
+  fn stats(s : SaveStore) : (Int, Int, Int, Int) do (s.sv_dirty, s.sv_flight, s.sv_failed, s.sv_aside) end
+
+  doc "The last refusal or failure, \"\" if none."
+  fn reason(s : SaveStore) : String do s.sv_reason end
+
+  -- ── Regions ──────────────────────────────────────────────────────────────
+
+  -- floor(v) as an Int, 0 for NaN or an infinity, clamped to +-2^52 so the
+  -- conversion cannot trap
+  pfn floor_safe(v : Float) : Int do
+    if float_is_nan(v) do 0
+    else if float_is_infinite(v) do 0
+    else if v > 4503599627370496.0 do 4503599627370496
+    else if v < -4503599627370496.0 do -4503599627370496
+    else float_floor(v) end end end end
+  end
+
+  doc "The region holding the point ([x], [y], [z]) in metres, in a world of voxel size [scale] metres: each coordinate floor-divided by 256 voxels. A scale that is not positive, a NaN or an infinity answers 0 on that axis rather than failing."
+  fn region_of(x : Float, y : Float, z : Float, scale : Float) : (Int, Int, Int) do
+    if scale > 0.0 do
+      let side = 256.0 *. scale
+      (floor_safe(x /. side), floor_safe(y /. side), floor_safe(z /. side))
+    else (0, 0, 0) end
+  end
+
+  -- floor(v / 8) for any sign
+  pfn floor8(v : Int) : Int do if v >= 0 do v / 8 else 0 - ((7 - v) / 8) end end
+
+  doc "The region holding the chunk at [k]: its coordinates floor-divided by 8, so chunks 0..7 are region 0 and -8..-1 region -1. Meant for level-0 keys; a coarser key answers the region of its first level-0 chunk."
+  fn region_of_key(k : Strata.Coord.Key) : (Int, Int, Int) do
+    let l = Strata.Coord.level(k)
+    let up = if l <= 0 do 0 else if l > 24 do 24 else l end end
+    (floor8(int_shl(Strata.Coord.kx(k), up)), floor8(int_shl(Strata.Coord.ky(k), up)), floor8(int_shl(Strata.Coord.kz(k), up)))
+  end
+end
