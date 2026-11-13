@@ -370,3 +370,14 @@ second arm (met writing `Strata.Population`'s readers). The same match
 with each arm on its own line parses. A one-line match with one arm
 (`match a do (x, _) -> x end`) is fine. Workaround: put each arm on its own
 line.
+
+## S40: on March main a bare `println` as a statement still builds and prints
+
+Met moving the animation onto March main (`07b58d065`). `println` answers
+`Result(Unit, CapError)` (S37), but one standing as a statement in a block,
+its result unused, compiles with no word and prints:
+`test/erosion_test.march` and `test/lattice_test.march` still have one each,
+and the library's `forge test` builds them and prints their lines. So the
+compiler is no help in finding the prints a move like S37's left unwrapped.
+Workaround: a scan for effect calls not inside `Authority.must(` (the
+animation's merge used one; it found 31 in the viewer, none in `lib/`).
