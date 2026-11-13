@@ -6,7 +6,7 @@
 layout(location = 0) in uint w0;
 layout(location = 1) in uint w1;
 
-struct Chunk { ivec4 origin_level; uint first[6]; uint count[6]; vec4 pos; vec4 rot; };   // a body slot (w bit 9) is drawn at pos (metres), turned by rot
+struct Chunk { ivec4 origin_level; uint first[6]; uint count[6]; vec4 pos; vec4 rot; };   // a body slot (w bit 9) is drawn at pos (metres; pos.w metres a voxel, 0 the world's), turned by rot
 layout(std430, set = 0, binding = 1) readonly buffer Table { Chunk chunks[]; } table;
 layout(std430, set = 0, binding = 4) readonly buffer DrawSlot { uint slot[]; } draw_slot;
 struct Block { int tex[6]; int flags; int emission; };
@@ -39,7 +39,7 @@ void main() {
     ivec4 ol = ch.origin_level;
     bool body = (ol.w & 512) != 0;
     float lod = float(1 << (ol.w & 255));   // a level-L chunk's voxels are 2^L world voxels on a side
-    vec3 world = body ? ch.pos.xyz + qrot(ch.rot, q * u.eye.w) : (vec3(ol.xyz) + q * lod) * u.eye.w;
+    vec3 world = body ? ch.pos.xyz + qrot(ch.rot, q * (ch.pos.w > 0.0 ? ch.pos.w : u.eye.w)) : (vec3(ol.xyz) + q * lod) * u.eye.w;
     v_rot = body ? ch.rot : vec4(0.0, 0.0, 0.0, 1.0);
     v_uv = vec2(0.5);                       // no corner shading on a plant
     v_tex = vec2(cu, 1.0 - cv);

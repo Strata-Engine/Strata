@@ -301,6 +301,41 @@ In the step, after integration (design §4 item 7): a contact whose impulse over
 - [ ] **Step 3:** run; expect FAIL. Implement.
 - [ ] **Step 4:** `forge test`; all pass. `scripts/verify.sh` PASS. Commit `feat(physics): bodies and blocks break by impact and material; fragments snap or spray`.
 
+### Task 8b: Fine bodies and pinned bodies
+
+Added 2026-11-12 at the owner's approval of design §11, ahead of Task 9 because the demo game's trees wait on it.
+
+**Files:** `lib/strata/physics.march`, `lib/strata/contact.march`, `lib/strata/render.march`, `lib/strata/ffi/vk.march` (or wherever `Strata.Ffi.Vk` lives), `native/strata_vk.c`, `native/shaders/trace.glsl`, `native/shaders/quad.vert`, `native/shaders/loose.vert`, `test/physics_test.march`
+
+**Interfaces — Produces:**
+```
+Strata.Physics.add_fine(p : Physics, g : Grid, k : Int, x : Float, y : Float, z : Float, q : Quat, kind : Int) : (Physics, Int)
+    -- voxels of the world's size / k; k must be 1, 2, 4 or 8, otherwise nothing is added and the id is -1
+Strata.Physics.pinned() : Int                       -- the third kind
+Strata.Physics.kind_of(p : Physics, id : Int) : Int -- -1 for none
+Strata.Physics.voxel_size(p : Physics, id : Int) : Float
+Strata.Physics.cut(p : Physics, x : Float, y : Float, z : Float, r : Float) : Physics   -- at the next step
+Strata.Ffi.Vk.body_voxel(handle, metres) / slot_voxel(slot, metres)   -- 0 = the world's
+```
+Event kind 6: voxels cut (where, how many).
+
+- [ ] **Step 1: failing tests** in `test/physics_test.march` ("Physics fine bodies"):
+  - **mass:** a 4 x 4 x 4 crate added with k = 4 at scale 1 weighs what a 1 x 1 x 1 crate weighs;
+  - **rests on the world:** that fine crate dropped 2 m onto flat ground at scale 1 sleeps with its bottom within 0.025 m of y = 0 (the contact slop is 0.02 of a world voxel);
+  - **fine on coarse and coarse on fine:** a 1 m crate dropped onto a resting 8 x 8 x 8 fine crate (k = 8) rests on top of it (its bottom within 0.025 m of the fine crate's top), and the fine crate dropped onto a resting coarse crate rests on it;
+  - **never blocks:** `to_blocks` on a fine body writes nothing and leaves the body;
+  - **k checked:** k = 3 adds nothing and gives -1;
+  - **rays:** `raycast` straight down onto a fine crate at rest hits it at its top face.
+- [ ] **Step 2: failing tests** ("Physics pinned bodies"):
+  - **stands:** a pinned fine tree (k = 4: a 2 x 6 x 2 trunk under a 4 x 4 x 4 crown, 1 m x 2.5 m x 1 m) on the ground stays put for 120 steps; a 0.5 m fine crate dropped inside its crown's top comes to rest on it, and the column has not moved;
+  - **pushes and drives do not move it:** `push` and a driven walker pressing against it leave its position unchanged;
+  - **cut through, the top falls:** `cut` at the column's base (a sphere through its lowest fine voxels, above ground level) leaves a held stump pinned under the original id and the crown a new dynamic body that falls and comes to rest on the ground; one event of kind 6 with the voxels cut;
+  - **ground dug out, it is freed:** removing the world cells under a pinned body and handing the edit to `wake` makes it dynamic, and it falls;
+  - **the job equals the step** with a cut handed between steps.
+- [ ] **Step 3:** run; expect FAIL. Implement: a voxel size on each body, threaded through mass, corners, contacts (two sizes: the corners' body and the target grid), sub-steps, reach and bounds, fracture, snapping, meshing, `raycast`/`drive`/`sweep`; the pinned kind; cuts handed like pushes and applied at the start of the step; renumbered with the step's new bodies in `finish_world`.
+- [ ] **Step 4:** renderer: body rows carry their voxel size (`trace.glsl` converts distances for bodies as it does for figure parts); body slots are posed at their voxel size in `quad.vert` and `loose.vert`; `Render.bodies` passes it. Viewer suite and goldens unchanged (no fine bodies in them).
+- [ ] **Step 5:** `forge test`; all pass. `scripts/verify.sh` PASS. Commit `feat(physics): fine bodies, pinned bodies, cutting`.
+
 ### Task 9: Water
 
 **Files:** `lib/strata/physics.march`, `lib/strata/fluid.march`, `viewer/lib/strata_viewer.march`, `test/physics_test.march`, `test/fluid_test.march`

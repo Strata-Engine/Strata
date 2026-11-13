@@ -27,7 +27,7 @@
 /* Rewritten by build_shaders.sh whenever the shaders change: forge decides
  * whether to recompile this file from its text alone, not from the headers
  * it includes (GAPS S14). */
-#define STRATA_SHADERS_STAMP "dbd687867761280d"
+#define STRATA_SHADERS_STAMP "6a4a74d9eabcdc2e"
 #include "strata_shaders.h"
 #include "strata_spray.h"
 #include "strata_alloc.h"
@@ -74,7 +74,7 @@ typedef SaRange Range;
 struct FigInst { float pos[3]; uint32_t flags; float rot[4]; };
 
 typedef struct { float pos[4]; float rot[4]; int32_t dims[4]; float sphere[4]; } BodyRow;    /* std430, 64 bytes: low corner (metres), rotation, size and first word, bounding sphere (voxels) */
-typedef struct { int shaped, placed; float pos[3], rot[4], seen_pos[3], seen_rot[4]; int32_t dims[3]; uint32_t first, nwords; } BodyRec;
+typedef struct { int shaped, placed; float pos[3], rot[4], seen_pos[3], seen_rot[4]; int32_t dims[3]; uint32_t first, nwords; float vs; } BodyRec;   /* vs: metres a voxel, 0 the world's */
 
 /* One entry of the chunk table, as the shaders read it (std430, 96 bytes).
  * The CPU writes entries straight into the mapped buffer. A frame in flight
@@ -2577,6 +2577,11 @@ void sv_body_place(int64_t handle, double px, double py, double pz, double qx, d
     if (!b->placed) { memcpy(b->seen_pos, b->pos, sizeof b->pos); memcpy(b->seen_rot, b->rot, sizeof b->rot); }
     b->placed = 1;
 }
+/* Body [handle]'s voxels are [metres] across; 0 for the world's. */
+void sv_body_voxel(int64_t handle, double metres) {
+    if (!g.ok || !g.bodies || handle < 0 || handle >= SV_MAX_BODIES) return;
+    g.bodies[handle].vs = metres > 0.0 ? (float)metres : 0.0f;
+}
 /* Body [handle] is gone: the rays no longer see it. */
 void sv_body_drop(int64_t handle) {
     if (!g.ok || !g.bodies || handle < 0 || handle >= SV_MAX_BODIES) return;
@@ -2607,20 +2612,21 @@ static void bodies_to_frame(Frame *F) {
         BodyRec *b = &g.bodies[h];
         if (!b->shaped || !b->placed) continue;
         BodyRow *r = &F->btable_map[n];
-        memcpy(r->pos, b->pos, 12); r->pos[3] = 0.0f; memcpy(r->rot, b->rot, 16);
+        memcpy(r->pos, b->pos, 12); r->pos[3] = b->vs; memcpy(r->rot, b->rot, 16);
+        float bs = b->vs > 0.0f ? b->vs : scale;   /* metres a voxel of its grid */
         r->dims[0] = b->dims[0]; r->dims[1] = b->dims[1]; r->dims[2] = b->dims[2]; r->dims[3] = (int32_t)b->first;
         float lo[3] = { 1e30f, 1e30f, 1e30f }, hi[3] = { -1e30f, -1e30f, -1e30f };
         for (int c = 0; c < 8; c++) {
-            float v[3] = { (c & 1) ? b->dims[0] * scale : 0.0f, (c & 2) ? b->dims[1] * scale : 0.0f, (c & 4) ? b->dims[2] * scale : 0.0f }, w[3];
+            float v[3] = { (c & 1) ? b->dims[0] * bs : 0.0f, (c & 2) ? b->dims[1] * bs : 0.0f, (c & 4) ? b->dims[2] * bs : 0.0f }, w[3];
             qrot3(b->rot, v, w);
             for (int k = 0; k < 3; k++) { float x = (b->pos[k] + w[k]) / scale; if (x < lo[k]) lo[k] = x; if (x > hi[k]) hi[k] = x; }
         }
         for (int k = 0; k < 3; k++) { box[n][k] = (int32_t)floorf(lo[k]) >> 5; box[n][3 + k] = (int32_t)floorf(hi[k]) >> 5; }
         {   /* a sphere round it, in voxels: most rays turn away on it, before any rotation */
-            float half[3] = { b->dims[0] * scale * 0.5f, b->dims[1] * scale * 0.5f, b->dims[2] * scale * 0.5f }, w[3];
+            float half[3] = { b->dims[0] * bs * 0.5f, b->dims[1] * bs * 0.5f, b->dims[2] * bs * 0.5f }, w[3];
             qrot3(b->rot, half, w);
             for (int k = 0; k < 3; k++) r->sphere[k] = (b->pos[k] + w[k]) / scale;
-            r->sphere[3] = 0.5f * sqrtf((float)(b->dims[0] * b->dims[0] + b->dims[1] * b->dims[1] + b->dims[2] * b->dims[2])) + 0.01f;
+            r->sphere[3] = 0.5f * sqrtf((float)(b->dims[0] * b->dims[0] + b->dims[1] * b->dims[1] + b->dims[2] * b->dims[2])) * (bs / scale) + 0.01f;
         }
         /* a body that moved since last frame unsettles light history round it, its shadow included */
         int moved = memcmp(b->pos, b->seen_pos, 12) != 0 || memcmp(b->rot, b->seen_rot, 16) != 0;
@@ -2720,8 +2726,16 @@ void sv_slot_pose(int64_t slot, double px, double py, double pz, double qx, doub
     if (!g.ok || slot < 0 || slot >= SV_MAX_SLOTS) return;
     ChunkEntry *e = &g.entries[slot];
     if (!(e->level_flags & SV_BODY)) return;
-    e->pos[0] = (float)px; e->pos[1] = (float)py; e->pos[2] = (float)pz; e->pos[3] = 0.0f;
+    e->pos[0] = (float)px; e->pos[1] = (float)py; e->pos[2] = (float)pz;
     e->rot[0] = (float)qx; e->rot[1] = (float)qy; e->rot[2] = (float)qz; e->rot[3] = (float)qw;
+    touch((uint32_t)slot);
+}
+/* A body part in [slot] has voxels [metres] across; 0 for the world's. */
+void sv_slot_voxel(int64_t slot, double metres) {
+    if (!g.ok || slot < 0 || slot >= SV_MAX_SLOTS) return;
+    ChunkEntry *e = &g.entries[slot];
+    if (!(e->level_flags & SV_BODY)) return;
+    e->pos[3] = metres > 0.0 ? (float)metres : 0.0f;
     touch((uint32_t)slot);
 }
 int64_t sv_chunk_part(int64_t part, void *words, int64_t n) {
