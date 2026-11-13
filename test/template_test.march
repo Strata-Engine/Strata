@@ -124,7 +124,54 @@ mod Strata.Test.Template do
     else 0 end end
   end
 
+  -- a 5 x 4 x 3 template: ids 1..60 but two holes; voxel probabilities and row probabilities mix 255 with others
+  pfn mixed() : Strata.Template.Template do
+    let n = 60
+    let ids = List.fold_left(List.range(0, n), NativeArray.make_i32(n, 0), fn (a, i) -> NativeArray.set_i32(a, i, if i == 7 do 0 else if i == 33 do 0 else i + 1 end end))
+    let t0 = Tp.make(5, 4, 3, ids, 1.0)
+    let t1 = List.fold_left(List.range(0, n), t0, fn (t, i) -> Tp.with_prob(t, i, match i % 5 do
+        0 -> 255
+        1 -> 180
+        2 -> 255
+        3 -> 90
+        _ -> 254
+      end))
+    Tp.with_yslice(Tp.with_yslice(t1, 1, 140), 3, 200)
+  end
+  -- the documented draw: id (not a hole) when both the voxel's and its row's draws pass
+  pfn want_draw(t : Strata.Template.Template, x : Int, y : Int, z : Int, stream : Int) : Int do
+    let i = x + Tp.t_sx(t) * (y + Tp.t_sy(t) * z)
+    let id = NativeArray.get_i32(Tp.t_ids(t), i)
+    let pv = Strata.Seed.unit(Strata.Seed.cell(stream, 0, x, y, z)) *. 255.0 < int_to_float(NativeArray.get_u8(Tp.t_prob(t), i))
+    let pr = Strata.Seed.unit(Strata.Seed.cell(stream, 1, 0, y, 0)) *. 255.0 < int_to_float(NativeArray.get_u8(Tp.t_yslice(t), y))
+    if id == 0 do 0 else if pv do (if pr do id else 0 end) else 0 end end
+  end
+  -- voxels of the turned template blitted at (ox, oy, oz) that differ from the documented draw (air where nothing is drawn)
+  pfn draw_misses(t : Strata.Template.Template, ox : Int, oy : Int, oz : Int, rot : Int, stream : Int) : Int do
+    let c = Tp.blit(C.uniform(0), origin(), t, ox, oy, oz, rot, stream)
+    let sx = Tp.t_sx(t)
+    let sz = Tp.t_sz(t)
+    List.fold_left(List.range(0, 60), 0, fn (acc, i) ->
+      let x = i % sx
+      let y = (i / sx) % 4
+      let z = i / (sx * 4)
+      let r = int_and(rot, 3)
+      let rx = if r == 0 do x else if r == 1 do sz - 1 - z else if r == 2 do sx - 1 - x else z end end end
+      let rz = if r == 0 do z else if r == 1 do x else if r == 2 do sz - 1 - z else sx - 1 - x end end end
+      if at(c, ox + rx, oy + y, oz + rz) == want_draw(t, x, y, z, stream) do acc else acc + 1 end)
+  end
+
   describe "Template" do
+    test "every voxel is drawn by the documented formula, probability 255 or not, at every turn" do
+      let t = mixed()
+      let bad = List.fold_left(List.range(0, 24), 0, fn (acc, s) -> acc + draw_misses(t, 3, 2, 5, s % 4, Strata.Seed.mix(s, 17)))
+      Test.assert_eq_int(bad, 0, "24 streams, four turns, 60 voxels each")
+      -- the draws do drop something and keep something, so the comparison has teeth
+      let c = Tp.blit(C.uniform(0), origin(), t, 3, 2, 5, 0, Strata.Seed.mix(0, 17))
+      Test.assert_true(solid(c) > 10, "some voxels are written")
+      Test.assert_true(solid(c) < 58, "and some are dropped")
+    end
+
     test "a hole is never written: the middle of a hollow block stays stone" do
       let c = Tp.blit(C.uniform(1), origin(), hollow(), 4, 4, 4, 0, 7)
       Test.assert_eq_int(at(c, 5, 5, 5), 1, "the hole leaves the stone")
