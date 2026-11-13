@@ -34,7 +34,7 @@ vec3 class_emission(uint c) {
 }
 
 // Bodies (Strata.Physics): each a grid of light classes, one byte a voxel, at
-// a pose. A ray that enters a chunk looks at the bodies listed for that
+// a pose, its voxels the world's size (pos.w 0) or its own (pos.w metres: a fine body). A ray that enters a chunk looks at the bodies listed for that
 // chunk's cell and steps through each one's grid in the body's own frame.
 // Traced figures (Strata.Anim) are listed the same way, one group row a
 // figure (pos.w -1; dims: its first part row, how many, its rig): each part
@@ -106,7 +106,7 @@ void body_ray(uint bi, vec3 ro, vec3 rd, float tmax, bool stop_glass, uint pal, 
     if (dot(oc, oc) - tca * tca > sp.w * sp.w || tca + sp.w < 0.0 || tca - sp.w > lim) return;
     BodyRow b = body_table.rows[bi];
     float sc = b.pos.w > 0.0 ? b.pos.w : u.eye.w;     // metres a voxel of its grid
-    float kv = b.pos.w > 0.0 ? sc / u.eye.w : 1.0;      // its voxel in world voxels: exactly 1 for a body (a GPU's x / x need not be)
+    float kv = b.pos.w > 0.0 ? sc / u.eye.w : 1.0;      // its voxel in world voxels: exactly 1 for a body of the world's voxels (a GPU's x / x need not be)
     vec4 qi = vec4(-b.rot.xyz, b.rot.w);
     vec3 o = qrot(qi, ro * u.eye.w - b.pos.xyz) / sc;
     vec3 d = qrot(qi, rd);
@@ -117,7 +117,7 @@ void body_ray(uint bi, vec3 ro, vec3 rd, float tmax, bool stop_glass, uint pal, 
     vec3 tlo = min(ta, tb), thi = max(ta, tb);
     float tin = max(max(tlo.x, tlo.y), max(tlo.z, 0.0));
     float lim2 = min(tmax, best);
-    if (pal != 0u) lim2 /= kv;
+    lim2 /= kv;
     float tout = min(min(thi.x, thi.y), min(thi.z, lim2));
     if (tin >= tout) return;
     // a ray that starts on the body's own surface does not stop on it at once
@@ -135,7 +135,7 @@ void body_ray(uint bi, vec3 ro, vec3 rd, float tmax, bool stop_glass, uint pal, 
         if (c != 0u && t > 0.05) {
             if (pal != 0u || class_kind(c) == 1 || class_kind(c) == 2 || (class_kind(c) == 3 && stop_glass)) {
                 vec3 nl = vec3(0.0); nl[axis] = -float(stp[axis]);
-                best = pal != 0u ? t * kv : t; bcls = pal != 0u ? pal | c : c; bface = nearest_face(qrot(b.rot, nl));
+                best = t * kv; bcls = pal != 0u ? pal | c : c; bface = nearest_face(qrot(b.rot, nl));
                 return;
             }
         }

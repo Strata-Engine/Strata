@@ -27,9 +27,9 @@
 /* Rewritten by build_shaders.sh whenever the shaders change: forge decides
  * whether to recompile this file from its text alone, not from the headers
  * it includes (GAPS S14). */
-#define STRATA_SHADERS_STAMP "dbd687867761280d"
+#define STRATA_SHADERS_STAMP "f10e9d07ef1a6684"
 #include "strata_shaders.h"
-#include "strata_spray.h"
+#include "strata_particles.h"
 #include "strata_alloc.h"
 #include "strata_text.h"
 
@@ -42,7 +42,7 @@ static inline void   *narr_data(void *a) { return (char *)a + NARR_HDR; }
 #define SV_DEFAULT_QUADS (8u * 1024u * 1024u)   /* 64 MB of 8-byte quads */
 #define SV_FRAMES 2            /* frames in flight */
 #define SV_SPRAY_CAP 65536     /* particles the spray ring holds */
-#define SV_SPRAY_FLOATS 10     /* floats a particle */
+#define SV_SPRAY_FLOATS PT_FLOATS     /* floats a particle's record */
 #define SV_UI_QUADS 16384      /* quads the 2D layer holds a frame */
 #define SV_UI_FLOATS 16        /* floats a quad (Strata.Ui) */
 #define SV_GLYPH_STAGE ST_UPLOAD_BYTES   /* bytes of new glyph pixels a frame carries to the atlas: all strata_text makes in a frame */
@@ -74,7 +74,7 @@ typedef SaRange Range;
 struct FigInst { float pos[3]; uint32_t flags; float rot[4]; };
 
 typedef struct { float pos[4]; float rot[4]; int32_t dims[4]; float sphere[4]; } BodyRow;    /* std430, 64 bytes: low corner (metres), rotation, size and first word, bounding sphere (voxels) */
-typedef struct { int shaped, placed; float pos[3], rot[4], seen_pos[3], seen_rot[4]; int32_t dims[3]; uint32_t first, nwords; } BodyRec;
+typedef struct { int shaped, placed; float pos[3], rot[4], seen_pos[3], seen_rot[4]; int32_t dims[3]; uint32_t first, nwords; float vs; } BodyRec;   /* vs: metres a voxel, 0 the world's */
 
 /* One entry of the chunk table, as the shaders read it (std430, 96 bytes).
  * The CPU writes entries straight into the mapped buffer. A frame in flight
@@ -206,10 +206,13 @@ static struct {
      * image, to the offscreen target); the two final passes are compatible */
     VkRenderPass pass_g, pass_l, pass, pass_off;
     VkPipelineLayout layout;
-    VkPipeline pipe_opaque, pipe_blend, pipe_cross, pipe_loose, pipe_cull, pipe_light, pipe_composite, pipe_spray;
-    /* Spray: a ring of particles in a mapped buffer, ten floats each (start
-     * xyz, birth, velocity xyz, life, texture layer, size). */
+    VkPipeline pipe_opaque, pipe_blend, pipe_cross, pipe_loose, pipe_cull, pipe_light, pipe_composite, pipe_spray, pipe_glow;
+    /* Particles: a ring of records in a mapped buffer (strata_particles.h),
+     * drawn twice, shaded (pipe_spray) then glowing (pipe_glow); and the
+     * effect table they read, PT_EFFECTS effects of PT_EFFECT_FLOATS, effect
+     * 0 spray's. [fx_set] marks the effects defined. */
     VkBuffer spray; VkDeviceMemory spray_mem; float *spray_map;
+    VkBuffer fx; VkDeviceMemory fx_mem; float *fx_map; uint8_t fx_set[PT_EFFECTS]; double glow_until;   /* when the last glowing particle born so far dies */
     SprayRing ring; float *spray_births;
     /* The 2D layer: the quads the game last handed over, drawn last. Each
      * Frame copies them when it is recorded. */
@@ -575,20 +578,22 @@ static int make_render_pass(VkImageLayout final, VkRenderPass *out) {
  * 3: loose quads; 4: the light pass; 5: the lit image to the screen;
  * 6: spray (final pass, blended, after the translucent quads);
  * 7: the 2D layer (final pass, blended, no depth, last of all);
- * 8: figure pieces (geometry pass; quads read from the quad buffer as words).
+ * 8: figure pieces (geometry pass; quads read from the quad buffer as words);
+ * 9: glowing particles (final pass, added, after the shaded ones of kind 6).
  * Kinds 0, 2, 3 and 8 belong to the geometry pass, 4 to the light pass, 1 and 5
  * to the final pass. */
 static int make_pipeline(int kind, VkPipeline *out) {
-    int spray = kind == 6, ui = kind == 7, fig = kind == 8;
+    int glow = kind == 9;
+    int spray = kind == 6 || glow, ui = kind == 7, fig = kind == 8;
     int blend = kind == 1 || spray || ui, cross = kind == 2, loose = kind == 3, full = kind == 4 || kind == 5, geom = kind == 0 || cross || loose || fig;
     VkShaderModule vs = fig ? shader(strata_figure_vert, sizeof(strata_figure_vert))
                       : ui ? shader(strata_ui_vert, sizeof(strata_ui_vert))
-                      : spray ? shader(strata_spray_vert, sizeof(strata_spray_vert))
+                      : spray ? shader(strata_particle_vert, sizeof(strata_particle_vert))
                       : cross ? shader(strata_cross_vert, sizeof(strata_cross_vert))
                       : loose ? shader(strata_loose_vert, sizeof(strata_loose_vert))
                       : full  ? shader(strata_fullscreen_vert, sizeof(strata_fullscreen_vert)) : shader(strata_quad_vert, sizeof(strata_quad_vert));
     VkShaderModule fs = ui ? shader(strata_ui_frag, sizeof(strata_ui_frag))
-                      : spray ? shader(strata_spray_frag, sizeof(strata_spray_frag))
+                      : spray ? shader(strata_particle_frag, sizeof(strata_particle_frag))
                       : kind == 4 ? shader(strata_light_frag, sizeof(strata_light_frag))
                       : kind == 5 ? shader(strata_composite_frag, sizeof(strata_composite_frag))
                       : blend     ? shader(strata_water_frag, sizeof(strata_water_frag)) : shader(strata_gbuffer_frag, sizeof(strata_gbuffer_frag));
@@ -607,12 +612,13 @@ static int make_pipeline(int kind, VkPipeline *out) {
         { .location = 1, .binding = 0, .format = VK_FORMAT_R32G32B32A32_UINT, .offset = 16 },
         { .location = 2, .binding = 0, .format = VK_FORMAT_R32G32B32A32_UINT, .offset = 32 },
         { .location = 3, .binding = 0, .format = VK_FORMAT_R32G32B32A32_UINT, .offset = 48 } };
-    /* a spray particle is ten floats */
+    /* a particle's record is sixteen floats */
     VkVertexInputBindingDescription sbind = { .binding = 0, .stride = SV_SPRAY_FLOATS * 4, .inputRate = VK_VERTEX_INPUT_RATE_INSTANCE };
-    VkVertexInputAttributeDescription sattrs[3] = {
+    VkVertexInputAttributeDescription sattrs[4] = {
         { .location = 0, .binding = 0, .format = VK_FORMAT_R32G32B32A32_SFLOAT, .offset = 0 },
         { .location = 1, .binding = 0, .format = VK_FORMAT_R32G32B32A32_SFLOAT, .offset = 16 },
-        { .location = 2, .binding = 0, .format = VK_FORMAT_R32G32_SFLOAT, .offset = 32 } };
+        { .location = 2, .binding = 0, .format = VK_FORMAT_R32G32B32A32_SFLOAT, .offset = 32 },
+        { .location = 3, .binding = 0, .format = VK_FORMAT_R32G32B32A32_SFLOAT, .offset = 48 } };
     /* a 2D quad is sixteen floats */
     VkVertexInputBindingDescription ubind = { .binding = 0, .stride = SV_UI_FLOATS * 4, .inputRate = VK_VERTEX_INPUT_RATE_INSTANCE };
     VkVertexInputAttributeDescription uattrs[4] = {
@@ -622,21 +628,21 @@ static int make_pipeline(int kind, VkPipeline *out) {
         { .location = 3, .binding = 0, .format = VK_FORMAT_R32G32B32A32_SFLOAT, .offset = 48 } };
     VkPipelineVertexInputStateCreateInfo vin = { .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
         .vertexBindingDescriptionCount = (full || fig) ? 0 : 1, .pVertexBindingDescriptions = ui ? &ubind : spray ? &sbind : (loose ? &lbind : &bind),
-        .vertexAttributeDescriptionCount = (full || fig) ? 0 : (ui ? 4 : spray ? 3 : (loose ? 4 : 2)), .pVertexAttributeDescriptions = ui ? uattrs : spray ? sattrs : (loose ? lattrs : attrs) };
+        .vertexAttributeDescriptionCount = (full || fig) ? 0 : (ui ? 4 : spray ? 4 : (loose ? 4 : 2)), .pVertexAttributeDescriptions = ui ? uattrs : spray ? sattrs : (loose ? lattrs : attrs) };
     VkPipelineInputAssemblyStateCreateInfo ia = { .sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
-        .topology = (cross || full) ? VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST : VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP };
+        .topology = (cross || full || spray) ? VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST : VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP };
     VkPipelineViewportStateCreateInfo vp = { .sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO, .viewportCount = 1, .scissorCount = 1 };
     VkPipelineRasterizationStateCreateInfo rs = { .sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO, .polygonMode = VK_POLYGON_MODE_FILL,
         /* a see-through surface is visible from behind too: water from below */
-        .cullMode = (kind == 0 || fig) ? VK_CULL_MODE_BACK_BIT : VK_CULL_MODE_NONE, .frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE, .lineWidth = 1.0f };
+        .cullMode = (kind == 0 || fig || spray) ? VK_CULL_MODE_BACK_BIT : VK_CULL_MODE_NONE, .frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE, .lineWidth = 1.0f };
     VkPipelineMultisampleStateCreateInfo ms = { .sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO, .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT };
     /* only the geometry pass writes depth; translucent quads test against it; full-screen passes ignore it */
     VkPipelineDepthStencilStateCreateInfo ds = { .sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO, .depthTestEnable = (full || ui) ? VK_FALSE : VK_TRUE,
         .depthWriteEnable = geom ? VK_TRUE : VK_FALSE, .depthCompareOp = VK_COMPARE_OP_LESS };
     VkPipelineColorBlendAttachmentState cba[3];
     cba[0] = (VkPipelineColorBlendAttachmentState){ .blendEnable = blend ? VK_TRUE : VK_FALSE,
-        .srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA, .dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA, .colorBlendOp = VK_BLEND_OP_ADD,
-        .srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE, .dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA, .alphaBlendOp = VK_BLEND_OP_ADD,
+        .srcColorBlendFactor = glow ? VK_BLEND_FACTOR_ONE : VK_BLEND_FACTOR_SRC_ALPHA, .dstColorBlendFactor = glow ? VK_BLEND_FACTOR_ONE : VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA, .colorBlendOp = VK_BLEND_OP_ADD,
+        .srcAlphaBlendFactor = glow ? VK_BLEND_FACTOR_ZERO : VK_BLEND_FACTOR_ONE, .dstAlphaBlendFactor = glow ? VK_BLEND_FACTOR_ONE : VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA, .alphaBlendOp = VK_BLEND_OP_ADD,
         .colorWriteMask = 0xF };
     cba[1] = cba[0]; cba[2] = cba[0];
     VkPipelineColorBlendStateCreateInfo cb = { .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO, .attachmentCount = geom ? 2 : (kind == 4 ? 3 : 1), .pAttachments = cba };
@@ -2008,7 +2014,7 @@ int64_t sv_open(int64_t w, int64_t h, int64_t capture_mouse, int64_t quad_capaci
     g.swap_ok = 1;
 
     /* one set layout for every pipeline: 0 uniforms, 1 chunk table, 2 indirect commands, 3 cull statistics, 4 command -> slot */
-    VkDescriptorSetLayoutBinding dslb[34] = {
+    VkDescriptorSetLayoutBinding dslb[35] = {
         { .binding = 0, .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, .descriptorCount = 1,
           .stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT },
         { .binding = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1,
@@ -2025,26 +2031,27 @@ int64_t sv_open(int64_t w, int64_t h, int64_t capture_mouse, int64_t quad_capaci
         { .binding = 8, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT },
         { .binding = 9, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT },
         { .binding = 10, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT },
-        /* the light volume: 11 classes, 12 the coarse copy, 13 cell owners; 14 the class table */
-        { .binding = 11, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT },
-        { .binding = 12, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT },
-        { .binding = 13, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT },
-        { .binding = 14, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT },
+        /* the light volume: 11 classes, 12 the coarse copy, 13 cell owners; 14 the class table
+         * (these, the bodies and the palette are seen by vertex shaders too: particles lit once each trace there) */
+        { .binding = 11, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_VERTEX_BIT },
+        { .binding = 12, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_VERTEX_BIT },
+        { .binding = 13, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_VERTEX_BIT },
+        { .binding = 14, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_VERTEX_BIT },
         /* the light pass's memory of the frame before */
         { .binding = 15, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT },
         { .binding = 16, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT },
         /* bodies, for the rays: table, classes, cell index, cell lists, moving boxes */
-        { .binding = 17, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT },
-        { .binding = 18, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT },
-        { .binding = 19, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT },
-        { .binding = 20, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT },
-        { .binding = 21, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT },
+        { .binding = 17, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_VERTEX_BIT },
+        { .binding = 18, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_VERTEX_BIT },
+        { .binding = 19, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_VERTEX_BIT },
+        { .binding = 20, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_VERTEX_BIT },
+        { .binding = 21, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_VERTEX_BIT },
         /* the 2D layer's interface atlas */
         { .binding = 22, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT },
         /* and its glyph atlas */
         { .binding = 23, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT },
         /* figures: 24 the rigs' palettes, 25 this frame's figure parts, 26 the quad buffer read as words */
-        { .binding = 24, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT },
+        { .binding = 24, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_VERTEX_BIT },
         { .binding = 25, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_VERTEX_BIT },
         { .binding = 26, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_VERTEX_BIT },
         /* 27 the plain figures' sun shadow map, a comparing sampler */
@@ -2056,8 +2063,10 @@ int64_t sv_open(int64_t w, int64_t h, int64_t capture_mouse, int64_t quad_capaci
         { .binding = 31, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT },
         /* lamps near each light-volume cell: per cell (first, count), and the list */
         { .binding = 32, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT },
-        { .binding = 33, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT } };
-    VkDescriptorSetLayoutCreateInfo dsli = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 34, .pBindings = dslb };
+        { .binding = 33, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT },
+        /* 34 the particles' effect table */
+        { .binding = 34, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT } };
+    VkDescriptorSetLayoutCreateInfo dsli = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 35, .pBindings = dslb };
     VKOK(vkCreateDescriptorSetLayout(g.dev, &dsli, NULL, &g.dsl), "descriptor set layout");
     /* where the call's range starts in draw_slot, and per-call flags (bit 0: cutout, bit 1: a figure);
      * a figure piece's draw adds eight words more (fig_record) */
@@ -2072,6 +2081,7 @@ int64_t sv_open(int64_t w, int64_t h, int64_t capture_mouse, int64_t quad_capaci
     if (!make_pipeline(4, &g.pipe_light)) return 0;
     if (!make_pipeline(5, &g.pipe_composite)) return 0;
     if (!make_pipeline(6, &g.pipe_spray)) return 0;
+    if (!make_pipeline(9, &g.pipe_glow)) return 0;
     if (!make_pipeline(7, &g.pipe_ui)) return 0;
     if (!make_pipeline(8, &g.pipe_fig)) return 0;
     g.ui_cpu = calloc((size_t)SV_UI_QUADS * SV_UI_FLOATS, sizeof(float));
@@ -2083,6 +2093,10 @@ int64_t sv_open(int64_t w, int64_t h, int64_t capture_mouse, int64_t quad_capaci
         g.spray_births = calloc(SV_SPRAY_CAP, sizeof(float));
         if (!g.spray_births) return 0;
         sp_init(&g.ring, g.spray_births, SV_SPRAY_CAP);
+        if (!make_buffer((VkDeviceSize)PT_EFFECTS * PT_EFFECT_FLOATS * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &g.fx, &g.fx_mem, &smap)) return 0;
+        g.fx_map = smap; memset(g.fx_map, 0, (size_t)PT_EFFECTS * PT_EFFECT_FLOATS * 4);
+        memset(g.fx_set, 0, sizeof g.fx_set);
+        pt_effect_spray(g.fx_map); g.fx_set[0] = 1; g.glow_until = -1.0;
     }
 
     void *map = NULL;
@@ -2122,7 +2136,7 @@ int64_t sv_open(int64_t w, int64_t h, int64_t capture_mouse, int64_t quad_capaci
     g.blocks_map = map;
     memset(g.blocks_map, 0, (size_t)SV_MAX_BLOCKS * 32);
     for (uint32_t t = 0; t < 65536; t++) ((uint32_t *)g.blocks_map)[SV_TOP_OF + t] = t;
-    VkDescriptorPoolSize dps[4] = { { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, SV_FRAMES }, { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 16 * SV_FRAMES }, { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 13 * SV_FRAMES },
+    VkDescriptorPoolSize dps[4] = { { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, SV_FRAMES }, { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 17 * SV_FRAMES }, { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 13 * SV_FRAMES },
                                     { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 4 * SV_FRAMES } };
     VkDescriptorPoolCreateInfo dpi = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = SV_FRAMES, .poolSizeCount = 4, .pPoolSizes = dps };
     VKOK(vkCreateDescriptorPool(g.dev, &dpi, NULL, &g.dpool), "descriptor pool");
@@ -2180,12 +2194,12 @@ int64_t sv_open(int64_t w, int64_t h, int64_t capture_mouse, int64_t quad_capaci
             bw[b] = (VkWriteDescriptorSet){ .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = F->dset, .dstBinding = 17 + b, .descriptorCount = 1,
                 .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &bb[b] };
         vkUpdateDescriptorSets(g.dev, 5, bw, 0, NULL);
-        VkDescriptorBufferInfo lb2[2] = { { F->lcells, 0, VK_WHOLE_SIZE }, { F->llist, 0, VK_WHOLE_SIZE } };
-        VkWriteDescriptorSet lw2[2];
-        for (uint32_t b = 0; b < 2; b++)
+        VkDescriptorBufferInfo lb2[3] = { { F->lcells, 0, VK_WHOLE_SIZE }, { F->llist, 0, VK_WHOLE_SIZE }, { g.fx, 0, VK_WHOLE_SIZE } };
+        VkWriteDescriptorSet lw2[3];
+        for (uint32_t b = 0; b < 3; b++)
             lw2[b] = (VkWriteDescriptorSet){ .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = F->dset, .dstBinding = 32 + b, .descriptorCount = 1,
                 .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &lb2[b] };
-        vkUpdateDescriptorSets(g.dev, 2, lw2, 0, NULL);
+        vkUpdateDescriptorSets(g.dev, 3, lw2, 0, NULL);
     }
     if (!fig_init()) { die("figures", 0); return 0; }
     for (int f = 0; f < SV_FRAMES; f++) {
@@ -2286,6 +2300,9 @@ void sv_close(void) {
         if (g.glyph_sampler) vkDestroySampler(g.dev, g.glyph_sampler, NULL);
         if (g.ui_sampler) vkDestroySampler(g.dev, g.ui_sampler, NULL);
         if (g.pipe_spray) vkDestroyPipeline(g.dev, g.pipe_spray, NULL);
+        if (g.pipe_glow) vkDestroyPipeline(g.dev, g.pipe_glow, NULL);
+        if (g.fx) vkDestroyBuffer(g.dev, g.fx, NULL);
+        if (g.fx_mem) vkFreeMemory(g.dev, g.fx_mem, NULL);
         if (g.spray) vkDestroyBuffer(g.dev, g.spray, NULL);
         if (g.spray_mem) vkFreeMemory(g.dev, g.spray_mem, NULL);
         if (g.pass_g) vkDestroyRenderPass(g.dev, g.pass_g, NULL);
@@ -2372,7 +2389,9 @@ void sv_set_vsync(int64_t on) { int off = on ? 0 : 1; if (g.ok && off != g.vsync
  * past the first SV_FIG_TRACED, drawn plain. Since the start: 20 the worst
  * of stat 12, 21 the worst of stat 14 (what figures cost a run with none).
  * The light volume: 22 pages in use, 23 chunks that found no page, 24 bytes
- * its pool holds (they were 10 to 12, which the figures' stats already used). */
+ * its pool holds (they were 10 to 12, which the figures' stats already used).
+ * 25 particles written over a slot still in the live span, since the start
+ * (a full ring). */
 double sv_stat(int64_t which) {
     if (which == 6) return (double)g.rebuilds;
     if (which == 22) return (double)(g.npages - g.nfree_pages);   /* light pages in use */
@@ -2393,6 +2412,7 @@ double sv_stat(int64_t which) {
     if (which == 19) return (double)fg.traced_over;
     if (which == 20) return fg.cpu_worst;
     if (which == 21) return fg.shadow_worst;
+    if (which == 25) return g.spray_births ? (double)g.ring.overwritten : 0.0;
     return (which >= 0 && which < 6) ? g.stat[which] : -1.0;
 }
 int64_t sv_drawn_chunks(void) { return g.drawn_chunks; }
@@ -2577,6 +2597,11 @@ void sv_body_place(int64_t handle, double px, double py, double pz, double qx, d
     if (!b->placed) { memcpy(b->seen_pos, b->pos, sizeof b->pos); memcpy(b->seen_rot, b->rot, sizeof b->rot); }
     b->placed = 1;
 }
+/* Body [handle]'s voxels are [metres] across; 0 for the world's. */
+void sv_body_voxel(int64_t handle, double metres) {
+    if (!g.ok || !g.bodies || handle < 0 || handle >= SV_MAX_BODIES) return;
+    g.bodies[handle].vs = metres > 0.0 ? (float)metres : 0.0f;
+}
 /* Body [handle] is gone: the rays no longer see it. */
 void sv_body_drop(int64_t handle) {
     if (!g.ok || !g.bodies || handle < 0 || handle >= SV_MAX_BODIES) return;
@@ -2607,20 +2632,21 @@ static void bodies_to_frame(Frame *F) {
         BodyRec *b = &g.bodies[h];
         if (!b->shaped || !b->placed) continue;
         BodyRow *r = &F->btable_map[n];
-        memcpy(r->pos, b->pos, 12); r->pos[3] = 0.0f; memcpy(r->rot, b->rot, 16);
+        memcpy(r->pos, b->pos, 12); r->pos[3] = b->vs; memcpy(r->rot, b->rot, 16);
+        float bs = b->vs > 0.0f ? b->vs : scale;   /* metres a voxel of its grid */
         r->dims[0] = b->dims[0]; r->dims[1] = b->dims[1]; r->dims[2] = b->dims[2]; r->dims[3] = (int32_t)b->first;
         float lo[3] = { 1e30f, 1e30f, 1e30f }, hi[3] = { -1e30f, -1e30f, -1e30f };
         for (int c = 0; c < 8; c++) {
-            float v[3] = { (c & 1) ? b->dims[0] * scale : 0.0f, (c & 2) ? b->dims[1] * scale : 0.0f, (c & 4) ? b->dims[2] * scale : 0.0f }, w[3];
+            float v[3] = { (c & 1) ? b->dims[0] * bs : 0.0f, (c & 2) ? b->dims[1] * bs : 0.0f, (c & 4) ? b->dims[2] * bs : 0.0f }, w[3];
             qrot3(b->rot, v, w);
             for (int k = 0; k < 3; k++) { float x = (b->pos[k] + w[k]) / scale; if (x < lo[k]) lo[k] = x; if (x > hi[k]) hi[k] = x; }
         }
         for (int k = 0; k < 3; k++) { box[n][k] = (int32_t)floorf(lo[k]) >> 5; box[n][3 + k] = (int32_t)floorf(hi[k]) >> 5; }
         {   /* a sphere round it, in voxels: most rays turn away on it, before any rotation */
-            float half[3] = { b->dims[0] * scale * 0.5f, b->dims[1] * scale * 0.5f, b->dims[2] * scale * 0.5f }, w[3];
+            float half[3] = { b->dims[0] * bs * 0.5f, b->dims[1] * bs * 0.5f, b->dims[2] * bs * 0.5f }, w[3];
             qrot3(b->rot, half, w);
             for (int k = 0; k < 3; k++) r->sphere[k] = (b->pos[k] + w[k]) / scale;
-            r->sphere[3] = 0.5f * sqrtf((float)(b->dims[0] * b->dims[0] + b->dims[1] * b->dims[1] + b->dims[2] * b->dims[2])) + 0.01f;
+            r->sphere[3] = 0.5f * sqrtf((float)(b->dims[0] * b->dims[0] + b->dims[1] * b->dims[1] + b->dims[2] * b->dims[2])) * (bs / scale) + 0.01f;
         }
         /* a body that moved since last frame unsettles light history round it, its shadow included */
         int moved = memcmp(b->pos, b->seen_pos, 12) != 0 || memcmp(b->rot, b->seen_rot, 16) != 0;
@@ -2720,8 +2746,16 @@ void sv_slot_pose(int64_t slot, double px, double py, double pz, double qx, doub
     if (!g.ok || slot < 0 || slot >= SV_MAX_SLOTS) return;
     ChunkEntry *e = &g.entries[slot];
     if (!(e->level_flags & SV_BODY)) return;
-    e->pos[0] = (float)px; e->pos[1] = (float)py; e->pos[2] = (float)pz; e->pos[3] = 0.0f;
+    e->pos[0] = (float)px; e->pos[1] = (float)py; e->pos[2] = (float)pz;
     e->rot[0] = (float)qx; e->rot[1] = (float)qy; e->rot[2] = (float)qz; e->rot[3] = (float)qw;
+    touch((uint32_t)slot);
+}
+/* A body part in [slot] has voxels [metres] across; 0 for the world's. */
+void sv_slot_voxel(int64_t slot, double metres) {
+    if (!g.ok || slot < 0 || slot >= SV_MAX_SLOTS) return;
+    ChunkEntry *e = &g.entries[slot];
+    if (!(e->level_flags & SV_BODY)) return;
+    e->pos[3] = metres > 0.0 ? (float)metres : 0.0f;
     touch((uint32_t)slot);
 }
 int64_t sv_chunk_part(int64_t part, void *words, int64_t n) {
@@ -2926,12 +2960,47 @@ int64_t sv_spray(double x, double y, double z, double vx, double vy, double vz, 
         p[3] = (float)g.time_s;
         p[4] = (float)(vx + spread * spray_hash(id, 4)); p[5] = (float)(vy + spread * 0.5 * (spray_hash(id, 5) + 1.0f)); p[6] = (float)(vz + spread * spray_hash(id, 6));
         p[7] = (float)(life * (0.7 + 0.15 * (spray_hash(id, 7) + 1.0f)));
-        p[8] = (float)tex; p[9] = 0.16f + 0.07f * spray_hash(id, 8);
+        p[8] = 0.0f; p[9] = 0.16f + 0.07f * spray_hash(id, 8);
+        p[10] = 0.5f * (spray_hash(id, 9) + 1.0f); p[11] = 3.14159265f * spray_hash(id, 10); p[12] = (float)tex; p[13] = 0.0f; p[14] = 0.0f; p[15] = 0.0f;
     }
     return n;
 }
+/* A burst of [count] particles (at most 512) of effect [effect], born now.
+ * [f18] holds 18 floats: the segment x0 y0 z0 x1 y1 z1 (metres), the shape's
+ * a b c, the mean velocity vx vy vz (m/s), its spread, life, life spread,
+ * size spread, and two unused; [shape] 0 a point, 1 a sphere of radius a, 2
+ * a box of half sizes a b c (strata_particles.h, pt_write). Answers how many
+ * were written: 0 for an effect never set. */
+int64_t sv_emit(int64_t effect, int64_t shape, void *f18, int64_t count, int64_t seed) {
+    if (!g.ok || !g.spray_map || !f18 || narr_len(f18) < 18 || effect < 0 || effect >= PT_EFFECTS || !g.fx_set[effect]) return 0;
+    const float *f = (const float *)narr_data(f18);
+    if (f[13] <= 0.0f) return 0;
+    int64_t n = sp_clamp(count);
+    if (n > 0 && g.fx_map[(size_t)effect * PT_EFFECT_FLOATS] > 0.5f) {
+        double until = g.time_s + (double)f[13] * (1.0 + fabs((double)f[14]));
+        if (until > g.glow_until) g.glow_until = until;
+    }
+    for (int64_t i = 0; i < n; i++) {
+        float life = f[13] * (1.0f + fabsf(f[14]));
+        uint32_t slot = sp_push(&g.ring, (float)g.time_s, life);
+        pt_write(g.spray_map + (size_t)slot * SV_SPRAY_FLOATS, (int)effect, (int)shape, f, f + 6, f + 9, f[12], f[13], f[14], f[15],
+                 (uint32_t)seed, (uint32_t)i, (uint32_t)n, (float)g.time_s);
+    }
+    return n;
+}
+
 /* The time, in seconds, that moving surface detail (water's ripples) runs on. */
 void sv_set_time(double seconds) { g.time_s = seconds; }
+
+/* Put effect [index] (1 .. PT_EFFECTS - 1) in the particles' effect table:
+ * PT_EFFECT_FLOATS floats laid out as strata_particles.h says. Effect 0 is
+ * spray's and cannot be changed. Answers 1, or 0 when refused. */
+int64_t sv_effect_set(int64_t index, void *floats) {
+    if (!g.ok || !g.fx_map || !floats || index < 1 || index >= PT_EFFECTS || narr_len(floats) < PT_EFFECT_FLOATS) return 0;
+    memcpy(g.fx_map + (size_t)index * PT_EFFECT_FLOATS, narr_data(floats), PT_EFFECT_FLOATS * sizeof(float));
+    g.fx_set[index] = 1;
+    return 1;
+}
 
 /* ── Frame parameters ─────────────────────────────────────────────────────── */
 /* [vp] is a column-major view-projection in OpenGL clip conventions (y up,
@@ -3210,9 +3279,14 @@ int64_t sv_frame(void) {
         uint32_t first = sp_first(&g.ring), n = sp_count(&g.ring);
         uint32_t run = first + n > SV_SPRAY_CAP ? SV_SPRAY_CAP - first : n;
         vkCmdBindVertexBuffers(F->cmd, 0, 1, &g.spray, &zero);
-        vkCmdBindPipeline(F->cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g.pipe_spray);
-        vkCmdDraw(F->cmd, 4, run, 0, first); draws++;
-        if (run < n) { vkCmdDraw(F->cmd, 4, n - run, 0, 0); draws++; }
+        /* shaded, then glowing (while a glowing particle may be alive): each sends the other look's particles off screen */
+        for (int pass = 0; pass < (g.time_s <= g.glow_until ? 2 : 1); pass++) {
+            uint32_t ppc[2] = { (uint32_t)pass, 0u };
+            vkCmdBindPipeline(F->cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pass == 0 ? g.pipe_spray : g.pipe_glow);
+            vkCmdPushConstants(F->cmd, g.layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, 8, ppc);
+            vkCmdDraw(F->cmd, 36, run, 0, first); draws++;      /* a cube's 36 vertices, or a square's 12 (strata_particles.h) */
+            if (run < n) { vkCmdDraw(F->cmd, 36, n - run, 0, 0); draws++; }
+        }
     }
     /* the 2D layer over everything: this Frame's own copy of the quads, one draw */
     if (g.ui_n > 0 && F->ui_map) {

@@ -52,20 +52,22 @@ mod Strata.Physics do
   fn dynamic() : Int do 0 end
   doc "A body the game moves."
   fn driven() : Int do 1 end
+  doc "A body fixed where it is, a wall to every other body, until it is no longer held: once none of its voxels lies on a colliding world cell (an edit handed by `wake`, or a `cut`) it becomes dynamic."
+  fn pinned() : Int do 2 end
 
   -- one body: its grid and what it weighs; its centre of mass (metres from the
   -- grid's low corner, and in the world); rotation; velocity and spin; the
   -- inverse inertia in its own frame (row-major); how many steps it has been
   -- still; asleep; asleep because it touches a chunk that is not loaded;
   -- a fragment (written into the world or sprayed once it rests); the
-  -- strength (N s/m2) of its weakest block
+  -- strength (N s/m2) of its weakest block; metres a voxel of its grid
   type Rigid = { id : Int, kind : Int, grid : Strata.Body.Grid, surf : NativeIntArr, m : Float, lx : Float, ly : Float, lz : Float,
                 ii : NativeFloatArr, px : Float, py : Float, pz : Float, q : Strata.Math.Quat.Quat,
                 vx : Float, vy : Float, vz : Float, wx : Float, wy : Float, wz : Float, still : Int, asleep : Bool, edge : Bool, waited : Int,
                 hx : Float, hy : Float, hz : Float, ground : Int, ppx : Float, ppy : Float, ppz : Float, pq : Strata.Math.Quat.Quat,
-                frag : Bool, weak : Float }
+                frag : Bool, weak : Float, vs : Float }
 
-  -- kind (0 impact, 1 break, 2 loose, 3 splash, 4 deferred, 5 spray), body, other (-1 the world), where, size
+  -- kind (0 impact, 1 break, 2 loose, 3 splash, 4 deferred, 5 spray, 6 cut), body, other (-1 the world), where, size
   type PhysEvent = PhEvent(Int, Int, Int, Float, Float, Float, Float)
 
   fn ev_kind(e : PhysEvent) : Int do match e do PhEvent(k, _, _, _, _, _, _) -> k end end
@@ -75,7 +77,7 @@ mod Strata.Physics do
   fn ev_x(e : PhysEvent) : Float do match e do PhEvent(_, _, _, x, _, _, _) -> x end end
   fn ev_y(e : PhysEvent) : Float do match e do PhEvent(_, _, _, _, y, _, _) -> y end end
   fn ev_z(e : PhysEvent) : Float do match e do PhEvent(_, _, _, _, _, z, _) -> z end end
-  doc "The impulse in N s for an impact; voxels for a break, a loose piece or spray; speed in m/s for a splash."
+  doc "The impulse in N s for an impact; voxels for a break, a loose piece, spray or a cut; speed in m/s for a splash."
   fn ev_size(e : PhysEvent) : Float do match e do PhEvent(_, _, _, _, _, _, s) -> s end end
 
   -- what a driven body touched: it, the other body, where, the normal impulse (N s; 0 for a block by `drive`)
@@ -97,11 +99,12 @@ mod Strata.Physics do
 
   type Physics = { reg : Strata.Blocks.Registry, cfg : PhysConfig, bodies : List(Rigid), next : Int, steps : Int, view : Sight, waiting : Int, over : Int, touches : List(Touch), driving : List(Touch), unmeshed : List(Int), meshes : List((Int, Int, Strata.Mesh.Meshed)), fills : Int,
                    loosed : List((Int, (Int, Int, Int, Int, Int, Int), List((Int, Int, Int, Int)), List(Strata.Edit.Change))),
-                   pushes : List(PhPush), wakes : List(Strata.Edit.Change), events : List(PhysEvent) }
+                   pushes : List(PhPush), wakes : List(Strata.Edit.Change), events : List(PhysEvent),
+                   cuts : List((Float, Float, Float, Float)) }
 
   doc "No bodies yet."
   fn new(r : Strata.Blocks.Registry, c : PhysConfig) : Physics do
-    { reg: r, cfg: c, bodies: Nil, next: 1, steps: 0, view: NoView, waiting: 0, over: 0, touches: Nil, driving: Nil, unmeshed: Nil, meshes: Nil, fills: 0, loosed: Nil, pushes: Nil, wakes: Nil, events: Nil }
+    { reg: r, cfg: c, bodies: Nil, next: 1, steps: 0, view: NoView, waiting: 0, over: 0, touches: Nil, driving: Nil, unmeshed: Nil, meshes: Nil, fills: 0, loosed: Nil, pushes: Nil, wakes: Nil, events: Nil, cuts: Nil }
   end
 
   -- ── Small maths ──────────────────────────────────────────────────────────
@@ -144,9 +147,20 @@ mod Strata.Physics do
   end
 
   -- ── Adding and reading bodies ────────────────────────────────────────────
-  doc "Add a body of the blocks in [g], its grid's low corner at (x, y, z) metres, turned by [q] about that corner, at rest. Returns the new body's id; ids are never reused."
+  doc "Add a body of the blocks in [g], its grid's low corner at (x, y, z) metres, turned by [q] about that corner, at rest. Returns the new body's id; ids are never reused. [kind] is `dynamic()` or `pinned()`."
   fn add(p : Physics, g : Strata.Body.Grid, x : Float, y : Float, z : Float, q : Strata.Math.Quat.Quat, kind : Int) : (Physics, Int) do
-    let mass = Bg.mass_of(p.reg, g, c_scale(p.cfg))
+    add_sized(p, g, c_scale(p.cfg), x, y, z, q, kind)
+  end
+
+  doc "Add a body as `add` does, its voxels the world's size divided by [k]: 1, 2, 4 or 8. Any other [k] adds nothing and gives id -1. A fine body (k above 1) never becomes blocks: at rest it stays a sleeping body."
+  fn add_fine(p : Physics, g : Strata.Body.Grid, k : Int, x : Float, y : Float, z : Float, q : Strata.Math.Quat.Quat, kind : Int) : (Physics, Int) do
+    if k == 1 || k == 2 || k == 4 || k == 8 do add_sized(p, g, c_scale(p.cfg) /. int_to_float(k), x, y, z, q, kind)
+    else (p, -1) end
+  end
+
+  pfn add_sized(p : Physics, g : Strata.Body.Grid, vs : Float, x : Float, y : Float, z : Float, q : Strata.Math.Quat.Quat, kind0 : Int) : (Physics, Int) do
+    let kind = if kind0 == pinned() do pinned() else dynamic() end
+    let mass = Bg.mass_of(p.reg, g, vs)
     let qn = Qt.normalize(q)
     match (Bg.centre(mass), Bg.inertia(mass)) do
       ((lx, ly, lz), (a, b, c, d, e, f)) ->
@@ -154,9 +168,9 @@ mod Strata.Physics do
           (ox, oy, oz) ->
             let body = { id: p.next, kind: kind, grid: g, surf: Bg.corners(p.reg, g), m: Bg.mass_kg(mass), lx: lx, ly: ly, lz: lz,
                          ii: inverse_sym(a, b, c, d, e, f), px: x +. ox, py: y +. oy, pz: z +. oz, q: qn,
-                         vx: 0.0, vy: 0.0, vz: 0.0, wx: 0.0, wy: 0.0, wz: 0.0, still: 0, asleep: false, edge: false, waited: 0,
+                         vx: 0.0, vy: 0.0, vz: 0.0, wx: 0.0, wy: 0.0, wz: 0.0, still: 0, asleep: kind == pinned(), edge: false, waited: 0,
                          hx: 0.0, hy: 0.0, hz: 0.0, ground: -1, ppx: x +. ox, ppy: y +. oy, ppz: z +. oz, pq: qn,
-                         frag: false, weak: weakest(p.reg, g) }
+                         frag: false, weak: weakest(p.reg, g), vs: vs }
             let p2 = { p with bodies: List.append(p.bodies, Cons(body, Nil)), next: p.next + 1, unmeshed: List.append(p.unmeshed, Cons(p.next, Nil)) }
             with_id(p2, p.next)
         end
@@ -206,7 +220,7 @@ mod Strata.Physics do
         let scale = c_scale(p.cfg)
         let gb = bounds(gone, scale)
         let rest = List.filter(p.bodies, fn b -> b.id != id)
-        { p with bodies: List.map(rest, fn b -> if b.asleep && overlap(bounds(b, scale), gb, 1) do awaken(b) else b end) }
+        { p with bodies: List.map(rest, fn b -> if b.asleep && b.kind != pinned() && overlap(bounds(b, scale), gb, 1) do awaken(b) else b end) }
     end
   end
 
@@ -245,6 +259,21 @@ mod Strata.Physics do
     Some(b) -> (b.wx, b.wy, b.wz)
     None -> (0.0, 0.0, 0.0)
   end end
+  doc "Body [id]'s kind (`dynamic()`, `driven()` or `pinned()`), or -1 for none."
+  fn kind_of(p : Physics, id : Int) : Int do match find(p, id) do
+    Some(b) -> b.kind
+    None -> -1
+  end end
+  doc "Metres a voxel of body [id]'s grid; 0 for none."
+  fn voxel_size(p : Physics, id : Int) : Float do match find(p, id) do
+    Some(b) -> if b.kind == driven() do 0.0 else b.vs end
+    None -> 0.0
+  end end
+  doc "Body [id]'s mass in kg; 0 for none."
+  fn mass(p : Physics, id : Int) : Float do match find(p, id) do
+    Some(b) -> b.m
+    None -> 0.0
+  end end
   fn count(p : Physics) : Int do List.length(p.bodies) end
   fn awake_count(p : Physics) : Int do List.length(List.filter(p.bodies, fn b -> !b.asleep && b.kind == dynamic())) end
   doc "Steps taken."
@@ -255,6 +284,11 @@ mod Strata.Physics do
   doc "Give body [id] an impulse of (ix, iy, iz) N s at world point (x, y, z), at the next step. It wakes."
   fn push(p : Physics, id : Int, x : Float, y : Float, z : Float, ix : Float, iy : Float, iz : Float) : Physics do
     { p with pushes: List.append(p.pushes, Cons(PhPush(id, x, y, z, ix, iy, iz), Nil)) }
+  end
+
+  doc "At the next step, take every voxel of every grid body whose centre lies within [r] metres of (x, y, z), as fire or a blade would. A body left empty is removed; one left in pieces keeps its id for one piece (for a pinned body, a held one) and the rest become new dynamic bodies. Reported as one event of kind 6 a body cut (where, voxels)."
+  fn cut(p : Physics, x : Float, y : Float, z : Float, r : Float) : Physics do
+    if r <= 0.0 do p else { p with cuts: List.append(p.cuts, Cons((x, y, z, r), Nil)) } end
   end
 
   doc "Hand an edit the game made to the next step: bodies whose bounds it touches wake."
@@ -276,6 +310,7 @@ mod Strata.Physics do
 
   -- ── Bounds ───────────────────────────────────────────────────────────────
   -- the body's box in world voxels: x0, y0, z0, x1, y1, z1
+  -- ([scale] is the world's voxel; the body's grid has its own, b.vs)
   pfn bounds(b : Rigid, scale : Float) : (Int, Int, Int, Int, Int, Int) do
     if b.kind == driven() do
       let fl = fn v -> float_to_int(Math.floor(v /. scale))
@@ -283,9 +318,9 @@ mod Strata.Physics do
     else grid_bounds(b, scale) end
   end
   pfn grid_bounds(b : Rigid, scale : Float) : (Int, Int, Int, Int, Int, Int) do
-    let ex = int_to_float(Bg.size_x(b.grid)) *. scale
-    let ey = int_to_float(Bg.size_y(b.grid)) *. scale
-    let ez = int_to_float(Bg.size_z(b.grid)) *. scale
+    let ex = int_to_float(Bg.size_x(b.grid)) *. b.vs
+    let ey = int_to_float(Bg.size_y(b.grid)) *. b.vs
+    let ez = int_to_float(Bg.size_z(b.grid)) *. b.vs
     match rot(b.q) do
       (a, bb, c, d, e, f, g, h, i) ->
         -- the box's centre relative to the centre of mass, and its half extent in the world
@@ -339,7 +374,7 @@ mod Strata.Physics do
 
   -- ── Before the dynamics: wakes, pushes, the loaded edge ──────────────────
   pfn woken(b : Rigid, cs : List(Strata.Edit.Change), scale : Float) : Rigid do
-    if !b.asleep do b
+    if !b.asleep || b.kind == pinned() do b
     else
       let bx = bounds(b, scale)
       if List.any(cs, fn c -> touches(bx, c, 1)) do awaken(b) else b end
@@ -372,7 +407,7 @@ mod Strata.Physics do
     match ps do
       Nil -> b
       Cons(PhPush(id, x, y, z, ix, iy, iz), t) ->
-        if id != b.id || b.m <= 0.0 do pushed(b, t)
+        if id != b.id || b.m <= 0.0 || b.kind == pinned() do pushed(b, t)
         else
           let rx = x -. b.px
           let ry = y -. b.py
@@ -463,7 +498,7 @@ mod Strata.Physics do
   pfn gen_all(cs : NativeFloatArr, nc : Int, st : NativeFloatArr, bs : List(Rigid), wins : List(Strata.Contact.Win3), k : Int, scale : Float, dt : Float) : (NativeFloatArr, Int) do
     match (bs, wins) do
       (Cons(b, t), Cons(win, wt)) ->
-        match Ct.gen_world(cs, nc, st, k, win, scale, dt, Bg.size_x(b.grid), Bg.size_y(b.grid), b.surf, b.lx, b.ly, b.lz) do
+        match Ct.gen_world(cs, nc, st, k, win, b.vs, scale, dt, Bg.size_x(b.grid), Bg.size_y(b.grid), b.surf, b.lx, b.ly, b.lz) do
           (cs2, nc2) -> gen_all(cs2, nc2, st, t, wt, k + 1, scale, dt)
         end
       _ -> (cs, nc)
@@ -484,9 +519,9 @@ mod Strata.Physics do
             (cs2, nc2) -> gen_pairs(cs2, nc2, st, t, scale, dt)
           end
         else
-        match Ct.gen_body(cs, nc, st, i, j, wb, scale, dt, Bg.size_x(a.grid), Bg.size_y(a.grid), a.surf, a.lx, a.ly, a.lz, b.lx, b.ly, b.lz) do
+        match Ct.gen_body(cs, nc, st, i, j, wb, a.vs, b.vs, dt, Bg.size_x(a.grid), Bg.size_y(a.grid), a.surf, a.lx, a.ly, a.lz, b.lx, b.ly, b.lz) do
           (cs2, nc2) ->
-            match Ct.gen_body(cs2, nc2, st, j, i, wa, scale, dt, Bg.size_x(b.grid), Bg.size_y(b.grid), b.surf, b.lx, b.ly, b.lz, a.lx, a.ly, a.lz) do
+            match Ct.gen_body(cs2, nc2, st, j, i, wa, b.vs, a.vs, dt, Bg.size_x(b.grid), Bg.size_y(b.grid), b.surf, b.lx, b.ly, b.lz, a.lx, a.ly, a.lz) do
               (cs3, nc3) -> gen_pairs(cs3, nc3, st, t, scale, dt)
             end
         end
@@ -494,9 +529,9 @@ mod Strata.Physics do
     end
   end
   -- a grid body (slot i) and a driven box (slot j): the body's corners against the box, the box's surface points against the body's grid
-  pfn box_pair(cs : NativeFloatArr, nc : Int, st : NativeFloatArr, i : Int, a : Rigid, wa : Strata.Contact.Win3, j : Int, b : Rigid, scale : Float, dt : Float) : (NativeFloatArr, Int) do
-    match Ct.gen_box(cs, nc, st, i, j, scale, dt, Bg.size_x(a.grid), Bg.size_y(a.grid), a.surf, a.lx, a.ly, a.lz, b.hx, b.hy, b.hz) do
-      (cs2, nc2) -> Ct.gen_points(cs2, nc2, st, j, i, wa, scale, dt, Ct.box_points(b.hx, b.hy, b.hz, scale), a.lx, a.ly, a.lz)
+  pfn box_pair(cs : NativeFloatArr, nc : Int, st : NativeFloatArr, i : Int, a : Rigid, wa : Strata.Contact.Win3, j : Int, b : Rigid, _scale : Float, dt : Float) : (NativeFloatArr, Int) do
+    match Ct.gen_box(cs, nc, st, i, j, a.vs, dt, Bg.size_x(a.grid), Bg.size_y(a.grid), a.surf, a.lx, a.ly, a.lz, b.hx, b.hy, b.hz) do
+      (cs2, nc2) -> Ct.gen_points(cs2, nc2, st, j, i, wa, a.vs, dt, Ct.box_points(b.hx, b.hy, b.hz, a.vs), a.lx, a.ly, a.lz)
     end
   end
   -- the contacts a driven slot took part in, from the last sub-step
@@ -545,22 +580,32 @@ mod Strata.Physics do
   -- impacts: per moving body, the normal impulse of contacts that were
   -- closing faster than 0.5 m/s; the thing (the world, or another body)
   -- struck hardest names the event. One pass over the contacts into a table
-  -- of 20 floats a slot: impulse, x, y, z sums, count, strongest, its other
-  -- slot, the strongest contact's arm and normal; then (from a second pass)
-  -- the furthest any contact lies from their mean, squared, and the box of
-  -- the contacts (low x, y, z, high x, y, z).
+  -- of 24 floats a slot: impulse, x, y, z sums, count, strongest, its other
+  -- slot, the strongest contact's arm and normal (of the contacts the
+  -- impulse went through); then the furthest any closing contact lies from
+  -- their mean, squared (from a second pass), the box of the closing
+  -- contacts (low x, y, z, high x, y, z), their count and x, y, z sums. The
+  -- area struck is what every closing contact covers, not only those the
+  -- solver happened to load: a fine face has many corners, and the impulse
+  -- may go through a few of them.
   pfn tally(cs : NativeFloatArr, nc : Int, n : Int, t : NativeFloatArr, c : Int) : NativeFloatArr do
     if c >= nc do t
     else
       let o = c * 28
       let l = pget(cs, o + 23)
       -- only moving bodies (slots below n) have rows; a wall's corners touching a moving body count against that body when it is the a side
-      if pget(cs, o + 27) < -0.5 && l > 0.0 && float_to_int(pget(cs, o)) < n do
-        let k = float_to_int(pget(cs, o)) * 20
-        let t0 = boxed(t, k, pget(cs, o + 2), pget(cs, o + 3), pget(cs, o + 4), pget(t, k + 4) < 0.5)
-        let t1 = pset(pset(pset(pset(pset(t0, k, pget(t0, k) +. l), k + 1, pget(t, k + 1) +. pget(cs, o + 2)), k + 2, pget(t, k + 2) +. pget(cs, o + 3)), k + 3, pget(t, k + 3) +. pget(cs, o + 4)), k + 4, pget(t, k + 4) +. 1.0)
-        let t2 = if l > pget(t1, k + 5) do strongest(t1, k, l, cs, o) else t1 end
-        tally(cs, nc, n, t2, c + 1)
+      if pget(cs, o + 27) < -0.5 && float_to_int(pget(cs, o)) < n do
+        let k = float_to_int(pget(cs, o)) * 24
+        let ax = pget(cs, o + 2)
+        let ay = pget(cs, o + 3)
+        let az = pget(cs, o + 4)
+        let t0 = boxed(t, k, ax, ay, az, pget(t, k + 20) < 0.5)
+        let tc = pset(pset(pset(pset(t0, k + 20, pget(t0, k + 20) +. 1.0), k + 21, pget(t0, k + 21) +. ax), k + 22, pget(t0, k + 22) +. ay), k + 23, pget(t0, k + 23) +. az)
+        if l > 0.0 do
+          let t1 = pset(pset(pset(pset(pset(tc, k, pget(tc, k) +. l), k + 1, pget(tc, k + 1) +. ax), k + 2, pget(tc, k + 2) +. ay), k + 3, pget(tc, k + 3) +. az), k + 4, pget(tc, k + 4) +. 1.0)
+          let t2 = if l > pget(t1, k + 5) do strongest(t1, k, l, cs, o) else t1 end
+          tally(cs, nc, n, t2, c + 1)
+        else tally(cs, nc, n, tc, c + 1) end
       else tally(cs, nc, n, t, c + 1) end
     end
   end
@@ -579,21 +624,23 @@ mod Strata.Physics do
     if c >= nc do t
     else
       let o = c * 28
-      if pget(cs, o + 27) < -0.5 && pget(cs, o + 23) > 0.0 && float_to_int(pget(cs, o)) < n do
-        let k = float_to_int(pget(cs, o)) * 20
-        let cnt = pget(t, k + 4)
-        let dx = pget(cs, o + 2) -. pget(t, k + 1) /. cnt
-        let dy = pget(cs, o + 3) -. pget(t, k + 2) /. cnt
-        let dz = pget(cs, o + 4) -. pget(t, k + 3) /. cnt
+      if pget(cs, o + 27) < -0.5 && float_to_int(pget(cs, o)) < n do
+        let k = float_to_int(pget(cs, o)) * 24
+        let cnt = pget(t, k + 20)
+        let dx = pget(cs, o + 2) -. pget(t, k + 21) /. cnt
+        let dy = pget(cs, o + 3) -. pget(t, k + 22) /. cnt
+        let dz = pget(cs, o + 4) -. pget(t, k + 23) /. cnt
         let d2 = dx *. dx +. dy *. dy +. dz *. dz
         spread(cs, nc, n, if d2 > pget(t, k + 13) do pset(t, k + 13, d2) else t end, c + 1)
       else spread(cs, nc, n, t, c + 1) end
     end
   end
-  pfn tally_of(cs : NativeFloatArr, nc : Int, n : Int) : NativeFloatArr do spread(cs, nc, n, tally(cs, nc, n, NativeArray.make_float(Strata.Size.of(n * 20 + 1), 0.0), 0), 0) end
+  pfn tally_of(cs : NativeFloatArr, nc : Int, n : Int) : NativeFloatArr do spread(cs, nc, n, tally(cs, nc, n, NativeArray.make_float(Strata.Size.of(n * 24 + 1), 0.0), 0), 0) end
 
   -- the area (m2) slot [o]'s impacting contacts cover, never less than one
-  -- voxel face: the smaller of their box across the strongest normal and
+  -- face of a world voxel ([scale], for fine bodies too: a fine body's
+  -- corner is no sharper than a coarse one's, or finer voxels would make
+  -- the same material weaker): the smaller of their box across the strongest normal and
   -- twice their furthest distance from the mean squared (a square's area,
   -- from its corners, however it is turned)
   pfn contact_area(t : NativeFloatArr, o : Int, scale : Float) : Float do
@@ -617,7 +664,7 @@ mod Strata.Physics do
   pfn hits_go(h : NativeFloatArr, t : NativeFloatArr, n : Int, scale : Float, k : Int) : NativeFloatArr do
     if k >= n do h
     else
-      let o = k * 20
+      let o = k * 24
       let cnt = pget(t, o + 4)
       if cnt <= 0.0 do hits_go(h, t, n, scale, k + 1)
       else
@@ -633,7 +680,7 @@ mod Strata.Physics do
   pfn impacts_go(t : NativeFloatArr, n : Int, ids : NativeIntArr, st : NativeFloatArr, k : Int, acc : List(PhysEvent)) : List(PhysEvent) do
     if k < 0 do acc
     else
-      let o = k * 20
+      let o = k * 24
       let cnt = pget(t, o + 4)
       if cnt <= 0.0 do impacts_go(t, n, ids, st, k - 1, acc)
       else
@@ -675,17 +722,18 @@ mod Strata.Physics do
     match bs do
       Nil -> if best > 32 do 32 else best end
       Cons(b, t) ->
-        let ex = int_to_float(Bg.size_x(b.grid) + Bg.size_y(b.grid) + Bg.size_z(b.grid)) *. scale
+        -- half of the body's own voxel a sub-step
+        let ex = int_to_float(Bg.size_x(b.grid) + Bg.size_y(b.grid) + Bg.size_z(b.grid)) *. b.vs
         let v = Math.sqrt(b.vx *. b.vx +. b.vy *. b.vy +. b.vz *. b.vz) +. g *. dt
         let w = Math.sqrt(b.wx *. b.wx +. b.wy *. b.wy +. b.wz *. b.wz) *. ex
-        let n = float_to_int(Math.ceil((v +. w) *. dt /. (0.5 *. scale)))
+        let n = float_to_int(Math.ceil((v +. w) *. dt /. (0.5 *. b.vs)))
         substeps(t, dt, g, scale, if n > best do n else best end)
     end
   end
 
   -- how many voxels a body may move this step, plus two
   pfn reach_of(b : Rigid, scale : Float, dt : Float) : Int do
-    let ex = int_to_float(Bg.size_x(b.grid) + Bg.size_y(b.grid) + Bg.size_z(b.grid)) *. scale
+    let ex = int_to_float(Bg.size_x(b.grid) + Bg.size_y(b.grid) + Bg.size_z(b.grid)) *. b.vs
     let reach = (Math.sqrt(b.vx *. b.vx +. b.vy *. b.vy +. b.vz *. b.vz) +. 10.0 *. dt +. Math.sqrt(b.wx *. b.wx +. b.wy *. b.wy +. b.wz *. b.wz) *. ex) *. dt
     float_to_int(Math.ceil(reach /. scale)) + 2
   end
@@ -863,13 +911,13 @@ mod Strata.Physics do
     end
   end
 
-  doc "Write body [id] into the world as blocks, turned to the nearest of the 24 axis-aligned rotations and rounded to whole voxels, and remove it. A voxel whose cell is taken by a block that collides is dropped. Bodies resting on it wake."
+  doc "Write body [id] into the world as blocks, turned to the nearest of the 24 axis-aligned rotations and rounded to whole voxels, and remove it. A voxel whose cell is taken by a block that collides is dropped. Bodies resting on it wake. A fine body (`add_fine`) is left as it is and nothing is written."
   fn to_blocks(p : Physics, w : Strata.World.World, id : Int) : (Physics, Strata.Edit.Outcome) do
     match find(p, id) do
       None -> (p, Strata.Edit.set_many(w, Nil))
       Some(b) ->
-        let o = Strata.Edit.set_many(w, snap_cells(p.reg, w, b, c_scale(p.cfg)))
-        (remove(p, id), o)
+        if b.kind != driven() && b.vs < c_scale(p.cfg) do (p, Strata.Edit.set_many(w, Nil))
+        else (remove(p, id), Strata.Edit.set_many(w, snap_cells(p.reg, w, b, c_scale(p.cfg)))) end
     end
   end
 
@@ -878,7 +926,8 @@ mod Strata.Physics do
     let excess = List.length(p.bodies) - c_total(p.cfg)
     if excess <= 0 do ({ p with over: 0 }, Nil)
     else
-      let cand = List.sort_by(List.filter(p.bodies, fn b -> b.asleep && b.kind == dynamic() && !in_view(p.view, b)), fn (a, b) -> farther(focus, a, b))
+      let ws = c_scale(p.cfg)
+      let cand = List.sort_by(List.filter(p.bodies, fn b -> b.asleep && b.kind == dynamic() && b.vs >= ws && !in_view(p.view, b)), fn (a, b) -> farther(focus, a, b))
       let gone = List.take(cand, excess)
       let scale = c_scale(p.cfg)
       let cells = List.fold_left(gone, Nil, fn (acc, b) -> List.append(acc, snap_cells(p.reg, w, b, scale)))
@@ -903,6 +952,159 @@ mod Strata.Physics do
         match capped(p, w, focus) do
           (p2, cells) -> (p2, Strata.Edit.set_many(w0, List.append(List.append(removals, written), cells)))
         end
+    end
+  end
+
+  -- ── Pinned bodies and cuts ───────────────────────────────────────────────
+  -- Is body [b] held: does any of its colliding voxels with nothing under it
+  -- in its own grid lie on a colliding world cell (the cell just under the
+  -- middle of its bottom face, within half a voxel)?
+  pfn held(r : Strata.Blocks.Registry, w : Strata.World.World, b : Rigid, ws : Float) : Bool do
+    let g = b.grid
+    held_go(r, w, b, ws, Bg.size_x(g), Bg.size_y(g), 0, Bg.size_x(g) * Bg.size_y(g) * Bg.size_z(g))
+  end
+  pfn held_go(r : Strata.Blocks.Registry, w : Strata.World.World, b : Rigid, ws : Float, sx : Int, sy : Int, i : Int, n : Int) : Bool do
+    if i >= n do false
+    else
+      let x = i % sx
+      let y = (i / sx) % sy
+      let z = i / (sx * sy)
+      let here = Strata.Blocks.collides(r, Bg.grid_get(b.grid, x, y, z))
+      let under = y > 0 && Strata.Blocks.collides(r, Bg.grid_get(b.grid, x, y - 1, z))
+      if !here || under do held_go(r, w, b, ws, sx, sy, i + 1, n)
+      else
+        match turn(b.q, (int_to_float(x) +. 0.5) *. b.vs -. b.lx, int_to_float(y) *. b.vs -. 0.5 *. b.vs -. b.ly, (int_to_float(z) +. 0.5) *. b.vs -. b.lz) do
+          (dx, dy, dz) ->
+            let fl = fn v -> float_to_int(Math.floor(v /. ws))
+            if Strata.Blocks.collides(r, Strata.World.get_block(w, fl(b.px +. dx), fl(b.py +. dy), fl(b.pz +. dz))) do true
+            else held_go(r, w, b, ws, sx, sy, i + 1, n) end
+        end
+      end
+    end
+  end
+  -- a pinned body an edit touched that nothing holds any more is freed: dynamic, awake
+  pfn freed(r : Strata.Blocks.Registry, w : Strata.World.World, b : Rigid, cs : List(Strata.Edit.Change), ws : Float) : Rigid do
+    if b.kind != pinned() || List.is_empty(cs) do b
+    else
+      let bx = bounds(b, ws)
+      if !List.any(cs, fn c -> touches(bx, c, 1)) || held(r, w, b, ws) do b
+      else { awaken(b) with kind: dynamic() } end
+    end
+  end
+
+  -- every cut handed since the last step, in order
+  pfn cut_all(p : Physics, w : Strata.World.World) : Physics do
+    if List.is_empty(p.cuts) do p
+    else List.fold_left(p.cuts, { p with cuts: Nil }, fn (q, c) -> match c do (x, y, z, r) -> cut_one(q, w, x, y, z, r) end) end
+  end
+  pfn cut_one(p : Physics, w : Strata.World.World, x : Float, y : Float, z : Float, r : Float) : Physics do
+    let ws = c_scale(p.cfg)
+    let fl = fn v -> float_to_int(Math.floor(v /. ws))
+    let sb = (fl(x -. r), fl(y -. r), fl(z -. r), fl(x +. r), fl(y +. r), fl(z +. r))
+    let hit = List.filter(p.bodies, fn b -> b.kind != driven() && overlap(bounds(b, ws), sb, 0))
+    List.fold_left(hit, p, fn (q, b) -> cut_body(q, w, b, x, y, z, r))
+  end
+  -- body [b] with its voxels within [r] of (x, y, z) taken
+  pfn cut_body(p : Physics, w : Strata.World.World, b : Rigid, x : Float, y : Float, z : Float, r : Float) : Physics do
+    let g = b.grid
+    let sx = Bg.size_x(g)
+    let sy = Bg.size_y(g)
+    match carve(p.reg, b, Bg.grid(sx, sy, Bg.size_z(g)), x, y, z, r *. r, sx, sy, 0, sx * sy * Bg.size_z(g), 0) do
+      (left, taken) ->
+        if taken == 0 do p
+        else
+          let p1 = { p with events: List.append(p.events, Cons(PhEvent(6, b.id, -1, x, y, z, int_to_float(taken)), Nil)) }
+          let parts = Bg.split(p.reg, left)
+          if List.is_empty(parts) do remove(p1, b.id)
+          else
+            let ws = c_scale(p.cfg)
+            -- the part kept under b's id: for a pinned body a held one if any, otherwise the largest
+            let cands = List.map(parts, fn pc -> (pc, regrid(p.reg, b, whole_of(pc, sx, sy, Bg.size_z(g)))))
+            let keep = keeper(p.reg, w, b, cands, ws)
+            match List.find(List.zip(List.range(0, List.length(cands)), cands), fn kc -> match kc do (k, _) -> k == keep end) do
+              Some((_, (_, kb))) ->
+                let kept = if b.kind != pinned() do awaken(kb) else if held(p.reg, w, kb, ws) do kb else { awaken(kb) with kind: dynamic() } end end
+                let p2 = { p1 with bodies: List.map(p1.bodies, fn o -> if o.id == b.id do kept else o end), unmeshed: List.append(p1.unmeshed, Cons(b.id, Nil)) }
+                -- what rested on it wakes
+                let bx = bounds(b, ws)
+                let p3 = { p2 with bodies: List.map(p2.bodies, fn o -> if o.id != b.id && o.asleep && o.kind == dynamic() && overlap(bounds(o, ws), bx, 1) do awaken(o) else o end) }
+                match turn(b.q, b.lx, b.ly, b.lz) do
+                  (ox, oy, oz) ->
+                    let corner = (b.px -. ox, b.py -. oy, b.pz -. oz)
+                    List.fold_left(List.zip(List.range(0, List.length(parts)), parts), p3, fn (q, ip) -> other_piece(q, b, corner, keep, ip))
+                end
+              None -> p1
+            end
+          end
+        end
+    end
+  end
+  -- every part but the one kept becomes a body of its own
+  pfn other_piece(p : Physics, b : Rigid, corner : (Float, Float, Float), keep : Int, ip : (Int, (Strata.Body.Grid, Int, Int, Int))) : Physics do
+    match ip do (k, pc) -> if k == keep do p else body_piece(p, b, corner, pc, b.vs) end end
+  end
+  -- [b]'s grid without the voxels whose centres lie within sqrt(r2) of (x, y, z): the grid left, and how many were taken
+  pfn carve(r : Strata.Blocks.Registry, b : Rigid, out : Strata.Body.Grid, x : Float, y : Float, z : Float, r2 : Float, sx : Int, sy : Int, i : Int, n : Int, taken : Int) : (Strata.Body.Grid, Int) do
+    if i >= n do (out, taken)
+    else
+      let vx = i % sx
+      let vy = (i / sx) % sy
+      let vz = i / (sx * sy)
+      let id = Bg.grid_get(b.grid, vx, vy, vz)
+      if id == 0 do carve(r, b, out, x, y, z, r2, sx, sy, i + 1, n, taken)
+      else
+        match turn(b.q, (int_to_float(vx) +. 0.5) *. b.vs -. b.lx, (int_to_float(vy) +. 0.5) *. b.vs -. b.ly, (int_to_float(vz) +. 0.5) *. b.vs -. b.lz) do
+          (dx, dy, dz) ->
+            let ex = b.px +. dx -. x
+            let ey = b.py +. dy -. y
+            let ez = b.pz +. dz -. z
+            if ex *. ex +. ey *. ey +. ez *. ez <= r2 && Strata.Blocks.collides(r, id) do carve(r, b, out, x, y, z, r2, sx, sy, i + 1, n, taken + 1)
+            else carve(r, b, Bg.grid_set(out, vx, vy, vz, id), x, y, z, r2, sx, sy, i + 1, n, taken) end
+        end
+      end
+    end
+  end
+  -- a part (its grid and offset) put back into a grid of the whole's size
+  pfn whole_of(pc : (Strata.Body.Grid, Int, Int, Int), sx : Int, sy : Int, sz : Int) : Strata.Body.Grid do
+    match pc do
+      (g, ox, oy, oz) ->
+        let px = Bg.size_x(g)
+        let py = Bg.size_y(g)
+        List.fold_left(List.range(0, px * py * Bg.size_z(g)), Bg.grid(sx, sy, sz), fn (acc, i) ->
+          let id = Bg.grid_get(g, i % px, (i / px) % py, i / (px * py))
+          if id == 0 do acc else Bg.grid_set(acc, ox + i % px, oy + (i / px) % py, oz + i / (px * py), id) end)
+    end
+  end
+  -- [b] with grid [g] (the same size, its low corner where b's is): mass, centre, inertia, corners and weakest block worked out again; it moves as that part of b did
+  pfn regrid(r : Strata.Blocks.Registry, b : Rigid, g : Strata.Body.Grid) : Rigid do
+    let mass = Bg.mass_of(r, g, b.vs)
+    match (Bg.centre(mass), Bg.inertia(mass)) do
+      ((lx, ly, lz), (a, bb, c, d, e, f)) ->
+        match (turn(b.q, b.lx, b.ly, b.lz), turn(b.q, lx, ly, lz)) do
+          ((ox, oy, oz), (nx, ny, nz)) ->
+            let px = b.px -. ox +. nx
+            let py = b.py -. oy +. ny
+            let pz = b.pz -. oz +. nz
+            let rx = px -. b.px
+            let ry = py -. b.py
+            let rz = pz -. b.pz
+            { b with grid: g, surf: Bg.corners(r, g), m: Bg.mass_kg(mass), lx: lx, ly: ly, lz: lz, ii: inverse_sym(a, bb, c, d, e, f),
+                     px: px, py: py, pz: pz, ppx: px, ppy: py, ppz: pz,
+                     vx: b.vx +. b.wy *. rz -. b.wz *. ry, vy: b.vy +. b.wz *. rx -. b.wx *. rz, vz: b.vz +. b.wx *. ry -. b.wy *. rx, weak: weakest(r, g) }
+        end
+    end
+  end
+  -- which of the parts keeps the id: for a pinned body the first held part, if any; otherwise the one of most voxels (the first of equals)
+  pfn keeper(r : Strata.Blocks.Registry, w : Strata.World.World, b : Rigid, cands : List(((Strata.Body.Grid, Int, Int, Int), Rigid)), ws : Float) : Int do
+    let sized = List.zip(List.range(0, List.length(cands)), List.map(cands, fn c -> match c do (_, kb) -> Bg.solid_count(r, kb.grid) end))
+    let largest = List.fold_left(sized, (0, -1), fn (best, kc) -> match (best, kc) do ((bi, bn), (k, cnt)) -> (if cnt > bn do (k, cnt) else (bi, bn) end) end)
+    let held_at = if b.kind != pinned() do -1 else first_held(r, w, cands, ws, 0) end
+    if held_at >= 0 do held_at else match largest do (k, _) -> k end end
+  end
+  pfn first_held(r : Strata.Blocks.Registry, w : Strata.World.World, cands : List(((Strata.Body.Grid, Int, Int, Int), Rigid)), ws : Float, k : Int) : Int do
+    match cands do
+      Nil -> -1
+      Cons((_, kb), t) -> if held(r, w, kb, ws) do k else first_held(r, w, t, ws, k + 1) end
     end
   end
 
@@ -951,7 +1153,7 @@ mod Strata.Physics do
 
   -- body [b] cut round the voxel under its contact
   pfn body_break(p : Physics, b : Rigid, h : NativeFloatArr, ho : Int, i : Float) : Physics do
-    let scale = c_scale(p.cfg)
+    let scale = b.vs
     let ax = pget(h, ho + 1)
     let ay = pget(h, ho + 2)
     let az = pget(h, ho + 3)
@@ -983,22 +1185,21 @@ mod Strata.Physics do
     match (corner, pc) do
       ((x0, y0, z0), (g, ox, oy, oz)) ->
         match turn(b.q, int_to_float(ox) *. scale, int_to_float(oy) *. scale, int_to_float(oz) *. scale) do
-          (dx, dy, dz) -> new_piece(p, g, x0 +. dx, y0 +. dy, z0 +. dz, b.q, b.px, b.py, b.pz, b.vx, b.vy, b.vz, b.wx, b.wy, b.wz, b.id)
+          (dx, dy, dz) -> new_piece(p, g, scale, x0 +. dx, y0 +. dy, z0 +. dz, b.q, b.px, b.py, b.pz, b.vx, b.vy, b.vz, b.wx, b.wy, b.wz, b.id)
         end
     end
   end
-  -- a piece with its low corner at (x, y, z), turned by [q], moving as a body centred at (cx, cy, cz) with (v, w) moves at its own centre
-  pfn new_piece(p : Physics, g : Strata.Body.Grid, x : Float, y : Float, z : Float, q : Strata.Math.Quat.Quat, cx : Float, cy : Float, cz : Float,
+  -- a piece of [scale] metres a voxel with its low corner at (x, y, z), turned by [q], moving as a body centred at (cx, cy, cz) with (v, w) moves at its own centre
+  pfn new_piece(p : Physics, g : Strata.Body.Grid, scale : Float, x : Float, y : Float, z : Float, q : Strata.Math.Quat.Quat, cx : Float, cy : Float, cz : Float,
                 vx : Float, vy : Float, vz : Float, wx : Float, wy : Float, wz : Float, from : Int) : Physics do
     let nv = Bg.solid_count(p.reg, g)
-    let scale = c_scale(p.cfg)
     if nv == 0 do p
     else if nv == 1 do
       match turn(q, 0.5 *. scale, 0.5 *. scale, 0.5 *. scale) do
         (hx, hy, hz) -> spray(p, from, x +. hx, y +. hy, z +. hz, 1)
       end
     else
-      match add(p, g, x, y, z, q, dynamic()) do
+      match add_sized(p, g, scale, x, y, z, q, dynamic()) do
         (p2, id) ->
           match position(p2, id) do
             (px, py, pz) ->
@@ -1068,7 +1269,7 @@ mod Strata.Physics do
   end
   pfn world_piece(p : Physics, x0 : Int, y0 : Int, z0 : Int, pc : (Strata.Body.Grid, Int, Int, Int), scale : Float, from : Int) : Physics do
     match pc do
-      (g, ox, oy, oz) -> new_piece(p, g, int_to_float(x0 + ox) *. scale, int_to_float(y0 + oy) *. scale, int_to_float(z0 + oz) *. scale, Qt.identity(), 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, from)
+      (g, ox, oy, oz) -> new_piece(p, g, scale, int_to_float(x0 + ox) *. scale, int_to_float(y0 + oy) *. scale, int_to_float(z0 + oz) *. scale, Qt.identity(), 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, from)
     end
   end
 
@@ -1086,12 +1287,14 @@ mod Strata.Physics do
         let nv = Bg.solid_count(p.reg, b.grid)
         if nv <= 1 do (spray(remove(p, b.id), b.id, b.px, b.py, b.pz, nv), written)
         else if !b.asleep || b.edge do (p, written)
+        -- a fine fragment cannot land in the world's cells: at rest it is spray
+        else if b.vs < c_scale(p.cfg) do (spray(remove(p, b.id), b.id, b.px, b.py, b.pz, nv), written)
         else
           let cells = snap_cells(p.reg, w, b, c_scale(p.cfg))
           let ok = List.length(cells) == nv && List.all(cells, fn c -> rests(p.reg, w, cells, written, c))
           if ok do (remove(p, b.id), List.append(written, cells))
           else (spray(remove(p, b.id), b.id, b.px, b.py, b.pz, nv), written) end
-        end end
+        end end end
     end
   end
   -- a fragment's cell is free of the cells written before it, and has the ground or another of its cells under it
@@ -1197,9 +1400,9 @@ mod Strata.Physics do
   end
 
   doc "One step of 1/60 s (the config's rate) against world [w], as it stands. [focus] orders the work when it is capped: bodies nearest it move first, and past the total cap the bodies farthest from it become blocks. Returns the bodies after the step and the edit physics made to the world."
-  fn step_world(p : Physics, w : Strata.World.World, focus : List((Float, Float, Float))) : (Physics, Strata.Edit.Outcome) do
-    match support_stage(p, w) do
-      (ps, ws, removals) -> dyn_step(ps, ws, focus, w, removals)
+  fn step_world(p0 : Physics, w : Strata.World.World, focus : List((Float, Float, Float))) : (Physics, Strata.Edit.Outcome) do
+    match support_stage(p0, w) do
+      (ps, ws, removals) -> dyn_step(cut_all(ps, ws), ws, focus, w, removals)
     end
   end
 
@@ -1209,7 +1412,7 @@ mod Strata.Physics do
     let g = c_gravity(p.cfg)
     -- where each dynamic body was when the step began: what `pose` interpolates from
     let bsp = List.map(p.bodies, fn b -> if b.kind == dynamic() do { b with ppx: b.px, ppy: b.py, ppz: b.pz, pq: b.q } else b end)
-    let bs0 = shoved(List.map(bsp, fn b -> at_edge(w, pushed(woken(b, p.wakes, scale), p.pushes), scale)), scale)
+    let bs0 = shoved(List.map(bsp, fn b -> at_edge(w, pushed(freed(p.reg, w, woken(b, p.wakes, scale), p.wakes, scale), p.pushes), scale)), scale)
     -- the awake cap: the soonest go, the rest wait
     let cand = List.sort_by(List.filter(bs0, fn b -> moving(b)), fn (a, b) -> sooner(focus, a, b))
     let mv = by_id(List.take(cand, c_awake(p.cfg)))
@@ -1274,7 +1477,7 @@ mod Strata.Physics do
       Cons(b, _) -> b
       Nil -> { id: 0, kind: 0, grid: Bg.grid(1, 1, 1), surf: NativeArray.make_int(0, 0), m: 0.0, lx: 0.0, ly: 0.0, lz: 0.0, ii: NativeArray.make_float(9, 0.0),
                px: 0.0, py: 0.0, pz: 0.0, q: Qt.identity(), vx: 0.0, vy: 0.0, vz: 0.0, wx: 0.0, wy: 0.0, wz: 0.0, still: 0, asleep: true, edge: false, waited: 0,
-               hx: 0.0, hy: 0.0, hz: 0.0, ground: -1, ppx: 0.0, ppy: 0.0, ppz: 0.0, pq: Qt.identity(), frag: false, weak: 1000000000000.0 }
+               hx: 0.0, hy: 0.0, hz: 0.0, ground: -1, ppx: 0.0, ppy: 0.0, ppz: 0.0, pq: Qt.identity(), frag: false, weak: 1000000000000.0, vs: 1.0 }
     end
   end
   -- boxes laid out six ints an item: x0 y0 z0 x1 y1 z1
@@ -1335,7 +1538,7 @@ mod Strata.Physics do
     let body = { id: p.next, kind: driven(), grid: Bg.grid(1, 1, 1), surf: NativeArray.make_int(0, 0), m: 80.0, lx: 0.0, ly: 0.0, lz: 0.0,
                  ii: NativeArray.make_float(9, 0.0), px: x, py: y, pz: z, q: Qt.identity(),
                  vx: 0.0, vy: 0.0, vz: 0.0, wx: 0.0, wy: 0.0, wz: 0.0, still: 0, asleep: false, edge: false, waited: 0,
-                 hx: hx, hy: hy, hz: hz, ground: -1, ppx: x, ppy: y, ppz: z, pq: Qt.identity(), frag: false, weak: 1000000000000.0 }
+                 hx: hx, hy: hy, hz: hz, ground: -1, ppx: x, ppy: y, ppz: z, pq: Qt.identity(), frag: false, weak: 1000000000000.0, vs: 1.0 }
     let p2 = { p with bodies: List.append(p.bodies, Cons(body, Nil)), next: p.next + 1 }
     with_id(p2, p.next)
   end
@@ -1360,15 +1563,15 @@ mod Strata.Physics do
     absf(x -. cx) < hx -. e && absf(y -. cy) < hy -. e && absf(z -. cz) < hz -. e
   end
   -- grid body b's colliding voxel under world point (x, y, z)?
-  pfn in_grid(t : NativeU8Arr, b : Rigid, scale : Float, x : Float, y : Float, z : Float) : Bool do
+  pfn in_grid(t : NativeU8Arr, b : Rigid, _scale : Float, x : Float, y : Float, z : Float) : Bool do
     match rot(b.q) do
       (r0, r1, r2, r3, r4, r5, r6, r7, r8) ->
         let dx = x -. b.px
         let dy = y -. b.py
         let dz = z -. b.pz
-        let ux = (r0 *. dx +. r3 *. dy +. r6 *. dz +. b.lx) /. scale
-        let uy = (r1 *. dx +. r4 *. dy +. r7 *. dz +. b.ly) /. scale
-        let uz = (r2 *. dx +. r5 *. dy +. r8 *. dz +. b.lz) /. scale
+        let ux = (r0 *. dx +. r3 *. dy +. r6 *. dz +. b.lx) /. b.vs
+        let uy = (r1 *. dx +. r4 *. dy +. r7 *. dz +. b.ly) /. b.vs
+        let uz = (r2 *. dx +. r5 *. dy +. r8 *. dz +. b.lz) /. b.vs
         let id = Bg.grid_get(b.grid, float_to_int(Math.floor(ux)), float_to_int(Math.floor(uy)), float_to_int(Math.floor(uz)))
         id > 0 && id < NativeArray.length_u8(t) && NativeArray.get_u8(t, id) == 1
     end
@@ -1381,7 +1584,7 @@ mod Strata.Physics do
       let v = NativeArray.get_int(b.surf, i)
       let sx = Bg.size_x(b.grid)
       let sy = Bg.size_y(b.grid)
-      match turn(b.q, int_to_float(v % (sx + 1)) *. scale -. b.lx, int_to_float((v / (sx + 1)) % (sy + 1)) *. scale -. b.ly, int_to_float(v / ((sx + 1) * (sy + 1))) *. scale -. b.lz) do
+      match turn(b.q, int_to_float(v % (sx + 1)) *. b.vs -. b.lx, int_to_float((v / (sx + 1)) % (sy + 1)) *. b.vs -. b.ly, int_to_float(v / ((sx + 1) * (sy + 1))) *. b.vs -. b.lz) do
         (rx, ry, rz) ->
           if in_box(b.px +. rx, b.py +. ry, b.pz +. rz, cx, cy, cz, hx, hy, hz, e) do true
           else any_corner_in(b, scale, cx, cy, cz, hx, hy, hz, e, i + 1, n) end
@@ -1399,7 +1602,7 @@ mod Strata.Physics do
     let e = 0.5 *. skin(scale)
     if b.kind == driven() do absf(b.px -. cx) < b.hx +. hx -. e && absf(b.py -. cy) < b.hy +. hy -. e && absf(b.pz -. cz) < b.hz +. hz -. e
     else
-      let pts = Ct.box_points(hx -. e, hy -. e, hz -. e, scale)
+      let pts = Ct.box_points(hx -. e, hy -. e, hz -. e, b.vs)
       any_corner_in(b, scale, cx, cy, cz, hx, hy, hz, e, 0, NativeArray.length_int(b.surf)) || any_point_in(t, b, scale, pts, cx, cy, cz, 0, NativeArray.length_float(pts) / 3)
     end
   end
@@ -1481,7 +1684,7 @@ mod Strata.Physics do
               Some(g) -> point_speed(g, b.px, b.py -. b.hy, b.pz)
               None -> (0.0, 0.0, 0.0)
             end
-          let walls = List.filter(p.bodies, fn o -> o.id != id && (o.kind == driven() || o.m > b.m))
+          let walls = List.filter(p.bodies, fn o -> o.id != id && (o.kind == driven() || o.kind == pinned() || o.m > b.m))
           match box_sweep(w, Ct.collide_table(p.reg), walls, scale, b.px, b.py, b.pz, b.hx, b.hy, b.hz, (vx +. gx) *. dt, (vy +. gy) *. dt, (vz +. gz) *. dt) do
             Moved3(x, y, z, bx, yb, bz, ky, ks) ->
               let down = (vy +. gy) <= 0.0
@@ -1535,13 +1738,13 @@ mod Strata.Physics do
           let x = ox +. dx *. t -. b.px
           let y = oy +. dy *. t -. b.py
           let z = oz +. dz *. t -. b.pz
-          let id = Bg.grid_get(b.grid, float_to_int(Math.floor((r0 *. x +. r3 *. y +. r6 *. z +. b.lx) /. scale)), float_to_int(Math.floor((r1 *. x +. r4 *. y +. r7 *. z +. b.ly) /. scale)), float_to_int(Math.floor((r2 *. x +. r5 *. y +. r8 *. z +. b.lz) /. scale)))
-          if id != 0 && stop(id) do t else march_in(b, scale, stop, ox, oy, oz, dx, dy, dz, t +. 0.1 *. scale, t1) end
+          let id = Bg.grid_get(b.grid, float_to_int(Math.floor((r0 *. x +. r3 *. y +. r6 *. z +. b.lx) /. b.vs)), float_to_int(Math.floor((r1 *. x +. r4 *. y +. r7 *. z +. b.ly) /. b.vs)), float_to_int(Math.floor((r2 *. x +. r5 *. y +. r8 *. z +. b.lz) /. b.vs)))
+          if id != 0 && stop(id) do t else march_in(b, scale, stop, ox, oy, oz, dx, dy, dz, t +. 0.1 *. b.vs, t1) end
       end
     end
   end
 
-  doc "Cast a ray as `Strata.Query.raycast` does, against the world and every grid body at its latest pose. Returns the nearer hit and the body's id, or -1 for the world or a miss. A body hit gives the voxel's place in the body's grid, face 0, and the distance; the distance is to within a tenth of a voxel."
+  doc "Cast a ray as `Strata.Query.raycast` does, against the world and every grid body (dynamic or pinned, fine or not) at its latest pose. Returns the nearer hit and the body's id, or -1 for the world or a miss. A body hit gives the voxel's place in the body's grid, face 0, and the distance; the distance is to within a tenth of the body's voxel."
   fn raycast(p : Physics, w : Strata.World.World, ox : Float, oy : Float, oz : Float, dx : Float, dy : Float, dz : Float, max : Float, stop : Int -> Bool) : (Strata.Query.Hit, Int) do
     let wh = Strata.Query.raycast(w, ox, oy, oz, dx, dy, dz, max, stop)
     let len = Math.sqrt(dx *. dx +. dy *. dy +. dz *. dz)
@@ -1552,7 +1755,7 @@ mod Strata.Physics do
       let uz = dz /. len
       let scale = c_scale(p.cfg)
       let limit = if Strata.Query.is_hit(wh) do Strata.Query.hit_dist(wh) else max end
-      let best = List.fold_left(List.filter(p.bodies, fn b -> b.kind == dynamic()), (limit, -1), fn (acc, b) ->
+      let best = List.fold_left(List.filter(p.bodies, fn b -> b.kind != driven()), (limit, -1), fn (acc, b) ->
         match acc do
           (bt, _) ->
             match ray_box(b, scale, ox, oy, oz, ux, uy, uz) do
@@ -1659,7 +1862,7 @@ mod Strata.Physics do
   fn begin(p : Physics, w : Strata.World.World, focus : List((Float, Float, Float))) : (Physics, Stepping) do
     -- the job meshes the bodies waiting for it; the meshes already made stay here to be taken
     let snap = { p with meshes: Nil }
-    let kept = { p with pushes: Nil, wakes: Nil, unmeshed: Nil }
+    let kept = { p with pushes: Nil, wakes: Nil, unmeshed: Nil, cuts: Nil }
     with_job(kept, PhJob(task_spawn(fn _ -> step_world(snap, w, focus)), p.next))
   end
 
