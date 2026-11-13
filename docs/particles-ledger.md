@@ -86,3 +86,17 @@ Stored after looking: `fx-showcase` (new), `combat-burning` (new),
 `combat-fire` (the fireball's trail; 38 to 40 draws), and with the cubes
 `splash-early`, `splash-late`, `splash-shaded` (blocky droplets). The lake
 scenes with spray passed unchanged until the cubes and pass with them.
+
+## Landing on main
+
+- Main moved twice while particles waited: combat (e58d71b) and then
+  physics Task 8 (8d83288). The burning blocks moved to 25 and 26, after
+  main's step blocks (22 to 24); the overwrite stat moved to 25.
+- **`combat-burning` re-stored after the physics merge.** Rendered at the
+  commit before it (075114e), it matched its golden exactly; after it,
+  15.7% of pixels differ, every one lighting noise in whole chunks (light
+  mode 4 still converging at frame 150), the scene's blocks, fire and
+  figures unchanged. Physics now writes its outcome through
+  `Strata.Edit.set_many` each step, which may be resetting those chunks'
+  light. Not investigated here: physics is another session's work. Cost if
+  wrong: a re-lighting regression in physics hides behind this golden.
