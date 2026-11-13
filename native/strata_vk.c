@@ -250,6 +250,7 @@ static struct {
     uint32_t rebuilds;             /* swapchain rebuilds so far */
     int ok, swap_ok, resized;
     int vsync_off;                 /* ask for the immediate present mode */
+    double pass_ms[4];             /* last frame's GPU ms by pass: before the geometry, geometry, light, after the light */
     double stat[6];                /* last frame: CPU ms, ms waiting, draw calls, GPU ms, translucent chunks drawn, microseconds ordering them */
     /* a chunk being assembled by sv_chunk_begin .. sv_chunk_commit */
     struct { int64_t slot; int32_t origin[3]; uint32_t *part[4]; uint32_t n[4], cap[4]; int open; int body; int fig; int32_t rp; int level; } stage;
@@ -2252,7 +2253,7 @@ int64_t sv_open(int64_t w, int64_t h, int64_t capture_mouse, int64_t quad_capaci
         VKOK(vkCreateFence(g.dev, &fi, NULL, &g.frames[f].fence), "fence");
     }
     if (g.have_ts) {
-        VkQueryPoolCreateInfo qi = { .sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, .queryType = VK_QUERY_TYPE_TIMESTAMP, .queryCount = 4 * SV_FRAMES };
+        VkQueryPoolCreateInfo qi = { .sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, .queryType = VK_QUERY_TYPE_TIMESTAMP, .queryCount = 8 * SV_FRAMES };
         if (vkCreateQueryPool(g.dev, &qi, NULL, &g.qpool) != VK_SUCCESS) g.have_ts = 0;
     }
     g.stat[3] = -1.0;
@@ -2413,6 +2414,7 @@ double sv_stat(int64_t which) {
     if (which == 19) return (double)fg.traced_over;
     if (which == 20) return fg.cpu_worst;
     if (which == 21) return fg.shadow_worst;
+    if (which >= 26 && which <= 29) return g.pass_ms[which - 26];
     if (which == 25) return g.spray_births ? (double)g.ring.overwritten : 0.0;
     return (which >= 0 && which < 6) ? g.stat[which] : -1.0;
 }
@@ -3065,7 +3067,7 @@ int64_t sv_frame(void) {
     if (!g.ok) return 0;
     if (g.resized || !g.swap_ok) { g.resized = 0; if (!rebuild_swapchain()) return 0; }
     Frame *F = &g.frames[g.frame_no % SV_FRAMES];
-    uint32_t q0 = (uint32_t)(g.frame_no % SV_FRAMES) * 4;
+    uint32_t q0 = (uint32_t)(g.frame_no % SV_FRAMES) * 8;
     double t_start = glfwGetTime();
     /* this Frame was last used two frames ago; when its fence is signalled,
      * everything released up to then is idle */
@@ -3090,8 +3092,17 @@ int64_t sv_frame(void) {
     F->stats_valid = 1;
     if (g.have_ts && F->ts_written) {
         uint64_t ts[2] = { 0, 0 };
-        if (vkGetQueryPoolResults(g.dev, g.qpool, q0, 2, sizeof ts, ts, sizeof ts[0], VK_QUERY_RESULT_64_BIT) == VK_SUCCESS)
+        if (vkGetQueryPoolResults(g.dev, g.qpool, q0, 2, sizeof ts, ts, sizeof ts[0], VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) {
             g.stat[3] = (double)(ts[1] - ts[0]) * (double)g.ts_period / 1.0e6;
+            uint64_t tp[3];
+            if (vkGetQueryPoolResults(g.dev, g.qpool, q0 + 4, 3, sizeof tp, tp, sizeof tp[0], VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) {
+                double ms = (double)g.ts_period / 1.0e6;
+                g.pass_ms[0] = (double)(tp[0] - ts[0]) * ms;   /* uploads and the cull */
+                g.pass_ms[1] = (double)(tp[1] - tp[0]) * ms;   /* geometry, figures included */
+                g.pass_ms[2] = (double)(tp[2] - tp[1]) * ms;   /* figure shadow map and the light pass */
+                g.pass_ms[3] = (double)(ts[1] - tp[2]) * ms;   /* water, composite, translucent, particles, interface */
+            }
+        }
         fg.shadow_ms = 0.0;
         if (F->fsm_ts && vkGetQueryPoolResults(g.dev, g.qpool, q0 + 2, 2, sizeof ts, ts, sizeof ts[0], VK_QUERY_RESULT_64_BIT) == VK_SUCCESS)
             fg.shadow_ms = (double)(ts[1] - ts[0]) * (double)g.ts_period / 1.0e6;
@@ -3115,7 +3126,7 @@ int64_t sv_frame(void) {
     VkCommandBufferBeginInfo bi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
     vkBeginCommandBuffer(F->cmd, &bi);
     fig_shadow_first(F);
-    if (g.have_ts) { vkCmdResetQueryPool(F->cmd, g.qpool, q0, 4); vkCmdWriteTimestamp(F->cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, g.qpool, q0); }
+    if (g.have_ts) { vkCmdResetQueryPool(F->cmd, g.qpool, q0, 8); vkCmdWriteTimestamp(F->cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, g.qpool, q0); }
     /* cull: one compute invocation per slot writes the indirect commands */
     int32_t *misc = (int32_t *)(g.ubo_map + 32);
     misc[0] = (int32_t)g.hi_slot; misc[1] = SV_CMD_STRIDE; misc[2] = (int32_t)g.layers; misc[3] = (int32_t)g.nblocks;
@@ -3208,6 +3219,8 @@ int64_t sv_frame(void) {
     VkViewport vpt = { 0, 0, (float)g.extent.width, (float)g.extent.height, 0.0f, 1.0f };
     VkRect2D sc = { { 0, 0 }, g.extent };
     VkDeviceSize zero = 0;
+    /* per-pass timestamps: 4 after the cull, 5 after the geometry, 6 after the light pass (1 is the frame's end) */
+    if (g.have_ts) vkCmdWriteTimestamp(F->cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, g.qpool, q0 + 4);
 
     /* 1. geometry: the solid ranges write colour, normal, material and depth.
      * One multi-draw-indirect call per range; the push constant tells the
@@ -3235,6 +3248,7 @@ int64_t sv_frame(void) {
     }
     draws += fig_record(F);
     vkCmdEndRenderPass(F->cmd);
+    if (g.have_ts) vkCmdWriteTimestamp(F->cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, g.qpool, q0 + 5);
     /* 1b. the plain figures' sun shadow map, when any is in reach */
     draws += fig_shadow_record(F, q0);
 
@@ -3246,6 +3260,7 @@ int64_t sv_frame(void) {
     vkCmdBindPipeline(F->cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g.pipe_light);
     vkCmdDraw(F->cmd, 3, 1, 0, 0);
     vkCmdEndRenderPass(F->cmd);
+    if (g.have_ts) vkCmdWriteTimestamp(F->cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, g.qpool, q0 + 6);
 
     /* the water's memory: this frame's depth image is cleared (nothing
      * remembered yet); last frame's writes are made visible to this frame's reads */
