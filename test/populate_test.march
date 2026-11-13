@@ -1,0 +1,327 @@
+-- Populate: a Frozen population evaluated over a Ground. Fields read back
+-- what the game supplied, noise agrees where two Grounds overlap, zones
+-- are what their names say, and a layer's density is its rule written out.
+mod Strata.Test.Populate do
+
+  -- this module uses no Check.all; the suite compiles as one program and
+  -- other test modules do (GAPS S3)
+  needs IO.Clock
+  needs IO.Process
+  import Test
+  alias Strata.Population as Pn
+  alias Strata.Populate as Pq
+
+  pfn frozen_of(p : Strata.Population.Pop) : Strata.Population.Frozen do
+    match Pn.freeze(p) do
+      Ok(f) -> f
+      Err(m) -> panic("expected the population to freeze: " ++ m)
+    end
+  end
+
+  pfn bare(x0 : Int, z0 : Int, n : Int, scale : Float, level : Int) : Strata.Populate.Ground do
+    Pq.ground(x0, z0, n, scale, level, NativeArray.make_int(n * n, 10), NativeArray.make_int(n * n, -1))
+  end
+
+  pfn ramp_go(a : NativeF32Arr, i : Int, nn : Int) : NativeF32Arr do
+    if i >= nn do a else ramp_go(NativeArray.set_f32(a, i, int_to_float(i)), i + 1, nn) end
+  end
+  -- value i at column i
+  pfn ramp_arr(nn : Int) : NativeF32Arr do ramp_go(NativeArray.make_f32(nn, 0.0), 0, nn) end
+
+  -- region ids: column i holds (i mod 4) pushed 0.4 off the integer, up on even columns and down on odd
+  pfn regions_go(a : NativeF32Arr, i : Int, nn : Int) : NativeF32Arr do
+    if i >= nn do a
+    else
+      let off = if i % 2 == 0 do 0.4 else 0.0 -. 0.4 end
+      regions_go(NativeArray.set_f32(a, i, int_to_float(i % 4) +. off), i + 1, nn)
+    end
+  end
+
+  -- a small linear congruential generator: the next state, and a value in [0, 1)
+  pfn lcg(s : Int) : Int do int_and(s * 1103515245 + 12345, 2147483647) end
+  pfn unit_of(s : Int) : Float do int_to_float(int_and(int_shr(s, 8), 65535)) /. 65536.0 end
+  pfn random_go(a : NativeF32Arr, s : Int, lo : Float, hi : Float, i : Int, nn : Int) : NativeF32Arr do
+    if i >= nn do a
+    else
+      let s2 = lcg(s)
+      random_go(NativeArray.set_f32(a, i, lo +. (hi -. lo) *. unit_of(s2)), s2, lo, hi, i + 1, nn)
+    end
+  end
+  pfn random_arr(seed : Int, lo : Float, hi : Float, nn : Int) : NativeF32Arr do random_go(NativeArray.make_f32(nn, 0.0), seed, lo, hi, 0, nn) end
+
+  -- the test's own piecewise-linear curve over points sorted by x: flat beyond the ends
+  pfn lerp_pts(pts : List((Float, Float)), x : Float) : Float do
+    match pts do
+      Nil -> 0.0
+      Cons((x0, y0), rest) ->
+        if x <= x0 do y0
+        else
+          match rest do
+            Nil -> y0
+            Cons((x1, y1), _) ->
+              if x <= x1 do y0 +. (y1 -. y0) *. ((x -. x0) /. (x1 -. x0)) else lerp_pts(rest, x) end
+          end
+        end
+    end
+  end
+
+  pfn near(a : Float, b : Float, tol : Float) : Bool do Math.abs(a -. b) <= tol end
+
+  -- every column of t's field `name` against value i -> expected
+  pfn fields_match(t : Strata.Populate.Table, name : String, expect : Int -> Float, i : Int, nn : Int) : Int do
+    if i >= nn do -1
+    else if near(Pq.field_at(t, name, i), expect(i), 0.00001) do fields_match(t, name, expect, i + 1, nn)
+    else i end end
+  end
+
+  -- the first column where zone `name` differs from expect, or -1
+  pfn zone_match(f : Strata.Population.Frozen, t : Strata.Populate.Table, name : String, expect : Int -> Bool, i : Int, nn : Int) : Int do
+    if i >= nn do -1
+    else if Pq.zone_at(f, t, name, i) == expect(i) do zone_match(f, t, name, expect, i + 1, nn)
+    else i end end
+  end
+  pfn zone_count_in(f : Strata.Population.Frozen, t : Strata.Populate.Table, name : String, i : Int, nn : Int, acc : Int) : Int do
+    if i >= nn do acc else zone_count_in(f, t, name, i + 1, nn, if Pq.zone_at(f, t, name, i) do acc + 1 else acc end) end
+  end
+
+  pfn in_band(v : Float, lo : Float, hi : Float) : Bool do if v >= lo do v < hi else false end end
+
+  -- overlap: the first (i, j) of b where a's column (i + dx, j + dz) differs, as i + 100 * j, or -1
+  pfn overlap_go(ta : Strata.Populate.Table, tb : Strata.Populate.Table, n : Int, dx : Int, dz : Int, i : Int, j : Int) : Int do
+    if j >= n - dz do -1
+    else if i >= n - dx do overlap_go(ta, tb, n, dx, dz, 0, j + 1)
+    else
+      let va = Pq.field_at(ta, "hills", (i + dx) + n * (j + dz))
+      let vb = Pq.field_at(tb, "hills", i + n * j)
+      if near(va, vb, 0.00001) do overlap_go(ta, tb, n, dx, dz, i + 1, j) else i + 100 * j end
+    end end
+  end
+  pfn count_differ(ta : Strata.Populate.Table, tb : Strata.Populate.Table, name : String, i : Int, nn : Int, acc : Int) : Int do
+    if i >= nn do acc
+    else count_differ(ta, tb, name, i + 1, nn, if near(Pq.field_at(ta, name, i), Pq.field_at(tb, name, i), 0.00001) do acc else acc + 1 end) end
+  end
+  pfn all_unit(t : Strata.Populate.Table, name : String, i : Int, nn : Int) : Bool do
+    if i >= nn do true
+    else
+      let v = Pq.field_at(t, name, i)
+      if v >= 0.0 do (if v <= 1.0 do all_unit(t, name, i + 1, nn) else false end) else false end
+    end
+  end
+
+  -- The rule test: fields alt (slot 0), slope (slot 1), wet (slot 6) and
+  -- steep (slope through a curve, declared before slope); zones high and
+  -- wetland (bands); three layers.
+  pfn steep_pts() : List((Float, Float)) do [(0.0, 1.0), (0.5, 1.0), (1.5, 0.2)] end
+  pfn grass_alt_pts() : List((Float, Float)) do [(0.0, 1.0), (50.0, 0.5), (100.0, 0.0)] end
+  pfn grass_steep_pts() : List((Float, Float)) do [(0.0, 0.0), (1.0, 1.0)] end
+  pfn reeds_pts() : List((Float, Float)) do [(0.5, 0.0), (1.0, 1.0)] end
+  pfn odd_pts() : List((Float, Float)) do [(0.0, 0.0 -. 1.0), (50.0, 1.0)] end
+
+  pfn rules_pop() : Strata.Population.Pop do
+    let p0 = Pn.field_ground(Pn.field_ground(Pn.field_curve(Pn.field_ground(Pn.new(), "alt", 0), "steep", "slope", Pn.curve(steep_pts())), "slope", 1), "wet", 6)
+    let p1 = Pn.zone_band(Pn.zone_band(p0, "high", "alt", 60.0, 1000.0), "wetland", "wet", 0.7, 2.0)
+    let p2 = Pn.shapes_blocks(p1, "g", [1])
+    let p3 = Pn.layer_cover(p2, "grass", "g", Pn.rule(0.8, [("alt", Pn.curve(grass_alt_pts())), ("steep", Pn.curve(grass_steep_pts()))], Nil, ["high"]), 1)
+    let p4 = Pn.layer_cover(p3, "reeds", "g", Pn.rule(2.0, [("wet", Pn.curve(reeds_pts()))], ["wetland"], Nil), 2)
+    Pn.layer_scatter(p4, "odd", "g", Pn.rule(1.5, [("alt", Pn.curve(odd_pts()))], Nil, Nil), 4.0, 0.5, 3)
+  end
+
+  pfn clamp0(v : Float) : Float do if v > 0.0 do v else 0.0 end end
+  -- the expected density of each layer at a column, from the declarations above
+  pfn expect_grass(alt : Float, slope : Float) : Float do
+    if in_band(alt, 60.0, 1000.0) do 0.0
+    else clamp0(0.8 *. lerp_pts(grass_alt_pts(), alt) *. lerp_pts(grass_steep_pts(), lerp_pts(steep_pts(), slope))) end
+  end
+  pfn expect_reeds(wet : Float) : Float do
+    if in_band(wet, 0.7, 2.0) do clamp0(2.0 *. lerp_pts(reeds_pts(), wet)) else 0.0 end
+  end
+  pfn expect_odd(alt : Float) : Float do clamp0(1.5 *. lerp_pts(odd_pts(), alt)) end
+
+  -- the first column of 0..nn where some layer's density differs from the expectation, or -1
+  pfn rules_go(f : Strata.Population.Frozen, t : Strata.Populate.Table, alt : NativeF32Arr, slope : NativeF32Arr, wet : NativeF32Arr, i : Int, nn : Int) : Int do
+    if i >= nn do -1
+    else
+      let a = NativeArray.get_f32(alt, i)
+      let ok1 = near(Pq.density_at(f, t, "grass", i), expect_grass(a, NativeArray.get_f32(slope, i)), 0.0001)
+      let ok2 = near(Pq.density_at(f, t, "reeds", i), expect_reeds(NativeArray.get_f32(wet, i)), 0.0001)
+      let ok3 = near(Pq.density_at(f, t, "odd", i), expect_odd(a), 0.0001)
+      if ok1 do (if ok2 do (if ok3 do rules_go(f, t, alt, slope, wet, i + 1, nn) else i end) else i end) else i end
+    end
+  end
+  pfn count_where(f : Strata.Population.Frozen, t : Strata.Populate.Table, layer : String, zero : Bool, i : Int, nn : Int, acc : Int) : Int do
+    if i >= nn do acc
+    else count_where(f, t, layer, zero, i + 1, nn, if (Pq.density_at(f, t, layer, i) == 0.0) == zero do acc + 1 else acc end)
+    end
+  end
+  -- the by-index forms agree with the named ones
+  pfn index_forms_go(f : Strata.Population.Frozen, t : Strata.Populate.Table, i : Int, nn : Int) : Bool do
+    if i >= nn do true
+    else
+      let d = Pq.density(t, Pn.layer_index(f, "grass"), i) == Pq.density_at(f, t, "grass", i)
+      let z = Pq.in_zone(t, Pn.zone_index(f, "high"), i) == Pq.zone_at(f, t, "high", i)
+      if d do (if z do index_forms_go(f, t, i + 1, nn) else false end) else false end
+    end
+  end
+
+  -- exact: the first column (i, j) of b, as i + 1000 * j, where a's column at the same world position reads other bits, or -1
+  pfn exact_go(ta : Strata.Populate.Table, tb : Strata.Populate.Table, n : Int, dx : Int, dz : Int, i : Int, j : Int) : Int do
+    if j >= n do -1
+    else if i >= n do exact_go(ta, tb, n, dx, dz, 0, j + 1)
+    else
+      let ia = i + dx
+      let ja = j + dz
+      let shared = if ia >= 0 do (if ia < n do (if ja >= 0 do ja < n else false end) else false end) else false end
+      if shared do
+        if Pq.field_at(ta, "hills", ia + n * ja) == Pq.field_at(tb, "hills", i + n * j) do exact_go(ta, tb, n, dx, dz, i + 1, j) else i + 1000 * j end
+      else exact_go(ta, tb, n, dx, dz, i + 1, j) end
+    end end
+  end
+  -- Grounds of n x n at (xa, za) and (xb, zb) at one scale and level: the first shared column reading other bits, or -1
+  pfn exact_pair(f : Strata.Population.Frozen, n : Int, scale : Float, level : Int, xa : Int, za : Int, xb : Int, zb : Int) : Int do
+    let ta = Pq.fields(f, 7, bare(xa, za, n, scale, level))
+    let tb = Pq.fields(f, 7, bare(xb, zb, n, scale, level))
+    exact_go(ta, tb, n, xb - xa, zb - za, 0, 0)
+  end
+  pfn all_zero(t : Strata.Populate.Table, f : Strata.Population.Frozen, i : Int, nn : Int) : Bool do
+    if i >= nn do true
+    else
+      let z = if Pq.field_at(t, "alt", i) == 0.0 do (if Pq.density_at(f, t, "grass", i) == 0.0 do !Pq.zone_at(f, t, "high", i) else false end) else false end
+      if z do all_zero(t, f, i + 1, nn) else false end
+    end
+  end
+  pfn has_msg(ms : List(String), part : String) : Bool do List.any(ms, fn m -> string_contains(m, part)) end
+  -- against sample2: the first world column (x, z) of xs x zs, as "x,z", where the Table of a Ground at (x0, z0), n x n, voxel metres, reads other than 0.5 + 0.5 * sample2 at the column's centre (within 0.0001); "" when all agree
+  pfn sample_go(t : Strata.Populate.Table, x0 : Int, z0 : Int, n : Int, voxel : Float, xs : List(Int), zs : List(Int), all_zs : List(Int)) : String do
+    match xs do
+      Nil -> ""
+      Cons(x, xrest) ->
+        match zs do
+          Nil -> sample_go(t, x0, z0, n, voxel, xrest, all_zs, all_zs)
+          Cons(z, zrest) ->
+            let s = Strata.Noise.settings(0, 3, 2.0, 0.5, 1, 0.0)
+            let want = 0.5 +. 0.5 *. Strata.Noise.sample2(s, Strata.Seed.mix(7, 5), 1.0 /. 7.0, (int_to_float(x) +. 0.5) *. voxel, (int_to_float(z) +. 0.5) *. voxel)
+            let got = Pq.field_at(t, "hills", (x - x0) + n * (z - z0))
+            if near(got, want, 0.0001) do sample_go(t, x0, z0, n, voxel, xs, zrest, all_zs)
+            else int_to_string(x) ++ "," ++ int_to_string(z) end
+        end
+    end
+  end
+  pfn sample_check(f : Strata.Population.Frozen, x0 : Int, z0 : Int, n : Int, scale : Float, level : Int) : String do
+    let t = Pq.fields(f, 7, bare(x0, z0, n, scale, level))
+    let zs = [-1, 0, 32]
+    sample_go(t, x0, z0, n, scale *. Math.pow(2.0, int_to_float(level)), [-33, -32, -1, 0, 31, 32], zs, zs)
+  end
+
+  describe "Populate" do
+    test "a ground field reads back what was supplied; a slot not supplied reads 0" do
+      let f = frozen_of(Pn.field_ground(Pn.field_ground(Pn.new(), "alt", 0), "slope", 1))
+      let g = Pq.with_field(bare(5, -3, 8, 1.0, 0), 0, ramp_arr(64))
+      let t = Pq.fields(f, 7, g)
+      Test.assert_eq_int(fields_match(t, "alt", fn i -> int_to_float(i), 0, 64), -1, "alt is the ramp at every column")
+      Test.assert_eq_int(fields_match(t, "slope", fn _ -> 0.0, 0, 64), -1, "slope, not supplied, is 0 at every column")
+      Test.assert_true(Pq.field_at(t, "nothing", 3) == 0.0, "an undeclared field reads 0")
+    end
+
+    test "a noise field agrees where two Grounds overlap, sits at column centres, and changes with the seed" do
+      let f = frozen_of(Pn.field_noise(Pn.new(), "hills", 0, 3, 40.0, 5))
+      let ta = Pq.fields(f, 7, bare(0, 0, 16, 1.0, 0))
+      let tb = Pq.fields(f, 7, bare(8, 4, 16, 1.0, 0))
+      Test.assert_eq_int(overlap_go(ta, tb, 16, 8, 4, 0, 0), -1, "the shared columns agree")
+      Test.assert_true(all_unit(ta, "hills", 0, 256), "noise reads in 0..1")
+      Test.assert_true(count_differ(ta, Pq.fields(f, 8, bare(0, 0, 16, 1.0, 0)), "hills", 0, 256, 0) > 200, "another seed gives other noise")
+      -- at scale 0.5 and level 2 a column is 2 m; column (i, j) of a Ground at (3, -2) is centred at ((3 + i + 0.5) * 2, (-2 + j + 0.5) * 2)
+      let tc = Pq.fields(f, 7, bare(3, -2, 4, 0.5, 2))
+      let s = Strata.Noise.settings(0, 3, 2.0, 0.5, 1, 0.0)
+      let want = 0.5 +. 0.5 *. Strata.Noise.sample2(s, Strata.Seed.mix(7, 5), 1.0 /. 40.0, (3.0 +. 1.0 +. 0.5) *. 2.0, (0.0 -. 2.0 +. 2.0 +. 0.5) *. 2.0)
+      Test.assert_true(near(Pq.field_at(tc, "hills", 1 + 4 * 2), want, 0.0001), "noise at column (1, 2) is the sample at its centre, mapped to 0..1")
+    end
+
+    test "zones: band, not, all, any, ring and regions" do
+      let camp = Pn.site(4.0, 3.0, 0.0, 1.0, 0)
+      let p0 = Pn.field_ground(Pn.new(), "alt", 0)
+      -- notmid is declared before the zone it negates
+      let p1 = Pn.zone_band(Pn.zone_not(p0, "notmid", "mid"), "mid", "alt", 10.0, 20.0)
+      let p2 = Pn.zone_any(Pn.zone_all(Pn.zone_band(p1, "low", "alt", 0.0, 15.0), "both", ["mid", "low"]), "either", ["mid", "low"])
+      let p3 = Pn.zone_regions(Pn.zone_ring(p2, "camp", [camp], 1.5, 3.0), "odd", [1, 3])
+      let f = frozen_of(p3)
+      let g = Pq.with_field(Pq.with_field(bare(0, 0, 8, 1.0, 0), 0, ramp_arr(64)), 7, regions_go(NativeArray.make_f32(64, 0.0), 0, 64))
+      let t = Pq.fields(f, 1, g)
+      Test.assert_eq_int(zone_match(f, t, "mid", fn i -> if i >= 10 do i < 20 else false end, 0, 64), -1, "mid is 10 <= alt < 20")
+      Test.assert_eq_int(zone_match(f, t, "notmid", fn i -> if i >= 10 do i >= 20 else true end, 0, 64), -1, "notmid is the rest")
+      Test.assert_eq_int(zone_match(f, t, "both", fn i -> if i >= 10 do i < 15 else false end, 0, 64), -1, "both is mid and low")
+      Test.assert_eq_int(zone_match(f, t, "either", fn i -> i < 20, 0, 64), -1, "either is mid or low")
+      let ring = fn i ->
+        let dx = int_to_float(i % 8) +. 0.5 -. 4.0
+        let dz = int_to_float(i / 8) +. 0.5 -. 3.0
+        let d = Math.sqrt(dx *. dx +. dz *. dz)
+        if d >= 1.5 do d < 3.0 else false end
+      Test.assert_eq_int(zone_match(f, t, "camp", ring, 0, 64), -1, "camp is 1.5 m to 3 m from the site, measured from column centres")
+      let inside = zone_count_in(f, t, "camp", 0, 64, 0)
+      Test.assert_true(inside > 4, "the ring holds columns (" ++ int_to_string(inside) ++ ")")
+      Test.assert_true(inside < 40, "and not all of them")
+      Test.assert_eq_int(zone_match(f, t, "odd", fn i -> if i % 4 == 1 do true else i % 4 == 3 end, 0, 64), -1, "odd matches the region slot rounded to 1 or 3")
+      Test.assert_false(Pq.zone_at(f, t, "nowhere", 0), "an undeclared zone holds nothing")
+    end
+
+    test "a layer's density is its rule written out, and never below 0" do
+      let f = frozen_of(rules_pop())
+      let alt = random_arr(11, 0.0, 100.0, 529)
+      let slope = random_arr(22, 0.0, 2.0, 529)
+      let wet = random_arr(33, 0.0, 1.0, 529)
+      let g = Pq.with_field(Pq.with_field(Pq.with_field(bare(-40, 17, 23, 1.0, 0), 0, alt), 1, slope), 6, wet)
+      let t = Pq.fields(f, 99, g)
+      Test.assert_eq_int(rules_go(f, t, alt, slope, wet, 0, 500), -1, "every layer at 500 columns")
+      Test.assert_true(count_where(f, t, "odd", true, 0, 500, 0) > 100, "odd's product is negative below alt 25 and reads 0")
+      Test.assert_true(count_where(f, t, "odd", false, 0, 500, 0) > 100, "and positive above it")
+      Test.assert_true(count_where(f, t, "reeds", false, 0, 500, 0) > 50, "reeds stand in the wetland")
+      Test.assert_true(count_where(f, t, "grass", true, 0, 500, 0) > 100, "grass is 0 in high ground")
+      Test.assert_true(index_forms_go(f, t, 0, 500), "density and in_zone agree with density_at and zone_at")
+      Test.assert_true(Pq.density_at(f, t, "nolayer", 0) == 0.0, "an undeclared layer has density 0")
+    end
+
+
+    test "noise reads the same bits at every shared column of two overlapping Grounds, at any scale" do
+      let f = frozen_of(Pn.field_noise(Pn.new(), "hills", 0, 3, 7.0, 5))
+      Test.assert_eq_int(exact_pair(f, 40, 0.1, 0, -45, -13, -20, 7), -1, "scale 0.1, negative corners, offsets 25 and 20")
+      Test.assert_eq_int(exact_pair(f, 40, 0.1, 0, -20, 7, -45, -13), -1, "the same pair the other way round")
+      Test.assert_eq_int(exact_pair(f, 37, 1.0, 1, -70, -3, -51, 12), -1, "scale 1 at level 1, offsets 19 and 15")
+      Test.assert_eq_int(exact_pair(f, 50, 0.3, 2, 3, -33, 41, -9), -1, "scale 0.3 at level 2, offsets 38 and 24")
+    end
+
+    test "noise is 0.5 + 0.5 * sample2 at the column centre across tile boundaries, at scale 0.1 level 0 and scale 1 level 1" do
+      let f = frozen_of(Pn.field_noise(Pn.new(), "hills", 0, 3, 7.0, 5))
+      Test.assert_eq_str(sample_check(f, -33, -33, 66, 0.1, 0), "", "scale 0.1 level 0, one Ground at (-33, -33)")
+      Test.assert_eq_str(sample_check(f, -40, -5, 80, 0.1, 0), "", "scale 0.1 level 0, one Ground at (-40, -5)")
+      Test.assert_eq_str(sample_check(f, -33, -33, 66, 1.0, 1), "", "scale 1 level 1 (voxel 2), one Ground at (-33, -33)")
+      Test.assert_eq_str(sample_check(f, -35, -2, 70, 1.0, 1), "", "scale 1 level 1 (voxel 2), one Ground at (-35, -2)")
+    end
+
+    test "problems lists every wrong-sized array, a slot outside 0..9 and a bad n or scale; fields over it is zeros" do
+      Test.assert_true(List.is_empty(Pq.problems(Pq.with_field(bare(0, 0, 4, 1.0, 0), 3, NativeArray.make_f32(16, 1.0)))), "a good Ground has none")
+      let g = Pq.ground(0, 0, 4, 1.0, 0, NativeArray.make_int(15, 0), NativeArray.make_int(17, 0))
+      let ps = Pq.problems(Pq.with_field(Pq.with_field(g, 2, NativeArray.make_f32(3, 0.0)), 12, NativeArray.make_f32(16, 0.0)))
+      Test.assert_true(has_msg(ps, "tops holds 15"), "tops")
+      Test.assert_true(has_msg(ps, "waters holds 17"), "waters")
+      Test.assert_true(has_msg(ps, "slot 2 holds 3"), "slot 2's length")
+      Test.assert_true(has_msg(ps, "slot 12 is outside 0..9"), "slot 12")
+      Test.assert_eq_int(List.length(ps), 4, "one message each")
+      Test.assert_true(has_msg(Pq.problems(Pq.ground(0, 0, 0, 1.0, 0, NativeArray.make_int(1, 0), NativeArray.make_int(1, 0))), "n is 0"), "n 0")
+      Test.assert_true(has_msg(Pq.problems(bare(0, 0, 4, 0.0, 0)), "scale is 0"), "scale 0")
+      Test.assert_true(has_msg(Pq.problems(bare(0, 0, 4, float_nan(), 0)), "scale is"), "scale NaN")
+      let f = frozen_of(rules_pop())
+      let bad = Pq.with_field(bare(0, 0, 8, 1.0, 0), 0, NativeArray.make_f32(10, 80.0))
+      Test.assert_true(all_zero(Pq.fields(f, 3, bad), f, 0, 64), "a Ground with problems gives zeros")
+      Test.assert_true(Pq.field_at(Pq.fields(f, 3, Pq.with_field(bare(0, 0, 8, 1.0, 0), 0, NativeArray.make_f32(64, 80.0))), "alt", 5) == 80.0, "the same Ground with the right size reads")
+    end
+
+    test "a NaN region value matches no region" do
+      let f = frozen_of(Pn.zone_regions(Pn.zone_regions(Pn.new(), "zero", [0]), "odd", [1, 3]))
+      let reg = NativeArray.set_f32(NativeArray.set_f32(NativeArray.make_f32(4, 1.0), 1, float_nan()), 2, 0.0)
+      let t = Pq.fields(f, 1, Pq.with_field(bare(0, 0, 2, 1.0, 0), 7, reg))
+      Test.assert_true(Pq.zone_at(f, t, "odd", 0), "1 is odd")
+      Test.assert_false(Pq.zone_at(f, t, "odd", 1), "NaN is not odd")
+      Test.assert_false(Pq.zone_at(f, t, "zero", 1), "NaN is not region 0")
+      Test.assert_true(Pq.zone_at(f, t, "zero", 2), "0 is region 0")
+    end
+  end
+end
