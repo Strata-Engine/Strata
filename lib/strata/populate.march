@@ -68,8 +68,9 @@ mod Strata.Populate do
   --   pt_vals   field f at column c is pt_vals[f * nn + c]          (nf * nn)
   --   pt_zones  zone z at column c is pt_zones[z * nn + c], 0 or 1  (nz * nn)
   --   pt_dens   layer l's density at column c is pt_dens[l * nn + c] (nl * nn)
+  --   pt_dmax   layer l's largest density over every column     (nl, padded)
   -- (opaque to callers: read it with field_at, in_zone, density)
-  type Table = { pt_nn : Int, pt_names : List(String), pt_nl : Int, pt_nz : Int, pt_vals : NativeF32Arr, pt_zones : NativeU8Arr, pt_dens : NativeF32Arr }
+  type Table = { pt_nn : Int, pt_names : List(String), pt_nl : Int, pt_nz : Int, pt_vals : NativeF32Arr, pt_zones : NativeU8Arr, pt_dens : NativeF32Arr, pt_dmax : NativeF32Arr }
 
   -- ── Ground ────────────────────────────────────────────────────────────────
 
@@ -325,7 +326,7 @@ mod Strata.Populate do
   pfn cumulative(ws : List(Float)) : List(Float) do cum_go(ws, 0.0, List.fold_left(ws, 0.0, fn (a, w) -> a +. w)) end
   pfn entry_zone(e : (Int, List(Float))) : Int do match e do (z, _) -> z end end
   pfn entry_weights(e : (Int, List(Float))) : List(Float) do match e do (_, w) -> w end end
-  -- a layer's block ids: a cover layer's block shape set's; none for templates or another kind
+  -- layer l's block ids: its shape set's ids when the set holds blocks, whatever the layer's kind; none when it holds templates
   pfn layer_blocks(f : Strata.Population.Frozen, l : Int) : List(Int) do
     let s = Pn.layer_shape_set(f, l)
     if Pn.shape_set_kind(f, s) == 0 do Pn.shape_set_blocks(f, s) else Nil end
@@ -630,6 +631,18 @@ mod Strata.Populate do
     if l >= nl do d else layers_go(layer_into(d, prog, num, vals, zs, nn, l), prog, num, vals, zs, nn, l + 1, nl) end
   end
 
+  -- the largest of d[off .. off + nn] (densities are never below 0)
+  pfn dmax_col(d : NativeF32Arr, off : Int, k : Int, nn : Int, m : Float) : Float do
+    if k >= nn do m
+    else
+      let v = NativeArray.get_f32(d, off + k)
+      dmax_col(d, off, k + 1, nn, if v > m do v else m end)
+    end
+  end
+  pfn dmax_go(out : NativeF32Arr, d : NativeF32Arr, nn : Int, l : Int, nl : Int) : NativeF32Arr do
+    if l >= nl do out else dmax_go(NativeArray.set_f32(out, l, dmax_col(d, l * nn, 0, nn, 0.0)), d, nn, l + 1, nl) end
+  end
+
   doc "Every field, zone and layer density of a plan over g's columns, once, into a Table the calling task owns. Ground fields are copied from g (0 where the slot was not supplied). A noise field is Strata.Noise.field2 on world-aligned tiles of 32 x 32 columns, sampled at column centres, seeded by Strata.Seed.mix(seed, salt), at 1 / period cycles per metre, fBm with lacunarity 2 and gain 0.5, read as 0.5 + 0.5 * noise; two Grounds read the same bits at a shared column. A curve field maps its source; a cover field reads 0 (Task 6 fills it). A layer's density is its base times each curve of its field, 0 where a zone fails, clamped at 0. A Ground with problems gives a Table of zeros."
   fn fields_with(p : PopPlan, seed : Int, g : Ground) : Table do
     let ok = List.is_empty(problems(g))
@@ -641,8 +654,8 @@ mod Strata.Populate do
       let vals = eval_fields(p, seed, g, nn, vals0, 0)
       let zs = eval_zones(p, g, nn, vals, zs0, 0)
       let d = layers_go(d0, p.pl_prog, p.pl_num, vals, zs, nn, 0, p.pl_nl)
-      { pt_nn: nn, pt_names: p.pl_names, pt_nl: p.pl_nl, pt_nz: p.pl_nz, pt_vals: vals, pt_zones: zs, pt_dens: d }
-    else { pt_nn: 0, pt_names: p.pl_names, pt_nl: p.pl_nl, pt_nz: p.pl_nz, pt_vals: vals0, pt_zones: zs0, pt_dens: d0 } end
+      { pt_nn: nn, pt_names: p.pl_names, pt_nl: p.pl_nl, pt_nz: p.pl_nz, pt_vals: vals, pt_zones: zs, pt_dens: d, pt_dmax: dmax_go(NativeArray.make_f32(p.pl_nl + 1, 0.0), d, nn, 0, p.pl_nl) }
+    else { pt_nn: 0, pt_names: p.pl_names, pt_nl: p.pl_nl, pt_nz: p.pl_nz, pt_vals: vals0, pt_zones: zs0, pt_dens: d0, pt_dmax: NativeArray.make_f32(p.pl_nl + 1, 0.0) } end
   end
 
   doc "fields_with(plan(f), seed, g): for tests and tools; a caller evaluating many Grounds keeps one plan."
@@ -698,7 +711,7 @@ mod Strata.Populate do
   -- column (cx, cz) is the Ground's column (cr_ci + cx) + cr_n * (cr_cj + cz)
   -- and world column (cr_wx0 + cx, cr_wz0 + cz); a floor at world height y
   -- writes local height y - cr_ylo when that is in 0..31.
-  type CoverRun = { cr_seed : Int, cr_salt : Int, cr_area : Float, cr_dens : NativeF32Arr, cr_doff : Int, cr_zs : NativeU8Arr, cr_nn : Int, cr_ids : NativeIntArr, cr_vat : Int, cr_vn : Int, cr_wzone : NativeIntArr, cr_wbase : NativeIntArr, cr_wcum : NativeFloatArr, cr_wat : Int, cr_wend : Int, cr_n : Int, cr_ci : Int, cr_cj : Int, cr_wx0 : Int, cr_wz0 : Int, cr_ylo : Int, cr_surf : Bool, cr_tops : NativeIntArr, cr_sat : NativeIntArr, cr_sys : NativeIntArr, cr_skind : NativeIntArr }
+  type CoverRun = { cr_seed : Int, cr_salt : Int, cr_area : Float, cr_dens : NativeF32Arr, cr_dmax : NativeF32Arr, cr_doff : Int, cr_zs : NativeU8Arr, cr_nn : Int, cr_ids : NativeIntArr, cr_vat : Int, cr_vn : Int, cr_wzone : NativeIntArr, cr_wbase : NativeIntArr, cr_wcum : NativeFloatArr, cr_wat : Int, cr_wend : Int, cr_n : Int, cr_ci : Int, cr_cj : Int, cr_wx0 : Int, cr_wz0 : Int, cr_ylo : Int, cr_surf : Bool, cr_tops : NativeIntArr, cr_sat : NativeIntArr, cr_sys : NativeIntArr, cr_skind : NativeIntArr }
 
   -- the first weights entry in e..e_end whose zone holds column col, or -1
   pfn weighted_entry(wzone : NativeIntArr, zs : NativeU8Arr, nn : Int, col : Int, e : Int, e_end : Int) : Int do
@@ -722,9 +735,8 @@ mod Strata.Populate do
       let nv = r.cr_vn
       let e = weighted_entry(r.cr_wzone, r.cr_zs, r.cr_nn, col, r.cr_wat, r.cr_wend)
       let k = if e >= 0 do cum_pick(r.cr_wcum, NativeArray.get_int(r.cr_wbase, e), 0, nv, u) else Math.min_int(nv - 1, float_to_int(u *. int_to_float(nv))) end
-      let id = NativeArray.get_int(r.cr_ids, r.cr_vat + k)
-      -- freeze refuses ids of 0 or below; an id above 65535 the chunk would store as air, so it places nothing
-      if id <= 65535 do id else 0 end
+      -- freeze refuses ids outside 1..65535, so every id claims its voxel
+      NativeArray.get_int(r.cr_ids, r.cr_vat + k)
     else 0 end
   end
 
@@ -764,12 +776,14 @@ mod Strata.Populate do
   -- layer l of the plan as a cover layer over the chunk r was set up for
   pfn cover_layer(p : PopPlan, base : CoverRun, c : Strata.Chunk.Chunk, l : Int) : (Strata.Chunk.Chunk, Int) do
     let nv = NativeArray.get_int(p.pl_lvn, l)
+    -- a layer whose density is 0 at every column of the Ground cannot place: no pass
     if nv <= 0 do (c, 0)
+    else if NativeArray.get_f32(base.cr_dmax, l) <= 0.0 do (c, 0)
     else
       let wat = NativeArray.get_int(p.pl_lwat, l)
       let r = { base with cr_salt: NativeArray.get_int(p.pl_lsalt, l), cr_doff: l * base.cr_nn, cr_vat: NativeArray.get_int(p.pl_lvat, l), cr_vn: nv, cr_wat: wat, cr_wend: wat + NativeArray.get_int(p.pl_lwn, l) }
       cover_go(r, c, 0, -1, 0, 0.0, 0, 0)
-    end
+    end end
   end
 
   -- the layers from l in run order, each dispatched on its kind
@@ -788,7 +802,7 @@ mod Strata.Populate do
 
   pfn span_ok(a : Int, n : Int) : Bool do if a >= 0 do a + 32 <= n else false end end
 
-  doc "The chunk at key k with plan p's layers placed, in run order, over Ground g, whose fields t holds (t = fields_with(p, seed, g)). This task: cover layers only, placing nothing above level 0; scatter and site layers pass the chunk through. A cover layer visits each floor of each of the chunk's columns (g's surfaces, or one floor at tops[col]); where the voxel above the floor is air and inside the chunk it rolls Strata.Seed.unit(Strata.Seed.cell(seed, salt, wx, y, wz)) at the floor's world voxel against the layer's density times the column's area (voxel size squared), and on success writes a variant's block id there: the variant comes from Strata.Seed.next of the same hash, against the weights of the first weighted zone (declaration order) the column is in, else uniformly. A written block is not air, so a later layer never overwrites it. g may be larger than the chunk; its corner and the key's 32 * kx, 32 * kz place the chunk's columns in it. The chunk comes back unchanged (the same value) when nothing is written: at a level above 0, with no cover layer, when g does not cover the chunk's 32 x 32 columns or has problems, when t is not n * n columns, or when no floor of g reaches the chunk. The chunk handed in is never changed."
+  doc "The chunk at key k with plan p's layers placed, in run order, over Ground g, whose fields t holds (t = fields_with(p, seed, g)). This task: cover layers only, placing nothing above level 0; scatter and site layers pass the chunk through. A cover layer visits each floor of each of the chunk's columns (g's surfaces, or one floor at tops[col]); where the voxel above the floor is air and inside the chunk it rolls Strata.Seed.unit(Strata.Seed.cell(seed, salt, wx, y, wz)) at the floor's world voxel against the layer's density times the column's area (voxel size squared), and on success writes a variant's block id there: the variant comes from Strata.Seed.next of the same hash, against the weights of the first weighted zone (declaration order) the column is in, else uniformly. A written block is not air, so a later layer never overwrites it. g may be larger than the chunk; its corner and the key's 32 * kx, 32 * kz place the chunk's columns in it. The chunk comes back unchanged (the same value) when nothing is written: at a level above 0, with no cover layer, when g does not cover the chunk's 32 x 32 columns, has problems or is at another level than k (its voxel is not scale * 2^level of k), when t is not n * n columns or holds another layer or zone count than p, or when no floor of g reaches the chunk. A layer whose density is 0 at every column of g costs no pass. The chunk handed in is never changed."
   fn place_with(p : PopPlan, seed : Int, k : Strata.Coord.Key, c : Strata.Chunk.Chunk, g : Ground, t : Table) : Strata.Chunk.Chunk do
     let n = g.pg_n
     let wx0 = 32 * Strata.Coord.kx(k)
@@ -800,11 +814,15 @@ mod Strata.Populate do
     let some = if level0 do p.pl_ncover > 0 else false end
     let covers = if span_ok(ci, n) do span_ok(cj, n) else false end
     let reached = if g.pg_fhi >= ylo do g.pg_flo <= ylo + 31 else false end
-    let fits = if covers do (if reached do t.pt_nn == n * n else false end) else false end
+    -- the Table must be this Ground's (n * n columns) and this plan's (its layer and zone counts)
+    let table_ok = if t.pt_nn == n * n do (if t.pt_nl == p.pl_nl do t.pt_nz == p.pl_nz else false end) else false end
+    -- the Ground's voxel must be the key's: scale * 2^level
+    let level_ok = g.pg_voxel == g.pg_scale *. Math.pow(2.0, int_to_float(Strata.Coord.level(k)))
+    let fits = if covers do (if reached do (if table_ok do level_ok else false end) else false end) else false end
     if some do
       if fits do
         if List.is_empty(problems(g)) do
-          let base = { cr_seed: seed, cr_salt: 0, cr_area: g.pg_voxel *. g.pg_voxel, cr_dens: t.pt_dens, cr_doff: 0, cr_zs: t.pt_zones, cr_nn: t.pt_nn,
+          let base = { cr_seed: seed, cr_salt: 0, cr_area: g.pg_voxel *. g.pg_voxel, cr_dens: t.pt_dens, cr_dmax: t.pt_dmax, cr_doff: 0, cr_zs: t.pt_zones, cr_nn: t.pt_nn,
                        cr_ids: p.pl_lids, cr_vat: 0, cr_vn: 0, cr_wzone: p.pl_wzone, cr_wbase: p.pl_wbase, cr_wcum: p.pl_wcum, cr_wat: 0, cr_wend: 0,
                        cr_n: n, cr_ci: ci, cr_cj: cj, cr_wx0: wx0, cr_wz0: wz0, cr_ylo: ylo, cr_surf: g.pg_surf, cr_tops: g.pg_tops, cr_sat: g.pg_sat, cr_sys: g.pg_sys, cr_skind: g.pg_skind }
           -- set_idx writes into arrays the chunk handed in still holds, so they are copied on the first write (GAPS S30) and c is never changed
