@@ -130,4 +130,7 @@ void main() {
         col += sun_highlight(n, toward_eye, rough, sun_vis);
     }
     o_lit = vec4(fogged(col, world), 1.0);
+    // light mode 5, for finding grain: lit as 4, but each pixel shows its memory: grey by how many past samples it leans on (white 64 and more),
+    // red where it was made to start over this frame (an edit near it, a moving body, a moved sun), blue where a moving figure's shadow box is
+    if (mode == 5) o_lit = vec4(settling ? vec3(0.9, 0.1, 0.1) : (shade_moves ? vec3(0.1, 0.3, 0.9) : vec3(min(count, 64.0) / 64.0)), 1.0);
 }

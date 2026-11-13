@@ -27,7 +27,7 @@
 /* Rewritten by build_shaders.sh whenever the shaders change: forge decides
  * whether to recompile this file from its text alone, not from the headers
  * it includes (GAPS S14). */
-#define STRATA_SHADERS_STAMP "f10e9d07ef1a6684"
+#define STRATA_SHADERS_STAMP "47456c40db8e4dd6"
 #include "strata_shaders.h"
 #include "strata_particles.h"
 #include "strata_alloc.h"
@@ -193,6 +193,7 @@ static struct {
     struct LightWrite { int cell[3]; int32_t chunk[3]; int valid; int uniform; int edit; unsigned char *bytes; } *lq;   /* writes waiting to be copied in, oldest first */
     uint32_t nlq, lq_cap;
     int32_t edit_lo[3], edit_hi[3];   /* the chunks an edit changed, while light_edit counts down */
+    int32_t last_lo[3], last_hi[3]; int last_edit;   /* the chunks the last frame's edits changed, if any */
     int light_relax;               /* frames left in which memory is capped short: the sun moved */
     float sun_seen[3];             /* the sun direction the light pass's memory was gathered under */
     int light_edit;                /* frames left in which the light pass must lean on new samples: an edit just reached the volume */
@@ -3129,14 +3130,34 @@ int64_t sv_frame(void) {
        * images are fresh, 2 just after the sun moved, else 255 (sun visibility
        * leans on 64 of them at most). An edit that reaches the volume this
        * frame caps only the pixels near it: its bounds go to the shader. */
-      for (uint32_t i = 0; i < g.nlq && i < SV_LIGHT_PER_FRAME; i++) if (g.lq[i].edit) {
-          const int32_t *ch = g.lq[i].chunk;
-          for (int k = 0; k < 3; k++) {
-              if (g.light_edit == 0 || ch[k] < g.edit_lo[k]) g.edit_lo[k] = ch[k];
-              if (g.light_edit == 0 || ch[k] > g.edit_hi[k]) g.edit_hi[k] = ch[k];
-          }
-          g.light_edit = 2;
-      }
+      /* the box is this frame's edits and the last frame's, not every edit since the
+       * box was last empty: with edits every frame (fire, freezing, flowing water) a
+       * box kept growing came to cover the whole field, and every pixel in it kept
+       * sampling afresh with a memory of 2, so shadows stayed grainy (13 November) */
+      { int32_t lo[3], hi[3]; int any = 0;
+        for (uint32_t i = 0; i < g.nlq && i < SV_LIGHT_PER_FRAME; i++) if (g.lq[i].edit) {
+            const int32_t *ch = g.lq[i].chunk;
+            for (int k = 0; k < 3; k++) {
+                if (!any || ch[k] < lo[k]) lo[k] = ch[k];
+                if (!any || ch[k] > hi[k]) hi[k] = ch[k];
+            }
+            any = 1;
+        }
+        if (any) {
+            for (int k = 0; k < 3; k++) {
+                g.edit_lo[k] = g.last_edit ? (lo[k] < g.last_lo[k] ? lo[k] : g.last_lo[k]) : lo[k];
+                g.edit_hi[k] = g.last_edit ? (hi[k] > g.last_hi[k] ? hi[k] : g.last_hi[k]) : hi[k];
+                g.last_lo[k] = lo[k]; g.last_hi[k] = hi[k];
+            }
+            g.light_edit = 2;
+        }
+        g.last_edit = any;
+        if (getenv("STRATA_LIGHTLOG")) {
+            static int frames, edited, relaxed; static int64_t vol_sum;
+            frames++; if (g.light_edit > 0) { edited++; vol_sum += (int64_t)(g.edit_hi[0] - g.edit_lo[0] + 1) * (g.edit_hi[1] - g.edit_lo[1] + 1) * (g.edit_hi[2] - g.edit_lo[2] + 1); }
+            if (g.light_relax > 0 || g.hist_reset > 0) relaxed++;
+            if (frames == 240) { fprintf(stderr, "light: of 240 frames %d had an edit box (mean %.1f chunks), %d a relaxed or reset memory\n", edited, edited ? (double)vol_sum / edited : 0.0, relaxed); frames = edited = relaxed = 0; vol_sum = 0; }
+        } }
       /* a sun that has moved more than a fraction of a degree since the memory was gathered: lean on it less */
       float sd = g.ubo_map[16] * g.sun_seen[0] + g.ubo_map[17] * g.sun_seen[1] + g.ubo_map[18] * g.sun_seen[2];
       if (sd < 0.99999f) { g.light_relax = 2; memcpy(g.sun_seen, g.ubo_map + 16, sizeof g.sun_seen); }
