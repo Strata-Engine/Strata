@@ -92,6 +92,7 @@ mod StrataViewer.Match do
                    mt_sword_rig : Int, mt_hbow_rig : Int, mt_hfire_rig : Int, mt_hice_rig : Int, mt_held : Int, mt_held_kind : Int, mt_held_t : Float, mt_swing : Float, mt_thrown_t : Float,
                    mt_hits : List((Int, Float, Bool)), mt_zones : List(MtZone), mt_blocked : Int, mt_zone_hits : Int,
                    mt_pbody_rig : Int, mt_pclips : List(Int), mt_arm_rig : Int, mt_harrow_rig : Int, mt_held3 : Int, mt_hold : Float, mt_pfig : Int, mt_pclip : Int, mt_arm1 : Int, mt_arm2 : Int,
+                   mt_near : Bool, mt_barrier : Int, mt_plant : List((Float, Float, Float, Int, Int)), mt_cells : List((Int, Int, Int)), mt_trees : List((Int, Int, Int, Int)), mt_uproot : List(Int), mt_cuts : List((Float, Float, Float, Float)), mt_felled : Int,
                    mt_biome : Int, mt_seen : List(Int), mt_shield_rig : Int, mt_hshield_rig : Int, mt_held2 : Int,
                    mt_teams : Bool, mt_round : Int, mt_rk0 : Int, mt_rk1 : Int, mt_rw0 : Int, mt_rw1 : Int, mt_wait : Float, mt_took : Int, mt_build_at : Int, mt_ox : Float, mt_oz : Float, mt_top : Float,
                    mt_arena : Bool, mt_picks : List(MtPickup), mt_health_rig : Int, mt_ice_rig : Int, mt_taken : Int, mt_thrown : Int, mt_arrows : Int, mt_iced : Int,
@@ -119,6 +120,7 @@ mod StrataViewer.Match do
       mt_sword_rig: -1, mt_hbow_rig: -1, mt_hfire_rig: -1, mt_hice_rig: -1, mt_held: -1, mt_held_kind: -1, mt_held_t: 0.0, mt_swing: 9.0, mt_thrown_t: 9.0,
       mt_hits: Nil, mt_zones: Nil, mt_blocked: 0, mt_zone_hits: 0,
       mt_pbody_rig: -1, mt_pclips: Nil, mt_arm_rig: -1, mt_harrow_rig: -1, mt_held3: -1, mt_hold: 0.0, mt_pfig: -1, mt_pclip: -1, mt_arm1: -1, mt_arm2: -1,
+      mt_near: false, mt_barrier: 0, mt_plant: Nil, mt_cells: Nil, mt_trees: Nil, mt_uproot: Nil, mt_cuts: Nil, mt_felled: 0,
       mt_biome: 0, mt_seen: Nil, mt_shield_rig: -1, mt_hshield_rig: -1, mt_held2: -1,
       mt_teams: false, mt_round: 0, mt_rk0: 0, mt_rk1: 0, mt_rw0: 0, mt_rw1: 0, mt_wait: 0.0, mt_took: -1, mt_build_at: 1, mt_ox: 0.0, mt_oz: 0.0, mt_top: 0.0,
       mt_arena: false, mt_picks: Nil, mt_health_rig: -1, mt_ice_rig: -1, mt_taken: 0, mt_thrown: 0, mt_arrows: 0, mt_iced: 0,
@@ -237,6 +239,38 @@ mod StrataViewer.Match do
     b.mb_shield
   end
   fn biome_name(m : MtMatch) : String do Rules.biome_name(m.mt_biome) end
+  -- ── The round's trees, for the viewer to stand up as bodies ───────────────
+  doc "The trees to plant now: (x, the ground's height, z in metres; species; seed). The bodies' ids of trees to take away. What fire and the sword cut this frame: (x, y, z, radius). The ids of the trees standing."
+  fn to_plant(m : MtMatch) : List((Float, Float, Float, Int, Int)) do m.mt_plant end
+  fn uproot(m : MtMatch) : List(Int) do m.mt_uproot end
+  fn cuts(m : MtMatch) : List((Float, Float, Float, Float)) do m.mt_cuts end
+  fn tree_ids(m : MtMatch) : List(Int) do List.map(m.mt_trees, fn t -> match t do (id, _, _, _) -> id end) end
+  pfn column(x : Int, y : Int, z : Int, id : Int) : List((Int, Int, Int, Int)) do [(x, y, z, id), (x, y + 1, z, id), (x, y + 2, z, id), (x, y + 3, z, id)] end
+  pfn pair_go(ids : List(Int), cells : List((Int, Int, Int)), trees : List((Int, Int, Int, Int)), drop : List((Int, Int, Int, Int))) : (List((Int, Int, Int, Int)), List((Int, Int, Int, Int))) do
+    match ids do
+      Nil -> (trees, drop)
+      Cons(id, irest) ->
+        match cells do
+          Nil -> (trees, drop)
+          Cons((x, y, z), crest) -> if id < 0 do pair_go(irest, crest, trees, List.append(column(x, y, z, 0), drop)) else pair_go(irest, crest, Cons((id, x, y, z), trees), drop) end
+        end
+    end
+  end
+  pfn fell_go(trees : List((Int, Int, Int, Int)), felled : List(Int), kept : List((Int, Int, Int, Int)), drop : List((Int, Int, Int, Int)), n : Int) : (List((Int, Int, Int, Int)), List((Int, Int, Int, Int)), Int) do
+    match trees do
+      Nil -> (kept, drop, n)
+      Cons((id, x, y, z), rest) -> if List.any(felled, fn f -> f == id) do fell_go(rest, felled, kept, List.append(column(x, y, z, 0), drop), n + 1) else fell_go(rest, felled, Cons((id, x, y, z), kept), drop, n) end
+    end
+  end
+  doc "The viewer's word back: the ids the trees asked for were given (-1 for one refused), in order, and the standing trees that have been cut through. A tree refused or cut through loses the stand-in in its trunk; what was asked for this frame is asked no more."
+  fn groved(m : MtMatch, ids : List(Int), felled : List(Int)) : MtMatch do
+    match pair_go(ids, m.mt_cells, m.mt_trees, Nil) do
+      (trees1, drop1) ->
+        match fell_go(trees1, felled, Nil, drop1, 0) do
+          (trees2, drop2, n) -> { m with mt_trees: trees2, mt_plant: Nil, mt_cells: Nil, mt_uproot: Nil, mt_cuts: Nil, mt_felled: m.mt_felled + n, mt_changes: List.append(drop2, m.mt_changes) }
+        end
+    end
+  end
   doc "Is this match played about an arena?"
   fn has_arena(m : MtMatch) : Bool do m.mt_arena end
 
@@ -732,8 +766,8 @@ mod StrataViewer.Match do
     end
   end
 
-  doc "Start a match: the field's middle found from the shore start (sx, sy, sz), sixteen spawn points on dry ground, the entity world opened for a stream of [radius_h] chunks, the fighters set down (the player nearest the start). With [teams_on] too it is a team match: blue against red, a round to the first team with 15 kills, the match to the first with 3 rounds, each round fought about a new arena somewhere else with its own spawn points and pickups. With [arena_on] the match (scene 0) is fought about an arena built at the middle at frame 1, with a fireball pickup at its centre, ice east and west of it, and four of health out in the field. With [player] false there is no player's box and the field's middle is the only focus. [scene0] is 0 for the match, or a scripted scene, and [script] 0 or a scripted player (see the module's head for both). Prints the field. Not on (`is_on` false) if the entity or figure world would not open."
-  fn start(seed : Int, w : Strata.World.World, sx : Float, sy : Float, sz : Float, radius_h : Int, player : Bool, scene0 : Int, script : Int, goal_ : Int, repeat : Int, arena_on : Bool, teams_on : Bool) : MtMatch do
+  doc "Start a match: the field's middle found from the shore start (sx, sy, sz), sixteen spawn points on dry ground, the entity world opened for a stream of [radius_h] chunks, the fighters set down (the player nearest the start). With [barrier] not 0 (the id of an unseen block that stops what a trunk stops) eight trees are asked of the viewer about each arena, as bodies of physics. With [teams_on] too it is a team match: blue against red, a round to the first team with 15 kills, the match to the first with 3 rounds, each round fought about a new arena somewhere else with its own spawn points and pickups. With [arena_on] the match (scene 0) is fought about an arena built at the middle at frame 1, with a fireball pickup at its centre, ice east and west of it, and four of health out in the field. With [player] false there is no player's box and the field's middle is the only focus. [scene0] is 0 for the match, or a scripted scene, and [script] 0 or a scripted player (see the module's head for both). Prints the field. Not on (`is_on` false) if the entity or figure world would not open."
+  fn start(seed : Int, w : Strata.World.World, sx : Float, sy : Float, sz : Float, radius_h : Int, player : Bool, scene0 : Int, script : Int, goal_ : Int, repeat : Int, arena_on : Bool, teams_on : Bool, barrier : Int) : MtMatch do
     let scene = if script == 1 do 5 else if script == 2 do 6 else if script == 4 do 7 else if scene0 == 40 do 4 else scene0 end end end end
     let top = sy +. 60.0
     match middle_go(w, sx, sz, top, 0, sx, sz, -1) do
@@ -764,7 +798,7 @@ mod StrataViewer.Match do
                   off()
                 else
                   let fs = if scene == 1 do bench_but(Rules.roster(), 8, 9, 0) else if scene == 2 do bench_but(Rules.roster(), 1, 8, 0) else if scene == 3 do bench_but(Rules.roster(), 8, 8, 0) else if scene == 4 do bench_but(Rules.roster(), 1, 8, 0) else if scene >= 5 do bench_but(Rules.roster(), 0, 1, 0) else Rules.roster() end end end end end
-                  let m00 = { off() with mt_live: true, mt_fence: scene0 == 40, mt_seed: seed, mt_player: player && (scene == 0 || scene >= 5), mt_scene: scene, mt_script: script, mt_goal: if arena && teams_on do 1000000 else if goal_ < 1 do 30 else goal_ end end, mt_teams: arena && teams_on, mt_ox: cx, mt_oz: cz, mt_top: top, mt_repeat: repeat, mt_ent: ent, mt_anim: a2,
+                  let m00 = { off() with mt_live: true, mt_fence: scene0 == 40, mt_seed: seed, mt_player: player && (scene == 0 || scene >= 5), mt_scene: scene, mt_script: script, mt_goal: if arena && teams_on do 1000000 else if goal_ < 1 do 30 else goal_ end end, mt_teams: arena && teams_on, mt_barrier: if arena do barrier % 1000 else 0 end, mt_near: barrier >= 1000, mt_ox: cx, mt_oz: cz, mt_top: top, mt_repeat: repeat, mt_ent: ent, mt_anim: a2,
                              mt_rigs: List.append(Fg.rigs(crowd), [Fg.bow(), Fg.arrow(), Fg.fireball(), Fg.medkit(), Fg.iceball(), Fg.held_bow(), Fg.held_sword(), Fg.held_ball(false), Fg.held_ball(true), Fg.shield_of(0.03), Fg.shield_of(0.012)]), mt_fire_rig: fire_rig, mt_health_rig: health_rig,
                              mt_arena: arena, mt_picks: if arena do picks_at(w, cx, cz, top, Rules.pickup_sites(cx, cz), ground(w, cx, cz, top)) else Nil end, mt_ice_rig: ice_rig, mt_sword_rig: sword_rig, mt_hbow_rig: hbow_rig, mt_shield_rig: shield_rig, mt_hshield_rig: hshield_rig, mt_biome: if arena && teams_on do biome_go(w, cx, cz, top, 0, 0, 0, 0, 0) else 0 end, mt_seen: if arena && teams_on do [biome_go(w, cx, cz, top, 0, 0, 0, 0, 0)] else Nil end, mt_hfire_rig: hfire_rig, mt_hice_rig: hice_rig,
                              mt_bow_rig: bow_rig, mt_arrow_rig: arrow_rig, mt_fs: fs, mt_bodies: empty_bodies(0),
@@ -983,7 +1017,7 @@ mod StrataViewer.Match do
     else
       let m2 = scorch(m1, ps, s.ms_who, touched, x, y, z, 0)
       let cs = Rules.fire_changes(fn (cx, cy, cz) -> Strata.World.get_block(w, cx, cy, cz), x, y, z)
-      { m2 with mt_changes: List.append(cs, m2.mt_changes), mt_burned: tally(cs, w, m2.mt_burned), mt_zones: if m2.mt_scene == 0 do Cons({ zn_ice: false, zn_x: x, zn_y: y, zn_z: z, zn_who: s.ms_who, zn_left: Rules.zone_life(false), zn_tick: 0.5 }, m2.mt_zones) else m2.mt_zones end }
+      { m2 with mt_changes: List.append(cs, m2.mt_changes), mt_burned: tally(cs, w, m2.mt_burned), mt_cuts: Cons((x, y, z, 2.0), m2.mt_cuts), mt_zones: if m2.mt_scene == 0 do Cons({ zn_ice: false, zn_x: x, zn_y: y, zn_z: z, zn_who: s.ms_who, zn_left: Rules.zone_life(false), zn_tick: 0.5 }, m2.mt_zones) else m2.mt_zones end }
     end
   end
 
@@ -1768,7 +1802,8 @@ mod StrataViewer.Match do
        else with_body(m, 0, b) end end end)
     else if tool == 99 do
       (if inp.mi_shoot && !blocking && cool <= 0.0 do
-         let m1 = sword_go({ m with mt_draw: 0.0, mt_swing: 0.0 }, ps, inp, 1)
+         -- the blade cuts what wood it meets: a sphere 0.7 m across the swing, 1.3 m ahead
+         let m1 = sword_go({ m with mt_draw: 0.0, mt_swing: 0.0, mt_cuts: Cons((inp.mi_x +. Math.sin(inp.mi_yaw) *. Math.cos(inp.mi_pitch) *. 1.3, inp.mi_y -. 0.25 +. Math.sin(inp.mi_pitch) *. 1.3, inp.mi_z +. Math.cos(inp.mi_yaw) *. Math.cos(inp.mi_pitch) *. 1.3, 0.7), m.mt_cuts) }, ps, inp, 1)
          let b1 = body(m1.mt_bodies, 0)
          with_body(m1, 0, { b1 with mb_cool: 0.45, mb_pt: b.mb_pt, mb_slow: b.mb_slow, mb_fought: true })
        else with_body({ m with mt_draw: 0.0 }, 0, b) end)
@@ -2063,11 +2098,41 @@ mod StrataViewer.Match do
     end
   end
 
+  -- ── The round's trees ────────────────────────────────────────────────────
+  -- which tree grows in a biome: oak and birch in forest and meadow, willow by the sea, pine in snow and on rock
+  pfn species_for(biome_ : Int, k : Int) : Int do if biome_ == 2 do 3 else if biome_ == 3 || biome_ == 4 do 2 else k % 2 end end end
+  -- Eight trees in the graded land about the arena (23 to 30 m from its middle, between the diagonals where health lies), each to be stood up by the
+  -- viewer as a body of quarter-metre voxels, with a stand-in four blocks high in its trunk.
+  pfn grove_go(m : MtMatch, w : Strata.World.World, k : Int, plant : List((Float, Float, Float, Int, Int)), cells : List((Int, Int, Int)), changes : List((Int, Int, Int, Int))) : MtMatch do
+    if k >= 8 do { m with mt_plant: List.reverse(plant), mt_cells: List.reverse(cells), mt_changes: List.append(changes, m.mt_changes) }
+    else
+      let a = int_to_float(k) *. 0.78539816 +. 0.39269908 +. int_to_float(m.mt_round) *. 0.3
+      let r = 23.0 +. int_to_float((k * 5 + m.mt_round) % 8)
+      -- for measuring (a barrier id given with 1000 added): the first tree stands 2.5 m from the player instead
+      let pb = body(m.mt_bodies, 0)
+      let pd = if hyp(m.mt_cx -. pb.mb_x, m.mt_cz -. pb.mb_z) < 0.1 do 1.0 else hyp(m.mt_cx -. pb.mb_x, m.mt_cz -. pb.mb_z) end
+      let near = m.mt_near && k == 0
+      let cx = Math.floor(if near do pb.mb_x +. (m.mt_cx -. pb.mb_x) /. pd *. 2.5 else m.mt_cx +. r *. Math.cos(a) end) +. 0.5
+      let cz = Math.floor(if near do pb.mb_z +. (m.mt_cz -. pb.mb_z) /. pd *. 2.5 else m.mt_cz +. r *. Math.sin(a) end) +. 0.5
+      let y = open_ground(w, cx, cz, m.mt_top)
+      if y < -999.0 do grove_go(m, w, k + 1, plant, cells, changes)
+      else
+        let gy = float_to_int(Math.round(y))
+        grove_go(m, w, k + 1, Cons((cx, int_to_float(gy), cz, species_for(m.mt_biome, k), Strata.Seed.mix(m.mt_seed, 7000 + m.mt_round * 16 + k)), plant), Cons((cell(cx), gy, cell(cz)), cells), List.append(column(cell(cx), gy, cell(cz), m.mt_barrier), changes))
+      end
+    end
+  end
+  -- the stand-ins of every standing tree taken out of the world, and the trees named for the viewer to take away
+  pfn clear_grove(m : MtMatch) : MtMatch do
+    let drop = List.fold_left(m.mt_trees, Nil, fn (acc, t) -> match t do (_, x, y, z) -> List.append(column(x, y, z, 0), acc) end)
+    { m with mt_uproot: List.append(tree_ids(m), m.mt_uproot), mt_trees: Nil, mt_plant: Nil, mt_cells: Nil, mt_changes: List.append(drop, m.mt_changes) }
+  end
+
   -- ── Rounds ───────────────────────────────────────────────────────────────
   -- The next round: fought about a new arena (the open ground nearest the round's place), with sixteen new spawn points and the pickups laid out anew.
   -- Everything of the last round is taken away, everyone is whole again, and each team is set down on its own side.
   pfn next_round(m_ : MtMatch, w : Strata.World.World, round : Int) : MtMatch do
-    let m = drop_self(m_)
+    let m = clear_grove(drop_self(m_))
     match site_go(m, w, round, 2, 0) do
       (sx, sz, found) ->
         -- with no place that will do, the round's fixed place about the first arena
@@ -2198,7 +2263,8 @@ mod StrataViewer.Match do
             end
           -- the pickups appear once the arena is built (frame 1's edit is in the world by frame 3)
           let m5d = if m5c.mt_arena && m5c.mt_frame >= m5c.mt_build_at + 2 do picks_go(m5c, ps, alive_, m5c.mt_picks, dt, Nil) else m5c end
-          let m5e = held_go(self_go(zones_go(m5d, ps, m5d.mt_zones, dt, Nil), inp), inp, dt)
+          let m5g = if m5d.mt_barrier > 0 && m5d.mt_arena && m5d.mt_frame == m5d.mt_build_at + 3 do grove_go(m5d, w, 0, Nil, Nil, Nil) else m5d end
+          let m5e = held_go(self_go(zones_go(m5g, ps, m5g.mt_zones, dt, Nil), inp), inp, dt)
           let m6a = idles(m5e, ps, alive_, 1, dt)
           let m6q = if m6a.mt_player && Rules.alive(m0.mt_fs, 0) && !Rules.alive(m6a.mt_fs, 0) do { m6a with mt_died: m6a.mt_frame } else m6a end
           let m6 = rounds(m6q, w, inp, dt)
@@ -2281,6 +2347,6 @@ mod StrataViewer.Match do
       end
     else if m.mt_matches > 1 do
       head ++ "\ncombat: matches " ++ int_to_string(m.mt_matches) ++ ", live entities " ++ int_to_string(match En.stats(m.mt_ent) do (live, _, _, _) -> live end) ++ ", figures " ++ int_to_string(match An.stats(m.mt_anim) do (figs, _, _, _) -> figs end)
-    else head ++ "\ncombat: leader " ++ leader(table(m)) ++ ", kills in all " ++ int_to_string(total_kills(table(m), 0)) ++ ", idle respawns " ++ int_to_string(m.mt_idles) ++ "\ncombat: pickups taken " ++ int_to_string(m.mt_taken) ++ ", fire and ice thrown by computer fighters " ++ int_to_string(m.mt_thrown) ++ ", their arrows " ++ int_to_string(m.mt_arrows) ++ ", water cells frozen " ++ int_to_string(m.mt_iced) ++ ", bites of burning or frozen ground " ++ int_to_string(m.mt_zone_hits) ++ ", blows blocked " ++ int_to_string(m.mt_blocked) ++ (if m.mt_teams do "\ncombat: teams: round " ++ int_to_string(m.mt_round) ++ ", kills " ++ int_to_string(m.mt_rk0) ++ " to " ++ int_to_string(m.mt_rk1) ++ ", rounds " ++ int_to_string(m.mt_rw0) ++ " to " ++ int_to_string(m.mt_rw1) else "" end) end end end end end end end end
+    else head ++ "\ncombat: leader " ++ leader(table(m)) ++ ", kills in all " ++ int_to_string(total_kills(table(m), 0)) ++ ", idle respawns " ++ int_to_string(m.mt_idles) ++ "\ncombat: pickups taken " ++ int_to_string(m.mt_taken) ++ ", fire and ice thrown by computer fighters " ++ int_to_string(m.mt_thrown) ++ ", their arrows " ++ int_to_string(m.mt_arrows) ++ ", water cells frozen " ++ int_to_string(m.mt_iced) ++ ", bites of burning or frozen ground " ++ int_to_string(m.mt_zone_hits) ++ ", blows blocked " ++ int_to_string(m.mt_blocked) ++ ", trees standing " ++ int_to_string(List.length(m.mt_trees)) ++ ", cut through " ++ int_to_string(m.mt_felled) ++ (if m.mt_teams do "\ncombat: teams: round " ++ int_to_string(m.mt_round) ++ ", kills " ++ int_to_string(m.mt_rk0) ++ " to " ++ int_to_string(m.mt_rk1) ++ ", rounds " ++ int_to_string(m.mt_rw0) ++ " to " ++ int_to_string(m.mt_rw1) else "" end) end end end end end end end end
   end
 end
