@@ -16,11 +16,13 @@ mod Strata.Test.Physics do
   alias Strata.Chunk as C
   alias Strata.Math.Quat as Qt
 
+  -- 1 stone; 2 glass (breaks under 2 000 N s/m2, into 0.5 m pieces); 3 a light block (1000 kg/m3)
   pfn reg() : Strata.Blocks.Registry do
-    match B.register(B.empty(), B.def()) do
-      Ok((r1, _)) -> r1
-      Err(_) -> B.empty()
-    end
+    let add = fn (r, d) -> match B.register(r, d) do
+        Ok((r2, _)) -> r2
+        Err(_) -> r
+      end
+    add(add(add(add(B.empty(), B.def()), B.with_physics(B.def(), 2000, 2000, 400, 50, false)), B.with_physics(B.def(), 1000, 50000, 400, 50, false)), B.with_physics(B.def(), 2000, 1000000000, 400, 50, false))
   end
   pfn flat() : Strata.Terrain.Gen do
     Strata.Terrain.gen(fn (k, seed) -> if Cd.ky(k) < 0 do C.uniform(1) else C.uniform(0) end)
@@ -334,8 +336,12 @@ mod Strata.Test.Physics do
   end
   pfn faster(s : Sim, id : Int, v : Float) : Bool do match Ph.velocity(sp(s), id) do (x, y, z) -> x *. x +. y *. y +. z *. z > v *. v end end
   pfn differs(pr : ((Float, Float, Float), (Float, Float, Float))) : Bool do match pr do ((ax, ay, az), (bx, yb, bz)) -> ax != bx || ay != yb || az != bz end end
+  -- a crate of block 4, too strong to break: the heap is about contacts settling, not breaking
+  pfn hard(sx : Int, sy : Int, sz : Int, g : Strata.Body.Grid, i : Int) : Strata.Body.Grid do
+    if i >= sx * sy * sz do g else hard(sx, sy, sz, Bg.grid_set(g, i % sx, (i / sx) % sy, i / (sx * sy), 4), i + 1) end
+  end
   pfn heap_one(p : Strata.Physics.Physics, i : Int) : Strata.Physics.Physics do
-    match add(p, block(2, 2, 2), int_to_float(i % 3) *. 0.7, 2.0 +. int_to_float(i) *. 2.2, int_to_float(i % 2) *. 0.6, Qt.from_axis_angle(0.0, 1.0, 0.0, int_to_float(i) *. 0.4)) do
+    match add(p, hard(2, 2, 2, Bg.grid(2, 2, 2), 0), int_to_float(i % 3) *. 0.7, 2.0 +. int_to_float(i) *. 2.2, int_to_float(i % 2) *. 0.6, Qt.from_axis_angle(0.0, 1.0, 0.0, int_to_float(i) *. 0.4)) do
       (p2, _) -> p2
     end
   end
@@ -793,6 +799,104 @@ mod Strata.Test.Physics do
     end
   end
 
+
+  -- ── Breaking ─────────────────────────────────────────────────────────────
+  pfn fill_id(g : Strata.Body.Grid, sx : Int, sy : Int, sz : Int, id : Int, i : Int) : Strata.Body.Grid do
+    if i >= sx * sy * sz do g else fill_id(Bg.grid_set(g, i % sx, (i / sx) % sy, i / (sx * sy), id), sx, sy, sz, id, i + 1) end
+  end
+  -- run n steps, adding up the voxels spray events carried away
+  pfn run_spray(s : Sim, n : Int, spray : Int) : (Sim, Int) do
+    if n <= 0 do (s, spray)
+    else
+      let s2 = run(s, 1)
+      let k = List.fold_left(Ph.events(sp(s2)), 0, fn (a, e) -> if Ph.ev_kind(e) == 5 do a + float_to_int(Ph.ev_size(e)) else a end)
+      run_spray(s2, n - 1, spray + k)
+    end
+  end
+  pfn body_voxels(p : Strata.Physics.Physics) : Int do List.fold_left(Ph.ids(p), 0, fn (a, i) -> a + Ph.voxel_count(p, i)) end
+  -- blocks of [id] in the world box
+  pfn count_in(w : Strata.World.World, id : Int, x0 : Int, y0 : Int, z0 : Int, x1 : Int, y1 : Int, z1 : Int) : Int do
+    count_go(w, id, x0, y0, z0, x1, y1, z1, x0, y0, z0, 0)
+  end
+  pfn count_go(w : Strata.World.World, id : Int, x0 : Int, y0 : Int, z0 : Int, x1 : Int, y1 : Int, z1 : Int, x : Int, y : Int, z : Int, n : Int) : Int do
+    if y > y1 do n
+    else if z > z1 do count_go(w, id, x0, y0, z0, x1, y1, z1, x0, y + 1, z0, n)
+    else if x > x1 do count_go(w, id, x0, y0, z0, x1, y1, z1, x0, y, z + 1, n)
+    else count_go(w, id, x0, y0, z0, x1, y1, z1, x + 1, y, z, if Strata.World.get_block(w, x, y, z) == id do n + 1 else n end) end end end
+  end
+  pfn drop_crate(id : Int) : (Sim, Int) do
+    match Ph.add(phys_at(0.1), fill_id(Bg.grid(20, 20, 20), 20, 20, 20, id, 0), 0.0, 3.0, 0.0, Qt.identity(), Ph.dynamic()) do
+      (p, _) -> run_spray(Sim(p, world_at(0.1)), 180, 0)
+    end
+  end
+
+  describe "Physics breaking" do
+    test "material decides: glass breaks, stone does not, and no voxel is lost" do
+      match drop_crate(2) do
+        (s, spray) ->
+          Test.assert_true(Ph.count(sp(s)) >= 2, "the glass crate is in pieces")
+          let written = count_in(sw(s), 2, -60, 0, -60, 60, 40, 60)
+          Test.assert_eq_int(body_voxels(sp(s)) + spray + written, 8000, "bodies, spray and blocks written hold all 8000 voxels")
+      end
+      match drop_crate(1) do
+        (s, spray) ->
+          Test.assert_eq_int(Ph.count(sp(s)), 1, "the stone crate is whole")
+          Test.assert_eq_int(body_voxels(sp(s)) + spray, 8000, "all its voxels")
+      end
+    end
+
+    test "a fragment at rest on the ground is written into it" do
+      match Ph.add_fragment(phys(), fill_id(Bg.grid(5, 1, 1), 5, 1, 1, 1, 0), 0.0, 3.0, 0.0, Qt.identity()) do
+        (p, id) ->
+          let s = run(Sim(p, world()), 300)
+          Test.assert_false(Ph.exists(sp(s), id), "no longer a body")
+          Test.assert_eq_int(count_in(sw(s), 1, -3, 0, -3, 8, 0, 3), 5, "five blocks on the ground")
+      end
+    end
+
+    test "a fragment at rest on a body is removed as spray" do
+      match crate_at(phys(), 0.0, 0.0, 0.0) do
+        (p0, _) ->
+          let s0 = run(Sim(p0, world()), 120)
+          -- five voxels: a 2 x 2 layer and one on top, sitting inside the crate's top face
+          let g = Bg.grid_set(fill_id(Bg.grid(2, 2, 2), 2, 1, 2, 1, 0), 0, 1, 0, 1)
+          match Ph.add_fragment(sp(s0), g, 0.0, 2.05, 0.0, Qt.identity()) do
+            (p1, id) ->
+              match run_spray(Sim(p1, sw(s0)), 240, 0) do
+                (s, spray) ->
+                  Test.assert_false(Ph.exists(sp(s), id), "gone")
+                  Test.assert_eq_int(spray, 5, "as five voxels of spray")
+                  Test.assert_eq_int(count_in(sw(s), 1, -3, 0, -3, 6, 4, 3), 0, "nothing written")
+              end
+          end
+      end
+    end
+
+    test "a fragment of one voxel turns to spray at once" do
+      match Ph.add_fragment(phys(), fill_id(Bg.grid(1, 1, 1), 1, 1, 1, 1, 0), 0.0, 10.0, 0.0, Qt.identity()) do
+        (p, id) ->
+          let s = run(Sim(p, world()), 1)
+          Test.assert_false(Ph.exists(sp(s), id), "gone at the first step")
+          Test.assert_true(kinds_seen(sp(s), 5), "a spray event")
+      end
+    end
+
+    test "world blocks struck past their strength break" do
+      -- a glass pane one voxel thick; a 1000 kg block at 10 m/s, no gravity
+      let w = Ed.world(Ed.fill_box(world(), 0, 1, -2, 0, 5, 2, 2))
+      let p0 = Ph.new(reg(), Ph.with_gravity(Ph.config(), 0.0))
+      match Ph.add(p0, fill_id(Bg.grid(1, 1, 1), 1, 1, 1, 3, 0), -6.0, 3.0, 0.0, Qt.identity(), Ph.dynamic()) do
+        (p1, id) ->
+          match run_spray(Sim(Ph.push(p1, id, -5.5, 3.5, 0.5, 10000.0, 0.0, 0.0), w), 60, 0) do
+            (s, spray) ->
+              let left = count_in(sw(s), 2, 0, 1, -2, 0, 5, 2)
+              Test.assert_true(left < 25, "some pane cells are air")
+              Test.assert_eq_int(body_voxels(sp(s)) - 1 + spray + count_in(sw(s), 2, -10, 0, -10, 10, 10, 10) - left, 25 - left, "every voxel the pane lost is in a body or spray")
+          end
+      end
+    end
+  end
+
   pfn ids_of_row(p : Strata.Physics.Physics, n : Int, i : Int, acc : List(Int)) : (Strata.Physics.Physics, List(Int)) do
     if i >= n do (p, reverse(acc))
     else
@@ -815,7 +919,7 @@ mod Strata.Test.Physics do
       Cons(((x, z), (h, sz)), t) ->
         if n >= 6 do p
         else
-          match Ph.add(p, block(sz, sz, sz), int_to_float(x / 3), 8.0 +. int_to_float(n) *. 3.0, int_to_float(z / 3), Qt.from_axis_angle(0.0, 1.0, 0.0, int_to_float(h) *. 0.3), Ph.dynamic()) do
+          match Ph.add(p, fill_id(Bg.grid(sz, sz, sz), sz, sz, sz, if h % 2 == 0 do 2 else 1 end, 0), int_to_float(x / 3), 8.0 +. int_to_float(n) *. 3.0, int_to_float(z / 3), Qt.from_axis_angle(0.0, 1.0, 0.0, int_to_float(h) *. 0.3), Ph.dynamic()) do
             (p2, _) -> dropped(p2, t, n + 1)
           end
         end
@@ -844,4 +948,5 @@ mod Strata.Test.Physics do
       Check.all_with(Gen.tuple2(Gen.list(Gen.int(0, 6)), Gen.list(Gen.tuple2(Gen.tuple2(Gen.int(0, 13), Gen.int(0, 13)), Gen.tuple2(Gen.int(0, 3), Gen.int(1, 3))))), fn c -> det_prop(c), { Check.default_config() with num_runs: 8 })
     end
   end
+
 end
