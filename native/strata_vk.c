@@ -27,7 +27,7 @@
 /* Rewritten by build_shaders.sh whenever the shaders change: forge decides
  * whether to recompile this file from its text alone, not from the headers
  * it includes (GAPS S14). */
-#define STRATA_SHADERS_STAMP "3fafa52a550363ae"
+#define STRATA_SHADERS_STAMP "5b1d259b5d5c1471"
 #include "strata_shaders.h"
 #include "strata_particles.h"
 #include "strata_alloc.h"
@@ -1442,6 +1442,31 @@ int64_t sv_rig_palette(int64_t rig, void *floats) {
     if (fg.glow) for (int p = 0; p < SV_FIG_PARTS; p++) fg.glow[rig * SV_FIG_PARTS + p] = -1.0f;
     return 1;
 }
+/* A shape for the rays (a body's light classes, or a figure part's palette
+ * indices): its bytes, x fastest, then y, then z, then a coarse layer of one
+ * byte a SV_SHAPE_BLOCK^3 block of them (1 if any voxel in the block is not
+ * 0), blocks x fastest, starting on the word after the voxels. A ray walks
+ * the blocks and steps voxel by voxel only inside the ones that hold
+ * something (trace.glsl's body_ray). Allocated from g_bbytes; false if full. */
+#define SV_SHAPE_BLOCK 4
+static int put_shape(const uint8_t *bytes, int64_t sx, int64_t sy, int64_t sz, uint32_t *first_out, uint32_t *words_out) {
+    int64_t n = sx * sy * sz, B = SV_SHAPE_BLOCK;
+    int64_t bx = (sx + B - 1) / B, by = (sy + B - 1) / B, bz = (sz + B - 1) / B;
+    uint32_t fine = (uint32_t)((n + 3) / 4), words = fine + (uint32_t)((bx * by * bz + 3) / 4), first = 0;
+    if (!sa_alloc(&g_bbytes, words, &first)) return 0;
+    uint8_t *dst = (uint8_t *)(g.bbytes_map + first);
+    memset(dst, 0, (size_t)words * 4);
+    memcpy(dst, bytes, (size_t)n);
+    uint8_t *coarse = dst + (size_t)fine * 4;
+    for (int64_t z = 0; z < sz; z++)
+        for (int64_t y = 0; y < sy; y++) {
+            const uint8_t *row = bytes + (size_t)(sx * (y + sy * z));
+            uint8_t *crow = coarse + (size_t)(bx * (y / B + by * (z / B)));
+            for (int64_t x = 0; x < sx; x++) if (row[x]) crow[x / B] = 1;
+        }
+    *first_out = first; *words_out = words;
+    return 1;
+}
 /* Rig [rig]'s part [part] as the rays see it: one palette index a voxel (0
  * empty), x fastest, then y, then z, [sx] x [sy] x [sz], its low corner the
  * part grid's (the anchor and voxel size are rig_part_anchor's). Shared by
@@ -1452,11 +1477,9 @@ int64_t sv_rig_shape(int64_t rig, int64_t part, void *bytes, int64_t n, int64_t 
     if (!g.ok || !fg.shape || rig < 0 || rig >= SV_FIG_RIGS || part < 0 || part >= SV_FIG_PARTS || !bytes) return 0;
     if (sx < 1 || sy < 1 || sz < 1 || sx > 128 || sy > 128 || sz > 128 || n < sx * sy * sz) return 0;
     struct FigShape *sh = &fg.shape[rig * SV_FIG_PARTS + part];
-    uint32_t words = (uint32_t)((sx * sy * sz + 3) / 4), first = 0;
-    if (!sa_alloc(&g_bbytes, words, &first)) { g.refused++; return 0; }
+    uint32_t words = 0, first = 0;
+    if (!put_shape((const uint8_t *)bytes, sx, sy, sz, &first, &words)) { g.refused++; return 0; }
     if (sh->shaped) sa_release(&g_bbytes, (SaRange){ sh->first, sh->nwords }, g.frame_no);
-    memset(g.bbytes_map + first, 0, (size_t)words * 4);
-    memcpy(g.bbytes_map + first, bytes, (size_t)(sx * sy * sz));
     sh->first = first; sh->nwords = words; sh->dims[0] = (int32_t)sx; sh->dims[1] = (int32_t)sy; sh->dims[2] = (int32_t)sz;
     sh->shaped = 1;
     fg.glow[rig * SV_FIG_PARTS + part] = -1.0f;
@@ -2582,11 +2605,9 @@ int64_t sv_chunk_begin(int64_t slot, double ox, double oy, double oz, int64_t le
 int64_t sv_body_shape(int64_t handle, void *bytes, int64_t n, int64_t sx, int64_t sy, int64_t sz) {
     if (!g.ok || !g.bodies || handle < 0 || handle >= SV_MAX_BODIES || sx < 1 || sy < 1 || sz < 1 || n < sx * sy * sz) return 0;
     BodyRec *b = &g.bodies[handle];
-    uint32_t words = (uint32_t)((sx * sy * sz + 3) / 4), first = 0;
-    if (!sa_alloc(&g_bbytes, words, &first)) { g.refused++; return 0; }
+    uint32_t words = 0, first = 0;
+    if (!put_shape((const uint8_t *)bytes, sx, sy, sz, &first, &words)) { g.refused++; return 0; }
     if (b->shaped) sa_release(&g_bbytes, (SaRange){ b->first, b->nwords }, g.frame_no);
-    memset(g.bbytes_map + first, 0, (size_t)words * 4);
-    memcpy(g.bbytes_map + first, bytes, (size_t)(sx * sy * sz));
     b->first = first; b->nwords = words; b->dims[0] = (int32_t)sx; b->dims[1] = (int32_t)sy; b->dims[2] = (int32_t)sz;
     b->shaped = 1;
     return 1;

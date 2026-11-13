@@ -348,14 +348,14 @@ Strata.Fluid.set_marks(f : Fluid, w : World, m : Strata.Store.Store(NativeU8Arr)
 ```
 Bodies feel drag in fluid cells in proportion to the eighths they hold (a body is never lifted: no buoyancy). A body whose bounds first enter fluid cells makes an event of kind 3 (where, speed). The viewer calls `set_marks` before each fluid `begin` and turns splash events into spray as it does falling water.
 
-- [ ] **Step 1: failing tests** in `test/fluid_test.march`: a marked cell holding 8 eighths beside open cells: after `set_marks`, it holds none and the box's amount is unchanged; a marked cell is never filled by a fluid step; unmarking a cell beside resting water wakes it and water enters it.
-- [ ] **Step 2: failing tests** in `test/physics_test.march`:
+- [x] **Step 1: failing tests** in `test/fluid_test.march`: a marked cell holding 8 eighths beside open cells: after `set_marks`, it holds none and the box's amount is unchanged; a marked cell is never filled by a fluid step; unmarking a cell beside resting water wakes it and water enters it.
+- [x] **Step 2: failing tests** in `test/physics_test.march`:
   - **conserved:** a crate dropped into a 6 x 4 x 6 pool, marks set and the fluid stepped every 6 physics steps for 600 physics steps: the pool's amount is equal at every fluid step;
   - **a dam holds:** a stream in a 1-wide channel; a 1 x 2 x 3 body resting across it: over 100 fluid steps the amount downstream of the body does not grow while upstream rises; remove the body, set marks: within 20 fluid steps water passes;
   - **sinks:** a crate dropped 2 m into water 4 m deep reaches the bed and sleeps there; its speed in the water stays below its speed at the same distance fallen in air;
   - **splash:** exactly one event of kind 3 on entry.
-- [ ] **Step 3:** run; expect FAIL. Implement.
-- [ ] **Step 4:** viewer: marks, splash spray. `forge test`; all pass. `scripts/verify.sh` PASS. Commit `feat(physics): bodies dam water and sink in it; water is pushed aside, never lost`.
+- [x] **Step 3:** run; expect FAIL. Implement.
+- [x] **Step 4:** viewer: marks, splash spray. `forge test`; all pass. `scripts/verify.sh` PASS. Commit `feat(physics): bodies dam water and sink in it; water is pushed aside, never lost`.
 
 ### Task 10: Scenes, soak, measurements
 
