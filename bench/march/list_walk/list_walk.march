@@ -1,0 +1,62 @@
+-- The river damp of one column: the least of a clamped bank distance over the
+-- river samples near a chunk, read from a list the columns share.
+-- VARIANT 0: the samples in a List((Float, Float, Float, Float)), walked per column.
+-- VARIANT 1: the same samples flat in a NativeF32Arr, four floats a sample.
+-- Both written without a Float-valued `if` (see ../float_if), so what is left
+-- is the cost of reading the samples and of sqrt, abs and /. .
+mod ListWalk do
+  needs IO
+
+  pfn fmin(a : Float, b : Float) : Float do 0.5 *. (a +. b -. Math.abs(a -. b)) end
+  pfn clamp01(v : Float) : Float do fmin(1.0, 0.5 *. (v +. Math.abs(v))) end
+
+  pfn damp_list(rs : List((Float, Float, Float, Float)), xm : Float, zm : Float, best : Float) : Float do
+    match rs do
+      Nil -> best
+      Cons((x, z, w, _), rest) ->
+        let dx = xm -. x
+        let dz = zm -. z
+        damp_list(rest, xm, zm, fmin(best, clamp01((Math.sqrt(dx *. dx +. dz *. dz) -. 0.5 *. w) /. (2.0 *. w))))
+    end
+  end
+
+  pfn damp_flat(rs : NativeF32Arr, k : Int, n : Int, xm : Float, zm : Float, best : Float) : Float do
+    if k >= n do best
+    else
+      let dx = xm -. NativeArray.get_f32(rs, 4 * k)
+      let dz = zm -. NativeArray.get_f32(rs, 4 * k + 1)
+      let w = NativeArray.get_f32(rs, 4 * k + 2)
+      damp_flat(rs, k + 1, n, xm, zm, fmin(best, clamp01((Math.sqrt(dx *. dx +. dz *. dz) -. 0.5 *. w) /. (2.0 *. w))))
+    end
+  end
+
+  pfn sx(k : Int) : Float do int_to_float((k * 13) % 64) end
+  pfn sz(k : Int) : Float do int_to_float((k * 29) % 64) end
+  pfn sw(k : Int) : Float do 2.0 +. int_to_float(k % 5) end
+
+  pfn make_list(k : Int, acc : List((Float, Float, Float, Float))) : List((Float, Float, Float, Float)) do
+    if k < 0 do acc else make_list(k - 1, Cons((sx(k), sz(k), sw(k), 40.0), acc)) end
+  end
+  pfn make_flat(a : NativeF32Arr, k : Int, n : Int) : NativeF32Arr do
+    if k >= n do a
+    else make_flat(NativeArray.set_f32(NativeArray.set_f32(NativeArray.set_f32(a, 4 * k, sx(k)), 4 * k + 1, sz(k)), 4 * k + 2, sw(k)), k + 1, n) end
+  end
+
+  -- 1024 columns against the 32 samples
+  pfn cols_list(rs : List((Float, Float, Float, Float)), c : Int, acc : Float) : Float do
+    if c >= 1024 do acc else cols_list(rs, c + 1, acc +. damp_list(rs, int_to_float(c % 32), int_to_float(c / 32), 1.0)) end
+  end
+  pfn cols_flat(rs : NativeF32Arr, c : Int, acc : Float) : Float do
+    if c >= 1024 do acc else cols_flat(rs, c + 1, acc +. damp_flat(rs, 0, 32, int_to_float(c % 32), int_to_float(c / 32), 1.0)) end
+  end
+
+  pfn rep(variant : Int, ls : List((Float, Float, Float, Float)), fl : NativeF32Arr, left : Int, acc : Float) : Float do
+    if left <= 0 do acc
+    else if variant == 0 do rep(variant, ls, fl, left - 1, acc +. cols_list(ls, 0, 0.0))
+    else rep(variant, ls, fl, left - 1, acc +. cols_flat(fl, 0, 0.0)) end end
+  end
+
+  fn main(_cap : Cap(IO)) : Unit do
+    Authority.must(println(float_to_string(rep(Authority.must(Env.get_int("VARIANT", 0)), make_list(31, Nil), make_flat(NativeArray.make_f32(128, 0.0), 0, 32), Authority.must(Env.get_int("REPS", 1)), 0.0))))
+  end
+end
