@@ -32,7 +32,7 @@ one fresh review of the whole branch at the end.
   first version drew it once any glowing effect was defined; the viewer
   defines its effects every run, which would have added a draw to every
   spray scene.)
-- **The overwritten-particles stat is 20** (19 was taken): a push that
+- **The overwritten-particles stat is 25** (19 to 24 were taken by the merge with main): a push that
   forces the ring's tail past a slot still in the live span.
 - **The effect table is one storage buffer** shared by every frame in
   flight, written in place when an effect is defined (at start).
@@ -47,8 +47,10 @@ one fresh review of the whole branch at the end.
 - **`combat-fire` (frame 60) is the in-flight golden** (it already
   catches the fireball mid-arc); the new golden is `combat-burning`
   (frame 150).
-- **`blast_test` aliases `Strata.Coord` as `Cco`.** Its `Cb` met combat's
-  `Cb` (`StrataViewer.Combat`) in the compiled test build: GAPS S35.
+- **`blast_test` aliased `Strata.Coord` as `Cco`.** Its `Cb` met combat's
+  `Cb` (`StrataViewer.Combat`) in the compiled test build: GAPS S41. Main
+  fixed the same clash its own way (`Kb`, `Rules`, `Cmb`), and the merge
+  took main's names.
 
 ## The owner's change: tiny voxels
 
