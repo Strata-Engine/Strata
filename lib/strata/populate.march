@@ -16,8 +16,10 @@
 -- Placers follow the field and rule section: `place_with` runs a plan's
 -- layers over one chunk, in run order: cover layers roll a block onto each
 -- floor, scatter layers stamp templates (or single blocks) at hashed places,
--- each stamp cut to the chunk so its neighbours hold the rest (site layers
--- in a later task).
+-- each stamp cut to the chunk so its neighbours hold the rest, site layers
+-- stamp a template at each of their sites. Before that, `adapt` draws the
+-- game's column heights to the sites, and `adapted` marks the columns it
+-- holds or changes.
 mod Strata.Populate do
 
   alias Strata.Population as Pn
@@ -68,12 +70,21 @@ mod Strata.Populate do
   --   with blocks.
   --   scatter, per layer l: pl_lnv its variants (blocks or templates),
   --   pl_lcell its cell (m), pl_ljit its jitter, pl_lreach how far its
-  --   templates reach (m); pl_ltemps its templates (Nil for blocks).
+  --   templates reach (m); pl_ltemps its templates (Nil for blocks, and for
+  --   cover layers; a site layer's too).
   --   pl_nscatter counts scatter layers; pl_reach is Strata.Population.reach;
-  --   pl_hmax the tallest thing a scatter layer places, in voxels (1 for a
-  --   block); pl_tvlo and pl_tvhi the smallest and largest voxel size of any
-  --   scatter layer's template (both 0 with none).
-  type PopPlan = { pl_names : List(String), pl_nf : Int, pl_nz : Int, pl_nl : Int, pl_forder : NativeIntArr, pl_fkind : NativeIntArr, pl_fa : NativeIntArr, pl_foct : NativeIntArr, pl_fsalt : NativeIntArr, pl_fper : NativeFloatArr, pl_fat : NativeIntArr, pl_fcnt : NativeIntArr, pl_fpts : NativeFloatArr, pl_zorder : NativeIntArr, pl_zkind : NativeIntArr, pl_za : NativeIntArr, pl_zlo : NativeFloatArr, pl_zhi : NativeFloatArr, pl_zat : NativeIntArr, pl_zcnt : NativeIntArr, pl_zints : NativeIntArr, pl_zsites : NativeFloatArr, pl_prog : NativeI32Arr, pl_num : NativeFloatArr, pl_lkind : NativeIntArr, pl_lsalt : NativeIntArr, pl_lvat : NativeIntArr, pl_lvn : NativeIntArr, pl_lids : NativeIntArr, pl_lwat : NativeIntArr, pl_lwn : NativeIntArr, pl_wzone : NativeIntArr, pl_wbase : NativeIntArr, pl_wcum : NativeFloatArr, pl_ncover : Int, pl_lnv : NativeIntArr, pl_lcell : NativeFloatArr, pl_ljit : NativeFloatArr, pl_lreach : NativeFloatArr, pl_ltemps : List(List(Strata.Template.Template)), pl_nscatter : Int, pl_reach : Float, pl_hmax : Int, pl_tvlo : Float, pl_tvhi : Float }
+  --   pl_hmax the tallest thing a scatter or site layer places, in voxels (1
+  --   for a block); pl_tvlo and pl_tvhi the smallest and largest voxel size
+  --   of any scatter or site layer's template (both 0 with none).
+  --   sites, every site layer's sites in run order, then declaration order:
+  --   site s at pl_sx[s], pl_sz[s] (m), floor pl_sfl[s] (m, held as a 32-bit
+  --   float, so adapt and place read the same value), radius pl_srad[s],
+  --   its layer's margin pl_smar[s] (m), index pl_sidx[s]; layer l's sites
+  --   are pl_lsat[l] .. pl_lsat[l] + pl_lsn[l] - 1; pl_ns of them in all,
+  --   pl_nsite site layers; pl_sflo and pl_sfhi the lowest and highest floor
+  --   (m) that is not NaN (a huge pair when there is none); pl_lext[l] the
+  --   largest side or height in voxels of layer l's templates (1 for blocks).
+  type PopPlan = { pl_names : List(String), pl_nf : Int, pl_nz : Int, pl_nl : Int, pl_forder : NativeIntArr, pl_fkind : NativeIntArr, pl_fa : NativeIntArr, pl_foct : NativeIntArr, pl_fsalt : NativeIntArr, pl_fper : NativeFloatArr, pl_fat : NativeIntArr, pl_fcnt : NativeIntArr, pl_fpts : NativeFloatArr, pl_zorder : NativeIntArr, pl_zkind : NativeIntArr, pl_za : NativeIntArr, pl_zlo : NativeFloatArr, pl_zhi : NativeFloatArr, pl_zat : NativeIntArr, pl_zcnt : NativeIntArr, pl_zints : NativeIntArr, pl_zsites : NativeFloatArr, pl_prog : NativeI32Arr, pl_num : NativeFloatArr, pl_lkind : NativeIntArr, pl_lsalt : NativeIntArr, pl_lvat : NativeIntArr, pl_lvn : NativeIntArr, pl_lids : NativeIntArr, pl_lwat : NativeIntArr, pl_lwn : NativeIntArr, pl_wzone : NativeIntArr, pl_wbase : NativeIntArr, pl_wcum : NativeFloatArr, pl_ncover : Int, pl_lnv : NativeIntArr, pl_lcell : NativeFloatArr, pl_ljit : NativeFloatArr, pl_lreach : NativeFloatArr, pl_ltemps : List(List(Strata.Template.Template)), pl_nscatter : Int, pl_reach : Float, pl_hmax : Int, pl_tvlo : Float, pl_tvhi : Float, pl_nsite : Int, pl_ns : Int, pl_lsat : NativeIntArr, pl_lsn : NativeIntArr, pl_lext : NativeIntArr, pl_sx : NativeFloatArr, pl_sz : NativeFloatArr, pl_sfl : NativeF32Arr, pl_srad : NativeFloatArr, pl_smar : NativeFloatArr, pl_sidx : NativeIntArr, pl_sflo : Float, pl_sfhi : Float }
 
   -- Every field, zone and layer density of a plan over one Ground.
   --   pt_vals   field f at column c is pt_vals[f * nn + c]          (nf * nn)
@@ -343,9 +354,29 @@ mod Strata.Populate do
     if Pn.shape_set_kind(f, s) == 0 do Pn.shape_set_blocks(f, s) else Nil end
   end
   pfn layer_weights(f : Strata.Population.Frozen, l : Int) : List((Int, List(Float))) do Pn.shape_set_weights(f, Pn.layer_shape_set(f, l)) end
-  -- a scatter layer's templates (none for a set of blocks, or another kind of layer)
-  pfn scatter_templates(f : Strata.Population.Frozen, l : Int) : List(Strata.Template.Template) do
-    if Pn.layer_kind(f, l) == 1 do Pn.shape_set_templates(f, Pn.layer_shape_set(f, l)) else Nil end
+  -- a scatter or site layer's templates (none for a set of blocks, or a cover layer)
+  pfn stamp_templates(f : Strata.Population.Frozen, l : Int) : List(Strata.Template.Template) do
+    if Pn.layer_kind(f, l) == 0 do Nil else Pn.shape_set_templates(f, Pn.layer_shape_set(f, l)) end
+  end
+  -- a site layer's sites, each with the layer's margin (none for another kind)
+  pfn layer_site_list(f : Strata.Population.Frozen, l : Int) : List((Strata.Population.PopSite, Float)) do
+    if Pn.layer_kind(f, l) == 2 do List.map(Pn.layer_sites(f, l), fn s -> (s, Pn.layer_margin(f, l))) else Nil end
+  end
+  pfn sp_site(e : (Strata.Population.PopSite, Float)) : Strata.Population.PopSite do match e do (s, _) -> s end end
+  pfn sp_margin(e : (Strata.Population.PopSite, Float)) : Float do match e do (_, m) -> m end end
+  -- the largest side or height, in voxels, of ts; 1 for none
+  pfn ext_of(ts : List(Strata.Template.Template)) : Int do
+    List.fold_left(ts, 1, fn (m, t) -> Math.max_int(m, Math.max_int(Strata.Template.t_sx(t), Math.max_int(Strata.Template.t_sy(t), Strata.Template.t_sz(t)))))
+  end
+  -- floats held as 32-bit floats, one padding entry
+  pfn f32s(xs : List(Float)) : NativeF32Arr do
+    f32_fill(NativeArray.make_f32(List.length(xs) + 1, 0.0), xs, 0)
+  end
+  pfn f32_fill(a : NativeF32Arr, xs : List(Float), i : Int) : NativeF32Arr do
+    match xs do
+      Nil -> a
+      Cons(x, rest) -> f32_fill(NativeArray.set_f32(a, i, x), rest, i + 1)
+    end
   end
 
   doc "f read once into flat arrays: the order its fields and zones are evaluated in, what each needs, and every layer's rule compiled. Build one per Frozen and keep it; a plan is immutable. A caller sharing one plan between worker tasks should unpack what a loop needs from it before the loop, not read it per column (GAPS S15); fields_with does so."
@@ -367,7 +398,14 @@ mod Strata.Populate do
     let lws = List.map(lis, fn l -> layer_weights(f, l))
     let entries = List.flat_map(lws, fn ws -> ws)
     let lvn = List.map(lblocks, List.length)
-    let stamps = List.flat_map(lis, fn l -> scatter_templates(f, l))
+    let stamps = List.flat_map(lis, fn l -> stamp_templates(f, l))
+    let lsites = List.map(lis, fn l -> layer_site_list(f, l))
+    let sites = List.flat_map(lsites, fn xs -> xs)
+    let sfl = f32s(List.map(sites, fn e -> Pn.site_floor(sp_site(e))))
+    let ns = List.length(sites)
+    -- the lowest and highest floor as held (32-bit), NaN skipped
+    let floors = List.filter(List.map(List.range(0, ns), fn i -> NativeArray.get_f32(sfl, i)), fn v -> v == v)
+    let huge = Math.pow(10.0, 300.0)
     let sizes = List.map(stamps, Strata.Template.t_voxel_size)
     let ncover = List.length(List.filter(List.zip(lkinds, lvn), fn kv -> match kv do (k, v) -> if k == 0 do v > 0 else false end end))
     -- one padding entry after the offsets and after the bases
@@ -409,12 +447,25 @@ mod Strata.Populate do
           pl_lcell: floats(List.map(lis, fn l -> Pn.layer_cell(f, l))),
           pl_ljit: floats(List.map(lis, fn l -> Pn.layer_jitter(f, l))),
           pl_lreach: floats(List.map(lis, fn l -> Pn.shape_set_reach(f, Pn.layer_shape_set(f, l)))),
-          pl_ltemps: List.map(lis, fn l -> scatter_templates(f, l)),
+          pl_ltemps: List.map(lis, fn l -> stamp_templates(f, l)),
           pl_nscatter: List.length(List.filter(lkinds, fn k -> k == 1)),
           pl_reach: Pn.reach(f),
           pl_hmax: List.fold_left(stamps, 1, fn (m, t) -> Math.max_int(m, Strata.Template.t_sy(t))),
           pl_tvlo: List.fold_left(sizes, List.fold_left(sizes, 0.0, fn (m, v) -> if v > m do v else m end), fn (m, v) -> if v < m do v else m end),
-          pl_tvhi: List.fold_left(sizes, 0.0, fn (m, v) -> if v > m do v else m end) }
+          pl_tvhi: List.fold_left(sizes, 0.0, fn (m, v) -> if v > m do v else m end),
+          pl_nsite: List.length(List.filter(lkinds, fn k -> k == 2)),
+          pl_ns: ns,
+          pl_lsat: ints(starts(List.map(lsites, List.length), 0)),
+          pl_lsn: ints(List.map(lsites, List.length)),
+          pl_lext: ints(List.map(lis, fn l -> ext_of(stamp_templates(f, l)))),
+          pl_sx: floats(List.map(sites, fn e -> Pn.site_xm(sp_site(e)))),
+          pl_sz: floats(List.map(sites, fn e -> Pn.site_zm(sp_site(e)))),
+          pl_sfl: sfl,
+          pl_srad: floats(List.map(sites, fn e -> Pn.site_radius(sp_site(e)))),
+          pl_smar: floats(List.map(sites, sp_margin)),
+          pl_sidx: ints(List.map(sites, fn e -> Pn.site_index(sp_site(e)))),
+          pl_sflo: List.fold_left(floors, huge, fn (m, v) -> if v < m do v else m end),
+          pl_sfhi: List.fold_left(floors, 0.0 -. huge, fn (m, v) -> if v > m do v else m end) }
     end
   end
 
@@ -719,6 +770,151 @@ mod Strata.Populate do
   doc "The layer named layer's density at column col; 0 for an undeclared layer. For tests and tools: per column, use density."
   fn density_at(f : Strata.Population.Frozen, t : Table, layer : String, col : Int) : Float do density(t, Pn.layer_index(f, layer), col) end
 
+  -- ── Ground adaptation ─────────────────────────────────────────────────────
+  --
+  -- adapt draws a game's column heights (metres) to every site layer's
+  -- sites, before the game builds its density. A column is read at its
+  -- centre, ((x0 + i + 0.5) * scale, (z0 + j + 0.5) * scale). Against a site
+  -- of radius R and floor F, in a layer of margin M, at distance d:
+  --   d <= R          inside: the height is a floor. Where several radii
+  --                   hold the column, the nearest site's floor (by centre;
+  --                   on a tie, the first in run order, then declaration
+  --                   order).
+  --   R < d < R + M   in the margin: t = (d - R) / M runs 0..1 across it and
+  --                   the site pulls with r = (1 - t) / t. Every site whose
+  --                   margin holds the column contributes, and the height is
+  --                   (H + sum r F) / (1 + sum r), H the height given. With
+  --                   one site that is F + (H - F) t: linear, the mean
+  --                   halfway, H at the outer edge; with several it is
+  --                   continuous, and tends to a site's floor at its radius.
+  --   beyond          untouched.
+  -- Each column is a function of its own centre and the sites, summed in the
+  -- plan's order, so an area gives the bits a larger area gives at the same
+  -- columns. Sites that reach no column of the area are left out first; they
+  -- would add nothing.
+
+  -- the box xa..xb, za..zb is within reach metres of (xm, zm) along each axis (NaN reaches nothing)
+  pfn box_reach(xm : Float, zm : Float, reach : Float, xa : Float, xb : Float, za : Float, zb : Float) : Bool do
+    if xm +. reach >= xa do (if xm -. reach <= xb do (if zm +. reach >= za do zm -. reach <= zb else false end) else false end) else false end
+  end
+  -- the plan's sites whose radius and margin can reach a column centre of the n x n area at (x0, z0), in plan order
+  pfn sites_near(p : PopPlan, x0 : Int, z0 : Int, n : Int, s : Float) : List(Int) do
+    let xa = (int_to_float(x0) +. 0.5) *. s
+    let xb = (int_to_float(x0 + n - 1) +. 0.5) *. s
+    let za = (int_to_float(z0) +. 0.5) *. s
+    let zb = (int_to_float(z0 + n - 1) +. 0.5) *. s
+    let sx = p.pl_sx
+    let sz = p.pl_sz
+    let rad = p.pl_srad
+    let mar = p.pl_smar
+    List.filter(List.range(0, p.pl_ns), fn i -> box_reach(NativeArray.get_float(sx, i), NativeArray.get_float(sz, i), NativeArray.get_float(rad, i) +. NativeArray.get_float(mar, i), xa, xb, za, zb))
+  end
+
+  pfn dist(xs : NativeFloatArr, zs : NativeFloatArr, i : Int, xm : Float, zm : Float) : Float do
+    let dx = xm -. NativeArray.get_float(xs, i)
+    let dz = zm -. NativeArray.get_float(zs, i)
+    Math.sqrt(dx *. dx +. dz *. dz)
+  end
+  -- the nearest of sites i.. whose radius holds (xm, zm), or best (-1 for none); bd its distance
+  pfn nearest_in(xs : NativeFloatArr, zs : NativeFloatArr, rs : NativeFloatArr, i : Int, cnt : Int, xm : Float, zm : Float, best : Int, bd : Float) : Int do
+    if i >= cnt do best
+    else
+      let d = dist(xs, zs, i, xm, zm)
+      if d <= NativeArray.get_float(rs, i) do
+        if best < 0 do nearest_in(xs, zs, rs, i + 1, cnt, xm, zm, i, d)
+        else if d < bd do nearest_in(xs, zs, rs, i + 1, cnt, xm, zm, i, d)
+        else nearest_in(xs, zs, rs, i + 1, cnt, xm, zm, best, bd) end end
+      else nearest_in(xs, zs, rs, i + 1, cnt, xm, zm, best, bd) end
+    end
+  end
+  -- over sites i.. whose margin holds (xm, zm): the sum of r (with_floor false) or of r * F (true), r = (1 - t) / t, t at least 10^-9
+  pfn pull_go(xs : NativeFloatArr, zs : NativeFloatArr, rs : NativeFloatArr, ms : NativeFloatArr, fs : NativeFloatArr, with_floor : Bool, i : Int, cnt : Int, xm : Float, zm : Float, acc : Float) : Float do
+    if i >= cnt do acc
+    else
+      let d = dist(xs, zs, i, xm, zm)
+      let r = NativeArray.get_float(rs, i)
+      let m = NativeArray.get_float(ms, i)
+      let held = if d > r do d < r +. m else false end
+      if held do
+        let t0 = (d -. r) /. m
+        let t = if t0 > 0.000000001 do t0 else 0.000000001 end
+        let w = (1.0 -. t) /. t
+        pull_go(xs, zs, rs, ms, fs, with_floor, i + 1, cnt, xm, zm, acc +. (if with_floor do w *. NativeArray.get_float(fs, i) else w end))
+      else pull_go(xs, zs, rs, ms, fs, with_floor, i + 1, cnt, xm, zm, acc) end
+    end
+  end
+  -- out (the heights handed in until the first write, then a copy, GAPS S30) adapted from column c on
+  pfn adapt_go(out : NativeF32Arr, hs : NativeF32Arr, xs : NativeFloatArr, zs : NativeFloatArr, rs : NativeFloatArr, ms : NativeFloatArr, fs : NativeFloatArr, cnt : Int, x0 : Int, z0 : Int, n : Int, s : Float, c : Int, nn : Int) : NativeF32Arr do
+    if c >= nn do out
+    else
+      let xm = (int_to_float(x0 + c % n) +. 0.5) *. s
+      let zm = (int_to_float(z0 + c / n) +. 0.5) *. s
+      let b = nearest_in(xs, zs, rs, 0, cnt, xm, zm, -1, 0.0)
+      if b >= 0 do adapt_go(NativeArray.set_f32(out, c, NativeArray.get_float(fs, b)), hs, xs, zs, rs, ms, fs, cnt, x0, z0, n, s, c + 1, nn)
+      else
+        let den = pull_go(xs, zs, rs, ms, fs, false, 0, cnt, xm, zm, 0.0)
+        if den > 0.0 do
+          let num = pull_go(xs, zs, rs, ms, fs, true, 0, cnt, xm, zm, 0.0)
+          adapt_go(NativeArray.set_f32(out, c, (NativeArray.get_f32(hs, c) +. num) /. (1.0 +. den)), hs, xs, zs, rs, ms, fs, cnt, x0, z0, n, s, c + 1, nn)
+        else adapt_go(out, hs, xs, zs, rs, ms, fs, cnt, x0, z0, n, s, c + 1, nn) end
+      end
+    end
+  end
+  -- some site i.. holds (xm, zm) in its radius or its margin
+  pfn held_by(xs : NativeFloatArr, zs : NativeFloatArr, rs : NativeFloatArr, ms : NativeFloatArr, i : Int, cnt : Int, xm : Float, zm : Float) : Bool do
+    if i >= cnt do false
+    else
+      let d = dist(xs, zs, i, xm, zm)
+      let r = NativeArray.get_float(rs, i)
+      if d <= r do true
+      else if d < r +. NativeArray.get_float(ms, i) do true
+      else held_by(xs, zs, rs, ms, i + 1, cnt, xm, zm) end end
+    end
+  end
+  pfn marks_go(out : NativeU8Arr, xs : NativeFloatArr, zs : NativeFloatArr, rs : NativeFloatArr, ms : NativeFloatArr, cnt : Int, x0 : Int, z0 : Int, n : Int, s : Float, c : Int, nn : Int) : NativeU8Arr do
+    if c >= nn do out
+    else
+      let xm = (int_to_float(x0 + c % n) +. 0.5) *. s
+      let zm = (int_to_float(z0 + c / n) +. 0.5) *. s
+      if held_by(xs, zs, rs, ms, 0, cnt, xm, zm) do marks_go(NativeArray.set_u8(out, c, 1), xs, zs, rs, ms, cnt, x0, z0, n, s, c + 1, nn)
+      else marks_go(out, xs, zs, rs, ms, cnt, x0, z0, n, s, c + 1, nn) end
+    end
+  end
+
+  -- n above 0 and at most 2^20 (so n * n stays far below 2^62), a scale above 0 (not NaN)
+  pfn area_ok(n : Int, scale : Float) : Bool do if n > 0 do (if n <= 1048576 do scale > 0.0 else false end) else false end end
+  pfn pick_floats(a : NativeFloatArr, ids : List(Int)) : NativeFloatArr do floats(List.map(ids, fn i -> NativeArray.get_float(a, i))) end
+
+  doc "Column heights in metres for the n x n area of columns whose corner is column (x0, z0) at `scale` metres a column (for a coarser level, pass that level's column size), heights[i + n * j], drawn to every site layer's sites: inside a site's radius the height is its floor (the nearest site's where radii overlap); across the layer's margin beyond it the height blends back to the one given, linearly for one site, and where several margins meet every site in reach pulls: (H + sum r F) / (1 + sum r) with r = (1 - t) / t, t running 0..1 across each margin; beyond, untouched. A column is read at its centre, and an area gives exactly the values a larger area gives at the same columns. Floors are read as 32-bit floats, as place reads them. The heights handed in are never changed; they come back as they are when nothing reaches the area, when n is not in 1..2^20, scale is not above 0, or heights is not n * n long. A game re-deriving tops as floor(h / scale) puts a site's floor column's top one voxel under the site's template."
+  fn adapt_with(p : PopPlan, x0 : Int, z0 : Int, n : Int, scale : Float, heights : NativeF32Arr) : NativeF32Arr do
+    if area_ok(n, scale) do
+      if NativeArray.length_f32(heights) == n * n do
+        let ids = sites_near(p, x0, z0, n, scale)
+        if List.is_empty(ids) do heights
+        else
+          let fs = floats(List.map(ids, fn i -> NativeArray.get_f32(p.pl_sfl, i)))
+          adapt_go(heights, heights, pick_floats(p.pl_sx, ids), pick_floats(p.pl_sz, ids), pick_floats(p.pl_srad, ids), pick_floats(p.pl_smar, ids), fs, List.length(ids), x0, z0, n, scale, 0, n * n)
+        end
+      else heights end
+    else heights end
+  end
+
+  doc "adapt_with(plan(f), x0, z0, n, scale, heights): for tests and tools; a game keeps one plan."
+  fn adapt(f : Strata.Population.Frozen, x0 : Int, z0 : Int, n : Int, scale : Float, heights : NativeF32Arr) : NativeF32Arr do adapt_with(plan(f), x0, z0, n, scale, heights) end
+
+  doc "1 for every column of the n x n area at (x0, z0) at `scale` metres a column that some site layer's site holds in its radius or its margin, else 0: the columns adapt holds at a floor or may change (a margin column whose height is already what the blend gives is marked though adapt leaves it). A function of position alone, the same from any area. A game keeps its own rules (caves, detail) off the marked columns. All 0 for a scale not above 0; empty for n not in 1..2^20."
+  fn adapted_with(p : PopPlan, x0 : Int, z0 : Int, n : Int, scale : Float) : NativeU8Arr do
+    if area_ok(n, scale) do
+      let out = NativeArray.make_u8(n * n, 0)
+      let ids = sites_near(p, x0, z0, n, scale)
+      if List.is_empty(ids) do out
+      else marks_go(out, pick_floats(p.pl_sx, ids), pick_floats(p.pl_sz, ids), pick_floats(p.pl_srad, ids), pick_floats(p.pl_smar, ids), List.length(ids), x0, z0, n, scale, 0, n * n) end
+    else NativeArray.make_u8(if n > 0 do (if n <= 1048576 do n * n else 0 end) else 0 end, 0) end
+  end
+
+  doc "adapted_with(plan(f), x0, z0, n, scale): for tests and tools."
+  fn adapted(f : Strata.Population.Frozen, x0 : Int, z0 : Int, n : Int, scale : Float) : NativeU8Arr do adapted_with(plan(f), x0, z0, n, scale) end
+
   -- ── Placers ───────────────────────────────────────────────────────────────
   --
   -- place_with runs the layers in run order over one chunk, each placer
@@ -729,8 +925,8 @@ mod Strata.Populate do
   -- writes a variant's block there. A block written is no longer air, so a
   -- later cover layer never overwrites it. A scatter layer (below the cover
   -- placer) stamps its instances in cell order, each cut to the chunk; a
-  -- stamp writes its voxels over whatever is there. Site layers (a later
-  -- task) pass the chunk through.
+  -- stamp writes its voxels over whatever is there. A site layer (after the
+  -- scatter placer) stamps one instance at each of its sites the same way.
 
   -- One cover layer over one chunk, everything its loop reads unpacked from
   -- the plan, the Table and the Ground once per layer (GAPS S15). The chunk's
@@ -969,30 +1165,114 @@ mod Strata.Populate do
     stamp_go(c, k, ts, p.pl_lids, NativeArray.get_int(p.pl_lvat, l), NativeArray.get_int(p.pl_lvn, l), voxel, xs, 0)
   end
 
+  -- ── Sites ─────────────────────────────────────────────────────────────────
+  --
+  -- A site layer stamps one instance at each of its sites, in declaration
+  -- order: variant index mod variants (never negative), turned
+  -- h mod 4 for h = Strata.Seed.cell(seed, salt, index, 0, 0), its
+  -- probabilities drawn from Strata.Seed.next(h). It stands on the column
+  -- holding the site's centre, its template's base centred there as a
+  -- scatter instance's is (w / 2 and d / 2 columns before it), its lowest row
+  -- on the voxel above the floor: floor(F / voxel) + 1, F read as a 32-bit
+  -- float. A block variant is that one voxel. Nothing reads the Ground. The
+  -- site's position and floor are compared as floats with the chunk's
+  -- bounds before any is turned into an Int, so a huge, infinite or NaN
+  -- floor or centre traps nothing and places nothing.
+
+  -- i mod n, 0..n - 1 (n above 0)
+  pfn euclid_mod(i : Int, n : Int) : Int do
+    let r = i % n
+    if r < 0 do r + n else r end
+  end
+  -- f (voxels) lies within e of the 32 columns from q
+  pfn near_span(f : Float, q : Int, e : Float) : Bool do if f >= int_to_float(q) -. e do f < int_to_float(q + 32) +. e else false end end
+
+  -- Sites s .. s1 - 1 of one layer stamped into chunk k, in order. ts its
+  -- templates (Nil for blocks: nb ids at ids[vat ..]), nv its variants, ext
+  -- its largest template side in voxels. Returns the chunk and how many
+  -- sites met it.
+  pfn site_go(c : Strata.Chunk.Chunk, k : Strata.Coord.Key, ts : List(Strata.Template.Template), ids : NativeIntArr, vat : Int, nb : Int, nv : Int, ext : Int, seed : Int, salt : Int, voxel : Float, sx : NativeFloatArr, sz : NativeFloatArr, sfl : NativeF32Arr, sidx : NativeIntArr, s : Int, s1 : Int, wrote : Int) : (Strata.Chunk.Chunk, Int) do
+    if s >= s1 do (c, wrote)
+    else
+      let qx = 32 * Strata.Coord.kx(k)
+      let qy = 32 * Strata.Coord.ky(k)
+      let qz = 32 * Strata.Coord.kz(k)
+      let fx = NativeArray.get_float(sx, s) /. voxel
+      let fz = NativeArray.get_float(sz, s) /. voxel
+      let fy = NativeArray.get_f32(sfl, s) /. voxel
+      let e = int_to_float(ext + 1)
+      -- within the layer's largest template of the chunk; the upper bound in y is exact (the lowest row floor(fy) + 1 <= qy + 31)
+      let close = if near_span(fx, qx, e) do (if near_span(fz, qz, e) do (if fy < int_to_float(qy + 31) do fy >= int_to_float(qy) -. e else false end) else false end) else false end
+      if close do
+        let index = NativeArray.get_int(sidx, s)
+        let v = euclid_mod(index, nv)
+        let h = Strata.Seed.cell(seed, salt, index, 0, 0)
+        let rot = h % 4
+        let wx = float_to_int(Math.floor(fx))
+        let wz = float_to_int(Math.floor(fz))
+        let oy = float_to_int(Math.floor(fy)) + 1
+        match List.nth_opt(ts, v) do
+          Some(tp) ->
+            match Strata.Template.bounds(tp, 0, 0, 0, rot) do
+              (_, _, _, w1, h1, d1) ->
+                let ox = wx - (w1 + 1) / 2
+                let oz = wz - (d1 + 1) / 2
+                let hit = if oy + h1 >= qy do (if meets(ox, ox + w1, qx) do meets(oz, oz + d1, qz) else false end) else false end
+                if hit do site_go(Strata.Template.blit(c, k, tp, ox, oy, oz, rot, Strata.Seed.next(h)), k, ts, ids, vat, nb, nv, ext, seed, salt, voxel, sx, sz, sfl, sidx, s + 1, s1, wrote + 1)
+                else site_go(c, k, ts, ids, vat, nb, nv, ext, seed, salt, voxel, sx, sz, sfl, sidx, s + 1, s1, wrote) end
+            end
+          None ->
+            let hit = if v < nb do (if meets(oy, oy, qy) do (if meets(wx, wx, qx) do meets(wz, wz, qz) else false end) else false end) else false end
+            if hit do site_go(Strata.Chunk.set_idx(c, Strata.Chunk.index((wx - qx) + 32 * ((wz - qz) + 32 * (oy - qy))), NativeArray.get_int(ids, vat + v)), k, ts, ids, vat, nb, nv, ext, seed, salt, voxel, sx, sz, sfl, sidx, s + 1, s1, wrote + 1)
+            else site_go(c, k, ts, ids, vat, nb, nv, ext, seed, salt, voxel, sx, sz, sfl, sidx, s + 1, s1, wrote) end
+        end
+      else site_go(c, k, ts, ids, vat, nb, nv, ext, seed, salt, voxel, sx, sz, sfl, sidx, s + 1, s1, wrote) end
+    end
+  end
+
+  -- layer l of the plan as a site layer over chunk k
+  pfn site_layer(p : PopPlan, seed : Int, k : Strata.Coord.Key, voxel : Float, c : Strata.Chunk.Chunk, l : Int) : (Strata.Chunk.Chunk, Int) do
+    let nv = NativeArray.get_int(p.pl_lnv, l)
+    if nv <= 0 do (c, 0)
+    else
+      let ts = match List.nth_opt(p.pl_ltemps, l) do
+        Some(v) -> v
+        None -> Nil
+      end
+      let s0 = NativeArray.get_int(p.pl_lsat, l)
+      site_go(c, k, ts, p.pl_lids, NativeArray.get_int(p.pl_lvat, l), NativeArray.get_int(p.pl_lvn, l), nv, NativeArray.get_int(p.pl_lext, l), seed, NativeArray.get_int(p.pl_lsalt, l), voxel, p.pl_sx, p.pl_sz, p.pl_sfl, p.pl_sidx, s0, s0 + NativeArray.get_int(p.pl_lsn, l), 0)
+    end
+  end
+
   -- ── Placing a chunk ───────────────────────────────────────────────────────
 
   -- the layers from l in run order, each dispatched on its kind. cover:
   -- whether some floor of the Ground lies in the chunk's reach (without one
   -- no cover layer makes its pass); scatter: whether some top of the Ground
-  -- can put a stamp in the chunk.
-  pfn layers_place(p : PopPlan, base : CoverRun, seed : Int, k : Strata.Coord.Key, g : Ground, t : Table, cover : Bool, scatter : Bool, c : Strata.Chunk.Chunk, wrote : Int, l : Int) : (Strata.Chunk.Chunk, Int) do
+  -- can put a stamp in the chunk; site: whether some site's floor can.
+  pfn layers_place(p : PopPlan, base : CoverRun, seed : Int, k : Strata.Coord.Key, g : Ground, t : Table, cover : Bool, scatter : Bool, site : Bool, c : Strata.Chunk.Chunk, wrote : Int, l : Int) : (Strata.Chunk.Chunk, Int) do
     if l >= p.pl_nl do (c, wrote)
     else
       let kind = NativeArray.get_int(p.pl_lkind, l)
       if kind == 0 do
         if cover do
           match cover_layer(p, base, c, l) do
-            (c2, w) -> layers_place(p, base, seed, k, g, t, cover, scatter, c2, wrote + w, l + 1)
+            (c2, w) -> layers_place(p, base, seed, k, g, t, cover, scatter, site, c2, wrote + w, l + 1)
           end
-        else layers_place(p, base, seed, k, g, t, cover, scatter, c, wrote, l + 1) end
+        else layers_place(p, base, seed, k, g, t, cover, scatter, site, c, wrote, l + 1) end
       else if kind == 1 do
         if scatter do
           match scatter_layer(p, seed, k, g, t, c, l) do
-            (c2, w) -> layers_place(p, base, seed, k, g, t, cover, scatter, c2, wrote + w, l + 1)
+            (c2, w) -> layers_place(p, base, seed, k, g, t, cover, scatter, site, c2, wrote + w, l + 1)
           end
-        else layers_place(p, base, seed, k, g, t, cover, scatter, c, wrote, l + 1) end
-      -- site layers: the chunk passes through
-      else layers_place(p, base, seed, k, g, t, cover, scatter, c, wrote, l + 1) end end
+        else layers_place(p, base, seed, k, g, t, cover, scatter, site, c, wrote, l + 1) end
+      else if kind == 2 do
+        if site do
+          match site_layer(p, seed, k, g.pg_voxel, c, l) do
+            (c2, w) -> layers_place(p, base, seed, k, g, t, cover, scatter, site, c2, wrote + w, l + 1)
+          end
+        else layers_place(p, base, seed, k, g, t, cover, scatter, site, c, wrote, l + 1) end
+      else layers_place(p, base, seed, k, g, t, cover, scatter, site, c, wrote, l + 1) end end end
     end
   end
 
@@ -1012,12 +1292,12 @@ mod Strata.Populate do
   -- the Ground's voxel must be the key's: scale * 2^level
   pfn level_fits(g : Ground, k : Strata.Coord.Key) : Bool do g.pg_voxel == g.pg_scale *. Math.pow(2.0, int_to_float(Strata.Coord.level(k))) end
   pfn same_size(a : Float, b : Float) : Bool do Math.abs(a -. b) <= 0.000001 *. a end
-  -- every scatter layer's template is at the Ground's voxel size (Strata.Template.fit's tolerance)
+  -- every scatter and site layer's template is at the Ground's voxel size (Strata.Template.fit's tolerance)
   pfn stamps_fit(p : PopPlan, g : Ground) : Bool do
     if p.pl_tvhi <= 0.0 do true else if same_size(p.pl_tvlo, g.pg_voxel) do same_size(p.pl_tvhi, g.pg_voxel) else false end end
   end
 
-  doc "Why place_with(p, _, k, _, g, t) would hand the chunk back unchanged though the plan has layers to place, one message each, or Nil: g's own problems; a key above level 0; g not covering the chunk's 32 x 32 columns and, when the plan has a scatter layer, pad more on each side; a Table that is not this plan's over g; g at another level than k; a scatter layer's template at another voxel size than g's (fit the population with Strata.Population.fit_all). A plan with nothing to place, and a chunk no floor or stamp reaches, are not problems."
+  doc "Why place_with(p, _, k, _, g, t) would hand the chunk back unchanged though the plan has layers to place, one message each, or Nil: g's own problems; a key above level 0; g not covering the chunk's 32 x 32 columns and, when the plan has a scatter layer, pad more on each side; a Table that is not this plan's over g; g at another level than k; a scatter or site layer's template at another voxel size than g's (fit the population with Strata.Population.fit_all). Site layers read no column of g and add no pad. A plan with nothing to place, and a chunk no floor or stamp reaches, are not problems."
   fn place_problems(p : PopPlan, k : Strata.Coord.Key, g : Ground, t : Table) : List(String) do
     let level = if Strata.Coord.level(k) == 0 do Nil else ["place: the key is at level " ++ int_to_string(Strata.Coord.level(k)) ++ "; layers are placed at level 0 only"] end
     let gp = problems(g)
@@ -1033,16 +1313,17 @@ mod Strata.Populate do
       let lvl = if level_fits(g, k) do Nil
         else ["place: the Ground's voxel is " ++ float_to_string(g.pg_voxel) ++ " m, not that of a key at level " ++ int_to_string(Strata.Coord.level(k)) ++ " of a world of " ++ float_to_string(g.pg_scale) ++ " m a voxel"] end
       let stamps = if stamps_fit(p, g) do Nil
-        else ["place: the scatter layers' templates have voxels of " ++ float_to_string(p.pl_tvlo) ++ " to " ++ float_to_string(p.pl_tvhi) ++ " m and the Ground's is " ++ float_to_string(g.pg_voxel) ++ " m; fit the population with Strata.Population.fit_all"] end
+        else ["place: the scatter and site layers' templates have voxels of " ++ float_to_string(p.pl_tvlo) ++ " to " ++ float_to_string(p.pl_tvhi) ++ " m and the Ground's is " ++ float_to_string(g.pg_voxel) ++ " m; fit the population with Strata.Population.fit_all"] end
       List.append(level, List.append(covers, List.append(table, List.append(lvl, stamps))))
     else List.append(gp, level) end
   end
 
-  doc "The chunk at key k with plan p's layers placed, in run order, over Ground g, whose fields t holds (t = fields_with(p, seed, g)). Cover and scatter layers, at level 0 only; site layers pass the chunk through. A cover layer visits each floor of each of the chunk's columns (g's surfaces, or one floor at tops[col]); where the voxel above the floor is air and inside the chunk it rolls Strata.Seed.unit(Strata.Seed.cell(seed, salt, wx, y, wz)) at the floor's world voxel against the layer's density times the column's area (voxel size squared), and on success writes a variant's block id there: the variant comes from Strata.Seed.next of the same hash, against the weights of the first weighted zone (declaration order) the column is in, else uniformly. A written block is not air, so a later cover layer never overwrites it. A scatter layer is Strata.Feature cells of its cell size, jitter and salt: a cell holds an instance with probability density * cell * cell (at most 1), the density read at the column the candidate stands on; its variant comes from the candidate's index against the same weights; a template variant, turned the candidate's quarter turn (w x d columns), is blitted with the candidate's stream from w / 2 and d / 2 columns (rounded down) before that column and one voxel above its top (tops, whatever the surfaces), the part inside the chunk written over whatever is there (holes leave it); a block variant is written at that one voxel. Instances of one layer are stamped in cell order (rows of z, x increasing), layers in run order, so where stamps overlap the later is on top, the same from every chunk. Every voxel is a function of its world position, the seed and the ground under the instances that reach it: any g that covers what is needed gives the same chunk. g may be larger than the chunk; its corner and the key's 32 * kx, 32 * kz place the chunk's columns in it. The chunk comes back unchanged (the same value) when nothing is written: at a level above 0, with no cover or scatter layer, when no floor of g reaches the chunk and no top of g can put a stamp in it, or when something is wrong, which place_problems words: g does not cover the chunk's 32 x 32 columns (and, with a scatter layer, plan_pad more on each side), has problems or is at another level than k, t is not n * n columns or holds another layer or zone count than p, or a scatter layer's template is not at g's voxel size. A layer whose density is 0 at every column of g costs no pass, and no cover layer makes a pass over a chunk that only stamps reach. A top or floor at either end of Int traps nothing. The chunk handed in is never changed."
+  doc "The chunk at key k with plan p's layers placed, in run order, over Ground g, whose fields t holds (t = fields_with(p, seed, g)). Cover, scatter and site layers, at level 0 only. A cover layer visits each floor of each of the chunk's columns (g's surfaces, or one floor at tops[col]); where the voxel above the floor is air and inside the chunk it rolls Strata.Seed.unit(Strata.Seed.cell(seed, salt, wx, y, wz)) at the floor's world voxel against the layer's density times the column's area (voxel size squared), and on success writes a variant's block id there: the variant comes from Strata.Seed.next of the same hash, against the weights of the first weighted zone (declaration order) the column is in, else uniformly. A written block is not air, so a later cover layer never overwrites it. A scatter layer is Strata.Feature cells of its cell size, jitter and salt: a cell holds an instance with probability density * cell * cell (at most 1), the density read at the column the candidate stands on; its variant comes from the candidate's index against the same weights; a template variant, turned the candidate's quarter turn (w x d columns), is blitted with the candidate's stream from w / 2 and d / 2 columns (rounded down) before that column and one voxel above its top (tops, whatever the surfaces), the part inside the chunk written over whatever is there (holes leave it); a block variant is written at that one voxel. A site layer stamps, at each of its sites in declaration order, variant index mod variants (0..variants - 1) turned h mod 4, its probabilities drawn from Strata.Seed.next(h), for h = Strata.Seed.cell(seed, salt, index, 0, 0), from w / 2 and d / 2 columns before the column holding the site's centre and with its lowest row at floor(F / voxel) + 1, F the site's floor read as a 32-bit float (a block variant at that one voxel); it reads no column of g. Instances of one layer are stamped in cell order (rows of z, x increasing), sites in declaration order, layers in run order, so where stamps overlap the later is on top, the same from every chunk. Every voxel is a function of its world position, the seed and the ground under the instances that reach it: any g that covers what is needed gives the same chunk. g may be larger than the chunk; its corner and the key's 32 * kx, 32 * kz place the chunk's columns in it. The chunk comes back unchanged (the same value) when nothing is written: at a level above 0, with no layer, when no floor of g reaches the chunk and no top of g or site floor can put a stamp in it, or when something is wrong, which place_problems words: g does not cover the chunk's 32 x 32 columns (and, with a scatter layer, plan_pad more on each side), has problems or is at another level than k, t is not n * n columns or holds another layer or zone count than p, or a scatter or site layer's template is not at g's voxel size. A layer whose density is 0 at every column of g costs no pass, and no cover layer makes a pass over a chunk that only stamps reach. A top or floor at either end of Int, and a site floor or centre that is huge, infinite or NaN, traps nothing. The chunk handed in is never changed."
   fn place_with(p : PopPlan, seed : Int, k : Strata.Coord.Key, c : Strata.Chunk.Chunk, g : Ground, t : Table) : Strata.Chunk.Chunk do
     let has_cover = p.pl_ncover > 0
     let has_scatter = p.pl_nscatter > 0
-    let some = if Strata.Coord.level(k) == 0 do (if has_cover do true else has_scatter end) else false end
+    let has_site = p.pl_nsite > 0
+    let some = if Strata.Coord.level(k) == 0 do (if has_cover do true else (if has_scatter do true else has_site end) end) else false end
     -- a scale above 0 before anything divides by it
     let sound = if some do g.pg_scale > 0.0 else false end
     if sound do
@@ -1050,7 +1331,9 @@ mod Strata.Populate do
       -- a floor at y covers y + 1; an instance on a top at y fills y + 1 .. y + pl_hmax at most
       let cover_reach = if has_cover do (if g.pg_fhi >= ylo do g.pg_flo <= ylo + 31 else false end) else false end
       let scatter_reach = if has_scatter do (if g.pg_thi >= ylo + 1 - p.pl_hmax do g.pg_tlo <= ylo + 31 else false end) else false end
-      let reached = if cover_reach do true else scatter_reach end
+      -- a site's lowest row is floor(F / voxel) + 1, its stamp at most pl_hmax high: compared as floats, so no floor overflows
+      let site_reach = if has_site do (if p.pl_sfhi /. g.pg_voxel >= int_to_float(ylo + 1 - p.pl_hmax) do p.pl_sflo /. g.pg_voxel < int_to_float(ylo + 32) else false end) else false end
+      let reached = if cover_reach do true else (if scatter_reach do true else site_reach end) end
       let fits = if reached do (if covers_chunk(g, k, need_of(p, g)) do (if table_fits(p, g, t) do (if level_fits(g, k) do stamps_fit(p, g) else false end) else false end) else false end) else false end
       if fits do
         if List.is_empty(problems(g)) do
@@ -1060,7 +1343,7 @@ mod Strata.Populate do
                        cr_ids: p.pl_lids, cr_vat: 0, cr_vn: 0, cr_wzone: p.pl_wzone, cr_wbase: p.pl_wbase, cr_wcum: p.pl_wcum, cr_wat: 0, cr_wend: 0,
                        cr_n: g.pg_n, cr_ci: wx0 - g.pg_x0, cr_cj: wz0 - g.pg_z0, cr_wx0: wx0, cr_wz0: wz0, cr_ylo: ylo, cr_surf: g.pg_surf, cr_tops: g.pg_tops, cr_sat: g.pg_sat, cr_sys: g.pg_sys, cr_skind: g.pg_skind }
           -- set_idx writes into arrays the chunk handed in still holds, so they are copied on the first write (GAPS S30) and c is never changed
-          match layers_place(p, base, seed, k, g, t, cover_reach, scatter_reach, c, 0, 0) do
+          match layers_place(p, base, seed, k, g, t, cover_reach, scatter_reach, site_reach, c, 0, 0) do
             (out, wrote) -> if wrote > 0 do out else c end
           end
         else c end

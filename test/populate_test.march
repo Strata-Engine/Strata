@@ -653,6 +653,221 @@ mod Strata.Test.Populate do
     end
   end
 
+  -- ── Site helpers ─────────────────────────────────────────────────────────
+
+  -- the centre in metres of column c of an n x n area at (x0, z0), at scale s
+  pfn col_xm(x0 : Int, n : Int, s : Float, c : Int) : Float do (int_to_float(x0 + c % n) +. 0.5) *. s end
+  pfn col_zm(z0 : Int, n : Int, s : Float, c : Int) : Float do (int_to_float(z0 + c / n) +. 0.5) *. s end
+  pfn site_d(st : Strata.Population.PopSite, xm : Float, zm : Float) : Float do
+    let dx = xm -. Pn.site_xm(st)
+    let dz = zm -. Pn.site_zm(st)
+    Math.sqrt(dx *. dx +. dz *. dz)
+  end
+  -- v as a 32-bit float reads it back
+  pfn f32_of(v : Float) : Float do NativeArray.get_f32(NativeArray.set_f32(NativeArray.make_f32(1, 0.0), 0, v), 0) end
+  -- heights of an n x n area at (x0, z0) by world column: a(wx) + b(wz) metres
+  pfn plane_heights(x0 : Int, z0 : Int, n : Int, a : Float, b : Float) : NativeF32Arr do
+    List.fold_left(List.range(0, n * n), NativeArray.make_f32(n * n, 0.0), fn (h, c) -> NativeArray.set_f32(h, c, a *. int_to_float(x0 + c % n) +. b *. int_to_float(z0 + c / n)))
+  end
+  -- one site layer "ruins" on shape set "halls" of ts
+  pfn site_pop(ts : List(Strata.Template.Template), ss : List(Strata.Population.PopSite), margin : Float, salt : Int) : Strata.Population.Pop do
+    Pn.layer_site(Pn.shapes_templates(Pn.new(), "halls", ts), "ruins", "halls", ss, margin, salt)
+  end
+  -- the site's turn and stream, as the brief and the ledger give them
+  pfn site_rot(seed : Int, salt : Int, index : Int) : Int do Strata.Seed.cell(seed, salt, index, 0, 0) % 4 end
+  pfn site_stream(seed : Int, salt : Int, index : Int) : Int do Strata.Seed.next(Strata.Seed.cell(seed, salt, index, 0, 0)) end
+  -- the site as an instance of variant v, for the test's own stamp: it stands on the column holding its centre, its top floor(floor / voxel) (the floor read as a 32-bit float)
+  pfn site_inst(st : Strata.Population.PopSite, v : Int, seed : Int, salt : Int, voxel : Float) : Strata.Populate.PopInstance do
+    Strata.Populate.PopInstance(0, Pn.site_xm(st), Pn.site_zm(st), vox(f32_of(Pn.site_floor(st)), voxel), v, site_rot(seed, salt, Pn.site_index(st)), site_stream(seed, salt, Pn.site_index(st)))
+  end
+
+  -- A 48 x 48 area at (x0, z0) at scale s whose heights rise 10 m along x;
+  -- one site at the centre of column (x0 + 20, z0 + 20), floor 3.25, radius
+  -- 4 columns, margin 6. Every column is checked against the test's own
+  -- blend. "" or what went wrong.
+  pfn ramp_case(s : Float, x0 : Int, z0 : Int) : String do
+    let n = 48
+    let st = Pn.site((int_to_float(x0 + 20) +. 0.5) *. s, (int_to_float(z0 + 20) +. 0.5) *. s, 3.25, 4.0 *. s, 2)
+    let f = frozen_of(site_pop([solid(1, 1, 1, 5, s)], [st], 6.0 *. s, 3))
+    let hs = List.fold_left(List.range(0, n * n), NativeArray.make_f32(n * n, 0.0), fn (h, c) -> NativeArray.set_f32(h, c, 10.0 *. int_to_float(c % n) /. 47.0))
+    let out = Pq.adapt(f, x0, z0, n, s, hs)
+    let r = 4.0 *. s
+    let m = 6.0 *. s
+    let bad = List.filter(List.range(0, n * n), fn c ->
+      let d = site_d(st, col_xm(x0, n, s, c), col_zm(z0, n, s, c))
+      let h = NativeArray.get_f32(hs, c)
+      let o = NativeArray.get_f32(out, c)
+      if d <= r do o != 3.25
+      else if d >= r +. m do o != h
+      else !near(o, 3.25 +. (h -. 3.25) *. (d -. r) /. m, 0.0001) end end)
+    let at = fn (i, j) -> i + n * j
+    let inside = List.length(List.filter(List.range(0, n * n), fn c -> site_d(st, col_xm(x0, n, s, c), col_zm(z0, n, s, c)) <= r))
+    match bad do
+      Cons(c, _) -> "column " ++ int_to_string(c % n) ++ ", " ++ int_to_string(c / n) ++ " reads " ++ float_to_string(NativeArray.get_f32(out, c)) ++ " for " ++ float_to_string(NativeArray.get_f32(hs, c)) ++ " (" ++ int_to_string(List.length(bad)) ++ " wrong)"
+      Nil ->
+        if NativeArray.get_f32(out, at(24, 20)) != 3.25 do "the column at the radius is not at the floor"
+        else if NativeArray.get_f32(out, at(30, 20)) != NativeArray.get_f32(hs, at(30, 20)) do "the column at the margin's outer edge changed"
+        else if !near(NativeArray.get_f32(out, at(27, 20)), 0.5 *. (3.25 +. NativeArray.get_f32(hs, at(27, 20))), 0.00001) do "halfway across the margin is not the mean: " ++ float_to_string(NativeArray.get_f32(out, at(27, 20)))
+        else if NativeArray.get_f32(hs, at(27, 20)) != f32_of(10.0 *. 27.0 /. 47.0) do "the heights handed in were changed"
+        else if inside < 45 do "only " ++ int_to_string(inside) ++ " columns inside the radius"
+        else "" end end end end end
+    end
+  end
+
+  -- Two site layers, declared "ruins" (A at floor 2.05, C far away, Q) then
+  -- "camps" (B at floor 7.05, P): A and B's margins overlap; P and Q's radii
+  -- overlap, P declared later. The floors of A and B are no height of
+  -- plane_heights(_, _, _, 0.3, 0.1), so every margin column changes.
+  pfn site_a() : Strata.Population.PopSite do Pn.site(10.5, 12.5, 2.05, 3.0, 0) end
+  pfn site_b() : Strata.Population.PopSite do Pn.site(19.5, 14.5, 7.05, 2.0, 1) end
+  pfn site_c() : Strata.Population.PopSite do Pn.site(70.5, 70.5, 20.0, 2.0, 2) end
+  pfn site_p() : Strata.Population.PopSite do Pn.site(40.5, 40.5, 1.0, 5.0, 3) end
+  pfn site_q() : Strata.Population.PopSite do Pn.site(46.5, 40.5, 9.0, 5.0, 4) end
+  pfn two_sites_pop() : Strata.Population.Frozen do
+    let p0 = Pn.shapes_templates(Pn.new(), "halls", [solid(1, 1, 1, 5, 1.0)])
+    frozen_of(Pn.layer_site(Pn.layer_site(p0, "ruins", "halls", [site_a(), site_c(), site_q()], 8.0, 3), "camps", "halls", [site_b(), site_p()], 8.0, 4))
+  end
+  -- the first column of the n x n area at (x0, z0) where out differs from big (the 96 x 96 area at (-16, -16)), or ""
+  pfn crop_diff(out : NativeF32Arr, big : NativeF32Arr, x0 : Int, z0 : Int, n : Int) : String do
+    match List.find(List.range(0, n * n), fn c -> NativeArray.get_f32(out, c) != NativeArray.get_f32(big, (x0 + 16 + c % n) + 96 * (z0 + 16 + c / n))) do
+      None -> ""
+      Some(c) -> "column " ++ int_to_string(x0 + c % n) ++ ", " ++ int_to_string(z0 + c / n) ++ ": " ++ float_to_string(NativeArray.get_f32(out, c)) ++ " against " ++ float_to_string(NativeArray.get_f32(big, (x0 + 16 + c % n) + 96 * (z0 + 16 + c / n)))
+    end
+  end
+  pfn crop_diff_u8(out : NativeU8Arr, big : NativeU8Arr, x0 : Int, z0 : Int, n : Int) : Int do
+    List.length(List.filter(List.range(0, n * n), fn c -> NativeArray.get_u8(out, c) != NativeArray.get_u8(big, (x0 + 16 + c % n) + 96 * (z0 + 16 + c / n))))
+  end
+  -- the blend from sites in their margins: (h + sum r F) / (1 + sum r), r = (1 - t) / t
+  pfn blend_of(h : Float, ss : List(Strata.Population.PopSite), margin : Float, xm : Float, zm : Float) : Float do
+    let rs = List.map(ss, fn st -> (1.0 -. (site_d(st, xm, zm) -. Pn.site_radius(st)) /. margin) /. ((site_d(st, xm, zm) -. Pn.site_radius(st)) /. margin))
+    (h +. List.fold_left(List.zip(rs, ss), 0.0, fn (a, rf) -> match rf do (r, st) -> a +. r *. Pn.site_floor(st) end)) /. (1.0 +. List.fold_left(rs, 0.0, fn (a, r) -> a +. r))
+  end
+
+  -- chunk k with ground (id 1) up to each column's top, tops from the n x n area at (x0, z0)
+  pfn ground_chunk(k : Strata.Coord.Key, tops : NativeIntArr, x0 : Int, z0 : Int, n : Int) : Strata.Chunk.Chunk do
+    let bx = 32 * Strata.Coord.kx(k)
+    let qy = 32 * Strata.Coord.ky(k)
+    let bz = 32 * Strata.Coord.kz(k)
+    List.fold_left(List.range(0, 1024), air(), fn (c, i) ->
+      let top = NativeArray.get_int(tops, (bx + i % 32 - x0) + n * (bz + i / 32 - z0))
+      if top >= qy do Strata.Chunk.fill_box(c, i % 32, 0, i / 32, i % 32, Math.min_int(top - qy, 31), i / 32, 1) else c end)
+  end
+  -- A 5 x 3 x 4 hall of block 9 fitted to scale s on a site at (16.2, 15.7),
+  -- floor 7.6, radius 5, margin 4, over ground rising 0.4 a metre in x and
+  -- 0.2 in z. The game adapts the heights of each chunk's area, re-derives
+  -- its tops as floor(h / s), fills the chunk's ground to them and places:
+  -- every footprint column's top is the floor's voxel, the hall's lowest row
+  -- stands on the voxel above it, and each chunk is the test's own stamp of
+  -- the hall over its ground. "" or what went wrong.
+  pfn standing_case(s : Float) : String do
+    let st = Pn.site(16.2, 15.7, 7.6, 5.0, 6)
+    let f = fit_of(site_pop([solid(5, 3, 4, 9, 1.0)], [st], 4.0, 8), s)
+    let t = match Pn.shape_set_templates(f, 0) do
+      Cons(v, _) -> v
+      Nil -> solid(1, 1, 1, 9, s)
+    end
+    let inst = site_inst(st, 0, 5, 8, s)
+    let ox = inst_ox(inst, t, s)
+    let oz = inst_oz(inst, t, s)
+    let oy = Pq.i_top(inst) + 1
+    let w = turned_w(t, Pq.i_rot(inst))
+    let d = turned_d(t, Pq.i_rot(inst))
+    let x0 = ox - 3
+    let z0 = oz - 3
+    let n = Math.max_int(w, d) + 6
+    let hs = List.fold_left(List.range(0, n * n), NativeArray.make_f32(n * n, 0.0), fn (h, c) -> NativeArray.set_f32(h, c, 0.4 *. col_xm(x0, n, s, c) +. 0.2 *. col_zm(z0, n, s, c)))
+    let out = Pq.adapt(f, x0, z0, n, s, hs)
+    let tops = List.fold_left(List.range(0, n * n), NativeArray.make_int(n * n, 0), fn (a, c) -> NativeArray.set_int(a, c, vox(NativeArray.get_f32(out, c), s)))
+    let foot = List.filter(List.range(0, n * n), fn c -> if between(x0 + c % n, ox, ox + w - 1) do between(z0 + c / n, oz, oz + d - 1) else false end)
+    let hung = List.filter(foot, fn c -> NativeArray.get_int(tops, c) != oy - 1)
+    let ks = keys_over(ox, oy - 1, oz, ox + w - 1, oy + Strata.Template.t_sy(t) - 1, oz + d - 1)
+    let wrong = List.filter(ks, fn k ->
+      let gx0 = 32 * Strata.Coord.kx(k)
+      let gz0 = 32 * Strata.Coord.kz(k)
+      let hk = Pq.adapt(f, gx0, gz0, 32, s, List.fold_left(List.range(0, 1024), NativeArray.make_f32(1024, 0.0), fn (h, c) -> NativeArray.set_f32(h, c, 0.4 *. col_xm(gx0, 32, s, c) +. 0.2 *. col_zm(gz0, 32, s, c))))
+      let tk = List.fold_left(List.range(0, 1024), NativeArray.make_int(1024, 0), fn (a, c) -> NativeArray.set_int(a, c, vox(NativeArray.get_f32(hk, c), s)))
+      let c0 = ground_chunk(k, tk, gx0, gz0, 32)
+      let got = Pq.place(f, 5, k, c0, Pq.ground(gx0, gz0, 32, s, 0, tk, NativeArray.make_int(1024, -1)))
+      hash_of(got) != hash_of(stamp_all(c0, k, [t], s, [inst])))
+    let pre = "scale " ++ float_to_string(s) ++ ": "
+    if List.length(foot) != w * d do pre ++ "the footprint is " ++ int_to_string(List.length(foot)) ++ " columns"
+    else if !List.is_empty(hung) do pre ++ int_to_string(List.length(hung)) ++ " footprint columns have no ground directly under the hall's lowest row"
+    else if oy - 1 != vox(7.6, s) do pre ++ "the hall stands at " ++ int_to_string(oy) ++ ", not on the floor's voxel"
+    else if (if s < 1.0 do List.length(ks) < 2 else false end) do pre ++ "the hall is in " ++ int_to_string(List.length(ks)) ++ " chunk"
+    else match wrong do
+      Cons(k, _) -> pre ++ "chunk " ++ key_str(k) ++ " is not the hall standing on its ground"
+      Nil -> ""
+    end end end end end
+  end
+
+  -- The first site index from i whose turn is rot.
+  pfn index_for_rot(seed : Int, salt : Int, rot : Int, i : Int) : Int do
+    if site_rot(seed, salt, i) == rot do i else index_for_rot(seed, salt, rot, i + 1) end
+  end
+  -- A 9 x 12 x 9 lump authored at 1 m, fitted to s, on one site across
+  -- x = 32 (8 m at 0.25 m) and y = 32 voxels, turned rot (its index found by
+  -- search): every chunk its box meets, each from a Ground of its own 32 x
+  -- 32 columns, is the test's own stamp, and together they hold the
+  -- template's voxels once. "" or what went wrong.
+  pfn site_border_case(s : Float, rot : Int) : String do
+    let index = index_for_rot(5, 9, rot, 0)
+    let st = Pn.site(32.0 *. s -. 0.3 *. s, 10.2 *. s, 25.3 *. s, 9.0, index)
+    let f = fit_of(site_pop([lump(9, 12, 9, 1.0)], [st], 2.0, 9), s)
+    match Pn.shape_set_templates(f, 0) do
+      Nil -> "no template"
+      Cons(t, _) ->
+        let inst = site_inst(st, 0, 5, 9, s)
+        let x0 = inst_ox(inst, t, s)
+        let y0 = Pq.i_top(inst) + 1
+        let z0 = inst_oz(inst, t, s)
+        let x1 = x0 + turned_w(t, rot) - 1
+        let y1 = y0 + Strata.Template.t_sy(t) - 1
+        let z1 = z0 + turned_d(t, rot) - 1
+        let ks = keys_over(x0, y0, z0, x1, y1, z1)
+        match border_keys_site(f, s, t, inst, ks, x0, y0, z0, x1, y1, z1, 0) do
+          (msg, found) ->
+            let pre = "scale " ++ float_to_string(s) ++ " turn " ++ int_to_string(rot) ++ ": "
+            if Pq.i_rot(inst) != rot do pre ++ "index " ++ int_to_string(index) ++ " turns " ++ int_to_string(Pq.i_rot(inst))
+            else if msg != "" do pre ++ msg
+            else if Strata.Coord.chunk_of(x0) == Strata.Coord.chunk_of(x1) do pre ++ "the site does not cross x = 32"
+            else if Strata.Coord.chunk_of(y0) == Strata.Coord.chunk_of(y1) do pre ++ "the site does not cross y = 32"
+            else if found != filled(t) do pre ++ int_to_string(List.length(ks)) ++ " chunks hold " ++ int_to_string(found) ++ " voxels; the template has " ++ int_to_string(filled(t))
+            else "" end end end end end
+        end
+    end
+  end
+  pfn border_keys_site(f : Strata.Population.Frozen, s : Float, t : Strata.Template.Template, inst : Strata.Populate.PopInstance, ks : List(Strata.Coord.Key), x0 : Int, y0 : Int, z0 : Int, x1 : Int, y1 : Int, z1 : Int, found : Int) : (String, Int) do
+    match ks do
+      Nil -> ("", found)
+      Cons(k, rest) ->
+        let got = Pq.place(f, 5, k, air(), key_ground(k, 0, s))
+        if hash_of(got) == hash_of(stamp_all(air(), k, [t], s, [inst])) do border_keys_site(f, s, t, inst, rest, x0, y0, z0, x1, y1, z1, found + filled_in(got, k, x0, y0, z0, x1, y1, z1))
+        else ("chunk " ++ key_str(k) ++ " is not the stamp of the site (" ++ int_to_string(count_filled(got)) ++ " voxels)", found) end
+    end
+  end
+
+  -- one site of a template sx x sy x sz of block 5 at (5.5, 5.5) on `floor`, at 1 m: how many voxels chunk (0, ky, 0) holds, and at which local height the lowest one is (-1 for none)
+  pfn floor_case(floor : Float, sy : Int, ky : Int) : (Int, Int) do
+    let f = frozen_of(site_pop([solid(1, sy, 1, 5, 1.0)], [Pn.site(5.5, 5.5, floor, 1.0, 0)], 1.0, 3))
+    let k = Strata.Coord.key(0, ky, 0)
+    let got = Pq.place(f, 2, k, air(), key_ground(k, 0, 1.0))
+    (count_all(got, 5), match List.find(List.range(0, 32), fn y -> Strata.Chunk.get_or(got, 5, y, 5, 0) == 5) do
+      Some(y) -> y
+      None -> -1
+    end)
+  end
+  -- floor_case with a shape set of block 5 in place of the template
+  pfn floor_block_case(floor : Float, ky : Int) : (Int, Int) do
+    let f = frozen_of(Pn.layer_site(Pn.shapes_blocks(Pn.new(), "stones", [5]), "ruins", "stones", [Pn.site(5.5, 5.5, floor, 1.0, 0)], 1.0, 3))
+    let k = Strata.Coord.key(0, ky, 0)
+    let got = Pq.place(f, 2, k, air(), key_ground(k, 0, 1.0))
+    (count_all(got, 5), match List.find(List.range(0, 32), fn y -> Strata.Chunk.get_or(got, 5, y, 5, 0) == 5) do
+      Some(y) -> y
+      None -> -1
+    end)
+  end
+  pfn floor_str(r : (Int, Int)) : String do match r do (n, y) -> int_to_string(n) ++ " from " ++ int_to_string(y) end end
+
   describe "Populate" do
     test "a ground field reads back what was supplied; a slot not supplied reads 0" do
       let f = frozen_of(Pn.field_ground(Pn.field_ground(Pn.new(), "alt", 0), "slope", 1))
@@ -1324,6 +1539,169 @@ mod Strata.Test.Populate do
       Test.assert_eq_str(block_odd_case(4611686018427387903), "", "a top of 2^62 - 1")
       Test.assert_eq_str(block_odd_case(4611686018427387902), "", "a top of 2^62 - 2")
       Test.assert_eq_str(block_odd_case(0 - 4611686018427387903 - 1), "", "a top of -2^62")
+    end
+
+    -- ── Sites ──────────────────────────────────────────────────────────────
+
+    test "adapt: on a 10 m ramp a site's radius is at its floor, its margin blends linearly back (the mean halfway, unchanged at the outer edge), and beyond it nothing changes" do
+      Test.assert_eq_str(ramp_case(1.0, 0, 0), "", "at 1 m")
+      Test.assert_eq_str(ramp_case(0.5, -23, 7), "", "at 0.5 m, off the chunk grid: columns are read at their centres")
+    end
+
+    test "adapt: an area is a larger area cropped to it, where margins overlap; every site in reach contributes; inside overlapping radii the nearest site's floor wins" do
+      let f = two_sites_pop()
+      let big = Pq.adapt(f, -16, -16, 96, 1.0, plane_heights(-16, -16, 96, 0.3, 0.1))
+      Test.assert_eq_str(crop_diff(Pq.adapt(f, 4, 6, 24, 1.0, plane_heights(4, 6, 24, 0.3, 0.1)), big, 4, 6, 24), "", "24 x 24 at (4, 6): both A and B in view")
+      Test.assert_eq_str(crop_diff(Pq.adapt(f, 17, 3, 9, 1.0, plane_heights(17, 3, 9, 0.3, 0.1)), big, 17, 3, 9), "", "9 x 9 at (17, 3): near B, A's margin and centre out of view")
+      Test.assert_eq_str(crop_diff(Pq.adapt(f, 14, 11, 3, 1.0, plane_heights(14, 11, 3, 0.3, 0.1)), big, 14, 11, 3), "", "3 x 3 between A and B, neither centre in view")
+      Test.assert_eq_str(crop_diff(Pq.adapt(f, 36, 30, 20, 1.0, plane_heights(36, 30, 20, 0.3, 0.1)), big, 36, 30, 20), "", "20 x 20 over P and Q")
+      -- column (15, 13): 5.1 m from A (radius 3) and 4.1 from B (radius 2), inside both margins
+      let c = (15 + 16) + 96 * (13 + 16)
+      let h = 0.3 *. 15.0 +. 0.1 *. 13.0
+      let both = blend_of(h, [site_a(), site_b()], 8.0, 15.5, 13.5)
+      Test.assert_true(near(NativeArray.get_f32(big, c), both, 0.0001), "(15, 13) is the blend of both: " ++ float_to_string(NativeArray.get_f32(big, c)) ++ " for " ++ float_to_string(both))
+      Test.assert_true(Math.abs(both -. blend_of(h, [site_a()], 8.0, 15.5, 13.5)) > 0.5, "and not A's alone")
+      Test.assert_true(Math.abs(both -. blend_of(h, [site_b()], 8.0, 15.5, 13.5)) > 0.5, "nor B's alone")
+      -- P (declared in the later layer) at x 40.5, Q at 46.5, both radius 5, along z 40.5
+      Test.assert_eq_str(float_to_string(NativeArray.get_f32(big, (42 + 16) + 96 * (40 + 16))), "1.", "(42, 40) is in both radii, nearer P: P's floor")
+      Test.assert_eq_str(float_to_string(NativeArray.get_f32(big, (45 + 16) + 96 * (40 + 16))), "9.", "(45, 40) is nearer Q: Q's floor")
+      Test.assert_eq_str(float_to_string(NativeArray.get_f32(big, (40 + 16) + 96 * (44 + 16))), "1.", "(40, 44) is in P's radius alone")
+      Test.assert_eq_str(float_to_string(NativeArray.get_f32(big, (70 + 16) + 96 * (70 + 16))), "20.", "C, far off, holds its floor")
+    end
+
+    test "adapted: 1 exactly where adapt changes the height or the column is inside a radius; the same from any area" do
+      let f = two_sites_pop()
+      let hs = plane_heights(-16, -16, 96, 0.3, 0.1)
+      let out = Pq.adapt(f, -16, -16, 96, 1.0, hs)
+      let marks = Pq.adapted(f, -16, -16, 96, 1.0)
+      let ss = [site_a(), site_b(), site_c(), site_p(), site_q()]
+      let inside = fn c -> List.any(ss, fn st -> site_d(st, col_xm(-16, 96, 1.0, c), col_zm(-16, 96, 1.0, c)) <= Pn.site_radius(st))
+      let changed = fn c -> NativeArray.get_f32(out, c) != NativeArray.get_f32(hs, c)
+      let wrong = List.filter(List.range(0, 9216), fn c -> (NativeArray.get_u8(marks, c) == 1) != (if changed(c) do true else inside(c) end))
+      Test.assert_eq_int(List.length(wrong), 0, "every column: " ++ string_join(List.map(wrong, fn c -> int_to_string(c % 96 - 16) ++ "," ++ int_to_string(c / 96 - 16) ++ " marked " ++ int_to_string(NativeArray.get_u8(marks, c)) ++ ", " ++ float_to_string(NativeArray.get_f32(hs, c)) ++ " to " ++ float_to_string(NativeArray.get_f32(out, c))), "; "))
+      Test.assert_true(List.length(List.filter(List.range(0, 9216), fn c -> if changed(c) do !inside(c) else false end)) > 300, "margin columns are marked")
+      Test.assert_true(List.length(List.filter(List.range(0, 9216), fn c -> NativeArray.get_u8(marks, c) == 0)) > 6000, "most are not")
+      Test.assert_eq_int(NativeArray.length_u8(marks), 9216, "one mark a column")
+      Test.assert_eq_int(crop_diff_u8(Pq.adapted(f, 4, 6, 24, 1.0), marks, 4, 6, 24), 0, "a 24 x 24 crop")
+      Test.assert_eq_int(crop_diff_u8(Pq.adapted(f, 14, 11, 3, 1.0), marks, 14, 11, 3), 0, "a 3 x 3 crop")
+    end
+
+    test "adapt and adapted with nothing to do or something wrong: the heights handed in come back, the marks are 0" do
+      let f = two_sites_pop()
+      let hs = plane_heights(0, 0, 8, 0.3, 0.1)
+      let short = NativeArray.make_f32(63, 4.0)
+      Test.assert_eq_int(NativeArray.length_f32(Pq.adapt(f, 0, 0, 8, 1.0, short)), 63, "heights not n * n long come back as they are")
+      Test.assert_true(NativeArray.get_f32(Pq.adapt(f, 6, 8, 8, 0.0, hs), 4 + 8 * 4) == NativeArray.get_f32(hs, 36), "a scale of 0: unchanged")
+      Test.assert_true(NativeArray.get_f32(Pq.adapt(f, 6, 8, 8, float_nan(), hs), 36) == NativeArray.get_f32(hs, 36), "a NaN scale: unchanged")
+      Test.assert_true(NativeArray.get_f32(Pq.adapt(f, 6, 8, 8, 1.0, hs), 36) != NativeArray.get_f32(hs, 36), "the same area at 1 m is adapted (A's radius)")
+      let none = frozen_of(Pn.layer_scatter(Pn.shapes_templates(Pn.new(), "s", [solid(1, 1, 1, 3, 1.0)]), "t", "s", Pn.rule(1.0, Nil, Nil, Nil), 4.0, 0.5, 1))
+      Test.assert_true(NativeArray.get_f32(Pq.adapt(none, 6, 8, 8, 1.0, hs), 36) == NativeArray.get_f32(hs, 36), "no site layer: unchanged")
+      Test.assert_eq_int(List.length(List.filter(List.range(0, 64), fn c -> NativeArray.get_u8(Pq.adapted(none, 6, 8, 8, 1.0), c) != 0)), 0, "and no marks")
+      Test.assert_eq_int(NativeArray.length_u8(Pq.adapted(f, 0, 0, 0, 1.0)), 0, "n of 0: no marks")
+      Test.assert_eq_int(List.length(List.filter(List.range(0, 64), fn c -> NativeArray.get_u8(Pq.adapted(f, 6, 8, 8, 0.0), c) != 0)), 0, "a scale of 0: no marks")
+    end
+
+    test "place: a site's template stands with its lowest row on the voxel above its floor, every footprint column with ground directly under it once tops are re-derived from adapt" do
+      Test.assert_eq_str(standing_case(1.0), "", "at 1 m (5 x 4 footprint)")
+      Test.assert_eq_str(standing_case(0.5), "", "at 0.5 m (10 x 8, even sides)")
+    end
+
+    test "place: a site across chunk borders in x and y, at 1 m, 0.5 m and 0.25 m and every quarter turn: each chunk holds its part, together the template once" do
+      List.fold_left([1.0, 0.5, 0.25], (), fn (_, s) -> List.fold_left([0, 1, 2, 3], (), fn (_, rot) -> Test.assert_eq_str(site_border_case(s, rot), "", "scale " ++ float_to_string(s) ++ " turn " ++ int_to_string(rot))))
+    end
+
+    test "place: the variant is the site's index mod the variants (0, 1, 2, 3 of three give 0, 1, 2, 0; -1 gives 2), for templates and blocks" do
+      let ss = List.map(List.zip(List.range(0, 6), [0, 1, 2, 3, -1, 5]), fn p -> match p do (i, ix) -> Pn.site(2.5 +. 4.0 *. int_to_float(i), 2.5, 10.0, 1.0, ix) end)
+      let ft = frozen_of(site_pop([solid(1, 1, 1, 21, 1.0), solid(1, 1, 1, 22, 1.0), solid(1, 1, 1, 23, 1.0)], ss, 1.0, 3))
+      let fb = frozen_of(Pn.layer_site(Pn.shapes_blocks(Pn.new(), "stones", [21, 22, 23]), "ruins", "stones", ss, 1.0, 3))
+      let k = Strata.Coord.key(0, 0, 0)
+      let read = fn c -> string_join(List.map(List.range(0, 6), fn i -> int_to_string(Strata.Chunk.get_or(c, 2 + 4 * i, 11, 2, -1))), ",")
+      Test.assert_eq_str(read(Pq.place(ft, 7, k, air(), key_ground(k, 0, 1.0))), "21,22,23,21,23,23", "templates: indices 0, 1, 2, 3, -1, 5")
+      Test.assert_eq_str(read(Pq.place(fb, 7, k, air(), key_ground(k, 0, 1.0))), "21,22,23,21,23,23", "blocks: the same")
+      Test.assert_eq_int(count_filled(Pq.place(fb, 7, k, air(), key_ground(k, 0, 1.0))), 6, "one block a site")
+    end
+
+    test "place: a site's height against a chunk's: floors 30.5 and -1 land in chunk y 0, 31 and -1.5 above and below; a 3-high template on -3 reaches it, on -3.5 not" do
+      Test.assert_eq_str(floor_str(floor_case(30.5, 1, 0)), "1 from 31", "floor 30.5: y 31")
+      Test.assert_eq_str(floor_str(floor_case(31.0, 1, 0)), "0 from -1", "floor 31: not in chunk y 0")
+      Test.assert_eq_str(floor_str(floor_case(31.0, 1, 1)), "1 from 0", "but in chunk y 1")
+      Test.assert_eq_str(floor_str(floor_case(-1.0, 1, 0)), "1 from 0", "floor -1: y 0")
+      Test.assert_eq_str(floor_str(floor_case(-1.5, 1, 0)), "0 from -1", "floor -1.5: not in chunk y 0")
+      Test.assert_eq_str(floor_str(floor_case(-1.5, 1, -1)), "1 from 31", "but in chunk y -1")
+      Test.assert_eq_str(floor_str(floor_case(-3.0, 3, 0)), "1 from 0", "3 high on -3: its top row at y 0")
+      Test.assert_eq_str(floor_str(floor_case(-3.5, 3, 0)), "0 from -1", "3 high on -3.5: below")
+      Test.assert_eq_str(floor_str(floor_case(29.0, 3, 0)), "2 from 30", "3 high on 29: two rows in chunk y 0")
+      Test.assert_eq_str(floor_str(floor_case(29.0, 3, 1)), "1 from 0", "and one in chunk y 1")
+      Test.assert_eq_str(floor_str(floor_case(3.99999999, 1, 0)), "1 from 5", "floor 3.99999999 is 4.0 as a 32-bit float: on y 5")
+      Test.assert_true(NativeArray.get_f32(Pq.adapt(frozen_of(site_pop([solid(1, 1, 1, 5, 1.0)], [Pn.site(5.5, 5.5, 3.99999999, 1.0, 0)], 1.0, 3)), 0, 0, 8, 1.0, NativeArray.make_f32(64, 0.0)), 5 + 8 * 5) == 4.0, "and adapt holds its column at 4.0, the top under it")
+      Test.assert_eq_str(floor_str(floor_block_case(30.5, 0)), "1 from 31", "a block on 30.5: y 31")
+      Test.assert_eq_str(floor_str(floor_block_case(31.0, 0)), "0 from -1", "a block on 31: not in chunk y 0")
+      Test.assert_eq_str(floor_str(floor_block_case(31.0, 1)), "1 from 0", "but in chunk y 1")
+      Test.assert_eq_str(floor_str(floor_block_case(-1.0, 0)), "1 from 0", "a block on -1: y 0")
+      Test.assert_eq_str(floor_str(floor_block_case(-1.5, 0)), "0 from -1", "a block on -1.5: not in chunk y 0")
+    end
+
+    test "place and adapt: a floor or centre that is huge, infinite or NaN traps nothing; the ordinary site beside it is placed" do
+      let big = 1000000000000000000000000000000.0
+      let odd = [Pn.site(5.5, 5.5, big, 1.0, 1), Pn.site(7.5, 5.5, 0.0 -. big, 1.0, 2), Pn.site(9.5, 5.5, float_nan(), 1.0, 3), Pn.site(11.5, 5.5, float_infinity(), 1.0, 4),
+                 Pn.site(13.5, 5.5, 4611686018427387904.0, 1.0, 5), Pn.site(15.5, 5.5, 0.0 -. 4611686018427387904.0, 1.0, 6), Pn.site(big, 5.5, 10.0, 1.0, 7), Pn.site(0.0 -. big, float_nan(), 10.0, 1.0, 8), Pn.site(float_infinity(), 5.5, 10.0, 1.0, 9)]
+      let f = frozen_of(site_pop([solid(1, 3, 1, 5, 1.0)], List.append(odd, [Pn.site(20.5, 20.5, 10.0, 1.0, 0)]), 2.0, 3))
+      List.fold_left([-1, 0, 1], (), fn (_, ky) ->
+        let k = Strata.Coord.key(0, ky, 0)
+        let got = Pq.place(f, 2, k, air(), key_ground(k, 0, 1.0))
+        Test.assert_eq_int(count_filled(got), if ky == 0 do 3 else 0 end, "chunk y " ++ int_to_string(ky) ++ ": the ordinary site's three voxels alone"))
+      let out = Pq.adapt(f, 0, 0, 32, 1.0, plane_heights(0, 0, 32, 0.3, 0.1))
+      Test.assert_eq_int(NativeArray.length_f32(out), 1024, "adapt answers")
+      Test.assert_true(NativeArray.get_f32(out, 20 + 32 * 20) == 10.0, "the ordinary site's floor")
+      Test.assert_eq_int(NativeArray.length_u8(Pq.adapted(f, 0, 0, 32, 1.0)), 1024, "adapted answers")
+    end
+
+    test "place: sites of one layer stamp in declared order, the later over the earlier, the same from both chunks; site templates not at the Ground's voxel are refused" do
+      let s0 = Pn.site(30.5, 8.5, 10.0, 4.0, 0)
+      let s1 = Pn.site(33.5, 9.5, 10.0, 4.0, 1)
+      let ts = [solid(6, 2, 6, 3, 1.0), solid(6, 2, 6, 4, 1.0)]
+      let f = frozen_of(site_pop(ts, [s0, s1], 2.0, 3))
+      let insts = [site_inst(s0, 0, 2, 3, 1.0), site_inst(s1, 1, 2, 3, 1.0)]
+      List.fold_left([Strata.Coord.key(0, 0, 0), Strata.Coord.key(1, 0, 0)], (), fn (_, k) ->
+        let got = Pq.place(f, 2, k, air(), key_ground(k, 0, 1.0))
+        Test.assert_eq_int(hash_of(got), hash_of(stamp_all(air(), k, ts, 1.0, insts)), "chunk " ++ key_str(k) ++ ": the first site, then the second over it")
+        Test.assert_eq_int(hash_of(Pq.place(f, 2, k, air(), world_ground(-20, -20, 100, 1.0))), hash_of(got), "the same from a larger Ground"))
+      let both = List.fold_left([Strata.Coord.key(0, 0, 0), Strata.Coord.key(1, 0, 0)], 0, fn (a, k) -> a + count_all(Pq.place(f, 2, k, air(), key_ground(k, 0, 1.0)), 4))
+      Test.assert_eq_int(both, 72, "the second site is whole")
+      let k = Strata.Coord.key(0, 0, 0)
+      let g = key_ground(k, 0, 0.5)
+      Test.assert_eq_int(hash_of(Pq.place(f, 2, k, air(), g)), hash_of(air()), "1 m templates in a 0.5 m world: refused")
+      let pl = Pq.plan(f)
+      Test.assert_true(has_msg(Pq.place_problems(pl, k, g, Pq.fields_with(pl, 2, g)), "fit_all"), "place_problems points at fit_all")
+      let off = world_ground(1, 0, 32, 1.0)
+      Test.assert_eq_int(hash_of(Pq.place(f, 2, k, air(), off)), hash_of(air()), "a Ground a column short of the chunk: refused")
+      Test.assert_true(has_msg(Pq.place_problems(pl, k, off, Pq.fields_with(pl, 2, off)), "the chunk needs x 0..31"), "place_problems says what is needed")
+    end
+
+    test "place: a site template's probabilities are drawn from Strata.Seed.next of the site's hash, the same in both chunks it spans" do
+      let t0 = solid(9, 6, 9, 3, 1.0)
+      let t = Strata.Template.with_yslice(List.fold_left(List.range(0, 486), t0, fn (acc, i) -> Strata.Template.with_prob(acc, i, 128)), 4, 100)
+      let st = Pn.site(31.5, 12.5, 10.0, 6.0, 17)
+      let f = frozen_of(site_pop([t], [st], 2.0, 4))
+      List.fold_left([Strata.Coord.key(0, 0, 0), Strata.Coord.key(1, 0, 0)], (), fn (_, k) ->
+        let got = Pq.place(f, 3, k, air(), key_ground(k, 0, 1.0))
+        Test.assert_eq_int(hash_of(got), hash_of(stamp_all(air(), k, [t], 1.0, [site_inst(st, 0, 3, 4, 1.0)])), "chunk " ++ key_str(k))
+        Test.assert_true(count_filled(got) > 60, "part of the stamp is drawn (" ++ int_to_string(count_filled(got)) ++ ")")
+        Test.assert_true(count_filled(got) < count_filled(stamp_all(air(), k, [t0], 1.0, [site_inst(st, 0, 3, 4, 1.0)])) * 3 / 4, "and not all of it"))
+    end
+
+    test "place: a site layer and a cover layer, in either declared order: cover never overwrites the site's voxels, the site overwrites cover" do
+      let st = Pn.site(16.5, 16.5, 10.0, 4.0, 0)
+      let p0 = Pn.shapes_blocks(Pn.shapes_templates(Pn.new(), "halls", [solid(5, 2, 5, 3, 1.0)]), "g", [7])
+      let sl = fn p -> Pn.layer_site(p, "ruins", "halls", [st], 2.0, 3)
+      let cv = fn p -> Pn.layer_cover(p, "grass", "g", Pn.rule(1.0, Nil, Nil, Nil), 3)
+      let k = Strata.Coord.key(0, 0, 0)
+      let g = flat_ground(0, 0, 32, 1.0, 10)
+      let a = Pq.place(frozen_of(cv(sl(p0))), 3, k, floor_chunk(10), g)
+      let b = Pq.place(frozen_of(sl(cv(p0))), 3, k, floor_chunk(10), g)
+      Test.assert_eq_int(count_layer(a, 3, 11), 25, "the hall's bottom row")
+      Test.assert_eq_int(count_layer(a, 7, 11), 1024 - 25, "cover on every other floor")
+      Test.assert_eq_int(hash_of(b), hash_of(a), "the same chunk in either order")
     end
   end
 end
