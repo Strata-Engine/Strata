@@ -731,6 +731,7 @@ boundary over the ground; their numbers are in `RESULTS.md`.
 | Module | Holds |
 |---|---|
 | `Strata.Coord` | chunk, local and world coordinates; chunk keys; voxel scale |
+| `Strata.Ballistics` | thrown and shot things: aim within a spread, lead a moving target, drag in air and water, where a step enters something, a bounce off a face |
 | `Strata.Blocks` | the block registry: definitions, state families, models |
 | `Strata.Chunk` | 32-cubed chunks in uniform, paletted and direct forms |
 | `Strata.Store` | the persistent chunk map |
@@ -739,12 +740,13 @@ boundary over the ground; their numbers are in `RESULTS.md`.
 | `Strata.Mesh` | the greedy mesher |
 | `Strata.Terrain` | the generator contract; a generator's stamps (its structure layer) |
 | `Strata.World` | loaded chunks, the edited-chunk cache, queued edits |
-| `Strata.Edit` | single, list, box and sphere edits; blasts |
+| `Strata.Edit` | single, list, box and sphere edits; blasts; `unsupported`: what an edit left hanging (plants over dug ground) |
 | `Strata.Stream` | loading around focus points; task-built chunks and meshes |
 | `Strata.Query` | raycast and swept box collision |
 | `Strata.Nav` | where a walker stands; A* paths over the voxels, nearest-by-test, straight lines, corners |
 | `Strata.Steer` | directions over the ground for a mover: seek, flee, arrive, keep apart, blend, turn |
 | `Strata.Fluid` | finite fluids: fall, run to a drop, stay level, sink, rest |
+| `Strata.Falls` | spray where still water (a generated river) steps down: found on a worker, thrown each frame |
 | `Strata.Slots`, `Strata.Render` | renderer slot bookkeeping; keeping the renderer in step with a stream |
 | `Strata.Model` | a model block's drawing geometry |
 | `Strata.Rig`, `Strata.Clip` | a jointed figure's description and part meshes; its animations |

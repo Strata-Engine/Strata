@@ -389,3 +389,20 @@ and the library's `forge test` builds them and prints their lines. So the
 compiler is no help in finding the prints a move like S37's left unwrapped.
 Workaround: a scan for effect calls not inside `Authority.must(` (the
 animation's merge used one; it found 31 in the viewer, none in `lib/`).
+
+## S41: a module alias is not private to its module in a test build
+
+`alias StrataViewer.Combat as Cb` in `viewer/lib/match.march` and
+`alias Strata.Coord as Cb` in `viewer/test/blast_test.march`: the test build
+resolved the test's `Cb.chunk_of` to `StrataViewer.Combat.chunk_of`, which
+clang then could not find ("use of undefined value"). The same family as
+S27. Workaround: aliases unique across the app (`Rules` in the match, `Cmb`
+in its test).
+
+## S42: `needs` cannot be a parameter name, nor `linear` (again)
+
+`fn unsupported(..., needs : Int -> Bool, ...)` reads as the capability
+keyword: "This `mod` has no matching `end`", reported at the module's
+first line. `linear` (S22) is refused as a parameter too. Workaround:
+`wants`, `steady`.
+
