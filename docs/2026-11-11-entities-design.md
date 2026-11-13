@@ -215,7 +215,11 @@ more than one chunk's side beyond that, so one pacing at the edge does not
 flicker between the two. With the cap on seen distance this leaves a whole
 loaded chunk beyond the farthest seen entity. A seen entity that would
 still step into a column the kernel has no blocks for (a chunk not yet
-generated) is held where it is for that tick. The test is distance, not the view cone, so turning the
+generated) is held where it is for that tick. (Amended while building:)
+seen flyers are not held: they fly on through unheld space as unseen ones
+do; and walkers are held at the top and bottom of the held box too, not
+only at its sides: one whose box would reach above or below the held chunks
+does not move that tick. The test is distance, not the view cone, so turning the
 camera changes nothing.
 
 **Becoming seen.** In order: the entity is set on the ground (below); it is

@@ -276,6 +276,14 @@ linear congruential generator in the test) asserted with `Test.assert_*`;
 existing properties (chunk, slots under random traffic, and others) are
 left as they are, and are worth rewriting the same way.
 
+Met again in the entity layer (entities Task 9): `Check.try_prop(fn n -> n > 100, 3)`
+answers `Ok(true)`, so a returned `false` never reaches `Check`. A property
+that raises does fail, with its counterexample shrunk:
+`fn n -> if n > 5 do panic("over five") else true end` reports 6. So a
+second workaround keeps shrinking: end the property in
+`if <cond> do true else panic("<what failed>") end`, as
+`entcheck/test/snapshot_test.march` does.
+
 ## S32: `by` cannot be a parameter name; `1.0e12` is not a number
 
 `pfn hits(fs, victim : Int, by : Int, ...)` is "I got stuck here" at `by`:
@@ -370,3 +378,31 @@ second arm (met writing `Strata.Population`'s readers). The same match
 with each arm on its own line parses. A one-line match with one arm
 (`match a do (x, _) -> x end`) is fine. Workaround: put each arm on its own
 line.
+
+## S40: on March main a bare `println` as a statement still builds and prints
+
+Met moving the animation onto March main (`07b58d065`). `println` answers
+`Result(Unit, CapError)` (S37), but one standing as a statement in a block,
+its result unused, compiles with no word and prints:
+`test/erosion_test.march` and `test/lattice_test.march` still have one each,
+and the library's `forge test` builds them and prints their lines. So the
+compiler is no help in finding the prints a move like S37's left unwrapped.
+Workaround: a scan for effect calls not inside `Authority.must(` (the
+animation's merge used one; it found 31 in the viewer, none in `lib/`).
+
+## S41: a module alias is not private to its module in a test build
+
+`alias StrataViewer.Combat as Cb` in `viewer/lib/match.march` and
+`alias Strata.Coord as Cb` in `viewer/test/blast_test.march`: the test build
+resolved the test's `Cb.chunk_of` to `StrataViewer.Combat.chunk_of`, which
+clang then could not find ("use of undefined value"). The same family as
+S27. Workaround: aliases unique across the app (`Rules` in the match, `Cmb`
+in its test).
+
+## S42: `needs` cannot be a parameter name, nor `linear` (again)
+
+`fn unsupported(..., needs : Int -> Bool, ...)` reads as the capability
+keyword: "This `mod` has no matching `end`", reported at the module's
+first line. `linear` (S22) is refused as a parameter too. Workaround:
+`wants`, `steady`.
+
