@@ -178,6 +178,174 @@ mod Strata.Test.World do
     end
   end
 
+  -- ── What a store reads: the change log, region values, release ──────────
+  pfn count_key(l : List(Strata.Coord.Key), k : Strata.Coord.Key) : Int do
+    List.fold_left(l, 0, fn (n, h) -> if Cd.key_eq(h, k) do n + 1 else n end)
+  end
+  pfn chunk_for(l : List((Strata.Coord.Key, Strata.Chunk.Chunk)), k : Strata.Coord.Key) : Option(Strata.Chunk.Chunk) do
+    match l do
+      Nil -> None
+      Cons((h, c), t) -> if Cd.key_eq(h, k) do Some(c) else chunk_for(t, k) end
+    end
+  end
+  pfn ops_for(l : List((Strata.Coord.Key, List(Strata.World.Op))), k : Strata.Coord.Key) : Option(List(Strata.World.Op)) do
+    match l do
+      Nil -> None
+      Cons((h, ops), t) -> if Cd.key_eq(h, k) do Some(ops) else ops_for(t, k) end
+    end
+  end
+  -- the tag of the first op, -1 if none
+  pfn first_tag(ops : List(Strata.World.Op)) : Int do
+    match ops do
+      Nil -> -1
+      Cons(o, _) ->
+        match Wd.op_fields(o) do
+          (tag, _) -> tag
+        end
+    end
+  end
+  -- the hash of the chunk region_values gives for k, -1 if none
+  pfn value_hash(w : Strata.World.World, k : Strata.Coord.Key) : Int do
+    match Wd.region_values(w, Cons(k, Nil)) do
+      (cs, _) ->
+        match chunk_for(cs, k) do
+          Some(c) -> C.hash(c)
+          None -> -1
+        end
+    end
+  end
+  -- the coarse chunk of coarse key p as the far field builds it on a worker
+  pfn far(w : Strata.World.World, p : Strata.Coord.Key) : Strata.Chunk.Chunk do
+    Wd.coarsen_over(Wd.registry(w), p, Strata.Terrain.run(Wd.terrain(w), p, Wd.seed(w)), Wd.edits_under(w, p))
+  end
+
+  describe "World change log" do
+    test "with the log off, edits, unloads and queued edits record nothing" do
+      let w = load(fresh(), 0, -1, 0)
+      let e = Ed.world(Ed.set_block(Ed.world(Ed.set_block(w, 5, -5, 5, 0)), 40, -5, 5, 0))
+      let u = Wd.unload(e, Cd.key(0, -1, 0))
+      match Wd.take_changes(u) do
+        (_, ks) -> Test.assert_eq_int(List.length(ks), 0, "nothing recorded while the log is off")
+      end
+    end
+    test "with the log on, an edit, a queued edit and an unload of an edited chunk each appear once; a second take is empty" do
+      let w = Wd.log_changes(load(load(fresh(), 0, -1, 0), 2, -1, 0), true)
+      -- a cell edit in loaded (0, -1, 0), twice; an edit queued for unloaded (1, -1, 0)
+      let e = Ed.world(Ed.set_block(Ed.world(Ed.set_block(Ed.world(Ed.set_block(w, 5, -5, 5, 0)), 6, -5, 5, 0)), 40, -5, 5, 0))
+      match Wd.take_changes(e) do
+        (e2, ks) ->
+          Test.assert_eq_int(List.length(ks), 2, "two keys")
+          Test.assert_eq_int(count_key(ks, Cd.key(0, -1, 0)), 1, "the loaded chunk's edits, once")
+          Test.assert_eq_int(count_key(ks, Cd.key(1, -1, 0)), 1, "the queued edit")
+          match Wd.take_changes(e2) do
+            (e3, ks2) ->
+              Test.assert_eq_int(List.length(ks2), 0, "a second take is empty")
+              -- an edited chunk unloaded; an untouched one unloaded
+              let u = Wd.unload(Wd.unload(e3, Cd.key(0, -1, 0)), Cd.key(2, -1, 0))
+              match Wd.take_changes(u) do
+                (_, ks3) ->
+                  Test.assert_eq_int(List.length(ks3), 1, "the unload of the edited chunk alone")
+                  Test.assert_eq_int(count_key(ks3, Cd.key(0, -1, 0)), 1, "once")
+              end
+          end
+      end
+    end
+    test "a chunk edited back to its generation is recorded, and turning the log off drops it" do
+      let w = Wd.log_changes(load(fresh(), 0, -1, 0), true)
+      match Wd.take_changes(Ed.world(Ed.set_block(w, 5, -5, 5, 0))) do
+        (e, _) ->
+          let back = Ed.world(Ed.set_block(e, 5, -5, 5, 1))
+          Test.assert_false(Wd.is_edited(back, Cd.key(0, -1, 0)), "edited back")
+          match Wd.take_changes(back) do
+            (_, ks) -> Test.assert_eq_int(count_key(ks, Cd.key(0, -1, 0)), 1, "recorded, so a store deletes its saved copy")
+          end
+          match Wd.take_changes(Wd.log_changes(Wd.log_changes(back, false), true)) do
+            (_, ks) -> Test.assert_eq_int(List.length(ks), 0, "off and on again: nothing kept from before")
+          end
+      end
+    end
+  end
+
+  describe "World region values" do
+    test "an edited loaded chunk compacted, a cached chunk, a queue in order, nothing for a chunk edited back" do
+      let w = load(load(load(fresh(), 0, -1, 0), 1, -1, 0), 2, -1, 0)
+      -- (0, -1, 0) edited and kept loaded; (1, -1, 0) edited and unloaded to the cache;
+      -- (2, -1, 0) edited back; (3, -1, 0) not loaded: two edits queued
+      let e1 = Ed.world(Ed.set_block(Ed.world(Ed.set_block(w, 5, -5, 5, 0)), 37, -5, 5, 0))
+      let e2 = Ed.world(Ed.set_block(Ed.world(Ed.set_block(e1, 69, -5, 5, 0)), 69, -5, 5, 1))
+      let e3 = Ed.world(Ed.set_block(Ed.world(Ed.fill_box(e2, 100, -9, 4, 101, -8, 5, 0)), 102, -5, 5, 0))
+      let v = Wd.unload(e3, Cd.key(1, -1, 0))
+      let keys = Cons(Cd.key(0, -1, 0), Cons(Cd.key(1, -1, 0), Cons(Cd.key(2, -1, 0), Cons(Cd.key(3, -1, 0), Cons(Cd.key(4, -1, 0), Nil)))))
+      match Wd.region_values(v, keys) do
+        (cs, qs) ->
+          Test.assert_eq_int(List.length(cs), 2, "two chunks")
+          match chunk_for(cs, Cd.key(0, -1, 0)) do
+            Some(c) ->
+              Test.assert_eq_int(C.get(c, 5, 27, 5), 0, "the loaded chunk with its edit")
+              Test.assert_eq_int(C.form(c), C.form(C.compact(c)), "compacted")
+            None -> Test.fail("the loaded edited chunk")
+          end
+          match chunk_for(cs, Cd.key(1, -1, 0)) do
+            Some(c) -> Test.assert_eq_int(C.get(c, 5, 27, 5), 0, "the cached chunk with its edit")
+            None -> Test.fail("the cached chunk")
+          end
+          Test.assert_true(Option.is_none(chunk_for(cs, Cd.key(2, -1, 0))), "nothing for a chunk edited back")
+          Test.assert_eq_int(List.length(qs), 1, "one queue")
+          match ops_for(qs, Cd.key(3, -1, 0)) do
+            Some(ops) ->
+              Test.assert_eq_int(List.length(ops), 2, "two queued edits")
+              Test.assert_eq_int(first_tag(ops), 1, "in the order they were made: the box first")
+            None -> Test.fail("the queue")
+          end
+      end
+    end
+  end
+
+  describe "World release" do
+    test "a written chunk is released for its coarse copy; one edited since the write is kept" do
+      let k = Cd.key(0, -1, 0)
+      let w = Ed.world(Ed.set_block(load(fresh(), 0, -1, 0), 5, -5, 5, 0))
+      let u = Wd.unload(w, k)
+      let h = value_hash(u, k)
+      Test.assert_eq_int(Wd.cache_size(u), 1, "cached")
+      Test.assert_eq_int(Wd.held_coarsened(u), 0, "no coarse copy yet")
+      let r = Wd.release_written(u, Cons((k, h), Nil))
+      Test.assert_eq_int(Wd.cache_size(r), 0, "released from the cache")
+      Test.assert_eq_int(Wd.held_coarsened(r), 1, "its coarse copy kept")
+      -- the chunk edited again after the write: loaded, edited, unloaded
+      let again = Wd.unload(Ed.world(Ed.set_block(load(u, 0, -1, 0), 6, -5, 5, 0)), k)
+      let kept = Wd.release_written(again, Cons((k, h), Nil))
+      Test.assert_eq_int(Wd.cache_size(kept), 1, "a stale hash keeps the chunk")
+      Test.assert_eq_int(Wd.held_coarsened(kept), 0, "and makes no coarse copy")
+      -- a loaded chunk is never released
+      let loaded = Wd.release_written(w, Cons((k, value_hash(w, k)), Nil))
+      Test.assert_true(Wd.is_loaded(loaded, k), "still loaded")
+      Test.assert_eq_int(Wd.held_coarsened(loaded), 0, "no coarse copy")
+      -- loading a released key generates it and drops its coarse copy
+      Test.assert_eq_int(Wd.held_coarsened(load(r, 0, -1, 0)), 0, "dropped when the chunk loads")
+    end
+    test "far field: the coarse chunks over a released edit equal the ones built before the release" do
+      let k = Cd.key(1, -1, 2)
+      let w0 = load_key(Wd.new(reg3(), flat_levels(), 7, 1.0), k)
+      -- a 6-cube carved, water poured in part of it, and a column of tall grass (a cross)
+      let w1 = Ed.world(Ed.fill_box(w0, 34, -20, 66, 39, -15, 71, 0))
+      let w2 = Ed.world(Ed.fill_box(w1, 34, -20, 66, 36, -19, 68, 9))
+      let w = Wd.unload(Ed.world(Ed.fill_box(w2, 40, -3, 70, 41, -1, 71, 10)), k)
+      let p1 = Cd.parent(k)
+      let p2 = Cd.parent(p1)
+      let before1 = far(w, p1)
+      let before2 = far(w, p2)
+      Test.assert_true(C.hash(before1) != C.hash(Strata.Terrain.run(Wd.terrain(w), p1, Wd.seed(w))), "the edit shows at level 1")
+      Test.assert_true(C.hash(before2) != C.hash(Strata.Terrain.run(Wd.terrain(w), p2, Wd.seed(w))), "and at level 2")
+      let r = Wd.release_written(w, Cons((k, value_hash(w, k)), Nil))
+      Test.assert_eq_int(Wd.cache_size(r), 0, "released")
+      Test.assert_eq_int(List.length(Wd.edits_under(r, p1)), 1, "the coarse copy is captured under level 1")
+      Test.assert_eq_int(C.hash(far(r, p1)), C.hash(before1), "level 1 equal after the release")
+      Test.assert_eq_int(C.hash(far(r, p2)), C.hash(before2), "level 2 equal after the release")
+      Test.assert_eq_int(C.hash(Wd.coarsen(r, p1)), C.hash(before1), "World.coarsen agrees")
+    end
+  end
+
   describe "World" do
     test "a block reads as air until its chunk is inserted" do
       let w = fresh()
