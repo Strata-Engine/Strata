@@ -13,7 +13,10 @@
 # it. Mode 12 is Strata.Template.blit alone, the template whole (972 voxels
 # visited a call). Modes 13 to 15 are sites: Strata.Populate.adapt_with over
 # 32 x 32 columns with two sites in reach, place_with with one site (its
-# template whole in the chunk), and adapted_with over mode 13's area. For each mode, a
+# template whole in the chunk), and adapted_with over mode 13's area. Mode
+# 16 is fields_with over a chunk and its pad (44 x 44) with one cover field
+# of radius 6 m over a scatter layer of one tree a 4 m cell; mode 17 the
+# same population without the cover field. For each mode, a
 # REPS=n run minus a REPS=0 run (the set-up alone), divided by n. CPU time is
 # user + system from /usr/bin/time -l; instructions are its counter.
 # Wall-clock time is not used.
@@ -21,7 +24,7 @@
 #   ./run.sh                 build with scripts/env.sh's March and measure
 #   NOBUILD=1 ./run.sh       measure the binary already in out/
 #   REPS=4000 ./run.sh       more calls (default 2000)
-#   MODES="4 5" ./run.sh     only these modes (default 1 to 15)
+#   MODES="4 5" ./run.sh     only these modes (default 1 to 17)
 #
 # scripts/env.sh exports MARCH_HOME so forge uses its March (march-main)
 # rather than the toolchain ~/.march/current names (March 0.5.0 on this
@@ -47,12 +50,13 @@ echo "march: $(march --version)"
 for c in main; do
   bin=out/populate_fields_$c
   [ -x "$bin" ] || { echo "no $bin"; continue; }
-  for m in ${MODES:-1 2 3 4 5 6 7 8 9 10 11 12 13 14 15}; do
+  for m in ${MODES:-1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17}; do
     case $m in 1) what="fields_with, 32 x 32, 4 fields, 3 layers";; 2) what="5 curve passes over 1024 columns";; 3) what="the same passes, no branch (v * 0.5)";;
       7) what="place_with, 2 cover layers, weights, surfaces";; 4) what="place_with, no layers";; 5) what="place_with, one cover layer 0.3/m2, flat floor";; 6) what="place_with, that layer, chunk no floor reaches";;
       8) what="place_with, scatter 9x12x9, 27 stamps, 1 m";; 9) what="place_with, the same fitted to 0.25 m";; 10) what="place_with, mode 8, no stamp meets the chunk";;
       11) what="place_with, cover + posts, chunk only posts reach";; 12) what="Strata.Template.blit, 9x12x9 whole";;
-      13) what="adapt_with, 32 x 32, two sites in reach";; 14) what="place_with, one site, 9x12x9 whole in chunk";; 15) what="adapted_with, 32 x 32, two sites in reach";; esac
+      13) what="adapt_with, 32 x 32, two sites in reach";; 14) what="place_with, one site, 9x12x9 whole in chunk";; 15) what="adapted_with, 32 x 32, two sites in reach";;
+      16) what="fields_with, 44 x 44, a 6 m cover field";; 17) what="fields_with, 44 x 44, no cover field";; esac
     a=$(measure "$bin" $m 0); b=$(measure "$bin" $m "$REPS")
     echo "$a $b" | awk -v c="$c" -v w="$what" -v r="$REPS" '{ printf "%-8s %-44s %10.1f %12.1f\n", c, w, ($3 - $1) * 1e6 / r, ($4 - $2) / r / 1e3 }'
   done

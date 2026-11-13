@@ -869,6 +869,81 @@ mod Strata.Test.Populate do
   end
   pfn floor_str(r : (Int, Int)) : String do match r do (n, y) -> int_to_string(n) ++ " from " ++ int_to_string(y) end end
 
+  -- ── Cover field helpers ───────────────────────────────────────────────────
+
+  -- region slot 7 of an n x n Ground at (x0, z0): 1 where world x is below 16 (negative x included)
+  pfn west_regions(x0 : Int, z0 : Int, n : Int) : NativeF32Arr do
+    List.fold_left(List.range(0, n * n), NativeArray.make_f32(n * n, 0.0), fn (a, i) -> if x0 + i % n < 16 do NativeArray.set_f32(a, i, 1.0) else a end)
+  end
+  pfn shade_ground(x0 : Int, z0 : Int, n : Int, scale : Float) : Strata.Populate.Ground do
+    Pq.with_field(world_ground(x0, z0, n, scale), 7, west_regions(x0, z0, n))
+  end
+  pfn shade_key_ground(k : Strata.Coord.Key, m : Int, scale : Float) : Strata.Populate.Ground do
+    shade_ground(32 * Strata.Coord.kx(k) - m, 32 * Strata.Coord.kz(k) - m, 32 + 2 * m, scale)
+  end
+  pfn trees_layer(p : Strata.Population.Pop, base : Float, west : Bool) : Strata.Population.Pop do
+    Pn.layer_scatter(p, "trees", "logs", Pn.rule(base, Nil, if west do ["west"] else Nil end, Nil), 2.0, 0.6, 41)
+  end
+  -- ferns (block 4, a cover layer) wherever some tree stands within 6 m: one tree gives shade 4 / 36 pi = 0.035, past the curve's step at 0.03
+  pfn ferns_layer(p : Strata.Population.Pop) : Strata.Population.Pop do
+    Pn.layer_cover(p, "ferns", "fronds", Pn.rule(1.0, [("shade", Pn.curve([(0.0, 0.0), (0.03, 1.0)]))], Nil, Nil), 42)
+  end
+  -- trees (block 9, a scatter layer of 2 m cells at `base`, in "west" only when west) and "shade", their cover within 6 m; ferns declared first when ferns_first
+  pfn shade_pop(base : Float, west : Bool, ferns_first : Bool) : Strata.Population.Frozen do
+    let p0 = Pn.field_cover(Pn.shapes_blocks(Pn.shapes_blocks(Pn.zone_regions(Pn.new(), "west", [1]), "logs", [9]), "fronds", [4]), "shade", "trees", 6.0)
+    frozen_of(if ferns_first do trees_layer(ferns_layer(p0), base, west) else ferns_layer(trees_layer(p0, base, west)) end)
+  end
+  -- shade by its definition: the instances whose base lies within r of the column's centre, over pi r^2 / cell^2, at most 1
+  pfn shade_ref(xs : List(Strata.Populate.PopInstance), xm : Float, zm : Float, r : Float, cell : Float) : Float do
+    let k = List.length(List.filter(xs, fn i ->
+      let dx = Pq.i_xm(i) -. xm
+      let dz = Pq.i_zm(i) -. zm
+      dx *. dx +. dz *. dz <= r *. r))
+    let v = int_to_float(k) /. (Math.pi() *. r *. r /. (cell *. cell))
+    if v > 1.0 do 1.0 else v end
+  end
+  -- the columns of g whose field "shade" is not shade_ref of the trees on g, as "x,z" (at most 5)
+  pfn shade_wrong(f : Strata.Population.Frozen, seed : Int, x0 : Int, z0 : Int, n : Int, s : Float) : String do
+    let g = shade_ground(x0, z0, n, s)
+    let t = Pq.fields(f, seed, g)
+    let xs = Pq.instances(f, seed, t, g, "trees")
+    let bad = List.filter(List.range(0, n * n), fn c -> !near(Pq.field_at(t, "shade", c), shade_ref(xs, col_xm(x0, n, s, c), col_zm(z0, n, s, c), 6.0, 2.0), 0.000001))
+    string_join(List.map(List.take(bad, 5), fn c -> int_to_string(x0 + c % n) ++ "," ++ int_to_string(z0 + c / n) ++ " reads " ++ float_to_string(Pq.field_at(t, "shade", c))), "; ")
+  end
+  -- chunk k (ky 0, air) from a Ground of m more columns a side against what the trees of a 40-column-padded Ground say:
+  -- above each column's top, 9 where a tree stands on it, else 4 where a tree's base is within 6 m of its centre, else air; nothing else
+  pfn ferns_case(f : Strata.Population.Frozen, seed : Int, k : Strata.Coord.Key, m : Int) : String do
+    let big = shade_key_ground(k, 40, 1.0)
+    let xs = Pq.instances(f, seed, Pq.fields(f, seed, big), big, "trees")
+    let got = Pq.place(f, seed, k, air(), shade_key_ground(k, m, 1.0))
+    let wx0 = 32 * Strata.Coord.kx(k)
+    let wz0 = 32 * Strata.Coord.kz(k)
+    let want = fn c ->
+      let wx = wx0 + c % 32
+      let wz = wz0 + c / 32
+      if List.any(xs, fn i -> if vox(Pq.i_xm(i), 1.0) == wx do vox(Pq.i_zm(i), 1.0) == wz else false end) do 9
+      else if shade_ref(xs, int_to_float(wx) +. 0.5, int_to_float(wz) +. 0.5, 6.0, 2.0) > 0.0 do 4 else 0 end end
+    let wants = List.map(List.range(0, 1024), want)
+    let bad = List.filter(List.zip(List.range(0, 1024), wants), fn cw -> match cw do (c, w) -> Strata.Chunk.get_or(got, c % 32, top_at(wx0 + c % 32, wz0 + c / 32) + 1, c / 32, -1) != w end)
+    let filled = List.length(List.filter(wants, fn w -> w > 0))
+    if !List.is_empty(bad) do int_to_string(List.length(bad)) ++ " columns differ, the first " ++ (match bad do
+      Cons((c, w), _) -> int_to_string(wx0 + c % 32) ++ "," ++ int_to_string(wz0 + c / 32) ++ " wants " ++ int_to_string(w) ++ " holds " ++ int_to_string(Strata.Chunk.get_or(got, c % 32, top_at(wx0 + c % 32, wz0 + c / 32) + 1, c / 32, -1))
+      Nil -> "" end)
+    else if count_filled(got) != filled do "the chunk holds " ++ int_to_string(count_filled(got)) ++ " voxels, " ++ int_to_string(filled) ++ " wanted"
+    else "" end end
+  end
+  -- field name of Table ta over an n-column Ground at (ax, az) against tb's at (bx, bz), at world columns x xa..xb, z za..zb: how many differ in their bits
+  pfn field_differ(ta : Strata.Populate.Table, ax : Int, az : Int, an : Int, tb : Strata.Populate.Table, bx : Int, bz : Int, bn : Int, name : String, xa : Int, xb : Int, za : Int, zb : Int) : Int do
+    List.fold_left(List.range(za, zb + 1), 0, fn (acc, z) ->
+      List.fold_left(List.range(xa, xb + 1), acc, fn (acc2, x) ->
+        if f32_of(Pq.field_at(ta, name, (x - ax) + an * (z - az))) == f32_of(Pq.field_at(tb, name, (x - bx) + bn * (z - bz))) do acc2 else acc2 + 1 end))
+  end
+  -- trees at base 0.15 everywhere and "bushes", a scatter layer of 3 x 2 x 3 solids (reach 1.5 m) on 3 m cells whose density is the shade
+  pfn bushes_pop() : Strata.Population.Frozen do
+    let p0 = Pn.field_cover(Pn.shapes_templates(Pn.shapes_blocks(Pn.new(), "logs", [9]), "shrubs", [solid(3, 2, 3, 6, 1.0)]), "shade", "trees", 6.0)
+    frozen_of(trees_layer(Pn.layer_scatter(p0, "bushes", "shrubs", Pn.rule(0.12, [("shade", Pn.curve([(0.0, 0.0), (1.0, 1.0)]))], Nil, Nil), 3.0, 0.5, 43), 0.15, false))
+  end
+
   describe "Populate" do
     test "a ground field reads back what was supplied; a slot not supplied reads 0" do
       let f = frozen_of(Pn.field_ground(Pn.field_ground(Pn.new(), "alt", 0), "slope", 1))
@@ -1755,6 +1830,149 @@ mod Strata.Test.Populate do
       Test.assert_eq_int(count_layer(a, 3, 11), 25, "the hall's bottom row")
       Test.assert_eq_int(count_layer(a, 7, 11), 1024 - 25, "cover on every other floor")
       Test.assert_eq_int(hash_of(b), hash_of(a), "the same chunk in either order")
+    end
+    test "cover field of a scatter layer: the trees whose base lies within the radius of the column's centre, over pi r^2 / cell^2, at most 1, at 1 m and 0.5 m and at negative columns" do
+      let f = shade_pop(1.0, true, false)
+      Test.assert_eq_str(shade_wrong(f, 5, -24, -24, 64, 1.0), "", "at 1 m over x, z -24..39")
+      Test.assert_eq_str(shade_wrong(f, 5, -40, -30, 96, 0.5), "", "at 0.5 m over x -40..55, z -30..65 (voxels)")
+      let sparse = shade_pop(0.1, false, false)
+      Test.assert_eq_str(shade_wrong(sparse, 6, -24, -24, 64, 1.0), "", "sparse trees everywhere, no clamp")
+      Test.assert_eq_str(shade_wrong(sparse, 6, -40, -30, 96, 0.5), "", "and at 0.5 m")
+    end
+
+    test "cover field of a scatter layer in the west half only: above 0.5 well inside it, 0 more than the radius beyond, between across the edge" do
+      let f = shade_pop(1.0, true, false)
+      let g = shade_ground(-24, -24, 64, 1.0)
+      let t = Pq.fields(f, 5, g)
+      let at = fn (x, z) -> Pq.field_at(t, "shade", (x + 24) + 64 * (z + 24))
+      let zs = List.range(-16, 31)
+      Test.assert_true(List.all(zs, fn z -> List.all(List.range(-16, 9), fn x -> at(x, z) > 0.5)), "x -16..8: above 0.5")
+      Test.assert_true(List.all(List.range(-24, 40), fn z -> List.all(List.range(22, 40), fn x -> at(x, z) == 0.0)), "x 22 and on: no tree base within 6 m, 0")
+      Test.assert_true(List.all(zs, fn z -> if at(17, z) > 0.0 do at(17, z) < 1.0 else false end), "x 17: between 0 and 1")
+      Test.assert_true(List.all(zs, fn z -> at(17, z) < at(12, z)), "and less than at x 12")
+    end
+
+    test "a cover layer reading the trees' shade places ferns exactly where a tree's base is within 6 m, nothing far from them; trees keep their own columns" do
+      let f = shade_pop(1.0, true, false)
+      List.fold_left([(0, 0), (-1, 0), (0, -1), (-1, -1)], (), fn (_, q) ->
+        match q do
+          (kx, kz) -> Test.assert_eq_str(ferns_case(f, 5, Strata.Coord.key(kx, 0, kz), 40), "", "chunk " ++ int_to_string(kx) ++ ", " ++ int_to_string(kz))
+        end)
+      let sparse = shade_pop(0.1, false, false)
+      Test.assert_eq_str(ferns_case(sparse, 6, Strata.Coord.key(0, 0, 0), 40), "", "sparse trees")
+      Test.assert_eq_str(ferns_case(sparse, 6, Strata.Coord.key(-2, 0, 1), 40), "", "sparse trees, chunk -2, 1")
+    end
+
+    test "pad includes the cover radius: 6 columns at 1 m, 12 at 0.5 m for blocks; a scatter layer reading the shade adds its own reach: 3 + 6" do
+      Test.assert_eq_int(Pq.pad(shade_pop(1.0, true, false), 1.0), 6, "ceil(6 / 1) beyond the trees' own pad of 1")
+      Test.assert_eq_int(Pq.pad(shade_pop(1.0, true, false), 0.5), 12, "ceil(6 / 0.5)")
+      Test.assert_eq_int(Pq.plan_pad(Pq.plan(shade_pop(1.0, true, false)), 1.0), 6, "plan_pad agrees")
+      Test.assert_eq_int(Pq.pad(bushes_pop(), 1.0), 9, "bushes reach 1.5 m (pad 3) and read shade of 6 m at their own columns")
+      Test.assert_eq_int(Pq.pad(bushes_pop(), 0.5), 16, "at 0.5 m: 4 + 12")
+    end
+
+    test "a chunk's ferns and shade are the same from a Ground of exactly the chunk and pad as from a larger one" do
+      let f = shade_pop(0.1, false, false)
+      let m = Pq.pad(f, 1.0)
+      List.fold_left([(0, 0), (-1, 0), (1, -2)], (), fn (_, q) ->
+        match q do
+          (kx, kz) ->
+            let k = Strata.Coord.key(kx, 0, kz)
+            Test.assert_eq_str(ferns_case(f, 6, k, m), "", "chunk " ++ int_to_string(kx) ++ ", " ++ int_to_string(kz) ++ " from the exact pad")
+            Test.assert_eq_int(hash_of(Pq.place(f, 6, k, air(), shade_key_ground(k, m, 1.0))), hash_of(Pq.place(f, 6, k, air(), shade_key_ground(k, 40, 1.0))), "the same chunk from either Ground")
+            let x0 = 32 * kx
+            let z0 = 32 * kz
+            Test.assert_eq_int(field_differ(Pq.fields(f, 6, shade_key_ground(k, m, 1.0)), x0 - m, z0 - m, 32 + 2 * m, Pq.fields(f, 6, shade_key_ground(k, 40, 1.0)), x0 - 40, z0 - 40, 112, "shade", x0, x0 + 31, z0, z0 + 31), 0, "shade over the chunk's columns, bit for bit")
+            Test.assert_true(field_differ(Pq.fields(f, 6, shade_key_ground(k, m, 1.0)), x0 - m, z0 - m, 32 + 2 * m, Pq.fields(f, 6, shade_key_ground(k, 40, 1.0)), x0 - 40, z0 - 40, 112, "shade", x0 - m, x0 + 31 + m, z0 - m, z0 + 31 + m) > 0, "the pad's own columns do miss trees beyond it")
+        end)
+      Test.assert_eq_int(hash_of(Pq.place(f, 6, Strata.Coord.key(0, 0, 0), air(), shade_key_ground(Strata.Coord.key(0, 0, 0), m - 1, 1.0))), hash_of(air()), "one column short: refused")
+    end
+
+    test "two neighbouring chunks: the shade on each side of their shared border, each from its own exact Ground, is that of one exact Ground over both" do
+      let f = shade_pop(0.1, false, false)
+      let m = Pq.pad(f, 1.0)
+      let n = 32 + 2 * m
+      let ta = Pq.fields(f, 6, shade_key_ground(Strata.Coord.key(0, 0, 0), m, 1.0))
+      let tb = Pq.fields(f, 6, shade_key_ground(Strata.Coord.key(1, 0, 0), m, 1.0))
+      let tab = Pq.fields(f, 6, shade_ground(0 - m, 0 - m, 64 + 2 * m, 1.0))
+      Test.assert_eq_int(field_differ(ta, 0 - m, 0 - m, n, tab, 0 - m, 0 - m, 64 + 2 * m, "shade", 30, 31, 0, 31), 0, "x 30 and 31 from chunk 0's Ground")
+      Test.assert_eq_int(field_differ(tb, 32 - m, 0 - m, n, tab, 0 - m, 0 - m, 64 + 2 * m, "shade", 32, 33, 0, 31), 0, "x 32 and 33 from chunk 1's Ground")
+      Test.assert_true(List.length(List.filter(List.range(0, 32), fn z -> Pq.field_at(tb, "shade", m + n * (z + m)) > 0.0)) > 10, "shade is not 0 along x 32")
+      Test.assert_eq_int(hash_of(Pq.place(f, 6, Strata.Coord.key(1, 0, 0), air(), shade_key_ground(Strata.Coord.key(1, 0, 0), m, 1.0))), hash_of(Pq.place(f, 6, Strata.Coord.key(1, 0, 0), air(), shade_ground(0 - m, 0 - m, 64 + 2 * m, 1.0))), "chunk 1's ferns from either")
+      Test.assert_eq_int(hash_of(Pq.place(f, 6, Strata.Coord.key(0, 0, 0), air(), shade_key_ground(Strata.Coord.key(0, 0, 0), m, 1.0))), hash_of(Pq.place(f, 6, Strata.Coord.key(0, 0, 0), air(), shade_ground(0 - m, 0 - m, 64 + 2 * m, 1.0))), "chunk 0's ferns from either")
+    end
+
+    test "a scatter layer reading the shade: its chunk and the shade at its instances' columns are the same from the exact pad (reach and radius add up)" do
+      let f = bushes_pop()
+      let m = Pq.pad(f, 1.0)
+      List.fold_left([(0, 0), (-1, 0), (0, -1), (2, 1)], (), fn (_, q) ->
+        match q do
+          (kx, kz) ->
+            let k = Strata.Coord.key(kx, 0, kz)
+            let x0 = 32 * kx
+            let z0 = 32 * kz
+            let te = Pq.fields(f, 7, shade_key_ground(k, m, 1.0))
+            let tb = Pq.fields(f, 7, shade_key_ground(k, 40, 1.0))
+            Test.assert_eq_int(field_differ(te, x0 - m, z0 - m, 32 + 2 * m, tb, x0 - 40, z0 - 40, 112, "shade", x0 - 3, x0 + 34, z0 - 3, z0 + 34), 0, "shade bit for bit over the chunk and 3 columns, chunk " ++ int_to_string(kx) ++ ", " ++ int_to_string(kz))
+            Test.assert_eq_int(hash_of(Pq.place(f, 7, k, air(), shade_key_ground(k, m, 1.0))), hash_of(Pq.place(f, 7, k, air(), shade_key_ground(k, 40, 1.0))), "the same chunk, chunk " ++ int_to_string(kx) ++ ", " ++ int_to_string(kz))
+        end)
+      let big = shade_ground(-40, -40, 112, 1.0)
+      let bs = Pq.instances(f, 7, Pq.fields(f, 7, big), big, "bushes")
+      Test.assert_true(List.length(bs) > 30, "bushes stand where trees do (" ++ int_to_string(List.length(bs)) ++ ")")
+    end
+
+    test "run order: the trees run before the ferns that read them, though declared after; the ferns' cover is the same either way" do
+      let a = shade_pop(1.0, true, true)
+      Test.assert_eq_str(string_join(Pn.layer_names(a), ","), "trees,ferns", "trees first")
+      Test.assert_eq_str(ferns_case(a, 5, Strata.Coord.key(0, 0, 0), 40), "", "ferns declared first")
+      Test.assert_eq_str(shade_wrong(a, 5, -24, -24, 64, 1.0), "", "shade declared before either")
+    end
+
+    test "cover field of a site layer: 1 where a site's centre is within its radius plus the cover radius of the column's centre, else 0" do
+      let sa = Pn.site(10.5, -4.5, 2.0, 3.0, 0)
+      let sb = Pn.site(-20.0, 30.0, 2.0, 1.0, 1)
+      let p0 = Pn.field_cover(Pn.shapes_blocks(Pn.new(), "halls", [3]), "near_ruin", "ruins", 2.0)
+      let f = frozen_of(Pn.layer_site(p0, "ruins", "halls", [sa, sb], 2.0, 3))
+      List.fold_left([(1.0, -32, -32, 80), (0.5, -64, -20, 100)], (), fn (_, q) ->
+        match q do
+          (s, x0, z0, n) ->
+            let t = Pq.fields(f, 1, bare(x0, z0, n, s, 0))
+            let want = fn c -> if site_d(sa, col_xm(x0, n, s, c), col_zm(z0, n, s, c)) <= 5.0 do 1.0 else (if site_d(sb, col_xm(x0, n, s, c), col_zm(z0, n, s, c)) <= 3.0 do 1.0 else 0.0 end) end
+            Test.assert_eq_int(List.length(List.filter(List.range(0, n * n), fn c -> Pq.field_at(t, "near_ruin", c) != want(c))), 0, "every column at scale " ++ float_to_string(s))
+            Test.assert_true(List.length(List.filter(List.range(0, n * n), fn c -> want(c) > 0.0)) > 30, "and some are near")
+        end)
+      Test.assert_eq_int(Pq.pad(f, 1.0), 1, "a site layer adds no pad")
+    end
+
+    test "cover field of a cover layer: its density times the column's area, at most 1, with no enumeration; it adds no pad" do
+      let p0 = Pn.field_cover(Pn.shapes_blocks(Pn.zone_regions(Pn.new(), "west", [1]), "fronds", [4]), "mossy", "moss", 3.0)
+      let moss = fn base -> frozen_of(Pn.layer_cover(p0, "moss", "fronds", Pn.rule(base, Nil, ["west"], Nil), 5))
+      let g = shade_ground(-8, -8, 40, 0.5)
+      let t = Pq.fields(moss(0.5), 1, g)
+      Test.assert_eq_int(fields_match(t, "mossy", fn c -> if -8 + c % 40 < 16 do 0.125 else 0.0 end, 0, 1600), -1, "0.5 per square metre on a quarter of a square metre in the west, 0 elsewhere")
+      let t7 = Pq.fields(moss(7.0), 1, shade_ground(-8, -8, 40, 1.0))
+      Test.assert_eq_int(fields_match(t7, "mossy", fn c -> if -8 + c % 40 < 16 do 1.0 else 0.0 end, 0, 1600), -1, "7 per square metre at 1 m is 1")
+      Test.assert_eq_int(Pq.pad(moss(0.5), 1.0), 1, "no pad beyond the one column every population has")
+    end
+    test "a base exactly the radius from a column's centre counts: trees on every column centre (1 m cells, jitter 0) give 113 within 6 m, Gauss's count with its rim" do
+      let p0 = Pn.field_cover(Pn.shapes_blocks(Pn.new(), "logs", [9]), "shade", "trees", 6.0)
+      let f = frozen_of(Pn.layer_scatter(p0, "trees", "logs", Pn.rule(1.0, Nil, Nil, Nil), 1.0, 0.0, 41))
+      let t = Pq.fields(f, 3, bare(-20, -20, 40, 1.0, 0))
+      let c = 20 + 40 * 20
+      Test.assert_true(near(Pq.field_at(t, "shade", c), 113.0 /. (36.0 *. Math.pi()), 0.000001), "113 / 36 pi at column (0, 0), not 109 (the rim left out): " ++ float_to_string(Pq.field_at(t, "shade", c)))
+    end
+
+    test "a layer whose weights zone bands the shade needs the radius too: pad 6, and its chunk is the same from the exact pad" do
+      let p0 = Pn.zone_band(Pn.field_cover(Pn.shapes_blocks(Pn.shapes_blocks(Pn.new(), "logs", [9]), "stones", [5, 6]), "shade", "trees", 6.0), "shady", "shade", 0.12, 2.0)
+      let p1 = Pn.weights(p0, "stones", "shady", [0.0, 1.0])
+      let f = frozen_of(Pn.layer_cover(trees_layer(p1, 0.1, false), "rocks", "stones", Pn.rule(0.5, Nil, Nil, Nil), 44))
+      Test.assert_eq_int(Pq.pad(f, 1.0), 6, "the rocks' variant reads shade at their own columns")
+      List.fold_left([(0, 0), (-1, 1)], (), fn (_, q) ->
+        match q do
+          (kx, kz) ->
+            let k = Strata.Coord.key(kx, 0, kz)
+            Test.assert_eq_int(hash_of(Pq.place(f, 6, k, air(), shade_key_ground(k, 6, 1.0))), hash_of(Pq.place(f, 6, k, air(), shade_key_ground(k, 40, 1.0))), "chunk " ++ int_to_string(kx) ++ ", " ++ int_to_string(kz))
+        end)
     end
   end
 end
