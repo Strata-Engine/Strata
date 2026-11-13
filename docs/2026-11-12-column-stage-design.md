@@ -1,9 +1,12 @@
 # The column stage: making a chunk column's shared work once
 
 12 November 2026. A design for the first restructuring in
-`docs/2026-11-12-chunk-performance-findings.md`. Not started. The owner
-chose shape A on 12 November; the plan is
-`docs/2026-11-12-column-stage-plan.md`.
+`docs/2026-11-12-chunk-performance-findings.md`. The owner chose shape A on
+12 November; it was built on 13 November as
+`docs/2026-11-12-column-stage-plan.md`, and what it measured is in the
+findings' second addendum (a full chunk 3.29 ms one by one, 1.55 ms in one
+call; the viewer at cap 2). Shape B is not planned: the cases counted leave
+it little to add.
 
 ## The problem
 

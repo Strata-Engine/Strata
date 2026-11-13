@@ -469,6 +469,61 @@ which current March requires, so they no longer build with 0.5.0 or
 1a4251bc8; `bench/chunk_stages/build.sh` builds one binary with the
 compiler `scripts/env.sh` names.
 
+## Addendum, 13 November: the column stage (restructuring 1, shape A)
+
+Done as `docs/2026-11-12-column-stage-plan.md`: a generator may carry a
+column function (`Strata.Terrain.run_column`), the island's makes what
+depends on the chunk column once for the keys it is given, and
+`Strata.Stream.with_batch(config, cap)` puts up to `cap` keys of one column
+that start in the same tick into one task. No chunk, stored hash or golden
+changed.
+
+Per column, over the 200 chunk columns (4.9 chunks generated in full each,
+`bench/chunk_stages` stages 33 and 34, March 07b58d065):
+
+| | CPU ms a column | CPU ms a full chunk | instructions a full chunk |
+|---|---:|---:|---:|
+| the chunks one by one (`Strata.Terrain.run`) | 16.13 | 3.29 | 57.1 M |
+| in one call (`run_column`) | 7.63 | 1.55 | 28.0 M |
+
+The viewer's start-up (11 971 chunks with four far levels, to settled;
+whole-run figures, so meshing and the two frames are in them; two to six
+runs each, load average 30 to 60):
+
+| cap | CPU s | instructions | wall s | quads |
+|---:|---:|---:|---:|---:|
+| 1 | 48 to 52 | 580 x 10^9 | 13.4 to 14.2 | 2 714 750 |
+| 2 | 37 to 39 | 516 x 10^9 | 11.6 to 13.4 | 2 714 750 |
+| 4 | 30 to 34 | 487 x 10^9 | 15.2 to 18.3 | 2 714 750 |
+| 8 | 31 to 32 | 486 x 10^9 | 15.2 to 16.3 | 2 714 750 |
+
+The viewer streams at cap 2 (`STRATA_BATCH` overrides it): a quarter less
+CPU and no slower by the clock. Cap 4 takes a third off the CPU but settles
+the start-up about a fifth slower: a tick starts the same number of keys as
+before, so a four-key batch runs on one worker where four keys ran on four,
+and the start-up loop spins through ticks without waiting for frames. In
+frame-paced play that should not cost anything; it was not measured (no
+flight was timed, and no soak: the load average was never under 8).
+Starting `workers` tasks a tick instead of `workers` keys was tried and
+rejected: at cap 4 the start-up took 28 s, 708 x 10^9 instructions and 20%
+more quads, because more keys start than a tick applies and coarse chunks
+load before the finer level is whole.
+
+How many keys of a column start together was counted first (stage 32): 3.4
+full chunks a column at level 0 at start-up, 2.5 in flight toward the
+coast, none in the layer a climb adds, about 1.1 at levels 1 and 2. So
+shape B (a column cache in the stream) would add little for the cases
+counted; a descent was not counted.
+
+Two faults were met on the way and are worth knowing. A batch at first put
+the keys it passed over back into the queue reversed, which left the world
+identical but meshed 97 top-level chunks where 66 should be; an island test
+on meshes per level catches it. And the spawning thread read the batch's
+list after starting the task that captured it, which crashed the stream
+tests in 6 of 14 runs: a March memory-safety bug, reduced in
+`bench/march/task_shared_list` (a list captured by a task and still read by
+its spawner: 19 of 20 runs die) and drafted as a GAPS entry.
+
 ## To reproduce
 
 ```sh

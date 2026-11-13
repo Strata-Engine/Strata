@@ -134,6 +134,16 @@ Inside: `GenTask` becomes `GenTask(List((Key, Int)), Task(List(Made)))`, each ke
 
 ---
 
+## As done (13 November)
+
+All five tasks, with these departures, each recorded where it was made:
+
+- **Task 1** counted batch sizes from the stream's boxes and the early-outs (`bench/chunk_stages` stage 32) instead of driving a stream: the queue is not public, and a batch is by construction the keys of a column that become wanted at once. No `bench/column_batches/`.
+- **Task 2** as written. The viewer's column half is `island_shared` (`island_col` was taken).
+- **Task 4.** A stale coarse key is not forced into a batch of its own: every key of a batch carries its own stamp and its own fine chunks to coarsen. The existing suite was not also run at cap 4; the same-world tests at caps 1, 4 and 8 and an island test on meshes per level stand in. The demo is left at one key a task (its generator has no column function). `room` counts keys, as planned; counting tasks was tried and rejected (see the findings).
+- **Task 5.** The cap is 2, not "the least start-up CPU": cap 4 costs less CPU but more time by the clock at start-up. No soak and no longest-task figure: the load average was never under 8. `RESULTS.md` and the ledgers were not edited (other sessions hold them); the numbers are in the findings.
+
+
 ## After this plan
 
 Not part of it, in the order the findings suggest: the river damp bucketed by atlas cell (0.57 ms a column), the lake-rim mask (0.20 ms), the detail noise as one `field2` call; then shape B if Task 5 says so.
