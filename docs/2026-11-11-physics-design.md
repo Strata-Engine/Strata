@@ -137,9 +137,10 @@ A body holds:
 - its kind: dynamic or driven;
 - whether it is asleep.
 
-A body's voxels are the world's size: a body in a 10 cm world has 10 cm
-voxels. Its blocks are ordinary registry blocks, so it is textured and lit
-as they are.
+A body's voxels are the world's size unless it is added fine: a body in a
+10 cm world has 10 cm voxels, and a fine body has voxels of the world's
+size divided by 2, 4 or 8 (§11). Its blocks are ordinary registry blocks,
+so it is textured and lit as they are.
 
 Bodies live in `Strata.Physics`, a value the game keeps beside its stream
 and fluid, holding every body and the work in flight. A body is named by an
@@ -365,6 +366,9 @@ aiming at and walking on rubble work with the calls a game already uses.
 
     Strata.Physics.new(registry, config)          -- gravity, step rate, support on or off, anchor depth, caps
     Strata.Physics.add(p, grid, x, y, z, rot, kind) -- a body from blocks the game supplies; returns (p, id)
+    Strata.Physics.add_fine(p, grid, k, x, y, z, rot, kind) -- a body of voxels 1/k of the world's (k 2, 4 or 8)
+    Strata.Physics.pinned()                       -- the kind of a body fixed until it is no longer held
+    Strata.Physics.cut(p, x, y, z, r)             -- take body voxels within r metres, at the next step
     Strata.Physics.remove(p, id)
     Strata.Physics.to_blocks(p, stream, id)       -- write a body back into the grid at its nearest aligned spot
     Strata.Physics.wake(p, outcome)               -- hand an edit the game made to the next step
@@ -377,6 +381,51 @@ aiming at and walking on rubble work with the calls a game already uses.
     Strata.Physics.contacts(p, id)                -- a driven body's contacts last step
     Strata.Physics.marks(p)                       -- the cells bodies fill, for Strata.Fluid.begin
     Strata.Render.bodies(r, p, t)                 -- keep the renderer in step with the bodies
+
+### 11. Fine bodies and pinned bodies
+
+Added 2026-11-12, approved by the owner ("Yes, as recommended") for the
+demo game's trees: generator trees built at 0.25 m standing in the 1 m
+island as bodies, colliding with the walker and shots, coming down when
+burned or cut, and breaking.
+
+**Fine bodies.** A body may have voxels of the world's size divided by 2, 4
+or 8 (`add_fine`). Nothing else divides: the cells of a fine grid line up
+with the world's. Everything that reads a body's grid reads it at the
+body's own size: its mass and inertia (density × its voxel volume), its
+surface corners, how many sub-steps it needs (half of its own voxel a
+sub-step), its pieces when it breaks, its mesh and its rows for the rays.
+Contacts already test each body's corners against the other's grid, the
+world's or another body's; a corner is placed in that grid at that grid's
+voxel size. Body against body is tested both ways, so a coarse face whose
+corners straddle a thin fine trunk is still caught by the trunk's own
+corners. A fine body never becomes blocks: `to_blocks` leaves it, the cap
+passes it over, and a fine fragment that comes to rest turns to spray
+rather than being written. A fine body at rest stays a sleeping body.
+(Resampling a fine body into world cells is left as a possible later
+option for debris.)
+
+**Pinned bodies.** A third kind beside dynamic and driven: a pinned body is
+fixed and asleep. It is a wall to every other body and to `drive`; pushes
+and touches do not move it. It is freed (becomes dynamic and wakes) when
+it is no longer held: a pinned body is held while any of its colliding
+voxels lies on a colliding world cell (the cell under the voxel's bottom
+face). This is checked when an edit handed by `wake` touches its bounds,
+and when it is cut.
+
+**Cutting.** `cut(p, x, y, z, r)` takes, at the next step, every voxel of
+every non-driven body whose centre lies within r metres of (x, y, z), as
+a fire or a blade would. A body left empty is removed. A body left in more
+than one face-connected part keeps its id for one part and the rest become
+new bodies: for a pinned body, the part kept is a held one if any part is
+held, and the others become dynamic; otherwise the largest part is kept.
+Each part moves with the velocity of where it was. Cut voxels are reported
+as one event of kind 6 (where, voxels).
+
+Pinned bodies do not break from being struck (only moving bodies are
+judged), and do not count toward the awake cap. A field of 30 to 60 pinned
+trees costs the step nothing while nothing moves near them; what they cost
+the rays is measured (Task 10 and the trees scene), not assumed.
 
 ## Budget and targets
 
