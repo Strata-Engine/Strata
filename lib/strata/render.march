@@ -15,16 +15,20 @@ mod Strata.Render do
 
   alias Strata.Slots as Sr2
 
-  -- the slot table, an empty mesh to stand in where one is required, the rig ids whose meshes the renderer holds, and the keys of the body parts it has
-  -- been given (kept here so that `bodies` need not look through every slot each frame: a streamed world holds thousands, a handful of them bodies')
-  type Render = Render(Strata.Slots.Slots, Strata.Mesh.Meshed, List(Int), List(Strata.Coord.Key))
+  -- the slot table, an empty mesh to stand in where one is required, the rig ids whose meshes the renderer holds
+  -- with the figure world's generation they were finished in (Strata.Anim.generation: a reopened world starts its rig ids at 0 again),
+  -- and the keys of the body parts it has been given (kept here so that `bodies` need not look through every slot each frame: a streamed
+  -- world holds thousands, a handful of them bodies')
+  type Render = Render(Strata.Slots.Slots, Strata.Mesh.Meshed, (Int, List(Int)), List(Strata.Coord.Key))
+
 
   pfn no_mesh() : Strata.Mesh.Meshed do
     Strata.Mesh.build(Strata.Blocks.empty(), Strata.Mesh.around_from(fn (dx, dy, dz) -> Strata.Chunk.uniform(0)))
   end
 
   doc "A renderer-side table of [capacity] chunk slots. The shim holds 16384."
-  fn new(capacity : Int) : Render do Render(Sr2.new(capacity), no_mesh(), Nil, Nil) end
+  fn new(capacity : Int) : Render do Render(Sr2.new(capacity), no_mesh(), (-1, Nil), Nil) end
+
 
   doc "Chunk slots in use."
   fn used(r : Render) : Int do match r do Render(sl, _, _, _) -> Sr2.used(sl) end end
@@ -38,7 +42,7 @@ mod Strata.Render do
 
   doc "The light volume's pool: (pages in use, pages it has, chunks that found no page). A chunk whose voxels are all one class takes no page; a chunk that finds none is seen by light rays as outside the world."
   fn light_pages() : (Int, Int, Int) do
-    (float_to_int(Strata.Ffi.Vk.stat(10)), float_to_int(Strata.Ffi.Vk.stat(12) /. 32768.0), float_to_int(Strata.Ffi.Vk.stat(11)))
+    (float_to_int(Strata.Ffi.Vk.stat(22)), float_to_int(Strata.Ffi.Vk.stat(24) /. 32768.0), float_to_int(Strata.Ffi.Vk.stat(23)))
   end
 
   doc "Give the renderer the registry's per-block data (textures, flags, emission). Call once the registry is built, and again if it changes."
@@ -296,10 +300,12 @@ mod Strata.Render do
     end
   end
   pfn upload_rig(id : Int, rg : Strata.Rig.Rig) : Bool do
+    -- whatever was held under this id (a rig of an older world, or a part-made upload) goes first
+    let cleared = Strata.Ffi.Vk.rig_clear(id)
     let pal = Strata.Ffi.Vk.rig_palette(id, palette_go(NativeArray.make_f32(256 * 5, 0.0), Strata.Rig.palette(rg)))
     let anc = anchors_go(id, rg, 0, Strata.Rig.part_count(rg), true)
     let shp = shapes_go(id, rg, 0, Strata.Rig.part_count(rg), true)
-    pal && anc && shp && pieces_go(id, Strata.Rig.meshes(rg), true)
+    cleared && pal && anc && shp && pieces_go(id, Strata.Rig.meshes(rg), true)
   end
   pfn figures_go(a : Strata.Anim.Anim, rigs : List(Strata.Rig.Rig), held : List(Int)) : List(Int) do
     match rigs do
@@ -313,13 +319,19 @@ mod Strata.Render do
     end
   end
 
-  doc "Give the renderer the meshes, ray shapes and palettes of these rigs, each finished in [a] (Strata.Anim.finish_rig): uploaded once per rig, shared by every figure made from it; a rig already held, or not finished in [a], is passed over. A rig the renderer had no room for is tried again at the next call. From then on every figure of those rigs that the animation lists is drawn at each frame, at its pose: a game calls nothing per figure."
-  fn figures(r : Render, a : Strata.Anim.Anim, rigs : List(Strata.Rig.Rig)) : Render do
-    match r do Render(sl, none, held, parts) -> Render(sl, none, figures_go(a, rigs, held), parts) end
+  doc "The rig ids held for generation [gen]: those held now if they were finished in it, none if the world was opened again since (its rig ids start at 0 again, so every one must be uploaded anew)."
+  fn held_for(held : (Int, List(Int)), gen : Int) : List(Int) do
+    match held do (g, ids) -> if g == gen do ids else Nil end end
   end
 
-  doc "Rigs whose meshes the renderer holds."
-  fn figure_rigs(r : Render) : Int do match r do Render(_, _, held, _) -> List.length(held) end end
+  doc "Give the renderer the meshes, ray shapes and palettes of these rigs, each finished in [a] (Strata.Anim.finish_rig): uploaded once per rig, shared by every figure made from it; a rig already held, or not finished in [a], is passed over. A rig the renderer had no room for is tried again at the next call. From then on every figure of those rigs that the animation lists is drawn at each frame, at its pose: a game calls nothing per figure. After `Strata.Anim.open` makes a new world, the rigs held from the old one are forgotten and these are uploaded anew, over the old meshes under the same ids."
+  fn figures(r : Render, a : Strata.Anim.Anim, rigs : List(Strata.Rig.Rig)) : Render do
+    let gen = Strata.Anim.generation(a)
+    match r do Render(sl, none, held, parts) -> Render(sl, none, (gen, figures_go(a, rigs, held_for(held, gen))), parts) end
+  end
+
+  doc "Rigs whose meshes the renderer holds for the figure world opened last."
+  fn figure_rigs(r : Render) : Int do match r do Render(_, _, (_, ids), _) -> List.length(ids) end end
 
   doc "Draw and present one frame, figures drawn [blend] (0..1) of the way from each one's pose before last to its last: the fraction of an animation step that has passed since the last `Strata.Anim.update`. False when the frame was skipped."
   fn draw(blend : Float) : Bool do
