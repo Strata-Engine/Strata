@@ -1913,11 +1913,15 @@ mod StrataViewer do
   pfn sim_phys(m : Sim) : Strata.Physics.Physics do match m do Sim(_, _, p) -> p end end
 
   -- Apply an edit and tell the fluid and physics about it.
-  pfn edit_one(m : Sim, o : Strata.Edit.Outcome) : Sim do
+  -- an edit heard by the stream, the fluid and physics (Strata.Sim.edit), physics looking for what it left unsupported when [collapse]
+  pfn sim_edit(m : Sim, o : Strata.Edit.Outcome, collapse : Bool) : Sim do
     match m do
-      Sim(s, f, p) -> Sim(Strata.Stream.apply(s, o), Strata.Fluid.wake(f, Strata.Edit.world(o), o), Strata.Physics.wake(p, o))
+      Sim(s, f, p) ->
+        let e = Strata.Sim.edit(Strata.Sim.new(s, f, p), o, collapse)
+        Sim(Strata.Sim.stream(e), Strata.Sim.fluid(e), Strata.Sim.physics(e))
     end
   end
+  pfn edit_one(m : Sim, o : Strata.Edit.Outcome) : Sim do sim_edit(m, o, true) end
 
   -- An edit applied to the simulation: the stream, the fluid and the physics hear of it; then the tall grass (block 11) it left hanging is taken away, as a second edit (Strata.Edit.unsupported).
   pfn edit(m : Sim, o : Strata.Edit.Outcome) : Sim do
@@ -1933,11 +1937,7 @@ mod StrataViewer do
   -- An edit physics is not told of: the stream and the fluid hear of it, and no support pass is run, so nothing it leaves hanging falls. For the
   -- match's arena, built at the start of each round: its grading leaves overhangs in the land about it, and the support pass would turn them into
   -- falling bodies, thousands of voxels of them, which stalled the game for seconds (13 November).
-  pfn edit_quiet(m : Sim, o : Strata.Edit.Outcome) : Sim do
-    match m do
-      Sim(s, f, p) -> Sim(Strata.Stream.apply(s, o), Strata.Fluid.wake(f, Strata.Edit.world(o), o), p)
-    end
-  end
+  pfn edit_quiet(m : Sim, o : Strata.Edit.Outcome) : Sim do sim_edit(m, o, false) end
   pfn match_edit(m : Sim, x : Float, y : Float, z : Float, fx : Float, fy : Float, fz : Float, dig : Bool, build : Bool, block : Int) : Sim do
     match StrataViewer.Match.single_edit(Strata.Stream.world(sim_stream(m)), x, y, z, fx, fy, fz, dig, build, block) do
       Nil -> m
@@ -2125,15 +2125,6 @@ mod StrataViewer do
           let count = if speed *. 8.0 > 64.0 do 64 else 8 + float_to_int(speed *. 8.0) end
           splash_events(t, if Strata.Render.spray(Strata.Physics.ev_x(e), Strata.Physics.ev_y(e) +. 0.3, Strata.Physics.ev_z(e), 0.0, 1.0 +. speed *. 0.5, 0.0, count, 0.5 +. speed *. 0.4, 0.8, 13) do n + count else n end)
         end
-    end
-  end
-
-  -- The cells bodies fill set as walls in the fluid, the water in them
-  -- pushed aside (an edit, applied to the stream as a fluid step's is).
-  -- Water does not collide, so it wakes no body.
-  pfn with_marks(m : Sim) : Sim do
-    match Strata.Fluid.set_marks(sim_fluid(m), Strata.Stream.world(sim_stream(m)), Strata.Physics.marks(sim_phys(m))) do
-      (f, o) -> Sim(Strata.Stream.apply(sim_stream(m), o), f, sim_phys(m))
     end
   end
 
@@ -2753,70 +2744,34 @@ mod StrataViewer do
           let drop = (ckey && !ck0) || (scripted && frame == Authority.must(Env.get_int("STRATA_CRATE", -1)))
           let m4c = if !drop do m4a
             else match m4a do Sim(ms, mf, mp) -> Sim(ms, mf, add_crate(mp, x2 +. Math.sin(yaw2) *. 6.0, y2 +. 2.0, z2 -. Math.cos(yaw2) *. 6.0, sc)) end end
-          -- physics on the clock: the step begun last frame is finished, and the next begun; at most two steps a frame
+          -- The world's simulation for this frame, in one order (Strata.Sim): physics on its clock, then the fluid when due (STRATA_FLUID_HZ steps a
+          -- second, 30 by default; STRATA_FLUID=0 none; STRATA_FLUID_SYNC=1 on the main thread), then the stream's tick. The clock is frame / 60 in a
+          -- scripted run, so it is the same every time. The stream ticks at most once in STRATA_TICK_MS (16 when playing, 0 scripted): it waits on
+          -- tasks two ticks old (March cannot ask whether a task is done: GAPS S12), and at 120 frames a second two ticks is less than a hard chunk takes.
           let tphys = if scripted do int_to_float(frame) /. 60.0 else now -. tz end
+          let tphys_prev = if scripted do int_to_float(frame - 1) /. 60.0 else t_prev -. tz end
           let focus = Cons((x2, y2, z2), Nil)
-          -- what physics did to the world (loose terrain, snapped rubble) wakes the water, as any edit does
-          let (pa, sa, fa) = match pjob do
-              Some(j) ->
-                match Strata.Physics.finish_world(j, sim_phys(m4c), Strata.Stream.world(sim_stream(m4c))) do
-                  (p5, o5) -> (p5, Strata.Stream.apply(sim_stream(m4c), o5), Strata.Fluid.wake(sim_fluid(m4c), Strata.Edit.world(o5), o5))
-                end
-              None -> (sim_phys(m4c), sim_stream(m4c), sim_fluid(m4c))
-            end
-          let owed = Strata.Physics.due(pa, tphys)
-          let (pb, sb) = if owed >= 2 do Strata.Physics.step(pa, sa, focus) else (pa, sa) end
-          -- a splash where a body went into water, for each step that just ended
+          let hz = if Authority.must(Env.get_int("STRATA_FLUID", 1)) == 0 do 0 else Authority.must(Env.get_int("STRATA_FLUID_HZ", 30)) end
+          let tick_gap = int_to_float(Authority.must(Env.get_int("STRATA_TICK_MS", if scripted do 0 else 16 end))) /. 1000.0
+          let sim0 = match m4c do Sim(ms, mf, mp) -> Strata.Sim.with_clock(Strata.Sim.with_jobs(Strata.Sim.with_tick_gap(Strata.Sim.with_fluid_hz(Strata.Sim.with_sync_fluid(Strata.Sim.new(ms, mf, mp), Authority.must(Env.get_int("STRATA_FLUID_SYNC", 0)) == 1), hz), tick_gap), job0, pjob), fn () -> Strata.Ffi.Vk.time()) end
+          let t_tick = Strata.Ffi.Vk.time()
+          let (sim1, sf) = Strata.Sim.step(sim0, focus, tphys, tphys_prev)
+          -- a splash where a body went into water, for each physics step that just ended; spray for what the fluid's step did
           let spray_on = Authority.must(Env.get_int("STRATA_SPRAY", 1)) != 0
-          let _splashed = if spray_on && Option.is_some(pjob) do splash_events(Strata.Physics.events(pa), 0) else 0 end
-          let _splashed2 = if spray_on && owed >= 2 do splash_events(Strata.Physics.events(pb), 0) else 0 end
-          let (pc, pjob2) = if owed >= 1 do
-              match Strata.Physics.begin(pb, Strata.Stream.world(sb), focus) do (p4, j4) -> (p4, Some(j4)) end
-            else (pb, None) end
-          let m4 = Sim(sb, fa, pc)
-          -- the fluid: STRATA_FLUID_HZ steps a second, 30 by default (a scripted run: one every 60 / hz frames)
-          let t_fluid = Strata.Ffi.Vk.time()
-          let hz = Authority.must(Env.get_int("STRATA_FLUID_HZ", 30))
-          let due = Authority.must(Env.get_int("STRATA_FLUID", 1)) != 0 && hz > 0 && (if scripted do frame % (if hz >= 60 do 1 else 60 / hz end) == 0 else Math.floor(now *. int_to_float(hz)) != Math.floor(t_prev *. int_to_float(hz)) end)
-          -- a step is worked out on a worker: the one begun last time is finished here, then the next begins
-          let m5 = if !due do m4
-            else if Authority.must(Env.get_int("STRATA_FLUID_SYNC", 0)) == 1 do
-              let m4w = with_marks(m4)
-              match Strata.Fluid.step(sim_fluid(m4w), sim_stream(m4w), Cons((x2, y2, z2), Nil)) do (f2, sf) -> Sim(sf, f2, sim_phys(m4w)) end
-            else
-              match job0 do
-                Some(j) -> match Strata.Fluid.finish(j, sim_fluid(m4), sim_stream(m4)) do (f2, sf) -> Sim(sf, f2, sim_phys(m4)) end
-                None -> m4
-              end
-            end end
-          -- the cells bodies fill are walls to the step about to begin, their water pushed aside first
-          let m5w = if due && Authority.must(Env.get_int("STRATA_FLUID_SYNC", 0)) != 1 do with_marks(m5) else m5 end
-          let begun = if due && Authority.must(Env.get_int("STRATA_FLUID_SYNC", 0)) != 1 do
-              match Strata.Fluid.begin(sim_fluid(m5w), Strata.Stream.world(sim_stream(m5w)), Cons((x2, y2, z2), Nil)) do
-                (f3, j2) -> (f3, Some(j2))
-              end
-            else (sim_fluid(m5w), job0) end
-          -- spray for what the step that just ended did, and a fountain if a timing run asks for one
-          let _sprayed = if due && Authority.must(Env.get_int("STRATA_SPRAY", 1)) != 0 do spray_events(Strata.Fluid.events(sim_fluid(m5)), 0) else 0 end
+          let _splashed = if spray_on do splash_events(sf.sf_physics_events, 0) else 0 end
+          let _sprayed = if sf.sf_fluid_due && spray_on do spray_events(sf.sf_fluid_events, 0) else 0 end
           let fountain = Authority.must(Env.get_int("STRATA_FOUNTAIN", 0))
           if fountain > 0 && Strata.Render.spray(x2 +. fx *. 30.0, y2 +. fy *. 30.0 -. 4.0, z2 +. fz *. 30.0, 0.0, 9.0, 0.0, fountain, 4.0, 3.0, 13) do () else () end
-          let fl2 = match begun do (f3, _) -> f3 end
-          let job2 = match begun do (_, j3) -> j3 end
-          let fluid_ms = (Strata.Ffi.Vk.time() -. t_fluid) *. 1000.0
-          if due && scripted && frame % 240 == 0 && Strata.Fluid.active_count(fl2) > 0 do Authority.must(println("  fluid step at frame " ++ int_to_string(frame) ++ ": " ++ ms2(fluid_ms) ++ " ms on the main thread for " ++ int_to_string(Strata.Fluid.active_count(fl2)) ++ " active cells")) else () end
-          let t_tick = Strata.Ffi.Vk.time()
-          -- The stream waits for any task still running two ticks after it began (March has no way to ask whether a task is done: GAPS S12), and at 120 frames
-          -- a second two ticks are 16 ms, less than a hard chunk takes. So the stream ticks at most once in each STRATA_TICK_MS of the clock (16 when playing;
-          -- 0, every frame, in scripted runs, which stay as they were): its tasks then have 32 ms and more, and a frame that does not tick costs nothing.
-          let tick_gap = int_to_float(Authority.must(Env.get_int("STRATA_TICK_MS", if scripted do 0 else 16 end))) /. 1000.0
-          let ticks_now = tick_gap <= 0.0 || Math.floor(now /. tick_gap) != Math.floor(t_prev /. tick_gap)
-          let s2 = if ticks_now do Strata.Stream.tick(sim_stream(m5w)) else sim_stream(m5w) end
-          let tick_ms = (Strata.Ffi.Vk.time() -. t_tick) *. 1000.0
-          match Strata.Render.sync(sl, s2) do
-            (sl2, s3) ->
-              let sync_ms = (Strata.Ffi.Vk.time() -. t_tick) *. 1000.0 -. tick_ms
-              let (sl3, pd) = Strata.Render.bodies(sl2, sim_phys(m5w), tphys -. 1.0 /. 60.0)
-              let bodies_ms = (Strata.Ffi.Vk.time() -. t_tick) *. 1000.0 -. tick_ms -. sync_ms
+          let fluid_ms = sf.sf_fluid_ms
+          let fl2 = Strata.Sim.fluid(sim1)
+          if sf.sf_fluid_due && scripted && frame % 240 == 0 && Strata.Fluid.active_count(fl2) > 0 do Authority.must(println("  fluid step at frame " ++ int_to_string(frame) ++ ": " ++ ms2(fluid_ms) ++ " ms on the main thread for " ++ int_to_string(Strata.Fluid.active_count(fl2)) ++ " active cells")) else () end
+          let tick_ms = sf.sf_physics_ms +. sf.sf_fluid_ms +. sf.sf_tick_ms
+          match Strata.Render.present(sl, sim1, tphys -. 1.0 /. 60.0, fn () -> Strata.Ffi.Vk.time()) do
+            (sl3, sim2, sync_ms, bodies_ms) ->
+              let s3 = Strata.Sim.stream(sim2)
+              let pd = Strata.Sim.physics(sim2)
+              let job2 = Strata.Sim.fluid_job(sim2)
+              let pjob2 = Strata.Sim.physics_job(sim2)
               let rig2 = PhysRig(pd, pjob2, me, ckey, sc, tz)
               let march_ms = (Strata.Ffi.Vk.time() -. t_march) *. 1000.0
               let aspect = int_to_float(Strata.Ffi.Vk.fb_w()) /. int_to_float(if Strata.Ffi.Vk.fb_h() < 1 do 1 else Strata.Ffi.Vk.fb_h() end)
@@ -2899,7 +2854,7 @@ mod StrataViewer do
               let next = if Strata.Render.draw(1.0) do frame + 1 else frame end
               let spent = now -. t_prev
               -- in a soak, name any frame slower than 25 ms and where its time went
-              if (script == 2 || slow_log) && frame >= 10 && (spent > 0.025 || march_ms > (if slow_log do 12.0 else 4.0 end)) do Authority.must(println("  slow frame " ++ int_to_string(frame) ++ ": " ++ ms2(spent *. 1000.0) ++ " ms since the last; this frame's march " ++ ms2(march_ms) ++ " ms (to the stream tick " ++ ms2((t_tick -. t_march) *. 1000.0) ++ ", tick " ++ ms2(tick_ms) ++ ", sync " ++ ms2(sync_ms) ++ ", bodies " ++ ms2(bodies_ms) ++ "), last frame's shim " ++ ms2(Strata.Ffi.Vk.stat(0)) ++ " ms and waiting " ++ ms2(Strata.Ffi.Vk.stat(1)) ++ " ms, gpu " ++ ms2(Strata.Ffi.Vk.stat(3)) ++ " ms (before " ++ ms2(Strata.Ffi.Vk.stat(26)) ++ ", geometry " ++ ms2(Strata.Ffi.Vk.stat(27)) ++ ", light " ++ ms2(Strata.Ffi.Vk.stat(28)) ++ ", after " ++ ms2(Strata.Ffi.Vk.stat(29)) ++ "), draws " ++ int_to_string(float_to_int(Strata.Ffi.Vk.stat(2))) ++ ", figure parts " ++ int_to_string(float_to_int(Strata.Ffi.Vk.stat(10))) ++ ", shadow gpu " ++ ms2(Strata.Ffi.Vk.stat(14)) ++ " ms")) else () end
+              if (script == 2 || slow_log) && frame >= 10 && (spent > 0.025 || march_ms > (if slow_log do 12.0 else 4.0 end)) do Authority.must(println("  slow frame " ++ int_to_string(frame) ++ ": " ++ ms2(spent *. 1000.0) ++ " ms since the last; this frame's march " ++ ms2(march_ms) ++ " ms (before the simulation " ++ ms2((t_tick -. t_march) *. 1000.0) ++ ", physics " ++ ms2(sf.sf_physics_ms) ++ ", fluid " ++ ms2(sf.sf_fluid_ms) ++ ", tick " ++ ms2(sf.sf_tick_ms) ++ ", sync " ++ ms2(sync_ms) ++ ", bodies " ++ ms2(bodies_ms) ++ "), last frame's shim " ++ ms2(Strata.Ffi.Vk.stat(0)) ++ " ms and waiting " ++ ms2(Strata.Ffi.Vk.stat(1)) ++ " ms, gpu " ++ ms2(Strata.Ffi.Vk.stat(3)) ++ " ms (before " ++ ms2(Strata.Ffi.Vk.stat(26)) ++ ", geometry " ++ ms2(Strata.Ffi.Vk.stat(27)) ++ ", light " ++ ms2(Strata.Ffi.Vk.stat(28)) ++ ", after " ++ ms2(Strata.Ffi.Vk.stat(29)) ++ "), draws " ++ int_to_string(float_to_int(Strata.Ffi.Vk.stat(2))) ++ ", figure parts " ++ int_to_string(float_to_int(Strata.Ffi.Vk.stat(10))) ++ ", shadow gpu " ++ ms2(Strata.Ffi.Vk.stat(14)) ++ " ms")) else () end
               -- STRATA_BENCH=1: one line a frame for scripts/bench.sh: since the last frame, the main thread's march, last frame's GPU and its passes
               if Authority.must(Env.get_int("STRATA_BENCH", 0)) == 1 && frame >= 10 do Authority.must(println("bench: " ++ ms2(spent *. 1000.0) ++ " " ++ ms2(march_ms) ++ " " ++ ms2(Strata.Ffi.Vk.stat(3)) ++ " " ++ ms2(Strata.Ffi.Vk.stat(26)) ++ " " ++ ms2(Strata.Ffi.Vk.stat(27)) ++ " " ++ ms2(Strata.Ffi.Vk.stat(28)) ++ " " ++ ms2(Strata.Ffi.Vk.stat(29)))) else () end
               let worst2 = if frame >= 10 && spent > worst do spent else worst end
