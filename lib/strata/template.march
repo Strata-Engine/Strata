@@ -151,6 +151,84 @@ mod Strata.Template do
     end
   end
 
+  -- ── Coarsening ──
+  --
+  -- A coarser level draws a template at k times its voxel: each coarse voxel
+  -- takes the id of highest rank among the non-hole voxels of its k x k x k
+  -- cube (rank[id]; an empty rank array ranks each id by itself, an id past
+  -- its end ranks 0; a tie goes to the higher id); a cube of holes stays a
+  -- hole, and any id beats a hole. coarsen cuts cubes from the template's
+  -- origin corner and ignores probabilities. coarsen_placed cuts them from
+  -- the world's coarse grid at a placement, after the turn and the draws, so
+  -- its coarse voxels are exactly the cubes of what blit writes there.
+
+  -- floor(a / b), b above 0, any sign
+  pfn fdiv(a : Int, b : Int) : Int do if a >= 0 do a / b else 0 - ((b - 1 - a) / b) end end
+  pfn rank_at(rank : NativeIntArr, rn : Int, id : Int) : Int do
+    if rn == 0 do id else if id < rn do NativeArray.get_int(rank, id) else 0 end end
+  end
+  -- (best ids, their ranks) with id of rank r offered at coarse voxel ci
+  pfn take_best(ids : NativeI32Arr, rs : NativeIntArr, ci : Int, id : Int, r : Int) : (NativeI32Arr, NativeIntArr) do
+    let bid = NativeArray.get_i32(ids, ci)
+    let br = NativeArray.get_int(rs, ci)
+    let wins = if bid == 0 do true else if r > br do true else if r < br do false else id > bid end end end
+    if wins do (NativeArray.set_i32(ids, ci, id), NativeArray.set_int(rs, ci, r)) else (ids, rs) end
+  end
+  -- every fine voxel i.. of the template (fields handed in) offered to its coarse voxel: turned rot,
+  -- shifted by the phase (px, py, pz), cubes of k, a coarse box cw x ch x cd; draws from stream when draw
+  pfn coarse_go(sx : Int, sy : Int, sz : Int, tids : NativeI32Arr, pr : NativeU8Arr, ys : NativeU8Arr, k : Int, rank : NativeIntArr, rn : Int, px : Int, py : Int, pz : Int, rot : Int, stream : Int, draw : Bool, cw : Int, ch : Int, ids : NativeI32Arr, rs : NativeIntArr, i : Int, n : Int) : (NativeI32Arr, NativeIntArr) do
+    if i >= n do (ids, rs)
+    else
+      let x = i % sx
+      let y = (i / sx) % sy
+      let z = i / (sx * sy)
+      let id = if draw do drawn(sx, sy, tids, pr, ys, x, y, z, stream) else NativeArray.get_i32(tids, i) end
+      if id == 0 do coarse_go(sx, sy, sz, tids, pr, ys, k, rank, rn, px, py, pz, rot, stream, draw, cw, ch, ids, rs, i + 1, n)
+      else
+        -- the turn of blit's doc: template (x, z) to footprint (rx, rz)
+        let r = quarter(rot)
+        let rx = if r == 0 do x else if r == 1 do sz - 1 - z else if r == 2 do sx - 1 - x else z end end end
+        let rz = if r == 0 do z else if r == 1 do x else if r == 2 do sz - 1 - z else sx - 1 - x end end end
+        let ci = (px + rx) / k + cw * ((py + y) / k + ch * ((pz + rz) / k))
+        match take_best(ids, rs, ci, id, rank_at(rank, rn, id)) do
+          (ids2, rs2) -> coarse_go(sx, sy, sz, tids, pr, ys, k, rank, rn, px, py, pz, rot, stream, draw, cw, ch, ids2, rs2, i + 1, n)
+        end
+      end
+    end
+  end
+  -- the coarse template of t turned rot, its fine corner at phase (px, py, pz) inside the first cube (each 0..k - 1)
+  pfn coarse_of(t : Template, k : Int, rank : NativeIntArr, px : Int, py : Int, pz : Int, rot : Int, stream : Int, draw : Bool) : Template do
+    match t do
+      Template(sx, sy, sz, tids, pr, ys, vs) ->
+        let w = if int_and(rot, 1) == 0 do sx else sz end
+        let d = if int_and(rot, 1) == 0 do sz else sx end
+        -- the last cube rounded up: (phase + side + k - 1) / k, written so nothing large is added to k
+        let cw = 1 + (px + w - 1) / k
+        let ch = 1 + (py + sy - 1) / k
+        let cd = 1 + (pz + d - 1) / k
+        let cn = Strata.Size.of(cw * ch * cd)
+        match coarse_go(sx, sy, sz, tids, pr, ys, k, rank, NativeArray.length_int(rank), px, py, pz, rot, stream, draw, cw, ch, NativeArray.make_i32(cn, 0), NativeArray.make_int(cn, 0), 0, sx * sy * sz) do
+          (ids, _) -> Template(cw, Strata.Size.of(ch), cd, ids, NativeArray.make_u8(cn, 255), NativeArray.make_u8(Strata.Size.of(ch), 255), vs *. int_to_float(k))
+        end
+    end
+  end
+
+  doc "Template t at k times its voxel size: cubes of k x k x k cut from its origin corner (the last rounded up, so a 5-wide template is 3 wide at k 2), each the id of highest rank among its non-hole voxels (rank[id]; an empty rank array ranks every id by itself, an id past its end ranks 0; a tie goes to the higher id); a cube of holes stays a hole and any id beats a hole. Probabilities are not carried: every voxel and row of the result is at 255. Its voxel size is k times t's. t itself for k 1 or less."
+  fn coarsen(t : Template, k : Int, rank : NativeIntArr) : Template do
+    if k <= 1 do t else coarse_of(t, k, rank, 0, 0, 0, 0, 0, false) end
+  end
+
+  doc "t as blit writes it at fine world voxel (ox, oy, oz), turned rot, its probabilities drawn from stream, coarsened onto the world's grid of cubes of k (coarse voxel V holds fine voxels k V .. k V + k - 1 on each axis): (the coarse template, already turned, every probability 255, at k times t's voxel size; its coarse corner (floor(ox / k), floor(oy / k), floor(oz / k))). Each coarse voxel is the id of highest rank, as in coarsen, among the voxels blit would write in its cube; blit it at that corner with rot 0 into a chunk of the coarser level. For k 1 or less, t and (ox, oy, oz) unchanged."
+  fn coarsen_placed(t : Template, k : Int, rank : NativeIntArr, ox : Int, oy : Int, oz : Int, rot : Int, stream : Int) : (Template, Int, Int, Int) do
+    if k <= 1 do (t, ox, oy, oz)
+    else
+      let cx = fdiv(ox, k)
+      let cy = fdiv(oy, k)
+      let cz = fdiv(oz, k)
+      (coarse_of(t, k, rank, ox - k * cx, oy - k * cy, oz - k * cz, rot, stream, true), cx, cy, cz)
+    end
+  end
+
   pfn map_go(pal : NativeU8Arr, to_id : NativeI32Arr, m : Int, ids : NativeI32Arr, i : Int, n : Int) : NativeI32Arr do
     if i >= n do ids
     else

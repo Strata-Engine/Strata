@@ -161,7 +161,109 @@ mod Strata.Test.Template do
       if at(c, ox + rx, oy + y, oz + rz) == want_draw(t, x, y, z, stream) do acc else acc + 1 end)
   end
 
+  -- ── Coarsening ──
+  -- a template of id `fill` everywhere, sx x sy x sz, with voxel (x, y, z) set to id
+  pfn filled_with(sx : Int, sy : Int, sz : Int, fill : Int, x : Int, y : Int, z : Int, id : Int, vs : Float) : Strata.Template.Template do
+    let n = sx * sy * sz
+    Tp.make(sx, sy, sz, NativeArray.set_i32(fill_ids(NativeArray.make_i32(n, 0), 0, n, fill), x + sx * (y + sy * z), id), vs)
+  end
+  pfn id_at(t : Strata.Template.Template, x : Int, y : Int, z : Int) : Int do NativeArray.get_i32(Tp.t_ids(t), x + Tp.t_sx(t) * (y + Tp.t_sy(t) * z)) end
+  -- rank[id] for the ids 0..9, from a list
+  pfn ranks_of(rs : List(Int)) : NativeIntArr do NativeArray.from_list_int(rs) end
+  -- the rank of id under rank (an empty rank: the id itself; past its end: 0)
+  pfn rank_of(rank : NativeIntArr, id : Int) : Int do
+    let n = NativeArray.length_int(rank)
+    if n == 0 do id else if id < n do NativeArray.get_int(rank, id) else 0 end end
+  end
+  -- the id of highest rank (ties: the higher id) among the non-hole voxels of fine chunk c in the k-cube at local (x, y, z); 0 when all are holes
+  pfn cube_best(c : Strata.Chunk.Chunk, rank : NativeIntArr, k : Int, x : Int, y : Int, z : Int) : Int do
+    List.fold_left(List.range(0, k * k * k), 0, fn (best, q) ->
+      let id = at(c, x + q % k, y + (q / k) % k, z + q / (k * k))
+      if id == 0 do best
+      else if best == 0 do id
+      else
+        let r = rank_of(rank, id)
+        let br = rank_of(rank, best)
+        if r > br do id else if r < br do best else if id > best do id else best end end end
+      end end)
+  end
+  -- coarse voxels of chunk cc (level L, cubes of k) over fine chunk cf's 32 / k cube (the level-0 chunk at offset (a, b, c) inside it) that differ from cube_best
+  pfn coarse_differ(cc : Strata.Chunk.Chunk, cf : Strata.Chunk.Chunk, rank : NativeIntArr, k : Int, a : Int, b : Int, c : Int) : Int do
+    let m = 32 / k
+    List.fold_left(List.range(0, m * m * m), 0, fn (acc, q) ->
+      let u = q % m
+      let v = (q / m) % m
+      let w = q / (m * m)
+      if at(cc, a * m + u, b * m + v, c * m + w) == cube_best(cf, rank, k, k * u, k * v, k * w) do acc else acc + 1 end)
+  end
+
   describe "Template" do
+    test "coarsen by 2: a cube of 8s holding one 7 becomes 7 when 7 ranks above 8, else 8" do
+      let t = filled_with(4, 4, 4, 8, 1, 0, 1, 7, 1.0)
+      let up = Tp.coarsen(t, 2, ranks_of([0, 0, 0, 0, 0, 0, 0, 5, 3]))
+      Test.assert_eq_int(Tp.t_sx(up), 2, "2 wide")
+      Test.assert_eq_int(Tp.t_sy(up), 2, "2 high")
+      Test.assert_eq_int(Tp.t_sz(up), 2, "2 deep")
+      Test.assert_eq_int(id_at(up, 0, 0, 0), 7, "7 ranks above 8: the cube holding it is 7")
+      Test.assert_eq_int(id_at(up, 1, 0, 0), 8, "a cube of 8s stays 8")
+      Test.assert_eq_int(id_at(up, 0, 1, 1), 8, "and another")
+      Test.assert_eq_int(id_at(Tp.coarsen(t, 2, ranks_of([0, 0, 0, 0, 0, 0, 0, 3, 5])), 0, 0, 0), 8, "8 ranks above 7: 8")
+      Test.assert_eq_int(id_at(Tp.coarsen(t, 2, ranks_of(Nil)), 0, 0, 0), 8, "no ranks given: each id ranked by itself, so 8")
+      Test.assert_eq_int(id_at(Tp.coarsen(t, 2, ranks_of([0, 0, 0, 0, 0, 0, 0, 4, 4])), 0, 0, 0), 8, "a tie goes to the higher id")
+      Test.assert_eq_int(id_at(Tp.coarsen(t, 2, ranks_of([0, 0, 0, 0, 0, 0, 0, 1])), 0, 0, 0), 7, "an id past the rank array ranks 0: 7 (rank 1) beats 8 (past the end)")
+    end
+
+    test "coarsen: an all-hole cube stays a hole, and any id beats a hole" do
+      -- holes everywhere but one voxel of id 3 (rank 0) at (2, 3, 0)
+      let t = filled_with(4, 4, 4, 0, 2, 3, 0, 3, 1.0)
+      let up = Tp.coarsen(t, 2, ranks_of([0, 0, 0, 0]))
+      Test.assert_eq_int(id_at(up, 0, 0, 0), 0, "a cube of holes is a hole")
+      Test.assert_eq_int(id_at(up, 1, 1, 0), 3, "a rank-0 id over holes")
+      Test.assert_eq_int(id_at(Tp.coarsen(filled_with(4, 4, 4, 5, 0, 0, 0, 0, 1.0), 2, ranks_of([9, 1, 1, 1, 1, 1])), 0, 0, 0), 5, "a hole never wins, whatever rank[0] says")
+    end
+
+    test "coarsen: an odd size rounds the last cube up, the voxel size is k times, probabilities are 255" do
+      let t = Tp.with_yslice(Tp.with_prob(filled_with(5, 5, 3, 2, 4, 4, 2, 6, 0.5), 0, 10), 0, 10)
+      let up = Tp.coarsen(t, 2, ranks_of(Nil))
+      Test.assert_eq_int(Tp.t_sx(up), 3, "5 wide is 3")
+      Test.assert_eq_int(Tp.t_sy(up), 3, "5 high is 3")
+      Test.assert_eq_int(Tp.t_sz(up), 2, "3 deep is 2")
+      Test.assert_eq_int(id_at(up, 2, 2, 1), 6, "the last cube, one voxel, holds it")
+      Test.assert_true(Tp.t_voxel_size(up) == 1.0, "0.5 m voxels become 1 m")
+      Test.assert_eq_int(NativeArray.get_u8(Tp.t_prob(up), 0), 255, "probabilities are not carried")
+      Test.assert_eq_int(NativeArray.get_u8(Tp.t_yslice(up), 0), 255, "nor rows'")
+      let by4 = Tp.coarsen(t, 4, ranks_of(Nil))
+      Test.assert_eq_int(Tp.t_sx(by4), 2, "5 wide by 4 is 2")
+      Test.assert_true(Tp.t_voxel_size(by4) == 2.0, "four times the voxel")
+      Test.assert_eq_int(Tp.t_sx(Tp.coarsen(t, 1, ranks_of(Nil))), 5, "by 1 it is the template")
+    end
+
+    test "coarsen_placed: the template blitted at a fine voxel, turned and drawn, coarsened on the world's grid, matches the fine blit's cubes at every turn and offset" do
+      let t = mixed()
+      let rank = ranks_of(List.map(List.range(0, 61), fn i -> (i * 37) % 61))
+      let bad = List.fold_left(List.range(0, 16), 0, fn (acc, s) ->
+        let k = if s < 8 do 2 else 4 end
+        let ox = 3 + s % 3
+        let oy = 2 + s % 2
+        let oz = 5 + (s / 2) % 3
+        let rot = s % 4
+        let stream = Strata.Seed.mix(s, 29)
+        let fine = Tp.blit(C.uniform(0), origin(), t, ox, oy, oz, rot, stream)
+        match Tp.coarsen_placed(t, k, rank, ox, oy, oz, rot, stream) do
+          (ct, cx, cy, cz) ->
+            let coarse = Tp.blit(C.uniform(0), Strata.Coord.key_at(0, 0, 0, if k == 2 do 1 else 2 end), ct, cx, cy, cz, 0, 0)
+            acc + coarse_differ(coarse, fine, rank, k, 0, 0, 0)
+        end)
+      Test.assert_eq_int(bad, 0, "16 placements at k 2 and 4")
+      match Tp.coarsen_placed(t, 2, rank, 5, 3, 0 - 3, 1, 7) do
+        (ct, cx, cy, cz) ->
+          Test.assert_true((cx, cy, cz) == (2, 1, 0 - 2), "the coarse corner is the fine corner floor-divided by k")
+          Test.assert_true(Tp.t_voxel_size(ct) == 2.0, "at twice the voxel")
+          -- turned once the footprint is 3 along x and 5 along z: from x 5 (phase 1) that is 2 coarse, from z -3 (phase 1) 3
+          Test.assert_true((Tp.t_sx(ct), Tp.t_sy(ct), Tp.t_sz(ct)) == (2, 3, 3), "the coarse box holds the fine one, turned")
+      end
+    end
+
     test "every voxel is drawn by the documented formula, probability 255 or not, at every turn" do
       let t = mixed()
       let bad = List.fold_left(List.range(0, 24), 0, fn (acc, s) -> acc + draw_misses(t, 3, 2, 5, s % 4, Strata.Seed.mix(s, 17)))
