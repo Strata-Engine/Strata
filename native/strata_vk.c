@@ -27,7 +27,7 @@
 /* Rewritten by build_shaders.sh whenever the shaders change: forge decides
  * whether to recompile this file from its text alone, not from the headers
  * it includes (GAPS S14). */
-#define STRATA_SHADERS_STAMP "5b1d259b5d5c1471"
+#define STRATA_SHADERS_STAMP "be23891431f5853c"
 #include "strata_shaders.h"
 #include "strata_particles.h"
 #include "strata_alloc.h"
@@ -3156,7 +3156,11 @@ int64_t sv_frame(void) {
     memcpy(g.prev_vp, g.ubo_map, sizeof g.prev_vp);
     g.ubo_map[UBO_LIGHT + 0] = (float)g.light_mode; g.ubo_map[UBO_LIGHT + 1] = (float)g.time_s;
     g.ubo_map[UBO_LIGHT + 2] = (float)(g.frame_no & 0xFFFFFF);
-    g.ubo_map[UBO_LIGHT + 3] = (float)g.sky_rays; g.ubo_map[UBO_SUN_COLOR + 3] = (float)g.reflections;
+    /* STRATA_SKY_FULL=1: the sky light sampled on the schedule of before the fast paths (every new pixel each frame, a settled one in four),
+     * sent as a negative ray count; the stored pictures (scripts/golden.sh) are taken this way, so they compare at frame 60 as they did */
+    { static int full = -1; if (full < 0) full = getenv("STRATA_SKY_FULL") && getenv("STRATA_SKY_FULL")[0] == '1';
+      g.ubo_map[UBO_LIGHT + 3] = full ? -(float)g.sky_rays : (float)g.sky_rays; }
+    g.ubo_map[UBO_SUN_COLOR + 3] = (float)g.reflections;
     { int32_t *vol = (int32_t *)(g.ubo_map + UBO_VOL); vol[0] = g.vn; vol[1] = g.vnv; vol[2] = g.vn;
       /* how many past samples a pixel may lean on: none while the remembered
        * images are fresh, 2 just after the sun moved, else 255 (sun visibility

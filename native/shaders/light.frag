@@ -95,10 +95,11 @@ void main() {
     // pixels newly in view trace it each frame, not all of them: turning the view had made the light pass three times as slow); until its first
     // sample it is lit by the flat sky term. The sun's ray, which is cheaper, it still traces every frame.
     bool fresh = kept < 4.0 || settling;
-    bool sky_now = fresh ? ((px.x & 1) + 2 * (px.y & 1)) == (frame & 3) : (((px.x >> 3) & 3) + 4 * ((px.y >> 3) & 3)) == (frame & 15);
+    bool full_sky = u.light.w < 0.0;   // STRATA_SKY_FULL: the schedule of before (stored pictures)
+    bool sky_now = full_sky ? sample_now : fresh ? ((px.x & 1) + 2 * (px.y & 1)) == (frame & 3) : (((px.x >> 3) & 3) + 4 * ((px.y >> 3) & 3)) == (frame & 15);
     float sun_vis = old.a;
-    int rays = mode >= 4 ? int(u.light.w) : 0;
-    vec3 sky = rays > 0 ? (kept > 0.0 ? old.rgb : sky_flat(n)) : sky_flat(n);
+    int rays = mode >= 4 ? int(abs(u.light.w)) : 0;
+    vec3 sky = rays > 0 ? (kept > 0.0 || u.light.w < 0.0 ? old.rgb : sky_flat(n)) : sky_flat(n);
     float count = kept;
     if (sample_now || shade_moves) {
         float sun_now = sun_visible(at, n, sun_toward(rand2(px, frame, 0)));
@@ -110,7 +111,7 @@ void main() {
         // shadows lean on 64 past samples at most, so they follow a moving sun; sky light on all of them, since a small bright thing is found by few rays
         sun_vis = mix(old.a, sun_now, 1.0 / (min(ks, 64.0) + 1.0));
         if (sample_now) {
-            if (rays > 0 && sky_now) sky = mix(old.rgb, sky_light(at, n, px, frame, rays), 1.0 / (min(kept, 255.0) / 4.0 + 1.0));
+            if (rays > 0 && sky_now) sky = mix(old.rgb, sky_light(at, n, px, frame, rays), full_sky ? 1.0 / (kept + 1.0) : 1.0 / (min(kept, 255.0) / 4.0 + 1.0));
             count = kept + 1.0;
         }
     }
