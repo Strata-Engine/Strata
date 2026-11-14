@@ -18,7 +18,8 @@
 # of radius 6 m over a scatter layer of one tree a 4 m cell; mode 17 the
 # same population without the cover field. Modes 18 and 19 are place_with at
 # level 1 and level 2 with mode 8's scatter layer; mode 20 is mode 18 with a
-# density by noise. For each mode, a
+# density by noise; modes 21 to 23 a 6 m scatter cover read at levels 0, 1
+# and 2. For each mode, a
 # REPS=n run minus a REPS=0 run (the set-up alone), divided by n. CPU time is
 # user + system from /usr/bin/time -l; instructions are its counter.
 # Wall-clock time is not used.
@@ -26,7 +27,7 @@
 #   ./run.sh                 build with scripts/env.sh's March and measure
 #   NOBUILD=1 ./run.sh       measure the binary already in out/
 #   REPS=4000 ./run.sh       more calls (default 2000)
-#   MODES="4 5" ./run.sh     only these modes (default 1 to 20)
+#   MODES="4 5" ./run.sh     only these modes (default 1 to 23)
 #
 # scripts/env.sh exports MARCH_HOME so forge uses its March (march-main)
 # rather than the toolchain ~/.march/current names (March 0.5.0 on this
@@ -52,14 +53,15 @@ echo "march: $(march --version)"
 for c in main; do
   bin=out/populate_fields_$c
   [ -x "$bin" ] || { echo "no $bin"; continue; }
-  for m in ${MODES:-1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20}; do
+  for m in ${MODES:-1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23}; do
     case $m in 1) what="fields_with, 32 x 32, 4 fields, 3 layers";; 2) what="5 curve passes over 1024 columns";; 3) what="the same passes, no branch (v * 0.5)";;
       7) what="place_with, 2 cover layers, weights, surfaces";; 4) what="place_with, no layers";; 5) what="place_with, one cover layer 0.3/m2, flat floor";; 6) what="place_with, that layer, chunk no floor reaches";;
       8) what="place_with, scatter 9x12x9, 27 stamps, 1 m";; 9) what="place_with, the same fitted to 0.25 m";; 10) what="place_with, mode 8, no stamp meets the chunk";;
       11) what="place_with, cover + posts, chunk only posts reach";; 12) what="Strata.Template.blit, 9x12x9 whole";;
       13) what="adapt_with, 32 x 32, two sites in reach";; 14) what="place_with, one site, 9x12x9 whole in chunk";; 15) what="adapted_with, 32 x 32, two sites in reach";;
       16) what="fields_with, 44 x 44, a 6 m cover field";; 17) what="fields_with, 44 x 44, no cover field";;
-      18) what="place_with, mode 8 at level 1";; 19) what="place_with, mode 8 at level 2";; 20) what="place_with, level 1, density by noise";; esac
+      18) what="place_with, mode 8 at level 1";; 19) what="place_with, mode 8 at level 2";; 20) what="place_with, level 1, density by noise";;
+      21) what="fields + place, 6 m scatter cover, level 0";; 22) what="table_for + place, the same, level 1";; 23) what="table_for + place, the same, level 2";; esac
     a=$(measure "$bin" $m 0); b=$(measure "$bin" $m "$REPS")
     echo "$a $b" | awk -v c="$c" -v w="$what" -v r="$REPS" '{ printf "%-8s %-44s %10.1f %12.1f\n", c, w, ($3 - $1) * 1e6 / r, ($4 - $2) / r / 1e3 }'
   done
