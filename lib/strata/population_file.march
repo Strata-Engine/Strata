@@ -1,0 +1,583 @@
+-- PopulationFile — a population declared in a text file. `read` turns the
+-- text into a `Strata.Population.Pop` through the public builders of
+-- `Strata.Population` only, so the file and the API cannot drift: every
+-- section is one builder call (two where a layer has `seen_to` or a shape
+-- set `ranks`).
+--
+-- The text is line-oriented. `#` starts a comment, to the end of its line;
+-- blank lines are skipped. A section starts with a header in brackets and
+-- runs to the next header; its settings are `name = value` and may sit on
+-- the header's line, on the lines below it, or both, several to a line. A
+-- value is one or more words separated by spaces or tabs and ends where the
+-- next `name =` begins or at the end of the line (a value does not continue
+-- onto the next line). Spaces around `=` are optional.
+--
+--   [field N]   kind = ground    slot = I
+--               kind = noise     noise = I  octaves = I  period = F  salt = I
+--               kind = curve     of = FIELD  curve = X:Y X:Y ...
+--               kind = cover     layer = LAYER  radius = F
+--   [zone N]    kind = regions   ids = I I ...
+--               kind = band      field = FIELD  lo = F  hi = F
+--               kind = ring      sites = SITELIST  inner = F  outer = F
+--               kind = all       of = ZONE ZONE ...
+--               kind = any       of = ZONE ZONE ...
+--               kind = not       of = ZONE
+--   [shapes N]  kind = blocks    ids = I I ...           [ranks = I I ...]
+--               kind = templates from = TEMPLATELIST     [ranks = I I ...]
+--   [weights SHAPES ZONE]        w = F F ...
+--   [layer N]   kind = cover     shapes = S  base = F  salt = I  [by = ...]  [inside = Z ...]  [outside = Z ...]  [seen_to = I]
+--               kind = scatter   the same, and cell = F  jitter = F
+--               kind = site      shapes = S  sites = SITELIST  margin = F  salt = I  [seen_to = I]
+--
+-- `by` is a list of factors `FIELD:X:Y,X:Y,...`, each a field through a
+-- curve. Settings in brackets are optional; every other one is required.
+-- A name holds letters, digits, `_`, `-` and `.`. A number F is decimal:
+-- an optional `-`, digits, optionally `.` and digits, optionally `e` or `E`,
+-- an optional sign and digits (`-0.5`, `40`, `1.5e1`); `.5`, `5.`, `+1`,
+-- `nan`, `inf`, `0x10` and anything trailing are malformed, and so is a
+-- value too large to be finite. An integer I is an optional `-` and digits,
+-- below 10^18 in size. Template lists and site lists are made by the game
+-- and named in a `PopNamed`. The ten built-in ground fields are declared
+-- before the file's sections under their slot names (`ground_fields`).
+--
+-- Errors are errors, never warnings. `read_into` answers `Err("line N: ...")`
+-- for the first mistake in file order (the lowest line): syntax (a header
+-- without `]`, kind or name; an unknown section kind; a setting before any
+-- header; a word that is not `name = value`; a setting with no value or
+-- given twice in one section) and each section's own mistakes (no kind or
+-- an unknown one, an unknown setting, a missing required setting — on the
+-- header's line — a setting given more values than it takes, a malformed
+-- number, a template or site list the game did not name). A section holding
+-- a syntax mistake reports that mistake only. Echoed text is cut to 40 bytes.
+-- A leading UTF-8 byte order mark is skipped.
+--
+-- `read` is `read_into` of `ground_fields` then `Strata.Population.freeze`;
+-- freeze's message comes back through `locate`, on the line of the section
+-- it is about (Strata.Population.freeze_subject). Meaning is freeze's: the
+-- reader checks no range, reference among declarations or cycle itself. A
+-- game mixing its own declarations with a file calls `read_into` on its Pop,
+-- freezes, and passes the message through `locate`.
+mod Strata.PopulationFile do
+
+  -- what a file cannot hold: template lists and site lists the game made, by name."
+  type PopNamed = PopNamed(List((String, List(Strata.Template.Template))), List((String, List(Strata.Population.PopSite))))
+
+  -- a section: its kind and names from the header, the header's line, and
+  -- its settings (name, value words, line) in file order
+  type PopFileSection = { pfs_kind : String, pfs_names : List(String), pfs_line : Int, pfs_sets : List((String, List(String), Int)) }
+
+  doc "The template lists and site lists a file may name (`from =`, `sites =`); where a name is given twice the first is used."
+  fn named(templates : List((String, List(Strata.Template.Template))), sites : List((String, List(Strata.Population.PopSite)))) : PopNamed do PopNamed(templates, sites) end
+
+  doc "p with the ten built-in ground fields declared under their slot names: altitude, slope, water_depth, river_dist, lake_dist, coast_dist, wetness, region, depth, sky (slots 0..9). `read` declares them before a file's sections."
+  fn ground_fields(p : Strata.Population.Pop) : Strata.Population.Pop do
+    List.fold_left(List.range(0, 10), p, fn (acc, s) -> Strata.Population.field_ground(acc, slot_name(s), s))
+  end
+  pfn slot_name(s : Int) : String do
+    if s == 0 do "altitude" else if s == 1 do "slope" else if s == 2 do "water_depth" else if s == 3 do "river_dist" else if s == 4 do "lake_dist"
+    else if s == 5 do "coast_dist" else if s == 6 do "wetness" else if s == 7 do "region" else if s == 8 do "depth" else "sky" end end end end end end end end end
+  end
+
+  -- ── Small helpers ──────────────────────────────────────────────────────
+
+  pfn at_line(n : Int, msg : String) : String do "line " ++ int_to_string(n) ++ ": " ++ msg end
+  pfn bad(n : Int, msg : String) : Result(a, String) do Err(at_line(n, msg)) end
+  pfn and_then(r : Result(a, String), f : a -> Result(b, String)) : Result(b, String) do
+    match r do
+      Ok(v) -> f(v)
+      Err(e) -> Err(e)
+    end
+  end
+  -- every word through f, or the first Err; a loop (tail calls only), so a value of many thousand words reads
+  pfn all_ok(xs : List(String), f : String -> Result(a, String)) : Result(List(a), String) do all_go(xs, f, Nil) end
+  pfn all_go(xs : List(String), f : String -> Result(a, String), acc : List(a)) : Result(List(a), String) do
+    match xs do
+      Nil -> Ok(List.reverse(acc))
+      Cons(x, rest) ->
+        match f(x) do
+          Ok(v) -> all_go(rest, f, Cons(v, acc))
+          Err(e) -> Err(e)
+        end
+    end
+  end
+  -- text echoed from the file, cut to 40 bytes and an ellipsis
+  pfn short(s : String) : String do if String.byte_size(s) > 40 do String.slice_bytes(s, 0, cut_at(s, 40)) ++ "..." else s end end
+  -- i moved back past UTF-8 continuation bytes (0x80..0xBF), so a cut there splits no character
+  pfn cut_at(s : String, i : Int) : Int do if i > 0 do (if string_contains(continuation_bytes(), String.slice_bytes(s, i, 1)) do cut_at(s, i - 1) else i end) else i end end
+  pfn continuation_bytes() : String do
+    "\x80\x81\x82\x83\x84\x85\x86\x87\x88\x89\x8A\x8B\x8C\x8D\x8E\x8F\x90\x91\x92\x93\x94\x95\x96\x97\x98\x99\x9A\x9B\x9C\x9D\x9E\x9F" ++
+    "\xA0\xA1\xA2\xA3\xA4\xA5\xA6\xA7\xA8\xA9\xAA\xAB\xAC\xAD\xAE\xAF\xB0\xB1\xB2\xB3\xB4\xB5\xB6\xB7\xB8\xB9\xBA\xBB\xBC\xBD\xBE\xBF"
+  end
+  pfn q(s : String) : String do "'" ++ short(s) ++ "'" end
+  pfn member(xs : List(String), s : String) : Bool do List.any(xs, fn x -> x == s) end
+  pfn drop_bytes(s : String, k : Int) : String do String.slice_bytes(s, k, String.byte_size(s) - k) end
+
+  -- a line without its comment, trimmed
+  pfn bare(line : String) : String do
+    match String.split_first(line, "#") do
+      Some((before, _)) -> String.trim(before)
+      None -> String.trim(line)
+    end
+  end
+  -- the words of s, split at spaces, tabs and carriage returns
+  pfn words(s : String) : List(String) do
+    List.filter(String.split(String.replace_all(String.replace_all(s, "\t", " "), "\r", " "), " "), fn w -> !String.is_empty(w))
+  end
+
+  pfn chars_ok(s : String, i : Int, n : Int, set : String) : Bool do
+    if i >= n do true else if string_contains(set, String.slice_bytes(s, i, 1)) do chars_ok(s, i + 1, n, set) else false end end
+  end
+  pfn name_ok(s : String) : Bool do
+    if String.is_empty(s) do false else chars_ok(s, 0, String.byte_size(s), "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-.") end
+  end
+
+  -- ── Numbers ────────────────────────────────────────────────────────────
+
+  pfn byte_is(s : String, i : Int, n : Int, c : String) : Bool do if i < n do String.slice_bytes(s, i, 1) == c else false end end
+  pfn digit_at(s : String, i : Int, n : Int) : Bool do if i < n do string_contains("0123456789", String.slice_bytes(s, i, 1)) else false end end
+  pfn digits_end(s : String, i : Int, n : Int) : Int do if digit_at(s, i, n) do digits_end(s, i + 1, n) else i end end
+  pfn digit_value(s : String, i : Int) : Int do
+    match String.index_of("0123456789", String.slice_bytes(s, i, 1)) do
+      Some(k) -> k
+      None -> 0
+    end
+  end
+
+  -- -?D+(.D+)?([eE][+-]?D+)?, the whole word
+  pfn number_shape(s : String) : Bool do
+    let n = String.byte_size(s)
+    let p0 = if byte_is(s, 0, n, "-") do 1 else 0 end
+    let p1 = digits_end(s, p0, n)
+    if p1 == p0 do false
+    else
+      let p2 = if byte_is(s, p1, n, ".") do digits_end(s, p1 + 1, n) else p1 end
+      if p2 == p1 + 1 do false
+      else
+        let e = if byte_is(s, p2, n, "e") do true else byte_is(s, p2, n, "E") end
+        if e do
+          let p3 = if byte_is(s, p2 + 1, n, "-") do p2 + 2 else if byte_is(s, p2 + 1, n, "+") do p2 + 2 else p2 + 1 end end
+          let p4 = digits_end(s, p3, n)
+          if p4 == p3 do false else p4 == n end
+        else p2 == n end
+      end
+    end
+  end
+
+  pfn parse_float(s : String) : Result(Float, String) do
+    let shape = q(s) ++ " is not a number (decimal: -2, 0.25, 1.5e1)"
+    if number_shape(s) do
+      match String.to_float(s) do
+        Ok(v) -> if float_is_infinite(v) do Err(q(s) ++ " is not a finite number") else Ok(v) end
+        Err(_) -> Err(shape)
+      end
+    else Err(shape) end
+  end
+
+  -- digits from i on, or None once the value would reach 10^18 (checked before multiplying, so nothing overflows)
+  pfn int_go(s : String, i : Int, n : Int, acc : Int) : Option(Int) do
+    if i >= n do Some(acc)
+    else
+      let d = digit_value(s, i)
+      if acc > (999999999999999999 - d) / 10 do None else int_go(s, i + 1, n, acc * 10 + d) end
+    end
+  end
+  pfn parse_int(s : String) : Result(Int, String) do
+    let n = String.byte_size(s)
+    let p0 = if byte_is(s, 0, n, "-") do 1 else 0 end
+    let p1 = digits_end(s, p0, n)
+    if p1 == p0 do Err(q(s) ++ " is not an integer")
+    else if p1 != n do Err(q(s) ++ " is not an integer")
+    else
+      match int_go(s, p0, n, 0) do
+        Some(v) -> if p0 == 1 do Ok(0 - v) else Ok(v) end
+        None -> Err(q(s) ++ " is not an integer below 10^18 in size")
+      end
+    end end
+  end
+
+  pfn point_of(s : String) : Result((Float, Float), String) do
+    match String.split_first(s, ":") do
+      None -> Err(q(s) ++ " is not a point x:y")
+      Some((x, y)) -> and_then(parse_float(x), fn a -> and_then(parse_float(y), fn b -> Ok((a, b))))
+    end
+  end
+  pfn factor_of(s : String) : Result((String, Strata.Population.PopCurve), String) do
+    match String.split_first(s, ":") do
+      None -> Err(q(s) ++ " is not a factor field:x:y,x:y,...")
+      Some((f, rest)) ->
+        if String.is_empty(f) do Err(q(s) ++ " names no field; a factor is field:x:y,x:y,...")
+        else and_then(all_ok(String.split(rest, ","), point_of), fn pts -> Ok((f, Strata.Population.curve(pts)))) end
+    end
+  end
+
+  -- ── Scanning: lines into sections ──────────────────────────────────────
+
+  pfn starts_setting(ts : List(String)) : Bool do
+    match ts do
+      Cons(e, _) -> e == "="
+      Nil -> false
+    end
+  end
+  -- the value words up to the next `name =`, and what follows
+  pfn values_go(ts : List(String), acc : List(String)) : (List(String), List(String)) do
+    match ts do
+      Nil -> (List.reverse(acc), Nil)
+      Cons(t, rest) -> if t == "=" do (List.reverse(acc), ts) else if starts_setting(rest) do (List.reverse(acc), ts) else values_go(rest, Cons(t, acc)) end end
+    end
+  end
+  pfn settings_go(ts : List(String), n : Int, acc : List((String, List(String)))) : Result(List((String, List(String))), String) do
+    match ts do
+      Nil -> Ok(List.reverse(acc))
+      Cons(t, rest) ->
+        if t == "=" do bad(n, "'=' with no setting name before it")
+        else if starts_setting(rest) do
+          let (vals, more) = values_go(List.drop(rest, 1), Nil)
+          if !name_ok(t) do bad(n, q(t) ++ " is not a setting name")
+          else if List.is_empty(vals) do bad(n, "setting " ++ q(t) ++ " has no value")
+          else settings_go(more, n, Cons((t, vals), acc)) end end
+        else bad(n, "expected name = value, found " ++ q(t)) end end
+    end
+  end
+
+  pfn set_name(e : (String, List(String), Int)) : String do match e do (k, _, _) -> k end end
+  pfn set_line(e : (String, List(String), Int)) : Int do match e do (_, _, l) -> l end end
+  pfn desc(sec : PopFileSection) : String do "[" ++ string_join(Cons(sec.pfs_kind, sec.pfs_names), " ") ++ "]" end
+
+  -- the section with the settings in text (on line n) added after its others
+  pfn add_settings(sec : PopFileSection, text : String, n : Int) : Result(PopFileSection, String) do
+    and_then(settings_go(words(String.replace_all(text, "=", " = ")), n, Nil), fn kvs -> add_go(sec, kvs, n))
+  end
+  pfn add_go(sec : PopFileSection, kvs : List((String, List(String))), n : Int) : Result(PopFileSection, String) do
+    match kvs do
+      Nil -> Ok(sec)
+      Cons((k, vs), rest) ->
+        match List.find(sec.pfs_sets, fn e -> set_name(e) == k) do
+          Some(e) -> bad(n, "setting " ++ q(k) ++ " is given twice in " ++ desc(sec) ++ " (first on line " ++ int_to_string(set_line(e)) ++ ")")
+          None -> add_go({ sec with pfs_sets: List.append(sec.pfs_sets, Cons((k, vs, n), Nil)) }, rest, n)
+        end
+    end
+  end
+
+  pfn names_count(kind : String) : Int do
+    if kind == "weights" do 2 else if member(["field", "zone", "shapes", "layer"], kind) do 1 else 0 end end
+  end
+  -- a header line (it starts with "["): the new section, and the text after "]"
+  pfn header(b : String, n : Int) : Result((PopFileSection, String), String) do
+    match String.split_first(drop_bytes(b, 1), "]") do
+      None -> bad(n, "a section header without its closing ]: " ++ short(b))
+      Some((h, tail)) ->
+        match words(h) do
+          Nil -> bad(n, "a section header with no kind: " ++ short(b))
+          Cons(k, names) ->
+            let want = names_count(k)
+            let got = List.length(names)
+            if want == 0 do bad(n, "unknown section kind " ++ q(k) ++ "; it must be field, zone, shapes, weights or layer")
+            else if got == 0 do bad(n, "section header " ++ short(b) ++ " has no name")
+            else if got != want do bad(n, "section header " ++ short(b) ++ " takes " ++ (if want == 1 do "one name" else "two names: a shape set and a zone" end))
+            else
+              match List.find(names, fn x -> !name_ok(x)) do
+                Some(x) -> bad(n, q(x) ++ " is not a name: a name holds letters, digits, _, - and .")
+                None -> Ok(({ pfs_kind: k, pfs_names: names, pfs_line: n, pfs_sets: Nil }, tail))
+              end
+            end end end
+        end
+    end
+  end
+
+  pfn close(cur : Option(PopFileSection), done : List(PopFileSection)) : List(PopFileSection) do
+    match cur do
+      Some(s) -> Cons(s, done)
+      None -> done
+    end
+  end
+  -- the sections of the lines from line n on, in file order, and the first
+  -- syntax mistake: at a mistake the scan stops, dropping the section it is
+  -- in (whose other mistakes may follow from it) and keeping those before;
+  -- a loop with tail calls only, so a file of many thousand lines reads
+  pfn scan(ls : List(String), n : Int, cur : Option(PopFileSection), done : List(PopFileSection)) : (List(PopFileSection), Option(String)) do
+    match ls do
+      Nil -> (List.reverse(close(cur, done)), None)
+      Cons(l, rest) ->
+        let b = bare(l)
+        if String.is_empty(b) do scan(rest, n + 1, cur, done)
+        else if String.starts_with(b, "[") do
+          match header(b, n) do
+            Err(e) -> (List.reverse(close(cur, done)), Some(e))
+            Ok((sec, tail)) ->
+              match add_settings(sec, tail, n) do
+                Err(e) -> (List.reverse(close(cur, done)), Some(e))
+                Ok(s2) -> scan(rest, n + 1, Some(s2), close(cur, done))
+              end
+          end
+        else
+          match cur do
+            None -> (Nil, Some(at_line(n, "a setting before any section header: " ++ short(b))))
+            Some(sec) ->
+              match add_settings(sec, b, n) do
+                Err(e) -> (List.reverse(done), Some(e))
+                Ok(s2) -> scan(rest, n + 1, Some(s2), done)
+              end
+          end
+        end end
+    end
+  end
+
+  -- ── Reading a section's settings ───────────────────────────────────────
+
+  pfn find_set(sec : PopFileSection, k : String) : Option((String, List(String), Int)) do List.find(sec.pfs_sets, fn e -> set_name(e) == k) end
+  pfn vals(sec : PopFileSection, k : String) : Option(List(String)) do
+    match find_set(sec, k) do
+      Some((_, vs, _)) -> Some(vs)
+      None -> None
+    end
+  end
+  -- the setting's line, or the header's when it is not given
+  pfn line_of(sec : PopFileSection, k : String) : Int do
+    match find_set(sec, k) do
+      Some(e) -> set_line(e)
+      None -> sec.pfs_line
+    end
+  end
+  -- a value's mistake, on the setting's line
+  pfn in_setting(sec : PopFileSection, k : String, r : Result(a, String)) : Result(a, String) do
+    match r do
+      Ok(v) -> Ok(v)
+      Err(m) -> bad(line_of(sec, k), m ++ " (setting " ++ q(k) ++ " of " ++ desc(sec) ++ ")")
+    end
+  end
+  pfn need(sec : PopFileSection, k : String) : Result(List(String), String) do
+    match vals(sec, k) do
+      Some(vs) -> Ok(vs)
+      None -> bad(sec.pfs_line, desc(sec) ++ " has no " ++ q(k))
+    end
+  end
+  pfn one_of(sec : PopFileSection, k : String) : Result(String, String) do
+    and_then(need(sec, k), fn vs -> match vs do
+      Cons(v, Nil) -> Ok(v)
+      _ -> bad(line_of(sec, k), "setting " ++ q(k) ++ " of " ++ desc(sec) ++ " takes one value, not " ++ int_to_string(List.length(vs)))
+    end)
+  end
+  pfn float_of(sec : PopFileSection, k : String) : Result(Float, String) do and_then(one_of(sec, k), fn v -> in_setting(sec, k, parse_float(v))) end
+  pfn int_of(sec : PopFileSection, k : String) : Result(Int, String) do and_then(one_of(sec, k), fn v -> in_setting(sec, k, parse_int(v))) end
+  pfn ints_of(sec : PopFileSection, k : String) : Result(List(Int), String) do and_then(need(sec, k), fn vs -> in_setting(sec, k, all_ok(vs, parse_int))) end
+  pfn floats_of(sec : PopFileSection, k : String) : Result(List(Float), String) do and_then(need(sec, k), fn vs -> in_setting(sec, k, all_ok(vs, parse_float))) end
+  pfn points_of(sec : PopFileSection, k : String) : Result(List((Float, Float)), String) do and_then(need(sec, k), fn vs -> in_setting(sec, k, all_ok(vs, point_of))) end
+  -- an optional setting: Nil when it is not given
+  pfn opt_names(sec : PopFileSection, k : String) : Result(List(String), String) do if Option.is_some(vals(sec, k)) do need(sec, k) else Ok(Nil) end end
+  pfn opt_factors(sec : PopFileSection, k : String) : Result(List((String, Strata.Population.PopCurve)), String) do
+    match vals(sec, k) do
+      Some(vs) -> in_setting(sec, k, all_ok(vs, factor_of))
+      None -> Ok(Nil)
+    end
+  end
+
+  pfn lookup(xs : List((String, a)), k : String) : Option(a) do
+    match xs do
+      Nil -> None
+      Cons((x, v), rest) -> if x == k do Some(v) else lookup(rest, k) end
+    end
+  end
+  pfn templates_of(sec : PopFileSection, k : String, nm : PopNamed) : Result(List(Strata.Template.Template), String) do
+    and_then(one_of(sec, k), fn v -> match nm do
+      PopNamed(ts, _) ->
+        match lookup(ts, v) do
+          Some(t) -> Ok(t)
+          None -> bad(line_of(sec, k), "no template list named " ++ q(v) ++ " was given (setting " ++ q(k) ++ " of " ++ desc(sec) ++ ")")
+        end
+    end)
+  end
+  pfn sites_of(sec : PopFileSection, k : String, nm : PopNamed) : Result(List(Strata.Population.PopSite), String) do
+    and_then(one_of(sec, k), fn v -> match nm do
+      PopNamed(_, ss) ->
+        match lookup(ss, v) do
+          Some(s) -> Ok(s)
+          None -> bad(line_of(sec, k), "no site list named " ++ q(v) ++ " was given (setting " ++ q(k) ++ " of " ++ desc(sec) ++ ")")
+        end
+    end)
+  end
+
+  -- the section's kind, one of kinds
+  pfn kind_of(sec : PopFileSection, kinds : List(String)) : Result(String, String) do
+    let which = "; it must be one of " ++ string_join(kinds, ", ")
+    if Option.is_none(vals(sec, "kind")) do bad(sec.pfs_line, desc(sec) ++ " has no kind" ++ which)
+    else
+      and_then(one_of(sec, "kind"), fn k -> if member(kinds, k) do Ok(k) else bad(line_of(sec, "kind"), "unknown kind " ++ q(k) ++ " for a " ++ sec.pfs_kind ++ which) end)
+    end
+  end
+  -- every setting given is one the section takes
+  pfn takes(sec : PopFileSection, what : String, allowed : List(String)) : Result(Unit, String) do
+    match List.find(sec.pfs_sets, fn e -> !member(allowed, set_name(e))) do
+      Some(e) -> bad(set_line(e), "unknown setting " ++ q(set_name(e)) ++ " for " ++ what ++ "; it takes " ++ string_join(allowed, ", "))
+      None -> Ok(())
+    end
+  end
+  pfn ranks_arr(xs : List(Int)) : NativeIntArr do fill_go(NativeArray.make_int(List.length(xs), 0), xs, 0) end
+  -- a[i..] from the list, walked once
+  pfn fill_go(a : NativeIntArr, xs : List(Int), i : Int) : NativeIntArr do
+    match xs do
+      Nil -> a
+      Cons(x, rest) -> fill_go(NativeArray.set_int(a, i, x), rest, i + 1)
+    end
+  end
+  pfn first_name(sec : PopFileSection) : String do
+    match sec.pfs_names do
+      Cons(x, _) -> x
+      Nil -> ""
+    end
+  end
+
+  -- ── Building: one section, one builder call ───────────────────────────
+
+  pfn build_field(p : Strata.Population.Pop, sec : PopFileSection) : Result(Strata.Population.Pop, String) do
+    let name = first_name(sec)
+    and_then(kind_of(sec, ["ground", "noise", "curve", "cover"]), fn k ->
+      if k == "ground" do
+        and_then(takes(sec, "a ground field", ["kind", "slot"]), fn _ -> and_then(int_of(sec, "slot"), fn s -> Ok(Strata.Population.field_ground(p, name, s))))
+      else if k == "noise" do
+        and_then(takes(sec, "a noise field", ["kind", "noise", "octaves", "period", "salt"]), fn _ ->
+          and_then(int_of(sec, "noise"), fn nk -> and_then(int_of(sec, "octaves"), fn o -> and_then(float_of(sec, "period"), fn per -> and_then(int_of(sec, "salt"), fn salt ->
+            Ok(Strata.Population.field_noise(p, name, nk, o, per, salt)))))))
+      else if k == "curve" do
+        and_then(takes(sec, "a curve field", ["kind", "of", "curve"]), fn _ ->
+          and_then(one_of(sec, "of"), fn of -> and_then(points_of(sec, "curve"), fn pts -> Ok(Strata.Population.field_curve(p, name, of, Strata.Population.curve(pts))))))
+      else
+        and_then(takes(sec, "a cover field", ["kind", "layer", "radius"]), fn _ ->
+          and_then(one_of(sec, "layer"), fn l -> and_then(float_of(sec, "radius"), fn r -> Ok(Strata.Population.field_cover(p, name, l, r)))))
+      end end end)
+  end
+
+  pfn build_zone(p : Strata.Population.Pop, sec : PopFileSection, nm : PopNamed) : Result(Strata.Population.Pop, String) do
+    let name = first_name(sec)
+    and_then(kind_of(sec, ["regions", "band", "ring", "all", "any", "not"]), fn k ->
+      if k == "regions" do
+        and_then(takes(sec, "a regions zone", ["kind", "ids"]), fn _ -> and_then(ints_of(sec, "ids"), fn ids -> Ok(Strata.Population.zone_regions(p, name, ids))))
+      else if k == "band" do
+        and_then(takes(sec, "a band zone", ["kind", "field", "lo", "hi"]), fn _ ->
+          and_then(one_of(sec, "field"), fn f -> and_then(float_of(sec, "lo"), fn lo -> and_then(float_of(sec, "hi"), fn hi -> Ok(Strata.Population.zone_band(p, name, f, lo, hi))))))
+      else if k == "ring" do
+        and_then(takes(sec, "a ring zone", ["kind", "sites", "inner", "outer"]), fn _ ->
+          and_then(sites_of(sec, "sites", nm), fn ss -> and_then(float_of(sec, "inner"), fn i -> and_then(float_of(sec, "outer"), fn o -> Ok(Strata.Population.zone_ring(p, name, ss, i, o))))))
+      else if k == "not" do
+        and_then(takes(sec, "a not zone", ["kind", "of"]), fn _ -> and_then(one_of(sec, "of"), fn z -> Ok(Strata.Population.zone_not(p, name, z))))
+      else
+        and_then(takes(sec, "an " ++ k ++ " zone", ["kind", "of"]), fn _ -> and_then(need(sec, "of"), fn zs ->
+          if k == "all" do Ok(Strata.Population.zone_all(p, name, zs)) else Ok(Strata.Population.zone_any(p, name, zs)) end))
+      end end end end)
+  end
+
+  pfn with_ranks(p : Strata.Population.Pop, sec : PopFileSection) : Result(Strata.Population.Pop, String) do
+    if Option.is_some(vals(sec, "ranks")) do and_then(ints_of(sec, "ranks"), fn rs -> Ok(Strata.Population.ranks(p, first_name(sec), ranks_arr(rs)))) else Ok(p) end
+  end
+  pfn build_shapes(p : Strata.Population.Pop, sec : PopFileSection, nm : PopNamed) : Result(Strata.Population.Pop, String) do
+    let name = first_name(sec)
+    and_then(kind_of(sec, ["blocks", "templates"]), fn k ->
+      if k == "blocks" do
+        and_then(takes(sec, "a shape set of blocks", ["kind", "ids", "ranks"]), fn _ -> and_then(ints_of(sec, "ids"), fn ids -> with_ranks(Strata.Population.shapes_blocks(p, name, ids), sec)))
+      else
+        and_then(takes(sec, "a shape set of templates", ["kind", "from", "ranks"]), fn _ -> and_then(templates_of(sec, "from", nm), fn ts -> with_ranks(Strata.Population.shapes_templates(p, name, ts), sec)))
+      end)
+  end
+
+  pfn build_weights(p : Strata.Population.Pop, sec : PopFileSection) : Result(Strata.Population.Pop, String) do
+    match sec.pfs_names do
+      Cons(s, Cons(z, _)) -> and_then(takes(sec, "weights", ["w"]), fn _ -> and_then(floats_of(sec, "w"), fn w -> Ok(Strata.Population.weights(p, s, z, w))))
+      _ -> bad(sec.pfs_line, desc(sec) ++ " takes two names")
+    end
+  end
+
+  pfn rule_of(sec : PopFileSection) : Result(Strata.Population.PopRule, String) do
+    and_then(float_of(sec, "base"), fn base -> and_then(opt_factors(sec, "by"), fn cs -> and_then(opt_names(sec, "inside"), fn ins -> and_then(opt_names(sec, "outside"), fn outs ->
+      Ok(Strata.Population.rule(base, cs, ins, outs))))))
+  end
+  pfn with_seen(p : Strata.Population.Pop, sec : PopFileSection) : Result(Strata.Population.Pop, String) do
+    if Option.is_some(vals(sec, "seen_to")) do and_then(int_of(sec, "seen_to"), fn lvl -> Ok(Strata.Population.seen_to(p, first_name(sec), lvl))) else Ok(p) end
+  end
+  pfn build_layer(p : Strata.Population.Pop, sec : PopFileSection, nm : PopNamed) : Result(Strata.Population.Pop, String) do
+    let name = first_name(sec)
+    let ruled = ["kind", "shapes", "base", "by", "inside", "outside", "salt", "seen_to"]
+    and_then(kind_of(sec, ["cover", "scatter", "site"]), fn k ->
+      if k == "cover" do
+        and_then(takes(sec, "a cover layer", ruled), fn _ -> and_then(one_of(sec, "shapes"), fn s -> and_then(rule_of(sec), fn r -> and_then(int_of(sec, "salt"), fn salt ->
+          with_seen(Strata.Population.layer_cover(p, name, s, r, salt), sec)))))
+      else if k == "scatter" do
+        and_then(takes(sec, "a scatter layer", List.append(ruled, ["cell", "jitter"])), fn _ -> and_then(one_of(sec, "shapes"), fn s -> and_then(rule_of(sec), fn r ->
+          and_then(float_of(sec, "cell"), fn cell -> and_then(float_of(sec, "jitter"), fn jit -> and_then(int_of(sec, "salt"), fn salt ->
+            with_seen(Strata.Population.layer_scatter(p, name, s, r, cell, jit, salt), sec)))))))
+      else
+        and_then(takes(sec, "a site layer", ["kind", "shapes", "sites", "margin", "salt", "seen_to"]), fn _ -> and_then(one_of(sec, "shapes"), fn s ->
+          and_then(sites_of(sec, "sites", nm), fn ss -> and_then(float_of(sec, "margin"), fn m -> and_then(int_of(sec, "salt"), fn salt ->
+            with_seen(Strata.Population.layer_site(p, name, s, ss, m, salt), sec))))))
+      end end)
+  end
+
+  pfn build_go(p : Strata.Population.Pop, secs : List(PopFileSection), nm : PopNamed) : Result(Strata.Population.Pop, String) do
+    match secs do
+      Nil -> Ok(p)
+      Cons(sec, rest) ->
+        let k = sec.pfs_kind
+        let r = if k == "field" do build_field(p, sec) else if k == "zone" do build_zone(p, sec, nm) else if k == "shapes" do build_shapes(p, sec, nm) else if k == "weights" do build_weights(p, sec) else build_layer(p, sec, nm) end end end end
+        match r do
+          Ok(p2) -> build_go(p2, rest, nm)
+          Err(e) -> Err(e)
+        end
+    end
+  end
+
+  -- ── Reading, and freeze's message back on its section's line ─────────
+
+  -- the text without a leading UTF-8 byte order mark
+  pfn no_bom(text : String) : String do if String.starts_with(text, "\xEF\xBB\xBF") do drop_bytes(text, 3) else text end end
+  pfn sections_of(text : String) : (List(PopFileSection), Option(String)) do scan(String.split(no_bom(text), "\n"), 1, None, Nil) end
+
+  doc "p with the declarations of the text added, its template and site lists taken from n by name; no ground fields are added and nothing is frozen, so the file may name what the game declared in p (or will declare after). Err(\"line N: ...\") for the first mistake in file order: syntax, an unknown section kind, kind or setting, a missing required setting, a malformed number, a template or site list n lacks. A game that freezes the result itself passes freeze's message through locate to get the file's line."
+  fn read_into(p : Strata.Population.Pop, text : String, n : PopNamed) : Result(Strata.Population.Pop, String) do
+    let (secs, syntax) = sections_of(text)
+    match build_go(p, secs, n) do
+      Err(e) -> Err(e)
+      Ok(p2) ->
+        match syntax do
+          Some(e) -> Err(e)
+          None -> Ok(p2)
+        end
+    end
+  end
+
+  pfn same_names(a : List(String), b : List(String)) : Bool do
+    match a do
+      Nil -> List.is_empty(b)
+      Cons(x, xs) ->
+        match b do
+          Cons(y, ys) -> if x == y do same_names(xs, ys) else false end
+          Nil -> false
+        end
+    end
+  end
+  doc "A message of Strata.Population.freeze (or fit_all) about a population holding the declarations of text, with the line of the section it is about put first (\"line N: ...\"): the last section of that kind and name (the later of two that share a name), or for a seen_to or ranks mistake the line of that setting in the file; the message unchanged when the text has no such section or setting (the declaration came from the game) or the message has no subject (Strata.Population.freeze_subject)."
+  fn locate(text : String, freeze_err : String) : String do
+    match Strata.Population.freeze_subject(freeze_err) do
+      None -> freeze_err
+      Some((kind, names)) ->
+        let (secs, _) = sections_of(text)
+        -- a seen_to or ranks mistake is the file's only where its section sets it, and is put on that setting's line
+        let setting = if kind == "seen_to" do "seen_to" else if kind == "ranks" do "ranks" else "" end end
+        let skind = if kind == "seen_to" do "layer" else if kind == "ranks" do "shapes" else kind end end
+        let hits = List.filter(secs, fn s -> if s.pfs_kind == skind do (if same_names(s.pfs_names, names) do (if String.is_empty(setting) do true else Option.is_some(vals(s, setting)) end) else false end) else false end)
+        match List.reverse(hits) do
+          Cons(s, _) -> at_line(if String.is_empty(setting) do s.pfs_line else line_of(s, setting) end, freeze_err)
+          Nil -> freeze_err
+        end
+    end
+  end
+
+  doc "The population declared in text, its template and site lists taken from n by name: read_into of the ten built-in ground fields (ground_fields), then Strata.Population.freeze, whose message comes back through locate, on the line of the section it is about. The Pop answered freezes."
+  fn read(text : String, n : PopNamed) : Result(Strata.Population.Pop, String) do
+    match read_into(ground_fields(Strata.Population.new()), text, n) do
+      Err(e) -> Err(e)
+      Ok(p) ->
+        match Strata.Population.freeze(p) do
+          Ok(_) -> Ok(p)
+          Err(m) -> Err(locate(text, m))
+        end
+    end
+  end
+end
