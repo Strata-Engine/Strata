@@ -1140,7 +1140,7 @@ these figures (its window aborts off the main thread).
 
 | what | before (a044934) | after | load | |
 |---|---|---|---|---|
-| island surface chunk, one at a time (stage 1, the unbatched path STRATA_CHUNK_TIMES times) | 3475 to 3525 us, 60.39 to 60.42 M instructions | 4015 to 4135 us, 70.54 to 70.57 M | 6.4 to 7.2 | 0.3 ms over the Step 1 figure allowed: missed by about 0.25 ms (10.2 M instructions) |
+| island surface chunk, one at a time (stage 1, the unbatched path STRATA_CHUNK_TIMES times) | 3475 to 3525 us, 60.39 to 60.42 M instructions | 4015 to 4135 us, 70.54 to 70.57 M | 6.4 to 7.2 | 0.3 ms over the Step 1 figure allowed: missed by about 0.25 ms (10.2 M instructions); met after fix round 1, below |
 | a chunk column's full chunks in one call (stage 34; 981 full chunks over the 200 columns, 4.9 a column) | 7275 to 7365 us, 133.8 M a column | 7750 to 7870 us, 141.5 to 141.6 M | 6.4 to 7.2 | about 0.1 ms (1.6 M) more a surface chunk |
 | Step 1, measured before any change | 3860 to 3880 us, 60.56 to 60.84 M | | 42.6 to 47.9 | |
 
@@ -1157,3 +1157,19 @@ the population's per-column passes, whose per-turn overhead is the one
 `bench/march/voxel_loop` already reduces. A density top at every Ground
 column was measured first, at 4.3 ms and 73 M instructions a chunk column,
 and refused.
+
+### Fix round 1: fields only where read
+
+After the review of edddff6. Stage 35 is new: a column's full chunks two keys a call (`run_column` over pairs), the stream's path at `STRATA_BATCH` 2. The a044934 harness and the fix's harness were run alternately in the same minutes, at load 11 to 21.
+
+| what | before (a044934) | after | a surface chunk |
+|---|---|---|---|
+| stage 35, two keys a call (the real path) | 200.65 to 200.67 M instructions a column, 11.3 to 11.4 ms | 210.26 to 210.37 M, 12.0 to 12.3 ms | about +2.0 M, about 0.12 ms: met, well under 0.3 ms |
+| stage 1, one chunk at a time | 60.41 to 60.44 M, 3.5 to 3.6 ms | 64.50 M, 3.7 to 3.8 ms | +4.1 M, about 0.24 ms: met |
+| stage 34, a column in one call | 133.87 to 133.97 M | 135.77 to 135.80 M | about +0.4 M |
+
+The population's Ground and Table for a chunk column now cost 4.3 M instructions, down from 10.7 M. Four changes did it:
+- `Strata.Populate.fields_for` evaluates each field only where a layer reads it.
+- `region_at` is called once per atlas sample.
+- The ground fields are supplied only at the columns that are read.
+- A density top is worked out only under candidates that stand.

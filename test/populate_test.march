@@ -117,6 +117,39 @@ mod Strata.Test.Populate do
   pfn reeds_pts() : List((Float, Float)) do [(0.5, 0.0), (1.0, 1.0)] end
   pfn odd_pts() : List((Float, Float)) do [(0.0, 0.0 -. 1.0), (50.0, 1.0)] end
 
+  -- every kind of field, zone and rule fields_at evaluates point by point (no cover field)
+  pfn every_pop() : Strata.Population.Pop do
+    let p0 = Pn.field_noise(Pn.field_ground(Pn.field_ground(Pn.field_ground(Pn.new(), "alt", 0), "slope", 1), "region", 7), "n1", 0, 2, 30.0, 5)
+    let p1 = Pn.field_curve(p0, "c1", "n1", Pn.curve([(0.2, 0.0), (0.7, 1.0)]))
+    let p2 = Pn.zone_band(Pn.zone_regions(Pn.zone_ring(p1, "near", [Pn.site(20.0, 20.0, 50.0, 8.0, 0)], 0.0, 15.0), "r1", [1, 3]), "high", "alt", 60.0, 1000.0)
+    let p3 = Pn.zone_not(Pn.zone_any(Pn.zone_all(p2, "a1", ["high", "r1"]), "o1", ["high", "near"]), "x1", "r1")
+    let p4 = Pn.shapes_blocks(Pn.shapes_blocks(p3, "g", [7]), "b", [8, 9])
+    let p5 = Pn.layer_cover(p4, "g1", "g", Pn.rule(0.9, [("alt", Pn.curve([(40.0, 0.2), (90.0, 1.0)])), ("c1", Pn.curve([(0.0, 0.5), (1.0, 1.0)]))], ["o1"], ["x1"]), 1)
+    Pn.weights(Pn.layer_scatter(p5, "s1", "b", Pn.rule(0.05, [("slope", Pn.curve([(0.0, 1.0), (1.0, 0.0)]))], ["a1"], Nil), 4.0, 0.5, 2), "b", "near", [1.0, 0.0])
+  end
+  -- a Ground for every_pop: alt 30..110, slope 0..1.2, regions near 0..3
+  pfn every_ground(x0 : Int, z0 : Int, n : Int) : Strata.Populate.Ground do
+    let nn = n * n
+    Pq.with_field(Pq.with_field(Pq.with_field(world_ground(x0, z0, n, 1.0), 0, random_arr(11, 30.0, 110.0, nn)), 1, random_arr(12, 0.0, 1.2, nn)), 7, regions_go(NativeArray.make_f32(nn, 0.0), 0, nn))
+  end
+  -- the first column where fields_at's Table differs from fields_with's (at a masked column) or is not empty (elsewhere), or -1
+  pfn at_match(f : Strata.Population.Frozen, ta : Strata.Populate.Table, tw : Strata.Populate.Table, mask : NativeU8Arr, c : Int, nn : Int) : Int do
+    if c >= nn do -1
+    else
+      let inm = NativeArray.get_u8(mask, c) == 1
+      -- "region" is a field no rule reads (the regions zone reads the slot itself): fields_at leaves it 0
+      let fs = List.all(List.filter(Pn.field_names(f), fn nm -> nm != "region"), fn nm -> if inm do Pq.field_at(ta, nm, c) == Pq.field_at(tw, nm, c) else Pq.field_at(ta, nm, c) == 0.0 end)
+      let zs = List.all(["near", "r1", "high", "a1", "o1", "x1"], fn nm -> if inm do Pq.zone_at(f, ta, nm, c) == Pq.zone_at(f, tw, nm, c) else !Pq.zone_at(f, ta, nm, c) end)
+      let ds = List.all(["g1", "s1"], fn nm -> if inm do Pq.density_at(f, ta, nm, c) == Pq.density_at(f, tw, nm, c) else Pq.density_at(f, ta, nm, c) == 0.0 end)
+      if fs && zs && ds do at_match(f, ta, tw, mask, c + 1, nn) else c end
+    end
+  end
+  -- the mask of chunk k's columns in an n-column Ground from (x0, z0), and of the columns places stand on
+  pfn chunk_mask(k : Strata.Coord.Key, x0 : Int, z0 : Int, n : Int, places : List((Float, Float))) : NativeU8Arr do
+    let m0 = List.fold_left(List.range(0, 1024), NativeArray.make_u8(n * n, 0), fn (m, i) -> NativeArray.set_u8(m, (32 * Strata.Coord.kx(k) + i % 32 - x0) + n * (32 * Strata.Coord.kz(k) + i / 32 - z0), 1))
+    List.fold_left(places, m0, fn (m, xz) -> match xz do (xm, zm) -> NativeArray.set_u8(m, (vox(xm, 1.0) - x0) + n * (vox(zm, 1.0) - z0), 1) end)
+  end
+
   pfn rules_pop() : Strata.Population.Pop do
     let p0 = Pn.field_ground(Pn.field_ground(Pn.field_curve(Pn.field_ground(Pn.new(), "alt", 0), "steep", "slope", Pn.curve(steep_pts())), "slope", 1), "wet", 6)
     let p1 = Pn.zone_band(Pn.zone_band(p0, "high", "alt", 60.0, 1000.0), "wetland", "wet", 0.7, 2.0)
@@ -1296,6 +1329,81 @@ mod Strata.Test.Populate do
       let air = Strata.Chunk.uniform(0)
       Test.assert_eq_int(count_layer(Pq.place(frozen_of(base), 4, k1, air, g), 7, 0), 1024, "without cover_on the floor at 31 is covered from chunk 1")
       Test.assert_eq_int(hash_of(Pq.place(frozen_of(Pn.cover_on(base, "grass", [0])), 4, k1, air, g)), hash_of(air), "with cover_on it is not, even for id 0")
+    end
+
+    test "fields_at: at the masked columns every field, zone and density is fields_with's, bit for bit; elsewhere 0, false and 0" do
+      let f = frozen_of(every_pop())
+      let p = Pq.plan(f)
+      let g = every_ground(-20, -20, 64)
+      let nn = 64 * 64
+      let tw = Pq.fields_with(p, 3, g)
+      let every_third = List.fold_left(List.range(0, nn), NativeArray.make_u8(nn, 0), fn (m, c) -> if c % 3 == 0 do NativeArray.set_u8(m, c, 1) else m end)
+      Test.assert_eq_int(at_match(f, Pq.fields_at(p, 3, g, every_third), tw, every_third, 0, nn), -1, "every third column as fields_with, the rest empty")
+      let all = NativeArray.make_u8(nn, 1)
+      Test.assert_eq_int(at_match(f, Pq.fields_at(p, 3, g, all), tw, all, 0, nn), -1, "a full mask is fields_with everywhere")
+      Test.assert_true(List.any(List.range(0, nn), fn c -> Pq.zone_at(f, tw, "near", c)), "the ring holds somewhere")
+      Test.assert_true(Pq.field_at(Pq.fields_at(p, 3, g, all), "region", 5) == 0.0, "a field no rule reads is not evaluated")
+      Test.assert_true(List.any(List.range(0, nn), fn c -> Pq.density_at(f, tw, "s1", c) > 0.0), "and the scatter layer's density is not 0 everywhere")
+      let short = Pq.fields_at(p, 3, g, NativeArray.make_u8(nn - 1, 1))
+      Test.assert_eq_int(hash_of(Pq.place_with(p, 3, Strata.Coord.key(0, 0, 0), floor_chunk(10), g, short)), hash_of(floor_chunk(10)), "a mask of another size gives a Table place_with turns away")
+      -- a plan with a cover field is evaluated in full
+      let fc = frozen_of(Pn.field_cover(every_pop(), "shade", "s1", 6.0))
+      let pc = Pq.plan(fc)
+      Test.assert_true(Pq.field_at(Pq.fields_at(pc, 3, g, every_third), "alt", 1) == Pq.field_at(Pq.fields_with(pc, 3, g), "alt", 1), "with a cover field, unmasked columns are evaluated too")
+    end
+
+    test "fields_for: each layer's density only at its own mask's columns, a field or zone at the masks of the layers that read it" do
+      let f = frozen_of(every_pop())
+      let p = Pq.plan(f)
+      let g = every_ground(-20, -20, 64)
+      let nn = 64 * 64
+      let tw = Pq.fields_with(p, 3, g)
+      let left = List.fold_left(List.range(0, nn), NativeArray.make_u8(nn, 0), fn (m, c) -> if c % 64 < 20 do NativeArray.set_u8(m, c, 1) else m end)
+      let odd = List.fold_left(List.range(0, nn), NativeArray.make_u8(nn, 0), fn (m, c) -> if c % 2 == 1 do NativeArray.set_u8(m, c, 1) else m end)
+      -- run order: g1 (cover) then s1 (scatter)
+      let t = Pq.fields_for(p, 3, g, [left, odd])
+      let bad = List.filter(List.range(0, nn), fn c ->
+        let l1 = NativeArray.get_u8(left, c) == 1
+        let o1 = NativeArray.get_u8(odd, c) == 1
+        let g1 = if l1 do Pq.density_at(f, t, "g1", c) == Pq.density_at(f, tw, "g1", c) else Pq.density_at(f, t, "g1", c) == 0.0 end
+        let s1 = if o1 do Pq.density_at(f, t, "s1", c) == Pq.density_at(f, tw, "s1", c) else Pq.density_at(f, t, "s1", c) == 0.0 end
+        -- c1 and x1 are read by g1 alone, slope and a1 by s1 alone, near by both (o1 for g1, weights for s1)
+        let c1 = if l1 do Pq.field_at(t, "c1", c) == Pq.field_at(tw, "c1", c) else Pq.field_at(t, "c1", c) == 0.0 end
+        let sl = if o1 do Pq.field_at(t, "slope", c) == Pq.field_at(tw, "slope", c) else Pq.field_at(t, "slope", c) == 0.0 end
+        let nr = if l1 || o1 do Pq.zone_at(f, t, "near", c) == Pq.zone_at(f, tw, "near", c) else !Pq.zone_at(f, t, "near", c) end
+        !(g1 && s1 && c1 && sl && nr))
+      Test.assert_eq_int(List.length(bad), 0, "every column as its layers' masks say")
+      let pad = Pq.plan_pad(p, 1.0)
+      let kn = 32 + 2 * pad
+      let gk = every_ground(0 - pad, 0 - pad, kn)
+      let full = NativeArray.make_u8(kn * kn, 1)
+      Test.assert_true(hash_of(Pq.place_with(p, 3, Strata.Coord.key(0, 0, 0), floor_chunk(10), gk, Pq.fields_for(p, 3, gk, [full, full]))) != hash_of(floor_chunk(10)), "two full masks: the layers place")
+      Test.assert_eq_int(hash_of(Pq.place_with(p, 3, Strata.Coord.key(0, 0, 0), floor_chunk(10), gk, Pq.fields_for(p, 3, gk, [full]))), hash_of(floor_chunk(10)), "one mask for two layers: a Table place_with turns away")
+    end
+
+    test "cell_places: every instance stands on one of them, whatever the density; with fields_at over the chunk and those columns place_with writes what it writes with fields_with" do
+      let f = frozen_of(every_pop())
+      let p = Pq.plan(f)
+      let k0 = Strata.Coord.key(0, 0, 0)
+      let pad = Pq.plan_pad(p, 1.0)
+      let n = 32 + 2 * pad
+      let g = every_ground(0 - pad, 0 - pad, n)
+      let tw = Pq.fields_with(p, 3, g)
+      let places = Pq.cell_places(p, 3, g, 1)
+      let xs = Pq.instances_with(p, 3, tw, g, 1)
+      Test.assert_true(List.length(xs) > 3, "some instances (" ++ int_to_string(List.length(xs)) ++ ")")
+      Test.assert_true(List.length(places) > List.length(xs), "more places than instances (" ++ int_to_string(List.length(places)) ++ ")")
+      Test.assert_true(List.all(xs, fn x -> List.any(places, fn q -> match q do (xm, zm) -> if xm == Pq.i_xm(x) do zm == Pq.i_zm(x) else false end end)), "every instance at one of the places")
+      Test.assert_eq_int(List.length(Pq.cell_places(p, 3, g, 0)), 0, "a cover layer has none")
+      let full = frozen_of(scatter_pop([solid(1, 1, 1, 7, 1.0)], 0.0625, 4.0, 0.5, 9))
+      let gf = world_ground(0, 0, 32, 1.0)
+      let pf = Pq.plan(full)
+      Test.assert_eq_int(List.length(Pq.cell_places(pf, 9, gf, 0)), List.length(Pq.instances_with(pf, 9, Pq.fields_with(pf, 9, gf), gf, 0)), "at a density every cell takes, as many places as instances")
+      let ta = Pq.fields_at(p, 3, g, chunk_mask(k0, 0 - pad, 0 - pad, n, places))
+      let c = floor_chunk(10)
+      let want = Pq.place_with(p, 3, k0, c, g, tw)
+      Test.assert_true(hash_of(want) != hash_of(c), "fields_with's Table writes")
+      Test.assert_eq_int(hash_of(Pq.place_with(p, 3, k0, c, g, ta)), hash_of(want), "and fields_at's over the chunk and the places writes the same")
     end
 
     test "place: density is per square metre: at scale 0.5 a layer at 0.25 fills 4% to 9% of the columns" do

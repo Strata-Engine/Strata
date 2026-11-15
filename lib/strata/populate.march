@@ -889,6 +889,261 @@ mod Strata.Populate do
     else { pt_nn: 0, pt_names: p.pl_names, pt_nl: p.pl_nl, pt_nz: p.pl_nz, pt_vals: vals0, pt_zones: zs0, pt_dens: d0, pt_dmax: NativeArray.make_f32(p.pl_nl + 1, 0.0), pt_zeros: false } end
   end
 
+  -- ── Fields where they are read ────────────────────────────────────────────
+  -- fields_for runs fields_with's passes over full-size arrays, each pass only
+  -- over the columns where something reads its result: a layer's density
+  -- over the columns its mask lists; a field or zone over the union of the
+  -- masks of the layers that read it, through curve fields, bands, combined
+  -- zones and weights zones. The masks a step serves are held as a set of
+  -- layers (bits of an Int), and each distinct set's columns are listed once.
+
+  pfn bit(l : Int) : Int do int_shl(1, l) end
+  pfn or_at(a : NativeIntArr, i : Int, b : Int) : NativeIntArr do NativeArray.set_int(a, i, int_or(NativeArray.get_int(a, i), b)) end
+  -- fb[i] |= b for every field of layer l's rule, zb[z] |= b for its inside, outside and weights zones
+  pfn mark_layer(p : PopPlan, l : Int, fb : NativeIntArr, zb : NativeIntArr) : (NativeIntArr, NativeIntArr) do
+    let b = bit(l)
+    let prog = p.pl_prog
+    let at = NativeArray.get_i32(prog, l)
+    let nc = NativeArray.get_i32(prog, at)
+    let ins_at = at + 1 + 3 * nc
+    let ni = NativeArray.get_i32(prog, ins_at)
+    let outs_at = ins_at + 1 + ni
+    let no = NativeArray.get_i32(prog, outs_at)
+    let fb2 = List.fold_left(List.range(0, nc), fb, fn (a, q) -> or_at(a, NativeArray.get_i32(prog, at + 1 + 3 * q), b))
+    let zl = List.append(List.map(List.range(0, ni), fn q -> NativeArray.get_i32(prog, ins_at + 1 + q)), List.map(List.range(0, no), fn q -> NativeArray.get_i32(prog, outs_at + 1 + q)))
+    let wat = NativeArray.get_int(p.pl_lwat, l)
+    let zw = List.map(List.range(wat, wat + NativeArray.get_int(p.pl_lwn, l)), fn e -> NativeArray.get_int(p.pl_wzone, e))
+    (fb2, List.fold_left(List.append(zl, zw), zb, fn (a, z) -> or_at(a, z, b)))
+  end
+  -- the steps from last to first: a zone passes its set to what it reads, a curve field to its source
+  pfn spread_need(p : PopPlan, fb : NativeIntArr, zb : NativeIntArr, k : Int) : (NativeIntArr, NativeIntArr) do
+    if k < 0 do (fb, zb)
+    else
+      let st = NativeArray.get_int(p.pl_steps, k)
+      let i = st / 3
+      let what = st % 3
+      if what == 0 do
+        if NativeArray.get_int(p.pl_fkind, i) == 2 do spread_need(p, or_at(fb, NativeArray.get_int(p.pl_fa, i), NativeArray.get_int(fb, i)), zb, k - 1)
+        else spread_need(p, fb, zb, k - 1) end
+      else if what == 1 do
+        let kind = NativeArray.get_int(p.pl_zkind, i)
+        let b = NativeArray.get_int(zb, i)
+        let a = NativeArray.get_int(p.pl_za, i)
+        if kind == 1 do spread_need(p, or_at(fb, a, b), zb, k - 1)
+        else if kind == 5 do spread_need(p, fb, or_at(zb, a, b), k - 1)
+        else if kind == 3 || kind == 4 do
+          let at = NativeArray.get_int(p.pl_zat, i)
+          spread_need(p, fb, List.fold_left(List.range(at, at + NativeArray.get_int(p.pl_zcnt, i)), zb, fn (acc, m) -> or_at(acc, NativeArray.get_int(p.pl_zints, m), b)), k - 1)
+        else spread_need(p, fb, zb, k - 1) end end end
+      else spread_need(p, fb, zb, k - 1) end end
+    end
+  end
+  -- the layers whose masks hold each column, as bits: bits[c] |= bit(l) where mask l holds c
+  pfn mask_bits(bits : NativeIntArr, m : NativeU8Arr, b : Int, c : Int, nn : Int) : NativeIntArr do
+    if c >= nn do bits
+    else if NativeArray.get_u8(m, c) == 1 do mask_bits(or_at(bits, c, b), m, b, c + 1, nn)
+    else mask_bits(bits, m, b, c + 1, nn) end end
+  end
+  pfn set_cols(bits : NativeIntArr, b : Int, c : Int, nn : Int, out : NativeIntArr, m : Int) : (NativeIntArr, Int) do
+    if c >= nn do (out, m)
+    else if int_and(NativeArray.get_int(bits, c), b) != 0 do set_cols(bits, b, c + 1, nn, NativeArray.set_int(out, m, c), m + 1)
+    else set_cols(bits, b, c + 1, nn, out, m) end end
+  end
+  -- the columns of set b, listed once a set (cache: (set, columns, count))
+  pfn cols_of_set(bits : NativeIntArr, b : Int, nn : Int, cache : List((Int, NativeIntArr, Int))) : ((NativeIntArr, Int), List((Int, NativeIntArr, Int))) do
+    match List.find(cache, fn e -> match e do (k, _, _) -> k == b end) do
+      Some((_, cs, m)) -> ((cs, m), cache)
+      None ->
+        let (cs, m) = set_cols(bits, b, 0, nn, NativeArray.make_int(Math.max_int(1, nn), 0), 0)
+        ((cs, m), Cons((b, cs, m), cache))
+    end
+  end
+
+  -- the passes over listed columns: column cols[q] for q < m
+  pfn copy_at(dst : NativeF32Arr, off : Int, src : NativeF32Arr, cols : NativeIntArr, q : Int, m : Int) : NativeF32Arr do
+    if q >= m do dst
+    else
+      let c = NativeArray.get_int(cols, q)
+      copy_at(NativeArray.set_f32(dst, off + c, NativeArray.get_f32(src, c)), off, src, cols, q + 1, m)
+    end
+  end
+  pfn curve_at_cols(vals : NativeF32Arr, dst : Int, src : Int, num : NativeFloatArr, at : Int, cnt : Int, cols : NativeIntArr, q : Int, m : Int) : NativeF32Arr do
+    if q >= m do vals
+    else
+      let c = NativeArray.get_int(cols, q)
+      curve_at_cols(NativeArray.set_f32(vals, dst + c, curve_eval(num, at, cnt, NativeArray.get_f32(vals, src + c))), dst, src, num, at, cnt, cols, q + 1, m)
+    end
+  end
+  -- 0.5 + 0.5 * noise at each listed column, sampled at noise_coord (as fields_with's tiles add)
+  pfn noise_at(vals : NativeF32Arr, off : Int, s : Strata.Noise.Settings, nseed : Int, freq : Float, voxel : Float, n : Int, x0 : Int, z0 : Int, cols : NativeIntArr, q : Int, m : Int) : NativeF32Arr do
+    if q >= m do vals
+    else
+      let c = NativeArray.get_int(cols, q)
+      let v = Strata.Noise.sample2(s, nseed, freq, noise_coord(voxel, x0 + c % n), noise_coord(voxel, z0 + c / n))
+      noise_at(NativeArray.set_f32(vals, off + c, 0.5 +. 0.5 *. v), off, s, nseed, freq, voxel, n, x0, z0, cols, q + 1, m)
+    end
+  end
+  pfn regions_at(zs : NativeU8Arr, off : Int, reg : NativeF32Arr, ids : NativeIntArr, at : Int, cnt : Int, cols : NativeIntArr, q : Int, m : Int) : NativeU8Arr do
+    if q >= m do zs
+    else
+      let c = NativeArray.get_int(cols, q)
+      regions_at(NativeArray.set_u8(zs, off + c, b2u(region_in(ids, at, cnt, NativeArray.get_f32(reg, c)))), off, reg, ids, at, cnt, cols, q + 1, m)
+    end
+  end
+  pfn fill_u8_at(zs : NativeU8Arr, off : Int, v : Int, cols : NativeIntArr, q : Int, m : Int) : NativeU8Arr do
+    if q >= m do zs else fill_u8_at(NativeArray.set_u8(zs, off + NativeArray.get_int(cols, q), v), off, v, cols, q + 1, m) end
+  end
+  pfn band_at(zs : NativeU8Arr, off : Int, vals : NativeF32Arr, src : Int, lo : Float, hi : Float, cols : NativeIntArr, q : Int, m : Int) : NativeU8Arr do
+    if q >= m do zs
+    else
+      let c = NativeArray.get_int(cols, q)
+      let v = NativeArray.get_f32(vals, src + c)
+      let inside = if v >= lo do v < hi else false end
+      band_at(NativeArray.set_u8(zs, off + c, b2u(inside)), off, vals, src, lo, hi, cols, q + 1, m)
+    end
+  end
+  pfn ring_at(zs : NativeU8Arr, off : Int, n : Int, x0 : Int, z0 : Int, voxel : Float, xz : NativeFloatArr, s0 : Int, s1 : Int, in2 : Float, out2 : Float, cols : NativeIntArr, q : Int, m : Int) : NativeU8Arr do
+    if q >= m do zs
+    else
+      let c = NativeArray.get_int(cols, q)
+      let xm = (int_to_float(x0 + c % n) +. 0.5) *. voxel
+      let zm = (int_to_float(z0 + c / n) +. 0.5) *. voxel
+      ring_at(NativeArray.set_u8(zs, off + c, b2u(near_site(xz, s0, s1, xm, zm, in2, out2))), off, n, x0, z0, voxel, xz, s0, s1, in2, out2, cols, q + 1, m)
+    end
+  end
+  pfn combine_at(zs : NativeU8Arr, off : Int, ms : NativeIntArr, at : Int, end_at : Int, any : Bool, nn : Int, cols : NativeIntArr, q : Int, m : Int) : NativeU8Arr do
+    if q >= m do zs
+    else
+      let c = NativeArray.get_int(cols, q)
+      let v = if any do b2u(!every_is(zs, ms, at, end_at, nn, c, 0)) else b2u(every_is(zs, ms, at, end_at, nn, c, 1)) end
+      combine_at(NativeArray.set_u8(zs, off + c, v), off, ms, at, end_at, any, nn, cols, q + 1, m)
+    end
+  end
+  pfn not_at(zs : NativeU8Arr, off : Int, src : Int, cols : NativeIntArr, q : Int, m : Int) : NativeU8Arr do
+    if q >= m do zs
+    else
+      let c = NativeArray.get_int(cols, q)
+      not_at(NativeArray.set_u8(zs, off + c, 1 - NativeArray.get_u8(zs, src + c)), off, src, cols, q + 1, m)
+    end
+  end
+  -- d[k] times each curve of its field at column c, from program entry at, cnt of them, each product stored (as times_curve)
+  pfn curves_one(d : NativeF32Arr, k : Int, vals : NativeF32Arr, prog : NativeI32Arr, num : NativeFloatArr, at : Int, cnt : Int, nn : Int, c : Int) : NativeF32Arr do
+    if cnt <= 0 do d
+    else
+      let src = NativeArray.get_i32(prog, at) * nn
+      let v = curve_eval(num, NativeArray.get_i32(prog, at + 1), NativeArray.get_i32(prog, at + 2), NativeArray.get_f32(vals, src + c))
+      curves_one(NativeArray.set_f32(d, k, NativeArray.get_f32(d, k) *. v), k, vals, prog, num, at + 3, cnt - 1, nn, c)
+    end
+  end
+  -- some zone of program entries at .. at + cnt reads bad at column c
+  pfn zone_reads(zs : NativeU8Arr, prog : NativeI32Arr, at : Int, cnt : Int, bad : Int, nn : Int, c : Int) : Bool do
+    if cnt <= 0 do false
+    else if NativeArray.get_u8(zs, NativeArray.get_i32(prog, at) * nn + c) == bad do true
+    else zone_reads(zs, prog, at + 1, cnt - 1, bad, nn, c) end end
+  end
+  -- layer l's density at each listed column: the base, times each curve, 0 where a zone fails, clamped at 0 (as layer_into)
+  pfn dens_at(d : NativeF32Arr, prog : NativeI32Arr, num : NativeFloatArr, vals : NativeF32Arr, zs : NativeU8Arr, nn : Int, l : Int, at : Int, nc : Int, ins_at : Int, ni : Int, outs_at : Int, no : Int, cols : NativeIntArr, q : Int, m : Int) : NativeF32Arr do
+    if q >= m do d
+    else
+      let c = NativeArray.get_int(cols, q)
+      let k = l * nn + c
+      let d1 = curves_one(NativeArray.set_f32(d, k, NativeArray.get_float(num, l)), k, vals, prog, num, at + 1, nc, nn, c)
+      let bad = if zone_reads(zs, prog, outs_at + 1, no, 1, nn, c) do true else zone_reads(zs, prog, ins_at + 1, ni, 0, nn, c) end
+      let d2 = if bad do NativeArray.set_f32(d1, k, 0.0) else d1 end
+      let d3 = if NativeArray.get_f32(d2, k) > 0.0 do d2 else NativeArray.set_f32(d2, k, 0.0) end
+      dens_at(d3, prog, num, vals, zs, nn, l, at, nc, ins_at, ni, outs_at, no, cols, q + 1, m)
+    end
+  end
+
+  pfn eval_field_at(p : PopPlan, seed : Int, g : Ground, nn : Int, vals : NativeF32Arr, i : Int, cols : NativeIntArr, m : Int) : NativeF32Arr do
+    let kind = NativeArray.get_int(p.pl_fkind, i)
+    let a = NativeArray.get_int(p.pl_fa, i)
+    if kind == 0 do
+      match slot_values(g.pg_slots, a) do
+        Some(arr) -> copy_at(vals, i * nn, arr, cols, 0, m)
+        None -> vals
+      end
+    else if kind == 1 do
+      let s = Strata.Noise.settings(a, NativeArray.get_int(p.pl_foct, i), 2.0, 0.5, 1, 0.0)
+      noise_at(vals, i * nn, s, Strata.Seed.mix(seed, NativeArray.get_int(p.pl_fsalt, i)), 1.0 /. NativeArray.get_float(p.pl_fper, i), g.pg_voxel, g.pg_n, g.pg_x0, g.pg_z0, cols, 0, m)
+    else if kind == 2 do curve_at_cols(vals, i * nn, a * nn, p.pl_fpts, NativeArray.get_int(p.pl_fat, i), NativeArray.get_int(p.pl_fcnt, i), cols, 0, m)
+    else vals end end end
+  end
+  pfn eval_zone_at(p : PopPlan, g : Ground, nn : Int, vals : NativeF32Arr, zs : NativeU8Arr, z : Int, cols : NativeIntArr, m : Int) : NativeU8Arr do
+    let kind = NativeArray.get_int(p.pl_zkind, z)
+    let off = z * nn
+    let at = NativeArray.get_int(p.pl_zat, z)
+    let cnt = NativeArray.get_int(p.pl_zcnt, z)
+    if kind == 0 do
+      match slot_values(g.pg_slots, 7) do
+        Some(reg) -> regions_at(zs, off, reg, p.pl_zints, at, cnt, cols, 0, m)
+        None -> fill_u8_at(zs, off, b2u(has_id(p.pl_zints, at, at + cnt, 0)), cols, 0, m)
+      end
+    else if kind == 1 do band_at(zs, off, vals, NativeArray.get_int(p.pl_za, z) * nn, NativeArray.get_float(p.pl_zlo, z), NativeArray.get_float(p.pl_zhi, z), cols, 0, m)
+    else if kind == 2 do ring_at(zs, off, g.pg_n, g.pg_x0, g.pg_z0, g.pg_voxel, p.pl_zsites, at / 2, at / 2 + cnt, NativeArray.get_float(p.pl_zlo, z), NativeArray.get_float(p.pl_zhi, z), cols, 0, m)
+    else if kind == 5 do not_at(zs, off, NativeArray.get_int(p.pl_za, z) * nn, cols, 0, m)
+    else combine_at(zs, off, p.pl_zints, at, at + cnt, kind == 4, nn, cols, 0, m)
+    end end end end
+  end
+  pfn layer_at(d : NativeF32Arr, p : PopPlan, vals : NativeF32Arr, zs : NativeU8Arr, nn : Int, l : Int, cols : NativeIntArr, m : Int) : NativeF32Arr do
+    let prog = p.pl_prog
+    let at = NativeArray.get_i32(prog, l)
+    let nc = NativeArray.get_i32(prog, at)
+    let ins_at = at + 1 + 3 * nc
+    let ni = NativeArray.get_i32(prog, ins_at)
+    let outs_at = ins_at + 1 + ni
+    dens_at(d, prog, p.pl_num, vals, zs, nn, l, at, nc, ins_at, ni, outs_at, NativeArray.get_i32(prog, outs_at), cols, 0, m)
+  end
+  pfn steps_for(p : PopPlan, seed : Int, g : Ground, nn : Int, masks : NativeIntArr, fb : NativeIntArr, zb : NativeIntArr, cache : List((Int, NativeIntArr, Int)), vals : NativeF32Arr, zs : NativeU8Arr, d : NativeF32Arr, k : Int) : (NativeF32Arr, NativeU8Arr, NativeF32Arr) do
+    if k >= p.pl_nsteps do (vals, zs, d)
+    else
+      let st = NativeArray.get_int(p.pl_steps, k)
+      let i = st / 3
+      let what = st % 3
+      let b = if what == 0 do NativeArray.get_int(fb, i) else if what == 1 do NativeArray.get_int(zb, i) else bit(i) end end
+      if b == 0 do steps_for(p, seed, g, nn, masks, fb, zb, cache, vals, zs, d, k + 1)
+      else
+        match cols_of_set(masks, b, nn, cache) do
+          ((cols, m), cache2) ->
+            if what == 0 do steps_for(p, seed, g, nn, masks, fb, zb, cache2, eval_field_at(p, seed, g, nn, vals, i, cols, m), zs, d, k + 1)
+            else if what == 1 do steps_for(p, seed, g, nn, masks, fb, zb, cache2, vals, eval_zone_at(p, g, nn, vals, zs, i, cols, m), d, k + 1)
+            else steps_for(p, seed, g, nn, masks, fb, zb, cache2, vals, zs, layer_at(d, p, vals, zs, nn, i, cols, m), k + 1) end end
+        end
+      end
+    end
+  end
+
+  pfn has_cover_field(p : PopPlan, i : Int) : Bool do
+    if i >= p.pl_nf do false else if NativeArray.get_int(p.pl_fkind, i) == 3 do true else has_cover_field(p, i + 1) end end
+  end
+
+  doc "fields_with evaluated only where it is read, one mask a layer (masks in run order, n * n bytes each, column i + n * j): layer l's density at the columns its mask holds; a field or zone at the columns of the masks of the layers that read it, through their rules, their weights zones, the zones a zone is made of, a band's field and a curve field's source; everything else reads 0, a zone false. Each value evaluated is the one fields_with gives that column, bit for bit (a noise field is sampled at each column by Strata.Noise.sample2 at noise_coord, which fields_with's tiles add the same way). For a game that knows where place_with reads its Table: a cover layer the chunk's columns, a scatter layer the columns its candidates stand on (cell_places), a site layer none. A plan with a cover field, or more than 60 layers, is evaluated in full by fields_with; masks of another count or size, or a g with problems, give a Table of zeros, which place_with turns away."
+  fn fields_for(p : PopPlan, seed : Int, g : Ground, masks : List(NativeU8Arr)) : Table do
+    if has_cover_field(p, 0) do fields_with(p, seed, g)
+    else if p.pl_nl > 60 do fields_with(p, seed, g)
+    else
+      let nn0 = g.pg_n * g.pg_n
+      let ok = if List.is_empty(problems(g)) do (if List.length(masks) == p.pl_nl do List.all(masks, fn m -> NativeArray.length_u8(m) == nn0) else false end) else false end
+      let nn = if ok do nn0 else 0 end
+      let vals0 = NativeArray.make_f32(Math.max_int(1, p.pl_nf * nn), 0.0)
+      let zs0 = NativeArray.make_u8(Math.max_int(1, p.pl_nz * nn), 0)
+      let d0 = NativeArray.make_f32(Math.max_int(1, p.pl_nl * nn), 0.0)
+      if ok do
+        let (fb1, zb1) = List.fold_left(List.range(0, p.pl_nl), (NativeArray.make_int(p.pl_nf + 1, 0), NativeArray.make_int(p.pl_nz + 1, 0)), fn (acc, l) -> match acc do (fb, zb) -> mark_layer(p, l, fb, zb) end)
+        let (fb, zb) = spread_need(p, fb1, zb1, p.pl_nsteps - 1)
+        let (bits, _) = List.fold_left(masks, (NativeArray.make_int(nn, 0), 0), fn (acc, m) -> match acc do (bs, l) -> (mask_bits(bs, m, bit(l), 0, nn), l + 1) end)
+        match steps_for(p, seed, g, nn, bits, fb, zb, Nil, vals0, zs0, d0, 0) do
+          (vals, zs, d) -> { pt_nn: nn, pt_names: p.pl_names, pt_nl: p.pl_nl, pt_nz: p.pl_nz, pt_vals: vals, pt_zones: zs, pt_dens: d, pt_dmax: dmax_go(NativeArray.make_f32(p.pl_nl + 1, 0.0), d, nn, 0, p.pl_nl), pt_zeros: false }
+        end
+      else { pt_nn: 0, pt_names: p.pl_names, pt_nl: p.pl_nl, pt_nz: p.pl_nz, pt_vals: vals0, pt_zones: zs0, pt_dens: d0, pt_dmax: NativeArray.make_f32(p.pl_nl + 1, 0.0), pt_zeros: false } end
+    end end
+  end
+
+  doc "fields_for with one mask for every layer: every density, and every field and zone some layer reads, at the columns mask holds (n * n bytes); the rest 0 and false. A field or zone no layer reads is not evaluated."
+  fn fields_at(p : PopPlan, seed : Int, g : Ground, mask : NativeU8Arr) : Table do
+    fields_for(p, seed, g, List.map(List.range(0, p.pl_nl), fn _ -> mask))
+  end
+
   doc "A Table of zeros the size fields_with(p, _, g) would give (g's n * n columns, p's layers and zones): what place_with asks for over a Ground above level 0, where it judges every candidate at its fine column and reads no value of the Table, so a game need not evaluate a coarse Ground's fields. At level 0 place_with reads the Table: it refuses this one (the chunk unchanged) and place_problems says so; hand it fields_with's."
   fn table_for(p : PopPlan, g : Ground) : Table do
     let nn = if List.is_empty(problems(g)) do g.pg_n * g.pg_n else 0 end
@@ -2090,6 +2345,25 @@ mod Strata.Populate do
   doc "Every instance of the scatter layer named layer that stands on a column of g, each with the top of that column, in cell order (rows of increasing z, x increasing within a row); t = fields(f, seed, g). The instances over an area are those over its parts. Nil for an undeclared layer or one that is not a scatter layer, a Table that is not f's over g, or a g with problems. For tests and tools: it builds a plan."
   fn instances(f : Strata.Population.Frozen, seed : Int, t : Table, g : Ground, layer : String) : List(PopInstance) do
     instances_with(plan(f), seed, t, g, Pn.layer_index(f, layer))
+  end
+
+  doc "Where the cells of the scatter layer at run-order index l would stand an instance on g's columns, whatever its density: every cell's candidate (Strata.Feature places a candidate by hashes the density does not enter, so every instance instances_with or place_with can find is among them), as (xm, zm) metres, in cell order. For a game that supplies a field only where instances can stand, and for fields_at's mask. Nil for an index that is not a scatter layer's or a g with problems."
+  fn cell_places(p : PopPlan, seed : Int, g : Ground, l : Int) : List((Float, Float)) do
+    let scatter = if l < 0 do false else if l >= p.pl_nl do false else NativeArray.get_int(p.pl_lkind, l) == 1 end end
+    if scatter do
+      if List.is_empty(problems(g)) do
+        let voxel = g.pg_voxel
+        let n = g.pg_n
+        let x0 = g.pg_x0
+        let z0 = g.pg_z0
+        let kind = Strata.Feature.kind(NativeArray.get_float(p.pl_lcell, l), NativeArray.get_float(p.pl_lreach, l), NativeArray.get_float(p.pl_ljit, l), NativeArray.get_int(p.pl_lsalt, l), 1.0)
+        let cs = Strata.Feature.candidates(kind, seed, int_to_float(x0) *. voxel, int_to_float(z0) *. voxel, int_to_float(x0 + n) *. voxel, int_to_float(z0 + n) *. voxel, fn (_, _) -> 1.0)
+        List.filter_map(cs, fn c ->
+          let xm = Strata.Feature.p_xm(c)
+          let zm = Strata.Feature.p_zm(c)
+          if in_range(col_of(xm, voxel) - x0, n) do (if in_range(col_of(zm, voxel) - z0, n) do Some((xm, zm)) else None end) else None end)
+      else Nil end
+    else Nil end
   end
 
   doc "instances for a game that keeps a plan: every instance of the scatter layer at run-order index l standing on a column of g, with that column's top, in cell order; t = fields_with(p, seed, g) at level 0, and above level 0 table_for(p, g) is enough (each candidate is judged at its fine column, as place_with judges it). Nil for an index that is not a scatter layer's, a Table that is not p's over g, or a g with problems."
