@@ -37,7 +37,7 @@ mod Strata.Support do
 
   -- ── The window ───────────────────────────────────────────────────────────
   -- low corner, sizes; per cell: 0 air, 1 solid, 2 anchor; and each solid cell's span in voxels
-  type Win = Win(Int, Int, Int, Int, Int, Int, NativeU8Arr, NativeU8Arr)
+  type Win = SpWin(Int, Int, Int, Int, Int, Int, NativeU8Arr, NativeU8Arr)
 
   pfn clamp255(v : Int) : Int do if v < 1 do 1 else if v > 255 do 255 else v end end end
   pfn span_vox(r : Strata.Blocks.Registry, id : Int, scale : Float) : Int do clamp255(float_to_int(int_to_float(Bs.span_cm(r, id)) /. (scale *. 100.0))) end
@@ -85,21 +85,21 @@ mod Strata.Support do
       (tk, ts) ->
         let maxspan = clamp255(float_to_int(int_to_float(Bs.max_span_cm(r)) /. (scale *. 100.0)))
         match fill_cells(NativeArray.make_u8(n, 0), NativeArray.make_u8(n, 0), w, tk, ts, anchor_y, x0, y0, z0, sx, sy, n, maxspan, Strata.Chunk.uniform(0), -1, false, 0) do
-          (kinds, spans) -> Win(x0, y0, z0, sx, sy, sz, kinds, spans)
+          (kinds, spans) -> SpWin(x0, y0, z0, sx, sy, sz, kinds, spans)
         end
     end
   end
 
   -- ── Spreading support ────────────────────────────────────────────────────
   -- each cell's distance from support, -1 where none has reached; buckets of cells waiting at each distance
-  type Spread = Spread(NativeIntArr, Strata.Tree.Tree(List(Int)))
+  type Spread = SpSpread(NativeIntArr, Strata.Tree.Tree(List(Int)))
 
   pfn push(sp : Spread, i : Int, v : Int) : Spread do
     match sp do
-      Spread(vals, bk) ->
+      SpSpread(vals, bk) ->
         if v > 255 do sp
         else if NativeArray.get_int(vals, i) >= 0 && NativeArray.get_int(vals, i) <= v do sp
-        else Spread(NativeArray.set_int(vals, i, v), Strata.Tree.set(bk, v, Cons(i, Strata.Tree.get(bk, v)))) end end
+        else SpSpread(NativeArray.set_int(vals, i, v), Strata.Tree.set(bk, v, Cons(i, Strata.Tree.get(bk, v)))) end end
     end
   end
 
@@ -110,7 +110,7 @@ mod Strata.Support do
     if i >= n do sp
     else
       match win do
-        Win(_, _, _, sx, sy, sz, kinds, spans) ->
+        SpWin(_, _, _, sx, sy, sz, kinds, spans) ->
           let k = NativeArray.get_u8(kinds, i)
           let x = i % sx
           let y = (i / sx) % sy
@@ -124,7 +124,7 @@ mod Strata.Support do
   -- a neighbour of cell (x, y, z) in the window, if inside and solid: its index, or -1
   pfn at(win : Win, x : Int, y : Int, z : Int) : Int do
     match win do
-      Win(_, _, _, sx, sy, sz, kinds, _) ->
+      SpWin(_, _, _, sx, sy, sz, kinds, _) ->
         if x < 0 || y < 0 || z < 0 || x >= sx || y >= sy || z >= sz do -1
         else
           let j = x + sx * (y + sy * z)
@@ -136,16 +136,16 @@ mod Strata.Support do
   -- empty bucket v, cell by cell: a held cell passes support up at v, sideways and down at v + 1
   pfn drain(win : Win, sp : Spread, v : Int) : Spread do
     match sp do
-      Spread(vals, bk) ->
+      SpSpread(vals, bk) ->
         match Strata.Tree.get(bk, v) do
           Nil -> sp
           Cons(i, rest) ->
-            let sp1 = Spread(vals, Strata.Tree.set(bk, v, rest))
+            let sp1 = SpSpread(vals, Strata.Tree.set(bk, v, rest))
             if NativeArray.get_int(vals, i) != v do drain(win, sp1, v)
             else if !held_at(win, i, v) do drain(win, sp1, v)
             else
               match win do
-                Win(_, _, _, sx, sy, _, _, _) ->
+                SpWin(_, _, _, sx, sy, _, _, _) ->
                   let x = i % sx
                   let y = (i / sx) % sy
                   let z = i / (sx * sy)
@@ -161,7 +161,7 @@ mod Strata.Support do
   -- an anchor is always held; a solid block while its distance is within its span
   pfn held_at(win : Win, i : Int, d : Int) : Bool do
     match win do
-      Win(_, _, _, _, _, _, kinds, spans) -> NativeArray.get_u8(kinds, i) == 2 || d <= NativeArray.get_u8(spans, i)
+      SpWin(_, _, _, _, _, _, kinds, spans) -> NativeArray.get_u8(kinds, i) == 2 || d <= NativeArray.get_u8(spans, i)
     end
   end
   pfn levels(win : Win, sp : Spread, v : Int) : Spread do
@@ -175,7 +175,7 @@ mod Strata.Support do
   pfn unheld(win : Win, vals : NativeIntArr, j : Int) : Bool do
     match win do
       -- (GAPS S16: a guard joined by && does not keep the read from happening)
-      Win(_, _, _, _, _, _, kinds, spans) ->
+      SpWin(_, _, _, _, _, _, kinds, spans) ->
         if j < 0 do false
         else if NativeArray.get_u8(kinds, j) != 1 do false
         else NativeArray.get_int(vals, j) < 0 || NativeArray.get_int(vals, j) > NativeArray.get_u8(spans, j) end end
@@ -188,7 +188,7 @@ mod Strata.Support do
         else if NativeArray.get_u8(seen, j) == 1 || !unheld(win, vals, j) do f
         else
           match win do
-            Win(ox, oy, oz, sx, sy, _, _, _) ->
+            SpWin(ox, oy, oz, sx, sy, _, _, _) ->
               Fill(NativeArray.set_u8(seen, j, 1), NativeArray.set_int(st, h, j), h + 1, Cons((ox + j % sx, oy + (j / sx) % sy, oz + j / (sx * sy)), cells), n + 1)
           end
         end end
@@ -200,7 +200,7 @@ mod Strata.Support do
         if h <= 0 do f
         else
           match win do
-            Win(_, _, _, sx, sy, _, _, _) ->
+            SpWin(_, _, _, sx, sy, _, _, _) ->
               let i = NativeArray.get_int(st, h - 1)
               let x = i % sx
               let y = (i / sx) % sy
@@ -248,11 +248,11 @@ mod Strata.Support do
                 let g = clamp255(float_to_int(Math.ceil(int_to_float(Bs.max_span_cm(r)) /. (scale *. 100.0)))) + 2
                 let win = window(r, w, scale, anchor_y, x0 - g, y0 - g, z0 - g, x1 + g, y1 + g, z1 + g)
                 match win do
-                  Win(_, _, _, sx, sy, sz, _, _) ->
+                  SpWin(_, _, _, sx, sy, sz, _, _) ->
                     let n = sx * sy * sz
-                    let sp0 = Spread(NativeArray.make_int(n, -1), Strata.Tree.from_list(List.map(List.range(0, 256), fn _ -> Nil), Nil))
+                    let sp0 = SpSpread(NativeArray.make_int(n, -1), Strata.Tree.from_list(List.map(List.range(0, 256), fn _ -> Nil), Nil))
                     match levels(win, seed(win, sp0, 0, n), 0) do
-                      Spread(vals, _) -> collect(win, vals, NativeArray.make_u8(n, 0), NativeArray.make_int(n, 0), cap, 0, n, Nil, 0)
+                      SpSpread(vals, _) -> collect(win, vals, NativeArray.make_u8(n, 0), NativeArray.make_int(n, 0), cap, 0, n, Nil, 0)
                     end
                 end
             end
