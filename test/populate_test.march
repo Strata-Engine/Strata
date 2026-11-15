@@ -954,6 +954,142 @@ mod Strata.Test.Populate do
     frozen_of(Pn.layer_scatter(Pn.layer_cover(p3, "moss", "fronds", Pn.rule(1.0, [("dense", lin)], Nil, Nil), 46), "stones", "pebbles", Pn.rule(0.16, [("dense", lin)], Nil, Nil), 2.5, 0.5, 47))
   end
 
+  -- ── Level helpers ────────────────────────────────────────────────────────
+
+  -- a tree 3 x h x 3 at 1 m: a trunk of 7 up the middle column, leaves of 8 (probability 200) from row 2 up, holes below them
+  pfn lv_tree(h : Int) : Strata.Template.Template do lv_tree_p(h, 200) end
+  -- the same with leaves at probability lp
+  pfn lv_tree_p(h : Int, lp : Int) : Strata.Template.Template do
+    let n = 9 * h
+    let id_of = fn i ->
+      let x = i % 3
+      let y = (i / 3) % h
+      let z = i / (3 * h)
+      if x == 1 do (if z == 1 do 7 else (if y >= 2 do 8 else 0 end) end) else (if y >= 2 do 8 else 0 end) end
+    let t0 = Strata.Template.make(3, h, 3, List.fold_left(List.range(0, n), NativeArray.make_i32(n, 0), fn (a, i) -> NativeArray.set_i32(a, i, id_of(i))), 1.0)
+    List.fold_left(List.range(0, n), t0, fn (t, i) -> if id_of(i) == 8 do Strata.Template.with_prob(t, i, lp) else t end)
+  end
+  -- scatter layer "trees" of two trees in every 12 m cell (jitter 0.5: any two stand 6 m apart along x or z, so their
+  -- footprints are 4 columns apart and share no coarse voxel up to level 2; 12 m cells do not line up with chunks), seen to `seen`
+  pfn lv_pop(seen : Int) : Strata.Population.Pop do
+    Pn.seen_to(scatter_pop([lv_tree(4), lv_tree(6)], 1.0, 12.0, 0.5, 5), "trees", seen)
+  end
+  -- chunk k's columns and m more a side, at `level` of a world of `scale`, every top at `top` (voxels of that level)
+  pfn lv_ground(k : Strata.Coord.Key, m : Int, scale : Float, level : Int, top : Int) : Strata.Populate.Ground do
+    let n = 32 + 2 * m
+    Pq.ground(32 * Strata.Coord.kx(k) - m, 32 * Strata.Coord.kz(k) - m, n, scale, level, NativeArray.make_int(n * n, top), NativeArray.make_int(n * n, -1))
+  end
+  pfn lv_pow2(l : Int) : Int do if l <= 0 do 1 else 2 * lv_pow2(l - 1) end end
+  pfn lv_rank(rank : NativeIntArr, id : Int) : Int do
+    let n = NativeArray.length_int(rank)
+    if n == 0 do id else if id < n do NativeArray.get_int(rank, id) else 0 end end
+  end
+  -- the id of highest rank (ties: the higher id) in fine chunk c's k-cube at local (x, y, z), `skip` read as a hole; 0 for none
+  pfn lv_best(c : Strata.Chunk.Chunk, rank : NativeIntArr, skip : Int, k : Int, x : Int, y : Int, z : Int) : Int do
+    List.fold_left(List.range(0, k * k * k), 0, fn (best, q) ->
+      let id = Strata.Chunk.get_or(c, x + q % k, y + (q / k) % k, z + q / (k * k), 0)
+      if id == 0 do best
+      else if id == skip do best
+      else if best == 0 do id
+      else
+        let r = lv_rank(rank, id)
+        let br = lv_rank(rank, best)
+        if r > br do id else if r < br do best else if id > best do id else best end end end
+      end end end)
+  end
+  -- over the 32 / k cube of coarse chunk cc that fine chunk cf (offset (a, b, c) in level-0 chunks) lies under: (coarse voxels not lv_best of their cube, fine voxels other than skip under an air coarse voxel)
+  pfn lv_compare(cc : Strata.Chunk.Chunk, cf : Strata.Chunk.Chunk, rank : NativeIntArr, skip : Int, k : Int, a : Int, b : Int, c : Int) : (Int, Int) do
+    let m = 32 / k
+    List.fold_left(List.range(0, m * m * m), (0, 0), fn (acc, q) ->
+      let u = q % m
+      let v = (q / m) % m
+      let w = q / (m * m)
+      let got = Strata.Chunk.get_or(cc, a * m + u, b * m + v, c * m + w, -1)
+      let want = lv_best(cf, rank, skip, k, k * u, k * v, k * w)
+      match acc do
+        (d, un) -> (if got == want do d else d + 1 end, if got == 0 do un + (if want == 0 do 0 else 1 end) else un end)
+      end)
+  end
+  -- level-L key kc of f placed over a Ground of its chunk and pad at top `coarse_top`, against its level-0 children (each over its own Ground at `fine_top`): (differing coarse voxels, fine voxels left uncovered, solid coarse voxels, solid coarse voxels on the chunk's x and z faces)
+  pfn lv_check(f : Strata.Population.Frozen, seed : Int, kc : Strata.Coord.Key, scale : Float, fine_top : Int, coarse_top : Int, rank : NativeIntArr, skip : Int) : (Int, Int, Int, Int) do
+    let l = Strata.Coord.level(kc)
+    let k = lv_pow2(l)
+    let cc = Pq.place(f, seed, kc, air(), lv_ground(kc, Pq.pad(f, scale *. int_to_float(k)), scale, l, coarse_top))
+    let pf = Pq.pad(f, scale)
+    let cmp = List.fold_left(List.range(0, k * k * k), (0, 0), fn (acc, q) ->
+      let a = q % k
+      let b = (q / k) % k
+      let c = q / (k * k)
+      let fk = Strata.Coord.key(k * Strata.Coord.kx(kc) + a, k * Strata.Coord.ky(kc) + b, k * Strata.Coord.kz(kc) + c)
+      let cf = Pq.place(f, seed, fk, air(), lv_ground(fk, pf, scale, 0, fine_top))
+      match (acc, lv_compare(cc, cf, rank, skip, k, a, b, c)) do
+        ((d, un), (d2, un2)) -> (d + d2, un + un2)
+      end)
+    let solid = List.fold_left(List.range(0, 32768), 0, fn (n, i) -> if Strata.Chunk.get_idx(cc, i) != 0 do n + 1 else n end)
+    let faces = List.fold_left(List.range(0, 32768), 0, fn (n, i) ->
+      let x = i % 32
+      let z = (i / 32) % 32
+      let face = if x == 0 do true else if x == 31 do true else if z == 0 do true else z == 31 end end end
+      if face do (if Strata.Chunk.get_idx(cc, i) != 0 do n + 1 else n end) else n end)
+    match cmp do
+      (d, un) -> (d, un, solid, faces)
+    end
+  end
+  pfn lv_str(r : (Int, Int, Int, Int)) : String do
+    match r do
+      (d, un, s, fc) -> "differ " ++ int_to_string(d) ++ ", uncovered " ++ int_to_string(un) ++ ", solid " ++ int_to_string(s) ++ ", on faces " ++ int_to_string(fc)
+    end
+  end
+  pfn lv_ok(r : (Int, Int, Int, Int)) : Bool do
+    match r do
+      (d, un, s, fc) -> if d == 0 do (if un == 0 do (if s > 0 do fc > 0 else false end) else false end) else false end
+    end
+  end
+
+  -- ── Fine judging at coarse levels ──
+
+  -- an n x n Ground at (x0, z0) at `level` of a world of `scale`, every top at `top`
+  pfn fj_area(x0 : Int, z0 : Int, n : Int, scale : Float, level : Int, top : Int) : Strata.Populate.Ground do
+    Pq.ground(x0, z0, n, scale, level, NativeArray.make_int(n * n, top), NativeArray.make_int(n * n, -1))
+  end
+  pfn fj_key(i : Strata.Populate.PopInstance) : String do
+    float_to_string(Pq.i_xm(i)) ++ "," ++ float_to_string(Pq.i_zm(i)) ++ " v" ++ int_to_string(Pq.i_variant(i)) ++ " r" ++ int_to_string(Pq.i_rot(i)) ++ " s" ++ int_to_string(Pq.i_stream(i))
+  end
+  pfn fj_inside(i : Strata.Populate.PopInstance) : Bool do
+    let x = Pq.i_xm(i)
+    let z = Pq.i_zm(i)
+    if x >= 16.0 do (if x < 112.0 do (if z >= 16.0 do z < 112.0 else false end) else false end) else false end
+  end
+  -- layer "trees"'s instances standing in 16..112 m (x and z) of a 1 m world, at `level`, as one string, and how many
+  pfn fj_list(f : Strata.Population.Frozen, seed : Int, level : Int) : (String, Int) do
+    let n = if level == 0 do 128 else if level == 1 do 64 else 32 end end
+    let top = if level == 0 do 10 else if level == 1 do 5 else 2 end end
+    let g = fj_area(0, 0, n, 1.0, level, top)
+    let xs = List.filter(Pq.instances(f, seed, Pq.fields(f, seed, g), g, "trees"), fj_inside)
+    (string_join(List.map(xs, fj_key), ";"), List.length(xs))
+  end
+  -- "" when levels 1 and 2 list level 0's instances (positions, variants, turns, streams) over the area, else what differs; and level 0's count
+  pfn fj_same(f : Strata.Population.Frozen, seed : Int) : (String, Int) do
+    match (fj_list(f, seed, 0), fj_list(f, seed, 1), fj_list(f, seed, 2)) do
+      ((a, na), (b, nb), (c, nc)) ->
+        let m1 = if a == b do "" else "level 1 differs (" ++ int_to_string(nb) ++ " against " ++ int_to_string(na) ++ ") " end
+        let m2 = if a == c do "" else "level 2 differs (" ++ int_to_string(nc) ++ " against " ++ int_to_string(na) ++ ")" end
+        (m1 ++ m2, na)
+    end
+  end
+  pfn fj_shapes() : Strata.Population.Pop do Pn.shapes_templates(Pn.new(), "s", [solid(1, 1, 1, 3, 1.0), solid(1, 1, 1, 4, 1.0)]) end
+  pfn fj_lin() : Strata.Population.PopCurve do Pn.curve([(0.0, 0.0), (1.0, 1.0)]) end
+  -- level-0 columns (x, z), x and z in xa .. xa + 39 step 3, where field_point over g1 (any level) differs from fields at level 0 over g0 (bit for bit)
+  pfn fj_point_misses(f : Strata.Population.Frozen, seed : Int, g0 : Strata.Populate.Ground, gx0 : Int, g1 : Strata.Populate.Ground, name : String, xa : Int, za : Int) : Int do
+    let t0 = Pq.fields(f, seed, g0)
+    let n0 = 128
+    List.fold_left(List.range(0, 196), 0, fn (acc, q) ->
+      let x = xa + 3 * (q % 14)
+      let z = za + 3 * (q / 14)
+      let want = Pq.field_at(t0, name, (x - gx0) + n0 * (z - gx0))
+      if Pq.field_point(f, seed, g1, name, x, z) == want do acc else acc + 1 end)
+  end
+
   describe "Populate" do
     test "a ground field reads back what was supplied; a slot not supplied reads 0" do
       let f = frozen_of(Pn.field_ground(Pn.field_ground(Pn.new(), "alt", 0), "slope", 1))
@@ -2016,7 +2152,7 @@ mod Strata.Test.Populate do
         end)
     end
 
-    test "a chain of three cover hops (trees -> shade -> bushes -> thicket -> shrubs -> dense, read by a cover and a scatter layer): pad 19 at 1 m, 36 at 0.5 m, 71 at 0.25 m; chunks at 1 m the same from the exact pad as from 60 columns" do
+    test "a chain of three cover hops (trees -> shade -> bushes -> thicket -> shrubs -> dense, read by a cover and a scatter layer): pad 19 at 1 m, 36 at 0.5 m, 71 at 0.25 m; chunks at 1 m the same from the exact pad as from a Ground of 120 columns a side" do
       -- reach 2.5 m (a 5-wide template), so the scatter pad is ceil(2.5 / s) + 1: 4, 6, 11; the radii add ceil(4 / s) + ceil(5 / s) + ceil(6 / s): 15, 30, 60
       let f = chain_pop()
       Test.assert_eq_str(string_join(Pn.layer_names(f), ","), "trees,bushes,shrubs,moss,stones", "run order")
@@ -2051,6 +2187,321 @@ mod Strata.Test.Populate do
       let tiny = frozen_of(Pn.field_cover(p0, "shade", "trees", Math.pow(10.0, -161.0)))
       let t = Pq.fields(tiny, 5, bare(-8, -8, 16, 1.0, 0))
       Test.assert_true(List.all(List.range(0, 256), fn c -> if Pq.field_at(t, "shade", c) >= 0.0 do Pq.field_at(t, "shade", c) <= 1.0 else false end), "fields over it run, every value 0..1")
+    end
+
+    test "levels: each coarse voxel of a level-1 chunk is the highest-ranked id of its fine cube at level 0, so every instance straddling its faces is covered (default ranks, leaves above trunks, and ranks putting trunks above leaves)" do
+      let f = frozen_of(lv_pop(2))
+      let none = NativeArray.make_int(0, 0)
+      -- level-0 tops at 11 stand an instance's base at 12, which is level 1's row 6, on its top 5
+      let a = lv_check(f, 3, Strata.Coord.key_at(0, 0, 0, 1), 1.0, 11, 5, none, -1)
+      Test.assert_true(lv_ok(a), "chunk (0, 0, 0) at level 1: " ++ lv_str(a))
+      let b = lv_check(f, 3, Strata.Coord.key_at(-1, 0, 1, 1), 1.0, 11, 5, none, -1)
+      Test.assert_true(lv_ok(b), "chunk (-1, 0, 1) at level 1: " ++ lv_str(b))
+      let woody = NativeArray.from_list_int([0, 0, 0, 0, 0, 0, 0, 2, 1])
+      let fl = frozen_of(Pn.ranks(lv_pop(2), "s", woody))
+      let c = lv_check(fl, 3, Strata.Coord.key_at(0, 0, 0, 1), 1.0, 11, 5, woody, -1)
+      Test.assert_true(lv_ok(c), "trunks ranked above leaves: " ++ lv_str(c))
+      Test.assert_true(hash_of(Pq.place(fl, 3, Strata.Coord.key_at(0, 0, 0, 1), air(), lv_ground(Strata.Coord.key_at(0, 0, 0, 1), 2, 1.0, 1, 5))) != hash_of(Pq.place(f, 3, Strata.Coord.key_at(0, 0, 0, 1), air(), lv_ground(Strata.Coord.key_at(0, 0, 0, 1), 2, 1.0, 1, 5))), "and the ranks change the coarse chunk")
+    end
+
+    test "levels: a level-2 chunk is the highest-ranked id of each 4-cube of its 64 level-0 children" do
+      let f = frozen_of(lv_pop(2))
+      let r = lv_check(f, 3, Strata.Coord.key_at(0, 0, -1, 2), 1.0, 11, 2, NativeArray.make_int(0, 0), -1)
+      Test.assert_true(lv_ok(r), "chunk (0, 0, -1) at level 2: " ++ lv_str(r))
+    end
+
+    test "levels: at 0.5 m the instances are level 0's too (an instance's fine column is read at the world's scale, its top at the Ground's)" do
+      let f = fit_of(lv_pop(2), 0.5)
+      let r = lv_check(f, 9, Strata.Coord.key_at(0, 0, 0, 1), 0.5, 21, 10, NativeArray.make_int(0, 0), -1)
+      Test.assert_true(lv_ok(r), "chunk (0, 0, 0) at level 1 of a 0.5 m world: " ++ lv_str(r))
+    end
+
+    test "levels: a level-2 chunk generated alone equals the same key generated after its children, and from a larger Ground off its grid" do
+      let f = frozen_of(lv_pop(2))
+      let kc = Strata.Coord.key_at(1, 0, 0, 2)
+      let m = Pq.pad(f, 4.0)
+      let alone = Pq.place(f, 3, kc, air(), lv_ground(kc, m, 1.0, 2, 2))
+      let kids = List.map(Strata.Coord.children(kc), fn k1 -> hash_of(Pq.place(f, 3, k1, air(), lv_ground(k1, Pq.pad(f, 2.0), 1.0, 1, 5))))
+      Test.assert_eq_int(List.length(kids), 8, "eight children placed first")
+      let after = Pq.place(f, 3, kc, air(), lv_ground(kc, m, 1.0, 2, 2))
+      Test.assert_eq_int(hash_of(after), hash_of(alone), "the same key after its children")
+      Test.assert_true(hash_of(alone) != hash_of(air()), "and it holds trees")
+      let n = 32 + 2 * m + 13
+      let big = Pq.ground(32 - m - 7, 0 - m - 6, n, 1.0, 2, NativeArray.make_int(n * n, 2), NativeArray.make_int(n * n, -1))
+      Test.assert_eq_int(hash_of(Pq.place(f, 3, kc, air(), big)), hash_of(alone), "a larger Ground off the chunk grid")
+    end
+
+    test "levels: the pad is counted in the level's own columns; one fewer is refused and place_problems says so" do
+      let f = frozen_of(lv_pop(2))
+      let kc = Strata.Coord.key_at(0, 0, 0, 1)
+      let m = Pq.pad(f, 2.0)
+      Test.assert_eq_int(m, 2, "reach 1.5 m over 2 m columns: ceil(0.75) + 1")
+      let exact = Pq.place(f, 3, kc, air(), lv_ground(kc, m, 1.0, 1, 5))
+      Test.assert_true(hash_of(exact) != hash_of(air()), "the exact pad places")
+      Test.assert_eq_int(hash_of(Pq.place(f, 3, kc, air(), lv_ground(kc, m + 9, 1.0, 1, 5))), hash_of(exact), "as a larger Ground does")
+      let short = lv_ground(kc, m - 1, 1.0, 1, 5)
+      Test.assert_eq_int(hash_of(Pq.place(f, 3, kc, air(), short)), hash_of(air()), "one column short is refused")
+      let pl = Pq.plan(f)
+      Test.assert_true(has_msg(Pq.place_problems(pl, kc, short, Pq.fields_with(pl, 3, short)), "2 more on each side"), "place_problems names the pad")
+      let g = lv_ground(kc, m, 1.0, 1, 5)
+      Test.assert_eq_int(List.length(Pq.place_problems(pl, kc, g, Pq.fields_with(pl, 3, g))), 0, "nothing wrong at level 1 with the right Ground")
+    end
+
+    test "levels: a stamp layer is absent above its seen_to (declared or default); block layers above level 0" do
+      let k1 = Strata.Coord.key_at(0, 0, 0, 1)
+      let k2 = Strata.Coord.key_at(0, 0, 0, 2)
+      let k3 = Strata.Coord.key_at(0, 0, 0, 3)
+      let one = frozen_of(lv_pop(1))
+      Test.assert_true(hash_of(Pq.place(one, 3, k1, air(), lv_ground(k1, 4, 1.0, 1, 5))) != hash_of(air()), "seen to 1: placed at level 1")
+      Test.assert_eq_int(hash_of(Pq.place(one, 3, k2, air(), lv_ground(k2, 4, 1.0, 2, 2))), hash_of(air()), "and absent at level 2")
+      -- a 9 m wide tree in a 1 m world is seen to level 2 by default
+      let wide = frozen_of(scatter_pop([solid(9, 8, 9, 4, 1.0)], 1.0, 16.0, 0.5, 5))
+      Test.assert_true(hash_of(Pq.place(wide, 3, k2, air(), lv_ground(k2, 4, 1.0, 2, 2))) != hash_of(air()), "9 m wide: placed at level 2")
+      Test.assert_eq_int(hash_of(Pq.place(wide, 3, k3, air(), lv_ground(k3, 4, 1.0, 3, 1))), hash_of(air()), "and absent at level 3")
+      let narrow = frozen_of(scatter_pop([lv_tree(4)], 1.0, 16.0, 0.5, 5))
+      Test.assert_eq_int(hash_of(Pq.place(narrow, 3, k1, air(), lv_ground(k1, 4, 1.0, 1, 5))), hash_of(air()), "3 m wide: absent at level 1 by default")
+      let lawn = cover_pop(1.0)
+      let floor1 = floor_chunk(5)
+      Test.assert_eq_int(hash_of(Pq.place(lawn, 3, k1, floor1, lv_ground(k1, 0, 1.0, 1, 5))), hash_of(floor1), "a cover layer: absent at level 1")
+      Test.assert_true(hash_of(Pq.place(lawn, 3, Strata.Coord.key(0, 0, 0), floor1, lv_ground(Strata.Coord.key(0, 0, 0), 0, 1.0, 0, 5))) != hash_of(floor1), "and present at level 0")
+      let tufts = frozen_of(Pn.layer_scatter(Pn.shapes_blocks(Pn.new(), "b", [9]), "tufts", "b", Pn.rule(1.0, Nil, Nil, Nil), 2.0, 0.5, 4))
+      Test.assert_eq_int(hash_of(Pq.place(tufts, 3, k1, air(), lv_ground(k1, 4, 1.0, 1, 5))), hash_of(air()), "a scatter layer of blocks: absent at level 1")
+      Test.assert_true(hash_of(Pq.place(tufts, 3, Strata.Coord.key(0, 0, 0), air(), lv_ground(Strata.Coord.key(0, 0, 0), 4, 1.0, 0, 5))) != hash_of(air()), "and present at level 0")
+    end
+
+    test "levels: a site layer at level 1 is the highest-ranked id of its fine cubes (leaves at probability 60, so the draws show)" do
+      let sites = [Pn.site(10.3, 20.6, 11.0, 2.0, 0), Pn.site(33.7, 41.2, 11.5, 2.0, 1), Pn.site(63.5, 5.5, 11.0, 2.0, 2), Pn.site(-1.2, 63.9, 11.0, 2.0, 3)]
+      let f = frozen_of(Pn.seen_to(Pn.layer_site(Pn.shapes_templates(Pn.new(), "huts", [lv_tree_p(5, 60), lv_tree_p(4, 60)]), "camp", "huts", sites, 1.0, 6), "camp", 1))
+      let r = lv_check(f, 4, Strata.Coord.key_at(0, 0, 0, 1), 1.0, 11, 5, NativeArray.make_int(0, 0), -1)
+      Test.assert_true(lv_ok(r), "chunk (0, 0, 0) at level 1: " ++ lv_str(r))
+    end
+
+    test "levels: a stamp layer reading a cover layer's cover field reads the same chance at level 1 as at level 0 (the level-0 column's area), so its instances are level 0's" do
+      -- moss (id 9) at 0.25 per square metre; mossy is its cover, 0.25 on a level-0 column; trees at 1/72 per square metre times mossy: half their 12 m cells hold one
+      let p0 = Pn.shapes_blocks(Pn.shapes_templates(Pn.new(), "s", [lv_tree(4), lv_tree(6)]), "m", [9])
+      let p1 = Pn.field_cover(Pn.layer_cover(p0, "moss", "m", Pn.rule(0.25, Nil, Nil, Nil), 2), "mossy", "moss", 2.0)
+      let p2 = Pn.layer_scatter(p1, "trees", "s", Pn.rule(0.013888888, [("mossy", Pn.curve([(0.0, 0.0), (1.0, 1.0)]))], Nil, Nil), 12.0, 0.5, 5)
+      let f = frozen_of(Pn.seen_to(p2, "trees", 1))
+      let r = lv_check(f, 3, Strata.Coord.key_at(1, 0, 0, 1), 1.0, 11, 5, NativeArray.make_int(0, 0), 9)
+      Test.assert_true(lv_ok(r), "chunk (1, 0, 0) at level 1, moss read as a hole: " ++ lv_str(r))
+      let g1 = lv_ground(Strata.Coord.key_at(0, 0, 0, 1), 4, 1.0, 1, 5)
+      Test.assert_true(Pq.field_at(Pq.fields(f, 3, g1), "mossy", 100) == 0.25, "mossy is 0.25 at level 1 as at level 0")
+    end
+
+    test "fine judging: at levels 1 and 2 the instances over an area are level 0's for a density by noise, a noise-band zone and a weights zone" do
+      let noisy = frozen_of(Pn.layer_scatter(Pn.field_noise(fj_shapes(), "n", 0, 3, 24.0, 7), "trees", "s", Pn.rule(0.25, [("n", fj_lin())], Nil, Nil), 2.0, 0.5, 5))
+      match fj_same(noisy, 3) do
+        (m, n) ->
+          Test.assert_eq_str(m, "", "density 0.25 x noise (period 24 m)")
+          Test.assert_true(n > 300, "over hundreds of instances (" ++ int_to_string(n) ++ ")")
+      end
+      let p1 = Pn.zone_band(Pn.zone_band(Pn.field_noise(fj_shapes(), "n", 0, 3, 48.0, 7), "hi", "n", 0.5, 2.0), "mid", "n", 0.3, 2.0)
+      match fj_same(frozen_of(Pn.layer_scatter(p1, "trees", "s", Pn.rule(0.25, Nil, ["mid"], Nil), 2.0, 0.5, 5)), 3) do
+        (m, n) ->
+          Test.assert_eq_str(m, "", "inside a noise-band zone")
+          Test.assert_true(n > 100, "instances (" ++ int_to_string(n) ++ ")")
+      end
+      match fj_same(frozen_of(Pn.layer_scatter(Pn.weights(p1, "s", "hi", [0.0, 1.0]), "trees", "s", Pn.rule(0.25, Nil, Nil, Nil), 2.0, 0.5, 5)), 3) do
+        (m, n) ->
+          Test.assert_eq_str(m, "", "variants by a weights zone")
+          Test.assert_true(n > 300, "instances (" ++ int_to_string(n) ++ ")")
+      end
+    end
+
+    test "fine judging: a layer reading a scatter layer's cover field (its source by noise) places level 0's instances at levels 1 and 2" do
+      let p0 = Pn.shapes_blocks(Pn.field_noise(fj_shapes(), "n", 0, 3, 30.0, 9), "b", [6])
+      let p1 = Pn.field_cover(Pn.layer_scatter(p0, "shrubs", "b", Pn.rule(0.5, [("n", fj_lin())], Nil, Nil), 3.0, 0.5, 8), "thick", "shrubs", 4.0)
+      let f = frozen_of(Pn.layer_scatter(p1, "trees", "s", Pn.rule(0.25, [("thick", fj_lin())], Nil, Nil), 2.0, 0.5, 5))
+      match fj_same(f, 4) do
+        (m, n) ->
+          Test.assert_eq_str(m, "", "trees over shrubs' cover within 4 m")
+          Test.assert_true(n > 50, "instances (" ++ int_to_string(n) ++ ")")
+      end
+    end
+
+    test "fine judging: field_point over a level-1 or level-2 Ground is the level-0 Table's value bit for bit, for noise, curve and every kind of cover field, at 1 m and 0.1 m" do
+      let p0 = Pn.shapes_blocks(Pn.shapes_blocks(Pn.field_noise(fj_shapes(), "n", 1, 4, 17.0, 9), "b", [6]), "m", [7])
+      let p1 = Pn.field_curve(p0, "c", "n", Pn.curve([(0.2, 0.0), (0.5, 0.7), (0.8, 1.0)]))
+      let p2 = Pn.layer_cover(Pn.layer_scatter(p1, "shrubs", "b", Pn.rule(0.5, [("c", fj_lin())], Nil, Nil), 3.0, 0.5, 8), "moss", "m", Pn.rule(0.6, [("n", fj_lin())], Nil, Nil), 4)
+      let p3 = Pn.layer_site(p2, "camp", "m", [Pn.site(40.3, 52.1, 3.0, 4.0, 0)], 1.0, 6)
+      let f = frozen_of(Pn.field_cover(Pn.field_cover(Pn.field_cover(p3, "thick", "shrubs", 4.0), "mossy", "moss", 2.0), "near", "camp", 3.0))
+      let g0 = fj_area(0, 0, 128, 1.0, 0, 10)
+      let at1 = List.map(["n", "c", "thick", "mossy", "near"], fn name -> name ++ ":" ++ int_to_string(fj_point_misses(f, 3, g0, 0, fj_area(0, 0, 64, 1.0, 1, 5), name, 22, 30)))
+      Test.assert_eq_str(string_join(at1, " "), "n:0 c:0 thick:0 mossy:0 near:0", "misses at level 1, 1 m")
+      let at2 = List.map(["n", "c", "thick", "mossy", "near"], fn name -> name ++ ":" ++ int_to_string(fj_point_misses(f, 3, g0, 0, fj_area(0, 0, 32, 1.0, 2, 2), name, 22, 30)))
+      Test.assert_eq_str(string_join(at2, " "), "n:0 c:0 thick:0 mossy:0 near:0", "misses at level 2, 1 m")
+      -- at 0.1 m, far from the origin, where a double off by one rounding would show: noise and curves
+      let x0 = 300000
+      let g0f = fj_area(x0, x0, 128, 0.1, 0, 10)
+      let far = List.map(["n", "c"], fn name -> name ++ ":" ++ int_to_string(fj_point_misses(f, 3, g0f, x0, fj_area(x0 / 2, x0 / 2, 64, 0.1, 1, 5), name, x0 + 7, x0 + 9)))
+      Test.assert_eq_str(string_join(far, " "), "n:0 c:0", "misses at level 1, 0.1 m, 300000 columns out")
+      Test.assert_true(Pq.field_at(Pq.fields(f, 3, g0), "near", 40 + 128 * 52) == 1.0, "near is 1 at the camp")
+      Test.assert_true(float_is_nan(Pq.field_point(f, 3, g0, "nothing", 0, 0)), "an undeclared field is NaN")
+    end
+
+    test "fine judging: a ground field is not exact above level 0 - field_point reads the coarse column (documented gap)" do
+      -- slot 0 by fine column: x mod 2, so every coarse column of level 1 averages away what level 0 sees
+      let f = frozen_of(Pn.layer_scatter(Pn.field_ground(fj_shapes(), "alt", 0), "trees", "s", Pn.rule(0.25, [("alt", fj_lin())], Nil, Nil), 2.0, 0.5, 5))
+      let g0 = Pq.with_field(fj_area(0, 0, 64, 1.0, 0, 10), 0, List.fold_left(List.range(0, 4096), NativeArray.make_f32(4096, 0.0), fn (a, i) -> NativeArray.set_f32(a, i, int_to_float(i % 2))))
+      let g1 = Pq.with_field(fj_area(0, 0, 32, 1.0, 1, 5), 0, NativeArray.make_f32(1024, 0.5))
+      Test.assert_true(Pq.field_point(f, 3, g1, "alt", 11, 7) == 0.5, "level 1 reads its coarse column's 0.5")
+      Test.assert_true(Pq.field_at(Pq.fields(f, 3, g0), "alt", 11 + 64 * 7) == 1.0, "where level 0 reads 1")
+      Test.assert_true(Pq.field_point(f, 3, g0, "alt", 11, 7) == 1.0, "at level 0 field_point is the Table's value")
+    end
+
+    test "fine judging: point noise samples a column where level 0's tile does, tile origin plus step in doubles, not (v + 0.5) * scale" do
+      let tile_way = fn (sc, v) ->
+        let t0 = 32 * (if v >= 0 do v / 32 else 0 - ((31 - v) / 32) end)
+        (int_to_float(t0) +. 0.5) *. sc +. int_to_float(v - t0) *. sc
+      let cols = List.range(-200, 200)
+      let scales = [0.1, 0.3, 1.0, 0.25]
+      let bad = List.fold_left(scales, 0, fn (acc, sc) -> List.fold_left(cols, acc, fn (a, v) -> if Pq.noise_coord(sc, v) == tile_way(sc, v) do a else a + 1 end))
+      Test.assert_eq_int(bad, 0, "every column at four scales")
+      let differ = List.fold_left(scales, 0, fn (acc, sc) -> List.fold_left(cols, acc, fn (a, v) -> if tile_way(sc, v) == (int_to_float(v) +. 0.5) *. sc do a else a + 1 end))
+      Test.assert_true(differ > 0, "and the two ways do differ somewhere (" ++ int_to_string(differ) ++ " columns), so the test has teeth")
+    end
+
+    test "levels: ranks and the default seen_to are the layer's shape set's, where layer and set indices differ" do
+      -- sets "s" (templates) then "m" (blocks); layers "moss" (on m) then "trees" (on s): layer 1 is on set 0
+      let woody = NativeArray.from_list_int([0, 0, 0, 0, 0, 0, 0, 2, 1])
+      let p0 = Pn.shapes_blocks(Pn.shapes_templates(Pn.new(), "s", [lv_tree(4), lv_tree(6)]), "m", [9])
+      let p1 = Pn.layer_cover(p0, "moss", "m", Pn.rule(0.2, Nil, Nil, Nil), 2)
+      let f = frozen_of(Pn.ranks(Pn.seen_to(Pn.layer_scatter(p1, "trees", "s", Pn.rule(1.0, Nil, Nil, Nil), 12.0, 0.5, 5), "trees", 2), "s", woody))
+      let r = lv_check(f, 3, Strata.Coord.key_at(0, 0, 0, 1), 1.0, 11, 5, woody, 9)
+      Test.assert_true(lv_ok(r), "trunks above leaves, from set s's ranks: " ++ lv_str(r))
+      let wide = frozen_of(Pn.layer_scatter(Pn.layer_cover(Pn.shapes_blocks(Pn.shapes_templates(Pn.new(), "s", [solid(9, 8, 9, 4, 1.0)]), "m", [9]), "moss", "m", Pn.rule(0.2, Nil, Nil, Nil), 2), "trees", "s", Pn.rule(1.0, Nil, Nil, Nil), 16.0, 0.5, 5))
+      let k2 = Strata.Coord.key_at(0, 0, 0, 2)
+      Test.assert_true(hash_of(Pq.place(wide, 3, k2, air(), lv_ground(k2, 4, 1.0, 2, 2))) != hash_of(air()), "9 m trees, no seen_to: present at level 2")
+      let narrow = frozen_of(Pn.layer_scatter(Pn.layer_cover(Pn.shapes_blocks(Pn.shapes_templates(Pn.new(), "s", [lv_tree(4)]), "m", [9]), "moss", "m", Pn.rule(0.2, Nil, Nil, Nil), 2), "trees", "s", Pn.rule(1.0, Nil, Nil, Nil), 12.0, 0.5, 5))
+      let k1 = Strata.Coord.key_at(0, 0, 0, 1)
+      Test.assert_eq_int(hash_of(Pq.place(narrow, 3, k1, air(), lv_ground(k1, 4, 1.0, 1, 5))), hash_of(air()), "3 m trees, no seen_to: absent at level 1")
+    end
+
+    test "levels: place refuses a level where a scatter layer's chunk walk would pass 2048 cells a side, and place_problems says so" do
+      let f = frozen_of(Pn.seen_to(scatter_pop([solid(1, 1, 1, 4, 1.0)], 0.5, 1.0, 0.5, 5), "trees", 6))
+      let k6 = Strata.Coord.key_at(0, 0, 0, 6)
+      let g = lv_ground(k6, 2, 1.0, 6, 0)
+      Test.assert_eq_int(hash_of(Pq.place(f, 3, k6, air(), g)), hash_of(air()), "refused at level 6")
+      let pl = Pq.plan(f)
+      Test.assert_true(has_msg(Pq.place_problems(pl, k6, g, Pq.fields_with(pl, 3, g)), "2048 cells"), "place_problems names the walk")
+      let k5 = Strata.Coord.key_at(0, 0, 0, 5)
+      let g5 = lv_ground(k5, 2, 1.0, 5, 0)
+      Test.assert_true(hash_of(Pq.place(f, 3, k5, air(), g5)) != hash_of(air()), "placed at level 5 (1025 a side)")
+    end
+
+    -- a source of blocks by noise, its cover read by a second source, whose cover the trees read (a chain of two scatter covers)
+    test "coarse covers: a chain of scatter covers, each computed once per call in run order, places level 0's instances at levels 1 and 2, over the whole of a coarse Ground" do
+      let p0 = Pn.shapes_blocks(Pn.shapes_blocks(Pn.field_noise(fj_shapes(), "n", 0, 3, 30.0, 9), "b", [6]), "c", [7])
+      let p1 = Pn.field_cover(Pn.layer_scatter(p0, "bushes", "c", Pn.rule(0.5, [("thick", fj_lin())], Nil, Nil), 2.0, 0.5, 11), "dense", "bushes", 3.0)
+      let p2 = Pn.field_cover(Pn.layer_scatter(p1, "shrubs", "b", Pn.rule(0.6, [("n", fj_lin())], Nil, Nil), 1.0, 0.5, 8), "thick", "shrubs", 3.0)
+      let f = frozen_of(Pn.layer_scatter(p2, "trees", "s", Pn.rule(0.25, [("dense", fj_lin())], Nil, Nil), 2.0, 0.5, 5))
+      Test.assert_eq_str(string_join(Pn.layer_names(f), ","), "shrubs,bushes,trees", "shrubs run first, though declared after bushes")
+      -- every instance a level-1 and a level-2 Ground over 0..128 m list, against level 0's over a larger Ground cut to 0..128 m
+      let cut = fn (i) -> if Pq.i_xm(i) >= 0.0 do (if Pq.i_xm(i) < 128.0 do (if Pq.i_zm(i) >= 0.0 do Pq.i_zm(i) < 128.0 else false end) else false end) else false end
+      let g0 = fj_area(-24, -24, 176, 1.0, 0, 10)
+      let a = string_join(List.map(List.filter(Pq.instances(f, 4, Pq.fields(f, 4, g0), g0, "trees"), cut), fj_key), ";")
+      let g1 = fj_area(0, 0, 64, 1.0, 1, 5)
+      let g2 = fj_area(0, 0, 32, 1.0, 2, 2)
+      let b = string_join(List.map(Pq.instances(f, 4, Pq.table_for(Pq.plan(f), g1), g1, "trees"), fj_key), ";")
+      let c = string_join(List.map(Pq.instances(f, 4, Pq.table_for(Pq.plan(f), g2), g2, "trees"), fj_key), ";")
+      Test.assert_true(string_byte_length(a) > 20000, "many instances (" ++ int_to_string(string_byte_length(a)) ++ " bytes listed)")
+      Test.assert_true(a == b, "level 1 lists level 0's")
+      Test.assert_true(a == c, "level 2 lists level 0's")
+    end
+
+    test "coarse covers: a level-1 chunk whose trees read a scatter source's cover is the rank-highest of its level-0 children's cubes, from a Table of zeros" do
+      let p0 = Pn.shapes_blocks(Pn.shapes_templates(Pn.field_noise(Pn.new(), "n", 0, 3, 30.0, 9), "s", [lv_tree(4), lv_tree(6)]), "b", [6])
+      let p1 = Pn.field_cover(Pn.layer_scatter(p0, "shrubs", "b", Pn.rule(0.6, [("n", fj_lin())], Nil, Nil), 1.0, 0.5, 8), "thick", "shrubs", 3.0)
+      let f = frozen_of(Pn.seen_to(Pn.layer_scatter(p1, "trees", "s", Pn.rule(0.02, [("thick", fj_lin())], Nil, Nil), 12.0, 0.5, 5), "trees", 2))
+      let r = lv_check(f, 3, Strata.Coord.key_at(0, 0, 0, 1), 1.0, 11, 5, NativeArray.make_int(0, 0), 6)
+      Test.assert_true(lv_ok(r), "chunk (0, 0, 0) at level 1, shrubs read as holes: " ++ lv_str(r))
+      let pl = Pq.plan(f)
+      List.map([1, 2], fn lvl ->
+        let k = Strata.Coord.key_at(0, 0, -1, lvl)
+        let g = lv_ground(k, Pq.plan_pad(pl, Math.pow(2.0, int_to_float(lvl))), 1.0, lvl, if lvl == 1 do 5 else 2 end)
+        let full = Pq.place_with(pl, 3, k, air(), g, Pq.fields_with(pl, 3, g))
+        let cheap = Pq.place_with(pl, 3, k, air(), g, Pq.table_for(pl, g))
+        Test.assert_eq_int(hash_of(cheap), hash_of(full), "table_for places the same chunk as fields_with at level " ++ int_to_string(lvl)))
+      let g0 = lv_ground(Strata.Coord.key(0, 0, 0), Pq.plan_pad(pl, 1.0), 1.0, 0, 11)
+      Test.assert_eq_int(hash_of(Pq.place_with(pl, 3, Strata.Coord.key(0, 0, 0), air(), g0, Pq.table_for(pl, g0))), hash_of(air()), "at level 0 a Table of zeros places nothing")
+    end
+
+    test "point evaluation equals fields_with over every interior column of a level-0 area, every field kind, at 1 m and 0.5 m, from a negative corner" do
+      let p0 = Pn.shapes_blocks(Pn.shapes_blocks(Pn.field_ground(Pn.field_noise(fj_shapes(), "n", 1, 3, 11.0, 9), "alt", 2), "b", [6]), "m", [7])
+      let p1 = Pn.field_curve(p0, "c", "n", Pn.curve([(0.2, 0.0), (0.5, 0.7), (0.8, 1.0)]))
+      let p2 = Pn.layer_cover(Pn.layer_scatter(p1, "shrubs", "b", Pn.rule(0.8, [("alt", fj_lin())], Nil, Nil), 1.0, 0.5, 8), "moss", "m", Pn.rule(0.6, [("c", fj_lin())], Nil, Nil), 4)
+      let p3 = Pn.layer_site(p2, "camp", "m", [Pn.site(-9.3, -14.1, 3.0, 2.0, 0)], 1.0, 6)
+      let f = frozen_of(Pn.field_cover(Pn.field_cover(Pn.field_cover(p3, "thick", "shrubs", 2.5), "mossy", "moss", 2.0), "near", "camp", 1.5))
+      let names = ["alt", "n", "c", "thick", "mossy", "near"]
+      let res = List.map([1.0, 0.5], fn sc ->
+        -- a 30-column Ground from (-23, -27); alt is a ramp over it; the interior leaves 6 columns a side (thick's 2.5 m at 0.5 m is 5)
+        let n = 30
+        let g = Pq.with_field(fj_area(-23, -27, n, sc, 0, 10), 2, List.fold_left(List.range(0, n * n), NativeArray.make_f32(n * n, 0.0), fn (a, q) -> NativeArray.set_f32(a, q, int_to_float((q % n) * 7 + (q / n) * 3 % 13) /. 100.0)))
+        let t = Pq.fields(f, 3, g)
+        let misses = List.map(names, fn name -> List.fold_left(List.range(0, 18 * 18), 0, fn (acc, q) ->
+          let i = 6 + q % 18
+          let j = 6 + q / 18
+          if Pq.field_point(f, 3, g, name, -23 + i, -27 + j) == Pq.field_at(t, name, i + n * j) do acc else acc + 1 end))
+        float_to_string(sc) ++ ":" ++ string_join(List.map(misses, int_to_string), ","))
+      Test.assert_eq_str(string_join(res, " "), "1.:0,0,0,0,0,0 0.5:0,0,0,0,0,0", "misses per field (alt, n, c, thick, mossy, near) over 324 columns")
+    end
+
+    test "coarse covers: a cover field read only by a layer not placed at the level is not computed there, and the chunk is the same" do
+      -- shrubs (blocks, 0.25 m cells) and their cover within 6 m; trees (seen to 2) read nothing; pebbles (blocks, level 0 only) read the cover
+      let p0 = Pn.shapes_blocks(Pn.shapes_blocks(Pn.shapes_templates(Pn.new(), "s", [lv_tree(4)]), "b", [6]), "q", [9])
+      let p1 = Pn.field_cover(Pn.layer_scatter(p0, "shrubs", "b", Pn.rule(0.5, Nil, Nil, Nil), 0.25, 0.5, 8), "thick", "shrubs", 6.0)
+      let p2 = Pn.seen_to(Pn.layer_scatter(p1, "trees", "s", Pn.rule(1.0, Nil, Nil, Nil), 12.0, 0.5, 5), "trees", 2)
+      let without = frozen_of(p2)
+      let with_pebbles = frozen_of(Pn.layer_scatter(p2, "pebbles", "q", Pn.rule(0.5, [("thick", fj_lin())], Nil, Nil), 1.0, 0.5, 4))
+      let k = Strata.Coord.key_at(0, 0, 0, 2)
+      let pa = Pq.plan(without)
+      let pb = Pq.plan(with_pebbles)
+      let ga = lv_ground(k, Pq.plan_pad(pa, 4.0), 1.0, 2, 2)
+      let gb = lv_ground(k, Pq.plan_pad(pb, 4.0), 1.0, 2, 2)
+      let a = Pq.place_with(pa, 3, k, air(), ga, Pq.table_for(pa, ga))
+      Test.assert_true(hash_of(a) != hash_of(air()), "trees at level 2")
+      Test.assert_eq_int(hash_of(Pq.place_with(pb, 3, k, air(), gb, Pq.table_for(pb, gb))), hash_of(a), "pebbles' cover is not needed at level 2: the same chunk (its cost is bench mode 24's)")
+    end
+
+    test "table_for: refused at level 0 (the chunk unchanged, even for a site layer, which reads no Table), and place_problems says so" do
+      let f = frozen_of(Pn.layer_site(Pn.shapes_templates(Pn.new(), "huts", [lv_tree(4)]), "camp", "huts", [Pn.site(10.5, 12.5, 11.0, 2.0, 0)], 1.0, 6))
+      let pl = Pq.plan(f)
+      let k = Strata.Coord.key(0, 0, 0)
+      let g = lv_ground(k, 0, 1.0, 0, 11)
+      Test.assert_true(hash_of(Pq.place_with(pl, 3, k, air(), g, Pq.fields_with(pl, 3, g))) != hash_of(air()), "with fields_with the hut is placed")
+      Test.assert_eq_int(hash_of(Pq.place_with(pl, 3, k, air(), g, Pq.table_for(pl, g))), hash_of(air()), "with table_for the chunk comes back unchanged")
+      Test.assert_true(has_msg(Pq.place_problems(pl, k, g, Pq.table_for(pl, g)), "only for levels above 0"), "place_problems says why")
+      Test.assert_eq_int(List.length(Pq.place_problems(pl, k, g, Pq.fields_with(pl, 3, g))), 0, "and nothing with fields_with's")
+      let k1 = Strata.Coord.key_at(0, 0, 0, 1)
+      let g1 = lv_ground(k1, 0, 1.0, 1, 5)
+      Test.assert_eq_int(List.length(Pq.place_problems(pl, k1, g1, Pq.table_for(pl, g1))), 0, "above level 0 table_for is fine")
+    end
+
+    test "coarse covers: the cached cover values over their whole box equal fields_with on a larger level-0 Ground, at 1 m and 0.5 m, from a negative corner" do
+      let p0 = Pn.shapes_blocks(Pn.shapes_blocks(Pn.field_noise(fj_shapes(), "n", 0, 3, 13.0, 9), "b", [6]), "c", [7])
+      let p1 = Pn.field_cover(Pn.layer_scatter(p0, "bushes", "c", Pn.rule(0.5, [("thick", fj_lin())], Nil, Nil), 2.0, 0.5, 11), "dense", "bushes", 3.0)
+      let p2 = Pn.field_cover(Pn.layer_scatter(p1, "shrubs", "b", Pn.rule(0.6, [("n", fj_lin())], Nil, Nil), 1.0, 0.5, 8), "thick", "shrubs", 3.0)
+      let f = frozen_of(Pn.layer_scatter(p2, "trees", "s", Pn.rule(0.25, [("dense", fj_lin())], Nil, Nil), 2.0, 0.5, 5))
+      let res = List.map([1.0, 0.5], fn sc ->
+        -- judged on fine columns -21 .. 2, -19 .. 4 (a level-1 Ground supplies the level); dense is read by trees (no margin), thick by bushes (ceil(3 / sc))
+        let gl = fj_area(-20, -20, 16, sc, 1, 5)
+        let m = if sc == 1.0 do 3 else 6 end
+        -- a level-0 Ground 40 columns wider each side than the box
+        let n0 = 24 + 2 * m + 80
+        let g0 = fj_area(-21 - m - 40, -19 - m - 40, n0, sc, 0, 10)
+        let t0 = Pq.fields(f, 3, g0)
+        let one = fn (name, mm) ->
+          match Pq.cover_cached(f, 3, gl, name, -21, -19, 2, 4) do
+            (bx, bz, bn, vals) ->
+              let shape = if bx == -21 - mm do (if bz == -19 - mm do bn == 24 + 2 * mm else false end) else false end
+              let miss = List.fold_left(List.range(0, bn * bn), 0, fn (acc, q) ->
+                let x = bx + q % bn
+                let z = bz + q / bn
+                if NativeArray.get_f32(vals, q) == Pq.field_at(t0, name, (x - (-21 - m - 40)) + n0 * (z - (-19 - m - 40))) do acc else acc + 1 end)
+              name ++ (if shape do "" else " box (" ++ int_to_string(bx) ++ "," ++ int_to_string(bz) ++ "," ++ int_to_string(bn) ++ ")" end) ++ ":" ++ int_to_string(miss)
+          end
+        float_to_string(sc) ++ " " ++ one("dense", 0) ++ " " ++ one("thick", m))
+      Test.assert_eq_str(string_join(res, " | "), "1. dense:0 thick:0 | 0.5 dense:0 thick:0", "boxes and misses")
     end
   end
 end

@@ -82,48 +82,56 @@ mod Strata.Template do
     (ox, oy, oz, ox + w - 1, oy + t_sy(t) - 1, oz + d - 1)
   end
 
-  -- template (x, z) of the rotated footprint cell (rx, rz): the inverse turn
-  pfn unturn(t : Template, rot : Int, rx : Int, rz : Int) : (Int, Int) do
+  -- template (x, z) of the rotated footprint cell (rx, rz) of a template sx wide and sz deep: the inverse turn
+  pfn unturn(sx : Int, sz : Int, rot : Int, rx : Int, rz : Int) : (Int, Int) do
     let r = quarter(rot)
     if r == 0 do (rx, rz)
-    else if r == 1 do (rz, t_sz(t) - 1 - rx)
-    else if r == 2 do (t_sx(t) - 1 - rx, t_sz(t) - 1 - rz)
-    else (t_sx(t) - 1 - rz, rx) end end end
+    else if r == 1 do (rz, sz - 1 - rx)
+    else if r == 2 do (sx - 1 - rx, sz - 1 - rz)
+    else (sx - 1 - rz, rx) end end end
   end
 
   pfn passes(h : Int, p : Int) : Bool do Strata.Seed.unit(h) *. 255.0 < int_to_float(p) end
 
-  -- the id template voxel (x, y, z) writes under stream, or 0 (hole or a failed draw)
-  pfn drawn(t : Template, x : Int, y : Int, z : Int, stream : Int) : Int do
-    let i = x + t_sx(t) * (y + t_sy(t) * z)
-    let id = NativeArray.get_i32(t_ids(t), i)
+  -- a draw at probability p for the hash at (stream, salt, x, y, z): 255 always
+  -- passes (Seed.unit is below 1), so its hash is not computed; each hash is a
+  -- pure function of its own coordinates, so skipping one shifts no other
+  pfn draw_ok(p : Int, stream : Int, salt : Int, x : Int, y : Int, z : Int) : Bool do
+    if p >= 255 do true else passes(Strata.Seed.cell(stream, salt, x, y, z), p) end
+  end
+
+  -- the id template voxel (x, y, z) writes under stream, or 0 (hole or a failed draw); the
+  -- template's fields are handed in, read once by blit before its loops (GAPS S43)
+  pfn drawn(sx : Int, sy : Int, ids : NativeI32Arr, pr : NativeU8Arr, ys : NativeU8Arr, x : Int, y : Int, z : Int, stream : Int) : Int do
+    let i = x + sx * (y + sy * z)
+    let id = NativeArray.get_i32(ids, i)
     -- nested ifs, not `&&`: each draw runs only when the one before passed (GAPS S16)
     if id == 0 do 0
-    else if passes(Strata.Seed.cell(stream, 0, x, y, z), NativeArray.get_u8(t_prob(t), i)) do
-      if passes(Strata.Seed.cell(stream, 1, 0, y, 0), NativeArray.get_u8(t_yslice(t), y)) do id else 0 end
+    else if draw_ok(NativeArray.get_u8(pr, i), stream, 0, x, y, z) do
+      if draw_ok(NativeArray.get_u8(ys, y), stream, 1, 0, y, 0) do id else 0 end
     else 0 end end
   end
 
   -- world cells (wx, wy, wz) for wx in x..x1 of one row; (base_x, base_y, base_z) the chunk's first voxel
-  pfn blit_x(c : Strata.Chunk.Chunk, t : Template, ox : Int, oy : Int, oz : Int, rot : Int, stream : Int, base_x : Int, base_y : Int, base_z : Int, x : Int, x1 : Int, y : Int, z : Int) : Strata.Chunk.Chunk do
+  pfn blit_x(c : Strata.Chunk.Chunk, sx : Int, sy : Int, sz : Int, ids : NativeI32Arr, pr : NativeU8Arr, ys : NativeU8Arr, ox : Int, oy : Int, oz : Int, rot : Int, stream : Int, base_x : Int, base_y : Int, base_z : Int, x : Int, x1 : Int, y : Int, z : Int) : Strata.Chunk.Chunk do
     if x > x1 do c
     else
-      let (tx, tz) = unturn(t, rot, x - ox, z - oz)
-      let id = drawn(t, tx, y - oy, tz, stream)
+      let (tx, tz) = unturn(sx, sz, rot, x - ox, z - oz)
+      let id = drawn(sx, sy, ids, pr, ys, tx, y - oy, tz, stream)
       let i = (x - base_x) + 32 * ((z - base_z) + 32 * (y - base_y))
       let c2 = if id == 0 do c else if i < 0 || i >= 32768 do c else Strata.Chunk.set_idx(c, i, id) end end
-      blit_x(c2, t, ox, oy, oz, rot, stream, base_x, base_y, base_z, x + 1, x1, y, z)
+      blit_x(c2, sx, sy, sz, ids, pr, ys, ox, oy, oz, rot, stream, base_x, base_y, base_z, x + 1, x1, y, z)
     end
   end
 
-  pfn blit_z(c : Strata.Chunk.Chunk, t : Template, ox : Int, oy : Int, oz : Int, rot : Int, stream : Int, base_x : Int, base_y : Int, base_z : Int, x0 : Int, x1 : Int, y : Int, z : Int, z1 : Int) : Strata.Chunk.Chunk do
+  pfn blit_z(c : Strata.Chunk.Chunk, sx : Int, sy : Int, sz : Int, ids : NativeI32Arr, pr : NativeU8Arr, ys : NativeU8Arr, ox : Int, oy : Int, oz : Int, rot : Int, stream : Int, base_x : Int, base_y : Int, base_z : Int, x0 : Int, x1 : Int, y : Int, z : Int, z1 : Int) : Strata.Chunk.Chunk do
     if z > z1 do c
-    else blit_z(blit_x(c, t, ox, oy, oz, rot, stream, base_x, base_y, base_z, x0, x1, y, z), t, ox, oy, oz, rot, stream, base_x, base_y, base_z, x0, x1, y, z + 1, z1) end
+    else blit_z(blit_x(c, sx, sy, sz, ids, pr, ys, ox, oy, oz, rot, stream, base_x, base_y, base_z, x0, x1, y, z), sx, sy, sz, ids, pr, ys, ox, oy, oz, rot, stream, base_x, base_y, base_z, x0, x1, y, z + 1, z1) end
   end
 
-  pfn blit_y(c : Strata.Chunk.Chunk, t : Template, ox : Int, oy : Int, oz : Int, rot : Int, stream : Int, base_x : Int, base_y : Int, base_z : Int, x0 : Int, x1 : Int, y : Int, y1 : Int, z0 : Int, z1 : Int) : Strata.Chunk.Chunk do
+  pfn blit_y(c : Strata.Chunk.Chunk, sx : Int, sy : Int, sz : Int, ids : NativeI32Arr, pr : NativeU8Arr, ys : NativeU8Arr, ox : Int, oy : Int, oz : Int, rot : Int, stream : Int, base_x : Int, base_y : Int, base_z : Int, x0 : Int, x1 : Int, y : Int, y1 : Int, z0 : Int, z1 : Int) : Strata.Chunk.Chunk do
     if y > y1 do c
-    else blit_y(blit_z(c, t, ox, oy, oz, rot, stream, base_x, base_y, base_z, x0, x1, y, z0, z1), t, ox, oy, oz, rot, stream, base_x, base_y, base_z, x0, x1, y + 1, y1, z0, z1) end
+    else blit_y(blit_z(c, sx, sy, sz, ids, pr, ys, ox, oy, oz, rot, stream, base_x, base_y, base_z, x0, x1, y, z0, z1), sx, sy, sz, ids, pr, ys, ox, oy, oz, rot, stream, base_x, base_y, base_z, x0, x1, y + 1, y1, z0, z1) end
   end
 
   pfn max_i(a : Int, b : Int) : Int do if a > b do a else b end end
@@ -135,8 +143,90 @@ mod Strata.Template do
     let base_y = Strata.Coord.ky(k) * 32
     let base_z = Strata.Coord.kz(k) * 32
     let (x0, y0, z0, x1, y1, z1) = bounds(t, ox, oy, oz, rot)
-    blit_y(c, t, ox, oy, oz, rot, stream, base_x, base_y, base_z,
-      max_i(x0, base_x), min_i(x1, base_x + 31), max_i(y0, base_y), min_i(y1, base_y + 31), max_i(z0, base_z), min_i(z1, base_z + 31))
+    -- the template's sizes and arrays read once, not per voxel (GAPS S43)
+    match t do
+      Template(sx, sy, sz, ids, pr, ys, _) ->
+        blit_y(c, sx, sy, sz, ids, pr, ys, ox, oy, oz, rot, stream, base_x, base_y, base_z,
+          max_i(x0, base_x), min_i(x1, base_x + 31), max_i(y0, base_y), min_i(y1, base_y + 31), max_i(z0, base_z), min_i(z1, base_z + 31))
+    end
+  end
+
+  -- ── Coarsening ──
+  --
+  -- A coarser level draws a template at k times its voxel: each coarse voxel
+  -- takes the id of highest rank among the non-hole voxels of its k x k x k
+  -- cube (rank[id]; an empty rank array ranks each id by itself, an id past
+  -- its end ranks 0; a tie goes to the higher id); a cube of holes stays a
+  -- hole, and any id beats a hole. coarsen cuts cubes from the template's
+  -- origin corner and ignores probabilities. coarsen_placed cuts them from
+  -- the world's coarse grid at a placement, after the turn and the draws, so
+  -- its coarse voxels are exactly the cubes of what blit writes there.
+
+  -- floor(a / b), b above 0, any sign
+  pfn fdiv(a : Int, b : Int) : Int do if a >= 0 do a / b else 0 - ((b - 1 - a) / b) end end
+  pfn rank_at(rank : NativeIntArr, rn : Int, id : Int) : Int do
+    if rn == 0 do id else if id < rn do NativeArray.get_int(rank, id) else 0 end end
+  end
+  -- (best ids, their ranks) with id of rank r offered at coarse voxel ci
+  pfn take_best(ids : NativeI32Arr, rs : NativeIntArr, ci : Int, id : Int, r : Int) : (NativeI32Arr, NativeIntArr) do
+    let bid = NativeArray.get_i32(ids, ci)
+    let br = NativeArray.get_int(rs, ci)
+    let wins = if bid == 0 do true else if r > br do true else if r < br do false else id > bid end end end
+    if wins do (NativeArray.set_i32(ids, ci, id), NativeArray.set_int(rs, ci, r)) else (ids, rs) end
+  end
+  -- every fine voxel i.. of the template (fields handed in) offered to its coarse voxel: turned rot,
+  -- shifted by the phase (px, py, pz), cubes of k, a coarse box cw x ch x cd; draws from stream when draw
+  pfn coarse_go(sx : Int, sy : Int, sz : Int, tids : NativeI32Arr, pr : NativeU8Arr, ys : NativeU8Arr, k : Int, rank : NativeIntArr, rn : Int, px : Int, py : Int, pz : Int, rot : Int, stream : Int, draw : Bool, cw : Int, ch : Int, ids : NativeI32Arr, rs : NativeIntArr, i : Int, n : Int) : (NativeI32Arr, NativeIntArr) do
+    if i >= n do (ids, rs)
+    else
+      let x = i % sx
+      let y = (i / sx) % sy
+      let z = i / (sx * sy)
+      let id = if draw do drawn(sx, sy, tids, pr, ys, x, y, z, stream) else NativeArray.get_i32(tids, i) end
+      if id == 0 do coarse_go(sx, sy, sz, tids, pr, ys, k, rank, rn, px, py, pz, rot, stream, draw, cw, ch, ids, rs, i + 1, n)
+      else
+        -- the turn of blit's doc: template (x, z) to footprint (rx, rz)
+        let r = quarter(rot)
+        let rx = if r == 0 do x else if r == 1 do sz - 1 - z else if r == 2 do sx - 1 - x else z end end end
+        let rz = if r == 0 do z else if r == 1 do x else if r == 2 do sz - 1 - z else sx - 1 - x end end end
+        let ci = (px + rx) / k + cw * ((py + y) / k + ch * ((pz + rz) / k))
+        match take_best(ids, rs, ci, id, rank_at(rank, rn, id)) do
+          (ids2, rs2) -> coarse_go(sx, sy, sz, tids, pr, ys, k, rank, rn, px, py, pz, rot, stream, draw, cw, ch, ids2, rs2, i + 1, n)
+        end
+      end
+    end
+  end
+  -- the coarse template of t turned rot, its fine corner at phase (px, py, pz) inside the first cube (each 0..k - 1)
+  pfn coarse_of(t : Template, k : Int, rank : NativeIntArr, px : Int, py : Int, pz : Int, rot : Int, stream : Int, draw : Bool) : Template do
+    match t do
+      Template(sx, sy, sz, tids, pr, ys, vs) ->
+        let w = if int_and(rot, 1) == 0 do sx else sz end
+        let d = if int_and(rot, 1) == 0 do sz else sx end
+        -- the last cube rounded up: (phase + side + k - 1) / k, written so nothing large is added to k
+        let cw = 1 + (px + w - 1) / k
+        let ch = 1 + (py + sy - 1) / k
+        let cd = 1 + (pz + d - 1) / k
+        let cn = Strata.Size.of(cw * ch * cd)
+        match coarse_go(sx, sy, sz, tids, pr, ys, k, rank, NativeArray.length_int(rank), px, py, pz, rot, stream, draw, cw, ch, NativeArray.make_i32(cn, 0), NativeArray.make_int(cn, 0), 0, sx * sy * sz) do
+          (ids, _) -> Template(cw, Strata.Size.of(ch), cd, ids, NativeArray.make_u8(cn, 255), NativeArray.make_u8(Strata.Size.of(ch), 255), vs *. int_to_float(k))
+        end
+    end
+  end
+
+  doc "Template t at k times its voxel size: cubes of k x k x k cut from its origin corner (the last rounded up, so a 5-wide template is 3 wide at k 2), each the id of highest rank among its non-hole voxels (rank[id]; an empty rank array ranks every id by itself, an id past its end ranks 0; a tie goes to the higher id); a cube of holes stays a hole and any id beats a hole. Probabilities are not carried: every voxel and row of the result is at 255. Its voxel size is k times t's. t itself for k 1 or less."
+  fn coarsen(t : Template, k : Int, rank : NativeIntArr) : Template do
+    if k <= 1 do t else coarse_of(t, k, rank, 0, 0, 0, 0, 0, false) end
+  end
+
+  doc "t as blit writes it at fine world voxel (ox, oy, oz), turned rot, its probabilities drawn from stream, coarsened onto the world's grid of cubes of k (coarse voxel V holds fine voxels k V .. k V + k - 1 on each axis): (the coarse template, already turned, every probability 255, at k times t's voxel size; its coarse corner (floor(ox / k), floor(oy / k), floor(oz / k))). Each coarse voxel is the id of highest rank, as in coarsen, among the voxels blit would write in its cube; blit it at that corner with rot 0 into a chunk of the coarser level. For k 1 or less, t and (ox, oy, oz) unchanged."
+  fn coarsen_placed(t : Template, k : Int, rank : NativeIntArr, ox : Int, oy : Int, oz : Int, rot : Int, stream : Int) : (Template, Int, Int, Int) do
+    if k <= 1 do (t, ox, oy, oz)
+    else
+      let cx = fdiv(ox, k)
+      let cy = fdiv(oy, k)
+      let cz = fdiv(oz, k)
+      (coarse_of(t, k, rank, ox - k * cx, oy - k * cy, oz - k * cz, rot, stream, true), cx, cy, cz)
+    end
   end
 
   pfn map_go(pal : NativeU8Arr, to_id : NativeI32Arr, m : Int, ids : NativeI32Arr, i : Int, n : Int) : NativeI32Arr do
