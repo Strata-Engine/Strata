@@ -19,8 +19,9 @@
 -- loaded. Work therefore has two whole frames to finish before it is asked
 -- for; `tick` waits only for a task still running two frames after it was
 -- started. (One frame was not enough: a hard chunk takes 14 ms or more to
--- mesh, and the wait showed as dropped frames.) (March has no non-blocking await, and an actor cannot be
--- called from a test; see GAPS S12.)
+-- mesh, and the wait showed as dropped frames.) With `with_poll` it does not
+-- wait at all: work not finished two ticks on (Task.poll) is kept for a later
+-- tick and counts against that tick's workers.
 --
 -- A mesh is requested with a stamp; a result whose stamp is no longer the
 -- chunk's current one (the chunk was edited or unloaded meanwhile) is
@@ -60,7 +61,7 @@ mod Strata.Stream do
 
   -- radius_h, radius_v (chunks), apply_budget (generated chunks per tick),
   -- workers, far_h, far_v (each coarse level's radii in its own chunks), levels
-  type Config = Config(Int, Int, Int, Int, Int, Int, Int, Int)
+  type Config = Config(Int, Int, Int, Int, Int, Int, Int, Int, Bool)
 
   pfn nonneg(v : Int) : Int do if v < 0 do 0 else v end end
 
@@ -71,22 +72,27 @@ mod Strata.Stream do
 
   doc "As `config`, with levels 1..[levels] each keeping a box [far_h] chunks out in x and z and [far_v] in y, in chunks of its own level, around the focus (Part F's reference: radius 10 x 3 at level 0, 10 x 1 for levels 1..4)."
   fn config_levels(radius_h : Int, radius_v : Int, apply_budget : Int, workers : Int, far_h : Int, far_v : Int, levels : Int) : Config do
-    Config(nonneg(radius_h), nonneg(radius_v), if apply_budget < 1 do 1 else apply_budget end, if workers < 1 do 1 else workers end, nonneg(far_h), nonneg(far_v), nonneg(levels), 1)
+    Config(nonneg(radius_h), nonneg(radius_v), if apply_budget < 1 do 1 else apply_budget end, if workers < 1 do 1 else workers end, nonneg(far_h), nonneg(far_v), nonneg(levels), 1, false)
   end
-  pfn rh(c : Config) : Int do match c do Config(a, _, _, _, _, _, _, _) -> a end end
-  pfn rv(c : Config) : Int do match c do Config(_, b, _, _, _, _, _, _) -> b end end
-  pfn budget(c : Config) : Int do match c do Config(_, _, n, _, _, _, _, _) -> n end end
-  pfn nworkers(c : Config) : Int do match c do Config(_, _, _, n, _, _, _, _) -> n end end
-  pfn fh(c : Config) : Int do match c do Config(_, _, _, _, a, _, _, _) -> a end end
-  pfn fv(c : Config) : Int do match c do Config(_, _, _, _, _, b, _, _) -> b end end
-  pfn nlevels(c : Config) : Int do match c do Config(_, _, _, _, _, _, n, _) -> n end end
+  pfn rh(c : Config) : Int do match c do Config(a, _, _, _, _, _, _, _, _) -> a end end
+  pfn rv(c : Config) : Int do match c do Config(_, b, _, _, _, _, _, _, _) -> b end end
+  pfn budget(c : Config) : Int do match c do Config(_, _, n, _, _, _, _, _, _) -> n end end
+  pfn nworkers(c : Config) : Int do match c do Config(_, _, _, n, _, _, _, _, _) -> n end end
+  pfn fh(c : Config) : Int do match c do Config(_, _, _, _, a, _, _, _, _) -> a end end
+  pfn fv(c : Config) : Int do match c do Config(_, _, _, _, _, b, _, _, _) -> b end end
+  pfn nlevels(c : Config) : Int do match c do Config(_, _, _, _, _, _, n, _, _) -> n end end
 
   doc "The configuration [c] with at most [cap] keys of one chunk column and level made by one generation task (Strata.Terrain.run_column), so a generator with a column function does a column's shared work once. 1, the default, is one key a task; below 1 is 1. A tick still starts no more keys than `workers`."
   fn with_batch(c : Config, cap : Int) : Config do
-    match c do Config(a, b, n, wk, f, g, l, _) -> Config(a, b, n, wk, f, g, l, if cap < 1 do 1 else cap end) end
+    match c do Config(a, b, n, wk, f, g, l, _, p) -> Config(a, b, n, wk, f, g, l, if cap < 1 do 1 else cap end, p) end
   end
+  doc "The configuration [c] whose tick takes only the work that has finished (Task.poll) and keeps the rest for a later tick, so it never waits on a worker. Off by default: a scripted run that must be the same every time has the work of two ticks ago applied whatever it costs to wait."
+  fn with_poll(c : Config, yes : Bool) : Config do
+    match c do Config(a, b, n, wk, f, g, l, bt, _) -> Config(a, b, n, wk, f, g, l, bt, yes) end
+  end
+  pfn polls(c : Config) : Bool do match c do Config(_, _, _, _, _, _, _, _, p) -> p end end
   doc "How many keys of one column a generation task may make."
-  fn batch(c : Config) : Int do match c do Config(_, _, _, _, _, _, _, n) -> n end end
+  fn batch(c : Config) : Int do match c do Config(_, _, _, _, _, _, _, n, _) -> n end end
 
   -- the highest level streamed: the config's, no higher than the generator's
   pfn top(c : Config, w : Strata.World.World) : Int do
@@ -187,14 +193,29 @@ mod Strata.Stream do
       Cons(GenTask(ks, t), rest) ->
         match g do
           Got(ok, bad) ->
-            match task_await(t) do
-              Ok(ms) ->
-                match results(ks, ms, ok) do
-                  Some(ok2) -> await_gens(rest, Got(ok2, bad))
-                  None -> await_gens(rest, Got(ok, keys_onto(ks, bad)))
-                end
-              Err(_) -> await_gens(rest, Got(ok, keys_onto(ks, bad)))
-            end
+            await_gens(rest, gen_done(ks, task_await(t), ok, bad))
+        end
+    end
+  end
+  -- a generation task's result folded in: its chunks, or its keys to try again
+  pfn gen_done(ks : List((Strata.Coord.Key, Int)), r : Result(List(Made), String), ok : List(GenRes), bad : List(Strata.Coord.Key)) : Got do
+    match r do
+      Ok(ms) ->
+        match results(ks, ms, ok) do
+          Some(ok2) -> Got(ok2, bad)
+          None -> Got(ok, keys_onto(ks, bad))
+        end
+      Err(_) -> Got(ok, keys_onto(ks, bad))
+    end
+  end
+  -- the finished tasks folded in, the rest answered (in order) to be kept for a later tick
+  pfn poll_gens(ts : List(GenTask), g : Got, still : List(GenTask)) : (Got, List(GenTask)) do
+    match ts do
+      Nil -> (g, List.reverse(still))
+      Cons(GenTask(ks, t), rest) ->
+        match task_poll(t) do
+          None -> poll_gens(rest, g, Cons(GenTask(ks, t), still))
+          Some(r) -> match g do Got(ok, bad) -> poll_gens(rest, gen_done(ks, r, ok, bad), still) end
         end
     end
   end
@@ -205,15 +226,27 @@ mod Strata.Stream do
   pfn await_meshes(ts : List(MeshTask), m : Meshing) : Meshing do
     match ts do
       Nil -> m
+      Cons(MeshTask(k, stamp, t), rest) -> await_meshes(rest, mesh_done(k, stamp, task_await(t), m))
+    end
+  end
+  -- a mesh task's result folded in
+  pfn mesh_done(k : Strata.Coord.Key, stamp : Int, r : Result(Strata.Mesh.Meshed, String), m : Meshing) : Meshing do
+    match m do
+      Meshing(need, asked, ready, todo, clock) ->
+        match r do
+          Ok(mesh) -> if So.get(need, k) == stamp do Meshing(need, asked, So.put(ready, k, mesh), todo, clock) else m end
+          Err(_) -> Meshing(need, So.remove(asked, k), ready, Cons(k, todo), clock)
+        end
+    end
+  end
+  -- the finished mesh tasks folded in, the rest answered (in order) to be kept for a later tick
+  pfn poll_meshes(ts : List(MeshTask), m : Meshing, still : List(MeshTask)) : (Meshing, List(MeshTask)) do
+    match ts do
+      Nil -> (m, List.reverse(still))
       Cons(MeshTask(k, stamp, t), rest) ->
-        match m do
-          Meshing(need, asked, ready, todo, clock) ->
-            match task_await(t) do
-              Ok(mesh) ->
-                if So.get(need, k) == stamp do await_meshes(rest, Meshing(need, asked, So.put(ready, k, mesh), todo, clock))
-                else await_meshes(rest, m) end
-              Err(_) -> await_meshes(rest, Meshing(need, So.remove(asked, k), ready, Cons(k, todo), clock))
-            end
+        match task_poll(t) do
+          None -> poll_meshes(rest, m, Cons(MeshTask(k, stamp, t), still))
+          Some(r) -> poll_meshes(rest, mesh_done(k, stamp, r, m), still)
         end
     end
   end
@@ -837,21 +870,23 @@ mod Strata.Stream do
   fn tick(s : Stream) : Stream do
     match s do
       Stream(w, c, fs, q, got, gts, mts, m, gone, gts_new, mts_new, Redo(rst, rn)) ->
-        match await_gens(gts, Got(Nil, Nil)) do
+        -- polling, the work not yet done is kept (still_g, still_m) and counts against this tick's workers; waiting, there is none
+        let (gotten, still_g) = if polls(c) do poll_gens(gts, Got(Nil, Nil), Nil) else (await_gens(gts, Got(Nil, Nil)), Nil) end
+        match gotten do
           Got(gens, failed) ->
-            let m1 = await_meshes(mts, m)
+            let (m1, still_m) = if polls(c) do poll_meshes(mts, m, Nil) else (await_meshes(mts, m), Nil) end
             match apply_gens(Applied(w, m1, Nil, rst, Nil, gone), append(got, gens), budget(c), c, fs) do
               Applied(w1, m2, waiting, rst2, again, gone2) ->
                 match start_stale(w1, c, fs, Redo(rst2, rn), prepend(again, prepend(failed, q))) do
                   (w2, rd2, q1) ->
                     let rs2 = match rd2 do Redo(st, _) -> st end
-                    match send_gens(skip_running(q1, gts_new), Nil, w2, c, fs, waiting, nworkers(c), rs2) do
+                    match send_gens(skip_running(q1, List.append(still_g, gts_new)), Nil, w2, c, fs, waiting, nonneg(nworkers(c) - List.length(still_g)), rs2) do
                       Handed(q2, gts2) ->
                         match take_todo(m2) do
                           (m3, todo) ->
-                            match send_meshes(todo, So.empty(false), m3, Nil, Nil, w2, nworkers(c)) do
+                            match send_meshes(todo, So.empty(false), m3, Nil, Nil, w2, nonneg(nworkers(c) - List.length(still_m))) do
                               -- what was started last tick is collected next tick; what starts now, the tick after
-                              Asked(m4, mts2, left) -> Stream(w2, c, fs, q2, waiting, gts_new, mts_new, with_todo(m4, left), gone2, gts2, mts2, rd2)
+                              Asked(m4, mts2, left) -> Stream(w2, c, fs, q2, waiting, List.append(still_g, gts_new), List.append(still_m, mts_new), with_todo(m4, left), gone2, gts2, mts2, rd2)
                             end
                         end
                     end
