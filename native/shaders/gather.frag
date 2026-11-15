@@ -18,10 +18,7 @@ void main() {
     int s = int(u.trace.x);
     ivec2 px = ivec2(gl_FragCoord.xy);                    // this pass's pixel: the schedules and random numbers run on it
     ivec2 full = textureSize(gb_depth, 0);
-    // the full-sized pixel it traces for: each of its block's in turn, frame by frame, so that its memory holds all of them
-    // (one pixel always would put a block's whole light on whatever that pixel hit, a voxel's very edge for some)
-    int turn = int(u.light.z) & 3;
-    ivec2 fp = min(px * s + (s > 1 ? ivec2(turn & 1, turn >> 1) : ivec2(0)), full - 1);
+    ivec2 fp = min(px * s, full - 1);                     // the full-sized pixel it traces for: its block's top left
     vec2 uv = (vec2(fp) + 0.5) / vec2(full);
     float depth = texelFetch(gb_depth, fp, 0).r;
     int mode = int(u.light.x);

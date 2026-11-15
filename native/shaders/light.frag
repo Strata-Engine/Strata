@@ -59,7 +59,7 @@ void main() {
     float view_depth = (u.vp * vec4(world, 1.0)).w;
     float s = u.trace.x;
     ivec2 hsize = textureSize(hist_cur, 0);
-    vec2 hp = (gl_FragCoord.xy - 0.5 * s) / s;            // where this pixel falls among the gathered ones (their blocks' centres)
+    vec2 hp = (gl_FragCoord.xy - 0.5) / s;                // where this pixel falls among the gathered ones (their blocks' top left pixels)
     ivec2 hc = ivec2(floor(hp + 0.5));
     // at one gathered pixel per screen pixel, just its own; else the 3 x 3 round the nearest, by a tent 1.5 gathered pixels wide,
     // which spreads each one's few samples over the screen pixels it stands for and its neighbours'
