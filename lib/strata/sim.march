@@ -1,0 +1,135 @@
+-- Sim — one frame of the world's simulation, in one order, for any game.
+--
+-- The world is simulated by three systems: the stream (chunks generated,
+-- meshed and kept), the fluid (water flowing) and physics (bodies, and the
+-- land that falls when nothing holds it). Each works partly on worker tasks,
+-- and each must hear of what the others change. This module is where they
+-- meet, so that a game does not wire them together itself:
+--
+-- * `edit` hands one edit of the world to all three: the stream applies it,
+--   the fluid wakes about it, and physics, when [collapse] is true, looks
+--   for what it left unsupported (a game's own large edits, such as building
+--   an arena, pass false: the support pass would bring the land about them
+--   down).
+--
+-- * `step` advances them on a clock, in this order: physics' step begun last
+--   frame is finished (what it did to the world is applied and wakes the
+--   fluid), a step owed twice over is run at once, and the next begun; then,
+--   when one is due (`fluid_hz` a second), the fluid's step begun last time
+--   is finished, the cells bodies fill are marked, and the next begun; then
+--   the stream ticks, at most once in `tick_gap` seconds (it waits on tasks
+--   two ticks old, so ticking every frame at a high frame rate waits on
+--   tasks not yet done). What each part cost on the main thread, and the
+--   events of the steps that ended, come back with it.
+--
+-- * Strata.Render.present brings a renderer up to date with it: the chunks
+--   meshed and gone, and the bodies where they are. (It lives with the
+--   renderer, so the simulation runs without one: in tests, on a server.)
+--
+-- The clock is seconds from any origin the game likes; a scripted run that
+-- must be the same every time passes frame / 60.
+mod Strata.Sim do
+
+  -- The three systems, the fluid's and physics' work in flight, and how often the fluid steps (a second) and the stream ticks (at least seconds apart; 0 every frame). With [sync_fluid] the fluid steps on the main thread (for tests).
+  type SmSim = { sm_stream : Strata.Stream.Stream, sm_fluid : Strata.Fluid.Fluid, sm_physics : Strata.Physics.Physics,
+               sm_fjob : Option(Strata.Fluid.Job), sm_pjob : Option(Strata.Physics.Stepping),
+               sm_fluid_hz : Int, sm_tick_gap : Float, sm_sync_fluid : Bool, sm_clock : () -> Float }
+
+  -- What a step did: main-thread milliseconds for physics, the fluid and the stream's tick; whether the fluid stepped and the stream ticked; the events of the physics steps that ended (oldest first) and of the fluid step that ended.
+  type SmFrame = { sf_physics_ms : Float, sf_fluid_ms : Float, sf_tick_ms : Float, sf_fluid_due : Bool, sf_ticked : Bool,
+                 sf_physics_events : List(Strata.Physics.PhysEvent), sf_fluid_events : List(Strata.Fluid.Event) }
+
+  doc "A simulation of these three, nothing in flight: the fluid stepping 30 times a second and the stream ticking every frame."
+  fn new(s : Strata.Stream.Stream, f : Strata.Fluid.Fluid, p : Strata.Physics.Physics) : SmSim do
+    { sm_stream: s, sm_fluid: f, sm_physics: p, sm_fjob: None, sm_pjob: None, sm_fluid_hz: 30, sm_tick_gap: 0.0, sm_sync_fluid: false, sm_clock: fn () -> 0.0 }
+  end
+  doc "The fluid steps [hz] times a second (0 never)."
+  fn with_fluid_hz(m : SmSim, hz : Int) : SmSim do { m with sm_fluid_hz: hz } end
+  doc "The stream ticks at most once in [seconds] (0: every frame)."
+  fn with_tick_gap(m : SmSim, seconds : Float) : SmSim do { m with sm_tick_gap: seconds } end
+  doc "Time each part of a step on [clock] (seconds; the game's own, such as Strata.Ffi.Vk.time). Without one every part reads 0 ms."
+  fn with_clock(m : SmSim, clock : () -> Float) : SmSim do { m with sm_clock: clock } end
+  doc "The fluid steps on the main thread, finished as it is begun."
+  fn with_sync_fluid(m : SmSim, yes : Bool) : SmSim do { m with sm_sync_fluid: yes } end
+
+  fn stream(m : SmSim) : Strata.Stream.Stream do m.sm_stream end
+  fn fluid(m : SmSim) : Strata.Fluid.Fluid do m.sm_fluid end
+  fn physics(m : SmSim) : Strata.Physics.Physics do m.sm_physics end
+  fn world(m : SmSim) : Strata.World.World do Strata.Stream.world(m.sm_stream) end
+  doc "The same simulation with these systems in place of its own (the work in flight is kept): for a game that changes one directly, as by adding a body."
+  fn with_parts(m : SmSim, s : Strata.Stream.Stream, f : Strata.Fluid.Fluid, p : Strata.Physics.Physics) : SmSim do { m with sm_stream: s, sm_fluid: f, sm_physics: p } end
+  doc "The fluid's work in flight, given up (a regenerated world has nothing for it)."
+  fn drop_fluid_job(m : SmSim) : SmSim do { m with sm_fjob: None } end
+  fn fluid_job(m : SmSim) : Option(Strata.Fluid.Job) do m.sm_fjob end
+  fn physics_job(m : SmSim) : Option(Strata.Physics.Stepping) do m.sm_pjob end
+  doc "A simulation with this work in flight (as a game that kept it apart hands it back)."
+  fn with_jobs(m : SmSim, fj : Option(Strata.Fluid.Job), pj : Option(Strata.Physics.Stepping)) : SmSim do { m with sm_fjob: fj, sm_pjob: pj } end
+
+  doc "One edit of the world, heard by all three: the stream applies it, the fluid wakes about it, and with [collapse] physics looks for what it left unsupported."
+  fn edit(m : SmSim, o : Strata.Edit.Outcome, collapse : Bool) : SmSim do
+    { m with sm_stream: Strata.Stream.apply(m.sm_stream, o), sm_fluid: Strata.Fluid.wake(m.sm_fluid, Strata.Edit.world(o), o),
+             sm_physics: if collapse do Strata.Physics.wake(m.sm_physics, o) else m.sm_physics end }
+  end
+
+  pfn ms_since(m : SmSim, t0 : Float) : Float do (m.sm_clock() -. t0) *. 1000.0 end
+
+  -- physics: the step begun last frame finished (its changes to the world applied, the fluid woken by them), a step owed twice over run now, the next begun
+  pfn physics_go(m : SmSim, focus : List((Float, Float, Float)), t : Float) : (SmSim, List(Strata.Physics.PhysEvent)) do
+    let (p1, s1, f1, ev1) = match m.sm_pjob do
+        Some(j) ->
+          match Strata.Physics.finish_world(j, m.sm_physics, Strata.Stream.world(m.sm_stream)) do
+            (p5, o5) -> (p5, Strata.Stream.apply(m.sm_stream, o5), Strata.Fluid.wake(m.sm_fluid, Strata.Edit.world(o5), o5), Strata.Physics.events(p5))
+          end
+        None -> (m.sm_physics, m.sm_stream, m.sm_fluid, Nil)
+      end
+    let owed = Strata.Physics.due(p1, t)
+    let (p2, s2) = if owed >= 2 do Strata.Physics.step(p1, s1, focus) else (p1, s1) end
+    let ev2 = if owed >= 2 do Strata.Physics.events(p2) else Nil end
+    let (p3, job) = if owed >= 1 do (match Strata.Physics.begin(p2, Strata.Stream.world(s2), focus) do (p4, j4) -> (p4, Some(j4)) end) else (p2, None) end
+    ({ m with sm_stream: s2, sm_fluid: f1, sm_physics: p3, sm_pjob: job }, List.append(ev1, ev2))
+  end
+
+  -- the cells bodies fill made walls to the fluid, their water pushed aside first
+  pfn marked(m : SmSim) : SmSim do
+    match Strata.Fluid.set_marks(m.sm_fluid, Strata.Stream.world(m.sm_stream), Strata.Physics.marks(m.sm_physics)) do
+      (f, o) -> { m with sm_stream: Strata.Stream.apply(m.sm_stream, o), sm_fluid: f }
+    end
+  end
+
+  -- the fluid, when due: the step begun last time finished, bodies' cells marked, the next begun (on the main thread with sync_fluid)
+  pfn fluid_go(m : SmSim, focus : List((Float, Float, Float))) : (SmSim, List(Strata.Fluid.Event)) do
+    if m.sm_sync_fluid do
+      let mw = marked(m)
+      match Strata.Fluid.step(mw.sm_fluid, mw.sm_stream, focus) do (f2, s2) -> ({ mw with sm_fluid: f2, sm_stream: s2 }, Strata.Fluid.events(f2)) end
+    else
+      let m1 = match m.sm_fjob do
+          Some(j) -> match Strata.Fluid.finish(j, m.sm_fluid, m.sm_stream) do (f2, s2) -> { m with sm_fluid: f2, sm_stream: s2 } end
+          None -> m
+        end
+      let ev = Strata.Fluid.events(m1.sm_fluid)
+      let mw = marked(m1)
+      match Strata.Fluid.begin(mw.sm_fluid, Strata.Stream.world(mw.sm_stream), focus) do
+        (f3, j3) -> ({ mw with sm_fluid: f3, sm_fjob: Some(j3) }, ev)
+      end
+    end
+  end
+
+  -- has a multiple of 1 / per_second passed between the two? (a millionth allowed, so frame / 60 at 30 a second crosses on the even frames whatever the rounding)
+  pfn crossed(t : Float, t_prev : Float, per_second : Float) : Bool do Math.floor(t *. per_second +. 0.000001) != Math.floor(t_prev *. per_second +. 0.000001) end
+
+  doc "One frame of simulation at clock [t] (seconds; the last frame's was [t_prev]) about [focus]: physics, then the fluid if due, then the stream's tick if due, in that order. Answers the simulation and what the frame did."
+  fn step(m : SmSim, focus : List((Float, Float, Float)), t : Float, t_prev : Float) : (SmSim, SmFrame) do
+    let t0 = m.sm_clock()
+    let (m1, pev) = physics_go(m, focus, t)
+    let p_ms = ms_since(m, t0)
+    let t1 = m.sm_clock()
+    let due = m.sm_fluid_hz > 0 && crossed(t, t_prev, int_to_float(m.sm_fluid_hz))
+    let (m2, fev) = if due do fluid_go(m1, focus) else (m1, Nil) end
+    let f_ms = ms_since(m, t1)
+    let t2 = m.sm_clock()
+    let ticks = m.sm_tick_gap <= 0.0 || crossed(t, t_prev, 1.0 /. m.sm_tick_gap)
+    let m3 = if ticks do { m2 with sm_stream: Strata.Stream.tick(m2.sm_stream) } else m2 end
+    (m3, { sf_physics_ms: p_ms, sf_fluid_ms: f_ms, sf_tick_ms: ms_since(m, t2), sf_fluid_due: due, sf_ticked: ticks, sf_physics_events: pev, sf_fluid_events: fev })
+  end
+
+end

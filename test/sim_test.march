@@ -1,0 +1,74 @@
+-- Sim: one frame of the stream, the fluid and physics, in one order. The world is stone below y = 0 and air above.
+mod Strata.Test.Sim do
+
+  needs IO.Clock
+  needs IO.Process
+  needs IO.Spawn      -- physics' and the fluid's steps are worked out on workers
+  needs IO.Foreign    -- Strata.Sim times each part
+  import Test
+
+  pfn reg() : Strata.Blocks.Registry do
+    let r1 = match Strata.Blocks.register(Strata.Blocks.empty(), Strata.Blocks.def()) do
+        Ok((r, _)) -> r
+        Err(_) -> Strata.Blocks.empty()
+      end
+    match Strata.Blocks.register_fluid(r1, Strata.Blocks.with_collide(Strata.Blocks.with_layer(Strata.Blocks.with_opacity(Strata.Blocks.def(), Strata.Blocks.SeeThrough), Strata.Blocks.Translucent), false)) do
+      Ok((r2, _)) -> r2
+      Err(_) -> r1
+    end
+  end
+  pfn sim() : Strata.Sim.SmSim do
+    let gen = Strata.Terrain.gen(fn (k, seed) -> if Strata.Coord.ky(k) < 0 do Strata.Chunk.uniform(1) else Strata.Chunk.uniform(0) end)
+    let w = Strata.World.new(reg(), gen, 7, 1.0)
+    let s = Strata.Stream.run_until_settled(Strata.Stream.set_focus(Strata.Stream.start(w, Strata.Stream.config(1, 1, 8, 2)), Cons((0.5, 1.0, 0.5), Nil)), 200)
+    Strata.Sim.new(s, Strata.Fluid.new(reg(), Cons((2, Strata.Fluid.flowing()), Nil)), Strata.Physics.new(reg(), Strata.Physics.config()))
+  end
+  -- steps frames f0 .. f1 - 1 on the clock frame / 60, the frames the fluid stepped on listed
+  pfn run(m : Strata.Sim.SmSim, f : Int, f1 : Int, acc : List(Int)) : List(Int) do
+    if f >= f1 do List.reverse(acc)
+    else
+      match Strata.Sim.step(m, Cons((0.5, 1.0, 0.5), Nil), int_to_float(f) /. 60.0, int_to_float(f - 1) /. 60.0) do
+        (m2, sf) -> run(m2, f + 1, f1, if sf.sf_fluid_due do Cons(f, acc) else acc end)
+      end
+    end
+  end
+
+  pfn same(a : List(Int), b : List(Int)) : Bool do
+    match a do
+      Nil -> List.length(b) == 0
+      Cons(x, ra) -> match b do
+        Nil -> false
+        Cons(y, rb) -> x == y && same(ra, rb)
+      end
+    end
+  end
+  -- how many of frames f .. 11 (at 120 a second) the stream ticked on
+  pfn ticks(m : Strata.Sim.SmSim, f : Int, n : Int) : Int do
+    if f >= 12 do n
+    else
+      match Strata.Sim.step(m, Nil, int_to_float(f) /. 120.0, int_to_float(f - 1) /. 120.0) do
+        (_, sf) -> ticks(m, f + 1, if sf.sf_ticked do n + 1 else n end)
+      end
+    end
+  end
+
+  describe "Strata.Sim" do
+    test "at 30 a second on the clock frame / 60 the fluid steps on the even frames" do
+      Test.assert_true(same(run(sim(), 0, 8, Nil), [0, 2, 4, 6]), "frames 0, 2, 4, 6")
+    end
+    test "at 20 a second, every third frame; at 0, never" do
+      Test.assert_true(same(run(Strata.Sim.with_fluid_hz(sim(), 20), 0, 7, Nil), [0, 3, 6]), "frames 0, 3, 6")
+      Test.assert_eq_int(List.length(run(Strata.Sim.with_fluid_hz(sim(), 0), 0, 7, Nil)), 0, "none")
+    end
+    test "the stream ticks every frame with no gap, and at most once in the gap with one" do
+      Test.assert_eq_int(ticks(Strata.Sim.with_tick_gap(sim(), 0.0), 0, 0), 12, "every frame")
+      Test.assert_eq_int(ticks(Strata.Sim.with_tick_gap(sim(), 0.016), 0, 0), 6, "about every other frame at 120 a second")
+    end
+    test "an edit is applied to the stream's world whether or not it may collapse" do
+      let m = sim()
+      let o = Strata.Edit.set_block(Strata.Sim.world(m), 3, 1, 3, 1)
+      Test.assert_eq_int(Strata.World.get_block(Strata.Sim.world(Strata.Sim.edit(m, o, false)), 3, 1, 3), 1, "set, quietly")
+      Test.assert_eq_int(Strata.World.get_block(Strata.Sim.world(Strata.Sim.edit(m, o, true)), 3, 1, 3), 1, "set, with collapse")
+    end
+  end
+end

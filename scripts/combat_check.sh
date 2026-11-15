@@ -11,7 +11,7 @@ FAILED=0
 run() {
   name="$1"; shift
   env MARCH_PIN_MAIN=1 STRATA_HIDDEN=1 STRATA_OFFSCREEN=1 STRATA_PIXELS=1 STRATA_AUDIO=0 STRATA_SIZE=640x400 STRATA_ISLAND=1 \
-      STRATA_SHORE=1 STRATA_COMBAT=1 STRATA_LIGHT=0 STRATA_LEVELS=0 STRATA_SHOT=/dev/null "$@" \
+      STRATA_SHORE=1 STRATA_COMBAT=1 STRATA_COMBAT_TEAMS=0 STRATA_LIGHT=0 STRATA_LEVELS=0 STRATA_SHOT=/dev/null "$@" \
       ./viewer/.march/build/release/strata_viewer > "$OUT/$name.log" 2>&1
   grep '^combat:' "$OUT/$name.log" > "$OUT/$name.txt"
 }

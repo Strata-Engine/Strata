@@ -89,9 +89,17 @@ void main() {
     if (figure && (fcode & 64) != 0) settling = true;
     if (settling) kept = min(kept, 2.0);
     bool sample_now = kept < 4.0 || settling || (((px.x >> 3) & 1) + 2 * ((px.y >> 3) & 1)) == (frame & 3);
+    // sky light changes slowly and costs most (its rays go far): a settled pixel traces it one frame in sixteen, in a pattern that moves round each
+    // 4 x 4 block of 8-pixel tiles, against the sun's one in four
+    // A pixel with little memory, or one settling, traces sky light one frame in four, a pixel of each 2 x 2 block in turn (so a quarter of the
+    // pixels newly in view trace it each frame, not all of them: turning the view had made the light pass three times as slow); until its first
+    // sample it is lit by the flat sky term. The sun's ray, which is cheaper, it still traces every frame.
+    bool fresh = kept < 4.0 || settling;
+    bool full_sky = u.light.w < 0.0;   // STRATA_SKY_FULL: the schedule of before (stored pictures)
+    bool sky_now = full_sky ? sample_now : fresh ? ((px.x & 1) + 2 * (px.y & 1)) == (frame & 3) : (((px.x >> 3) & 3) + 4 * ((px.y >> 3) & 3)) == (frame & 15);
     float sun_vis = old.a;
-    int rays = mode >= 4 ? int(u.light.w) : 0;
-    vec3 sky = rays > 0 ? old.rgb : sky_flat(n);
+    int rays = mode >= 4 ? int(abs(u.light.w)) : 0;
+    vec3 sky = rays > 0 ? (kept > 0.0 || u.light.w < 0.0 ? old.rgb : sky_flat(n)) : sky_flat(n);
     float count = kept;
     if (sample_now || shade_moves) {
         float sun_now = sun_visible(at, n, sun_toward(rand2(px, frame, 0)));
@@ -103,7 +111,7 @@ void main() {
         // shadows lean on 64 past samples at most, so they follow a moving sun; sky light on all of them, since a small bright thing is found by few rays
         sun_vis = mix(old.a, sun_now, 1.0 / (min(ks, 64.0) + 1.0));
         if (sample_now) {
-            if (rays > 0) sky = mix(old.rgb, sky_light(at, n, px, frame, rays), 1.0 / (kept + 1.0));
+            if (rays > 0 && sky_now) sky = mix(old.rgb, sky_light(at, n, px, frame, rays), full_sky ? 1.0 / (kept + 1.0) : 1.0 / (min(kept, 255.0) / 4.0 + 1.0));
             count = kept + 1.0;
         }
     }
@@ -130,4 +138,7 @@ void main() {
         col += sun_highlight(n, toward_eye, rough, sun_vis);
     }
     o_lit = vec4(fogged(col, world), 1.0);
+    // light mode 5, for finding grain: lit as 4, but each pixel shows its memory: grey by how many past samples it leans on (white 64 and more),
+    // red where it was made to start over this frame (an edit near it, a moving body, a moved sun), blue where a moving figure's shadow box is
+    if (mode == 5) o_lit = vec4(settling ? vec3(0.9, 0.1, 0.1) : (shade_moves ? vec3(0.1, 0.3, 0.9) : vec3(min(count, 64.0) / 64.0)), 1.0);
 }

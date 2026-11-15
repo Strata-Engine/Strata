@@ -27,7 +27,7 @@
 /* Rewritten by build_shaders.sh whenever the shaders change: forge decides
  * whether to recompile this file from its text alone, not from the headers
  * it includes (GAPS S14). */
-#define STRATA_SHADERS_STAMP "f10e9d07ef1a6684"
+#define STRATA_SHADERS_STAMP "be23891431f5853c"
 #include "strata_shaders.h"
 #include "strata_particles.h"
 #include "strata_alloc.h"
@@ -193,6 +193,7 @@ static struct {
     struct LightWrite { int cell[3]; int32_t chunk[3]; int valid; int uniform; int edit; unsigned char *bytes; } *lq;   /* writes waiting to be copied in, oldest first */
     uint32_t nlq, lq_cap;
     int32_t edit_lo[3], edit_hi[3];   /* the chunks an edit changed, while light_edit counts down */
+    int32_t last_lo[3], last_hi[3]; int last_edit;   /* the chunks the last frame's edits changed, if any */
     int light_relax;               /* frames left in which memory is capped short: the sun moved */
     float sun_seen[3];             /* the sun direction the light pass's memory was gathered under */
     int light_edit;                /* frames left in which the light pass must lean on new samples: an edit just reached the volume */
@@ -249,6 +250,7 @@ static struct {
     uint32_t rebuilds;             /* swapchain rebuilds so far */
     int ok, swap_ok, resized;
     int vsync_off;                 /* ask for the immediate present mode */
+    double pass_ms[4];             /* last frame's GPU ms by pass: before the geometry, geometry, light, after the light */
     double stat[6];                /* last frame: CPU ms, ms waiting, draw calls, GPU ms, translucent chunks drawn, microseconds ordering them */
     /* a chunk being assembled by sv_chunk_begin .. sv_chunk_commit */
     struct { int64_t slot; int32_t origin[3]; uint32_t *part[4]; uint32_t n[4], cap[4]; int open; int body; int fig; int32_t rp; int level; } stage;
@@ -1440,6 +1442,31 @@ int64_t sv_rig_palette(int64_t rig, void *floats) {
     if (fg.glow) for (int p = 0; p < SV_FIG_PARTS; p++) fg.glow[rig * SV_FIG_PARTS + p] = -1.0f;
     return 1;
 }
+/* A shape for the rays (a body's light classes, or a figure part's palette
+ * indices): its bytes, x fastest, then y, then z, then a coarse layer of one
+ * byte a SV_SHAPE_BLOCK^3 block of them (1 if any voxel in the block is not
+ * 0), blocks x fastest, starting on the word after the voxels. A ray walks
+ * the blocks and steps voxel by voxel only inside the ones that hold
+ * something (trace.glsl's body_ray). Allocated from g_bbytes; false if full. */
+#define SV_SHAPE_BLOCK 4
+static int put_shape(const uint8_t *bytes, int64_t sx, int64_t sy, int64_t sz, uint32_t *first_out, uint32_t *words_out) {
+    int64_t n = sx * sy * sz, B = SV_SHAPE_BLOCK;
+    int64_t bx = (sx + B - 1) / B, by = (sy + B - 1) / B, bz = (sz + B - 1) / B;
+    uint32_t fine = (uint32_t)((n + 3) / 4), words = fine + (uint32_t)((bx * by * bz + 3) / 4), first = 0;
+    if (!sa_alloc(&g_bbytes, words, &first)) return 0;
+    uint8_t *dst = (uint8_t *)(g.bbytes_map + first);
+    memset(dst, 0, (size_t)words * 4);
+    memcpy(dst, bytes, (size_t)n);
+    uint8_t *coarse = dst + (size_t)fine * 4;
+    for (int64_t z = 0; z < sz; z++)
+        for (int64_t y = 0; y < sy; y++) {
+            const uint8_t *row = bytes + (size_t)(sx * (y + sy * z));
+            uint8_t *crow = coarse + (size_t)(bx * (y / B + by * (z / B)));
+            for (int64_t x = 0; x < sx; x++) if (row[x]) crow[x / B] = 1;
+        }
+    *first_out = first; *words_out = words;
+    return 1;
+}
 /* Rig [rig]'s part [part] as the rays see it: one palette index a voxel (0
  * empty), x fastest, then y, then z, [sx] x [sy] x [sz], its low corner the
  * part grid's (the anchor and voxel size are rig_part_anchor's). Shared by
@@ -1450,11 +1477,9 @@ int64_t sv_rig_shape(int64_t rig, int64_t part, void *bytes, int64_t n, int64_t 
     if (!g.ok || !fg.shape || rig < 0 || rig >= SV_FIG_RIGS || part < 0 || part >= SV_FIG_PARTS || !bytes) return 0;
     if (sx < 1 || sy < 1 || sz < 1 || sx > 128 || sy > 128 || sz > 128 || n < sx * sy * sz) return 0;
     struct FigShape *sh = &fg.shape[rig * SV_FIG_PARTS + part];
-    uint32_t words = (uint32_t)((sx * sy * sz + 3) / 4), first = 0;
-    if (!sa_alloc(&g_bbytes, words, &first)) { g.refused++; return 0; }
+    uint32_t words = 0, first = 0;
+    if (!put_shape((const uint8_t *)bytes, sx, sy, sz, &first, &words)) { g.refused++; return 0; }
     if (sh->shaped) sa_release(&g_bbytes, (SaRange){ sh->first, sh->nwords }, g.frame_no);
-    memset(g.bbytes_map + first, 0, (size_t)words * 4);
-    memcpy(g.bbytes_map + first, bytes, (size_t)(sx * sy * sz));
     sh->first = first; sh->nwords = words; sh->dims[0] = (int32_t)sx; sh->dims[1] = (int32_t)sy; sh->dims[2] = (int32_t)sz;
     sh->shaped = 1;
     fg.glow[rig * SV_FIG_PARTS + part] = -1.0f;
@@ -2251,7 +2276,7 @@ int64_t sv_open(int64_t w, int64_t h, int64_t capture_mouse, int64_t quad_capaci
         VKOK(vkCreateFence(g.dev, &fi, NULL, &g.frames[f].fence), "fence");
     }
     if (g.have_ts) {
-        VkQueryPoolCreateInfo qi = { .sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, .queryType = VK_QUERY_TYPE_TIMESTAMP, .queryCount = 4 * SV_FRAMES };
+        VkQueryPoolCreateInfo qi = { .sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, .queryType = VK_QUERY_TYPE_TIMESTAMP, .queryCount = 8 * SV_FRAMES };
         if (vkCreateQueryPool(g.dev, &qi, NULL, &g.qpool) != VK_SUCCESS) g.have_ts = 0;
     }
     g.stat[3] = -1.0;
@@ -2412,6 +2437,7 @@ double sv_stat(int64_t which) {
     if (which == 19) return (double)fg.traced_over;
     if (which == 20) return fg.cpu_worst;
     if (which == 21) return fg.shadow_worst;
+    if (which >= 26 && which <= 29) return g.pass_ms[which - 26];
     if (which == 25) return g.spray_births ? (double)g.ring.overwritten : 0.0;
     return (which >= 0 && which < 6) ? g.stat[which] : -1.0;
 }
@@ -2579,11 +2605,9 @@ int64_t sv_chunk_begin(int64_t slot, double ox, double oy, double oz, int64_t le
 int64_t sv_body_shape(int64_t handle, void *bytes, int64_t n, int64_t sx, int64_t sy, int64_t sz) {
     if (!g.ok || !g.bodies || handle < 0 || handle >= SV_MAX_BODIES || sx < 1 || sy < 1 || sz < 1 || n < sx * sy * sz) return 0;
     BodyRec *b = &g.bodies[handle];
-    uint32_t words = (uint32_t)((sx * sy * sz + 3) / 4), first = 0;
-    if (!sa_alloc(&g_bbytes, words, &first)) { g.refused++; return 0; }
+    uint32_t words = 0, first = 0;
+    if (!put_shape((const uint8_t *)bytes, sx, sy, sz, &first, &words)) { g.refused++; return 0; }
     if (b->shaped) sa_release(&g_bbytes, (SaRange){ b->first, b->nwords }, g.frame_no);
-    memset(g.bbytes_map + first, 0, (size_t)words * 4);
-    memcpy(g.bbytes_map + first, bytes, (size_t)(sx * sy * sz));
     b->first = first; b->nwords = words; b->dims[0] = (int32_t)sx; b->dims[1] = (int32_t)sy; b->dims[2] = (int32_t)sz;
     b->shaped = 1;
     return 1;
@@ -3064,7 +3088,7 @@ int64_t sv_frame(void) {
     if (!g.ok) return 0;
     if (g.resized || !g.swap_ok) { g.resized = 0; if (!rebuild_swapchain()) return 0; }
     Frame *F = &g.frames[g.frame_no % SV_FRAMES];
-    uint32_t q0 = (uint32_t)(g.frame_no % SV_FRAMES) * 4;
+    uint32_t q0 = (uint32_t)(g.frame_no % SV_FRAMES) * 8;
     double t_start = glfwGetTime();
     /* this Frame was last used two frames ago; when its fence is signalled,
      * everything released up to then is idle */
@@ -3089,8 +3113,17 @@ int64_t sv_frame(void) {
     F->stats_valid = 1;
     if (g.have_ts && F->ts_written) {
         uint64_t ts[2] = { 0, 0 };
-        if (vkGetQueryPoolResults(g.dev, g.qpool, q0, 2, sizeof ts, ts, sizeof ts[0], VK_QUERY_RESULT_64_BIT) == VK_SUCCESS)
+        if (vkGetQueryPoolResults(g.dev, g.qpool, q0, 2, sizeof ts, ts, sizeof ts[0], VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) {
             g.stat[3] = (double)(ts[1] - ts[0]) * (double)g.ts_period / 1.0e6;
+            uint64_t tp[3];
+            if (vkGetQueryPoolResults(g.dev, g.qpool, q0 + 4, 3, sizeof tp, tp, sizeof tp[0], VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) {
+                double ms = (double)g.ts_period / 1.0e6;
+                g.pass_ms[0] = (double)(tp[0] - ts[0]) * ms;   /* uploads and the cull */
+                g.pass_ms[1] = (double)(tp[1] - tp[0]) * ms;   /* geometry, figures included */
+                g.pass_ms[2] = (double)(tp[2] - tp[1]) * ms;   /* figure shadow map and the light pass */
+                g.pass_ms[3] = (double)(ts[1] - tp[2]) * ms;   /* water, composite, translucent, particles, interface */
+            }
+        }
         fg.shadow_ms = 0.0;
         if (F->fsm_ts && vkGetQueryPoolResults(g.dev, g.qpool, q0 + 2, 2, sizeof ts, ts, sizeof ts[0], VK_QUERY_RESULT_64_BIT) == VK_SUCCESS)
             fg.shadow_ms = (double)(ts[1] - ts[0]) * (double)g.ts_period / 1.0e6;
@@ -3114,7 +3147,7 @@ int64_t sv_frame(void) {
     VkCommandBufferBeginInfo bi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
     vkBeginCommandBuffer(F->cmd, &bi);
     fig_shadow_first(F);
-    if (g.have_ts) { vkCmdResetQueryPool(F->cmd, g.qpool, q0, 4); vkCmdWriteTimestamp(F->cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, g.qpool, q0); }
+    if (g.have_ts) { vkCmdResetQueryPool(F->cmd, g.qpool, q0, 8); vkCmdWriteTimestamp(F->cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, g.qpool, q0); }
     /* cull: one compute invocation per slot writes the indirect commands */
     int32_t *misc = (int32_t *)(g.ubo_map + 32);
     misc[0] = (int32_t)g.hi_slot; misc[1] = SV_CMD_STRIDE; misc[2] = (int32_t)g.layers; misc[3] = (int32_t)g.nblocks;
@@ -3123,20 +3156,44 @@ int64_t sv_frame(void) {
     memcpy(g.prev_vp, g.ubo_map, sizeof g.prev_vp);
     g.ubo_map[UBO_LIGHT + 0] = (float)g.light_mode; g.ubo_map[UBO_LIGHT + 1] = (float)g.time_s;
     g.ubo_map[UBO_LIGHT + 2] = (float)(g.frame_no & 0xFFFFFF);
-    g.ubo_map[UBO_LIGHT + 3] = (float)g.sky_rays; g.ubo_map[UBO_SUN_COLOR + 3] = (float)g.reflections;
+    /* STRATA_SKY_FULL=1: the sky light sampled on the schedule of before the fast paths (every new pixel each frame, a settled one in four),
+     * sent as a negative ray count; the stored pictures (scripts/golden.sh) are taken this way, so they compare at frame 60 as they did */
+    { static int full = -1; if (full < 0) full = getenv("STRATA_SKY_FULL") && getenv("STRATA_SKY_FULL")[0] == '1';
+      g.ubo_map[UBO_LIGHT + 3] = full ? -(float)g.sky_rays : (float)g.sky_rays; }
+    g.ubo_map[UBO_SUN_COLOR + 3] = (float)g.reflections;
     { int32_t *vol = (int32_t *)(g.ubo_map + UBO_VOL); vol[0] = g.vn; vol[1] = g.vnv; vol[2] = g.vn;
       /* how many past samples a pixel may lean on: none while the remembered
        * images are fresh, 2 just after the sun moved, else 255 (sun visibility
        * leans on 64 of them at most). An edit that reaches the volume this
        * frame caps only the pixels near it: its bounds go to the shader. */
-      for (uint32_t i = 0; i < g.nlq && i < SV_LIGHT_PER_FRAME; i++) if (g.lq[i].edit) {
-          const int32_t *ch = g.lq[i].chunk;
-          for (int k = 0; k < 3; k++) {
-              if (g.light_edit == 0 || ch[k] < g.edit_lo[k]) g.edit_lo[k] = ch[k];
-              if (g.light_edit == 0 || ch[k] > g.edit_hi[k]) g.edit_hi[k] = ch[k];
-          }
-          g.light_edit = 2;
-      }
+      /* the box is this frame's edits and the last frame's, not every edit since the
+       * box was last empty: with edits every frame (fire, freezing, flowing water) a
+       * box kept growing came to cover the whole field, and every pixel in it kept
+       * sampling afresh with a memory of 2, so shadows stayed grainy (13 November) */
+      { int32_t lo[3], hi[3]; int any = 0;
+        for (uint32_t i = 0; i < g.nlq && i < SV_LIGHT_PER_FRAME; i++) if (g.lq[i].edit) {
+            const int32_t *ch = g.lq[i].chunk;
+            for (int k = 0; k < 3; k++) {
+                if (!any || ch[k] < lo[k]) lo[k] = ch[k];
+                if (!any || ch[k] > hi[k]) hi[k] = ch[k];
+            }
+            any = 1;
+        }
+        if (any) {
+            for (int k = 0; k < 3; k++) {
+                g.edit_lo[k] = g.last_edit ? (lo[k] < g.last_lo[k] ? lo[k] : g.last_lo[k]) : lo[k];
+                g.edit_hi[k] = g.last_edit ? (hi[k] > g.last_hi[k] ? hi[k] : g.last_hi[k]) : hi[k];
+                g.last_lo[k] = lo[k]; g.last_hi[k] = hi[k];
+            }
+            g.light_edit = 2;
+        }
+        g.last_edit = any;
+        if (getenv("STRATA_LIGHTLOG")) {
+            static int frames, edited, relaxed; static int64_t vol_sum;
+            frames++; if (g.light_edit > 0) { edited++; vol_sum += (int64_t)(g.edit_hi[0] - g.edit_lo[0] + 1) * (g.edit_hi[1] - g.edit_lo[1] + 1) * (g.edit_hi[2] - g.edit_lo[2] + 1); }
+            if (g.light_relax > 0 || g.hist_reset > 0) relaxed++;
+            if (frames == 240) { fprintf(stderr, "light: of 240 frames %d had an edit box (mean %.1f chunks), %d a relaxed or reset memory\n", edited, edited ? (double)vol_sum / edited : 0.0, relaxed); frames = edited = relaxed = 0; vol_sum = 0; }
+        } }
       /* a sun that has moved more than a fraction of a degree since the memory was gathered: lean on it less */
       float sd = g.ubo_map[16] * g.sun_seen[0] + g.ubo_map[17] * g.sun_seen[1] + g.ubo_map[18] * g.sun_seen[2];
       if (sd < 0.99999f) { g.light_relax = 2; memcpy(g.sun_seen, g.ubo_map + 16, sizeof g.sun_seen); }
@@ -3187,6 +3244,8 @@ int64_t sv_frame(void) {
     VkViewport vpt = { 0, 0, (float)g.extent.width, (float)g.extent.height, 0.0f, 1.0f };
     VkRect2D sc = { { 0, 0 }, g.extent };
     VkDeviceSize zero = 0;
+    /* per-pass timestamps: 4 after the cull, 5 after the geometry, 6 after the light pass (1 is the frame's end) */
+    if (g.have_ts) vkCmdWriteTimestamp(F->cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, g.qpool, q0 + 4);
 
     /* 1. geometry: the solid ranges write colour, normal, material and depth.
      * One multi-draw-indirect call per range; the push constant tells the
@@ -3214,6 +3273,7 @@ int64_t sv_frame(void) {
     }
     draws += fig_record(F);
     vkCmdEndRenderPass(F->cmd);
+    if (g.have_ts) vkCmdWriteTimestamp(F->cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, g.qpool, q0 + 5);
     /* 1b. the plain figures' sun shadow map, when any is in reach */
     draws += fig_shadow_record(F, q0);
 
@@ -3225,6 +3285,7 @@ int64_t sv_frame(void) {
     vkCmdBindPipeline(F->cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g.pipe_light);
     vkCmdDraw(F->cmd, 3, 1, 0, 0);
     vkCmdEndRenderPass(F->cmd);
+    if (g.have_ts) vkCmdWriteTimestamp(F->cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, g.qpool, q0 + 6);
 
     /* the water's memory: this frame's depth image is cleared (nothing
      * remembered yet); last frame's writes are made visible to this frame's reads */
