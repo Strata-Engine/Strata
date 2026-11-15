@@ -40,17 +40,23 @@
 -- and named in a `PopNamed`. The ten built-in ground fields are declared
 -- before the file's sections under their slot names (`ground_fields`).
 --
--- Errors are errors, never warnings: `read` answers `Err("line N: ...")`
--- for the first mistake, found in this order: syntax in file order (a
--- header without `]`, kind or name; an unknown section kind; a setting
--- before any header; a word that is not `name = value`; a setting with no
--- value or given twice in one section); then each section in file order
--- (no kind or an unknown one, an unknown setting, a missing required
--- setting — on the header's line — a setting given more values than it
--- takes, a malformed number, a template or site list the game did not
--- name); then `Strata.Population.freeze`, whose message comes back on the
--- header line of the section it names. Meaning is freeze's: `read` checks
--- no range, reference among declarations or cycle itself.
+-- Errors are errors, never warnings. `read_into` answers `Err("line N: ...")`
+-- for the first mistake in file order (the lowest line): syntax (a header
+-- without `]`, kind or name; an unknown section kind; a setting before any
+-- header; a word that is not `name = value`; a setting with no value or
+-- given twice in one section) and each section's own mistakes (no kind or
+-- an unknown one, an unknown setting, a missing required setting — on the
+-- header's line — a setting given more values than it takes, a malformed
+-- number, a template or site list the game did not name). A section holding
+-- a syntax mistake reports that mistake only. Echoed text is cut to 40 bytes.
+-- A leading UTF-8 byte order mark is skipped.
+--
+-- `read` is `read_into` of `ground_fields` then `Strata.Population.freeze`;
+-- freeze's message comes back through `locate`, on the line of the section
+-- it is about (Strata.Population.freeze_subject). Meaning is freeze's: the
+-- reader checks no range, reference among declarations or cycle itself. A
+-- game mixing its own declarations with a file calls `read_into` on its Pop,
+-- freezes, and passes the message through `locate`.
 mod Strata.PopulationFile do
 
   -- what a file cannot hold: template lists and site lists the game made, by name."
@@ -82,14 +88,21 @@ mod Strata.PopulationFile do
       Err(e) -> Err(e)
     end
   end
-  -- every word through f, or the first Err
-  pfn all_ok(xs : List(String), f : String -> Result(a, String)) : Result(List(a), String) do
+  -- every word through f, or the first Err; a loop (tail calls only), so a value of many thousand words reads
+  pfn all_ok(xs : List(String), f : String -> Result(a, String)) : Result(List(a), String) do all_go(xs, f, Nil) end
+  pfn all_go(xs : List(String), f : String -> Result(a, String), acc : List(a)) : Result(List(a), String) do
     match xs do
-      Nil -> Ok(Nil)
-      Cons(x, rest) -> and_then(f(x), fn v -> and_then(all_ok(rest, f), fn vs -> Ok(Cons(v, vs))))
+      Nil -> Ok(List.reverse(acc))
+      Cons(x, rest) ->
+        match f(x) do
+          Ok(v) -> all_go(rest, f, Cons(v, acc))
+          Err(e) -> Err(e)
+        end
     end
   end
-  pfn q(s : String) : String do "'" ++ s ++ "'" end
+  -- text echoed from the file, cut to 40 bytes and an ellipsis
+  pfn short(s : String) : String do if String.byte_size(s) > 40 do String.slice_bytes(s, 0, 40) ++ "..." else s end end
+  pfn q(s : String) : String do "'" ++ short(s) ++ "'" end
   pfn member(xs : List(String), s : String) : Bool do List.any(xs, fn x -> x == s) end
   pfn drop_bytes(s : String, k : Int) : String do String.slice_bytes(s, k, String.byte_size(s) - k) end
 
@@ -245,16 +258,16 @@ mod Strata.PopulationFile do
   -- a header line (it starts with "["): the new section, and the text after "]"
   pfn header(b : String, n : Int) : Result((PopFileSection, String), String) do
     match String.split_first(drop_bytes(b, 1), "]") do
-      None -> bad(n, "a section header without its closing ]: " ++ b)
+      None -> bad(n, "a section header without its closing ]: " ++ short(b))
       Some((h, tail)) ->
         match words(h) do
-          Nil -> bad(n, "a section header with no kind: " ++ b)
+          Nil -> bad(n, "a section header with no kind: " ++ short(b))
           Cons(k, names) ->
             let want = names_count(k)
             let got = List.length(names)
             if want == 0 do bad(n, "unknown section kind " ++ q(k) ++ "; it must be field, zone, shapes, weights or layer")
-            else if got == 0 do bad(n, "section header " ++ b ++ " has no name")
-            else if got != want do bad(n, "section header " ++ b ++ " takes " ++ (if want == 1 do "one name" else "two names: a shape set and a zone" end))
+            else if got == 0 do bad(n, "section header " ++ short(b) ++ " has no name")
+            else if got != want do bad(n, "section header " ++ short(b) ++ " takes " ++ (if want == 1 do "one name" else "two names: a shape set and a zone" end))
             else
               match List.find(names, fn x -> !name_ok(x)) do
                 Some(x) -> bad(n, q(x) ++ " is not a name: a name holds letters, digits, _, - and .")
@@ -271,19 +284,33 @@ mod Strata.PopulationFile do
       None -> done
     end
   end
-  -- the sections of the lines from line n on, in file order
-  pfn scan(ls : List(String), n : Int, cur : Option(PopFileSection), done : List(PopFileSection)) : Result(List(PopFileSection), String) do
+  -- the sections of the lines from line n on, in file order, and the first
+  -- syntax mistake: at a mistake the scan stops, dropping the section it is
+  -- in (whose other mistakes may follow from it) and keeping those before;
+  -- a loop with tail calls only, so a file of many thousand lines reads
+  pfn scan(ls : List(String), n : Int, cur : Option(PopFileSection), done : List(PopFileSection)) : (List(PopFileSection), Option(String)) do
     match ls do
-      Nil -> Ok(List.reverse(close(cur, done)))
+      Nil -> (List.reverse(close(cur, done)), None)
       Cons(l, rest) ->
         let b = bare(l)
         if String.is_empty(b) do scan(rest, n + 1, cur, done)
         else if String.starts_with(b, "[") do
-          and_then(header(b, n), fn ht -> match ht do (sec, tail) -> and_then(add_settings(sec, tail, n), fn s2 -> scan(rest, n + 1, Some(s2), close(cur, done))) end)
+          match header(b, n) do
+            Err(e) -> (List.reverse(close(cur, done)), Some(e))
+            Ok((sec, tail)) ->
+              match add_settings(sec, tail, n) do
+                Err(e) -> (List.reverse(close(cur, done)), Some(e))
+                Ok(s2) -> scan(rest, n + 1, Some(s2), close(cur, done))
+              end
+          end
         else
           match cur do
-            None -> bad(n, "a setting before any section header: " ++ b)
-            Some(sec) -> and_then(add_settings(sec, b, n), fn s2 -> scan(rest, n + 1, Some(s2), done))
+            None -> (Nil, Some(at_line(n, "a setting before any section header: " ++ short(b))))
+            Some(sec) ->
+              match add_settings(sec, b, n) do
+                Err(e) -> (List.reverse(done), Some(e))
+                Ok(s2) -> scan(rest, n + 1, Some(s2), done)
+              end
           end
         end end
     end
@@ -485,62 +512,65 @@ mod Strata.PopulationFile do
       Cons(sec, rest) ->
         let k = sec.pfs_kind
         let r = if k == "field" do build_field(p, sec) else if k == "zone" do build_zone(p, sec, nm) else if k == "shapes" do build_shapes(p, sec, nm) else if k == "weights" do build_weights(p, sec) else build_layer(p, sec, nm) end end end end
-        and_then(r, fn p2 -> build_go(p2, rest, nm))
-    end
-  end
-
-  -- ── freeze's message, back on its section's line ──────────────────────
-
-  -- (prefix after "population: ", section kind, how: 0 the first section of one name, 1 the last, 2 the first of a shape set and zone pair, 3 the last such pair, 4 a cycle's first name)
-  pfn blame_rules() : List((String, String, Int)) do
-    [("two fields named '", "field", 1), ("two zones named '", "zone", 1), ("two shape sets named '", "shapes", 1), ("two layers named '", "layer", 1), ("two weights of '", "weights", 3),
-     ("seen_to of layer '", "layer", 0), ("ranks of shape set '", "shapes", 0), ("weights of '", "weights", 2),
-     ("field '", "field", 0), ("zone '", "zone", 0), ("shape set '", "shapes", 0), ("layer '", "layer", 0),
-     ("fields read each other in a cycle: ", "field", 4), ("zones are made of each other in a cycle: ", "zone", 4), ("layers read each other's cover in a cycle: ", "layer", 4)]
-  end
-  pfn upto_quote(s : String) : String do
-    match String.split_first(s, "'") do
-      Some((a, _)) -> a
-      None -> s
-    end
-  end
-  -- the names a message names after its prefix
-  pfn blamed_names(rest : String, how : Int) : List(String) do
-    if how == 4 do
-      match words(String.replace_all(rest, ",", " ")) do
-        Cons(w, _) -> Cons(w, Nil)
-        Nil -> Nil
-      end
-    else if how >= 2 do
-      match String.split_first(rest, "' in '") do
-        Some((s, more)) -> [s, upto_quote(more)]
-        None -> Nil
-      end
-    else Cons(upto_quote(rest), Nil) end end
-  end
-  pfn same_names(a : List(String), b : List(String)) : Bool do string_join(a, "\n") == string_join(b, "\n") end
-  pfn blame(m : String, secs : List(PopFileSection)) : String do
-    let body = if String.starts_with(m, "population: ") do drop_bytes(m, 12) else m end
-    match List.find(blame_rules(), fn r -> match r do (pre, _, _) -> String.starts_with(body, pre) end) do
-      None -> m
-      Some((pre, kind, how)) ->
-        let names = blamed_names(drop_bytes(body, String.byte_size(pre)), how)
-        let hits = List.filter(secs, fn s -> if s.pfs_kind == kind do same_names(s.pfs_names, names) else false end)
-        let pick = if how == 1 do List.reverse(hits) else if how == 3 do List.reverse(hits) else hits end end
-        match pick do
-          Cons(s, _) -> at_line(s.pfs_line, m)
-          Nil -> m
+        match r do
+          Ok(p2) -> build_go(p2, rest, nm)
+          Err(e) -> Err(e)
         end
     end
   end
 
-  doc "The population declared in text, its template and site lists taken from n by name: the ten built-in ground fields (ground_fields), then each section in file order through the Strata.Population builders. Err(\"line N: ...\") for the first mistake: syntax, an unknown section kind, kind or setting, a missing required setting, a malformed number, a template or site list n lacks; and what Strata.Population.freeze refuses, its message on the header line of the section it names (or without a line, should it name none). The Pop answered freezes."
+  -- ── Reading, and freeze's message back on its section's line ─────────
+
+  -- the text without a leading UTF-8 byte order mark
+  pfn no_bom(text : String) : String do if String.starts_with(text, "\xEF\xBB\xBF") do drop_bytes(text, 3) else text end end
+  pfn sections_of(text : String) : (List(PopFileSection), Option(String)) do scan(String.split(no_bom(text), "\n"), 1, None, Nil) end
+
+  doc "p with the declarations of the text added, its template and site lists taken from n by name; no ground fields are added and nothing is frozen, so the file may name what the game declared in p (or will declare after). Err(\"line N: ...\") for the first mistake in file order: syntax, an unknown section kind, kind or setting, a missing required setting, a malformed number, a template or site list n lacks. A game that freezes the result itself passes freeze's message through locate to get the file's line."
+  fn read_into(p : Strata.Population.Pop, text : String, n : PopNamed) : Result(Strata.Population.Pop, String) do
+    let (secs, syntax) = sections_of(text)
+    match build_go(p, secs, n) do
+      Err(e) -> Err(e)
+      Ok(p2) ->
+        match syntax do
+          Some(e) -> Err(e)
+          None -> Ok(p2)
+        end
+    end
+  end
+
+  pfn same_names(a : List(String), b : List(String)) : Bool do
+    match a do
+      Nil -> List.is_empty(b)
+      Cons(x, xs) ->
+        match b do
+          Cons(y, ys) -> if x == y do same_names(xs, ys) else false end
+          Nil -> false
+        end
+    end
+  end
+  doc "A message of Strata.Population.freeze (or fit_all) about a population holding the declarations of text, with the line of the section it is about put first (\"line N: ...\"): the last section of that kind and name (the later of two that share a name); the message unchanged when the text has no such section (the declaration came from the game) or the message has no subject (Strata.Population.freeze_subject)."
+  fn locate(text : String, freeze_err : String) : String do
+    match Strata.Population.freeze_subject(freeze_err) do
+      None -> freeze_err
+      Some((kind, names)) ->
+        let (secs, _) = sections_of(text)
+        let hits = List.filter(secs, fn s -> if s.pfs_kind == kind do same_names(s.pfs_names, names) else false end)
+        match List.reverse(hits) do
+          Cons(s, _) -> at_line(s.pfs_line, freeze_err)
+          Nil -> freeze_err
+        end
+    end
+  end
+
+  doc "The population declared in text, its template and site lists taken from n by name: read_into of the ten built-in ground fields (ground_fields), then Strata.Population.freeze, whose message comes back through locate, on the line of the section it is about. The Pop answered freezes."
   fn read(text : String, n : PopNamed) : Result(Strata.Population.Pop, String) do
-    and_then(scan(String.split(text, "\n"), 1, None, Nil), fn secs ->
-      and_then(build_go(ground_fields(Strata.Population.new()), secs, n), fn p ->
+    match read_into(ground_fields(Strata.Population.new()), text, n) do
+      Err(e) -> Err(e)
+      Ok(p) ->
         match Strata.Population.freeze(p) do
           Ok(_) -> Ok(p)
-          Err(m) -> Err(blame(m, secs))
-        end))
+          Err(m) -> Err(locate(text, m))
+        end
+    end
   end
 end

@@ -331,5 +331,109 @@ mod Strata.Test.PopulationFile do
       fails_at(lines(List.append(base, ["[layer l] kind = cover shapes = s base = 1 salt = 1 seen_to = 2"])), 3, "seen_to", "seen_to above 0 for a cover layer")
       fails_at(lines(List.append(base, ["[field a] kind = curve of = b curve = 0:0", "[field b] kind = curve of = a curve = 0:0"])), 3, "cycle", "curve fields in a cycle")
     end
+
+    -- ── fix round 1 ──────────────────────────────────────────────────────
+
+    test "a list of 50000 values reads; one ending in x is an Err on its line" do
+      let ids = string_join(List.map(List.range(0, 50000), fn i -> int_to_string(1 + i % 60000)), " ")
+      let f = frozen_of(read_ok("# blocks\n[shapes a] kind = blocks ids = " ++ ids))
+      Test.assert_eq_int(Pn.shape_set_variants(f, 0), 50000, "50000 variants")
+      fails_at("# blocks\n[shapes a] kind = blocks ids = " ++ ids ++ " x", 2, "integer", "50000 values and an x")
+      let pts = string_join(List.map(List.range(0, 50000), fn i -> int_to_string(i) ++ ":0.5"), " ")
+      let g = frozen_of(read_ok("[field c] kind = curve of = wetness curve = " ++ pts))
+      Test.assert_eq_int(List.length(Pn.curve_points(Pn.field_source_curve(g, 10))), 50000, "a curve of 50000 points")
+    end
+
+    test "a file of 30000 lines reads" do
+      let filler = string_join(List.map(List.range(0, 15000), fn _ -> "# a comment\n"), "")
+      let f = frozen_of(read_ok(filler ++ "[shapes a]\n" ++ filler ++ "kind = blocks ids = 3"))
+      Test.assert_eq_int(Pn.shape_set_count(f), 1, "the one shape set")
+      fails_at(filler ++ "[shapes a]\n" ++ filler ++ "kind = blocks ids = y", 30002, "y", "an error on line 30002")
+    end
+
+    test "read_into adds the file to a game's own declarations, which the file may name; locate finds freeze's line" do
+      let game = Pn.zone_regions(Pn.field_ground(Pn.new(), "wet", 6), "meadow", [1])
+      let text = lines(["[shapes s] kind = blocks ids = 4", "", "[layer l] kind = cover shapes = s base = 0.5 inside = meadow salt = 3 by = wet:0:0,1:1"])
+      let p = match Pfl.read_into(game, text, named()) do
+        Ok(v) -> v
+        Err(m) -> panic("expected read_into to read: " ++ m)
+      end
+      let f = frozen_of(p)
+      Test.assert_eq_str(names_str(Pn.layer_names(f)), "l", "the file's layer")
+      Test.assert_eq_str(names_str(Pn.zone_names(f)), "meadow", "the game's zone, and no built-ins added")
+      Test.assert_eq_str(names_str(Pn.field_names(f)), "wet", "no ground fields added by read_into")
+      Test.assert_true(string_contains(err_of(lines(["[shapes s] kind = blocks ids = 4", "[layer l] kind = cover shapes = s base = 0.5 inside = meadow salt = 3"])), "meadow"), "read alone refuses the zone the file does not declare")
+      -- a mixed population the game freezes itself: locate puts the file's line on freeze's message
+      let bad_text = lines(["[shapes s] kind = blocks ids = 4", "[layer l] kind = cover shapes = s base = 0.5 inside = pasture salt = 3"])
+      let q = match Pfl.read_into(game, bad_text, named()) do
+        Ok(v) -> v
+        Err(m) -> panic("expected read_into to read: " ++ m)
+      end
+      let m = match Pn.freeze(q) do
+        Ok(_) -> ""
+        Err(e) -> e
+      end
+      Test.assert_true(String.starts_with(Pfl.locate(bad_text, m), "line 2: "), "locate: line 2 (got: " ++ Pfl.locate(bad_text, m) ++ ")")
+      -- a mistake in the game's own declarations has no line in the file
+      let m2 = match Pn.freeze(Pn.layer_cover(p, "g", "nothing", Pn.rule(1.0, Nil, Nil, Nil), 1)) do
+        Ok(_) -> ""
+        Err(e) -> e
+      end
+      Test.assert_true(m2 != "", "the game's layer is refused")
+      Test.assert_eq_str(Pfl.locate(text, m2), m2, "the game's mistake comes back unchanged")
+      Test.assert_eq_str(Pfl.locate(text, "not a freeze message"), "not a freeze message", "a message with no subject comes back unchanged")
+    end
+
+    test "the first mistake in file order wins over a later syntax mistake" do
+      fails_at(lines(["[shapes a] kind = blocks ids = x", "[shapes b] kind = blocks ids = 1", "stray"]), 1, "x", "a malformed number before a stray word")
+      fails_at(lines(["[shapes a] kind = blocks ids = 1", "[shapes b] kind = blocks", "stray"]), 3, "stray", "a section holding a syntax mistake reports that mistake, not its missing ids")
+      fails_at(lines(["[shapes a] kind = blocks", "[forest b]"]), 1, "ids", "a missing setting before an unknown section kind")
+    end
+
+    test "a leading byte order mark is skipped" do
+      let f = frozen_of(read_ok("\xEF\xBB\xBF[shapes a] kind = blocks ids = 3"))
+      Test.assert_eq_int(Pn.shape_set_count(f), 1, "the shape set reads")
+      fails_at("\xEF\xBB\xBF[shapes a] kind = blocks ids = 3\n\xEF\xBB\xBF[shapes b] kind = blocks ids = 4", 2, "expected name = value", "a mark later in the text is not skipped")
+    end
+
+    test "an echoed value is cut to 40 characters" do
+      let big = string_join(List.map(List.range(0, 400), fn i -> int_to_string(i % 10)), "")
+      let m = err_of("[shapes a] kind = blocks ids = " ++ big)
+      Test.assert_true(String.starts_with(m, "line 1: "), "line 1 (got " ++ m ++ ")")
+      Test.assert_true(string_contains(m, "'" ++ String.slice_bytes(big, 0, 40) ++ "...'"), "40 digits and an ellipsis")
+      Test.assert_true(String.byte_size(m) < 200, "the message stays short (" ++ int_to_string(String.byte_size(m)) ++ " bytes)")
+    end
+
+    test "a duplicate is put on the later section, for every kind" do
+      fails_at(lines(["[zone z] kind = regions ids = 1", "[zone z] kind = regions ids = 2"]), 2, "two zones", "zones")
+      fails_at(lines(["[field f] kind = ground slot = 1", "[field f] kind = ground slot = 2"]), 2, "two fields", "fields")
+      fails_at(lines(["[shapes a] kind = blocks ids = 1", "[shapes a] kind = blocks ids = 2"]), 2, "two shape sets", "shape sets")
+      fails_at(lines(["[shapes a] kind = blocks ids = 1 2", "[zone z] kind = regions ids = 1", "[weights a z] w = 1 1", "[weights a z] w = 1 2"]), 4, "two weights", "weights")
+    end
+
+    test "every family of freeze's messages comes back with its section's line" do
+      fails_at(lines(["[shapes a] kind = blocks ids = 1", "[field f] kind = noise noise = 9 octaves = 1 period = 1 salt = 0"]), 2, "noise kind", "a field")
+      fails_at(lines(["[zone b] kind = band field = nope lo = 0 hi = 1"]), 1, "nope", "a zone")
+      fails_at(lines(["[shapes a] kind = blocks ids = 0"]), 1, "block id", "a shape set")
+      fails_at(lines(["[shapes a] kind = blocks ids = 1", "[zone a] kind = not of = b", "[zone b] kind = not of = a"]), 2, "cycle", "zones in a cycle")
+      fails_at(lines(["[shapes a] kind = blocks ids = 1 2", "[zone z] kind = regions ids = 1", "[weights a z] w = 1 1 1"]), 3, "weights", "weights")
+      fails_at(lines(["[weights a z] w = 1"]), 1, "undeclared shape set", "weights of an undeclared shape set")
+      fails_at(lines(["[shapes a] kind = blocks ids = 1", "[layer l] kind = cover shapes = a base = -1 salt = 1"]), 2, "base", "a layer")
+      fails_at(lines(["[shapes t] kind = templates from = broadleaf", "[shapes a] kind = blocks ids = 1", "[layer l] kind = scatter shapes = t base = 1 cell = 4 jitter = 0 salt = 1 seen_to = 17"]), 3, "seen_to", "seen_to")
+      fails_at(lines(["[shapes t] kind = templates from = broadleaf ranks = -1"]), 1, "rank", "ranks")
+      -- a reads b's cover, b and c each other's: the loop repeats at b, not at a, the first layer waiting
+      fails_at(lines(["[shapes s] kind = blocks ids = 1", "[field cb] kind = cover layer = b radius = 2", "[field cc] kind = cover layer = c radius = 2",
+                      "[layer a] kind = cover shapes = s base = 1 by = cb:0:0,1:1 salt = 1", "[layer b] kind = cover shapes = s base = 1 by = cc:0:0,1:1 salt = 2",
+                      "[layer c] kind = cover shapes = s base = 1 by = cb:0:0,1:1 salt = 3"]), 5, "cycle", "a layer cycle, on the layer where it repeats")
+    end
+
+    test "a template list named twice in PopNamed: the first is used" do
+      let t1 = solid(1, 1, 1, 3)
+      let nm = Pfl.named([("a", [t1]), ("a", [t1, solid(1, 2, 1, 4)])], Nil)
+      match Pfl.read("[shapes s] kind = templates from = a", nm) do
+        Ok(p) -> Test.assert_eq_int(Pn.shape_set_variants(frozen_of(p), 0), 1, "one variant")
+        Err(m) -> Test.fail("expected the file to read: " ++ m)
+      end
+    end
   end
 end
