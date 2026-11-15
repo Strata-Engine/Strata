@@ -95,6 +95,21 @@ mod Strata.Test.PopulationFile do
       Cons(x, rest) -> if i == 0 do x else nth_or(rest, i - 1) end
     end
   end
+  pfn read_into_ok(p : Strata.Population.Pop, text : String) : Strata.Population.Pop do
+    match Pfl.read_into(p, text, named()) do
+      Ok(v) -> v
+      Err(m) -> panic("expected read_into to read: " ++ m)
+    end
+  end
+  pfn freeze_err(p : Strata.Population.Pop) : String do
+    match Pn.freeze(p) do
+      Ok(_) -> ""
+      Err(m) -> m
+    end
+  end
+  pfn ranks_of(xs : List(Int)) : NativeIntArr do
+    List.fold_left(List.range(0, List.length(xs)), NativeArray.make_int(List.length(xs), 0), fn (a, i) -> NativeArray.set_int(a, i, nth_or(xs, i)))
+  end
   pfn names_str(xs : List(String)) : String do string_join(xs, ",") end
   pfn ints_str(xs : List(Int)) : String do string_join(List.map(xs, int_to_string), ",") end
   pfn lines(xs : List(String)) : String do string_join(xs, "\n") end
@@ -433,6 +448,65 @@ mod Strata.Test.PopulationFile do
       match Pfl.read("[shapes s] kind = templates from = a", nm) do
         Ok(p) -> Test.assert_eq_int(Pn.shape_set_variants(frozen_of(p), 0), 1, "one variant")
         Err(m) -> Test.fail("expected the file to read: " ++ m)
+      end
+    end
+
+    -- ── fix round 2 ──────────────────────────────────────────────────────
+
+    test "a duplicate weights, seen_to or ranks is reported before that family's own checks" do
+      fails_at(lines(["[shapes s] kind = blocks ids = 1 2", "[zone z] kind = regions ids = 1", "[weights s z] w = 1", "[weights s z] w = 1 1"]), 4, "two weights", "weights: the duplicate, on the later section")
+      let base = lines(["[shapes t] kind = templates from = broadleaf", "[layer l] kind = scatter shapes = t base = 1 cell = 4 jitter = 0 salt = 1", "seen_to = 17", "[shapes u] kind = templates from = broadleaf", "ranks = -1"])
+      -- the game sets them too: a second seen_to for l and a second ranks for u
+      let p = read_into_ok(Pfl.ground_fields(Pn.new()), base)
+      let m1 = freeze_err(Pn.seen_to(p, "l", 1))
+      Test.assert_true(string_contains(m1, "two seen_to"), "seen_to: the duplicate first (got " ++ m1 ++ ")")
+      Test.assert_true(String.starts_with(Pfl.locate(base, m1), "line 3: "), "on the file's seen_to line (got " ++ Pfl.locate(base, m1) ++ ")")
+      let base2 = lines(["[shapes u] kind = templates from = broadleaf", "ranks = -1"])
+      let m2 = freeze_err(Pn.ranks(read_into_ok(Pn.new(), base2), "u", ranks_of([1])))
+      Test.assert_true(string_contains(m2, "two ranks"), "ranks: the duplicate first (got " ++ m2 ++ ")")
+      Test.assert_true(String.starts_with(Pfl.locate(base2, m2), "line 2: "), "on the file's ranks line (got " ++ Pfl.locate(base2, m2) ++ ")")
+    end
+
+    test "a game's seen_to or ranks mistake on a file's declaration comes back without a line; the file's own on its setting's line" do
+      let text = lines(["[shapes s] kind = blocks ids = 1", "[shapes t] kind = templates from = broadleaf", "[layer l] kind = scatter shapes = t base = 1 cell = 4 jitter = 0 salt = 1"])
+      let p = read_into_ok(Pfl.ground_fields(Pn.new()), text)
+      let m1 = freeze_err(Pn.ranks(p, "t", ranks_of([-1])))
+      Test.assert_eq_str(Pfl.locate(text, m1), m1, "the game's ranks: unchanged")
+      let m2 = freeze_err(Pn.seen_to(p, "l", 17))
+      Test.assert_eq_str(Pfl.locate(text, m2), m2, "the game's seen_to: unchanged")
+      fails_at(lines(["[shapes s] kind = blocks ids = 1", "[shapes t] kind = templates from = broadleaf", "", "ranks = -1"]), 4, "rank", "the file's ranks, on its line")
+      fails_at(lines(["[shapes t] kind = templates from = broadleaf", "[layer l] kind = scatter shapes = t base = 1 cell = 4 jitter = 0 salt = 1", "seen_to = 17"]), 3, "seen_to", "the file's seen_to, on its line")
+    end
+
+    test "an echo is cut at a character boundary" do
+      let v = string_join(List.map(List.range(0, 39), fn _ -> "a"), "") ++ "\xC3\xA9" ++ "zzzz"
+      let m = err_of("[shapes s] kind = blocks ids = " ++ v)
+      Test.assert_true(string_contains(m, "'" ++ String.slice_bytes(v, 0, 39) ++ "...'"), "39 letters, not half of the e-acute (got " ++ m ++ ")")
+      let w = string_join(List.map(List.range(0, 38), fn _ -> "a"), "") ++ "\xC3\xA9" ++ "zzzz"
+      Test.assert_true(string_contains(err_of("[shapes s] kind = blocks ids = " ++ w), "'" ++ String.slice_bytes(w, 0, 40) ++ "...'"), "a whole character at the cut is kept")
+    end
+
+    test "100000 ranks read" do
+      let rs = string_join(List.map(List.range(0, 100000), fn i -> int_to_string(i % 7)), " ")
+      let f = frozen_of(read_ok("[shapes t] kind = templates from = broadleaf ranks = " ++ rs))
+      Test.assert_eq_int(NativeArray.length_int(Pn.shape_set_ranks(f, 0)), 100000, "100000 ranks")
+      Test.assert_eq_int(NativeArray.get_int(Pn.shape_set_ranks(f, 0), 99999), 99999 % 7, "the last rank")
+    end
+
+    test "locate matches kind, every name, and fit_all's subjects" do
+      fails_at(lines(["[zone a] kind = band field = nope lo = 0 hi = 1", "[shapes a] kind = blocks ids = 1"]), 1, "nope", "a zone, not the shape set of its name")
+      fails_at(lines(["[shapes a] kind = blocks ids = 1 2", "[zone z] kind = regions ids = 1", "[zone y] kind = regions ids = 1", "[weights a z] w = 1 1 1", "[weights a y] w = 1 1"]), 4, "weights", "weights: both names")
+      fails_at(lines(["[shapes a] kind = blocks", "[shapes b] stray"]), 1, "ids", "a syntax mistake on a header line keeps the section before")
+      fails_at(lines(["[shapes t] kind = templates from = broadleaf", "[layer l] kind = scatter shapes = t base = 1 cell = 1000000 jitter = 0 salt = 1", "[field c] kind = cover layer = l radius = 1e-200"]), 3, "cell", "a cover field's normaliser")
+      let fit_text = "[shapes t] kind = templates from = broadleaf"
+      match Pn.fit_all(frozen_of(read_ok(fit_text)), 0.3) do
+        Ok(_) -> Test.fail("expected fit_all to refuse 0.3 m")
+        Err(m) -> Test.assert_true(String.starts_with(Pfl.locate(fit_text, m), "line 1: "), "fit_all's shape set (got " ++ Pfl.locate(fit_text, m) ++ ")")
+      end
+      let walk_text = lines(["[shapes t] kind = templates from = broadleaf", "[layer l] kind = scatter shapes = t base = 1 cell = 1 jitter = 0 salt = 1 seen_to = 8"])
+      match Pn.fit_all(frozen_of(read_ok(walk_text)), 1.0) do
+        Ok(_) -> Test.fail("expected fit_all to refuse the walk")
+        Err(m) -> Test.assert_true(String.starts_with(Pfl.locate(walk_text, m), "line 2: "), "fit_all's layer (got " ++ Pfl.locate(walk_text, m) ++ ")")
       end
     end
   end

@@ -101,7 +101,13 @@ mod Strata.PopulationFile do
     end
   end
   -- text echoed from the file, cut to 40 bytes and an ellipsis
-  pfn short(s : String) : String do if String.byte_size(s) > 40 do String.slice_bytes(s, 0, 40) ++ "..." else s end end
+  pfn short(s : String) : String do if String.byte_size(s) > 40 do String.slice_bytes(s, 0, cut_at(s, 40)) ++ "..." else s end end
+  -- i moved back past UTF-8 continuation bytes (0x80..0xBF), so a cut there splits no character
+  pfn cut_at(s : String, i : Int) : Int do if i > 0 do (if string_contains(continuation_bytes(), String.slice_bytes(s, i, 1)) do cut_at(s, i - 1) else i end) else i end end
+  pfn continuation_bytes() : String do
+    "\x80\x81\x82\x83\x84\x85\x86\x87\x88\x89\x8A\x8B\x8C\x8D\x8E\x8F\x90\x91\x92\x93\x94\x95\x96\x97\x98\x99\x9A\x9B\x9C\x9D\x9E\x9F" ++
+    "\xA0\xA1\xA2\xA3\xA4\xA5\xA6\xA7\xA8\xA9\xAA\xAB\xAC\xAD\xAE\xAF\xB0\xB1\xB2\xB3\xB4\xB5\xB6\xB7\xB8\xB9\xBA\xBB\xBC\xBD\xBE\xBF"
+  end
   pfn q(s : String) : String do "'" ++ short(s) ++ "'" end
   pfn member(xs : List(String), s : String) : Bool do List.any(xs, fn x -> x == s) end
   pfn drop_bytes(s : String, k : Int) : String do String.slice_bytes(s, k, String.byte_size(s) - k) end
@@ -405,14 +411,12 @@ mod Strata.PopulationFile do
       None -> Ok(())
     end
   end
-  pfn ranks_arr(xs : List(Int)) : NativeIntArr do
-    let n = List.length(xs)
-    List.fold_left(List.range(0, n), NativeArray.make_int(n, 0), fn (a, i) -> NativeArray.set_int(a, i, nth_int(xs, i)))
-  end
-  pfn nth_int(xs : List(Int), i : Int) : Int do
+  pfn ranks_arr(xs : List(Int)) : NativeIntArr do fill_go(NativeArray.make_int(List.length(xs), 0), xs, 0) end
+  -- a[i..] from the list, walked once
+  pfn fill_go(a : NativeIntArr, xs : List(Int), i : Int) : NativeIntArr do
     match xs do
-      Nil -> 0
-      Cons(x, rest) -> if i == 0 do x else nth_int(rest, i - 1) end
+      Nil -> a
+      Cons(x, rest) -> fill_go(NativeArray.set_int(a, i, x), rest, i + 1)
     end
   end
   pfn first_name(sec : PopFileSection) : String do
@@ -548,15 +552,18 @@ mod Strata.PopulationFile do
         end
     end
   end
-  doc "A message of Strata.Population.freeze (or fit_all) about a population holding the declarations of text, with the line of the section it is about put first (\"line N: ...\"): the last section of that kind and name (the later of two that share a name); the message unchanged when the text has no such section (the declaration came from the game) or the message has no subject (Strata.Population.freeze_subject)."
+  doc "A message of Strata.Population.freeze (or fit_all) about a population holding the declarations of text, with the line of the section it is about put first (\"line N: ...\"): the last section of that kind and name (the later of two that share a name), or for a seen_to or ranks mistake the line of that setting in the file; the message unchanged when the text has no such section or setting (the declaration came from the game) or the message has no subject (Strata.Population.freeze_subject)."
   fn locate(text : String, freeze_err : String) : String do
     match Strata.Population.freeze_subject(freeze_err) do
       None -> freeze_err
       Some((kind, names)) ->
         let (secs, _) = sections_of(text)
-        let hits = List.filter(secs, fn s -> if s.pfs_kind == kind do same_names(s.pfs_names, names) else false end)
+        -- a seen_to or ranks mistake is the file's only where its section sets it, and is put on that setting's line
+        let setting = if kind == "seen_to" do "seen_to" else if kind == "ranks" do "ranks" else "" end end
+        let skind = if kind == "seen_to" do "layer" else if kind == "ranks" do "shapes" else kind end end
+        let hits = List.filter(secs, fn s -> if s.pfs_kind == skind do (if same_names(s.pfs_names, names) do (if String.is_empty(setting) do true else Option.is_some(vals(s, setting)) end) else false end) else false end)
         match List.reverse(hits) do
-          Cons(s, _) -> at_line(s.pfs_line, freeze_err)
+          Cons(s, _) -> at_line(if String.is_empty(setting) do s.pfs_line else line_of(s, setting) end, freeze_err)
           Nil -> freeze_err
         end
     end
