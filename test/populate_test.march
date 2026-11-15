@@ -2445,5 +2445,63 @@ mod Strata.Test.Populate do
         float_to_string(sc) ++ ":" ++ string_join(List.map(misses, int_to_string), ","))
       Test.assert_eq_str(string_join(res, " "), "1.:0,0,0,0,0,0 0.5:0,0,0,0,0,0", "misses per field (alt, n, c, thick, mossy, near) over 324 columns")
     end
+
+    test "coarse covers: a cover field read only by a layer not placed at the level is not computed there, and the chunk is the same" do
+      -- shrubs (blocks, 0.25 m cells) and their cover within 6 m; trees (seen to 2) read nothing; pebbles (blocks, level 0 only) read the cover
+      let p0 = Pn.shapes_blocks(Pn.shapes_blocks(Pn.shapes_templates(Pn.new(), "s", [lv_tree(4)]), "b", [6]), "q", [9])
+      let p1 = Pn.field_cover(Pn.layer_scatter(p0, "shrubs", "b", Pn.rule(0.5, Nil, Nil, Nil), 0.25, 0.5, 8), "thick", "shrubs", 6.0)
+      let p2 = Pn.seen_to(Pn.layer_scatter(p1, "trees", "s", Pn.rule(1.0, Nil, Nil, Nil), 12.0, 0.5, 5), "trees", 2)
+      let without = frozen_of(p2)
+      let with_pebbles = frozen_of(Pn.layer_scatter(p2, "pebbles", "q", Pn.rule(0.5, [("thick", fj_lin())], Nil, Nil), 1.0, 0.5, 4))
+      let k = Strata.Coord.key_at(0, 0, 0, 2)
+      let pa = Pq.plan(without)
+      let pb = Pq.plan(with_pebbles)
+      let ga = lv_ground(k, Pq.plan_pad(pa, 4.0), 1.0, 2, 2)
+      let gb = lv_ground(k, Pq.plan_pad(pb, 4.0), 1.0, 2, 2)
+      let a = Pq.place_with(pa, 3, k, air(), ga, Pq.table_for(pa, ga))
+      Test.assert_true(hash_of(a) != hash_of(air()), "trees at level 2")
+      Test.assert_eq_int(hash_of(Pq.place_with(pb, 3, k, air(), gb, Pq.table_for(pb, gb))), hash_of(a), "pebbles' cover is not needed at level 2: the same chunk (its cost is bench mode 24's)")
+    end
+
+    test "table_for: refused at level 0 (the chunk unchanged, even for a site layer, which reads no Table), and place_problems says so" do
+      let f = frozen_of(Pn.layer_site(Pn.shapes_templates(Pn.new(), "huts", [lv_tree(4)]), "camp", "huts", [Pn.site(10.5, 12.5, 11.0, 2.0, 0)], 1.0, 6))
+      let pl = Pq.plan(f)
+      let k = Strata.Coord.key(0, 0, 0)
+      let g = lv_ground(k, 0, 1.0, 0, 11)
+      Test.assert_true(hash_of(Pq.place_with(pl, 3, k, air(), g, Pq.fields_with(pl, 3, g))) != hash_of(air()), "with fields_with the hut is placed")
+      Test.assert_eq_int(hash_of(Pq.place_with(pl, 3, k, air(), g, Pq.table_for(pl, g))), hash_of(air()), "with table_for the chunk comes back unchanged")
+      Test.assert_true(has_msg(Pq.place_problems(pl, k, g, Pq.table_for(pl, g)), "only for levels above 0"), "place_problems says why")
+      Test.assert_eq_int(List.length(Pq.place_problems(pl, k, g, Pq.fields_with(pl, 3, g))), 0, "and nothing with fields_with's")
+      let k1 = Strata.Coord.key_at(0, 0, 0, 1)
+      let g1 = lv_ground(k1, 0, 1.0, 1, 5)
+      Test.assert_eq_int(List.length(Pq.place_problems(pl, k1, g1, Pq.table_for(pl, g1))), 0, "above level 0 table_for is fine")
+    end
+
+    test "coarse covers: the cached cover values over their whole box equal fields_with on a larger level-0 Ground, at 1 m and 0.5 m, from a negative corner" do
+      let p0 = Pn.shapes_blocks(Pn.shapes_blocks(Pn.field_noise(fj_shapes(), "n", 0, 3, 13.0, 9), "b", [6]), "c", [7])
+      let p1 = Pn.field_cover(Pn.layer_scatter(p0, "bushes", "c", Pn.rule(0.5, [("thick", fj_lin())], Nil, Nil), 2.0, 0.5, 11), "dense", "bushes", 3.0)
+      let p2 = Pn.field_cover(Pn.layer_scatter(p1, "shrubs", "b", Pn.rule(0.6, [("n", fj_lin())], Nil, Nil), 1.0, 0.5, 8), "thick", "shrubs", 3.0)
+      let f = frozen_of(Pn.layer_scatter(p2, "trees", "s", Pn.rule(0.25, [("dense", fj_lin())], Nil, Nil), 2.0, 0.5, 5))
+      let res = List.map([1.0, 0.5], fn sc ->
+        -- judged on fine columns -21 .. 2, -19 .. 4 (a level-1 Ground supplies the level); dense is read by trees (no margin), thick by bushes (ceil(3 / sc))
+        let gl = fj_area(-20, -20, 16, sc, 1, 5)
+        let m = if sc == 1.0 do 3 else 6 end
+        -- a level-0 Ground 40 columns wider each side than the box
+        let n0 = 24 + 2 * m + 80
+        let g0 = fj_area(-21 - m - 40, -19 - m - 40, n0, sc, 0, 10)
+        let t0 = Pq.fields(f, 3, g0)
+        let one = fn (name, mm) ->
+          match Pq.cover_cached(f, 3, gl, name, -21, -19, 2, 4) do
+            (bx, bz, bn, vals) ->
+              let shape = if bx == -21 - mm do (if bz == -19 - mm do bn == 24 + 2 * mm else false end) else false end
+              let miss = List.fold_left(List.range(0, bn * bn), 0, fn (acc, q) ->
+                let x = bx + q % bn
+                let z = bz + q / bn
+                if NativeArray.get_f32(vals, q) == Pq.field_at(t0, name, (x - (-21 - m - 40)) + n0 * (z - (-19 - m - 40))) do acc else acc + 1 end)
+              name ++ (if shape do "" else " box (" ++ int_to_string(bx) ++ "," ++ int_to_string(bz) ++ "," ++ int_to_string(bn) ++ ")" end) ++ ":" ++ int_to_string(miss)
+          end
+        float_to_string(sc) ++ " " ++ one("dense", 0) ++ " " ++ one("thick", m))
+      Test.assert_eq_str(string_join(res, " | "), "1. dense:0 thick:0 | 0.5 dense:0 thick:0", "boxes and misses")
+    end
   end
 end
