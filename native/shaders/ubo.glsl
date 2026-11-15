@@ -19,6 +19,7 @@ layout(set = 0, binding = 0) uniform U {
     vec4 water2;     // x the height of that liquid's surface (metres); y 1 when water may keep its memory between frames (storage images); z 1 when there are lamps for the light pass to aim at
     mat4 sun_vp;     // the plain figures' shadow map: world (metres) to its clip space, orthographic from the sun, OpenGL conventions
     vec4 fshadow;    // x 1 when the map holds figures this frame (else it is not read), y one texel in its 0..1 coordinates, z depth per metre toward the sun
+    vec4 trace;      // x screen pixels along each side of one the gather pass traces for (1 or 2)
 } u;
 
 // OpenGL clip space to Vulkan's: y points down, depth runs 0..1.

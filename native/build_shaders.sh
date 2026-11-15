@@ -25,6 +25,7 @@ build figure.vert figquad.glsl
 build figure_shadow.vert figquad.glsl
 build fullscreen.vert
 build gbuffer.frag tiles.glsl
+build gather.frag shade.glsl tiles.glsl gbuf.glsl trace.glsl sky.glsl
 build light.frag shade.glsl tiles.glsl gbuf.glsl trace.glsl sky.glsl reflect.glsl
 build composite.frag
 build water.frag shade.glsl tiles.glsl gbuf.glsl trace.glsl sky.glsl reflect.glsl

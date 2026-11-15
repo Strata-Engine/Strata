@@ -1,13 +1,11 @@
 // The light pass: one fragment per screen pixel reads the geometry buffers
-// and writes the lit colour.
+// and what the gather pass traced, and writes the lit colour.
 layout(location = 0) in vec2 v_uv;
 
 layout(location = 0) out vec4 o_lit;
-layout(location = 1) out vec4 o_hist;
-layout(location = 2) out vec4 o_meta;
-// boxes (voxels, low and high corners) round bodies that moved this frame, then round traced figures that moved lately (strata_vk.c, fig_trace_prepare):
-// the low corner's w 1 for a figure's shadow box (the sun term alone), 0 for the rest (every term)
-layout(std430, set = 0, binding = 21) readonly buffer Movers { vec4 boxes[]; } movers;
+// what the gather pass wrote this frame (gather.frag): rgb sky light, a sun visibility; and r samples, g view depth, b face, a its state
+layout(set = 0, binding = 35) uniform sampler2D hist_cur;
+layout(set = 0, binding = 36) uniform sampler2D hmeta_cur;
 
 // A colour for a light class, for looking at the volume.
 vec3 class_tint(uint c) {
@@ -17,7 +15,6 @@ vec3 class_tint(uint c) {
 }
 
 void main() {
-    o_hist = vec4(0.0); o_meta = vec4(0.0);
     float depth = texture(gb_depth, v_uv).r;
     int mode = int(u.light.x);
     if (depth >= 1.0) {                                               // nothing drawn here: sky
@@ -55,68 +52,47 @@ void main() {
     bool far = !figure && r8 < 16 && nm.g > 0.5;
     if (mode == 1 || far) { o_lit = vec4(fogged(albedo * (u.sun_color.rgb * ndl * dim * ripple + sky_flat(n) * dim), world), 1.0); return; }
 
-    // What the same surface point had last frame, if it was on screen and is
-    // the same surface: same face, same distance from that frame's eye.
-    ivec2 px = ivec2(gl_FragCoord.xy);
-    int frame = int(u.light.z);
+    // The sky light and sun visibility the gather pass found (gather.frag), from the gathered pixels round this one that are the same
+    // surface: same face, about the same distance from the eye, weighed by how near they are. A pixel none of them matches (an edge,
+    // something thinner than a gathered pixel) traces the sun itself and takes the flat sky.
     vec3 at = world / u.eye.w;
     float view_depth = (u.vp * vec4(world, 1.0)).w;
-    vec4 pc = u.prev_vp * vec4(world, 1.0);
-    vec2 puv = vec2(pc.x / pc.w * 0.5 + 0.5, 0.5 - pc.y / pc.w * 0.5);
-    float kept = 0.0;
-    vec4 old = vec4(0.0);
-    if (u.vol.w > 0 && pc.w > 0.0 && all(greaterThanEqual(puv, vec2(0.0))) && all(lessThan(puv, vec2(1.0)))) {
-        vec4 om = texture(meta_prev, puv);
-        if (abs(om.g - pc.w) < 0.02 * pc.w + 0.05 && int(om.b + 0.5) == face) {
-            kept = min(om.r, float(u.vol.w));
-            old = texture(hist_prev, puv);
+    float s = u.trace.x;
+    ivec2 hsize = textureSize(hist_cur, 0);
+    vec2 hp = (gl_FragCoord.xy - 0.5 * s) / s;            // where this pixel falls among the gathered ones (their blocks' centres)
+    ivec2 hc = ivec2(floor(hp + 0.5));
+    // at one gathered pixel per screen pixel, just its own; else the 3 x 3 round the nearest, by a tent 1.5 gathered pixels wide,
+    // which spreads each one's few samples over the screen pixels it stands for and its neighbours'
+    int r = s > 1.0 ? 1 : 0;
+    vec4 acc = vec4(0.0); float wsum = 0.0; vec4 meta = vec4(0.0); float wbest = 0.0;
+    for (int dy = -r; dy <= r; dy++)
+        for (int dx = -r; dx <= r; dx++) {
+            ivec2 hq = clamp(hc + ivec2(dx, dy), ivec2(0), hsize - 1);
+            vec2 d = abs(vec2(hq) - hp);
+            float wb = max(1.5 - d.x, 0.0) * max(1.5 - d.y, 0.0);
+            if (wb <= 0.0) continue;
+            vec4 m = texelFetch(hmeta_cur, hq, 0);
+            if (m.g <= 0.0 || int(m.b + 0.5) != face || abs(m.g - view_depth) > 0.03 * view_depth + 0.05) continue;
+            acc += wb * texelFetch(hist_cur, hq, 0); wsum += wb;
+            if (wb > wbest) { wbest = wb; meta = m; }
         }
-    }
-    // A pixel with a settled memory takes a new sample one frame in four, in
-    // a pattern that moves round each 2 x 2 block; a pixel with little
-    // memory, and every pixel while an edit settles, samples every frame.
-    // An edit unsettles the pixels it can reach: those within 32 voxels of the chunks it changed.
-    // So does a sun that has just moved, everywhere.
-    bool settling = u.vol.w <= 2 || u.edit_lo.w > 0.5 && all(greaterThan(at, u.edit_lo.xyz - 32.0)) && all(lessThan(at, u.edit_hi.xyz + 32.0));
-    // so does a body moving near it (its own surface, its shadow), or a glowing traced figure (the light it gives);
-    // a moving traced figure's shadow box (w 1) samples the sun alone every frame, the sky keeping its schedule and memory
-    bool shade_moves = false;
-    for (int m = 0; m < u.bodies.x && m < 144; m++)
-        if (all(greaterThan(at, movers.boxes[2 * m].xyz)) && all(lessThan(at, movers.boxes[2 * m + 1].xyz))) {
-            if (movers.boxes[2 * m].w > 0.5) shade_moves = true; else settling = true;
-        }
-    // and a figure that moved since the last frame, on its own surface
-    if (figure && (fcode & 64) != 0) settling = true;
-    if (settling) kept = min(kept, 2.0);
-    bool sample_now = kept < 4.0 || settling || (((px.x >> 3) & 1) + 2 * ((px.y >> 3) & 1)) == (frame & 3);
-    // sky light changes slowly and costs most (its rays go far): a settled pixel traces it one frame in sixteen, in a pattern that moves round each
-    // 4 x 4 block of 8-pixel tiles, against the sun's one in four
-    // A pixel with little memory, or one settling, traces sky light one frame in four, a pixel of each 2 x 2 block in turn (so a quarter of the
-    // pixels newly in view trace it each frame, not all of them: turning the view had made the light pass three times as slow); until its first
-    // sample it is lit by the flat sky term. The sun's ray, which is cheaper, it still traces every frame.
-    bool fresh = kept < 4.0 || settling;
-    bool full_sky = u.light.w < 0.0;   // STRATA_SKY_FULL: the schedule of before (stored pictures)
-    bool sky_now = full_sky ? sample_now : fresh ? ((px.x & 1) + 2 * (px.y & 1)) == (frame & 3) : (((px.x >> 3) & 3) + 4 * ((px.y >> 3) & 3)) == (frame & 15);
-    float sun_vis = old.a;
+    // none: a face thinner than a gathered pixel; look two further out, at any distance along the same face's plane
+    if (wsum == 0.0 && r > 0)
+        for (int dy = -2; dy <= 2; dy++)
+            for (int dx = -2; dx <= 2; dx++) {
+                ivec2 hq = clamp(hc + ivec2(dx, dy), ivec2(0), hsize - 1);
+                vec4 m = texelFetch(hmeta_cur, hq, 0);
+                if (m.g <= 0.0 || int(m.b + 0.5) != face || abs(m.g - view_depth) > 0.1 * view_depth + 0.5) continue;
+                float wb = 1.0 / (1.0 + float(dx * dx + dy * dy));
+                acc += wb * texelFetch(hist_cur, hq, 0); wsum += wb;
+                if (wb > wbest) { wbest = wb; meta = m; }
+            }
     int rays = mode >= 4 ? int(abs(u.light.w)) : 0;
-    vec3 sky = rays > 0 ? (kept > 0.0 || u.light.w < 0.0 ? old.rgb : sky_flat(n)) : sky_flat(n);
-    float count = kept;
-    if (sample_now || shade_moves) {
-        float sun_now = sun_visible(at, n, sun_toward(rand2(px, frame, 0)));
-        // while an edit settles, a pixel whose new sample contradicts its memory starts again
-        if (settling && abs(old.a - sun_now) > 0.6) kept = 0.0;
-        // in a moving figure's shadow box the sun leans on 2 past samples, and none when the new one contradicts them
-        float ks = shade_moves ? min(kept, 2.0) : kept;
-        if (shade_moves && abs(old.a - sun_now) > 0.6) ks = 0.0;
-        // shadows lean on 64 past samples at most, so they follow a moving sun; sky light on all of them, since a small bright thing is found by few rays
-        sun_vis = mix(old.a, sun_now, 1.0 / (min(ks, 64.0) + 1.0));
-        if (sample_now) {
-            if (rays > 0 && sky_now) sky = mix(old.rgb, sky_light(at, n, px, frame, rays), full_sky ? 1.0 / (kept + 1.0) : 1.0 / (min(kept, 255.0) / 4.0 + 1.0));
-            count = kept + 1.0;
-        }
-    }
-    o_hist = vec4(sky, sun_vis);
-    o_meta = vec4(count, view_depth, float(face), 0.0);
+    vec3 sky; float sun_vis;
+    if (wsum > 0.0) { sky = acc.rgb / wsum; sun_vis = acc.a / wsum; }
+    else { sky = sky_flat(n); sun_vis = sun_visible(at, n, sun_toward(rand2(ivec2(gl_FragCoord.xy), int(u.light.z), 0))); }
+    if (rays == 0) sky = sky_flat(n);
+    float count = meta.r;
     // the plain figures' shadow, from this frame's map, the darker of it and the
     // traced shadow; never remembered, so a moving figure's shadow leaves no trail
     if (u.fshadow.x > 0.5 && ndl > 0.0) sun_vis = min(sun_vis, fig_shadow(world, n));
@@ -140,5 +116,5 @@ void main() {
     o_lit = vec4(fogged(col, world), 1.0);
     // light mode 5, for finding grain: lit as 4, but each pixel shows its memory: grey by how many past samples it leans on (white 64 and more),
     // red where it was made to start over this frame (an edit near it, a moving body, a moved sun), blue where a moving figure's shadow box is
-    if (mode == 5) o_lit = vec4(settling ? vec3(0.9, 0.1, 0.1) : (shade_moves ? vec3(0.1, 0.3, 0.9) : vec3(min(count, 64.0) / 64.0)), 1.0);
+    if (mode == 5) o_lit = vec4(meta.a > 1.5 ? vec3(0.1, 0.3, 0.9) : (meta.a > 0.5 ? vec3(0.9, 0.1, 0.1) : vec3(min(count, 64.0) / 64.0)), 1.0);
 }
