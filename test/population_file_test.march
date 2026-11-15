@@ -1,0 +1,335 @@
+-- PopulationFile: a population declared in a text file reads to the same
+-- Pop as the same declarations made through Strata.Population; every
+-- mistake is an Err carrying its line.
+mod Strata.Test.PopulationFile do
+
+  -- this module uses no Check.all; the suite compiles as one program and
+  -- other test modules do (GAPS S3)
+  needs IO.Clock
+  needs IO.Process
+  import Test
+  alias Strata.Population as Pn
+  alias Strata.Populate as Pq
+  alias Strata.PopulationFile as Pfl
+
+  -- ── Values the game makes ──────────────────────────────────────────────
+
+  pfn lump_id(x : Int, y : Int, z : Int) : Int do if (3 * x + y + 5 * z) % 4 == 0 do 0 else 2 + (x + 2 * y + 3 * z) % 5 end end
+  pfn lump(sx : Int, sy : Int, sz : Int) : Strata.Template.Template do
+    let n = sx * sy * sz
+    Strata.Template.make(sx, sy, sz, List.fold_left(List.range(0, n), NativeArray.make_i32(n, 0), fn (a, i) -> NativeArray.set_i32(a, i, lump_id(i % sx, (i / sx) % sy, i / (sx * sy)))), 1.0)
+  end
+  pfn solid(sx : Int, sy : Int, sz : Int, id : Int) : Strata.Template.Template do
+    Strata.Template.make(sx, sy, sz, NativeArray.make_i32(sx * sy * sz, id), 1.0)
+  end
+  pfn broadleaf() : List(Strata.Template.Template) do [lump(5, 6, 5), lump(3, 4, 3), solid(3, 5, 3, 4)] end
+  pfn stones() : List(Strata.Template.Template) do [solid(3, 2, 3, 9)] end
+  pfn camps() : List(Strata.Population.PopSite) do [Pn.site(10.0, 12.0, 12.0, 4.0, 1), Pn.site(40.0, 50.0, 9.0, 5.0, 2)] end
+  pfn named() : Strata.PopulationFile.PopNamed do Pfl.named([("broadleaf", broadleaf()), ("stones", stones())], [("camps", camps())]) end
+
+  -- ── The brief's example ────────────────────────────────────────────────
+
+  pfn example_lines(lawn_by : String) : List(String) do
+    ["[field wet]            kind = curve      of = wetness     curve = 0:0 0.4:0.2 1:1",
+     "[field patches]        kind = noise      noise = 0   octaves = 2   period = 40   salt = 7",
+     "[field shade]          kind = cover      layer = forest   radius = 6",
+     "[zone wood]            kind = regions    ids = 0 2",
+     "[zone shore]           kind = band       field = coast_dist   lo = 0   hi = 12",
+     "[zone yard]            kind = ring       sites = camps    inner = 0   outer = 20",
+     "[zone damp_wood]       kind = all        of = wood shore",
+     "[shapes blades]        kind = blocks     ids = 11",
+     "[shapes big]           kind = templates  from = broadleaf",
+     "[shapes stones]        kind = templates  from = stones",
+     "[weights big wood]     w = 3 1 0",
+     "[layer lawn]           kind = cover      shapes = blades  base = 0.3   by = " ++ lawn_by ++ "   inside = wood   outside = shore   salt = 26",
+     "[layer forest]         kind = scatter    shapes = big     base = 0.02  cell = 6   jitter = 0.6   salt = 21   seen_to = 2",
+     "[layer ruins]          kind = site       shapes = stones  sites = camps   margin = 3   salt = 28"]
+  end
+  pfn example(lawn_by : String) : String do string_join(example_lines(lawn_by), "\n") end
+
+  -- the same declarations through the API (only the two ground fields the example reads)
+  pfn example_api() : Strata.Population.Pop do
+    let p0 = Pn.field_ground(Pn.field_ground(Pn.new(), "wetness", 6), "coast_dist", 5)
+    let p1 = Pn.field_cover(Pn.field_noise(Pn.field_curve(p0, "wet", "wetness", Pn.curve([(0.0, 0.0), (0.4, 0.2), (1.0, 1.0)])), "patches", 0, 2, 40.0, 7), "shade", "forest", 6.0)
+    let p2 = Pn.zone_all(Pn.zone_ring(Pn.zone_band(Pn.zone_regions(p1, "wood", [0, 2]), "shore", "coast_dist", 0.0, 12.0), "yard", camps(), 0.0, 20.0), "damp_wood", ["wood", "shore"])
+    let p3 = Pn.weights(Pn.shapes_templates(Pn.shapes_templates(Pn.shapes_blocks(p2, "blades", [11]), "big", broadleaf()), "stones", stones()), "big", "wood", [3.0, 1.0, 0.0])
+    let p4 = Pn.layer_cover(p3, "lawn", "blades", Pn.rule(0.3, [("wet", Pn.curve([(0.0, 0.0), (1.0, 1.0)]))], ["wood"], ["shore"]), 26)
+    let p5 = Pn.layer_scatter(p4, "forest", "big", Pn.rule(0.02, Nil, Nil, Nil), 6.0, 0.6, 21)
+    Pn.seen_to(Pn.layer_site(p5, "ruins", "stones", camps(), 3.0, 28), "forest", 2)
+  end
+
+  pfn read_ok(text : String) : Strata.Population.Pop do
+    match Pfl.read(text, named()) do
+      Ok(p) -> p
+      Err(m) -> panic("expected the file to read: " ++ m)
+    end
+  end
+  pfn frozen_of(p : Strata.Population.Pop) : Strata.Population.Frozen do
+    match Pn.freeze(p) do
+      Ok(f) -> f
+      Err(m) -> panic("expected the population to freeze: " ++ m)
+    end
+  end
+  pfn fitted(p : Strata.Population.Pop) : Strata.Population.Frozen do
+    match Pn.fit_all(frozen_of(p), 1.0) do
+      Ok(f) -> f
+      Err(m) -> panic("expected the population to fit: " ++ m)
+    end
+  end
+  -- the message of read's Err, or "" when it read
+  pfn err_of(text : String) : String do
+    match Pfl.read(text, named()) do
+      Ok(_) -> ""
+      Err(m) -> m
+    end
+  end
+  -- read fails on line n, and its message holds `part`
+  pfn fails_at(text : String, n : Int, part : String, what : String) : Unit do
+    let m = err_of(text)
+    Test.assert_true(String.starts_with(m, "line " ++ int_to_string(n) ++ ": "), what ++ ": the Err is on line " ++ int_to_string(n) ++ " (got: " ++ m ++ ")")
+    Test.assert_true(string_contains(m, part), what ++ ": the message says " ++ part ++ " (got: " ++ m ++ ")")
+  end
+  pfn nth_or(xs : List(a), i : Int) : a do
+    match xs do
+      Nil -> panic("nth_or: past the end")
+      Cons(x, rest) -> if i == 0 do x else nth_or(rest, i - 1) end
+    end
+  end
+  pfn names_str(xs : List(String)) : String do string_join(xs, ",") end
+  pfn ints_str(xs : List(Int)) : String do string_join(List.map(xs, int_to_string), ",") end
+  pfn lines(xs : List(String)) : String do string_join(xs, "\n") end
+
+  -- ── Placing: a Ground by world column ──────────────────────────────────
+
+  pfn md(a : Int, m : Int) : Int do ((a % m) + m) % m end
+  pfn top_at(x : Int, z : Int) : Int do 5 + md(3 * x + 7 * z, 11) end
+  pfn wet_at(x : Int, z : Int) : Float do int_to_float(md(7 * x + 3 * z, 20)) /. 19.0 end
+  pfn coast_at(x : Int, z : Int) : Float do int_to_float(md(x + 2 * z, 30)) end
+  pfn region_at(x : Int, z : Int) : Float do int_to_float(md((x + 1600) / 16 + (z + 1600) / 16, 3)) end
+  pfn f32_by(x0 : Int, z0 : Int, n : Int, f : Int -> Int -> Float) : NativeF32Arr do
+    List.fold_left(List.range(0, n * n), NativeArray.make_f32(n * n, 0.0), fn (a, i) -> NativeArray.set_f32(a, i, f(x0 + i % n, z0 + i / n)))
+  end
+  pfn tops_by(x0 : Int, z0 : Int, n : Int) : NativeIntArr do
+    List.fold_left(List.range(0, n * n), NativeArray.make_int(n * n, 0), fn (a, i) -> NativeArray.set_int(a, i, top_at(x0 + i % n, z0 + i / n)))
+  end
+  pfn ground_for(k : Strata.Coord.Key, m : Int) : Strata.Populate.Ground do
+    let x0 = 32 * Strata.Coord.kx(k) - m
+    let z0 = 32 * Strata.Coord.kz(k) - m
+    let n = 32 + 2 * m
+    let g0 = Pq.ground(x0, z0, n, 1.0, 0, tops_by(x0, z0, n), NativeArray.make_int(n * n, -1))
+    Pq.with_field(Pq.with_field(Pq.with_field(g0, 5, f32_by(x0, z0, n, coast_at)), 6, f32_by(x0, z0, n, wet_at)), 7, f32_by(x0, z0, n, region_at))
+  end
+  pfn placed(f : Strata.Population.Frozen, k : Strata.Coord.Key, m : Int) : Strata.Chunk.Chunk do
+    Pq.place(f, 77, k, Strata.Chunk.uniform(0), ground_for(k, m))
+  end
+  -- chunks (of keys) where a and b place differently; and where a placed nothing
+  pfn differ(a : Strata.Population.Frozen, b : Strata.Population.Frozen, ks : List(Strata.Coord.Key), m : Int) : Int do
+    List.fold_left(ks, 0, fn (acc, k) -> if Strata.Chunk.hash(placed(a, k, m)) == Strata.Chunk.hash(placed(b, k, m)) do acc else acc + 1 end)
+  end
+  pfn empty_count(a : Strata.Population.Frozen, ks : List(Strata.Coord.Key), m : Int) : Int do
+    let air = Strata.Chunk.hash(Strata.Chunk.uniform(0))
+    List.fold_left(ks, 0, fn (acc, k) -> if Strata.Chunk.hash(placed(a, k, m)) == air do acc + 1 else acc end)
+  end
+  pfn count_id(c : Strata.Chunk.Chunk, id : Int) : Int do
+    List.fold_left(List.range(0, 32768), 0, fn (acc, i) -> if Strata.Chunk.get_or(c, i % 32, (i / 32) % 32, i / 1024, -1) == id do acc + 1 else acc end)
+  end
+  pfn count_in(f : Strata.Population.Frozen, ks : List(Strata.Coord.Key), m : Int, id : Int) : Int do
+    List.fold_left(ks, 0, fn (acc, k) -> acc + count_id(placed(f, k, m), id))
+  end
+
+  -- ── Every builder: a text of the frozen result through its readers ─────
+
+  pfn fl(v : Float) : String do float_to_string(v) end
+  pfn pts_str(c : Strata.Population.PopCurve) : String do string_join(List.map(Pn.curve_points(c), fn p -> match p do (x, y) -> fl(x) ++ ":" ++ fl(y) end), " ") end
+  pfn site_str(s : Strata.Population.PopSite) : String do string_join(List.map([Pn.site_xm(s), Pn.site_zm(s), Pn.site_floor(s), Pn.site_radius(s)], fl), ",") ++ "#" ++ int_to_string(Pn.site_index(s)) end
+  pfn sites_str(ss : List(Strata.Population.PopSite)) : String do string_join(List.map(ss, site_str), ";") end
+  pfn weights_str(ws : List((Int, List(Float)))) : String do string_join(List.map(ws, fn w -> match w do (z, v) -> int_to_string(z) ++ ":" ++ string_join(List.map(v, fl), ",") end), ";") end
+  pfn rank_str(a : NativeIntArr) : String do ints_str(List.map(List.range(0, NativeArray.length_int(a)), fn i -> NativeArray.get_int(a, i))) end
+  pfn curves_str(cs : List((Int, Strata.Population.PopCurve))) : String do string_join(List.map(cs, fn c -> match c do (i, k) -> int_to_string(i) ++ "@" ++ pts_str(k) end), ";") end
+  pfn field_str(f : Strata.Population.Frozen, i : Int) : String do
+    string_join([int_to_string(Pn.field_kind(f, i)), int_to_string(Pn.field_slot(f, i)), int_to_string(Pn.field_noise_kind(f, i)), int_to_string(Pn.field_octaves(f, i)), fl(Pn.field_period(f, i)), int_to_string(Pn.field_salt(f, i)),
+                 int_to_string(Pn.field_source(f, i)), pts_str(Pn.field_source_curve(f, i)), int_to_string(Pn.field_layer(f, i)), fl(Pn.field_radius(f, i))], "|")
+  end
+  pfn zone_str(f : Strata.Population.Frozen, i : Int) : String do
+    string_join([int_to_string(Pn.zone_kind(f, i)), ints_str(Pn.zone_ids(f, i)), int_to_string(Pn.zone_field(f, i)), fl(Pn.zone_lo(f, i)), fl(Pn.zone_hi(f, i)), sites_str(Pn.zone_sites(f, i)), fl(Pn.zone_inner(f, i)), fl(Pn.zone_outer(f, i)), ints_str(Pn.zone_members(f, i))], "|")
+  end
+  pfn shapes_str(f : Strata.Population.Frozen, i : Int) : String do
+    string_join([int_to_string(Pn.shape_set_kind(f, i)), ints_str(Pn.shape_set_blocks(f, i)), int_to_string(Pn.shape_set_variants(f, i)), weights_str(Pn.shape_set_weights(f, i)), rank_str(Pn.shape_set_ranks(f, i))], "|")
+  end
+  pfn layer_str(f : Strata.Population.Frozen, i : Int) : String do
+    string_join([int_to_string(Pn.layer_kind(f, i)), int_to_string(Pn.layer_shape_set(f, i)), int_to_string(Pn.layer_salt(f, i)), fl(Pn.layer_base(f, i)), curves_str(Pn.layer_curves(f, i)), ints_str(Pn.layer_inside(f, i)), ints_str(Pn.layer_outside(f, i)),
+                 fl(Pn.layer_cell(f, i)), fl(Pn.layer_jitter(f, i)), sites_str(Pn.layer_sites(f, i)), fl(Pn.layer_margin(f, i)), int_to_string(Pn.layer_seen_to(f, i))], "|")
+  end
+  pfn dump(f : Strata.Population.Frozen) : String do
+    let fs = List.map(List.range(0, Pn.field_count(f)), fn i -> "field " ++ nth_or(Pn.field_names(f), i) ++ " " ++ field_str(f, i))
+    let zs = List.map(List.range(0, Pn.zone_count(f)), fn i -> "zone " ++ nth_or(Pn.zone_names(f), i) ++ " " ++ zone_str(f, i))
+    let ss = List.map(List.range(0, Pn.shape_set_count(f)), fn i -> "shapes " ++ nth_or(Pn.shape_set_names(f), i) ++ " " ++ shapes_str(f, i))
+    let ls = List.map(List.range(0, Pn.layer_count(f)), fn i -> "layer " ++ nth_or(Pn.layer_names(f), i) ++ " " ++ layer_str(f, i))
+    string_join(List.concat([fs, zs, ss, ls, ["ground " ++ ints_str(Pn.missing_ground(f))]]), "\n")
+  end
+
+  -- every kind of declaration and every setting, optional ones included
+  pfn everything_text() : String do
+    lines(["[field rd] kind = ground slot = 3",
+           "[field hills] kind = noise noise = 2 octaves = 3 period = 12.5 salt = -4",
+           "[field hc] kind = curve of = hills curve = 1:1 0:0.5 0.5:-0.25",
+           "[field shade] kind = cover layer = canopy radius = 4",
+           "[zone north] kind = regions ids = 1 2",
+           "[zone near] kind = band field = rd lo = -1.5 hi = 20",
+           "[zone camp] kind = ring sites = camps inner = 1 outer = 5",
+           "[zone both] kind = all of = north near",
+           "[zone either] kind = any of = camp north",
+           "[zone south] kind = not of = north",
+           "[shapes grass] kind = blocks ids = 7 8",
+           "[shapes trees] kind = templates from = broadleaf ranks = 0 3 1 2",
+           "[shapes ruin] kind = templates from = stones",
+           "[weights grass north] w = 2 1",
+           "[weights trees either] w = 1 0.5 0",
+           "[layer lawn] kind = cover shapes = grass base = 0.5 by = hc:0:0,10:1 shade:0:1,1:0 inside = north outside = south near salt = 11 seen_to = 0",
+           "[layer canopy] kind = scatter shapes = trees base = 0.02 cell = 6 jitter = 0.5 salt = 12 seen_to = 3",
+           "[layer bare] kind = scatter shapes = trees base = 1 cell = 8 jitter = 0 salt = 14",
+           "[layer camps] kind = site shapes = ruin sites = camps margin = 2 salt = 13 seen_to = 1"])
+  end
+  pfn everything_api() : Strata.Population.Pop do
+    let p0 = Pn.field_cover(Pn.field_curve(Pn.field_noise(Pn.field_ground(Pfl.ground_fields(Pn.new()), "rd", 3), "hills", 2, 3, 12.5, 0 - 4), "hc", "hills", Pn.curve([(1.0, 1.0), (0.0, 0.5), (0.5, 0.0 -. 0.25)])), "shade", "canopy", 4.0)
+    let p1 = Pn.zone_any(Pn.zone_all(Pn.zone_ring(Pn.zone_band(Pn.zone_regions(p0, "north", [1, 2]), "near", "rd", 0.0 -. 1.5, 20.0), "camp", camps(), 1.0, 5.0), "both", ["north", "near"]), "either", ["camp", "north"])
+    let p2 = Pn.shapes_templates(Pn.shapes_templates(Pn.shapes_blocks(Pn.zone_not(p1, "south", "north"), "grass", [7, 8]), "trees", broadleaf()), "ruin", stones())
+    let rk = List.fold_left(List.range(0, 4), NativeArray.make_int(4, 0), fn (a, i) -> NativeArray.set_int(a, i, nth_or([0, 3, 1, 2], i)))
+    let p3 = Pn.weights(Pn.weights(Pn.ranks(p2, "trees", rk), "grass", "north", [2.0, 1.0]), "trees", "either", [1.0, 0.5, 0.0])
+    let p4 = Pn.layer_cover(p3, "lawn", "grass", Pn.rule(0.5, [("hc", Pn.curve([(0.0, 0.0), (10.0, 1.0)])), ("shade", Pn.curve([(0.0, 1.0), (1.0, 0.0)]))], ["north"], ["south", "near"]), 11)
+    let p5 = Pn.layer_scatter(Pn.layer_scatter(p4, "canopy", "trees", Pn.rule(0.02, Nil, Nil, Nil), 6.0, 0.5, 12), "bare", "trees", Pn.rule(1.0, Nil, Nil, Nil), 8.0, 0.0, 14)
+    Pn.seen_to(Pn.seen_to(Pn.seen_to(Pn.layer_site(p5, "camps", "ruin", camps(), 2.0, 13), "lawn", 0), "canopy", 3), "camps", 1)
+  end
+
+  describe "PopulationFile" do
+    test "the example reads to a Pop whose layers run in declaration order" do
+      let f = frozen_of(read_ok(example("wet:0:0,1:1")))
+      Test.assert_eq_str(names_str(Pn.layer_names(f)), "lawn,forest,ruins", "nothing depends on anything")
+      Test.assert_eq_str(ints_str(Pn.missing_ground(f)), "5,6,7", "wetness, coast_dist and the regions zone's slot 7 are read")
+      Test.assert_eq_str(names_str(List.take(Pn.field_names(f), 10)), "altitude,slope,water_depth,river_dist,lake_dist,coast_dist,wetness,region,depth,sky", "the ten built-ins come first, in slot order")
+    end
+
+    test "a lawn reading the forest's shade runs after the forest" do
+      let f = frozen_of(read_ok(example("wet:0:0,1:1 shade:0:1,1:0.2")))
+      Test.assert_eq_str(names_str(Pn.layer_names(f)), "forest,lawn,ruins", "shade is a cover of the forest")
+    end
+
+    test "the file and the API place identically on 5 chunks" do
+      let a = fitted(read_ok(example("wet:0:0,1:1")))
+      let b = fitted(example_api())
+      let m = Pq.pad(a, 1.0)
+      Test.assert_eq_int(m, Pq.pad(b, 1.0), "the same pad")
+      let ks = [Strata.Coord.key(0, 0, 0), Strata.Coord.key(1, 0, 0), Strata.Coord.key(0, 0, 1), Strata.Coord.key(1, 0, 1), Strata.Coord.key(-1, 0, 0)]
+      Test.assert_eq_int(differ(a, b, ks, m), 0, "every chunk is the same")
+      Test.assert_eq_int(empty_count(a, ks, m), 0, "and every chunk holds something")
+      Test.assert_true(count_in(a, ks, m, 11) > 0, "the lawn placed blades")
+      Test.assert_true(count_in(a, ks, m, 9) > 0, "the ruins placed stones")
+      Test.assert_true(count_in(a, ks, m, 4) > 0, "the forest placed its solid variant")
+      -- a different file places differently: the comparison can fail
+      let c = fitted(read_ok(string_join(List.map(example_lines("wet:0:0,1:1"), fn l -> if string_contains(l, "salt = 21") do string_replace(l, "salt = 21", "salt = 22") else l end), "\n")))
+      Test.assert_true(differ(a, c, ks, m) > 0, "another salt places another forest")
+    end
+
+    test "every builder is reachable from the file, optional settings included" do
+      let a = frozen_of(read_ok(everything_text()))
+      let b = frozen_of(everything_api())
+      Test.assert_eq_str(dump(a), dump(b), "the file and the API freeze to the same declarations")
+      Test.assert_eq_str(names_str(Pn.layer_names(a)), "canopy,lawn,bare,camps", "the lawn reads the canopy's shade")
+      Test.assert_eq_int(Pn.layer_seen_to(a, 0), 3, "canopy seen to 3")
+      Test.assert_eq_int(Pn.layer_seen_to(a, 2), -1, "bare has no seen_to")
+      Test.assert_eq_str(rank_str(Pn.shape_set_ranks(a, 1)), "0,3,1,2", "trees' ranks")
+    end
+
+    test "an unknown kind is an Err on its line" do
+      fails_at(lines(["[field wet] kind = curve of = wetness curve = 0:0 1:1", "[layer lawn]", "  kind = covr shapes = blades base = 0.3 salt = 1", "[shapes blades] kind = blocks ids = 11"]), 3, "covr", "unknown kind")
+    end
+
+    test "an unknown setting is an Err on its line" do
+      fails_at(lines(["[shapes blades] kind = blocks ids = 11", "[layer lawn] kind = cover shapes = blades", "base = 0.3", "salt = 1 colour = green"]), 4, "colour", "unknown setting")
+    end
+
+    test "a missing shapes is an Err on its section's header line" do
+      fails_at(lines(["[shapes blades] kind = blocks ids = 11", "", "[layer lawn]", "kind = cover base = 0.3 salt = 1"]), 3, "shapes", "missing shapes")
+    end
+
+    test "a template list the game did not name is an Err on its line" do
+      fails_at(lines(["[shapes big]", "kind = templates", "from = nothing"]), 3, "nothing", "from = nothing")
+    end
+
+    test "a malformed number is an Err on its line" do
+      fails_at(lines(["[shapes blades] kind = blocks ids = 11", "[layer lawn] kind = cover shapes = blades", "   base = 0.x3 salt = 1"]), 3, "0.x3", "base = 0.x3")
+    end
+
+    test "a section header with no name is an Err on its line" do
+      fails_at(lines(["# a population", "[field]", "kind = noise noise = 0 octaves = 1 period = 4 salt = 0"]), 2, "no name", "[field]")
+    end
+
+    test "comments, blank lines, settings split across lines, tabs, CRLF and no spaces around = are accepted" do
+      let text = lines(["# the lawn's fields", "", "[field wet]   # a curve of the wetness", "kind=curve", "\tof =wetness\r", "curve= 0:0 0.4:0.2   1:1   # rising",
+                        "", "   ", "[field patches] kind = noise noise = 0 octaves = 2 period = 40 salt = 7", "[field shade] kind = cover", "layer = forest", "radius = 6",
+                        "[zone wood] kind = regions ids = 0 2", "[zone shore]", "kind = band", "field = coast_dist", "lo = 0", "hi = 12",
+                        "[zone yard] kind = ring sites = camps inner = 0 outer = 20", "[zone damp_wood] kind = all of = wood shore",
+                        "[shapes blades] kind = blocks ids = 11", "[shapes big] kind = templates from = broadleaf", "[shapes stones] kind = templates from = stones",
+                        "[weights big wood]", "w = 3 1 0  # no salt here", "[layer lawn]", "kind = cover", "shapes = blades", "base = 0.3", "by = wet:0:0,1:1", "inside = wood", "outside = shore", "salt = 26#tight",
+                        "[layer forest] kind = scatter shapes = big base = 0.02", "cell = 6 jitter = 0.6", "salt = 21 seen_to = 2",
+                        "[layer ruins] kind = site shapes = stones sites = camps margin = 3", "salt = 28", "", "# the end"])
+      Test.assert_eq_str(dump(frozen_of(read_ok(text))), dump(frozen_of(read_ok(example("wet:0:0,1:1")))), "the same declarations as the example")
+    end
+
+    test "line numbers count comments, blank lines and settings lines" do
+      let head = ["# one", "", "[shapes blades] # three", "kind = blocks", "", "# six", "ids = 11", ""]
+      fails_at(lines(List.append(head, ["[layer lawn] kind = cover shapes = blades base = 0.3 salt = 1 # nine", "", "  # eleven", "seen_to = x"])), 12, "x", "the twelfth line")
+      fails_at(lines(List.append(head, ["[layer lawn] kind = cover shapes = blades base = 0.3 salt = 1 # nine", "", "  # eleven", "[layer last] kind = cover base = 1 salt = 2"])), 12, "shapes", "the last section, at the end of the text")
+      fails_at(lines(List.append(head, ["[layer last] kind = cover base = 1 salt = 2 # nine", "", "# eleven"])), 9, "shapes", "the last section, before trailing comments")
+      fails_at(lines(["[shapes a] kind = blocks ids = 1 # a comment # with = signs", "[shapes b] kind = blocks ids = 2 bad = 3"]), 2, "bad", "a comment holding = is stripped")
+    end
+
+    test "syntax errors: a setting before any header, a duplicate setting, an unknown section kind, a bad header" do
+      fails_at(lines(["# nothing yet", "kind = blocks", "[shapes a] kind = blocks ids = 1"]), 2, "before", "a setting before any header")
+      fails_at(lines(["[shapes a] kind = blocks", "ids = 1", "ids = 2"]), 3, "twice", "a setting given twice")
+      fails_at(lines(["[shapes a] kind = blocks ids = 1 kind = blocks"]), 1, "twice", "a setting given twice on one line")
+      fails_at(lines(["[shapes a] kind = blocks ids = 1", "[forest a] kind = blocks ids = 1"]), 2, "forest", "an unknown section kind")
+      fails_at(lines(["[shapes a] kind = blocks ids = 1", "[]"]), 2, "no kind", "an empty header")
+      fails_at(lines(["[shapes a b] kind = blocks ids = 1"]), 1, "one name", "two names for a shape set")
+      fails_at(lines(["[weights a] w = 1"]), 1, "two names", "one name for weights")
+      fails_at(lines(["[shapes a kind = blocks ids = 1"]), 1, "]", "a header without ]")
+      fails_at(lines(["[shapes a] kind = blocks = 1"]), 1, "no value", "a setting with no value")
+      fails_at(lines(["[shapes a] kind = blocks ids = 1", "= 4"]), 2, "no setting name", "= with no name")
+      fails_at(lines(["[shapes a] kind = blocks ids = 1", "stray"]), 2, "stray", "a word that is not a setting")
+      fails_at(lines(["[shapes a]", "ids = 1"]), 1, "kind", "a section with no kind")
+      fails_at(lines(["[shapes a] kind = blocks templates ids = 1"]), 1, "one value", "kind with two values")
+      fails_at(lines(["[shapes b?d] kind = blocks ids = 1"]), 1, "b?d", "a name with a character outside letters, digits, _ - .")
+      fails_at(lines(["[field w] kind = curve of = wetness curve = 0:0 1"]), 1, "x:y", "a curve point without its colon")
+      fails_at(lines(["[shapes s] kind = blocks ids = 1", "[layer l] kind = cover shapes = s base = 1 salt = 1 by = wet:0:0,"]), 2, "x:y", "a factor point left empty")
+      fails_at(lines(["[shapes s] kind = blocks ids = 1", "[layer l] kind = cover shapes = s base = 1 salt = 1 by = :0:0,1:1"]), 2, "field", "a factor with no field")
+      fails_at(lines(["[zone z] kind = ring sites = tents inner = 0 outer = 1"]), 1, "tents", "a site list the game did not name")
+      fails_at(lines(["[weights s z] kind = x w = 1"]), 1, "kind", "weights have no kind")
+    end
+
+    test "numbers: decimals, negatives and exponents read; anything else is malformed, and a huge integer is an Err, not a trap" do
+      let ok_text = lines(["[field h] kind = noise noise = 0 octaves = 1 period = 1.5e1 salt = -999999999999999999", "[zone z] kind = band field = h lo = -0.5 hi = 2E-1"])
+      let f = frozen_of(read_ok(ok_text))
+      Test.assert_true(Pn.field_period(f, 10) == 15.0, "1.5e1 is 15")
+      Test.assert_eq_int(Pn.field_salt(f, 10), 0 - 999999999999999999, "eighteen nines, negative")
+      Test.assert_true(Pn.zone_lo(f, 0) == 0.0 -. 0.5, "-0.5")
+      Test.assert_true(Pn.zone_hi(f, 0) == 0.2, "2E-1 is 0.2")
+      let bad = ["0.x3", "1e", "nan", "inf", "-inf", "1.5junk", ".5", "5.", "-", "+1", "1e400", "0x10", "1_000", "1.2.3", "--1", "1e+", "infinity"]
+      List.fold_left(bad, (), fn (_, v) -> fails_at("[zone z] kind = band field = altitude lo = 0 hi = " ++ v, 1, "number", "hi = " ++ v))
+      List.fold_left(["1.5", "1e2", "99999999999999999999", "-1000000000000000000", "1000000000000000000", "x", "2-"], (), fn (_, v) -> fails_at("[field h] kind = noise noise = 0 octaves = 1 period = 1 salt = " ++ v, 1, "integer", "salt = " ++ v))
+      fails_at("[shapes s] kind = blocks ids = 1 9999999999999999999999999 3", 1, "integer", "a huge block id")
+    end
+
+    test "freeze's errors come back with the line of the section at fault" do
+      let base = ["[shapes s] kind = blocks ids = 1", "[shapes t] kind = templates from = broadleaf"]
+      fails_at(lines(List.append(base, ["[layer l] kind = scatter shapes = t base = 1 cell = 0.001 jitter = 0 salt = 1"])), 3, "cell", "a cell below 1/64 m")
+      fails_at(lines(List.append(base, ["", "[layer l] kind = cover shapes = s base = 1 salt = 1", "inside = nowhere"])), 4, "nowhere", "an undeclared zone")
+      fails_at(lines(List.append(base, ["[layer l] kind = cover shapes = s base = 1 salt = 1", "[layer l] kind = cover shapes = s base = 2 salt = 2"])), 4, "two layers", "a second layer of one name")
+      fails_at(lines(List.append(base, ["[field wetness] kind = ground slot = 6"])), 3, "wetness", "a field named like a built-in")
+      fails_at(lines(List.append(base, ["[field c] kind = cover layer = l radius = 2", "[layer l] kind = cover shapes = s base = 1 by = c:0:0,1:1 salt = 1", "[layer m] kind = scatter shapes = t base = 1 cell = 4 jitter = 0 salt = 1"])), 4, "cycle", "a layer reading its own cover")
+      fails_at(lines(List.append(base, ["[weights t z] w = 1 1 1"])), 3, "'z'", "weights in an undeclared zone")
+      fails_at(lines(List.append(base, ["[shapes u] kind = blocks ids = 1 ranks = 1"])), 3, "ranks", "ranks for blocks")
+      fails_at(lines(List.append(base, ["[layer l] kind = cover shapes = s base = 1 salt = 1 seen_to = 2"])), 3, "seen_to", "seen_to above 0 for a cover layer")
+      fails_at(lines(List.append(base, ["[field a] kind = curve of = b curve = 0:0", "[field b] kind = curve of = a curve = 0:0"])), 3, "cycle", "curve fields in a cycle")
+    end
+  end
+end
