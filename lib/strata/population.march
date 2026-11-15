@@ -39,8 +39,8 @@ mod Strata.Population do
   type PopLayerDecl = PdLayerCover(String, String, PopRule, Int) | PdLayerScatter(String, String, PopRule, Float, Float, Int) | PdLayerSite(String, String, List(PopSite), Float, Int)
 
   -- each list newest first; freeze reverses them
-  -- pp_seen: (layer, level) from seen_to; pp_ranks: (shape set, rank) from ranks
-  type Pop = { pp_fields : List(PopFieldDecl), pp_zones : List(PopZoneDecl), pp_shapes : List(PopShapesDecl), pp_weights : List(PopWeightsDecl), pp_layers : List(PopLayerDecl), pp_seen : List((String, Int)), pp_ranks : List((String, NativeIntArr)) }
+  -- pp_seen: (layer, level) from seen_to; pp_ranks: (shape set, rank) from ranks; pp_on: (layer, block ids) from cover_on; pp_between: (layer, lo, hi) from cover_between
+  type Pop = { pp_fields : List(PopFieldDecl), pp_zones : List(PopZoneDecl), pp_shapes : List(PopShapesDecl), pp_weights : List(PopWeightsDecl), pp_layers : List(PopLayerDecl), pp_seen : List((String, Int)), pp_ranks : List((String, NativeIntArr)), pp_on : List((String, List(Int))), pp_between : List((String, Float, Float)) }
 
   -- compiled: a field index is into fz_fields, a zone index into fz_zones,
   -- a shape set index into fz_shapes, a layer index into fz_layers (run order)
@@ -53,20 +53,20 @@ mod Strata.Population do
   -- shape set first; cover: rule, salt; scatter: rule, cell (m), jitter, salt; site: sites, margin (m), salt
   type PopLayer = PfLayerCover(Int, PopFrozenRule, Int) | PfLayerScatter(Int, PopFrozenRule, Float, Float, Int) | PfLayerSite(Int, List(PopSite), Float, Int)
 
-  -- fz_seen: each layer's declared seen_to level (run order), -1 for the default; fz_ranks: each shape set's rank array, empty for the default
-  type Frozen = { fz_field_names : List(String), fz_fields : List(PopField), fz_zone_names : List(String), fz_zones : List(PopZone), fz_shape_names : List(String), fz_shapes : List(PopShapes), fz_layer_names : List(String), fz_layers : List(PopLayer), fz_ground : List(Int), fz_seen : List(Int), fz_ranks : List(NativeIntArr) }
+  -- fz_seen: each layer's declared seen_to level (run order), -1 for the default; fz_ranks: each shape set's rank array, empty for the default; fz_on: each layer's cover_on block ids (run order), empty for any block; fz_between: each layer's cover_between heights, (-inf, inf) for any
+  type Frozen = { fz_field_names : List(String), fz_fields : List(PopField), fz_zone_names : List(String), fz_zones : List(PopZone), fz_shape_names : List(String), fz_shapes : List(PopShapes), fz_layer_names : List(String), fz_layers : List(PopLayer), fz_ground : List(Int), fz_seen : List(Int), fz_ranks : List(NativeIntArr), fz_on : List(List(Int)), fz_between : List((Float, Float)) }
 
   -- Building
 
   doc "A population with nothing declared."
-  fn new() : Pop do { pp_fields: Nil, pp_zones: Nil, pp_shapes: Nil, pp_weights: Nil, pp_layers: Nil, pp_seen: Nil, pp_ranks: Nil } end
+  fn new() : Pop do { pp_fields: Nil, pp_zones: Nil, pp_shapes: Nil, pp_weights: Nil, pp_layers: Nil, pp_seen: Nil, pp_ranks: Nil, pp_on: Nil, pp_between: Nil } end
 
   pfn add_field(p : Pop, d : PopFieldDecl) : Pop do { p with pp_fields: Cons(d, p.pp_fields) } end
   pfn add_zone(p : Pop, d : PopZoneDecl) : Pop do { p with pp_zones: Cons(d, p.pp_zones) } end
   pfn add_shapes(p : Pop, d : PopShapesDecl) : Pop do { p with pp_shapes: Cons(d, p.pp_shapes) } end
   pfn add_layer(p : Pop, d : PopLayerDecl) : Pop do { p with pp_layers: Cons(d, p.pp_layers) } end
 
-  doc "A field the game supplies in its Ground, in slot 0..9: 0 altitude (m), 1 slope (rise over run), 2 water depth (m), 3 river distance (m), 4 lake distance (m), 5 coast distance (m), 6 wetness (unit), 7 region (id), 8 depth below the top surface (m), 9 open sky (0 or 1). freeze refuses another slot."
+  doc "A field the game supplies in its Ground, in slot 0..31. Slots 0..9 are the built-ins: 0 altitude (m), 1 slope (rise over run), 2 water depth (m), 3 river distance (m), 4 lake distance (m), 5 coast distance (m), 6 wetness (unit), 7 region (id), 8 depth below the top surface (m), 9 open sky (0 or 1). Slots 10..31 are the game's own: the library gives them no meaning, and the game names them as it declares them. freeze refuses another slot."
   fn field_ground(p : Pop, name : String, slot : Int) : Pop do add_field(p, PdGround(name, slot)) end
 
   doc "A noise field: noise kind, octaves, period in metres and a seed salt."
@@ -151,6 +151,12 @@ mod Strata.Population do
 
   doc "How a shape set of templates is coarsened at coarser levels: rank[id] is id's rank, and each coarse voxel takes the id of highest rank among the fine voxels its cube holds (Strata.Template.coarsen; an id past the array's end ranks 0, a tie goes to the higher id, any id beats a hole). Without it every id is ranked by itself. Ranks must be 0 or more; at most one per shape set; not for a set of blocks."
   fn ranks(p : Pop, shapes : String, rank : NativeIntArr) : Pop do { p with pp_ranks: Cons((shapes, rank), p.pp_ranks) } end
+
+  doc "The block ids the cover layer named layer places on: a floor holds one of its blocks only where the floor's own voxel holds one of ids (a floor below the chunk, whose voxel the chunk does not hold, holds none). Without it a cover layer places on any floor. ids not empty, each 0..65535; at most one per layer; a cover layer only."
+  fn cover_on(p : Pop, layer : String, ids : List(Int)) : Pop do { p with pp_on: Cons((layer, ids), p.pp_on) } end
+
+  doc "The heights the cover layer named layer places on: a floor whose height in metres (its voxel's bottom, its world voxel y times the voxel size) is above lo and at most hi. Without it a cover layer places at any height. lo and hi numbers (either may be infinite), lo below hi; at most one per layer; a cover layer only."
+  fn cover_between(p : Pop, layer : String, lo : Float, hi : Float) : Pop do { p with pp_between: Cons((layer, lo, hi), p.pp_between) } end
 
   -- Names and lookups
 
@@ -277,7 +283,7 @@ mod Strata.Population do
   pfn check_field(fnames : List(String), lnames : List(String), d : PopFieldDecl) : Option(String) do
     let s = about1("field", field_name(d))
     match d do
-      PdGround(n, slot) -> fail_if(if slot < 0 do true else slot > 9 end, s, "field " ++ q(n) ++ " reads ground slot " ++ int_to_string(slot) ++ ", outside 0..9")
+      PdGround(n, slot) -> fail_if(if slot < 0 do true else slot > 31 end, s, "field " ++ q(n) ++ " reads ground slot " ++ int_to_string(slot) ++ ", outside 0..31")
       PdNoise(n, k, o, per, _) ->
         first_of([
           fail_if(not_positive(per), s, "field " ++ q(n) ++ " has a noise period of " ++ float_to_string(per) ++ " m; it must be above 0"),
@@ -420,6 +426,53 @@ mod Strata.Population do
             first_of([fail_if(if lvl < 0 do true else lvl > 16 end, about1("seen_to", n), who ++ " is level " ++ int_to_string(lvl) ++ "; it must be within 0..16"),
                       fail_if(if lvl > 0 do block_layer(ss, d) else false end, about1("seen_to", n), who ++ " is level " ++ int_to_string(lvl) ++ ", but it places blocks of shape set " ++ q(layer_shapes(d)) ++ ", which are placed at level 0 only")])
         end
+    end
+  end
+  pfn on_name(e : (String, List(Int))) : String do match e do (n, _) -> n end end
+  pfn check_on(ls : List(PopLayerDecl), e : (String, List(Int))) : Option(String) do
+    match e do
+      (n, ids) ->
+        let who = "cover_on of layer " ++ q(n)
+        match find_layer(ls, n) do
+          None -> fail(about1("cover_on", n), "cover_on names undeclared layer " ++ q(n))
+          Some(d) ->
+            let cover = match d do
+                PdLayerCover(_, _, _, _) -> true
+                _ -> false
+              end
+            first_of([fail_if(!cover, about1("cover_on", n), who ++ ", which is not a cover layer; only cover layers place on a floor's block"),
+                      fail_if(List.is_empty(ids), about1("cover_on", n), who ++ " names no block id"),
+                      fail_if(List.any(ids, fn i -> if i < 0 do true else i > 65535 end), about1("cover_on", n), who ++ " holds a block id outside 0..65535")])
+        end
+    end
+  end
+  pfn between_name(e : (String, Float, Float)) : String do match e do (n, _, _) -> n end end
+  pfn check_between(ls : List(PopLayerDecl), e : (String, Float, Float)) : Option(String) do
+    match e do
+      (n, lo, hi) ->
+        let who = "cover_between of layer " ++ q(n)
+        match find_layer(ls, n) do
+          None -> fail(about1("cover_between", n), "cover_between names undeclared layer " ++ q(n))
+          Some(d) ->
+            let cover = match d do
+                PdLayerCover(_, _, _, _) -> true
+                _ -> false
+              end
+            first_of([fail_if(!cover, about1("cover_between", n), who ++ ", which is not a cover layer; only cover layers place on a floor's height"),
+                      fail_if(if lo < hi do false else true end, about1("cover_between", n), who ++ " is " ++ float_to_string(lo) ++ " .. " ++ float_to_string(hi) ++ "; lo must be below hi, both numbers")])
+        end
+    end
+  end
+  pfn between_of(bs : List((String, Float, Float)), n : String) : (Float, Float) do
+    match List.find(bs, fn e -> between_name(e) == n) do
+      Some((_, lo, hi)) -> (lo, hi)
+      None -> (float_neg_infinity(), float_infinity())
+    end
+  end
+  pfn on_of(ons : List((String, List(Int))), n : String) : List(Int) do
+    match List.find(ons, fn e -> on_name(e) == n) do
+      Some((_, v)) -> v
+      None -> Nil
     end
   end
   pfn rank_name(e : (String, NativeIntArr)) : String do match e do (n, _) -> n end end
@@ -668,7 +721,7 @@ mod Strata.Population do
     let znames = List.map(zs, zone_name)
     let snames = List.map(ss, shapes_name)
     let layers = List.filter_map(lorder, fn n -> find_layer(ls, n))
-    { fz_field_names: fnames, fz_fields: List.map(fs, fn d -> compile_field(fnames, lorder, d)), fz_zone_names: znames, fz_zones: List.map(zs, fn d -> compile_zone(fnames, znames, d)), fz_shape_names: snames, fz_shapes: List.map(ss, fn d -> compile_shapes(znames, ws, d)), fz_layer_names: lorder, fz_layers: List.map(layers, fn d -> compile_layer(fnames, znames, snames, d)), fz_ground: ground_used(fs, zs, ls), fz_seen: Nil, fz_ranks: Nil }
+    { fz_field_names: fnames, fz_fields: List.map(fs, fn d -> compile_field(fnames, lorder, d)), fz_zone_names: znames, fz_zones: List.map(zs, fn d -> compile_zone(fnames, znames, d)), fz_shape_names: snames, fz_shapes: List.map(ss, fn d -> compile_shapes(znames, ws, d)), fz_layer_names: lorder, fz_layers: List.map(layers, fn d -> compile_layer(fnames, znames, snames, d)), fz_ground: ground_used(fs, zs, ls), fz_seen: Nil, fz_ranks: Nil, fz_on: Nil, fz_between: Nil }
   end
 
   pfn seen_of(seens : List((String, Int)), n : String) : Int do
@@ -684,7 +737,7 @@ mod Strata.Population do
     end
   end
 
-  doc "Checks the declarations and compiles them, or the first mistake found, naming the offender: a duplicate name within a kind; a field, zone, rule, weights or layer naming something undeclared; a ground slot outside 0..9; a noise period not above 0, a noise kind outside 0..3 or octaves outside 1..16; a shape set with no variants; a block id of 0 or below or above 65535; a cover layer on a shape set of templates; weights whose count is not the variant count, with a negative weight, or summing to 0; a second weights for one shape set and zone; a rule base below 0 or not a number; a curve with no points; a negative radius or margin; a cover radius not above 0, NaN or infinite; a cover field of a scatter layer whose pi * radius^2 / cell^2 is not above 0 or not finite; a site radius or site layer margin that is NaN or infinite; a site layer's site index outside -2^40..2^40; a cell that is not finite or is below 1/64 m; a jitter outside 0..0.6; a seen_to naming an undeclared layer, a level outside 0..16, a level above 0 for a block layer, or a second seen_to for a layer; ranks naming an undeclared shape set or a set of blocks, a rank below 0, or a second ranks for a set; curve fields or zones that refer to each other in a cycle; layers that read each other's cover in a cycle, through their rules or their shape sets' weights zones. Every message ends with a line naming the declaration at fault, which freeze_subject reads."
+  doc "Checks the declarations and compiles them, or the first mistake found, naming the offender: a duplicate name within a kind; a field, zone, rule, weights or layer naming something undeclared; a ground slot outside 0..31; a noise period not above 0, a noise kind outside 0..3 or octaves outside 1..16; a shape set with no variants; a block id of 0 or below or above 65535; a cover layer on a shape set of templates; weights whose count is not the variant count, with a negative weight, or summing to 0; a second weights for one shape set and zone; a rule base below 0 or not a number; a curve with no points; a negative radius or margin; a cover radius not above 0, NaN or infinite; a cover field of a scatter layer whose pi * radius^2 / cell^2 is not above 0 or not finite; a site radius or site layer margin that is NaN or infinite; a site layer's site index outside -2^40..2^40; a cell that is not finite or is below 1/64 m; a jitter outside 0..0.6; a seen_to naming an undeclared layer, a level outside 0..16, a level above 0 for a block layer, or a second seen_to for a layer; ranks naming an undeclared shape set or a set of blocks, a rank below 0, or a second ranks for a set; cover_on naming an undeclared layer or one that is not a cover layer, no ids or an id outside 0..65535, or a second cover_on for a layer; cover_between naming an undeclared layer or one that is not a cover layer, lo not below hi (or NaN), or a second cover_between for a layer; curve fields or zones that refer to each other in a cycle; layers that read each other's cover in a cycle, through their rules or their shape sets' weights zones. Every message ends with a line naming the declaration at fault, which freeze_subject reads."
   fn freeze(p : Pop) : Result(Frozen, String) do
     let fs = List.reverse(p.pp_fields)
     let zs = List.reverse(p.pp_zones)
@@ -697,6 +750,8 @@ mod Strata.Population do
     let lnames = List.map(ls, layer_name)
     let seens = List.reverse(p.pp_seen)
     let rks = List.reverse(p.pp_ranks)
+    let ons = List.reverse(p.pp_on)
+    let bets = List.reverse(p.pp_between)
     let mistake = first_of([
       duplicate("field", "field", fnames), duplicate("zone", "zone", znames), duplicate("shape set", "shapes", snames), duplicate("layer", "layer", lnames),
       first_some(fs, fn d -> check_field(fnames, lnames, d)),
@@ -710,6 +765,10 @@ mod Strata.Population do
       first_some(seens, fn e -> check_seen(ls, ss, e)),
       duplicate("ranks of a shape set", "ranks", List.map(rks, rank_name)),
       first_some(rks, fn e -> check_ranks(ss, e)),
+      duplicate("cover_on of a layer", "cover_on", List.map(ons, on_name)),
+      first_some(ons, fn e -> check_on(ls, e)),
+      duplicate("cover_between of a layer", "cover_between", List.map(bets, between_name)),
+      first_some(bets, fn e -> check_between(ls, e)),
       first_some(fnames, fn n -> field_loop(fs, n, Nil)),
       first_some(znames, fn n -> zone_loop(zs, n, Nil))])
     match mistake do
@@ -719,12 +778,12 @@ mod Strata.Population do
           Err(e) -> Err(e)
           Ok(lorder) ->
             let f = compile(fs, zs, ss, ws, ls, lorder)
-            Ok({ f with fz_seen: List.map(lorder, fn n -> seen_of(seens, n)), fz_ranks: List.map(ss, fn d -> rank_of_set(rks, shapes_name(d))) })
+            Ok({ f with fz_seen: List.map(lorder, fn n -> seen_of(seens, n)), fz_ranks: List.map(ss, fn d -> rank_of_set(rks, shapes_name(d))), fz_on: List.map(lorder, fn n -> on_of(ons, n)), fz_between: List.map(lorder, fn n -> between_of(bets, n)) })
         end
     end
   end
 
-  doc "What a message from freeze or fit_all is about: the kind of declaration at fault (\"field\", \"zone\", \"shapes\", \"weights\", \"layer\", or \"seen_to\" or \"ranks\" for a mistake in a seen_to or ranks call) and its name (for weights, the shape set's and the zone's; for seen_to the layer's, for ranks the shape set's), read from the line \"  about: KIND<tab>NAME...\" every such message ends with; None for any other text. Where two declarations share the name (a duplicate) it is the later one at fault. A name holding a tab or a newline does not read back."
+  doc "What a message from freeze or fit_all is about: the kind of declaration at fault (\"field\", \"zone\", \"shapes\", \"weights\", \"layer\", or \"seen_to\", \"ranks\", \"cover_on\" or \"cover_between\" for a mistake in such a call) and its name (for weights, the shape set's and the zone's; for seen_to, cover_on and cover_between the layer's, for ranks the shape set's), read from the line \"  about: KIND<tab>NAME...\" every such message ends with; None for any other text. Where two declarations share the name (a duplicate) it is the later one at fault. A name holding a tab or a newline does not read back."
   fn freeze_subject(err : String) : Option((String, List(String))) do
     match String.split_first(err, subject_mark()) do
       None -> None
@@ -1080,6 +1139,20 @@ mod Strata.Population do
     match nth_of(f.fz_seen, i) do
       Some(v) -> v
       None -> -1
+    end
+  end
+  doc "Layer i's cover_on block ids (run order); Nil when none were declared (any floor) or for no such layer."
+  fn layer_on(f : Frozen, i : Int) : List(Int) do
+    match nth_of(f.fz_on, i) do
+      Some(v) -> v
+      None -> Nil
+    end
+  end
+  doc "Layer i's cover_between heights (run order): (lo, hi), (-inf, inf) when none were declared or for no such layer."
+  fn layer_between(f : Frozen, i : Int) : (Float, Float) do
+    match nth_of(f.fz_between, i) do
+      Some(v) -> v
+      None -> (float_neg_infinity(), float_infinity())
     end
   end
   doc "Shape set i's rank array (ranks); empty when none was declared (every id ranked by itself) or for no such set."

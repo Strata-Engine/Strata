@@ -1126,3 +1126,34 @@ search's own arrays) has not been profiled.
 
 All twelve combat checks pass, each run twice with the same result. The
 library's Nav and Steer tests (27) and the viewer's tests (92) pass.
+
+# Population core
+
+## Task 9: the island's content placed by the population
+
+CPU by `bench/chunk_stages` (REPS=10 minus REPS=0 under `/usr/bin/time -l`,
+over the 200 surface chunks `STRATA_CHUNK_TIMES` uses, March 0.7.0 at
+6c88ab912). The pre-port harness was rebuilt from a044934 and run in the same
+minutes as the port. Instructions are the stable figure. The viewer's own
+`STRATA_CHUNK_TIMES` run could not be differenced from the session that made
+these figures (its window aborts off the main thread).
+
+| what | before (a044934) | after | load | |
+|---|---|---|---|---|
+| island surface chunk, one at a time (stage 1, the unbatched path STRATA_CHUNK_TIMES times) | 3475 to 3525 us, 60.39 to 60.42 M instructions | 4015 to 4135 us, 70.54 to 70.57 M | 6.4 to 7.2 | 0.3 ms over the Step 1 figure allowed: missed by about 0.25 ms (10.2 M instructions) |
+| a chunk column's full chunks in one call (stage 34; 981 full chunks over the 200 columns, 4.9 a column) | 7275 to 7365 us, 133.8 M a column | 7750 to 7870 us, 141.5 to 141.6 M | 6.4 to 7.2 | about 0.1 ms (1.6 M) more a surface chunk |
+| Step 1, measured before any change | 3860 to 3880 us, 60.56 to 60.84 M | | 42.6 to 47.9 | |
+
+Where the extra goes: `pop_ground`, the population's Ground and Table for a
+chunk column, is 10.7 M instructions over its 50 x 50 columns at 1 m. Of
+that, `fields_with` is 5.3 M (every field, zone and layer density over 2500
+columns, about 2.1 k a column across the population's passes), and the
+density top under each of the about 70 cell candidates is about 2 M (29 k
+each). The remainder is the region, entrance, slope and water fields (about
+2.3 M) and the candidates' cell walk. `place_with` with the chunk's floors is
+1.9 M, against the old tree and ruin blits' 1.2 M and the old grass roll in
+`finish_go`. `sample` shows no single March gap: the cost is spread across
+the population's per-column passes, whose per-turn overhead is the one
+`bench/march/voxel_loop` already reduces. A density top at every Ground
+column was measured first, at 4.3 ms and 73 M instructions a chunk column,
+and refused.

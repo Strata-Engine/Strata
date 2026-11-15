@@ -16,12 +16,16 @@ name() {
     1) echo "island_full (whole chunk)";; 2) echo "atlas window (3 layers + river list)";;
     3) echo "columns (cols3_go)";; 4) echo "talus field (C) + talus_go";;
     5) echo "thermal relax";; 6) echo "area_n (2..5 + span/inner/beard)";;
-    7) echo "inner 32x32 copies";; 8) echo "lattice + entrance fields (C)";;
+    7) echo "island_shared (column half + population)";; 8) echo "lattice + entrance fields (C)";;
     9) echo "cave factors";; 10) echo "4 lattice fills (C)";;
     11) echo "per-voxel density (dens_go)";; 12) echo "any_cut + drop_islands";;
     13) echo "above_go";; 14) echo "surface scan + rule";;
     15) echo "scan + finish_go (subtract 14)";; 16) echo "Chunk.from_flat";;
-    17) echo "tree candidates + tests";; 18) echo "tree blits";; 19) echo "ruin blit";;
+    17) echo "pop_ground (fields, instances, tops)";; 18) echo "place_with with floors";; 19) echo "island_shared, no population";;
+    25) echo "place_with, no floors (stamps)";;
+    40) echo "pop: region field";; 41) echo "pop: entrance field (C)";;
+    42) echo "pop: slope, water, altitude fields";; 43) echo "pop: fields_with";;
+    44) echo "pop: instances";; 45) echo "pop: density tops";;
     20) echo "air early-out";; 21) echo "stone early-out";;
     22) echo "area_n at pad 0 (48 x 48)";; 23) echo "island_full, no trees or ruins";;
     24) echo "any_cut alone";;
@@ -37,7 +41,7 @@ measure() { # stage reps -> "cpu_seconds instructions cycles"
     /cycles elapsed/ { cyc = $1 }
     END { printf "%s %s %s\n", cpu, ins, cyc }'
 }
-STAGES=${*:-"1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 22 23 24 26 27 28 33 34 20 21"}
+STAGES=${*:-"1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 22 23 24 25 26 27 28 33 34 20 21"}
 printf "%-5s %-38s %10s %12s %12s\n" stage what "cpu us" "instr (k)" "cycles (k)"
 for s in $STAGES; do
   r=$REPS; case $s in 20|21|24) r=$((REPS * 100));; esac  # cheap stages need more runs

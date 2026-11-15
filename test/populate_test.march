@@ -1174,14 +1174,15 @@ mod Strata.Test.Populate do
       Test.assert_eq_str(sample_check(f, -35, -2, 70, 1.0, 1), "", "scale 1 level 1 (voxel 2), one Ground at (-35, -2)")
     end
 
-    test "problems lists every wrong-sized array, a slot outside 0..9 and a bad n or scale; fields over it is zeros" do
+    test "problems lists every wrong-sized array, a slot outside 0..31 and a bad n or scale; fields over it is zeros" do
       Test.assert_true(List.is_empty(Pq.problems(Pq.with_field(bare(0, 0, 4, 1.0, 0), 3, NativeArray.make_f32(16, 1.0)))), "a good Ground has none")
       let g = Pq.ground(0, 0, 4, 1.0, 0, NativeArray.make_int(15, 0), NativeArray.make_int(17, 0))
-      let ps = Pq.problems(Pq.with_field(Pq.with_field(g, 2, NativeArray.make_f32(3, 0.0)), 12, NativeArray.make_f32(16, 0.0)))
+      let ps = Pq.problems(Pq.with_field(Pq.with_field(Pq.with_field(g, 2, NativeArray.make_f32(3, 0.0)), 32, NativeArray.make_f32(16, 0.0)), 12, NativeArray.make_f32(16, 0.0)))
       Test.assert_true(has_msg(ps, "tops holds 15"), "tops")
       Test.assert_true(has_msg(ps, "waters holds 17"), "waters")
       Test.assert_true(has_msg(ps, "slot 2 holds 3"), "slot 2's length")
-      Test.assert_true(has_msg(ps, "slot 12 is outside 0..9"), "slot 12")
+      Test.assert_true(has_msg(ps, "slot 32 is outside 0..31"), "slot 32")
+      Test.assert_false(has_msg(ps, "slot 12"), "slot 12 is the game's own")
       Test.assert_eq_int(List.length(ps), 4, "one message each")
       Test.assert_true(has_msg(Pq.problems(Pq.ground(0, 0, 0, 1.0, 0, NativeArray.make_int(1, 0), NativeArray.make_int(1, 0))), "n is 0"), "n 0")
       Test.assert_true(has_msg(Pq.problems(bare(0, 0, 4, 0.0, 0)), "scale is 0"), "scale 0")
@@ -1233,6 +1234,68 @@ mod Strata.Test.Populate do
       Test.assert_true(q >= 205, "0.25 fills at least 20% (" ++ int_to_string(q) ++ ")")
       Test.assert_true(q <= 307, "and at most 30% (" ++ int_to_string(q) ++ ")")
       Test.assert_eq_int(roll_match(Pq.place(cover_pop(0.25), 4, k0, floor_chunk(10), g), 4, 3, 10, 0.25, 0), -1, "a column is covered exactly when unit(cell(seed, salt, x, 10, z)) < 0.25, the floor's own voxel")
+    end
+
+    test "place: a game slot (10..31) reads back as a field and drives a rule" do
+      let f = frozen_of(Pn.layer_cover(Pn.shapes_blocks(Pn.field_ground(Pn.new(), "entrance", 17), "b", [7]), "c", "b", Pn.rule(1.0, Nil, Nil, ["open"]), 1) |> Pn.zone_band("open", "entrance", 0.5, 2.0))
+      let vals = NativeArray.set_f32(NativeArray.make_f32(1024, 0.0), 5 + 32 * 6, 1.0)
+      let g = Pq.with_field(flat_ground(0, 0, 32, 1.0, 10), 17, vals)
+      Test.assert_true(Pq.field_at(Pq.fields(f, 1, g), "entrance", 5 + 32 * 6) == 1.0, "slot 17 reads back")
+      let out = Pq.place(f, 1, Strata.Coord.key(0, 0, 0), floor_chunk(10), g)
+      Test.assert_eq_int(count_layer(out, 7, 11), 1023, "every column but the one the game's slot shuts")
+      Test.assert_eq_int(Strata.Chunk.get_or(out, 5, 11, 6, -1), 0, "that column is bare")
+    end
+
+    test "place: cover_on places only on floors whose own voxel holds one of the ids, at every floor of a column" do
+      let k0 = Strata.Coord.key(0, 0, 0)
+      -- stone floor at 10, its top row grass (3) on x < 16, dirt (2) elsewhere; a ledge of grass at 20 over x = 3
+      let c0 = Strata.Chunk.fill_box(Strata.Chunk.fill_box(floor_chunk(10), 0, 10, 0, 15, 10, 31, 3), 16, 10, 0, 31, 10, 31, 2)
+      let c = Strata.Chunk.fill_box(c0, 3, 20, 0, 3, 20, 31, 3)
+      let base = Pn.layer_cover(Pn.shapes_blocks(Pn.new(), "g", [7]), "grass", "g", Pn.rule(1.0, Nil, Nil, Nil), 3)
+      let on3 = frozen_of(Pn.cover_on(base, "grass", [3]))
+      let g = flat_ground(0, 0, 32, 1.0, 10)
+      let out = Pq.place(on3, 4, k0, c, g)
+      Test.assert_eq_int(count_box(out, 7, 0, 15, 11, 11), 16 * 32, "every grass floor at 10")
+      Test.assert_eq_int(count_box(out, 7, 16, 31, 11, 11), 0, "none on dirt")
+      Test.assert_eq_int(hash_of(Pq.place(frozen_of(Pn.cover_on(base, "grass", [2, 3])), 4, k0, c, g)), hash_of(Pq.place(frozen_of(base), 4, k0, c, g)), "ids 2 and 3 cover every floor here, as no cover_on does")
+      -- two floors a column (with_surfaces): the ledge's grass at 20 and the floor at 10
+      let counts = NativeArray.make_int(1024, 2)
+      let ys = List.fold_left(List.range(0, 1024), NativeArray.make_int(2048, 0), fn (a, i) -> NativeArray.set_int(NativeArray.set_int(a, 2 * i, 20), 2 * i + 1, 10))
+      let gs = Pq.with_surfaces(g, counts, ys, NativeArray.make_int(2048, 0))
+      let out2 = Pq.place(on3, 4, k0, c, gs)
+      Test.assert_eq_int(count_box(out2, 7, 3, 3, 21, 21), 32, "the ledge's grass floor holds cover")
+      Test.assert_eq_int(count_box(out2, 7, 0, 31, 21, 21), 32, "and no floor at 20 that is air")
+      Test.assert_eq_int(count_box(out2, 7, 0, 15, 11, 11), 16 * 32, "each column's floor at 10 is rolled too, under the ledge included")
+      Test.assert_eq_int(count_box(out2, 7, 16, 31, 11, 11), 0, "and still none on dirt")
+    end
+
+    test "place: cover_between places only on floors whose height is above lo and at most hi, at every floor of a column" do
+      let k0 = Strata.Coord.key(0, 0, 0)
+      let base = Pn.layer_cover(Pn.shapes_blocks(Pn.new(), "g", [7]), "grass", "g", Pn.rule(1.0, Nil, Nil, Nil), 3)
+      -- floors at 10 and 20 in every column (a ledge of stone at 20 over the floor at 10)
+      let c = Strata.Chunk.fill_box(floor_chunk(10), 0, 20, 0, 31, 20, 31, 1)
+      let counts = NativeArray.make_int(1024, 2)
+      let ys = List.fold_left(List.range(0, 1024), NativeArray.make_int(2048, 0), fn (a, i) -> NativeArray.set_int(NativeArray.set_int(a, 2 * i, 20), 2 * i + 1, 10))
+      let gs = Pq.with_surfaces(flat_ground(0, 0, 32, 1.0, 10), counts, ys, NativeArray.make_int(2048, 0))
+      let out = Pq.place(frozen_of(Pn.cover_between(base, "grass", 10.0, 20.0)), 4, k0, c, gs)
+      Test.assert_eq_int(count_layer(out, 7, 21), 1024, "the floor at 20 m (above 10, at most 20) holds cover")
+      Test.assert_eq_int(count_layer(out, 7, 11), 0, "the floor at 10 m (not above 10) none")
+      let both = Pq.place(frozen_of(Pn.cover_between(base, "grass", 9.0, 20.0)), 4, k0, c, gs)
+      Test.assert_eq_int(count_layer(both, 7, 11), 1024, "above 9: the floor at 10 too")
+      let dense = Pn.layer_cover(Pn.shapes_blocks(Pn.new(), "g", [7]), "grass", "g", Pn.rule(4.0, Nil, Nil, Nil), 3)
+      let half = Pq.place(frozen_of(Pn.cover_between(dense, "grass", 4.0, 5.0)), 4, k0, Strata.Chunk.fill_box(floor_chunk(10), 0, 20, 0, 31, 20, 31, 1), Pq.with_surfaces(flat_ground(0, 0, 32, 0.5, 10), counts, ys, NativeArray.make_int(2048, 0)))
+      Test.assert_eq_int(count_layer(half, 7, 11), 1024, "at 0.5 m the floor at voxel 10 is 5 m high: inside 4..5")
+      Test.assert_eq_int(count_layer(half, 7, 21), 0, "and the one at voxel 20, 10 m, is not")
+    end
+
+    test "place: cover_on refuses a floor below the chunk, whose voxel the chunk does not hold" do
+      -- floors at 31 (chunk 0's top row) and the voxel above in chunk 1; chunk 1 holds air only
+      let base = Pn.layer_cover(Pn.shapes_blocks(Pn.new(), "g", [7]), "grass", "g", Pn.rule(1.0, Nil, Nil, Nil), 3)
+      let g = flat_ground(0, 0, 32, 1.0, 31)
+      let k1 = Strata.Coord.key(0, 1, 0)
+      let air = Strata.Chunk.uniform(0)
+      Test.assert_eq_int(count_layer(Pq.place(frozen_of(base), 4, k1, air, g), 7, 0), 1024, "without cover_on the floor at 31 is covered from chunk 1")
+      Test.assert_eq_int(hash_of(Pq.place(frozen_of(Pn.cover_on(base, "grass", [0])), 4, k1, air, g)), hash_of(air), "with cover_on it is not, even for id 0")
     end
 
     test "place: density is per square metre: at scale 0.5 a layer at 0.25 fills 4% to 9% of the columns" do
@@ -1491,6 +1554,10 @@ mod Strata.Test.Populate do
       Test.assert_eq_int(Pq.i_layer(i0), 0, "and its layer's index")
       Test.assert_true(insts_str(Pq.instances(f, 12, Pq.fields(f, 12, whole), whole, "trees")) != insts_str(all), "another seed, other instances")
       Test.assert_eq_int(List.length(Pq.instances(f, 11, Pq.fields(f, 11, whole), whole, "nope")), 0, "an undeclared layer has none")
+      let p = Pq.plan(f)
+      Test.assert_eq_str(insts_str(Pq.instances_with(p, 11, Pq.fields_with(p, 11, whole), whole, 0)), insts_str(all), "instances_with by run-order index, with a plan, gives the same")
+      Test.assert_eq_int(List.length(Pq.instances_with(p, 11, Pq.fields_with(p, 11, whole), whole, 1)), 0, "an index past the layers has none")
+      Test.assert_eq_int(List.length(Pq.instances_with(p, 11, Pq.fields_with(p, 11, whole), whole, -1)), 0, "nor a negative one")
     end
 
     test "instances: one in every cell at 1 / cell^2 and above, none where a zone fails at its column, none out of its cell at jitter 0.6; the variant by the column's zone" do
