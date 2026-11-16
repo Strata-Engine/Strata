@@ -23,15 +23,16 @@ mod Strata.Vox do
   needs IO.Foreign
   needs IO.FileRead
 
-  -- A model: its name ('' without a scene graph), size, translation (the file's axes, z up), and voxels as (x, y, z, colour index) quads of bytes.
-  type VoxModel = { name : String, sx : Int, sy : Int, sz : Int, tx : Int, ty : Int, tz : Int, voxels : NativeU8Arr }
+  -- A model: its name ('' without a scene graph), size, translation (the file's axes, z up), voxels as (x, y, z, colour index) quads of bytes,
+  -- and whether a transform above it rotates or mirrors it (`_r` other than 4, the identity; the reader does not turn the voxels).
+  type VoxModel = { name : String, sx : Int, sy : Int, sz : Int, tx : Int, ty : Int, tz : Int, voxels : NativeU8Arr, turned : Bool }
 
   -- A file: its models in file order, the palette (256 entries of r, g, b, a bytes; index 0 empty), per index emission (0..1) and roughness,
   -- and the voxel size in metres the root transform (node 0) gives as `_strata_voxel` (0 when it gives none).
   type Vox = { models : List(VoxModel), palette : NativeU8Arr, emit : NativeF32Arr, rough : NativeF32Arr, scale : Float }
 
   -- a transform node: its id, its child, its name, its translation
-  type VoxTrn = VoxTrnC(Int, Int, String, Int, Int, Int)
+  type VoxTrn = VoxTrnC(Int, Int, String, Int, Int, Int, Bool)
 
   -- what the walk has gathered; lists newest first
   type VoxGot = { sizes : List((Int, Int, Int)), xyzis : List(NativeU8Arr), pal : Option(NativeU8Arr), g_emit : NativeF32Arr, g_rough : NativeF32Arr, g_scale : Float,
@@ -112,9 +113,11 @@ mod Strata.Vox do
         (attrs, p1) ->
           let child = i32(a, p1)
           let frames = i32(a, p1 + 12)
-          let t = if frames > 0 do (match dict_at(a, p1 + 16, stop) do (fk, _) -> ints3(lookup(fk, "_t")) end) else (0, 0, 0) end
+          let fk = if frames > 0 do (match dict_at(a, p1 + 16, stop) do (d, _) -> d end) else Nil end
+          let t = ints3(lookup(fk, "_t"))
+          let rot = match lookup(fk, "_r") do Some(r) -> String.trim(r) != "4" | None -> false end
           let g1 = if i32(a, p) == 0 do { g with g_scale: num(lookup(attrs, "_strata_voxel"), 0.0) } else g end
-          match t do (x, y, z) -> { g1 with trns: Cons(VoxTrnC(i32(a, p), child, unwrap_or(lookup(attrs, "_name"), ""), x, y, z), g1.trns) } end
+          match t do (x, y, z) -> { g1 with trns: Cons(VoxTrnC(i32(a, p), child, unwrap_or(lookup(attrs, "_name"), ""), x, y, z, rot), g1.trns) } end
       end
     else if id == "nGRP" do
       match dict_at(a, p + 4, stop) do (_, p1) -> { g with grps: Cons((i32(a, p), ids_go(a, p1 + 4, imin(i32(a, p1), (stop - p1 - 4) / 4), Nil)), g.grps) } end
@@ -144,20 +147,20 @@ mod Strata.Vox do
   end
 
   -- ── the scene ────────────────────────────────────────────────────────────
-  pfn trn_over(g : VoxGot, child : Int) : Option(VoxTrn) do List.find(g.trns, fn t -> match t do VoxTrnC(_, c, _, _, _, _) -> c == child end) end
+  pfn trn_over(g : VoxGot, child : Int) : Option(VoxTrn) do List.find(g.trns, fn t -> match t do VoxTrnC(_, c, _, _, _, _, _) -> c == child end) end
   pfn grp_over(g : VoxGot, child : Int) : Option(Int) do
     match List.find(g.grps, fn gk -> match gk do (_, kids) -> List.member(kids, child) end) do Some((gid, _)) -> Some(gid) | None -> None end
   end
-  -- the sum of the translations above node n, at most 64 levels
-  pfn up(g : VoxGot, n : Int, acc : (Int, Int, Int), depth : Int) : (Int, Int, Int) do
+  -- the sum of the translations above node n, at most 64 levels, and whether any of those transforms turns it
+  pfn up(g : VoxGot, n : Int, acc : (Int, Int, Int, Bool), depth : Int) : (Int, Int, Int, Bool) do
     if depth > 64 do acc
     else
       match trn_over(g, n) do
         None -> acc
-        Some(VoxTrnC(tid, _, _, x, y, z)) ->
+        Some(VoxTrnC(tid, _, _, x, y, z, r)) ->
           match acc do
-            (ax, ay, az) ->
-              let acc2 = (ax + x, ay + y, az + z)
+            (ax, ay, az, ar) ->
+              let acc2 = (ax + x, ay + y, az + z, ar || r)
               match grp_over(g, tid) do None -> acc2 | Some(gid) -> up(g, gid, acc2, depth + 1) end
           end
       end
@@ -168,15 +171,15 @@ mod Strata.Vox do
       (sid, mid, sname) ->
         match (List.nth_opt(sizes, mid), List.nth_opt(xyzis, mid)) do
           (Some((sx, sy, sz)), Some(vs)) ->
-            let name = if !String.is_empty(sname) do sname else (match trn_over(g, sid) do Some(VoxTrnC(_, _, n, _, _, _)) -> n | None -> "" end) end
-            match up(g, sid, (0, 0, 0), 0) do (tx, ty, tz) -> Some({ name: name, sx: sx, sy: sy, sz: sz, tx: tx, ty: ty, tz: tz, voxels: vs }) end
+            let name = if !String.is_empty(sname) do sname else (match trn_over(g, sid) do Some(VoxTrnC(_, _, n, _, _, _, _)) -> n | None -> "" end) end
+            match up(g, sid, (0, 0, 0, false), 0) do (tx, ty, tz, tr) -> Some({ name: name, sx: sx, sy: sy, sz: sz, tx: tx, ty: ty, tz: tz, voxels: vs, turned: tr }) end
           _ -> None
         end
     end
   end
   pfn bare(sizes : List((Int, Int, Int)), xyzis : List(NativeU8Arr)) : List(VoxModel) do
     match (sizes, xyzis) do
-      (Cons((sx, sy, sz), s2), Cons(vs, x2)) -> Cons({ name: "", sx: sx, sy: sy, sz: sz, tx: 0, ty: 0, tz: 0, voxels: vs }, bare(s2, x2))
+      (Cons((sx, sy, sz), s2), Cons(vs, x2)) -> Cons({ name: "", sx: sx, sy: sy, sz: sz, tx: 0, ty: 0, tz: 0, voxels: vs, turned: false }, bare(s2, x2))
       _ -> Nil
     end
   end

@@ -483,6 +483,9 @@ def surface(vs):
 
 def vox_bytes(f, colours, glow):
     """The figure as a MagicaVoxel file: each part a model, named and placed (low corner + floor(size / 2))."""
+    # MagicaVoxel is right-handed with z up: a figure facing +y has its left on -x. The recipes put the left on +x (the rig's
+    # way); the file holds them mirrored, so they show the right way round in the editor (Strata.Character mirrors x back).
+    f.parts = {n: {(-x, y, z): c for (x, y, z), c in vs.items()} for n, vs in f.parts.items()}
     names = PARTS + [n for n in f.order if n not in PARTS]
     models, nodes = [], []
     kids = [2 + 2 * k for k in range(len(names))]
