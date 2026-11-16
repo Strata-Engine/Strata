@@ -430,8 +430,9 @@ static int make_swapchain(void) {
     if (!make_image(FMT_ALBEDO, tu, VK_IMAGE_ASPECT_COLOR_BIT, &g.gb_albedo.img, &g.gb_albedo.mem, &g.gb_albedo.view)) return 0;
     if (!make_image(FMT_NM, tu, VK_IMAGE_ASPECT_COLOR_BIT, &g.gb_nm.img, &g.gb_nm.mem, &g.gb_nm.view)) return 0;
     if (!make_image(FMT_LIT, tu, VK_IMAGE_ASPECT_COLOR_BIT, &g.lit.img, &g.lit.mem, &g.lit.view)) return 0;
-    /* the gather pass traces one pixel of each 2 x 2 block; STRATA_TRACE_FULL=1 every pixel, as before it was split from the light pass */
-    if (!g.trace_scale) { const char *tf = getenv("STRATA_TRACE_FULL"); g.trace_scale = tf && tf[0] == '1' ? 1 : 2; }
+    /* the gather pass traces one pixel of each trace_scale x trace_scale block (sv_set_trace_scale, default 2);
+     * STRATA_TRACE_FULL=1 every pixel whatever the game asked, as before it was split from the light pass */
+    { const char *tf = getenv("STRATA_TRACE_FULL"); if (tf && tf[0] == '1') g.trace_scale = 1; else if (!g.trace_scale) g.trace_scale = 2; }
     g.trace_extent = (VkExtent2D){ (ext.width + g.trace_scale - 1) / g.trace_scale, (ext.height + g.trace_scale - 1) / g.trace_scale };
     for (int f = 0; f < SV_FRAMES; f++) {
         if (!make_image_sized(g.trace_extent, FMT_LIT, tu, VK_IMAGE_ASPECT_COLOR_BIT, &g.hist[f].img, &g.hist[f].mem, &g.hist[f].view)) return 0;
@@ -3000,6 +3001,16 @@ void sv_set_quality(int64_t sky_rays, int64_t reflections) {
     g.sky_rays = rays;
     g.reflections = reflections != 0;
 }
+/* How finely the light is traced: one pixel of each [scale] x [scale] block
+ * (1..4; 1 every pixel, 2 the default). The screen-sized images are made
+ * again before the next frame, and what the light pass remembered starts over. */
+void sv_set_trace_scale(int64_t scale) {
+    int sc = scale < 1 ? 1 : (scale > 4 ? 4 : (int)scale);
+    if (sc == g.trace_scale) return;
+    g.trace_scale = sc; g.hist_reset = SV_FRAMES;
+    if (g.ok) g.resized = 1;
+}
+int64_t sv_trace_scale(void) { return g.trace_scale ? g.trace_scale : 2; }
 /* Add [count] spray particles (at most 512 a call) at (x, y, z), flying at
  * about (vx, vy, vz) m/s, each velocity component off by up to [spread],
  * living [life] seconds, drawn with texture layer [tex]. They are born at
