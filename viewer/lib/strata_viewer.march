@@ -380,13 +380,13 @@ mod StrataViewer do
   -- the tree templates (species s at 3 s .. 3 s + 2), the ruins (wall, tower, arch, or none), the settings,
   -- the population if one was read, and the plan the ground is drawn to the sites by (the population's, else
   -- a plan of the sites alone)
-  type Decor = Decor(List(Strata.Template.Template), List(Strata.Template.Template), Gp, Option(DecorPop), Option(Strata.Populate.PopPlan))
+  type Decor = Decor(List(Strata.Template.Template), List(Strata.Template.Template), Gp, Option(DecorPop), Option(Strata.Populate.PopPlan), Bool)
 
   doc "Nothing standing on atlas a's island at the default settings: no trees, ruins, posts or tall grass; the land alone, its ground still drawn to each site's floor."
   fn bare_decor(a : Strata.Atlas.Atlas) : Decor do bare_decor_of(gp_default(), a) end
 
   doc "As bare_decor, at settings g."
-  fn bare_decor_of(g : Gp, a : Strata.Atlas.Atlas) : Decor do Decor(Nil, Nil, g, None, beard_plan(g, a)) end
+  fn bare_decor_of(g : Gp, a : Strata.Atlas.Atlas) : Decor do Decor(Nil, Nil, g, None, beard_plan(g, a), false) end
 
   -- the atlas's sites, as the population takes them
   pfn pop_sites(a : Strata.Atlas.Atlas) : List(Strata.Population.PopSite) do
@@ -554,17 +554,31 @@ mod StrataViewer do
         Some(DecorPop(_, p)) -> Some(p)
         None -> beard_plan(g, a)
       end
-    Decor(ts, ruins, g, pop, ground)
+    Decor(ts, ruins, g, pop, ground, false)
   end
 
   doc "The tree templates of a Decor (species s at 3 s .. 3 s + 2)."
-  fn decor_trees(d : Decor) : List(Strata.Template.Template) do match d do Decor(v, _, _, _, _) -> v end end
+  fn decor_trees(d : Decor) : List(Strata.Template.Template) do match d do Decor(v, _, _, _, _, _) -> v end end
   doc "The ruin templates of a Decor: wall, tower, arch, or none."
-  fn decor_ruins(d : Decor) : List(Strata.Template.Template) do match d do Decor(_, v, _, _, _) -> v end end
+  fn decor_ruins(d : Decor) : List(Strata.Template.Template) do match d do Decor(_, v, _, _, _, _) -> v end end
   doc "The generator settings a Decor carries."
-  fn decor_gp(d : Decor) : Gp do match d do Decor(_, _, g, _, _) -> g end end
-  pfn decor_pop(d : Decor) : Option(DecorPop) do match d do Decor(_, _, _, v, _) -> v end end
-  pfn decor_ground(d : Decor) : Option(Strata.Populate.PopPlan) do match d do Decor(_, _, _, _, v) -> v end end
+  fn decor_gp(d : Decor) : Gp do match d do Decor(_, _, g, _, _, _) -> g end end
+  pfn decor_pop(d : Decor) : Option(DecorPop) do match d do Decor(_, _, _, v, _, _) -> v end end
+  -- whether d's Ground supplies every ground slot at every column (decor_everywhere)
+  pfn decor_full(d : Decor) : Bool do match d do Decor(_, _, _, _, _, v) -> v end end
+  doc "d with every ground slot of its population supplied at every column of a chunk column's Ground, not only where a layer reads it: the same chunks, at more cost (for checking the narrow supply)."
+  fn decor_everywhere(d : Decor) : Decor do match d do Decor(ts, rs, g, pop, gp, _) -> Decor(ts, rs, g, pop, gp, true) end end
+  doc "d with the population of island.pop's [text] instead (the same trees, ruins and settings; [scale] the world's metres a voxel), or the first mistake."
+  fn decor_with(d : Decor, a : Strata.Atlas.Atlas, scale : Float, text : String) : Result(Decor, String) do
+    match d do
+      Decor(ts, rs, g, _, _, full) ->
+        match pop_of(g, a, ts, rs, scale, text) do
+          Ok(dp) -> match dp do DecorPop(_, p) -> Ok(Decor(ts, rs, g, Some(dp), Some(p), full)) end
+          Err(m) -> Err(m)
+        end
+    end
+  end
+  pfn decor_ground(d : Decor) : Option(Strata.Populate.PopPlan) do match d do Decor(_, _, _, _, v, _) -> v end end
   doc "The population a Decor places, frozen and fitted; None when island.pop could not be read."
   fn decor_frozen(d : Decor) : Option(Strata.Population.Frozen) do
     match decor_pop(d) do
@@ -1189,18 +1203,6 @@ mod StrataViewer do
       rows_go(g, seed, gx, gz, tx, tz, r0, scale, NativeArray.set_f32(out, k, a0 *. (1.0 -. tz) +. a1 *. tz), k + 1, cnt)
     end
   end
-  pfn top_go(cv : Cv, rows : NativeF32Arr, r0 : Int, h : Float, cm : Float, scale : Float, y : Int, low : Int) : Int do
-    if y < low do low
-    else
-      let r = fdiv(y, 8)
-      let t = int_to_float(y - 8 * r) *. 0.125
-      let n0 = NativeArray.get_f32(rows, r - r0)
-      let n = n0 +. (NativeArray.get_f32(rows, r - r0 + 1) -. n0) *. t
-      let ym = int_to_float(y) *. scale
-      let d = match cv do Cv(a, sq, sea, _, _, _, _, _) -> (h -. ym) *. sq +. a *. cm *. shaped(a, sea, n, h, cm, ym) end
-      if d >= 0.0 do y else top_go(cv, rows, r0, h, cm, scale, y - 1, low) end
-    end
-  end
 
   doc "The highest solid voxel of an island column's density (caves aside), at whole-voxel column (wx, wz) with 2D height h metres and calm cm: where a tree stands."
   fn density_top(g : Gp, seed : Int, wx : Int, wz : Int, h : Float, cm : Float, scale : Float) : Int do
@@ -1210,8 +1212,31 @@ mod StrataViewer do
     let low = vox(h -. p_amp(g), scale) - 1
     let r0 = fdiv(low, 8)
     let cnt = fdiv(hi, 8) - r0 + 2
-    let rows = rows_go(g, seed, gx, gz, int_to_float(wx - gx) *. 0.25, int_to_float(wz - gz) *. 0.25, r0, scale, NativeArray.make_f32(cnt, 0.0), 0, cnt)
-    top_go(cave_vals(g), rows, r0, h, cm, scale, hi, low)
+    -- the rows are worked out as the walk down from hi reaches them (most columns stop near h, far above low)
+    top_lazy(g, seed, gx, gz, int_to_float(wx - gx) *. 0.25, int_to_float(wz - gz) *. 0.25, r0, scale, cave_vals(g), NativeArray.make_f32(cnt, 0.0), NativeArray.make_u8(cnt, 0), h, cm, hi, low)
+  end
+  -- top_go with row k of the lattice noise worked out (rows_go's one row) the first time the walk reads it
+  pfn row_in(g : Gp, seed : Int, gx : Int, gz : Int, tx : Float, tz : Float, r0 : Int, scale : Float, rows : NativeF32Arr, got : NativeU8Arr, k : Int) : (NativeF32Arr, NativeU8Arr) do
+    if NativeArray.get_u8(got, k) == 1 do (rows, got)
+    else (rows_go(g, seed, gx, gz, tx, tz, r0, scale, rows, k, k + 1), NativeArray.set_u8(got, k, 1)) end
+  end
+  pfn top_lazy(g : Gp, seed : Int, gx : Int, gz : Int, tx : Float, tz : Float, r0 : Int, scale : Float, cv : Cv, rows : NativeF32Arr, got : NativeU8Arr, h : Float, cm : Float, y : Int, low : Int) : Int do
+    if y < low do low
+    else
+      let r = fdiv(y, 8)
+      match row_in(g, seed, gx, gz, tx, tz, r0, scale, rows, got, r - r0) do
+        (rows1, got1) ->
+          match row_in(g, seed, gx, gz, tx, tz, r0, scale, rows1, got1, r - r0 + 1) do
+            (rows2, got2) ->
+              let t = int_to_float(y - 8 * r) *. 0.125
+              let n0 = NativeArray.get_f32(rows2, r - r0)
+              let n = n0 +. (NativeArray.get_f32(rows2, r - r0 + 1) -. n0) *. t
+              let ym = int_to_float(y) *. scale
+              let d = match cv do Cv(a, sq, sea, _, _, _, _, _) -> (h -. ym) *. sq +. a *. cm *. shaped(a, sea, n, h, cm, ym) end
+              if d >= 0.0 do y else top_lazy(g, seed, gx, gz, tx, tz, r0, scale, cv, rows2, got2, h, cm, y - 1, low) end
+          end
+      end
+    end
   end
 
   -- ── The population's Ground ──────────────────────────────────────────────
@@ -1220,21 +1245,21 @@ mod StrataViewer do
   -- evaluated only where they are read (Strata.Populate.fields_for): a
   -- cover layer's at the chunk's own 32 x 32 columns, a scatter layer's at
   -- the columns its candidates stand on (cell_places: every cell's
-  -- candidate, whatever the density), a site layer's nowhere. The viewer supplies the ground
-  -- fields (supplied_slots) only where a rule reads them: water depth at
-  -- every such column; slope (central differences a metre's worth of
-  -- columns each side; the area is cut wider than the Ground where the
-  -- pad's spare outer columns are fewer, ring_cols), region (one region_at
-  -- a sample, regions_tab), entrance (the noise at the column's corner:
+  -- candidate, whatever the density), a site layer's nowhere. Each ground
+  -- slot is supplied wherever some layer reads it, the columns
+  -- Strata.Populate.slots_read gives for those masks, so any population the
+  -- file declares is evaluated as if every slot were supplied everywhere:
+  -- slope (central differences a metre's worth of columns each side; the
+  -- area is cut wider than the Ground where the pad's spare outer columns
+  -- are fewer, ring_cols), water depth, region (one region_at a sample,
+  -- regions_tab), entrance (the noise at the column's corner:
   -- island_shared's own 32 x 32 inside the chunk, Strata.Noise.sample2
-  -- outside it) and stand at the candidates' columns, where the scatter
-  -- layers read them.
-  -- Stand and the tops hold the density top only under the candidates that
-  -- are instances when every stand is let through (a first, cheap pass over
-  -- the candidates' columns alone): a density top costs a column of noise
-  -- rows. Elsewhere stand reads 1e9 and a top -2^40, where nothing reads
-  -- them. Above level 0 no field is read (table_for). Made once per chunk
-  -- column (island_shared).
+  -- outside it) and stand (the density top's height). The tops are the
+  -- density top at every candidate's column, where an instance can stand,
+  -- and -2^40 elsewhere, where nothing reads them; a density top walks its
+  -- column's noise rows down from the top only as far as it needs. Above
+  -- level 0 no field is read (table_for). Made once per chunk column
+  -- (island_shared).
   type IslandPop = IslandPop(Strata.Populate.Ground, Strata.Populate.Table, Int)
 
   -- how many columns a metre is at [scale] metres a voxel, at least one: how far each side the slope is sampled
@@ -1325,67 +1350,70 @@ mod StrataViewer do
   pfn mark_chunk(m : NativeU8Arr, n : Int, pad : Int, c : Int) : NativeU8Arr do
     if c >= 1024 do m else mark_chunk(NativeArray.set_u8(m, (c % 32 + pad) + n * (c / 32 + pad), 1), n, pad, c + 1) end
   end
-  -- the density top at the column of each instance x: the tops and the stand field (metres) there
-  pfn stands_go(g : Gp, seed : Int, xs : List(Strata.Populate.PopInstance), ha : NativeF32Arr, ca : NativeF32Arr, na : Int, k : Int, gx0 : Int, gz0 : Int, n : Int, vs : Float, tops : NativeIntArr, st : NativeF32Arr) : (NativeIntArr, NativeF32Arr) do
-    match xs do
-      Nil -> (tops, st)
-      Cons(x, rest) ->
-        let i = float_to_int(Math.floor(Strata.Populate.i_xm(x) /. vs)) - gx0
-        let j = float_to_int(Math.floor(Strata.Populate.i_zm(x) /. vs)) - gz0
-        let inside = if i < 0 do false else if i >= n do false else if j < 0 do false else j < n end end end
-        if inside do
-          let ac = (i + k) + na * (j + k)
-          let top = density_top(g, seed, gx0 + i, gz0 + j, NativeArray.get_f32(ha, ac), NativeArray.get_f32(ca, ac), vs)
-          stands_go(g, seed, rest, ha, ca, na, k, gx0, gz0, n, vs, NativeArray.set_int(tops, i + n * j, top), NativeArray.set_f32(st, i + n * j, int_to_float(top) *. vs))
-        else stands_go(g, seed, rest, ha, ca, na, k, gx0, gz0, n, vs, tops, st) end
+  -- the density top at every column of tm (tops, voxels) and, where sm holds, as the stand field (metres)
+  pfn stands_go(g : Gp, seed : Int, tm : NativeU8Arr, sm : NativeU8Arr, ha : NativeF32Arr, ca : NativeF32Arr, na : Int, k : Int, gx0 : Int, gz0 : Int, n : Int, vs : Float, tops : NativeIntArr, st : NativeF32Arr, c : Int) : (NativeIntArr, NativeF32Arr) do
+    if c >= n * n do (tops, st)
+    else
+      let wt = NativeArray.get_u8(tm, c) == 1
+      let ws = NativeArray.get_u8(sm, c) == 1
+      if wt || ws do
+        let i = c % n
+        let j = c / n
+        let ac = (i + k) + na * (j + k)
+        let top = density_top(g, seed, gx0 + i, gz0 + j, NativeArray.get_f32(ha, ac), NativeArray.get_f32(ca, ac), vs)
+        stands_go(g, seed, tm, sm, ha, ca, na, k, gx0, gz0, n, vs, if wt do NativeArray.set_int(tops, c, top) else tops end, if ws do NativeArray.set_f32(st, c, int_to_float(top) *. vs) else st end, c + 1)
+      else stands_go(g, seed, tm, sm, ha, ca, na, k, gx0, gz0, n, vs, tops, st, c + 1) end
     end
   end
   pfn scatter_layers(f : Strata.Population.Frozen) : List(Int) do
     List.filter(List.range(0, Strata.Population.layer_count(f)), fn l -> Strata.Population.layer_kind(f, l) == 1)
   end
-  -- fields where they are read at level 0, one mask a layer (run order): a cover layer's the chunk's columns, a
-  -- scatter layer's its candidates' columns, a site layer's none; above level 0 none is read
-  pfn table_at(f : Strata.Population.Frozen, p : Strata.Populate.PopPlan, seed : Int, gr : Strata.Populate.Ground, lvl : Int, chunk : NativeU8Arr, cand : NativeU8Arr) : Strata.Populate.Table do
-    if lvl == 0 do
-      let none = NativeArray.make_u8(NativeArray.length_u8(cand), 0)
-      Strata.Populate.fields_for(p, seed, gr, List.map(List.range(0, Strata.Population.layer_count(f)), fn l ->
-        let kind = Strata.Population.layer_kind(f, l)
-        if kind == 0 do chunk else if kind == 1 do cand else none end end))
-    else Strata.Populate.table_for(p, gr) end
+  -- the masks each layer's Table is read at (run order): a cover layer the chunk's columns (level 0 only), a
+  -- scatter layer its candidates' columns, a site layer none
+  pfn layer_masks(f : Strata.Population.Frozen, chunk : NativeU8Arr, cand : NativeU8Arr, none : NativeU8Arr) : List(NativeU8Arr) do
+    List.map(List.range(0, Strata.Population.layer_count(f)), fn l ->
+      let kind = Strata.Population.layer_kind(f, l)
+      if kind == 0 do chunk else if kind == 1 do cand else none end end)
+  end
+  -- the columns where the population reads ground slot s (Strata.Populate.slots_read), none when it reads none
+  pfn slot_mask(reads : List((Int, NativeU8Arr)), s : Int, none : NativeU8Arr) : NativeU8Arr do
+    match List.find(reads, fn e -> match e do (k, _) -> k == s end) do
+      Some((_, m)) -> m
+      None -> none
+    end
   end
   -- The Ground and Table of population (f, p) over an area na x na of H ha, calm ca, lake and river lines la,
   -- ra, cut k columns in each side: n = na - 2 k columns from whole-voxel column (gx0, gz0) of level lvl, vs
-  -- metres a voxel (s0 at level 0); ens the chunk's 32 x 32 of entrance noise at its column corners
-  pfn pop_ground(a : Strata.Atlas.Atlas, g : Gp, f : Strata.Population.Frozen, p : Strata.Populate.PopPlan, ha : NativeF32Arr, ca : NativeF32Arr, la : NativeIntArr, ra : NativeIntArr, ens : NativeF32Arr, na : Int, k : Int, gx0 : Int, gz0 : Int, s0 : Float, lvl : Int, vs : Float, seed : Int) : IslandPop do
+  -- metres a voxel (s0 at level 0); ens the chunk's 32 x 32 of entrance noise at its column corners. Each
+  -- ground slot is supplied wherever some layer reads it (Strata.Populate.slots_read over the layers' masks),
+  -- the tops at every candidate's column (where an instance can stand).
+  pfn pop_ground(a : Strata.Atlas.Atlas, g : Gp, f : Strata.Population.Frozen, p : Strata.Populate.PopPlan, ha : NativeF32Arr, ca : NativeF32Arr, la : NativeIntArr, ra : NativeIntArr, ens : NativeF32Arr, na : Int, k : Int, gx0 : Int, gz0 : Int, s0 : Float, lvl : Int, vs : Float, seed : Int, full : Bool) : IslandPop do
     let n = na - 2 * k
     let nn = n * n
     let pad = (n - 32) / 2
     let waters = NativeArray.make_int(nn, 0 - 1099511627776)
     let deep = NativeArray.make_int(nn, 0 - 1099511627776)
+    let none = NativeArray.make_u8(nn, 0)
     let g0 = Strata.Populate.ground(gx0, gz0, n, s0, lvl, deep, waters)
-    -- every candidate the scatter layers' cells can hold here, and the columns that are read
+    -- every candidate the scatter layers' cells can hold here, and where each layer's Table is read
     let places = List.flat_map(scatter_layers(f), fn l -> Strata.Populate.cell_places(p, seed, g0, l))
     let cand = mark_places(NativeArray.make_u8(nn, 0), places, gx0, gz0, n, vs)
-    let chunk = if lvl == 0 do mark_chunk(NativeArray.make_u8(nn, 0), n, pad, 0) else NativeArray.make_u8(nn, 0) end
-    let mask = if lvl == 0 do mark_chunk(mark_places(NativeArray.make_u8(nn, 0), places, gx0, gz0, n, vs), n, pad, 0) else cand end
+    let chunk = if lvl == 0 do mark_chunk(NativeArray.make_u8(nn, 0), n, pad, 0) else none end
+    let masks = layer_masks(f, chunk, cand, none)
+    let read = Strata.Populate.slots_read(p, masks)
+    let reads = if full do List.map(read, fn e -> match e do (sl, _) -> (sl, NativeArray.make_u8(nn, 1)) end) else read end
     let sk = slope_cols(vs)
-    let wet = wet_at(mask, la, ra, na, k, n, NativeArray.make_f32(nn, 0.0), 0)
-    let slope = slope_at(cand, ha, na, k, sk, 2.0 *. int_to_float(sk) *. vs, n, NativeArray.make_f32(nn, 0.0), 0)
+    let wet = wet_at(slot_mask(reads, 2, none), la, ra, na, k, n, NativeArray.make_f32(nn, 0.0), 0)
+    let slope = slope_at(slot_mask(reads, 1, none), ha, na, k, sk, 2.0 *. int_to_float(sk) *. vs, n, NativeArray.make_f32(nn, 0.0), 0)
     let reg = match regions_tab(a, gx0, gz0, n, vs) do
-        RegionTab(i0, j0, w, tab) -> region_at_cols(cand, tab, i0, j0, w, Strata.Atlas.step(a), Strata.Atlas.n(a), gx0, gz0, n, vs, NativeArray.make_f32(nn, 0.0), 0)
+        RegionTab(i0, j0, w, tab) -> region_at_cols(slot_mask(reads, 7, none), tab, i0, j0, w, Strata.Atlas.step(a), Strata.Atlas.n(a), gx0, gz0, n, vs, NativeArray.make_f32(nn, 0.0), 0)
       end
-    let en = entrance_at(g, seed, cand, ens, gx0, gz0, n, pad, vs, NativeArray.make_f32(nn, 0.0), 0)
-    let base = fn (tops : NativeIntArr, st : NativeF32Arr) ->
-      let g1 = Strata.Populate.ground(gx0, gz0, n, s0, lvl, tops, waters)
-      Strata.Populate.with_field(Strata.Populate.with_field(Strata.Populate.with_field(Strata.Populate.with_field(Strata.Populate.with_field(g1, 1, slope), 2, wet), 7, reg), 10, en), 11, st)
-    -- the candidates that stand when every stand is let through, from their own columns alone
-    let ga = base(deep, NativeArray.make_f32(nn, 1000000000.0))
-    let ta = table_at(f, p, seed, ga, lvl, NativeArray.make_u8(nn, 0), cand)
-    let xs = List.flat_map(scatter_layers(f), fn l -> Strata.Populate.instances_with(p, seed, ta, ga, l))
-    match stands_go(g, seed, xs, ha, ca, na, k, gx0, gz0, n, vs, NativeArray.make_int(nn, 0 - 1099511627776), NativeArray.make_f32(nn, 1000000000.0)) do
+    let en = entrance_at(g, seed, slot_mask(reads, 10, none), ens, gx0, gz0, n, pad, vs, NativeArray.make_f32(nn, 0.0), 0)
+    match stands_go(g, seed, cand, slot_mask(reads, 11, none), ha, ca, na, k, gx0, gz0, n, vs, deep, NativeArray.make_f32(nn, 0.0), 0) do
       (tops, st) ->
-        let gr = base(tops, st)
-        IslandPop(gr, table_at(f, p, seed, gr, lvl, chunk, cand), pad)
+        let g1 = Strata.Populate.ground(gx0, gz0, n, s0, lvl, tops, waters)
+        let gr = Strata.Populate.with_field(Strata.Populate.with_field(Strata.Populate.with_field(Strata.Populate.with_field(Strata.Populate.with_field(g1, 1, slope), 2, wet), 7, reg), 10, en), 11, st)
+        IslandPop(gr, if lvl == 0 do Strata.Populate.fields_for(p, seed, gr, masks) else Strata.Populate.table_for(p, gr) end, pad)
     end
   end
 
@@ -1619,7 +1647,7 @@ mod StrataViewer do
         let fac = factors_go(a, g, x0m, z0m, scale, NativeArray.make_f32(81, 0.0), 0)
         let fs = factor_cols(fac, NativeArray.make_f32(1024, 0.0), 0)
         let ip = match pop do
-            Some(DecorPop(f, p)) -> Some(pop_ground(a, g, f, p, hp, cp, lp, rp, ens, na, k, x0 - pad, z0 - pad, s0, lvl, scale, seed))
+            Some(DecorPop(f, p)) -> Some(pop_ground(a, g, f, p, hp, cp, lp, rp, ens, na, k, x0 - pad, z0 - pad, s0, lvl, scale, seed, decor_full(d)))
             None -> None
           end
         IslandCol(hs, cms, gs, ls, rs, ens, fs, ip)

@@ -1113,6 +1113,46 @@ mod Strata.Populate do
     end
   end
 
+  -- for each field and zone, the layers that read it, as bits
+  pfn read_sets(p : PopPlan) : (NativeIntArr, NativeIntArr) do
+    let (fb1, zb1) = List.fold_left(List.range(0, p.pl_nl), (NativeArray.make_int(p.pl_nf + 1, 0), NativeArray.make_int(p.pl_nz + 1, 0)), fn (acc, l) -> match acc do (fb, zb) -> mark_layer(p, l, fb, zb) end)
+    spread_need(p, fb1, zb1, p.pl_nsteps - 1)
+  end
+  -- for each column, the layers whose masks hold it, as bits
+  pfn masks_bits(masks : List(NativeU8Arr), nn : Int) : NativeIntArr do
+    match List.fold_left(masks, (NativeArray.make_int(Math.max_int(1, nn), 0), 0), fn (acc, m) -> match acc do (bs, l) -> (mask_bits(bs, m, bit(l), 0, nn), l + 1) end) do
+      (bits, _) -> bits
+    end
+  end
+  -- the layers reading ground slot s: every ground field of slot s, and for slot 7 every regions zone
+  pfn slot_set(p : PopPlan, fb : NativeIntArr, zb : NativeIntArr, s : Int) : Int do
+    let f = List.fold_left(List.range(0, p.pl_nf), 0, fn (acc, i) -> if NativeArray.get_int(p.pl_fkind, i) == 0 do (if NativeArray.get_int(p.pl_fa, i) == s do int_or(acc, NativeArray.get_int(fb, i)) else acc end) else acc end)
+    if s == 7 do List.fold_left(List.range(0, p.pl_nz), f, fn (acc, z) -> if NativeArray.get_int(p.pl_zkind, z) == 0 do int_or(acc, NativeArray.get_int(zb, z)) else acc end) else f end
+  end
+  pfn set_mask(bits : NativeIntArr, b : Int, out : NativeU8Arr, c : Int, nn : Int) : NativeU8Arr do
+    if c >= nn do out
+    else if int_and(NativeArray.get_int(bits, c), b) != 0 do set_mask(bits, b, NativeArray.set_u8(out, c, 1), c + 1, nn)
+    else set_mask(bits, b, out, c + 1, nn) end end
+  end
+
+  doc "Where fields_for(p, seed, g, masks) will read each ground slot: for every slot (0..31) some layer reads (through a ground field in its rule, its weights zones, a band, a curve's source, a combined zone's members, or for slot 7 a regions zone), the union of the masks of the layers that read it, n * n bytes like the masks; slots no layer reads are left out. A game that supplies a slot only at its columns gets the Table fields_for gives with the slot supplied everywhere. Nil for masks of another count, or of sizes that differ; a plan with a cover field or more than 60 layers, which fields_for evaluates in full, needs every slot at every column: each read slot comes back with a mask of all ones."
+  fn slots_read(p : PopPlan, masks : List(NativeU8Arr)) : List((Int, NativeU8Arr)) do
+    let nn = match masks do
+        Cons(m, _) -> NativeArray.length_u8(m)
+        Nil -> 0
+      end
+    let ok = if List.length(masks) == p.pl_nl do List.all(masks, fn m -> NativeArray.length_u8(m) == nn) else false end
+    if !ok do Nil
+    else
+      let full = if has_cover_field(p, 0) do true else p.pl_nl > 60 end
+      let (fb, zb) = read_sets(p)
+      let bits = if full do NativeArray.make_int(Math.max_int(1, nn), -1) else masks_bits(masks, nn) end
+      List.filter_map(List.range(0, 32), fn s ->
+        let b = slot_set(p, fb, zb, s)
+        if b == 0 do None else Some((s, set_mask(bits, if full do -1 else b end, NativeArray.make_u8(nn, 0), 0, nn))) end)
+    end
+  end
+
   pfn has_cover_field(p : PopPlan, i : Int) : Bool do
     if i >= p.pl_nf do false else if NativeArray.get_int(p.pl_fkind, i) == 3 do true else has_cover_field(p, i + 1) end end
   end
@@ -1129,9 +1169,8 @@ mod Strata.Populate do
       let zs0 = NativeArray.make_u8(Math.max_int(1, p.pl_nz * nn), 0)
       let d0 = NativeArray.make_f32(Math.max_int(1, p.pl_nl * nn), 0.0)
       if ok do
-        let (fb1, zb1) = List.fold_left(List.range(0, p.pl_nl), (NativeArray.make_int(p.pl_nf + 1, 0), NativeArray.make_int(p.pl_nz + 1, 0)), fn (acc, l) -> match acc do (fb, zb) -> mark_layer(p, l, fb, zb) end)
-        let (fb, zb) = spread_need(p, fb1, zb1, p.pl_nsteps - 1)
-        let (bits, _) = List.fold_left(masks, (NativeArray.make_int(nn, 0), 0), fn (acc, m) -> match acc do (bs, l) -> (mask_bits(bs, m, bit(l), 0, nn), l + 1) end)
+        let (fb, zb) = read_sets(p)
+        let bits = masks_bits(masks, nn)
         match steps_for(p, seed, g, nn, bits, fb, zb, Nil, vals0, zs0, d0, 0) do
           (vals, zs, d) -> { pt_nn: nn, pt_names: p.pl_names, pt_nl: p.pl_nl, pt_nz: p.pl_nz, pt_vals: vals, pt_zones: zs, pt_dens: d, pt_dmax: dmax_go(NativeArray.make_f32(p.pl_nl + 1, 0.0), d, nn, 0, p.pl_nl), pt_zeros: false }
         end
@@ -2347,7 +2386,19 @@ mod Strata.Populate do
     instances_with(plan(f), seed, t, g, Pn.layer_index(f, layer))
   end
 
-  doc "Where the cells of the scatter layer at run-order index l would stand an instance on g's columns, whatever its density: every cell's candidate (Strata.Feature places a candidate by hashes the density does not enter, so every instance instances_with or place_with can find is among them), as (xm, zm) metres, in cell order. For a game that supplies a field only where instances can stand, and for fields_at's mask. Nil for an index that is not a scatter layer's or a g with problems."
+  pfn larger(a : Float, b : Float) : Float do if a > b do a else b end end
+  -- layer l's highest possible density: its base times the largest size of each curve's points (zones only take away)
+  pfn dens_bound(p : PopPlan, l : Int) : Float do
+    let prog = p.pl_prog
+    let at = NativeArray.get_i32(prog, l)
+    let nc = NativeArray.get_i32(prog, at)
+    List.fold_left(List.range(0, nc), Math.abs(NativeArray.get_float(p.pl_num, l)), fn (acc, q) ->
+      let pa = NativeArray.get_i32(prog, at + 2 + 3 * q)
+      let pc = NativeArray.get_i32(prog, at + 3 + 3 * q)
+      acc *. List.fold_left(List.range(0, pc), 0.0, fn (m, k) -> larger(m, Math.abs(NativeArray.get_float(p.pl_num, pa + 2 * k + 1)))))
+  end
+
+  doc "Where the cells of the scatter layer at run-order index l could stand an instance on g's columns, whatever its fields: every cell's candidate whose roll passes at the layer's highest possible density (its base times the largest point of each curve, zones only taking away), as (xm, zm) metres, in cell order. Strata.Feature places a candidate by hashes no field enters, so every instance instances_with or place_with can find, under any fields, is among them. For a game that supplies a field only where instances can stand, and for fields_at's mask. Nil for an index that is not a scatter layer's or a g with problems."
   fn cell_places(p : PopPlan, seed : Int, g : Ground, l : Int) : List((Float, Float)) do
     let scatter = if l < 0 do false else if l >= p.pl_nl do false else NativeArray.get_int(p.pl_lkind, l) == 1 end end
     if scatter do
@@ -2356,8 +2407,13 @@ mod Strata.Populate do
         let n = g.pg_n
         let x0 = g.pg_x0
         let z0 = g.pg_z0
-        let kind = Strata.Feature.kind(NativeArray.get_float(p.pl_lcell, l), NativeArray.get_float(p.pl_lreach, l), NativeArray.get_float(p.pl_ljit, l), NativeArray.get_int(p.pl_lsalt, l), 1.0)
-        let cs = Strata.Feature.candidates(kind, seed, int_to_float(x0) *. voxel, int_to_float(z0) *. voxel, int_to_float(x0 + n) *. voxel, int_to_float(z0 + n) *. voxel, fn (_, _) -> 1.0)
+        let cell = NativeArray.get_float(p.pl_lcell, l)
+        let kind = Strata.Feature.kind(cell, NativeArray.get_float(p.pl_lreach, l), NativeArray.get_float(p.pl_ljit, l), NativeArray.get_int(p.pl_lsalt, l), 1.0)
+        -- a cell's candidate is an instance only when its roll is under its chance, at most the layer's highest density
+        -- times the cell's area (a hair over, for the density's 32-bit rounding)
+        let most = dens_bound(p, l) *. cell *. cell *. 1.000001
+        let top = if most < 1.0 do most else 1.0 end
+        let cs = Strata.Feature.candidates(kind, seed, int_to_float(x0) *. voxel, int_to_float(z0) *. voxel, int_to_float(x0 + n) *. voxel, int_to_float(z0 + n) *. voxel, fn (_, _) -> top)
         List.filter_map(cs, fn c ->
           let xm = Strata.Feature.p_xm(c)
           let zm = Strata.Feature.p_zm(c)
