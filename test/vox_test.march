@@ -1,0 +1,81 @@
+-- Vox: reading MagicaVoxel files.
+mod Strata.Test.Vox do
+
+  needs IO.Clock      -- charged to every test module once any uses Check.all (GAPS S3)
+  needs IO.Process
+  import Test
+  alias Strata.Test.VoxFixture as VoxF
+
+  pfn ok(r : Result(Strata.Vox.Vox, String)) : Strata.Vox.Vox do
+    match r do Ok(v) -> v | Err(e) -> panic("parse: " ++ e) end
+  end
+  pfn err_has(r : Result(Strata.Vox.Vox, String), want : String) : Unit do
+    match r do
+      Ok(_) -> Test.assert_true(false, "expected an error naming " ++ want)
+      Err(e) -> Test.assert_true(string_contains(e, want), "the error \"" ++ e ++ "\" names " ++ want)
+    end
+  end
+  pfn feq(a : Float, b : Float, what : String) : Unit do Test.assert_true(float_abs(a -. b) < 0.0001, what ++ ": " ++ float_to_string(a) ++ " vs " ++ float_to_string(b)) end
+  pfn pal(v : Strata.Vox.Vox, i : Int, k : Int) : Int do NativeArray.get_u8(v.palette, 4 * i + k) end
+
+  describe "Vox" do
+    test "parses one model" do
+      let v = ok(Strata.Vox.parse(VoxF.bytes(VoxF.file([VoxF.model(2, 3, 4, [(0, 0, 0, 1), (1, 2, 3, 7), (1, 0, 2, 9)])]))))
+      Test.assert_eq_int(List.length(v.models), 1, "models")
+      let m = List.head(v.models)
+      Test.assert_eq_int(m.sx * 100 + m.sy * 10 + m.sz, 234, "size")
+      Test.assert_eq_int(NativeArray.length_u8(m.voxels), 12, "three voxels")
+      Test.assert_eq_int(NativeArray.get_u8(m.voxels, 7), 7, "second voxel's index")
+      Test.assert_eq_int(NativeArray.get_u8(m.voxels, 9), 0, "third voxel's y")
+    end
+
+    test "reads names and translations" do
+      let f = VoxF.file([VoxF.model(1, 1, 1, [(0, 0, 0, 1)]), VoxF.model(2, 2, 2, [(1, 1, 1, 2)]), VoxF.scene([("head", "1 -2 30"), ("pelvis", "0 0 0")])])
+      let v = ok(Strata.Vox.parse(VoxF.bytes(f)))
+      Test.assert_eq_int(List.length(v.models), 2, "models")
+      let h = List.head(v.models)
+      Test.assert_eq_str(h.name, "head", "first name")
+      Test.assert_eq_int(h.tx, 1, "tx")
+      Test.assert_eq_int(h.ty, -2, "ty")
+      Test.assert_eq_int(h.tz, 30, "tz")
+      let p = List.nth(v.models, 1)
+      Test.assert_eq_str(p.name, "pelvis", "second name")
+      Test.assert_eq_int(p.sx, 2, "second keeps its size")
+    end
+
+    test "without RGBA the palette is a grey ramp" do
+      let v = ok(Strata.Vox.parse(VoxF.bytes(VoxF.file([VoxF.model(1, 1, 1, [(0, 0, 0, 1)])]))))
+      Test.assert_eq_int(pal(v, 200, 0), 200, "red of 200")
+      Test.assert_eq_int(pal(v, 200, 2), 200, "blue of 200")
+    end
+
+    test "palette shift: the file's first entry is index 1" do
+      let v = ok(Strata.Vox.parse(VoxF.bytes(VoxF.file([VoxF.model(1, 1, 1, [(0, 0, 0, 1)]), VoxF.rgba([(10, 20, 30), (40, 50, 60)])]))))
+      Test.assert_eq_int(pal(v, 1, 0), 10, "index 1 red")
+      Test.assert_eq_int(pal(v, 2, 1), 50, "index 2 green")
+      Test.assert_eq_int(pal(v, 0, 3), 0, "index 0 empty")
+    end
+
+    test "materials give emission and roughness" do
+      let v = ok(Strata.Vox.parse(VoxF.bytes(VoxF.file([VoxF.model(1, 1, 1, [(0, 0, 0, 5)]), VoxF.matl(5, [("_type", "_emit"), ("_emit", "0.5"), ("_flux", "2"), ("_rough", "0.3")]), VoxF.matl(6, [("_emit", "0.25")])]))))
+      feq(NativeArray.get_f32(v.emit, 5), 1.0, "emit 5 clamped")
+      feq(NativeArray.get_f32(v.rough, 5), 0.3, "rough 5")
+      feq(NativeArray.get_f32(v.emit, 6), 0.25, "emit 6 without flux")
+      feq(NativeArray.get_f32(v.emit, 7), 0.0, "emit unset")
+      feq(NativeArray.get_f32(v.rough, 7), 0.8, "rough unset")
+    end
+
+    test "skips chunks it doesn't know" do
+      let f = VoxF.file([VoxF.chunk("LAYR", VoxF.i32(0)), VoxF.model(1, 1, 1, [(0, 0, 0, 1)]), VoxF.chunk("rOBJ", VoxF.dict([("_type", "_bg")])), VoxF.chunk("NOTE", VoxF.i32(0)), VoxF.rgba([(1, 2, 3)])])
+      let v = ok(Strata.Vox.parse(VoxF.bytes(f)))
+      Test.assert_eq_int(List.length(v.models), 1, "one model")
+      Test.assert_eq_int(pal(v, 1, 2), 3, "palette after the unknown chunks")
+    end
+
+    test "refuses what is not a .vox file, and a cut-off one" do
+      err_has(Strata.Vox.parse(VoxF.bytes(VoxF.str("hello world, no voxels"))), "VOX ")
+      let whole = VoxF.file([VoxF.model(2, 2, 2, [(0, 0, 0, 1), (1, 1, 1, 1)])])
+      err_has(Strata.Vox.parse(VoxF.bytes(List.take(whole, List.length(whole) - 3))), "truncated")
+    end
+  end
+end

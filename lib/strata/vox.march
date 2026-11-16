@@ -1,0 +1,209 @@
+-- Vox — reading MagicaVoxel (.vox) files.
+--
+-- A file is "VOX ", a version, then chunks: each a 4-byte id, the size of
+-- its content, the size of its children, the content, then the children
+-- (chunks again). The reader walks every chunk in order and keeps what it
+-- needs: SIZE and XYZI (a model each, in order), RGBA (the palette), MATL
+-- (a palette entry's emission and roughness), and the scene graph's nTRN,
+-- nGRP and nSHP (each model's name and placement). Every other chunk
+-- (LAYR, rOBJ, rCAM, NOTE, IMAP, ...) is skipped.
+--
+-- A model's name is its shape node's `_name`, else that of the transform
+-- above the shape (where MagicaVoxel writes it). Its translation is the sum
+-- of the `_t` of every transform on the path from the root to its shape.
+-- MagicaVoxel centres a model on its translation: its low corner is the
+-- translation less floor(size / 2) on each axis (Strata.Character uses that).
+--
+-- Palette: the file's RGBA entry k is colour index k + 1, so index 0 stays
+-- empty. Without an RGBA chunk index i is the grey (i, i, i). Emission is a
+-- material's `_emit`, times `_flux` when given, at most 1; roughness its
+-- `_rough`, 0.8 when not given.
+mod Strata.Vox do
+
+  needs IO.Foreign
+
+  -- A model: its name ('' without a scene graph), size, translation (the file's axes, z up), and voxels as (x, y, z, colour index) quads of bytes.
+  type VoxModel = { name : String, sx : Int, sy : Int, sz : Int, tx : Int, ty : Int, tz : Int, voxels : NativeU8Arr }
+
+  -- A file: its models in file order, the palette (256 entries of r, g, b, a bytes; index 0 empty), and per index emission (0..1) and roughness.
+  type Vox = { models : List(VoxModel), palette : NativeU8Arr, emit : NativeF32Arr, rough : NativeF32Arr }
+
+  -- a transform node: its id, its child, its name, its translation
+  type VoxTrn = VoxTrnC(Int, Int, String, Int, Int, Int)
+
+  -- what the walk has gathered; lists newest first
+  type VoxGot = { sizes : List((Int, Int, Int)), xyzis : List(NativeU8Arr), pal : Option(NativeU8Arr), g_emit : NativeF32Arr, g_rough : NativeF32Arr,
+                trns : List(VoxTrn), grps : List((Int, List(Int))), shps : List((Int, Int, String)) }
+
+  pfn imin(a : Int, b : Int) : Int do if a < b do a else b end end
+  pfn imax(a : Int, b : Int) : Int do if a > b do a else b end end
+
+  -- ── bytes ────────────────────────────────────────────────────────────────
+  pfn u8(a : NativeU8Arr, p : Int) : Int do if p >= 0 && p < NativeArray.length_u8(a) do NativeArray.get_u8(a, p) else 0 end end
+  pfn i32(a : NativeU8Arr, p : Int) : Int do
+    let u = u8(a, p) + int_shl(u8(a, p + 1), 8) + int_shl(u8(a, p + 2), 16) + int_shl(u8(a, p + 3), 24)
+    if u >= 2147483648 do u - 4294967296 else u end
+  end
+  pfn tag(a : NativeU8Arr, p : Int) : String do Bytes.to_string(Bytes.slice(Bytes.from_u8_arr(a), p, 4)) end
+  pfn copy_go(a : NativeU8Arr, p : Int, d : NativeU8Arr, i : Int, n : Int) : NativeU8Arr do
+    if i >= n do d else copy_go(a, p, NativeArray.set_u8(d, i, u8(a, p + i)), i + 1, n) end
+  end
+  pfn copy(a : NativeU8Arr, p : Int, n : Int) : NativeU8Arr do copy_go(a, p, NativeArray.make_u8(Strata.Size.of(n), 0), 0, n) end
+
+  -- a string at p, read no further than stop: (it, the position after it)
+  pfn string_at(a : NativeU8Arr, p : Int, stop : Int) : (String, Int) do
+    let len = imin(imax(i32(a, p), 0), imax(stop - p - 4, 0))
+    (Bytes.to_string(Bytes.slice(Bytes.from_u8_arr(a), p + 4, len)), p + 4 + len)
+  end
+  pfn dict_go(a : NativeU8Arr, p : Int, stop : Int, left : Int, acc : List((String, String))) : (List((String, String)), Int) do
+    if left <= 0 || p >= stop do (List.reverse(acc), p)
+    else
+      match string_at(a, p, stop) do
+        (k, p1) -> match string_at(a, p1, stop) do (v, p2) -> dict_go(a, p2, stop, left - 1, Cons((k, v), acc)) end
+      end
+    end
+  end
+  pfn dict_at(a : NativeU8Arr, p : Int, stop : Int) : (List((String, String)), Int) do dict_go(a, p + 4, stop, i32(a, p), Nil) end
+  pfn lookup(kvs : List((String, String)), k : String) : Option(String) do
+    match kvs do
+      Nil -> None
+      Cons((k2, v), rest) -> if k2 == k do Some(v) else lookup(rest, k) end
+    end
+  end
+  pfn num(s : Option(String), dflt : Float) : Float do
+    match s do
+      None -> dflt
+      Some(t) -> match String.to_float(String.trim(t)) do Ok(f) -> f | Err(_) -> match String.to_int(String.trim(t)) do Ok(i) -> int_to_float(i) | Err(_) -> dflt end end
+    end
+  end
+  pfn ints3(s : Option(String)) : (Int, Int, Int) do
+    match s do
+      None -> (0, 0, 0)
+      Some(t) ->
+        let ws = List.filter(String.split(String.trim(t), " "), fn w -> !String.is_empty(w))
+        let n = fn i -> match List.nth_opt(ws, i) do Some(w) -> (match String.to_int(w) do Ok(v) -> v | Err(_) -> 0 end) | None -> 0 end
+        (n(0), n(1), n(2))
+    end
+  end
+  pfn ids_go(a : NativeU8Arr, p : Int, left : Int, acc : List(Int)) : List(Int) do
+    if left <= 0 do List.reverse(acc) else ids_go(a, p + 4, left - 1, Cons(i32(a, p), acc)) end
+  end
+
+  -- ── the chunks ───────────────────────────────────────────────────────────
+  pfn take(g : VoxGot, a : NativeU8Arr, id : String, p : Int, stop : Int) : VoxGot do
+    if id == "SIZE" do { g with sizes: Cons((i32(a, p), i32(a, p + 4), i32(a, p + 8)), g.sizes) }
+    else if id == "XYZI" do { g with xyzis: Cons(copy(a, p + 4, 4 * imin(imax(i32(a, p), 0), (stop - p - 4) / 4)), g.xyzis) }
+    else if id == "RGBA" do { g with pal: Some(shifted(a, p)) }
+    else if id == "MATL" do
+      let i = i32(a, p)
+      match dict_at(a, p + 4, stop) do
+        (kvs, _) ->
+          if i < 0 || i > 255 do g
+          else
+            let e0 = num(lookup(kvs, "_emit"), 0.0) *. num(lookup(kvs, "_flux"), 1.0)
+            let e = if e0 > 1.0 do 1.0 else e0 end
+            { g with g_emit: NativeArray.set_f32(g.g_emit, i, e), g_rough: NativeArray.set_f32(g.g_rough, i, num(lookup(kvs, "_rough"), 0.8)) }
+          end
+      end
+    else if id == "nTRN" do
+      match dict_at(a, p + 4, stop) do
+        (attrs, p1) ->
+          let child = i32(a, p1)
+          let frames = i32(a, p1 + 12)
+          let t = if frames > 0 do (match dict_at(a, p1 + 16, stop) do (fk, _) -> ints3(lookup(fk, "_t")) end) else (0, 0, 0) end
+          match t do (x, y, z) -> { g with trns: Cons(VoxTrnC(i32(a, p), child, unwrap_or(lookup(attrs, "_name"), ""), x, y, z), g.trns) } end
+      end
+    else if id == "nGRP" do
+      match dict_at(a, p + 4, stop) do (_, p1) -> { g with grps: Cons((i32(a, p), ids_go(a, p1 + 4, imin(i32(a, p1), (stop - p1 - 4) / 4), Nil)), g.grps) } end
+    else if id == "nSHP" do
+      match dict_at(a, p + 4, stop) do (attrs, p1) -> { g with shps: Cons((i32(a, p), i32(a, p1 + 4), unwrap_or(lookup(attrs, "_name"), "")), g.shps) } end
+    else g end end end end end end end
+  end
+  pfn shifted_go(a : NativeU8Arr, p : Int, d : NativeU8Arr, k : Int) : NativeU8Arr do
+    if k >= 255 do d
+    else shifted_go(a, p, NativeArray.set_u8(NativeArray.set_u8(NativeArray.set_u8(NativeArray.set_u8(d, 4 * k + 4, u8(a, p + 4 * k)), 4 * k + 5, u8(a, p + 4 * k + 1)), 4 * k + 6, u8(a, p + 4 * k + 2)), 4 * k + 7, u8(a, p + 4 * k + 3)), k + 1) end
+  end
+  pfn shifted(a : NativeU8Arr, p : Int) : NativeU8Arr do shifted_go(a, p, NativeArray.make_u8(Strata.Size.of(1024), 0), 0) end
+  pfn grey_go(d : NativeU8Arr, i : Int) : NativeU8Arr do
+    if i >= 256 do d else grey_go(NativeArray.set_u8(NativeArray.set_u8(NativeArray.set_u8(NativeArray.set_u8(d, 4 * i, i), 4 * i + 1, i), 4 * i + 2, i), 4 * i + 3, 255), i + 1) end
+  end
+
+  -- every chunk from p to stop, in order, children included (they follow their parent's content)
+  pfn walk(g : VoxGot, a : NativeU8Arr, p : Int, stop : Int) : Result(VoxGot, String) do
+    if p >= stop do Ok(g)
+    else if p + 12 > stop do Err("vox: truncated chunk header at byte " ++ int_to_string(p))
+    else
+      let cs = i32(a, p + 4)
+      let end_ = p + 12 + cs
+      if cs < 0 || end_ > stop do Err("vox: truncated " ++ tag(a, p) ++ " chunk at byte " ++ int_to_string(p))
+      else walk(take(g, a, tag(a, p), p + 12, end_), a, end_, stop) end
+    end end
+  end
+
+  -- ── the scene ────────────────────────────────────────────────────────────
+  pfn trn_over(g : VoxGot, child : Int) : Option(VoxTrn) do List.find(g.trns, fn t -> match t do VoxTrnC(_, c, _, _, _, _) -> c == child end) end
+  pfn grp_over(g : VoxGot, child : Int) : Option(Int) do
+    match List.find(g.grps, fn gk -> match gk do (_, kids) -> List.member(kids, child) end) do Some((gid, _)) -> Some(gid) | None -> None end
+  end
+  -- the sum of the translations above node n, at most 64 levels
+  pfn up(g : VoxGot, n : Int, acc : (Int, Int, Int), depth : Int) : (Int, Int, Int) do
+    if depth > 64 do acc
+    else
+      match trn_over(g, n) do
+        None -> acc
+        Some(VoxTrnC(tid, _, _, x, y, z)) ->
+          match acc do
+            (ax, ay, az) ->
+              let acc2 = (ax + x, ay + y, az + z)
+              match grp_over(g, tid) do None -> acc2 | Some(gid) -> up(g, gid, acc2, depth + 1) end
+          end
+      end
+    end
+  end
+  pfn model_of(g : VoxGot, sizes : List((Int, Int, Int)), xyzis : List(NativeU8Arr), shp : (Int, Int, String)) : Option(VoxModel) do
+    match shp do
+      (sid, mid, sname) ->
+        match (List.nth_opt(sizes, mid), List.nth_opt(xyzis, mid)) do
+          (Some((sx, sy, sz)), Some(vs)) ->
+            let name = if !String.is_empty(sname) do sname else (match trn_over(g, sid) do Some(VoxTrnC(_, _, n, _, _, _)) -> n | None -> "" end) end
+            match up(g, sid, (0, 0, 0), 0) do (tx, ty, tz) -> Some({ name: name, sx: sx, sy: sy, sz: sz, tx: tx, ty: ty, tz: tz, voxels: vs }) end
+          _ -> None
+        end
+    end
+  end
+  pfn bare(sizes : List((Int, Int, Int)), xyzis : List(NativeU8Arr)) : List(VoxModel) do
+    match (sizes, xyzis) do
+      (Cons((sx, sy, sz), s2), Cons(vs, x2)) -> Cons({ name: "", sx: sx, sy: sy, sz: sz, tx: 0, ty: 0, tz: 0, voxels: vs }, bare(s2, x2))
+      _ -> Nil
+    end
+  end
+
+  doc "The file in [bytes], or why it can't be read."
+  fn parse(bytes : NativeU8Arr) : Result(Vox, String) do
+    let n = NativeArray.length_u8(bytes)
+    if n < 8 || tag(bytes, 0) != "VOX " do Err("vox: not a MagicaVoxel file (no \"VOX \" at the start)")
+    else
+      let g0 : VoxGot = { sizes: Nil, xyzis: Nil, pal: None, g_emit: NativeArray.make_f32(Strata.Size.of(256), 0.0), g_rough: NativeArray.make_f32(Strata.Size.of(256), 0.8), trns: Nil, grps: Nil, shps: Nil }
+      match walk(g0, bytes, 8, n) do
+        Err(e) -> Err(e)
+        Ok(g) ->
+          let sizes = List.reverse(g.sizes)
+          let xyzis = List.reverse(g.xyzis)
+          if List.length(sizes) != List.length(xyzis) do Err("vox: " ++ int_to_string(List.length(sizes)) ++ " SIZE chunks but " ++ int_to_string(List.length(xyzis)) ++ " XYZI (truncated?)")
+          else
+            let models = if is_nil(g.shps) do bare(sizes, xyzis) else List.filter_map(List.reverse(g.shps), fn s -> model_of(g, sizes, xyzis, s)) end
+            let pal = match g.pal do Some(p) -> p | None -> grey_go(NativeArray.make_u8(Strata.Size.of(1024), 0), 0) end
+            Ok({ models: models, palette: NativeArray.set_u8(pal, 3, 0), emit: g.g_emit, rough: g.g_rough })
+          end
+      end
+    end
+  end
+
+  doc "The file at [path], or why it can't be read."
+  fn read(path : String) : Result(Vox, String) do
+    match Authority.must(File.read(path)) do
+      Ok(text) -> parse(Bytes.to_u8_arr(Bytes.from_string(text)))
+      Err(_) -> Err("vox: can't read " ++ path)
+    end
+  end
+end
