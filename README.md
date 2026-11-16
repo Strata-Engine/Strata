@@ -49,8 +49,10 @@ its surface the land is a 3D density (`Strata.Lattice`) with overhangs and
 caves that open here and there, its steepest slopes relaxed to scree
 (`Strata.Thermal`), grass over dirt over stone laid by `Strata.Surface`.
 Trees, grown at start-up by a procedural branching generator (oak, birch,
-pine, willow) and scattered by `Strata.Feature`, stand across chunk borders;
-ruins stand on the atlas's sites with the ground pulled up to them.
+pine, willow), stand across chunk borders; ruins stand on the atlas's sites
+with the ground pulled up to them; posts and tall grass stand on the grass.
+All four are declared in `viewer/assets/island.pop` and placed by the
+population (see Population below).
 
 **The atlas cache.** The atlas is one pass over the whole island (height,
 erosion, drainage, rivers, lakes, regions, sites); at 512 x 512 samples it
@@ -689,6 +691,209 @@ chunk has the edited level-0 chunks under it coarsened over it
 the chunk), and an edit makes its ancestors stale (`Strata.World.stale`),
 which the stream puts through its generation queue again without waiting.
 
+## Population
+
+Design: `docs/2026-11-12-population-design.md` (stage 1 is built). Plan:
+`docs/2026-11-12-population-core-plan.md`. Every ruling made on the way:
+`docs/population-ledger.md`. Cost: `RESULTS.md`, Population core.
+
+A population is what a world holds, declared by the game as data at
+start-up and placed by the engine as each chunk is made. It has four kinds
+of declaration, each its own namespace of names:
+
+- **fields**: a number per ground column. A ground field is one the game
+  supplies in a slot (built-ins 0..9, the game's own 10..31). A noise field
+  is made by Strata. A curve field maps another field. A cover field says
+  how much of a layer stands near the column.
+- **zones**: yes or no per column: region ids, a band of a field, a ring
+  round sites, and all, any and not of other zones.
+- **shapes**: what is placed: a set of block ids, or of templates
+  (`Strata.Template`), each a variant, picked by weights per zone or
+  evenly.
+- **layers**: what is placed, by which placer, under which rule. A rule is a
+  base density a square metre times a curve of each of some fields, passing
+  only inside some zones and outside others.
+
+There are three placers. A **cover** layer rolls a block onto each floor of
+a column. A **scatter** layer stamps a template (or one block) at a hashed
+place in each cell, by `Strata.Feature`'s cells. A **site** layer stamps a
+template at each of its sites and draws the ground to the site's floor.
+Layers run in declaration order, except that a layer runs after every layer
+whose cover it reads. Every placement is a function of world position and
+seed alone, so a chunk comes out the same from any Ground that holds it,
+and a stamp across a chunk border is whole.
+
+**The calls a game makes.** At start-up it declares (or reads a file),
+freezes, fits and plans:
+
+```march
+alias Strata.Population as Pn
+alias Strata.Populate as Pq
+
+let p = Pn.new()
+  |> Pn.field_ground("slope", 1)
+  |> Pn.zone_band("steep", "slope", 0.7, 1000000.0)
+  |> Pn.shapes_templates("trees", trees)           -- the game's templates
+  |> Pn.layer_scatter("forest", "trees", Pn.rule(0.01, Nil, Nil, Cons("steep", Nil)), 6.0, 0.4, 21)
+-- freeze: every name resolved, every mistake an Err naming the offender
+let pop = match Pn.freeze(p) do
+    Ok(f) -> Pn.fit_all(f, scale)                    -- templates to the world's voxel size
+    Err(m) -> Err(m)
+  end
+let plan = match pop do
+    Ok(f) -> Some(Pq.plan(f))                         -- read once into flat arrays; keep it
+    Err(_) -> None                                    -- say why, and place nothing
+  end
+```
+
+`fit_all` must come before `pad` and `place`: `place_with` refuses
+templates not at the Ground's voxel size. `Pn.missing_ground(f)` lists the
+ground slots the population reads, so a game knows what to supply. Then,
+for each chunk (or once for a column of chunks):
+
+```march
+-- plan: the PopPlan kept from start-up; scale: the world's voxel size (level 0's)
+-- voxel: the key's level's own voxel size, scale * 2^level (scale itself at level 0)
+let voxel = Pq.voxel_of(scale, level)
+-- pad: the Ground's columns beyond the chunk, in this level's columns
+let pad = Pq.plan_pad(plan, voxel)
+-- the Ground's corner and size: the chunk's 32 columns and the pad on each side
+let x0 = 32 * kx - pad
+let z0 = 32 * kz - pad
+let n = 32 + 2 * pad
+-- the game's column heights drawn to the sites, and the columns the sites rule
+let hs2 = Pq.adapt_with(plan, x0, z0, n, voxel, hs)
+let ruled = Pq.adapted_with(plan, x0, z0, n, voxel)
+-- the Ground takes the world's scale and the level, and works out voxel itself
+let g = Pq.ground(x0, z0, n, scale, level, tops, waters)
+  |> Pq.with_surfaces(counts, ys, kinds)              -- optional: every floor and ceiling
+  |> Pq.with_field(1, slope)
+let t = Pq.fields_with(plan, seed, g)                 -- every field, zone and density, once
+let c2 = Pq.place_with(plan, seed, k, c, g, t)
+```
+
+`adapt_with`, `adapted_with` and `plan_pad` take the level's own voxel
+size; only `ground` takes the world's scale (and the level). A Table knows
+the Ground (corner, size and voxel), the seed and the plan it was made
+for: `place_with` and `instances_with` refuse another's. `place_with`
+hands the chunk back unchanged when something does not fit;
+`place_problems(plan, seed, k, g, t)` says why, one message each. Other calls:
+`instances_with` lists a scatter layer's instances (with their place,
+top, variant, turn and draw stream) for a game's own use;
+`site_places(plan, seed, l)` lists a site layer's stamps (each site's row
+and index, its variant and template, the origin, turn and stream
+`Strata.Template.blit` takes), so a game can replay or find a site's stamp
+without the placement formula (level 0 only, nothing for a site layer of
+blocks, and its origins are in the template's own voxels, so fit the
+population with `fit_all` first); `seen_to` and
+`ranks` set how far out a layer is drawn and which block wins when a
+template is coarsened; above level 0, `table_for(plan, g)` is the Table to
+hand over, since no field is read from it there; `field_point` and
+`cover_cached` are for tests and tools. `cover_on` and `cover_between` hold
+a cover layer to floors of some blocks or some heights. A masked Table
+(`fields_for`, `fields_at`) whose mask misses columns where a scatter
+candidate stands drops those instances without an error, so build scatter
+masks from `cell_places`.
+
+**What a game holds.** `Pop`, `Frozen`, `Ground`, `PopPlan` and `Table`
+are opaque: a game makes them only through the calls above (`new` and the
+builders, `freeze` and `fit_all`, `ground` with `with_surfaces` and
+`with_field`, `plan`, and `fields`, `fields_with`, `fields_for`,
+`fields_at` or `table_for`; `Strata.PopulationFile.read` and `read_into`
+also make a `Pop`), so none skips freeze's checks, `problems` or a Table's
+identity. March has no package-private visibility, so the `Frozen` readers
+`Strata.Populate` needs (`field_kind`, `zone_lo`, `layer_curves` and the
+like) are public; a game needs the names, indices and counts
+(`layer_names`, `layer_index`, `layer_count` and theirs for fields, zones
+and shape sets), the layer readers and `shape_set_templates`. A layer's
+placer is asked by name: `is_cover(f, l)`, `is_scatter(f, l)` and
+`is_site(f, l)` (each false for no such layer).
+`freeze_subject` (which declaration a freeze message is about) and
+`PopulationFile.ground_fields` (the ten built-in fields, for `read_into`)
+are public for games; `default_seen` and `walk_ok` only because
+`Strata.Populate` reads them (a game asks `seen_level_at`, `fit_all` and
+`place_problems`).
+
+**The Ground.** An n x n area of columns at one level: its corner in world
+voxels, the voxel size (`voxel_of(scale, level)`, `scale * 2^level`), each column's ground top and
+water line in voxels, optionally every surface of every column
+(`with_surfaces`; without it each column has one floor at its top), and
+the ground fields by slot. The built-in slots are 0 altitude, 1 slope, 2
+water_depth, 3 river_dist, 4 lake_dist, 5 coast_dist, 6 wetness, 7 region,
+8 depth, 9 sky; Strata gives 10..31 no meaning. `problems(g)` lists what is
+wrong with a Ground. Its size:
+
+- a population with no scatter layer needs the chunk's own 32 x 32
+  columns;
+- with a scatter layer, `plan_pad(plan, voxel)` more on each side:
+  `ceil(reach / voxel) + 1`, where `reach` is the widest template's
+  half-width in metres, and more for each cover field a layer reads
+  (`ceil(radius / voxel)` a hop, adding up along chains);
+- above level 0 the pad is counted in that level's columns, which is why
+  `plan_pad` takes the level's voxel size, not the world's scale.
+
+A game that knows where its layers read can supply less. A cover layer
+reads the chunk's columns; a scatter layer reads the columns its candidates
+stand on (`cell_places`); a site layer reads none. With one mask a layer,
+`slots_read(plan, masks)` says at which columns each slot is read, and
+`fields_for(plan, seed, g, masks)` evaluates only there, bit for bit as
+`fields_with` does. The viewer does this.
+
+**The file.** `Strata.PopulationFile` reads the same declarations from text,
+through the same builders, so a file and the API cannot drift. The viewer's
+island is `viewer/assets/island.pop`; some of its lines:
+
+```
+[field slope]     kind = ground  slot = 1
+[field water_depth] kind = ground  slot = 2
+[zone wet]        kind = band   field = water_depth   lo = 0.5   hi = 1e30
+[zone steep]      kind = band   field = slope         lo = {tree_slope_tan}  hi = 1e30
+[zone beard]      kind = ring   sites = sites         inner = 0  outer = {beard_outer}
+[shapes trees]    kind = templates  from = trees
+                  ranks = 0 0 0 0 0 0 0 2 1           # coarser levels: wood (7) over leaves (8)
+[weights trees r0]  w = {region0_w}
+[layer forest]    kind = scatter  shapes = trees  salt = 21
+                  base = {tree_base}  by = region:{region_curve}
+                  cell = {tree_cell}  jitter = {tree_jitter}
+                  outside = wet beard steep low opening
+                  seen_to = 2
+[layer ruins]     kind = site  shapes = ruins  sites = sites  margin = {beard_margin}  salt = 28  seen_to = 0
+[layer grass]     kind = cover  shapes = tall_grass  base = {tall_grass_chance}  outside = wet  on = 3  between = {grass_lo} {grass_below}  salt = 26
+```
+
+A section is a header in brackets, `[field N]`, `[zone N]`, `[shapes N]`,
+`[weights SHAPES ZONE]` or `[layer N]`, and its settings, `name = value`,
+on the header's line or below. `#` starts a comment. A value ends at the
+next `name =` or the end of the line. `by` is a list of `FIELD:X:Y,X:Y,...`
+factors. The full grammar is at the head of
+`lib/strata/population_file.march`. Template lists and site lists are made
+by the game and named in a `PopNamed`. The `{name}`s are the viewer's own:
+it puts `island.gen`'s settings in before reading, so the numbers stay in
+one file.
+
+`read(text, named)` declares the ten built-in ground fields and reads the
+file; it freezes only to check, and hands back the `Pop`, which the game
+freezes. `read_into(pop, text, named)` adds the file's sections
+to a game's own `Pop` and does not freeze; the game freezes, and
+`locate(text, err)` puts freeze's message on the line of the section it is
+about. Every mistake is an `Err("line N: ...")`, the first in file order.
+
+**Limits (stage 1).**
+
+- Blocks and stamps only: no props, no shape generators (templates are the
+  game's own or `.vox` files), no polygon zones, and only the cover,
+  scatter and site placers.
+- A cover field of a scatter layer counts its instances: one 6 m cover
+  field is about 0.1 ms a chunk, the whole budget for fields. Two cover
+  layers together are about 0.19 ms against 0.1 ms.
+- Scatter instances stand on the column's top, never on a cave floor.
+- Above level 0, ground slots and regions zones are read at the coarse
+  column, so an instance whose rule reads one can differ from level 0's.
+  A level-L chunk costs about 4^L level-0 chunks of stamps.
+- A template fitted to an even width sits half a voxel off its column's
+  centre.
+- A Ground too small for the pad refuses the whole chunk, cover included.
+
 ## Particles
 
 Design: `docs/2026-11-12-particles-design.md`. A game describes an effect
@@ -797,6 +1002,9 @@ boundary over the ground; their numbers are in `RESULTS.md`.
 | `Strata.Rig`, `Strata.Clip` | a jointed figure's description and part meshes; its animations |
 | `Strata.Anim`, `Strata.Ffi.Anim` | figures posed by the C kernel in `native/strata_anim.h` |
 | `Strata.Feature` | scattering features by hashed cells: the same placements however an area is cut |
+| `Strata.Population` | a population's declarations (fields, zones, shapes, layers), `freeze`, `fit_all`, read accessors |
+| `Strata.Populate` | a frozen population run over a Ground: fields, `adapt`, `place_with`, instances |
+| `Strata.PopulationFile` | a population read from a text file |
 | `Strata.Template`, `Strata.Ffi.Vox` | voxel templates (holes, probabilities, turns) blitted into chunks; MagicaVoxel `.vox` import (`native/strata_vox.cpp`, link with `-fno-exceptions`) |
 | `Strata.Entities`, `Strata.Ffi.Ent` | entity kinds, and entities kept as rows by the C kernel in `native/strata_ent.h` |
 | `Strata.Particles` | particle effects as data, emitters, the bursts a frame hands the renderer |
@@ -836,10 +1044,12 @@ boundary over the ground; their numbers are in `RESULTS.md`.
   the mapped buffer is correct everywhere and slower on a discrete GPU.
 - The frame in which the camera enters a new chunk spends 5 to 7 ms in
   `Strata.Stream.set_focus`. See `RESULTS.md`.
-- Generating an island chunk costs about 12 ms of CPU for a surface chunk
-  at level 0 and about 11 ms for a coarse one, against a 1 ms target; the
-  far field takes about 30 s to fill from cold (measured at a load average
-  of 34). See `RESULTS.md`.
+- Generating an island surface chunk at level 0 costs about 3.7 to 3.8 ms
+  of CPU made one at a time (load 11 to 21), against a 1 ms target. A
+  coarse chunk cost about 11 ms and the far field about 30 s to fill from
+  cold when last measured, before the March fix of S44 (load 34). See
+  `RESULTS.md`.
+- The population's limits are listed under Population above.
 - The island's thermal scree and its cave and density sampling are tuned
   at 1 m a voxel: their reach and spacing are counted in voxels, so at a
   finer scale steep slopes relax less and the lattice is finer. The rest of
