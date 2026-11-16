@@ -798,7 +798,9 @@ identity. March has no package-private visibility, so the `Frozen` readers
 `Strata.Populate` needs (`field_kind`, `zone_lo`, `layer_curves` and the
 like) are public; a game needs the names, indices and counts
 (`layer_names`, `layer_index`, `layer_count` and theirs for fields, zones
-and shape sets), the layer readers and `shape_set_templates`.
+and shape sets), the layer readers and `shape_set_templates`. A layer's
+placer is asked by name: `is_cover(f, l)`, `is_scatter(f, l)` and
+`is_site(f, l)` (each false for no such layer).
 `freeze_subject` (which declaration a freeze message is about) and
 `PopulationFile.ground_fields` (the ten built-in fields, for `read_into`)
 are public for games; `default_seen` and `walk_ok` only because
