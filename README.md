@@ -789,6 +789,22 @@ a cover layer to floors of some blocks or some heights. A masked Table
 candidate stands drops those instances without an error, so build scatter
 masks from `cell_places`.
 
+**What a game holds.** `Pop`, `Frozen`, `Ground`, `PopPlan` and `Table`
+are opaque: a game makes them only through the calls above (`new` and the
+builders, `freeze` and `fit_all`, `ground` with `with_surfaces` and
+`with_field`, `plan`, and `fields_with`, `fields_for`, `fields_at` or
+`table_for`), so none skips freeze's checks, `problems` or a Table's
+identity. March has no package-private visibility, so the `Frozen` readers
+`Strata.Populate` needs (`field_kind`, `zone_lo`, `layer_curves` and the
+like) are public; a game needs the names, indices and counts
+(`layer_names`, `layer_index`, `layer_count` and theirs for fields, zones
+and shape sets), the layer readers and `shape_set_templates`.
+`freeze_subject` (which declaration a freeze message is about) and
+`PopulationFile.ground_fields` (the ten built-in fields, for `read_into`)
+are public for games; `default_seen` and `walk_ok` only because
+`Strata.Populate` reads them (a game asks `seen_level_at`, `fit_all` and
+`place_problems`).
+
 **The Ground.** An n x n area of columns at one level: its corner in world
 voxels, the voxel size (`voxel_of(scale, level)`, `scale * 2^level`), each column's ground top and
 water line in voxels, optionally every surface of every column
