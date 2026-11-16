@@ -779,7 +779,11 @@ for: `place_with` and `instances_with` refuse another's. `place_with`
 hands the chunk back unchanged when something does not fit;
 `place_problems(plan, seed, k, g, t)` says why, one message each. Other calls:
 `instances_with` lists a scatter layer's instances (with their place,
-top, variant, turn and draw stream) for a game's own use; `seen_to` and
+top, variant, turn and draw stream) for a game's own use;
+`site_places(plan, seed, l)` lists a site layer's stamps (each site's row
+and index, its variant and template, the origin, turn and stream
+`Strata.Template.blit` takes), so a game can replay or find a site's stamp
+without the placement formula; `seen_to` and
 `ranks` set how far out a layer is drawn and which block wins when a
 template is coarsened; above level 0, `table_for(plan, g)` is the Table to
 hand over, since no field is read from it there; `field_point` and

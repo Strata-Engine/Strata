@@ -456,6 +456,11 @@ mod Strata.Test.Populate do
         else c end
     end
   end
+  -- a site place stamped by the test's own stamp, at its origin, turn and stream
+  pfn stamp_place(c : Strata.Chunk.Chunk, k : Strata.Coord.Key, sp : Strata.Populate.PopSitePlace) : Strata.Chunk.Chunk do
+    let t = Pq.sp_template(sp)
+    List.fold_left(List.range(0, NativeArray.length_i32(Strata.Template.t_ids(t))), c, fn (acc, v) -> stamp_voxel(acc, k, t, Pq.sp_ox(sp), Pq.sp_oy(sp), Pq.sp_oz(sp), Pq.sp_rot(sp), Pq.sp_stream(sp), v))
+  end
   pfn stamp_all(c : Strata.Chunk.Chunk, k : Strata.Coord.Key, ts : List(Strata.Template.Template), voxel : Float, xs : List(Strata.Populate.PopInstance)) : Strata.Chunk.Chunk do
     List.fold_left(xs, c, fn (acc, i) -> stamp_inst(acc, k, ts, voxel, i))
   end
@@ -2192,6 +2197,39 @@ mod Strata.Test.Populate do
         Test.assert_eq_int(hash_of(got), hash_of(stamp_all(air(), k, [t], 1.0, [site_inst(st, 0, 3, 4, 1.0)])), "chunk " ++ key_str(k))
         Test.assert_true(count_filled(got) > 60, "part of the stamp is drawn (" ++ int_to_string(count_filled(got)) ++ ")")
         Test.assert_true(count_filled(got) < count_filled(stamp_all(air(), k, [t0], 1.0, [site_inst(st, 0, 3, 4, 1.0)])) * 3 / 4, "and not all of it"))
+    end
+
+    test "site_places: each site's template, turn, origin and stream, which stamped by hand give place_with's chunks at 1 m and 0.5 m" do
+      -- odd and even footprints, a template drawn at 128 in 255, sites spanning chunk borders in x, y and z, and an index below 0
+      let t0 = solid(7, 3, 4, 3, 1.0)
+      let t1 = Strata.Template.with_yslice(List.fold_left(List.range(0, 270), solid(6, 5, 9, 4, 1.0), fn (acc, i) -> Strata.Template.with_prob(acc, i, 128)), 2, 100)
+      let t2 = solid(5, 4, 5, 5, 1.0)
+      let sites = [Pn.site(31.5, 12.5, 30.25, 6.0, 17), Pn.site(16.25, 31.75, 9.5, 6.0, -5), Pn.site(40.5, 40.5, 2.0, 6.0, 2), Pn.site(5.5, 5.5, 31.0, 6.0, 0)]
+      let base = site_pop([t0, t1, t2], sites, 2.0, 4)
+      let keys_to = fn m -> List.flat_map(List.range(0, m), fn kx -> List.flat_map(List.range(0, m), fn ky -> List.map(List.range(0, m), fn kz -> Strata.Coord.key(kx, ky, kz))))
+      List.fold_left([1.0, 0.5], (), fn (_, sc) ->
+        let p = Pq.plan(fit_of(base, sc))
+        let places = Pq.site_places(p, 3, 0)
+        Test.assert_eq_str(string_join(List.map(places, fn sp -> int_to_string(Pq.sp_row(sp)) ++ ":" ++ int_to_string(Pq.sp_index(sp)) ++ "v" ++ int_to_string(Pq.sp_variant(sp))), " "), "0:17v2 1:-5v1 2:2v2 3:0v0", "rows, indices and variants (index mod 3) at " ++ float_to_string(sc))
+        Test.assert_true(List.all(places, fn sp -> Strata.Template.t_voxel_size(Pq.sp_template(sp)) == sc), "the fitted templates")
+        Test.assert_true(List.all(places, fn sp -> Pq.sp_rot(sp) == Strata.Seed.cell(3, 4, Pq.sp_index(sp), 0, 0) % 4), "turned by the site's hash")
+        let all_keys = keys_to(if sc == 0.5 do 3 else 2 end)
+        let bad = List.filter(all_keys, fn k ->
+          let g = world_ground(32 * Strata.Coord.kx(k), 32 * Strata.Coord.kz(k), 32, sc)
+          let got = Pq.place_with(p, 3, k, air(), g, Pq.fields_with(p, 3, g))
+          hash_of(got) != hash_of(List.fold_left(places, air(), fn (c, sp) -> stamp_place(c, k, sp))))
+        Test.assert_eq_str(string_join(List.map(bad, key_str), " "), "", "every chunk at " ++ float_to_string(sc) ++ " is the places stamped by hand")
+        let filled = List.fold_left(all_keys, 0, fn (a, k) -> a + count_filled(Pq.place(fit_of(base, sc), 3, k, air(), world_ground(32 * Strata.Coord.kx(k), 32 * Strata.Coord.kz(k), 32, sc))))
+        Test.assert_true(filled > 100, "and the chunks hold stamps (" ++ int_to_string(filled) ++ ")"))
+      -- not a site layer, an index out of range, a site layer of blocks: none
+      let mixed = Pq.plan(frozen_of(Pn.layer_site(Pn.layer_cover(Pn.shapes_blocks(base, "b", [9]), "moss", "b", Pn.rule(0.2, Nil, Nil, Nil), 2), "posts", "b", sites, 1.0, 5)))
+      Test.assert_eq_int(List.length(Pq.site_places(mixed, 3, 0)), 4, "the ruins")
+      Test.assert_eq_int(List.length(Pq.site_places(mixed, 3, 1)), 0, "a cover layer: none")
+      Test.assert_eq_int(List.length(Pq.site_places(mixed, 3, 2)), 0, "a site layer of blocks: none")
+      Test.assert_eq_int(List.length(Pq.site_places(mixed, 3, 3)) + List.length(Pq.site_places(mixed, 3, -1)), 0, "no such layer: none")
+      -- a site whose floor is not a number, or beyond any chunk, has no place
+      let odd = Pq.plan(frozen_of(site_pop([t0], [Pn.site(1.5, 1.5, float_nan(), 2.0, 0), Pn.site(1.5, 1.5, Math.pow(10.0, 300.0), 2.0, 1), Pn.site(2.5, 2.5, 4.0, 2.0, 2)], 1.0, 4)))
+      Test.assert_eq_str(string_join(List.map(Pq.site_places(odd, 3, 0), fn sp -> int_to_string(Pq.sp_row(sp))), " "), "2", "only the third")
     end
 
     test "place: a site layer and a cover layer, in either declared order: cover never overwrites the site's voxels, the site overwrites cover" do

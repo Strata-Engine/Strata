@@ -2556,4 +2556,71 @@ mod Strata.Populate do
       else Nil end
     else Nil end
   end
+
+  -- ── Site places ───────────────────────────────────────────────────────────
+
+  -- a site layer's stamp at one site: its row in the layer's site list, the
+  -- game's index, the variant, the template, the origin (world voxels), the
+  -- quarter turn and the draw stream
+  type PopSitePlace = PopSitePlace(Int, Int, Int, Strata.Template.Template, Int, Int, Int, Int, Int)
+
+  doc "The site's row: its position in the layer's site list, in declaration order."
+  fn sp_row(sp : PopSitePlace) : Int do match sp do PopSitePlace(v, _, _, _, _, _, _, _, _) -> v end end
+  doc "The site's index, as the game gave it (Strata.Population.site)."
+  fn sp_index(sp : PopSitePlace) : Int do match sp do PopSitePlace(_, v, _, _, _, _, _, _, _) -> v end end
+  doc "The variant stamped: the index mod the shape set's variants (0 .. variants - 1)."
+  fn sp_variant(sp : PopSitePlace) : Int do match sp do PopSitePlace(_, _, v, _, _, _, _, _, _) -> v end end
+  doc "The template stamped, as the plan holds it (fitted, when the population was put through fit_all)."
+  fn sp_template(sp : PopSitePlace) : Strata.Template.Template do match sp do PopSitePlace(_, _, _, v, _, _, _, _, _) -> v end end
+  doc "The stamp's origin along x, in world voxels: what Strata.Template.blit takes as ox."
+  fn sp_ox(sp : PopSitePlace) : Int do match sp do PopSitePlace(_, _, _, _, v, _, _, _, _) -> v end end
+  doc "The stamp's origin along y, its lowest row, in world voxels: what Strata.Template.blit takes as oy."
+  fn sp_oy(sp : PopSitePlace) : Int do match sp do PopSitePlace(_, _, _, _, _, v, _, _, _) -> v end end
+  doc "The stamp's origin along z, in world voxels: what Strata.Template.blit takes as oz."
+  fn sp_oz(sp : PopSitePlace) : Int do match sp do PopSitePlace(_, _, _, _, _, _, v, _, _) -> v end end
+  doc "The stamp's quarter turn (0..3): what Strata.Template.blit takes as rot."
+  fn sp_rot(sp : PopSitePlace) : Int do match sp do PopSitePlace(_, _, _, _, _, _, _, v, _) -> v end end
+  doc "The stream the template's probabilities are drawn from: what Strata.Template.blit takes as stream."
+  fn sp_stream(sp : PopSitePlace) : Int do match sp do PopSitePlace(_, _, _, _, _, _, _, _, v) -> v end end
+
+  -- a coordinate in voxels that floor and float_to_int take without a trap, and that no chunk key passes
+  pfn site_coord_ok(v : Float) : Bool do if v > -1152921504606846976.0 do v < 1152921504606846976.0 else false end end
+
+  doc "Where the site layer at run-order index l stamps each of its sites at level 0, as place_with stamps them: for each site, in declaration order, its row, its index, the variant (index mod the variants), the template, the origin, the quarter turn and the draw stream, so that Strata.Template.blit(c, k, sp_template(sp), sp_ox(sp), sp_oy(sp), sp_oz(sp), sp_rot(sp), sp_stream(sp)) puts into chunk k what place_with's site layer puts there (a later site over an earlier, a later layer over both). The turn is h mod 4 and the stream Strata.Seed.next(h), for h = Strata.Seed.cell(seed, salt, index, 0, 0); the origin is w / 2 and d / 2 columns (rounded down) before the column holding the site's centre, w x d the turned footprint, and its lowest row is floor(F / voxel) + 1, F the floor read as a 32-bit float. voxel is the template's own voxel size: the world's once the population is fitted (fit_all), as place_with requires; within fit's tolerance of one in a million, a template it left as it was could be a voxel off for a site far out. It reads no Ground and no Table. Nil for an index that is not a site layer's, and for a site layer of blocks (one voxel at the origin, whose voxel size the plan does not hold); a site whose centre or floor, in voxels, is NaN, infinite or 2^60 or more from 0 is left out (place_with stamps it in no chunk)."
+  fn site_places(p : PopPlan, seed : Int, l : Int) : List(PopSitePlace) do site_places_d(pd(p), seed, l) end
+  pfn site_places_d(p : PlanData, seed : Int, l : Int) : List(PopSitePlace) do
+    let site = if l < 0 do false else if l >= p.pl_nl do false else NativeArray.get_int(p.pl_lkind, l) == 2 end end
+    let ts = if site do (match List.nth_opt(p.pl_ltemps, l) do
+        Some(v) -> v
+        None -> Nil
+      end) else Nil end
+    let nv = NativeArray.get_int(p.pl_lnv, Math.max_int(l, 0))
+    if List.is_empty(ts) do Nil
+    else if nv <= 0 do Nil
+    else
+      let s0 = NativeArray.get_int(p.pl_lsat, l)
+      let salt = NativeArray.get_int(p.pl_lsalt, l)
+      List.filter_map(List.range(0, NativeArray.get_int(p.pl_lsn, l)), fn r -> site_place(p, ts, nv, seed, salt, s0 + r, r))
+    end end
+  end
+  -- site s (row r of its layer) as site_go stamps it
+  pfn site_place(p : PlanData, ts : List(Strata.Template.Template), nv : Int, seed : Int, salt : Int, s : Int, r : Int) : Option(PopSitePlace) do
+    let index = NativeArray.get_int(p.pl_sidx, s)
+    let v = euclid_mod(index, nv)
+    match List.nth_opt(ts, v) do
+      None -> None
+      Some(tp) ->
+        let voxel = Strata.Template.t_voxel_size(tp)
+        let fx = NativeArray.get_float(p.pl_sx, s) /. voxel
+        let fz = NativeArray.get_float(p.pl_sz, s) /. voxel
+        let fy = NativeArray.get_f32(p.pl_sfl, s) /. voxel
+        if site_coord_ok(fx) && site_coord_ok(fz) && site_coord_ok(fy) do
+          let h = Strata.Seed.cell(seed, salt, index, 0, 0)
+          let rot = h % 4
+          match Strata.Template.bounds(tp, 0, 0, 0, rot) do
+            (_, _, _, w1, _, d1) -> Some(PopSitePlace(r, index, v, tp, float_to_int(Math.floor(fx)) - (w1 + 1) / 2, float_to_int(Math.floor(fy)) + 1, float_to_int(Math.floor(fz)) - (d1 + 1) / 2, rot, Strata.Seed.next(h)))
+          end
+        else None end
+    end
+  end
 end
