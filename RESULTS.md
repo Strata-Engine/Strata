@@ -1173,3 +1173,63 @@ The population's Ground and Table for a chunk column now cost 4.3 M instructions
 - `region_at` is called once per atlas sample.
 - The ground fields are supplied only at the columns that are read.
 - A density top is worked out only under candidates that stand.
+
+### Fix round 2: each ground slot supplied wherever a layer reads it
+
+After the re-review of 7b9e233. The library now says where each slot is read
+(`slots_read`), and the viewer supplies each slot exactly there; the stand
+pass is gone. The a044934 harness and the fix's were run alternately, at
+load 11 to 14. The chunks are the same as round 1's.
+
+| what | before (a044934) | after | a surface chunk |
+|---|---|---|---|
+| stage 35, two keys a call (the real path) | 200.49 to 200.50 M instructions a column | 209.21 to 209.27 M | about +1.8 M, about 0.1 ms: met |
+| stage 1, one chunk at a time | 60.40 to 60.42 M | 64.11 to 64.12 M | +3.7 M, about 0.2 ms: met |
+
+`pop_ground` is 3.9 M a chunk column (round 1: 4.3 M). The milliseconds are
+the instructions at round 1's 17.2 M a ms; CPU time at this load was not
+recorded apart.
+
+## Task 10: the stage-1 targets
+
+The design's targets (`docs/2026-11-12-population-design.md`, Budget and
+targets) against what the plan measured. CPU time is from `/usr/bin/time -l`
+as a `REPS=n` run minus a `REPS=0` run; instructions are the stable figure,
+because the load average moved between 4 and 223 over the plan. Every row
+was measured under March 0.7.0 (main at `07b58d065` or later). The sources
+are `docs/population-ledger.md` and the plan's task reports; only the last
+row was measured for this record.
+
+| target | measured | load | verdict |
+|---|---|---|---|
+| fields and rules for a surface chunk: 0.1 ms | `bench/populate_fields` mode 1, 32 x 32 columns, 4 fields, 3 layers: 78 to 80 us, 1.64 M instructions | 214 to 223 | met |
+| the same with one cover field | mode 16, the chunk and its pad (44 x 44 columns), a 6 m cover field of 122 trees: 110 to 115 us, 1.91 M; the cover field alone about 100 to 105 us, 1.66 M | 4.3 to 8.0 | missed: one 6 m cover field is about the whole budget |
+| all cover layers together: 0.1 ms | one layer at 0.3 a square metre on a flat floor: 52 to 55 us, 0.73 to 0.74 M | 24 to 45 | met for one layer |
+| | two layers (weights in a zone, three surfaces a column): 185 to 195 us, 2.55 to 2.57 M | 24 to 45 | missed |
+| scatter and stamp layers: what trees cost before the port | before (a044934): tree candidates and tests 65 us and 0.65 M, tree blits 45 us and 1.18 M, the ruin blit 40 us and 0.02 M a surface chunk. After: `place_with` with the chunk's floors 1.9 M; the whole port +1.8 M a surface chunk on the real path (about 0.1 ms), +3.7 M one chunk at a time (about 0.2 ms), against 0.3 ms allowed | 42.6 to 47.9 before; 11 to 14 after | met |
+| | `bench/populate_fields` mode 8, 27 stamps of a 9 x 12 x 9 template: 23.94 M and 1.5 ms before Task 7, 7.57 M and 0.37 ms after (the draw skipped at probability 255, sizes read once) | 4.2 to 6.5 | |
+| building a population at start-up, 12 shape sets of 6 variants at 0.25 m: under 2 s | the island's population (4 shape sets: 12 tree templates, 3 ruins, 2 of blocks) read from island.pop, frozen, fitted and planned: 0.29 to 0.30 ms and 4.73 M at 1 m and at 0.25 m. With its templates made (12 trees grown, 3 ruins read and fitted): 4.0 to 4.25 ms and 62.6 M at 1 m, 55 to 57.5 ms and 738 M at 0.25 m | 8.2 to 8.9 | met for the island's population; the 12 x 6 case was not built, since stage 1 has no shape generators |
+
+The start-up row is `bench/chunk_stages` stages 36 to 39 (new), run
+directly, two runs each. Stage 36 is the population alone (`pop_of`), stage
+37 the whole Decor the viewer builds (`decor_of`), stage 38 the 12 tree
+templates alone (3.25 to 3.75 ms and 56.4 M at 1 m; 42.5 to 45 ms and
+562 M at 0.25 m), stage 39 island.pop's `{name}`s worked out and substituted
+(0.05 ms and 0.84 M). So reading, freezing, fitting and planning the
+population is about 3.9 M instructions, and the start-up cost is the
+viewer's trees.
+
+Not targets, recorded with them:
+
+- **Coarse levels.** A scatter layer placed at level L costs about 4^L
+  times a level-0 chunk, since a level-L chunk holds 4^L times the
+  instances and each is walked at its fine size: mode 8's layer at level 1
+  27.2 M and 1.4 ms, at level 2 79.1 M and 3.7 ms (load 5.0 to 5.6).
+  Caching coarse templates by variant, turn and phase where every
+  probability is 255 is deferred.
+- **Ground slots above level 0.** Above level 0 a candidate is judged at
+  its fine column, bit for bit level 0's, except for ground slots and
+  regions zones, which are read at the coarse column holding it. On the
+  island 19 of 20 trees in the level-1 forest chunk are level 0's. Open.
+- **The March share.** Every per-column cost above is plain March code. Its
+  gaps have reduced cases: GAPS S43 to S47.

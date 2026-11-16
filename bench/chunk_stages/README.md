@@ -55,4 +55,13 @@ The layer a climb adds is all air (early-outs), so the one-key-a-column case
 costs nothing there; a descent was not counted. Coarse levels have little to
 share (1.1 full chunks a column at levels 1 and 2).
 
+Stages 36 to 39 time start-up rather than a chunk; run the binary
+directly, a `REPS=n` run minus a `REPS=0` run under `/usr/bin/time -l`,
+divided by n (`QUARTER=1` makes the world 0.25 m a voxel): 36 the island's
+population alone (`pop_of`: island.pop's `{name}`s substituted, read,
+frozen, fitted, planned), 37 the whole Decor (`decor_of`: the 12 tree
+templates grown, the ruins read and fitted, then 36), 38 the tree templates
+alone, 39 the `{name}`s worked out and substituted alone. Figures:
+`RESULTS.md`, Population core, Task 10.
+
 Results and what they mean: `docs/2026-11-12-chunk-performance-findings.md`.

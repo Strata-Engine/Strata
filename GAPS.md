@@ -90,6 +90,11 @@ edit) produced a binary with the old shaders. Workaround:
 `native/build_shaders.sh` rewrites a stamp line in `strata_vk.c` with the
 header's hash.
 
+Met again in the population plan's Task 9 (found by its re-review):
+`native/strata_lamps.h`, the light volume's lamp lists, is included by
+`strata_vk.c`, and a change to it alone is not rebuilt either. No stamp line
+covers it; `forge clean` before building does.
+
 ## S15: a value shared by worker tasks is slow to pass around a hot loop
 
 `Strata.Mesh` ran seven times slower (1183 chunks in 1.95 s, from 0.27 s)
@@ -441,3 +446,52 @@ visited; mode 12 is blit alone). The Strata code is left plain; wanted from
 March: a tuple answered by a small function kept out of the heap (or the
 function inlined), and a constructor argument that is only read borrowed
 across modules as it is within one.
+
+## S44: a Float-valued `if` allocates a box (closed on March `07b58d065`)
+
+An `if` or `match` whose value is a Float boxed it: a `malloc` and a `free`
+per evaluation. Reduced case `bench/march/float_if`: 22.3 ns against C's
+0.55 ns (40 times) on March 0.5.0 and on main at 1a4251bc8; 0.85 ns against
+0.56 after march-language/march#1263 (merged as `07b58d065`). Met in the
+population plan's Task 2: a curve is piecewise linear with Float-valued
+branches, and the five curve passes of `bench/populate_fields` mode 1 cost
+210 us of CPU before the fix and 23.5 us after, with the Strata code
+unchanged. Closed; recorded because Strata kept the plain code through it
+and the hand rewrites are now slower than the plain code
+(`docs/2026-11-12-chunk-performance-findings.md`).
+
+## S45: a loop pays per turn for array calls, a scheduler poll and a stack save
+
+Each array read or write is a call into the runtime (with its own bounds
+check), and each turn of a loop reloads the scheduler's preempt flag and
+saves and restores the stack pointer, so no loop vectorises. Reduced case
+`bench/march/voxel_loop`: 3.70 ns and 77 instructions a voxel against C's
+0.53 ns and 16 on March 0.5.0; 1.75 ns against 0.56 on `07b58d065`.
+Met in every per-column loop of the population: the cover placer's loop
+(about 270 instructions a floor, Task 3), `adapt` (about 445 a column, Task
+5), the cover-field count (about 49 a test, Task 6), the island's per-column
+passes (Task 9), and the loop of `Strata.Template.blit` beside S43. The
+Strata code is left plain; open.
+
+## S46: `Strata.Seed` hashes in 32-bit lanes
+
+March Ints are 63 bits and overflow traps, so `Strata.Seed` masks every
+product into 32-bit lanes. Reduced case `bench/march/hash64`: one
+`Seed.cell` 27.8 ns and 241 instructions against 1.54 ns for the 64-bit mix
+C would write (18 times); 28.3 ns on `07b58d065`. March main has had
+`int_wrapping_mul` since the move (S37), and the same mix in one 63-bit lane
+costs 3.50 ns there, so the language has closed this gap; `Strata.Seed`
+stays in lanes because moving it would change every hash, every placement
+and every stored golden. Met in the population plan: the roll and `next`
+are about 155 instructions a floor rolled in the cover placer (208 k of
+740 k a layer, Task 3) and the two draw hashes 4.8 M of 24.1 M in a chunk
+of 27 stamps (Task 4, before blit skipped draws at probability 255). Open,
+on Strata's side: a decision to change every hash at once.
+
+## S47: `/` and `%` by a constant cost more than shifts
+
+Reduced case `bench/march/divmod`: four `/` and `%` by 32 a voxel, 2.44 ns
+and 29 instructions on March main against C's 0.85 ns and 20 (2.9 times; on
+0.5.0 each is a runtime call). Met in the cover placer's loop, which
+recovers a column's x and z from its index (Task 3). Small; the Strata code
+is left plain.
