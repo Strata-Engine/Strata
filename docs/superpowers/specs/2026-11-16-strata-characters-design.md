@@ -152,3 +152,19 @@ script), not hand painted.
   language.
 - A contact sheet of all twelve in game (front and side, neutral and both
   teams) as the check that the roster reads.
+
+## Changes decided while building (2026-11-16, the user's decisions)
+
+- **Voxels of 1/32 m**, not 1/16 m, for detail. Each file says its voxel
+  size (the root transform's `_strata_voxel`); a file without it is 1/16 m.
+- **Gritty, not cartoony**: realistic proportions (a head about 1/7.5 of
+  the height), muted colours, shading and wear baked into the voxels'
+  colours, faces with brows over set-in eyes.
+- **Roster changes**: Brakk is replaced by **Corvin** (gladiator, a scarred
+  veteran legionnaire in segmented plate, open helmet, short cloak); Ixa by
+  **Nyx** (alien hunter, chitin plates, swept crest, mandibles, folded
+  forearm blades). Mother has a **power pack** on her back with cables over
+  her shoulders, not a shoulder cannon. Torvald's helmet has no horns.
+- **Sizes within 10%**: every character stands 1.78 to 1.88 m. The hit box
+  is per character in height only; its **width is shared, 0.6 m** (0.3 m
+  half width, as combat uses today), whatever the body's width.

@@ -20,11 +20,14 @@
 -- parts at their top face: at the middle of where that face overlaps the
 -- parent's box seen from above, or the middle of the face where it doesn't
 -- (an arm hanging beside the spine). Extras turn about their low corner. A
--- joint more than a voxel outside its parent's box is refused, as is a part
+-- joint further outside its parent's box than a voxel plus half the part's
+-- width is refused, as is an extra whose box doesn't touch its parent's, as is a part
 -- over 128 voxels a side, more than 64 parts, or a name out of place.
 --
--- Sockets: the middle of each hand's bottom face, half a voxel up (socket 0
--- left, 1 right). Both legs declared, sole 1/16 m. Mask 0: the right arm.
+-- Sockets: the middle of each hand's bottom face, 1/32 m up (socket 0 left,
+-- 1 right). Both legs declared, sole one voxel. Mask 0: the right arm.
+--
+-- Voxel size: the file's own (`_strata_voxel` on its root transform), else 1/16 m.
 --
 -- Palette: the file's colours, emission and roughness. Indices 241-244 are
 -- trim: `trimmed` gives them a shade, each scaled by its own brightness over
@@ -44,7 +47,8 @@ mod Strata.Character do
   -- a part as placed: its name, its parent's place in the order (-1 the root), its low corner and size (rig axes, voxels), its voxels
   type ChrPlaced = ChrPlaced(String, Int, Int, Int, Int, Int, Int, Int, NativeU8Arr)
 
-  pfn voxel_m() : Float do 0.0625 end
+  -- the file's voxel size: its own, else 1/16 m
+  pfn voxel_of(v : Strata.Vox.Vox) : Float do if v.scale > 0.0 do v.scale else 0.0625 end end
 
   doc "The fifteen part names, in the rig's order."
   fn part_names() : List(String) do
@@ -119,10 +123,20 @@ mod Strata.Character do
         else (overlap_mid(x, x + sx, px, px + psx), int_to_float(if k == 1 do y else y + sy end), overlap_mid(z, z + sz, pz, pz + psz)) end
     end
   end
-  pfn inside(j : (Float, Float, Float), p : ChrPlaced) : Bool do
+  -- j within p's box grown by m voxels
+  pfn inside(j : (Float, Float, Float), p : ChrPlaced, m : Float) : Bool do
     match (j, p) do
       ((jx, jy, jz), ChrPlaced(_, _, x, y, z, sx, sy, sz, _)) ->
-        jx >= int_to_float(x - 1) && jx <= int_to_float(x + sx + 1) && jy >= int_to_float(y - 1) && jy <= int_to_float(y + sy + 1) && jz >= int_to_float(z - 1) && jz <= int_to_float(z + sz + 1)
+        jx >= int_to_float(x) -. m && jx <= int_to_float(x + sx) +. m && jy >= int_to_float(y) -. m && jy <= int_to_float(y + sy) +. m && jz >= int_to_float(z) -. m && jz <= int_to_float(z + sz) +. m
+    end
+  end
+  -- how far a joint may lie outside its parent: a voxel, plus half the child's width (an arm hanging beside the chest)
+  pfn margin(c : ChrPlaced) : Float do match c do ChrPlaced(_, _, _, _, _, sx, _, sz, _) -> 1.0 +. int_to_float(imax(sx, sz)) /. 2.0 end end
+  -- two boxes no more than a voxel apart on every axis (an extra must touch its parent somewhere)
+  pfn touching(a : ChrPlaced, b : ChrPlaced) : Bool do
+    match (a, b) do
+      (ChrPlaced(_, _, ax, ay, az, asx, asy, asz, _), ChrPlaced(_, _, bx, b_y, bz, bsx, bsy, bsz, _)) ->
+        ax <= bx + bsx + 1 && bx <= ax + asx + 1 && ay <= b_y + bsy + 1 && b_y <= ay + asy + 1 && az <= bz + bsz + 1 && bz <= az + asz + 1
     end
   end
   pfn name_of(c : ChrPlaced) : String do match c do ChrPlaced(n, _, _, _, _, _, _, _, _) -> n end end
@@ -164,7 +178,7 @@ mod Strata.Character do
           else
             let pc = List.nth(ps, par)
             let j = joint(i, c, pc)
-            if !inside(j, pc) do Err("part " ++ name ++ " doesn't touch its parent " ++ name_of(pc))
+            if !(if join_kind(i) == 3 do touching(c, pc) else inside(j, pc, margin(c)) end) do Err("part " ++ name ++ " doesn't touch its parent " ++ name_of(pc))
             else
               match (j, pc) do
                 ((jx, jy, jz), ChrPlaced(_, _, px, py, pz, _, _, _, _)) ->
@@ -181,25 +195,25 @@ mod Strata.Character do
   pfn colours(r : Strata.Rig.Rig, v : Strata.Vox.Vox, idx : List(Int)) : Strata.Rig.Rig do
     List.fold_left(idx, r, fn (acc, i) -> ChrRg.colour(acc, i, ch(v.palette, i, 0), ch(v.palette, i, 1), ch(v.palette, i, 2), NativeArray.get_f32(v.rough, i), NativeArray.get_f32(v.emit, i)))
   end
-  pfn sockets(r : Strata.Rig.Rig, ps : List(ChrPlaced)) : Strata.Rig.Rig do
+  pfn sockets(r : Strata.Rig.Rig, ps : List(ChrPlaced), vm : Float) : Strata.Rig.Rig do
     let at = fn p -> match List.nth(ps, p) do ChrPlaced(_, _, _, _, _, sx, _, sz, _) -> (int_to_float(sx) /. 2.0, int_to_float(sz) /. 2.0) end
     match (at(5), at(8)) do
       ((lx, lz), (rx, rz)) ->
-        let r1 = Tuple.first(ChrRg.socket(r, 5, lx, 0.5, lz, Strata.Math.Quat.identity()))
-        let r2 = Tuple.first(ChrRg.socket(r1, 8, rx, 0.5, rz, Strata.Math.Quat.identity()))
-        Tuple.first(ChrRg.mask(ChrRg.leg(ChrRg.leg(r2, 9, 10, 11, voxel_m()), 12, 13, 14, voxel_m()), [6]))
+        let r1 = Tuple.first(ChrRg.socket(r, 5, lx, 0.03125 /. vm, lz, Strata.Math.Quat.identity()))
+        let r2 = Tuple.first(ChrRg.socket(r1, 8, rx, 0.03125 /. vm, rz, Strata.Math.Quat.identity()))
+        Tuple.first(ChrRg.mask(ChrRg.leg(ChrRg.leg(r2, 9, 10, 11, vm), 12, 13, 14, vm), [6]))
     end
   end
 
-  pfn size_of(ps : List(ChrPlaced), shift : Int) : CharSize do
+  pfn size_of(ps : List(ChrPlaced), shift : Int, vm : Float) : CharSize do
     let full = List.filter(ps, has_voxels)
     let top = List.fold_left(full, -100000, fn (a, c) -> match c do ChrPlaced(_, _, _, y, _, _, sy, _, _) -> imax(a, y + sy) end)
     let x0 = List.fold_left(full, 100000, fn (a, c) -> match c do ChrPlaced(_, _, x, _, _, _, _, _, _) -> imin(a, x) end)
     let x1 = List.fold_left(full, -100000, fn (a, c) -> match c do ChrPlaced(_, _, x, _, _, sx, _, _, _) -> imax(a, x + sx) end)
     let z0 = List.fold_left(full, 100000, fn (a, c) -> match c do ChrPlaced(_, _, _, _, z, _, _, _, _) -> imin(a, z) end)
     let z1 = List.fold_left(full, -100000, fn (a, c) -> match c do ChrPlaced(_, _, _, _, z, _, _, sz, _) -> imax(a, z + sz) end)
-    let h = int_to_float(top + shift) *. voxel_m()
-    { height: h, half_w: int_to_float(imax(x1 - x0, z1 - z0)) *. voxel_m() /. 2.0, eye: h -. 0.12 }
+    let h = int_to_float(top + shift) *. vm
+    { height: h, half_w: int_to_float(imax(x1 - x0, z1 - z0)) *. vm /. 2.0, eye: h -. 0.12 }
   end
 
   doc "The character a MagicaVoxel file describes, or why it doesn't follow the convention (naming the part)."
@@ -212,14 +226,15 @@ mod Strata.Character do
           Ok(ps) ->
             let shift = 0 - imin(low_y(List.nth(ps, 11)), low_y(List.nth(ps, 14)))
             let idx = List.sort_by(used(ps), fn (a, b) -> a < b)
-            match add_parts(colours(ChrRg.new(voxel_m()), v, idx), ps, 0, shift) do
+            let vm = voxel_of(v)
+            match add_parts(colours(ChrRg.new(vm), v, idx), ps, 0, shift) do
               Err(e) -> Err("character: " ++ e)
               Ok(r0) ->
-                let r = sockets(r0, ps)
+                let r = sockets(r0, ps, vm)
                 if ChrRg.refused(r) > 0 do Err("character: the rig refused a call: " ++ ChrRg.why(r))
                 else
                   let trim = List.map(List.filter(idx, fn i -> i >= 241 && i <= 244), fn i -> (i, ch(v.palette, i, 0), ch(v.palette, i, 1), ch(v.palette, i, 2)))
-                  Ok({ rig: r, size: size_of(ps, shift), trim: trim })
+                  Ok({ rig: r, size: size_of(ps, shift, vm), trim: trim })
                 end
             end
         end
