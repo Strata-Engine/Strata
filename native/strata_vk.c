@@ -31,6 +31,7 @@
 #include "strata_shaders.h"
 #include "strata_particles.h"
 #include "strata_alloc.h"
+#include "strata_lamps.h"
 #include "strata_text.h"
 
 #define NARR_HDR 32
@@ -2753,7 +2754,8 @@ static void bodies_to_frame(Frame *F) {
 /* The lamps near each cell of the light volume, into this frame's copy when
  * they have changed: every glowing voxel a chunk keeps is listed for each
  * cell whose chunk comes within SV_LAMP_REACH voxels of it, at most
- * SV_CELL_LAMPS a cell, so a point finds every lamp whose light reaches it. */
+ * SV_CELL_LAMPS a cell, the nearest when more can reach it (strata_lamps.h),
+ * so a point finds every lamp whose light reaches it while a cell has room. */
 static void lamps_to_frame(Frame *F) {
     float *wt = g.ubo_map + UBO_WATER;
     if (!g.cells || g.vn <= 0 || g.vnv <= 0) { wt[6] = 0.0f; return; }
@@ -2775,9 +2777,11 @@ static void lamps_to_frame(Frame *F) {
                         uint32_t t = (uint32_t)(wrapi(cx, nx) + nx * (wrapi(cy, ny) + ny * wrapi(cz, nz)));
                         if (pass == 0) { F->lcells_map[t * 2 + 1]++; continue; }
                         uint32_t k = F->lcells_map[t * 2 + 1];
-                        if (k >= SV_CELL_LAMPS || F->lcells_map[t * 2] + k >= SV_LAMP_LIST) continue;
-                        memcpy(F->llist_map + (F->lcells_map[t * 2] + k) * 4, l, 16);
-                        F->lcells_map[t * 2 + 1]++;
+                        if (F->lcells_map[t * 2] + (k < SV_CELL_LAMPS ? k : SV_CELL_LAMPS - 1) >= SV_LAMP_LIST) continue;
+                        /* past the cap the nearest lamps stay (strata_lamps.h): a cell never loses
+                         * its own lamp to its neighbours' (scene 17's post did, to generated ones) */
+                        lamp_keep(F->llist_map + F->lcells_map[t * 2] * 4, &k, SV_CELL_LAMPS, l, cx, cy, cz);
+                        F->lcells_map[t * 2 + 1] = k;
                     }
                 }
             }
