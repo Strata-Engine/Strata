@@ -110,7 +110,8 @@ script), not hand painted.
   see it in game with no code change.
 - Non-goal: new skeletons, new animations, or extras that animate on
   their own (a swinging tail). Possible later.
-- Non-goal: per-character abilities or stats.
+- Non-goal: per-character abilities or stats, other than the size that
+  comes with each body's own hit box.
 - Anti-goal: twelve recolours of one body. If two characters only differ
   by colour, that has failed.
 - Anti-goal: trim that can't be seen in a fight, so teams can't be told
@@ -118,11 +119,13 @@ script), not hand painted.
 
 ## Hit box (the user's decision)
 
-- **One shared box.** Every character is hit, collides and sees from the
-  same 1.8 m body combat uses today (match.march places the middle 0.9 m
-  over the feet). Combat code doesn't change for characters; only the
-  drawing does. If the mismatch looks wrong, the tallest and shortest
-  characters move closer to 1.8 m rather than the box changing.
+- **A box per character.** Each character is hit, collides and sees from
+  its own height and width, taken from its body. Today combat assumes one
+  1.8 m body (match.march places the middle 0.9 m over the feet); that
+  becomes per character: the hit test, the physics box, the eye height
+  and anything else sized for 1.8 m. Size is therefore a stat (Ixa is
+  harder to hit, Brakk easier), accepted by the user; balancing beyond
+  that is not part of this work.
 
 ## Settled after the builder check (my calls)
 
