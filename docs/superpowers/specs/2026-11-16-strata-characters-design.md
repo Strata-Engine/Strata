@@ -170,3 +170,13 @@ script), not hand painted.
   uses today, for every character (this replaces "a box per character"
   above). Combat code does not change for characters; each is drawn with
   its feet on the ground at its own height.
+
+## The roster, as built (2026-11-16, the user's decision)
+
+The mixed-worlds roster above was replaced: **twelve medieval characters,
+blocky, at 1/16 m voxels**, every body on one frame (head 5 voxels a side,
+1.81 m to the top of the head; hats and helmets to 1.94 m): Knight,
+Man-at-arms, Archer, Crossbowman, Norseman, Templar, Landsknecht, Ranger,
+Executioner, Friar, Squire, Lord. Team trim is heraldry: tabards,
+surcoats, shields, crosses, stripes and bands. One shared hit box (1.8 m
+by 0.6 m). The contact sheet is docs/strata-characters.png.
