@@ -1,0 +1,138 @@
+-- Roster — the twelve characters the viewer's fighters and player are drawn
+-- as: MagicaVoxel files in viewer/assets/characters (written by
+-- scripts/characters.py, editable by hand), read by Strata.Character when a
+-- match starts. A file that is missing or breaks the convention is reported
+-- on one line and its place is taken by today's humanoid; the game starts.
+--
+-- Fighter i (0 to 11) plays character i; the player (fighter 0) plays
+-- STRATA_CHARACTER (0 to 11, default 0), and the fighter who would have had
+-- that character plays character 0 instead.
+mod StrataViewer.Roster do
+
+  needs IO.Foreign
+  needs IO.Console
+  needs IO.FileRead
+  needs IO.Process
+
+  alias Strata.Rig as RosRg
+
+  doc "The twelve characters' ids, in roster order (their files are <id>.vox)."
+  fn ids() : List(String) do ["corvin", "vesper", "rook", "unit7", "mother", "skrell", "gorrum", "nyx", "sabine", "kade", "hex", "torvald"] end
+
+  -- where the characters are: viewer/assets/characters, found from the program's own path (the viewer and its
+  -- tests are built in viewer/.march/build/<profile>/), else from the working directory
+  pfn dirs() : List(String) do
+    let own = match process_argv() do
+        Cons(exe, _) -> Cons(Path.dirname(exe) ++ "/../../../assets/characters/", Nil)
+        Nil -> Nil
+      end
+    List.append(own, Cons("viewer/assets/characters/", Cons("assets/characters/", Nil)))
+  end
+  pfn first_there(ds : List(String), name : String) : Option(String) do
+    match ds do
+      Nil -> None
+      Cons(d, rest) -> if Authority.must(File.exists(d ++ name)) do Some(d ++ name) else first_there(rest, name) end
+    end
+  end
+
+  doc "Today's humanoid as a character: 1.8 m, a 0.3 m half width, the eye at 1.68 m, no trim."
+  fn humanoid() : Strata.Character.Character do
+    { rig: StrataViewer.Figures.humanoid(), size: { height: 1.8, half_w: 0.3, eye: 1.68 }, trim: Nil }
+  end
+
+  doc "Character [id] read from the first of [ds] that has <id>.vox; today's humanoid, with a line saying why, if none has it or it can't be built."
+  fn load_from(ds : List(String), id : String) : Strata.Character.Character do
+    match first_there(ds, id ++ ".vox") do
+      None ->
+        let _said = Authority.must(println("strata_viewer: character " ++ id ++ ": no " ++ id ++ ".vox in viewer/assets/characters; using the humanoid"))
+        humanoid()
+      Some(path) ->
+        match Strata.Character.load(path) do
+          Ok(c) -> c
+          Err(e) ->
+            let _said = Authority.must(println("strata_viewer: character " ++ id ++ ": " ++ e ++ "; using the humanoid"))
+            humanoid()
+        end
+    end
+  end
+
+  doc "The twelve characters, in roster order."
+  fn load_cast() : List(Strata.Character.Character) do List.map(ids(), fn id -> load_from(dirs(), id)) end
+
+  doc "The player's character, STRATA_CHARACTER (0 to 11; default 0)."
+  fn pick() : Int do Authority.must(Env.get_int("STRATA_CHARACTER", 0)) end
+
+  doc "Which character fighter [i] plays, the player having chosen [pick] (0 to 11; anything else is 0)."
+  fn cast(i : Int, pick : Int) : Int do
+    let p = if pick >= 0 && pick < 12 do pick else 0 end
+    if i == 0 do p else if i == p do 0 else i end end
+  end
+
+  -- ── a character's other rigs ─────────────────────────────────────────────
+  -- does part p hang, through its parents, from one of [roots]?
+  pfn under(par : NativeI32Arr, p : Int, roots : List(Int)) : Bool do
+    if p < 0 do false else if List.member(roots, p) do true else under(par, NativeArray.get_i32(par, p), roots) end end
+  end
+  pfn empty_part(r : Strata.Rig.Rig, p : Int) : Strata.Rig.Rig do
+    match RosRg.size(r, p) do (sx, sy, sz) -> if sx * sy * sz == 0 do r else RosRg.box(r, p, 0, 0, 0, sx - 1, sy - 1, sz - 1, 0) end end
+  end
+
+  doc "The rig as the player sees its own body: every part and joint as before, so the same clips move it, but the head, the arms and whatever hangs from them hold no voxels."
+  fn body_of(r : Strata.Rig.Rig) : Strata.Rig.Rig do
+    let par = RosRg.parents(r)
+    List.fold_left(List.range(0, RosRg.part_count(r)), r, fn (acc, p) -> if under(par, p, [2, 3, 6]) do empty_part(acc, p) else acc end)
+  end
+
+  pfn colour_from(r : Strata.Rig.Rig, c : (Int, Float, Float, Float, Float, Float)) : Strata.Rig.Rig do
+    match c do (i, cr, cg, cb, ro, em) -> RosRg.colour(r, i, cr, cg, cb, ro, em) end
+  end
+  pfn with_palette(r : Strata.Rig.Rig, from : Strata.Rig.Rig) : Strata.Rig.Rig do
+    List.fold_left(RosRg.palette(from), r, fn (acc, c) -> colour_from(acc, c))
+  end
+  -- copy a part's grid g (sides sx, sy) into part q of r: as it is when top < 0, else laid along the arm, voxel (x, y, z) going to
+  -- (x + ox, z + oz, top - y)
+  pfn copy_go(r : Strata.Rig.Rig, q : Int, g : NativeU8Arr, sx : Int, sy : Int, i : Int, n : Int, ox : Int, oz : Int, top : Int) : Strata.Rig.Rig do
+    if i >= n do r
+    else
+      let c = NativeArray.get_u8(g, i)
+      let x = i % sx
+      let y = (i / sx) % sy
+      let z = i / (sx * sy)
+      let r2 = if c == 0 do r else if top < 0 do RosRg.voxel(r, q, x, y, z, c) else RosRg.voxel(r, q, x + ox, z + oz, top - y, c) end end
+      copy_go(r2, q, g, sx, sy, i + 1, n, ox, oz, top)
+    end
+  end
+
+  doc "Part [part] of the rig alone, as a rig of one part in its palette, anchored at its middle: what a fallen fighter comes apart into."
+  fn piece_of(r : Strata.Rig.Rig, part : Int) : Strata.Rig.Rig do
+    match RosRg.size(r, part) do
+      (sx, sy, sz) ->
+        let base = with_palette(RosRg.new(RosRg.voxel_size(r)), r)
+        match RosRg.part(base, -1, 0.0, 0.0, 0.0, imax(sx, 1), imax(sy, 1), imax(sz, 1)) do
+          (r1, p) ->
+            let r2 = RosRg.anchor(r1, p, int_to_float(sx) /. 2.0, int_to_float(sy) /. 2.0, int_to_float(sz) /. 2.0)
+            copy_go(r2, p, RosRg.grid(r, part), sx, sy, 0, sx * sy * sz, 0, 0, -1)
+        end
+    end
+  end
+
+  doc "The right forearm and hand (parts 7 and 8) as one rig for the player's view, in the character's colours, its voxels scaled so it is 8.5 cm wide: lying along +z from the elbow (z 0) to the fingers, anchored at the palm, where what it holds is."
+  fn forearm_of(r : Strata.Rig.Rig) : Strata.Rig.Rig do
+    match (RosRg.size(r, 7), RosRg.size(r, 8)) do
+      ((fx, fy, fz), (hx, hy, hz)) ->
+        let w = imax(fx, hx)
+        let d = imax(fz, hz)
+        -- as wide as today's view forearm (8.5 cm), whatever the character's build: it is seen from half a metre
+        let base = with_palette(RosRg.new(0.085 /. int_to_float(imax(w, d))), r)
+        match RosRg.part(base, -1, 0.0, 0.0, 0.0, w, d, fy + hy) do
+          (r1, p) ->
+            -- a part's y runs up its grid; along the arm, z runs from the elbow (the forearm's top) to the fingers (the hand's bottom)
+            let r2 = copy_go(r1, p, RosRg.grid(r, 7), fx, fy, 0, fx * fy * fz, (w - fx) / 2, (d - fz) / 2, fy - 1)
+            let r3 = copy_go(r2, p, RosRg.grid(r, 8), hx, hy, 0, hx * hy * hz, (w - hx) / 2, (d - hz) / 2, fy + hy - 1)
+            RosRg.anchor(r3, p, int_to_float(w) /. 2.0, int_to_float(d) /. 2.0, int_to_float(fy) +. int_to_float(hy) /. 2.0)
+        end
+    end
+  end
+
+  pfn imax(a : Int, b : Int) : Int do if a > b do a else b end end
+end

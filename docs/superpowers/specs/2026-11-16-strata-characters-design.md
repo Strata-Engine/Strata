@@ -165,6 +165,8 @@ script), not hand painted.
   **Nyx** (alien hunter, chitin plates, swept crest, mandibles, folded
   forearm blades). Mother has a **power pack** on her back with cables over
   her shoulders, not a shoulder cannon. Torvald's helmet has no horns.
-- **Sizes within 10%**: every character stands 1.78 to 1.88 m. The hit box
-  is per character in height only; its **width is shared, 0.6 m** (0.3 m
-  half width, as combat uses today), whatever the body's width.
+- **Sizes within 10%**: every character stands 1.78 to 1.88 m.
+- **One shared hit box** after all: 0.6 m wide and 1.8 m tall, as combat
+  uses today, for every character (this replaces "a box per character"
+  above). Combat code does not change for characters; each is drawn with
+  its feet on the ground at its own height.

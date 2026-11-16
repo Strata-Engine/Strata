@@ -768,7 +768,7 @@ def hash3(x, y, z, k=0):
 DARKER, DARK_, LIGHT_ = 16, 32, 48   # shade variants: base index + offset (bases 1-15)
 
 
-def mute(c, sat=0.62, gain=0.9):
+def mute(c, sat=0.78, gain=0.95):
     r, g, b = c
     grey = 0.3 * r + 0.59 * g + 0.11 * b
     return tuple(int(max(0, min(255, (grey + (v - grey) * sat) * gain))) for v in (r, g, b))
