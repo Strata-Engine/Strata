@@ -1366,14 +1366,13 @@ mod StrataViewer do
     end
   end
   pfn scatter_layers(f : Strata.Population.Frozen) : List(Int) do
-    List.filter(List.range(0, Strata.Population.layer_count(f)), fn l -> Strata.Population.layer_kind(f, l) == 1)
+    List.filter(List.range(0, Strata.Population.layer_count(f)), fn l -> Strata.Population.is_scatter(f, l))
   end
   -- the masks each layer's Table is read at (run order): a cover layer the chunk's columns (level 0 only), a
   -- scatter layer its candidates' columns, a site layer none
   pfn layer_masks(f : Strata.Population.Frozen, chunk : NativeU8Arr, cand : NativeU8Arr, none : NativeU8Arr) : List(NativeU8Arr) do
     List.map(List.range(0, Strata.Population.layer_count(f)), fn l ->
-      let kind = Strata.Population.layer_kind(f, l)
-      if kind == 0 do chunk else if kind == 1 do cand else none end end)
+      if Strata.Population.is_cover(f, l) do chunk else if Strata.Population.is_scatter(f, l) do cand else none end end)
   end
   -- the columns where the population reads ground slot s (Strata.Populate.slots_read), none when it reads none
   pfn slot_mask(reads : List((Int, NativeU8Arr)), s : Int, none : NativeU8Arr) : NativeU8Arr do
@@ -1434,7 +1433,7 @@ mod StrataViewer do
               Some(IslandPop(gr, t, _)) ->
                 List.flat_map(List.range(0, Strata.Population.layer_count(f)), fn l ->
                   let ts = Strata.Population.shape_set_templates(f, Strata.Population.layer_shape_set(f, l))
-                  let xs = if Strata.Population.layer_kind(f, l) == 1 do Strata.Populate.instances_with(p, seed, t, gr, l) else Nil end
+                  let xs = if Strata.Population.is_scatter(f, l) do Strata.Populate.instances_with(p, seed, t, gr, l) else Nil end
                   List.filter_map(xs, fn x -> tree_of(ts, x, vs)))
             end
         end
@@ -1447,35 +1446,17 @@ mod StrataViewer do
     end
   end
 
-  doc "The ruin on site s, and where, as the population's site layer stands it (Strata.Populate.place_with): (template, x, y, z, rot) as a blit takes them: variant index mod the variants, turned h mod 4 for h = Strata.Seed.cell(seed, salt, index, 0, 0), from w / 2 and d / 2 columns before the column holding the site's centre, its lowest row at floor(F / scale) + 1 with F the floor as a 32-bit float. None without ruins or a population."
-  fn site_ruin(d : Decor, s : Strata.Atlas.Site, scale : Float, seed : Int) : Option((Strata.Template.Template, Int, Int, Int, Int)) do
+  doc "The ruin on site s as the population's site layer stamps it, from Strata.Populate.site_places: its template, origin, turn and stream, as a template blit takes them. None without ruins or a population."
+  fn ruin_place(d : Decor, s : Strata.Atlas.Site, seed : Int) : Option(Strata.Populate.PopSitePlace) do
+    if List.is_empty(decor_ruins(d)) do None else
     match decor_pop(d) do
       None -> None
-      Some(DecorPop(f, _)) ->
-        match List.filter(List.range(0, Strata.Population.layer_count(f)), fn l -> Strata.Population.layer_kind(f, l) == 2) do
+      Some(DecorPop(f, p)) ->
+        match List.filter(List.range(0, Strata.Population.layer_count(f)), fn l -> Strata.Population.is_site(f, l)) do
           Nil -> None
-          Cons(l, _) ->
-            let ts = Strata.Population.shape_set_templates(f, Strata.Population.layer_shape_set(f, l))
-            let nv = List.length(ts)
-            if nv == 0 do None
-            else if List.is_empty(decor_ruins(d)) do None
-            else
-              let idx = Strata.Atlas.s_index(s)
-              match List.nth_opt(ts, ((idx % nv) + nv) % nv) do
-                None -> None
-                Some(t) ->
-                  let rot = Strata.Seed.cell(seed, Strata.Population.layer_salt(f, l), idx, 0, 0) % 4
-                  match Strata.Template.bounds(t, 0, 0, 0, rot) do
-                    (_, _, _, w1, _, d1) ->
-                      let fl = NativeArray.get_f32(NativeArray.set_f32(NativeArray.make_f32(1, 0.0), 0, Strata.Atlas.s_floor(s)), 0)
-                      let cx = float_to_int(Math.floor(Strata.Atlas.s_x(s) /. scale))
-                      let cz = float_to_int(Math.floor(Strata.Atlas.s_z(s) /. scale))
-                      Some((t, cx - (w1 + 1) / 2, float_to_int(Math.floor(fl /. scale)) + 1, cz - (d1 + 1) / 2, rot))
-                  end
-              end
-            end end
+          Cons(l, _) -> List.find(Strata.Populate.site_places(p, seed, l), fn sp -> Strata.Populate.sp_index(sp) == Strata.Atlas.s_index(s))
         end
-    end
+    end end
   end
 
   -- how far the ground around a site falls or rises from its floor: the most over 16 directions 25 m out
@@ -3199,9 +3180,10 @@ mod StrataViewer do
         match slope_site(a) do
           None -> (0, land_height(land, 0, 0, seed), 0)
           Some(s) ->
-            match site_ruin(d, s, 1.0, seed) do
+            match ruin_place(d, s, seed) do
               None -> (float_to_int(Strata.Atlas.s_x(s)), vox(Strata.Atlas.s_floor(s), 1.0) + 3, float_to_int(Strata.Atlas.s_z(s)))
-              Some((t, ox, oy, oz, rot)) ->
+              Some(sp) ->
+                let (t, ox, oy, oz, rot) = (Strata.Populate.sp_template(sp), Strata.Populate.sp_ox(sp), Strata.Populate.sp_oy(sp), Strata.Populate.sp_oz(sp), Strata.Populate.sp_rot(sp))
                 match Strata.Template.bounds(t, ox, oy, oz, rot) do
                   (x0, y0, z0, x1, _, z1) ->
                     let mx = (x0 + x1) / 2

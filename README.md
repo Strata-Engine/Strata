@@ -779,7 +779,13 @@ for: `place_with` and `instances_with` refuse another's. `place_with`
 hands the chunk back unchanged when something does not fit;
 `place_problems(plan, seed, k, g, t)` says why, one message each. Other calls:
 `instances_with` lists a scatter layer's instances (with their place,
-top, variant, turn and draw stream) for a game's own use; `seen_to` and
+top, variant, turn and draw stream) for a game's own use;
+`site_places(plan, seed, l)` lists a site layer's stamps (each site's row
+and index, its variant and template, the origin, turn and stream
+`Strata.Template.blit` takes), so a game can replay or find a site's stamp
+without the placement formula (level 0 only, nothing for a site layer of
+blocks, and its origins are in the template's own voxels, so fit the
+population with `fit_all` first); `seen_to` and
 `ranks` set how far out a layer is drawn and which block wins when a
 template is coarsened; above level 0, `table_for(plan, g)` is the Table to
 hand over, since no field is read from it there; `field_point` and
@@ -788,6 +794,25 @@ a cover layer to floors of some blocks or some heights. A masked Table
 (`fields_for`, `fields_at`) whose mask misses columns where a scatter
 candidate stands drops those instances without an error, so build scatter
 masks from `cell_places`.
+
+**What a game holds.** `Pop`, `Frozen`, `Ground`, `PopPlan` and `Table`
+are opaque: a game makes them only through the calls above (`new` and the
+builders, `freeze` and `fit_all`, `ground` with `with_surfaces` and
+`with_field`, `plan`, and `fields`, `fields_with`, `fields_for`,
+`fields_at` or `table_for`; `Strata.PopulationFile.read` and `read_into`
+also make a `Pop`), so none skips freeze's checks, `problems` or a Table's
+identity. March has no package-private visibility, so the `Frozen` readers
+`Strata.Populate` needs (`field_kind`, `zone_lo`, `layer_curves` and the
+like) are public; a game needs the names, indices and counts
+(`layer_names`, `layer_index`, `layer_count` and theirs for fields, zones
+and shape sets), the layer readers and `shape_set_templates`. A layer's
+placer is asked by name: `is_cover(f, l)`, `is_scatter(f, l)` and
+`is_site(f, l)` (each false for no such layer).
+`freeze_subject` (which declaration a freeze message is about) and
+`PopulationFile.ground_fields` (the ten built-in fields, for `read_into`)
+are public for games; `default_seen` and `walk_ok` only because
+`Strata.Populate` reads them (a game asks `seen_level_at`, `fit_all` and
+`place_problems`).
 
 **The Ground.** An n x n area of columns at one level: its corner in world
 voxels, the voxel size (`voxel_of(scale, level)`, `scale * 2^level`), each column's ground top and
