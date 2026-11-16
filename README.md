@@ -752,31 +752,45 @@ ground slots the population reads, so a game knows what to supply. Then,
 for each chunk (or once for a column of chunks):
 
 ```march
--- plan: the PopPlan kept from start-up; pad: the Ground's columns beyond the chunk
-let pad = Pq.plan_pad(plan, scale)
+-- plan: the PopPlan kept from start-up; scale: the world's voxel size (level 0's)
+-- voxel: the key's level's own voxel size, scale * 2^level (scale itself at level 0)
+let voxel = Pq.voxel_of(scale, level)
+-- pad: the Ground's columns beyond the chunk, in this level's columns
+let pad = Pq.plan_pad(plan, voxel)
+-- the Ground's corner and size: the chunk's 32 columns and the pad on each side
+let x0 = 32 * kx - pad
+let z0 = 32 * kz - pad
+let n = 32 + 2 * pad
 -- the game's column heights drawn to the sites, and the columns the sites rule
-let hs2 = Pq.adapt_with(plan, x0, z0, n, scale, hs)
-let ruled = Pq.adapted_with(plan, x0, z0, n, scale)
--- the Ground: the chunk's 32 columns and the pad on each side, at the key's level
-let g = Pq.ground(32 * kx - pad, 32 * kz - pad, 32 + 2 * pad, scale, 0, tops, waters)
+let hs2 = Pq.adapt_with(plan, x0, z0, n, voxel, hs)
+let ruled = Pq.adapted_with(plan, x0, z0, n, voxel)
+-- the Ground takes the world's scale and the level, and works out voxel itself
+let g = Pq.ground(x0, z0, n, scale, level, tops, waters)
   |> Pq.with_surfaces(counts, ys, kinds)              -- optional: every floor and ceiling
   |> Pq.with_field(1, slope)
 let t = Pq.fields_with(plan, seed, g)                 -- every field, zone and density, once
 let c2 = Pq.place_with(plan, seed, k, c, g, t)
 ```
 
-`place_with` hands the chunk back unchanged when something does not fit;
-`place_problems(plan, k, g, t)` says why, one message each. Other calls:
+`adapt_with`, `adapted_with` and `plan_pad` take the level's own voxel
+size; only `ground` takes the world's scale (and the level). A Table knows
+the Ground (corner, size and voxel), the seed and the plan it was made
+for: `place_with` and `instances_with` refuse another's. `place_with`
+hands the chunk back unchanged when something does not fit;
+`place_problems(plan, seed, k, g, t)` says why, one message each. Other calls:
 `instances_with` lists a scatter layer's instances (with their place,
 top, variant, turn and draw stream) for a game's own use; `seen_to` and
 `ranks` set how far out a layer is drawn and which block wins when a
 template is coarsened; above level 0, `table_for(plan, g)` is the Table to
 hand over, since no field is read from it there; `field_point` and
 `cover_cached` are for tests and tools. `cover_on` and `cover_between` hold
-a cover layer to floors of some blocks or some heights.
+a cover layer to floors of some blocks or some heights. A masked Table
+(`fields_for`, `fields_at`) whose mask misses columns where a scatter
+candidate stands drops those instances without an error, so build scatter
+masks from `cell_places`.
 
 **The Ground.** An n x n area of columns at one level: its corner in world
-voxels, the voxel size (`scale * 2^level`), each column's ground top and
+voxels, the voxel size (`voxel_of(scale, level)`, `scale * 2^level`), each column's ground top and
 water line in voxels, optionally every surface of every column
 (`with_surfaces`; without it each column has one floor at its top), and
 the ground fields by slot. The built-in slots are 0 altitude, 1 slope, 2
@@ -786,11 +800,12 @@ wrong with a Ground. Its size:
 
 - a population with no scatter layer needs the chunk's own 32 x 32
   columns;
-- with a scatter layer, `plan_pad(plan, scale)` more on each side:
-  `ceil(reach / scale) + 1`, where `reach` is the widest template's
+- with a scatter layer, `plan_pad(plan, voxel)` more on each side:
+  `ceil(reach / voxel) + 1`, where `reach` is the widest template's
   half-width in metres, and more for each cover field a layer reads
-  (`ceil(radius / scale)` a hop, adding up along chains);
-- above level 0 the pad is counted in that level's columns.
+  (`ceil(radius / voxel)` a hop, adding up along chains);
+- above level 0 the pad is counted in that level's columns, which is why
+  `plan_pad` takes the level's voxel size, not the world's scale.
 
 A game that knows where its layers read can supply less. A cover layer
 reads the chunk's columns; a scatter layer reads the columns its candidates
@@ -831,8 +846,9 @@ by the game and named in a `PopNamed`. The `{name}`s are the viewer's own:
 it puts `island.gen`'s settings in before reading, so the numbers stay in
 one file.
 
-`read(text, named)` declares the ten built-in ground fields, reads the
-file and freezes it. `read_into(pop, text, named)` adds the file's sections
+`read(text, named)` declares the ten built-in ground fields and reads the
+file; it freezes only to check, and hands back the `Pop`, which the game
+freezes. `read_into(pop, text, named)` adds the file's sections
 to a game's own `Pop` and does not freeze; the game freezes, and
 `locate(text, err)` puts freeze's message on the line of the section it is
 about. Every mistake is an `Err("line N: ...")`, the first in file order.
