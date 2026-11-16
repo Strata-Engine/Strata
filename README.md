@@ -783,7 +783,9 @@ top, variant, turn and draw stream) for a game's own use;
 `site_places(plan, seed, l)` lists a site layer's stamps (each site's row
 and index, its variant and template, the origin, turn and stream
 `Strata.Template.blit` takes), so a game can replay or find a site's stamp
-without the placement formula; `seen_to` and
+without the placement formula (level 0 only, nothing for a site layer of
+blocks, and its origins are in the template's own voxels, so fit the
+population with `fit_all` first); `seen_to` and
 `ranks` set how far out a layer is drawn and which block wins when a
 template is coarsened; above level 0, `table_for(plan, g)` is the Table to
 hand over, since no field is read from it there; `field_point` and
@@ -796,8 +798,9 @@ masks from `cell_places`.
 **What a game holds.** `Pop`, `Frozen`, `Ground`, `PopPlan` and `Table`
 are opaque: a game makes them only through the calls above (`new` and the
 builders, `freeze` and `fit_all`, `ground` with `with_surfaces` and
-`with_field`, `plan`, and `fields_with`, `fields_for`, `fields_at` or
-`table_for`), so none skips freeze's checks, `problems` or a Table's
+`with_field`, `plan`, and `fields`, `fields_with`, `fields_for`,
+`fields_at` or `table_for`; `Strata.PopulationFile.read` and `read_into`
+also make a `Pop`), so none skips freeze's checks, `problems` or a Table's
 identity. March has no package-private visibility, so the `Frozen` readers
 `Strata.Populate` needs (`field_kind`, `zone_lo`, `layer_curves` and the
 like) are public; a game needs the names, indices and counts
