@@ -49,3 +49,13 @@ browser runtime still uses a bump allocator and no-op reference counts.
 The fixture does not establish general native array aliasing semantics or
 bounded memory during repeated stepping. Those are prerequisites for
 moving on to continuous play.
+
+To see the same fixture drawn by WebGPU, run:
+
+```sh
+python3 -m http.server 8765 --bind 127.0.0.1 --directory browser
+```
+
+Open `http://127.0.0.1:8765/preview.html` in a WebGPU-capable browser.
+The preview reads the WASM quad buffer directly and uses a fixed isometric
+view with face and corner shading.

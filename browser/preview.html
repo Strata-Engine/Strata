@@ -1,0 +1,120 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Strata WASM mesh preview</title>
+<style>
+  html { color-scheme: dark; background: #101719; color: #e5ede7; font: 15px system-ui, sans-serif; }
+  body { margin: 0; display: grid; min-height: 100vh; place-content: center; }
+  main { width: min(94vw, 920px); }
+  h1 { font-size: 24px; margin: 0 0 12px; }
+  canvas { display: block; width: 100%; border: 1px solid #384647; border-radius: 8px; }
+  p { color: #b9c8c1; }
+</style>
+<main>
+  <h1>Strata · WASM mesh preview</h1>
+  <canvas width="920" height="580" aria-label="Voxel terrain viewed from above"></canvas>
+  <p id="status" role="status">Loading terrain…</p>
+</main>
+<script type="module">
+const status = document.querySelector('#status');
+const canvas = document.querySelector('canvas');
+try {
+  const adapter = await navigator.gpu?.requestAdapter();
+  if (!adapter) throw new Error('No WebGPU adapter is available.');
+  const device = await adapter.requestDevice();
+  device.lost.then(({ message }) => { status.textContent = `WebGPU device lost. ${message}`; });
+  const { instance } = await WebAssembly.instantiateStreaming(fetch('./.build/core.wasm'));
+  const core = instance.exports;
+  if (core.init(12345, 1) !== 0) throw new Error('The terrain fixture failed to initialize.');
+
+  const bytes = core.mesh_bytes();
+  const quads = device.createBuffer({ size: bytes, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+  device.queue.writeBuffer(quads, 0, new Uint8Array(core.memory.buffer, core.mesh_ptr(), bytes));
+
+  const shader = device.createShaderModule({ code: /* wgsl */ `
+    @group(0) @binding(0) var<storage, read> quads: array<vec2u>;
+
+    struct Vertex {
+      @builtin(position) position: vec4f,
+      @location(0) color: vec3f,
+    }
+
+    @vertex fn vertex(@builtin(vertex_index) v: u32, @builtin(instance_index) i: u32) -> Vertex {
+      let word = quads[i].x;
+      let face = (word >> 25u) & 7u;
+      let u = v & 1u;
+      let t = (v >> 1u) & 1u;
+      let du = f32(u * (1u + ((word >> 15u) & 31u)));
+      let dv = f32(t * (1u + ((word >> 20u) & 31u)));
+      var p = vec3f(f32(word & 31u), f32((word >> 5u) & 31u), f32((word >> 10u) & 31u));
+      switch face {
+        case 0u: { p += vec3f(du, 1, dv); }
+        case 1u: { p += vec3f(du, 0, dv); }
+        case 2u: { p += vec3f(1, dv, du); }
+        case 3u: { p += vec3f(0, dv, du); }
+        case 4u: { p += vec3f(du, dv, 1); }
+        default: { p += vec3f(du, dv, 0); }
+      }
+      let q = p - vec3f(16, 4.5, 16);
+      let shade = array<f32, 6>(1, 0.45, 0.77, 0.58, 0.64, 0.52);
+      let ao = f32((quads[i].y >> (16u + 2u * v)) & 3u);
+      let turf = mix(vec3f(0.27, 0.54, 0.30), vec3f(0.66, 0.79, 0.42), clamp(p.y / 8, 0, 1));
+      let soil = mix(vec3f(0.23, 0.35, 0.27), vec3f(0.47, 0.54, 0.30), clamp(p.y / 8, 0, 1));
+      let color = select(soil, turf, face == 0u) * shade[face] * (0.65 + 0.35 * ao / 3);
+      return Vertex(vec4f((q.x - q.z) * 0.026, q.y * 0.075 - (q.x + q.z) * 0.025,
+        0.5 - (q.x + q.z + q.y) * 0.01, 1), color);
+    }
+
+    @fragment fn fragment(vertex: Vertex) -> @location(0) vec4f {
+      return vec4f(vertex.color, 1);
+    }
+  ` });
+  const format = navigator.gpu.getPreferredCanvasFormat();
+  const pipeline = await device.createRenderPipelineAsync({
+    layout: 'auto',
+    vertex: { module: shader, entryPoint: 'vertex' },
+    fragment: { module: shader, entryPoint: 'fragment', targets: [{ format }] },
+    primitive: { topology: 'triangle-strip' },
+    depthStencil: { format: 'depth24plus', depthWriteEnabled: true, depthCompare: 'less' },
+  });
+  const group = device.createBindGroup({
+    layout: pipeline.getBindGroupLayout(0),
+    entries: [{ binding: 0, resource: { buffer: quads } }],
+  });
+  const context = canvas.getContext('webgpu');
+  context.configure({ device, format });
+  const depth = device.createTexture({
+    size: [canvas.width, canvas.height],
+    format: 'depth24plus',
+    usage: GPUTextureUsage.RENDER_ATTACHMENT,
+  });
+  const encoder = device.createCommandEncoder();
+  const pass = encoder.beginRenderPass({
+    colorAttachments: [{
+      view: context.getCurrentTexture().createView(),
+      clearValue: { r: 0.066, g: 0.102, b: 0.110, a: 1 },
+      loadOp: 'clear',
+      storeOp: 'store',
+    }],
+    depthStencilAttachment: {
+      view: depth.createView(),
+      depthClearValue: 1,
+      depthLoadOp: 'clear',
+      depthStoreOp: 'discard',
+    },
+  });
+  pass.setPipeline(pipeline);
+  pass.setBindGroup(0, group);
+  pass.draw(4, bytes / 8);
+  pass.end();
+  device.queue.submit([encoder.finish()]);
+  await device.queue.onSubmittedWorkDone();
+  status.textContent = `${(bytes / 8).toLocaleString()} quads · March + FastNoiseLite → WASM → WebGPU`;
+  document.documentElement.dataset.rendered = 'true';
+} catch (error) {
+  status.textContent = error.message;
+  console.error(error);
+}
+</script>
+</html>
