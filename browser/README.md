@@ -74,3 +74,35 @@ one short cue. If the browser suspends audio, a later click can resume it.
 The preview remains playable when Web Audio is unavailable. If the
 embedded browser rejects Pointer Lock, open the preview in a standalone
 browser.
+
+## Streaming
+
+While flying, the preview keeps a 3×3 window of horizontal chunks. Terrain
+samples use world coordinates, and the renderer reuses nine GPU mesh
+buffers. Each animation frame can generate one chunk or remesh one edit.
+The renderer keeps at most two submissions in flight. The terrain still
+uses the preview's single layer of voxels and chunks mesh against air at
+their borders.
+
+The browser keeps up to 4,096 distinct edited cells for the current page
+session. An edited chunk restores those cells when it returns to the
+window. Once the journal is full, edits to new cells are rejected.
+
+The core test flies across ten chunks in both directions on each
+horizontal axis, returns to the edited origin, and repeats the route
+four times. It checks that the origin reloads with its edit intact and
+that both WASM memory and peak scratch use stay flat after the first route.
+
+For a browser timing check, run the following against a dedicated local
+Chrome test profile with remote debugging enabled on port 9229 and a
+test tab open. Keep the preview server running on port 8765.
+
+```sh
+node browser/test/streaming-chrome.mjs
+```
+
+On the development Mac, a 16-second headless Chrome flight loaded 12
+chunks after warm-up. The p95 and maximum frame intervals were 16.7 ms
+and 16.8 ms. A callback took at most 3.5 ms on the CPU, and WASM linear
+memory held at 16,842,752 bytes. These are observed timings for that
+browser, device, and flight path.

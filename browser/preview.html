@@ -48,6 +48,7 @@ try {
 
     struct View { matrix: mat4x4f, perspective: vec4f }
     @group(0) @binding(1) var<uniform> camera: View;
+    @group(0) @binding(2) var<uniform> chunkOrigin: vec4f;
 
     struct Vertex {
       @builtin(position) position: vec4f,
@@ -78,7 +79,7 @@ try {
       let color = select(soil, turf, face == 0u) * shade[face] * (0.65 + 0.35 * ao / 3);
       var position = vec4f((q.x - q.z) * 0.026, q.y * 0.075 - (q.x + q.z) * 0.025,
         0.5 - (q.x + q.z + q.y) * 0.01, 1);
-      if (camera.perspective.x != 0) { position = camera.matrix * vec4f(p, 1); }
+      if (camera.perspective.x != 0) { position = camera.matrix * vec4f(p + chunkOrigin.xyz, 1); }
       return Vertex(position, color);
     }
 
@@ -96,12 +97,45 @@ try {
   });
   const context = canvas.getContext('webgpu');
   context.configure({ device, format });
-  let quads, group, depth, revision;
-  let bytes = 0;
+  let depth;
   let playing = false, perspective = false, lost = false;
   let previous = null, accumulated = 0, frame;
   const tick = 1000 / 60;
   const view = new Float32Array(20);
+  const origin = new Float32Array(4);
+  let pendingDraws = 0;
+  const slots = Array.from({ length: core.chunk_capacity() }, () => {
+    const quads = device.createBuffer({
+      size: core.chunk_buffer_bytes(), usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+    });
+    const offset = device.createBuffer({
+      size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    });
+    const group = device.createBindGroup({
+      layout: pipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: quads } },
+        { binding: 1, resource: { buffer: cameraBuffer } },
+        { binding: 2, resource: { buffer: offset } },
+      ],
+    });
+    return { quads, offset, group, revision: 0, bytes: 0 };
+  });
+
+  function uploadChunks() {
+    for (const [i, slot] of slots.entries()) {
+      const revision = core.chunk_revision(i);
+      if (slot.revision === revision) continue;
+      slot.revision = revision;
+      slot.bytes = core.chunk_bytes(i);
+      if (!slot.bytes) continue;
+      device.queue.writeBuffer(slot.quads, 0,
+        new Uint8Array(core.memory.buffer, core.chunk_ptr(i), slot.bytes));
+      origin[0] = core.chunk_x(i) * 32;
+      origin[2] = core.chunk_z(i) * 32;
+      device.queue.writeBuffer(slot.offset, 0, origin);
+    }
+  }
 
   function draw() {
     const limit = device.limits.maxTextureDimension2D;
@@ -115,23 +149,7 @@ try {
         size: [width, height], format: 'depth24plus', usage: GPUTextureUsage.RENDER_ATTACHMENT,
       });
     }
-    const current = core.mesh_revision();
-    if (revision !== current) {
-      bytes = core.mesh_bytes();
-      if (bytes && (!quads || quads.size < bytes)) {
-        quads?.destroy();
-        quads = device.createBuffer({ size: bytes, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
-        group = device.createBindGroup({
-          layout: pipeline.getBindGroupLayout(0),
-          entries: [
-            { binding: 0, resource: { buffer: quads } },
-            { binding: 1, resource: { buffer: cameraBuffer } },
-          ],
-        });
-      }
-      if (bytes) device.queue.writeBuffer(quads, 0, new Uint8Array(core.memory.buffer, core.mesh_ptr(), bytes));
-      revision = current;
-    }
+    uploadChunks();
 
     view.set(new Float32Array(core.memory.buffer, core.camera_ptr(), 16));
     for (let i = 0; i < 16; i += 4) view[i] *= height / width;
@@ -149,13 +167,16 @@ try {
         view: depth.createView(), depthClearValue: 1, depthLoadOp: 'clear', depthStoreOp: 'discard',
       },
     });
-    if (bytes) {
-      pass.setPipeline(pipeline);
-      pass.setBindGroup(0, group);
-      pass.draw(4, bytes / 8);
+    pass.setPipeline(pipeline);
+    for (const slot of slots) {
+      if (!slot.bytes) continue;
+      pass.setBindGroup(0, slot.group);
+      pass.draw(4, slot.bytes / 8);
     }
     pass.end();
     device.queue.submit([encoder.finish()]);
+    pendingDraws++;
+    void device.queue.onSubmittedWorkDone().finally(() => { pendingDraws--; }).catch(() => {});
   }
 
   function resetClock() {
@@ -199,22 +220,28 @@ try {
 
   function animate(now) {
     if (lost) return;
+    let events = 0;
     if (playing && !document.hidden && document.hasFocus()) {
       if (previous !== null) accumulated = Math.min(accumulated + now - previous, 4 * tick);
       previous = now;
       if (accumulated >= tick) {
         const first = input.sample();
-        audio.playEvents(core.step(tick, first.held, first.pressed, first.dx, first.dy));
+        events = core.step(tick, first.held, first.pressed, first.dx, first.dy);
+        audio.playEvents(events);
         accumulated -= tick;
         while (accumulated >= tick) {
-          audio.playEvents(core.step(tick, first.held, 0, 0, 0));
+          core.step(tick, first.held, 0, 0, 0);
           accumulated -= tick;
         }
       }
     } else {
       resetClock();
     }
-    draw();
+    // Keep the GPU queue bounded and do at most one remesh this frame.
+    if (pendingDraws < 2) {
+      if (playing && !document.hidden && (events & 1) === 0) core.stream_one();
+      draw();
+    }
     frame = requestAnimationFrame(animate);
   }
 
@@ -222,7 +249,7 @@ try {
   await device.queue.onSubmittedWorkDone();
   if (!lost) {
     play.disabled = false;
-    status.textContent = `${(bytes / 8).toLocaleString()} quads · March + FastNoiseLite → WASM → WebGPU`;
+    status.textContent = `${(core.mesh_bytes() / 8).toLocaleString()} quads · March + FastNoiseLite → WASM → WebGPU`;
     document.documentElement.dataset.rendered = 'true';
     frame = requestAnimationFrame(animate);
   }

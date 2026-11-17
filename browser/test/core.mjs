@@ -83,3 +83,66 @@ assert.equal(core.mesh_revision(), initial + 1126);
 assert.equal(core.step(0, 0, remove, 0, 0), 0);
 assert.equal(core.mesh_revision(), initial + 1126);
 console.log('Removing the final voxel publishes an empty mesh');
+
+const streamed = new WebAssembly.Instance(module).exports;
+assert.equal(streamed.init(12345, 1), 0);
+assert.equal(streamed.chunk_capacity(), 9);
+
+const chunk = (x, z) => {
+  for (let i = 0; i < streamed.chunk_capacity(); i++) {
+    if (streamed.chunk_revision(i) && streamed.chunk_x(i) === x && streamed.chunk_z(i) === z) {
+      return Buffer.from(new Uint8Array(streamed.memory.buffer, streamed.chunk_ptr(i), streamed.chunk_bytes(i)));
+    }
+  }
+};
+
+for (let i = 0; i < 8; i++) assert.equal(streamed.stream_one(), 1);
+assert.equal(streamed.stream_one(), 0);
+assert.deepEqual(chunk(0, 0), reference.subarray(28));
+assert.notDeepEqual(chunk(-1, 0), chunk(0, 0));
+assert.equal(streamed.step(0, 0, remove, 0, 0), 1);
+const editedOrigin = chunk(0, 0);
+assert.notDeepEqual(editedOrigin, reference.subarray(28));
+
+const timings = [];
+let replacements = 0;
+function fly(held, frames) {
+  for (let frame = 0; frame < frames; frame++) {
+    streamed.step(100, held, 0, 0, 0);
+    const start = performance.now();
+    const loaded = streamed.stream_one();
+    if (loaded) {
+      timings.push(performance.now() - start);
+      replacements++;
+    }
+  }
+}
+function roundTrip() {
+  fly(1 << 1, 400);
+  assert.equal(chunk(0, 0), undefined);
+  assert.ok(chunk(10, 0)?.length);
+  fly(1 << 3, 800);
+  assert.ok(chunk(-10, 0)?.length);
+  fly(1 << 1, 400);
+  assert.deepEqual(chunk(0, 0), editedOrigin);
+
+  streamed.step(0, 0, 0, Math.PI / (2 * 0.003), 0);
+  fly(1 << 3, 400);
+  assert.ok(chunk(0, 10)?.length);
+  fly(1 << 1, 800);
+  assert.ok(chunk(0, -10)?.length);
+  fly(1 << 3, 400);
+  streamed.step(0, 0, 0, -Math.PI / (2 * 0.003), 0);
+  assert.deepEqual(chunk(0, 0), editedOrigin);
+}
+roundTrip();
+const steadyPages = streamed.memory.buffer.byteLength;
+const steadyScratch = streamed.mesh_heap_high_water();
+for (let trip = 0; trip < 3; trip++) {
+  roundTrip();
+  assert.equal(streamed.memory.buffer.byteLength, steadyPages);
+  assert.equal(streamed.mesh_heap_high_water(), steadyScratch);
+}
+timings.sort((a, b) => a - b);
+console.log(`Streaming: 4 round trips, ${replacements} loads/reloads, ${steadyPages} bytes WASM, ${steadyScratch} bytes scratch`);
+console.log(`Node chunk generation and meshing: p95 ${timings[Math.ceil(timings.length * 0.95) - 1].toFixed(2)} ms, max ${timings.at(-1).toFixed(2)} ms`);

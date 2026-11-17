@@ -1,8 +1,4 @@
-#include <stdint.h>
-
-int32_t *strata_browser_cells(void);
-int strata_browser_ready(void);
-void strata_browser_remesh(void);
+#include "stream.h"
 
 enum { FORWARD = 1, LEFT = 2, BACK = 4, RIGHT = 8, RISE = 16, DESCEND = 32,
        REMOVE = 64, PLACE = 128 };
@@ -55,14 +51,11 @@ void strata_browser_init_camera(void) {
     update_camera(f, r, u);
 }
 
-static int cell_index(const int p[3]) {
-    for (int i = 0; i < 3; i++) if (p[i] < 0 || p[i] >= 32) return -1;
-    return p[0] + 32 * p[2] + 1024 * p[1];
-}
+int strata_browser_eye_cell(int axis) { return (int)__builtin_floor(eye[axis]); }
 
-/* Traverse the fixture's flat grid with the same next-boundary rule as
- * Strata.Query. Return the first solid cell and the empty cell before it. */
-static int pick(const double direction[3], int *previous) {
+/* Walk the world grid until a solid voxel is found. Track the preceding
+ * loaded air cell for placement, including across a chunk boundary. */
+static int pick(const double direction[3], int hit[3], int previous[3], int *has_previous) {
     int cell[3], advance[3];
     double next[3], delta[3];
     for (int axis = 0; axis < 3; axis++) {
@@ -76,15 +69,19 @@ static int pick(const double direction[3], int *previous) {
             delta[axis] = advance[axis] / direction[axis];
         }
     }
-    *previous = -1;
-    int32_t *cells = strata_browser_cells();
+    *has_previous = 0;
     for (;;) {
-        int index = cell_index(cell);
-        if (index >= 0 && cells[index] != 0) return index;
-        *previous = index;
+        int voxel = strata_browser_voxel(cell);
+        if (voxel > 0) {
+            for (int i = 0; i < 3; i++) hit[i] = cell[i];
+            return 1;
+        }
+        *has_previous = voxel == 0;
+        if (*has_previous)
+            for (int i = 0; i < 3; i++) previous[i] = cell[i];
         int axis = next[0] <= next[1] ? 0 : 1;
         if (next[2] < next[axis]) axis = 2;
-        if (next[axis] > 16) return -1;
+        if (next[axis] > 16) return 0;
         cell[axis] += advance[axis];
         next[axis] += delta[axis];
     }
@@ -117,15 +114,10 @@ uint32_t step(double dt_ms, uint32_t held, uint32_t pressed, double dx, double d
     update_camera(f, r, u);
 
     if (!(pressed & (REMOVE | PLACE))) return 0;
-    int before;
-    int hit = pick(f, &before);
-    if (hit < 0) return 0;
-    int remove = !!(pressed & REMOVE);
-    int target = remove ? hit : before;
-    if (target < 0) return 0;
-    strata_browser_cells()[target] = remove ? 0 : 1;
-    strata_browser_remesh();
-    return 1;
+    int hit[3], before[3], has_before;
+    if (!pick(f, hit, before, &has_before)) return 0;
+    if (pressed & REMOVE) return strata_browser_edit(hit, 0);
+    return has_before && strata_browser_edit(before, 1);
 }
 
 __attribute__((export_name("camera_ptr")))
