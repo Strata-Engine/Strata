@@ -15,7 +15,7 @@ void strata_browser_init_camera(void);
 enum { CACHE_SIDE = 3, SLOT_COUNT = CACHE_SIDE * CACHE_SIDE, EDIT_LIMIT = 4096 };
 
 typedef struct {
-    int x, z, live;
+    int x, z, live, dirty;
     uint32_t revision, bytes;
     int32_t cells[CELL_COUNT];
     uint32_t mesh[MESH_WORDS];
@@ -42,6 +42,7 @@ static void remesh(ChunkSlot *slot, int reuse_cells) {
     strata_browser_end_mesh();
     slot->revision = ++revision;
     slot->live = 1;
+    slot->dirty = 0;
 }
 
 int strata_browser_ready(void) { return initialized; }
@@ -50,6 +51,15 @@ static ChunkSlot *find_slot(int x, int z) {
     for (int i = 0; i < SLOT_COUNT; i++)
         if (slots[i].live && slots[i].x == x && slots[i].z == z) return &slots[i];
     return 0;
+}
+
+static void invalidate_neighbors(int x, int z, int min_x, int max_x, int min_z, int max_z) {
+    for (int dz = min_z; dz <= max_z; dz++)
+        for (int dx = min_x; dx <= max_x; dx++) {
+            if (!dx && !dz) continue;
+            ChunkSlot *slot = find_slot(x + dx, z + dz);
+            if (slot) slot->dirty = 1;
+        }
 }
 
 static int chunk_coord(int cell) {
@@ -83,6 +93,8 @@ int strata_browser_edit(const int cell[3], int32_t value) {
     if (i == edit_count) edit_count++;
     edits[i] = (Edit){slot->x, slot->z, index, value};
     slot->cells[index] = value;
+    int x = index % 32, z = (index / 32) % 32;
+    invalidate_neighbors(slot->x, slot->z, -(x == 0), x == 31, -(z == 0), z == 31);
     remesh(slot, 1);
     return 1;
 }
@@ -104,16 +116,26 @@ int stream_one(void) {
             break;
         }
     }
-    if (!replace) return 0;
+    if (!replace) {
+        for (int i = 0; i < SLOT_COUNT; i++) {
+            if (slots[i].dirty) {
+                remesh(&slots[i], 1);
+                return 1;
+            }
+        }
+        return 0;
+    }
 
     /* Center, then the cardinal neighbors, then corners. */
     for (int distance = 0; distance <= 2; distance++) {
         for (int z = -1; z <= 1; z++) {
             for (int x = -1; x <= 1; x++) {
                 if (x*x + z*z != distance || find_slot(cx+x, cz+z)) continue;
+                if (replace->live) invalidate_neighbors(replace->x, replace->z, -1, 1, -1, 1);
                 replace->x = cx+x;
                 replace->z = cz+z;
                 remesh(replace, 0);
+                invalidate_neighbors(replace->x, replace->z, -1, 1, -1, 1);
                 return 1;
             }
         }
@@ -167,6 +189,33 @@ void strata_browser_sync_cells(void *array) {
     }
 #else
     (void)array;
+#endif
+}
+
+/* March supplies a zeroed 34³ NativeIntArr. Copy only the center and the
+ * resident neighbors' one-cell shell, including diagonals for corner AO. */
+int64_t strata_browser_padded(void *array) {
+#ifdef __wasm__
+    int64_t *ids = (int64_t *)((char *)array + 32);
+    ChunkSlot *near[3][3];
+    for (int dz = -1; dz <= 1; dz++)
+        for (int dx = -1; dx <= 1; dx++)
+            near[dz+1][dx+1] = dx || dz ? find_slot(building->x+dx, building->z+dz) : building;
+    for (int z = -1; z <= 32; z++) {
+        int dz = (z == 32) - (z == -1);
+        for (int x = -1; x <= 32; x++) {
+            int dx = (x == 32) - (x == -1);
+            const ChunkSlot *slot = near[dz+1][dx+1];
+            if (!slot) continue;
+            int from = x - 32*dx + 32*(z - 32*dz);
+            int to = x+1 + 34*(z+1) + 1156;
+            for (int y = 0; y < 32; y++) ids[to + 1156*y] = slot->cells[from + 1024*y];
+        }
+    }
+    return 1;
+#else
+    (void)array;
+    return 0;
 #endif
 }
 

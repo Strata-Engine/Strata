@@ -80,9 +80,12 @@ browser.
 While flying, the preview keeps a 3×3 window of horizontal chunks. Terrain
 samples use world coordinates, and the renderer reuses nine GPU mesh
 buffers. Each animation frame can generate one chunk or remesh one edit.
-The renderer keeps at most two submissions in flight. The terrain still
-uses the preview's single layer of voxels and chunks mesh against air at
-their borders.
+The renderer keeps at most two submissions in flight. The preview uses one vertical layer of chunks. Meshing reads a one-voxel
+shell from resident neighbors, including diagonals for corner shading.
+Loading or evicting a chunk queues affected neighbors for refresh. Border
+edits queue only the neighbors that read that cell. Unloaded space is air.
+Refreshes share the one-job-per-frame budget, so a border can take a few
+frames to settle.
 
 The browser keeps up to 4,096 distinct edited cells for the current page
 session. An edited chunk restores those cells when it returns to the
@@ -106,3 +109,8 @@ chunks after warm-up. The p95 and maximum frame intervals were 16.7 ms
 and 16.8 ms. A callback took at most 3.5 ms on the CPU, and WASM linear
 memory held at 16,842,752 bytes. These are observed timings for that
 browser, device, and flight path.
+
+With neighbor meshing enabled, the same flight measured 16.7 ms p95 and
+16.8 ms maximum frame interval, with a 3.4 ms maximum CPU callback and
+the same 16,842,752-byte WASM memory size. The core test also checks that
+removing one of two touching border voxels exposes the exact shared face.

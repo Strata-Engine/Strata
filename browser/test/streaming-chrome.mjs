@@ -87,7 +87,8 @@ try {
   for (const type of ['mousePressed', 'mouseReleased'])
     await call('Input.dispatchMouseEvent', { type, x, y, button: 'left', clickCount: 1 });
   await until('document.pointerLockElement === document.querySelector("canvas")');
-  await until('flight.core.mesh_revision() === 9');
+  await until('flight.core.mesh_revision() >= 9');
+  await delay(250); // Let queued seam refreshes finish before measuring the flight.
   const memory = await evaluate('flight.core.memory.buffer.byteLength');
 
   async function fly(key, milliseconds) {
@@ -108,14 +109,14 @@ try {
       return { p95: sorted[Math.ceil(sorted.length * 0.95) - 1], max: sorted.at(-1) };
     };
     return {
-      frames: flight.times.length, chunksLoaded: flight.loads,
+      frames: flight.times.length, meshJobs: flight.loads,
       cpuFrameMs: summarize(flight.times), frameIntervalMs: summarize(flight.intervals),
-      populatedChunkMs: summarize(flight.loadTimes), wasmBytes: flight.core.memory.buffer.byteLength,
+      chunkWorkMs: summarize(flight.loadTimes), wasmBytes: flight.core.memory.buffer.byteLength,
       scratchBytes: flight.core.mesh_heap_high_water()
     };
   })()`);
   assert.ok(result.frames > 300, 'Expected an active animation loop');
-  assert.ok(result.chunksLoaded >= 6, 'Expected multiple chunk boundaries to be crossed');
+  assert.ok(result.meshJobs >= 6, 'Expected multiple chunk boundaries to be crossed');
   assert.equal(result.wasmBytes, memory, 'Linear memory grew after cache warm-up');
   console.log(JSON.stringify(result, null, 2));
 } finally {

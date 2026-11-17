@@ -97,10 +97,40 @@ const chunk = (x, z) => {
 };
 
 for (let i = 0; i < 8; i++) assert.equal(streamed.stream_one(), 1);
-assert.equal(streamed.stream_one(), 0);
-assert.deepEqual(chunk(0, 0), reference.subarray(28));
+function settle() {
+  for (let jobs = 0; jobs < 18; jobs++) if (!streamed.stream_one()) return;
+  assert.fail('Neighbor work did not settle');
+}
+settle();
+assert.notDeepEqual(chunk(0, 0), reference.subarray(28));
+// At z=12 the seed has touching voxels at y=3 on both sides.
+function eastWestFace(mesh) {
+  for (let offset = 0; offset < mesh.length; offset += 8) {
+    const word = mesh.readUInt32LE(offset);
+    const y = (word >>> 5) & 31, z = (word >>> 10) & 31;
+    if ((word & 31) === 0 && ((word >>> 25) & 7) === 3 &&
+        y <= 3 && y + ((word >>> 20) & 31) >= 3 &&
+        z <= 12 && z + ((word >>> 15) & 31) >= 12) return true;
+  }
+  return false;
+}
+const turn = Math.PI / (2 * 0.003);
+assert.equal(eastWestFace(chunk(1, 0)), false, 'Touching blocks hide the seam face');
+streamed.step(0, 0, 0, turn, 0);
+for (let i = 0; i < 8; i++) streamed.step(62.5, 1 << 1, 0, 0, 0);
+streamed.step(0, 0, 0, -turn, 0);
+for (let i = 0; i < 30; i++) streamed.step(62.5, 1 << 1, 0, 0, 0);
+assert.equal(streamed.step(0, 0, remove, 0, 0), 1);
+assert.equal(streamed.stream_one(), 1, 'A border edit queues the adjacent resident chunk');
+settle();
+assert.equal(eastWestFace(chunk(1, 0)), true, 'Removal exposes the neighboring face');
+for (let i = 0; i < 30; i++) streamed.step(62.5, 1 << 3, 0, 0, 0);
+streamed.step(0, 0, 0, turn, 0);
+for (let i = 0; i < 8; i++) streamed.step(62.5, 1 << 3, 0, 0, 0);
+streamed.step(0, 0, 0, -turn, 0);
 assert.notDeepEqual(chunk(-1, 0), chunk(0, 0));
 assert.equal(streamed.step(0, 0, remove, 0, 0), 1);
+settle();
 const editedOrigin = chunk(0, 0);
 assert.notDeepEqual(editedOrigin, reference.subarray(28));
 
@@ -124,6 +154,7 @@ function roundTrip() {
   fly(1 << 3, 800);
   assert.ok(chunk(-10, 0)?.length);
   fly(1 << 1, 400);
+  settle();
   assert.deepEqual(chunk(0, 0), editedOrigin);
 
   streamed.step(0, 0, 0, Math.PI / (2 * 0.003), 0);
@@ -133,6 +164,7 @@ function roundTrip() {
   assert.ok(chunk(0, -10)?.length);
   fly(1 << 3, 400);
   streamed.step(0, 0, 0, -Math.PI / (2 * 0.003), 0);
+  settle();
   assert.deepEqual(chunk(0, 0), editedOrigin);
 }
 roundTrip();
@@ -144,5 +176,5 @@ for (let trip = 0; trip < 3; trip++) {
   assert.equal(streamed.mesh_heap_high_water(), steadyScratch);
 }
 timings.sort((a, b) => a - b);
-console.log(`Streaming: 4 round trips, ${replacements} loads/reloads, ${steadyPages} bytes WASM, ${steadyScratch} bytes scratch`);
-console.log(`Node chunk generation and meshing: p95 ${timings[Math.ceil(timings.length * 0.95) - 1].toFixed(2)} ms, max ${timings.at(-1).toFixed(2)} ms`);
+console.log(`Streaming: 4 round trips, ${replacements} mesh jobs, ${steadyPages} bytes WASM, ${steadyScratch} bytes scratch`);
+console.log(`Node chunk work: p95 ${timings[Math.ceil(timings.length * 0.95) - 1].toFixed(2)} ms, max ${timings.at(-1).toFixed(2)} ms`);
