@@ -18,6 +18,11 @@ assert.ok(ir.includes(entry));
 ir = ir.replace(entry, '  %result = call ptr @march_main(ptr @fixture_cap)');
 
 // Decode signed tagged immediates at pointer width before widening.
+// A cached literal would keep an arena pointer after a remesh releases it.
+ir = ir.replace(/call ptr @march_string_lit_static\((ptr @[^,]+, i64 \d+), ptr @[^)]+\)/g,
+  'call ptr @march_string_lit($1)');
+assert.doesNotMatch(ir, /call ptr @march_string_lit_static/);
+
 let decoded = 0;
 ir = ir.replace(/^define [^\n]+\n[\s\S]*?^}/gm, (fn) => {
   const pointerInts = new Set(Array.from(

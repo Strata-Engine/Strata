@@ -19,7 +19,8 @@ march --compile -o "$out/native" --ffi-c "$bridge" --ffi-c "$noise" \
     --ffi-link -ffp-contract=off --ffi-link -fwrapv "$out/core.march"
 march --emit-llvm --target wasm32-unknown-unknown "$out/core.march"
 node browser/native/prepare-ir.mjs "$out/core.ll" browser/native/fixture-abi.ll.in "$out/link.ll"
+cat "$STRATA_MARCH_HOME/runtime/march_runtime_wasm.c" browser/native/scoped-heap.c > "$out/runtime.c"
 "$wasm_clang" --target=wasm32-unknown-unknown -ffreestanding -nostdlib \
     -O2 -ffp-contract=off -fwrapv -Wl,--no-entry -Wl,--export-memory -Wl,--fatal-warnings \
-    -Ibrowser/native/freestanding "$out/link.ll" "$bridge" browser/native/arrays.c "$noise" \
-    "$STRATA_MARCH_HOME/runtime/march_runtime_wasm.c" -o "$out/core.wasm"
+    -Ibrowser/native/freestanding "$out/link.ll" "$bridge" browser/native/arrays.c browser/native/flight.c "$noise" \
+    "$out/runtime.c" -o "$out/core.wasm"

@@ -8,32 +8,45 @@
   body { margin: 0; display: grid; min-height: 100vh; place-content: center; }
   main { width: min(94vw, 920px); }
   h1 { font-size: 24px; margin: 0 0 12px; }
-  canvas { display: block; width: 100%; border: 1px solid #384647; border-radius: 8px; }
+  canvas { display: block; width: 100%; aspect-ratio: 46 / 29; border: 1px solid #384647; border-radius: 8px; }
+  .viewport { position: relative; }
+  .viewport[data-playing]::after {
+    content: '+'; position: absolute; inset: 50% auto auto 50%;
+    transform: translate(-50%, -50%); color: white; pointer-events: none;
+    text-shadow: 0 1px 3px black;
+  }
+  button { padding: 8px 14px; font: inherit; cursor: pointer; }
   p { color: #b9c8c1; }
 </style>
 <main>
   <h1>Strata · WASM mesh preview</h1>
-  <canvas width="920" height="580" aria-label="Voxel terrain viewed from above"></canvas>
+  <div class="viewport"><canvas width="920" height="580" aria-label="Voxel terrain"></canvas></div>
+  <p><button id="play" disabled>Fly through terrain</button></p>
   <p id="status" role="status">Loading terrain…</p>
 </main>
 <script type="module">
+import { createInput } from './input.mjs';
+
+const play = document.querySelector('#play');
 const status = document.querySelector('#status');
 const canvas = document.querySelector('canvas');
 try {
   const adapter = await navigator.gpu?.requestAdapter();
   if (!adapter) throw new Error('No WebGPU adapter is available.');
   const device = await adapter.requestDevice();
-  device.lost.then(({ message }) => { status.textContent = `WebGPU device lost. ${message}`; });
   const { instance } = await WebAssembly.instantiateStreaming(fetch('./.build/core.wasm'));
   const core = instance.exports;
   if (core.init(12345, 1) !== 0) throw new Error('The terrain fixture failed to initialize.');
 
-  const bytes = core.mesh_bytes();
-  const quads = device.createBuffer({ size: bytes, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
-  device.queue.writeBuffer(quads, 0, new Uint8Array(core.memory.buffer, core.mesh_ptr(), bytes));
+  const cameraBuffer = device.createBuffer({
+    size: 80, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+  });
 
   const shader = device.createShaderModule({ code: /* wgsl */ `
     @group(0) @binding(0) var<storage, read> quads: array<vec2u>;
+
+    struct View { matrix: mat4x4f, perspective: vec4f }
+    @group(0) @binding(1) var<uniform> camera: View;
 
     struct Vertex {
       @builtin(position) position: vec4f,
@@ -62,8 +75,10 @@ try {
       let turf = mix(vec3f(0.27, 0.54, 0.30), vec3f(0.66, 0.79, 0.42), clamp(p.y / 8, 0, 1));
       let soil = mix(vec3f(0.23, 0.35, 0.27), vec3f(0.47, 0.54, 0.30), clamp(p.y / 8, 0, 1));
       let color = select(soil, turf, face == 0u) * shade[face] * (0.65 + 0.35 * ao / 3);
-      return Vertex(vec4f((q.x - q.z) * 0.026, q.y * 0.075 - (q.x + q.z) * 0.025,
-        0.5 - (q.x + q.z + q.y) * 0.01, 1), color);
+      var position = vec4f((q.x - q.z) * 0.026, q.y * 0.075 - (q.x + q.z) * 0.025,
+        0.5 - (q.x + q.z + q.y) * 0.01, 1);
+      if (camera.perspective.x != 0) { position = camera.matrix * vec4f(p, 1); }
+      return Vertex(position, color);
     }
 
     @fragment fn fragment(vertex: Vertex) -> @location(0) vec4f {
@@ -78,40 +93,134 @@ try {
     primitive: { topology: 'triangle-strip' },
     depthStencil: { format: 'depth24plus', depthWriteEnabled: true, depthCompare: 'less' },
   });
-  const group = device.createBindGroup({
-    layout: pipeline.getBindGroupLayout(0),
-    entries: [{ binding: 0, resource: { buffer: quads } }],
-  });
   const context = canvas.getContext('webgpu');
   context.configure({ device, format });
-  const depth = device.createTexture({
-    size: [canvas.width, canvas.height],
-    format: 'depth24plus',
-    usage: GPUTextureUsage.RENDER_ATTACHMENT,
+  let quads, group, depth, revision;
+  let bytes = 0;
+  let playing = false, perspective = false, lost = false;
+  let previous = null, accumulated = 0, frame;
+  const tick = 1000 / 60;
+  const view = new Float32Array(20);
+
+  function draw() {
+    const limit = device.limits.maxTextureDimension2D;
+    const width = Math.min(limit, Math.max(1, Math.round(canvas.clientWidth * devicePixelRatio)));
+    const height = Math.min(limit, Math.max(1, Math.round(canvas.clientHeight * devicePixelRatio)));
+    if (!depth || canvas.width !== width || canvas.height !== height) {
+      canvas.width = width;
+      canvas.height = height;
+      depth?.destroy();
+      depth = device.createTexture({
+        size: [width, height], format: 'depth24plus', usage: GPUTextureUsage.RENDER_ATTACHMENT,
+      });
+    }
+    const current = core.mesh_revision();
+    if (revision !== current) {
+      bytes = core.mesh_bytes();
+      if (bytes && (!quads || quads.size < bytes)) {
+        quads?.destroy();
+        quads = device.createBuffer({ size: bytes, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+        group = device.createBindGroup({
+          layout: pipeline.getBindGroupLayout(0),
+          entries: [
+            { binding: 0, resource: { buffer: quads } },
+            { binding: 1, resource: { buffer: cameraBuffer } },
+          ],
+        });
+      }
+      if (bytes) device.queue.writeBuffer(quads, 0, new Uint8Array(core.memory.buffer, core.mesh_ptr(), bytes));
+      revision = current;
+    }
+
+    view.set(new Float32Array(core.memory.buffer, core.camera_ptr(), 16));
+    for (let i = 0; i < 16; i += 4) view[i] *= height / width;
+    view[16] = Number(perspective);
+    device.queue.writeBuffer(cameraBuffer, 0, view);
+    const encoder = device.createCommandEncoder();
+    const pass = encoder.beginRenderPass({
+      colorAttachments: [{
+        view: context.getCurrentTexture().createView(),
+        clearValue: { r: 0.066, g: 0.102, b: 0.110, a: 1 },
+        loadOp: 'clear',
+        storeOp: 'store',
+      }],
+      depthStencilAttachment: {
+        view: depth.createView(), depthClearValue: 1, depthLoadOp: 'clear', depthStoreOp: 'discard',
+      },
+    });
+    if (bytes) {
+      pass.setPipeline(pipeline);
+      pass.setBindGroup(0, group);
+      pass.draw(4, bytes / 8);
+    }
+    pass.end();
+    device.queue.submit([encoder.finish()]);
+  }
+
+  function resetClock() {
+    previous = null;
+    accumulated = 0;
+  }
+
+  const input = createInput(canvas, (locked) => {
+    playing = locked;
+    perspective ||= locked;
+    canvas.parentElement.toggleAttribute('data-playing', locked);
+    resetClock();
+    status.textContent = locked
+      ? 'WASD to fly · Space / Shift for height · Left click to remove · Right click to place · Esc to release'
+      : 'Click Fly through terrain to resume.';
   });
-  const encoder = device.createCommandEncoder();
-  const pass = encoder.beginRenderPass({
-    colorAttachments: [{
-      view: context.getCurrentTexture().createView(),
-      clearValue: { r: 0.066, g: 0.102, b: 0.110, a: 1 },
-      loadOp: 'clear',
-      storeOp: 'store',
-    }],
-    depthStencilAttachment: {
-      view: depth.createView(),
-      depthClearValue: 1,
-      depthLoadOp: 'clear',
-      depthStoreOp: 'discard',
-    },
+  const start = async () => {
+    if (lost || playing) return;
+    try {
+      await canvas.requestPointerLock();
+    } catch (error) {
+      status.textContent = error.message || 'Could not capture the mouse.';
+    }
+  };
+  play.addEventListener('click', start);
+  canvas.addEventListener('click', start);
+  window.addEventListener('blur', resetClock);
+  document.addEventListener('visibilitychange', resetClock);
+  device.lost.then(({ message }) => {
+    lost = true;
+    cancelAnimationFrame(frame);
+    input.dispose();
+    if (document.pointerLockElement === canvas) document.exitPointerLock();
+    play.disabled = true;
+    status.textContent = `WebGPU device lost. ${message}`;
   });
-  pass.setPipeline(pipeline);
-  pass.setBindGroup(0, group);
-  pass.draw(4, bytes / 8);
-  pass.end();
-  device.queue.submit([encoder.finish()]);
+
+  function animate(now) {
+    if (lost) return;
+    if (playing && !document.hidden && document.hasFocus()) {
+      if (previous !== null) accumulated = Math.min(accumulated + now - previous, 4 * tick);
+      previous = now;
+      if (accumulated >= tick) {
+        const first = input.sample();
+        core.step(tick, first.held, first.pressed, first.dx, first.dy);
+        accumulated -= tick;
+        while (accumulated >= tick) {
+          core.step(tick, first.held, 0, 0, 0);
+          accumulated -= tick;
+        }
+      }
+    } else {
+      resetClock();
+    }
+    draw();
+    frame = requestAnimationFrame(animate);
+  }
+
+  draw();
   await device.queue.onSubmittedWorkDone();
-  status.textContent = `${(bytes / 8).toLocaleString()} quads · March + FastNoiseLite → WASM → WebGPU`;
-  document.documentElement.dataset.rendered = 'true';
+  if (!lost) {
+    play.disabled = false;
+    status.textContent = `${(bytes / 8).toLocaleString()} quads · March + FastNoiseLite → WASM → WebGPU`;
+    document.documentElement.dataset.rendered = 'true';
+    frame = requestAnimationFrame(animate);
+  }
 } catch (error) {
   status.textContent = error.message;
   console.error(error);

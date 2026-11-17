@@ -44,11 +44,17 @@ fixture. The sign fix covers values in the signed 31-bit immediate range.
 The seed stays on the typed i64 path. General March programs can require
 larger tagged values and additional runtime support.
 
-This build proves one initialization and mesh publication. The upstream
-browser runtime still uses a bump allocator and no-op reference counts.
-The fixture does not establish general native array aliasing semantics or
-bounded memory during repeated stepping. Those are prerequisites for
-moving on to continuous play.
+The browser keeps the editable cells, camera matrix and published mesh in
+static buffers. Each remesh uses the March allocator as scratch space and
+rewinds it after copying out the mesh. The generated code has literal
+caching disabled so the runtime does not retain a pointer into that
+scratch space. This scope applies to the fixture's mesher call graph.
+
+The test runs 10,000 frame steps with 100 alternating edits, compares the
+restored mesh with native, and checks both consumed scratch bytes and
+linear memory after warm-up. It then clears the fixture one voxel at a
+time and checks that the last edit publishes zero mesh bytes and a new
+revision.
 
 To see the same fixture drawn by WebGPU, run:
 
@@ -57,5 +63,8 @@ python3 -m http.server 8765 --bind 127.0.0.1 --directory browser
 ```
 
 Open `http://127.0.0.1:8765/preview.html` in a WebGPU-capable browser.
-The preview reads the WASM quad buffer directly and uses a fixed isometric
-view with face and corner shading.
+The preview opens in an isometric view. Select **Fly through terrain** to
+capture the mouse. Fly with WASD and Space or Left Shift, look with the
+mouse, and remove or place a block with the left or right button. Escape
+releases the mouse. The browser steps the core at 60 Hz and uploads mesh
+data when its revision changes.
