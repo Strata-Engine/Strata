@@ -68,3 +68,9 @@ capture the mouse. Fly with WASD and Space or Left Shift, look with the
 mouse, and remove or place a block with the left or right button. Escape
 releases the mouse. The browser steps the core at 60 Hz and uploads mesh
 data when its revision changes.
+
+The play gesture also enables Web Audio. Each successful block edit plays
+one short cue. If the browser suspends audio, a later click can resume it.
+The preview remains playable when Web Audio is unavailable. If the
+embedded browser rejects Pointer Lock, open the preview in a standalone
+browser.
