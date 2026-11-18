@@ -2751,6 +2751,121 @@ static void bodies_to_frame(Frame *F) {
     bu[0] = (int32_t)nmov; bu[1] = (int32_t)(n + (uint32_t)fg.tgroups + (uint32_t)fg.tparts);
 }
 
+/* Keep the last completed set as well as the current set: vehicles and
+ * pedestrians update at different points in the frame. Coordinates are voxels.
+ *
+ * Broad phase: a footprint sets its bit in every cell of a hashed 16-voxel grid
+ * that its bounds (widened by a voxel) overlap, and a query tests only the
+ * footprints in the cells its segment's bounds overlap. A footprint can only
+ * block a segment that meets its bounds, and hash collisions only add
+ * candidates, so a query answers exactly what testing every footprint would.
+ * A footprint whose bounds cannot be gridded (not finite, a direction too
+ * short, or too large) is tested by every query; a query whose bounds cannot
+ * be gridded tests every footprint. */
+enum { SV_FOOTPRINTS = 512, SV_FOOTPRINT_CELLS = 4096, SV_FOOTPRINT_WORDS = SV_FOOTPRINTS / 64,
+       SV_FOOTPRINT_SPAN = 8 };
+static struct Footprint {
+    int64_t slot;
+    double x, y, z, dx, dz, half_length, half_width;
+} footprints[2][SV_FOOTPRINTS];
+static unsigned footprint_count[2], footprint_frame;
+static uint64_t footprint_grid[2][SV_FOOTPRINT_CELLS][SV_FOOTPRINT_WORDS];
+static uint64_t footprint_wide[2][SV_FOOTPRINT_WORDS];
+
+/* The cells [*first, *last] spanning [lo, hi] on one axis, or 0 when there are too many. */
+static int footprint_cells(double lo, double hi, int *first, int *last) {
+    if (!(lo >= -1e9 && hi <= 1e9 && hi - lo <= 16.0 * (SV_FOOTPRINT_SPAN - 1))) return 0;
+    *first = (int)floor(lo / 16.0);
+    *last = (int)floor(hi / 16.0);
+    return 1;
+}
+static unsigned footprint_hash(int x, int z) {
+    return ((unsigned)x * 73856093u ^ (unsigned)z * 19349663u) & (SV_FOOTPRINT_CELLS - 1);
+}
+
+void sv_footprints_begin(void) {
+    footprint_frame ^= 1;
+    footprint_count[footprint_frame] = 0;
+    memset(footprint_grid[footprint_frame], 0, sizeof footprint_grid[0]);
+    memset(footprint_wide[footprint_frame], 0, sizeof footprint_wide[0]);
+}
+
+void sv_footprint(int64_t slot, double x, double y, double z, double dx, double dz, double length, double width) {
+    unsigned index = footprint_count[footprint_frame];
+    if (index >= SV_FOOTPRINTS) return;
+    struct Footprint v = {slot, x, y, z, dx, dz, length * 0.5 + 0.8, width * 0.5 + 0.8};
+    footprints[footprint_frame][index] = v;
+    footprint_count[footprint_frame] = index + 1;
+    uint64_t bit = UINT64_C(1) << (index % 64);
+    /* Inside the footprint |p.d| <= half_length and |p x d| <= half_width, and
+     * p = ((p.d) d + (p x d) d_perp) / |d|^2, which bounds each coordinate of p. */
+    double n = dx * dx + dz * dz;
+    double hl = fabs(v.half_length), hw = fabs(v.half_width);
+    double rx = (hl * fabs(dx) + hw * fabs(dz)) / n + 1.0;
+    double rz = (hl * fabs(dz) + hw * fabs(dx)) / n + 1.0;
+    int x0, x1, z0, z1;
+    if (!(n >= 0.25) || !footprint_cells(x - rx, x + rx, &x0, &x1) || !footprint_cells(z - rz, z + rz, &z0, &z1)) {
+        footprint_wide[footprint_frame][index / 64] |= bit;
+        return;
+    }
+    for (int cz = z0; cz <= z1; cz++)
+        for (int cx = x0; cx <= x1; cx++)
+            footprint_grid[footprint_frame][footprint_hash(cx, cz)][index / 64] |= bit;
+}
+
+static int footprint_axis(double start, double end, double half, double *first, double *last) {
+    double motion = end - start;
+    if (fabs(motion) < 1e-6) return fabs(start) <= half;
+    double a = (-half - start) / motion;
+    double b = (half - start) / motion;
+    *first = fmax(*first, fmin(a, b));
+    *last = fmin(*last, fmax(a, b));
+    return *first <= *last;
+}
+
+static int footprint_hit(const struct Footprint *v, double x0, double y0, double z0,
+                         double x1, double y1, double z1, int64_t ignore) {
+    if (v->slot == ignore || v->slot < 0 || v->slot >= SV_MAX_SLOTS ||
+        !(g.entries[v->slot].level_flags & SV_IN_USE)) return 0;
+    if (fmin(y0, y1) > v->y + 6.0 || fmax(y0, y1) < v->y - 4.0) return 0;
+    double ax = x0 - v->x, az = z0 - v->z, bx = x1 - v->x, bz = z1 - v->z;
+    double a = ax * v->dx + az * v->dz, b = bx * v->dx + bz * v->dz;
+    double side_a = az * v->dx - ax * v->dz, side_b = bz * v->dx - bx * v->dz;
+    /* A pedestrian already clipped by a moving vehicle can step clear. */
+    if (fabs(a) <= v->half_length && fabs(side_a) <= v->half_width &&
+        bx * bx + bz * bz > ax * ax + az * az) return 0;
+    double first = 0.0, last = 1.0;
+    return footprint_axis(a, b, v->half_length, &first, &last) &&
+        footprint_axis(side_a, side_b, v->half_width, &first, &last);
+}
+
+int64_t sv_footprint_blocked(double x0, double y0, double z0, double x1, double y1, double z1, int64_t ignore) {
+    if (!g.ok) return 0;
+    int cx0, cx1, cz0, cz1;
+    int gridded = footprint_cells(fmin(x0, x1), fmax(x0, x1), &cx0, &cx1) &&
+        footprint_cells(fmin(z0, z1), fmax(z0, z1), &cz0, &cz1);
+    for (unsigned frame = 0; frame < 2; frame++) {
+        if (!gridded) {
+            for (unsigned i = 0; i < footprint_count[frame]; i++)
+                if (footprint_hit(&footprints[frame][i], x0, y0, z0, x1, y1, z1, ignore)) return 1;
+            continue;
+        }
+        uint64_t selected[SV_FOOTPRINT_WORDS];
+        memcpy(selected, footprint_wide[frame], sizeof selected);
+        for (int cz = cz0; cz <= cz1; cz++)
+            for (int cx = cx0; cx <= cx1; cx++) {
+                const uint64_t *cell = footprint_grid[frame][footprint_hash(cx, cz)];
+                for (unsigned w = 0; w < SV_FOOTPRINT_WORDS; w++) selected[w] |= cell[w];
+            }
+        for (unsigned w = 0; w < SV_FOOTPRINT_WORDS; w++)
+            for (uint64_t bits = selected[w]; bits; bits &= bits - 1) {
+                unsigned i = w * 64 + (unsigned)__builtin_ctzll(bits);
+                if (footprint_hit(&footprints[frame][i], x0, y0, z0, x1, y1, z1, ignore)) return 1;
+            }
+    }
+    return 0;
+}
+
 /* The lamps near each cell of the light volume, into this frame's copy when
  * they have changed: every glowing voxel a chunk keeps is listed for each
  * cell whose chunk comes within SV_LAMP_REACH voxels of it, at most
