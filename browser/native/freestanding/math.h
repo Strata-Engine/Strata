@@ -1,0 +1,1 @@
+/* This FastNoiseLite revision includes math.h but uses no libm declarations. */

@@ -1,0 +1,261 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Strata WASM mesh preview</title>
+<style>
+  html { color-scheme: dark; background: #101719; color: #e5ede7; font: 15px system-ui, sans-serif; }
+  body { margin: 0; display: grid; min-height: 100vh; place-content: center; }
+  main { width: min(94vw, 920px); }
+  h1 { font-size: 24px; margin: 0 0 12px; }
+  canvas { display: block; width: 100%; aspect-ratio: 46 / 29; border: 1px solid #384647; border-radius: 8px; }
+  .viewport { position: relative; }
+  .viewport[data-playing]::after {
+    content: '+'; position: absolute; inset: 50% auto auto 50%;
+    transform: translate(-50%, -50%); color: white; pointer-events: none;
+    text-shadow: 0 1px 3px black;
+  }
+  button { padding: 8px 14px; font: inherit; cursor: pointer; }
+  p { color: #b9c8c1; }
+</style>
+<main>
+  <h1>Strata · WASM mesh preview</h1>
+  <div class="viewport"><canvas width="920" height="580" aria-label="Voxel terrain"></canvas></div>
+  <p><button id="play" disabled>Fly through terrain</button></p>
+  <p id="status" role="status">Loading terrain…</p>
+</main>
+<script type="module">
+import { createAudio } from './audio.mjs';
+import { createInput } from './input.mjs';
+
+const play = document.querySelector('#play');
+const status = document.querySelector('#status');
+const canvas = document.querySelector('canvas');
+try {
+  const adapter = await navigator.gpu?.requestAdapter();
+  if (!adapter) throw new Error('No WebGPU adapter is available.');
+  const device = await adapter.requestDevice();
+  const { instance } = await WebAssembly.instantiateStreaming(fetch('./.build/core.wasm'));
+  const core = instance.exports;
+  if (core.init(12345, 1) !== 0) throw new Error('The terrain fixture failed to initialize.');
+
+  const cameraBuffer = device.createBuffer({
+    size: 80, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+  });
+
+  const shader = device.createShaderModule({ code: /* wgsl */ `
+    @group(0) @binding(0) var<storage, read> quads: array<vec2u>;
+
+    struct View { matrix: mat4x4f, perspective: vec4f }
+    @group(0) @binding(1) var<uniform> camera: View;
+    @group(0) @binding(2) var<uniform> chunkOrigin: vec4f;
+
+    struct Vertex {
+      @builtin(position) position: vec4f,
+      @location(0) color: vec3f,
+    }
+
+    @vertex fn vertex(@builtin(vertex_index) v: u32, @builtin(instance_index) i: u32) -> Vertex {
+      let word = quads[i].x;
+      let face = (word >> 25u) & 7u;
+      let u = v & 1u;
+      let t = (v >> 1u) & 1u;
+      let du = f32(u * (1u + ((word >> 15u) & 31u)));
+      let dv = f32(t * (1u + ((word >> 20u) & 31u)));
+      var p = vec3f(f32(word & 31u), f32((word >> 5u) & 31u), f32((word >> 10u) & 31u));
+      switch face {
+        case 0u: { p += vec3f(du, 1, dv); }
+        case 1u: { p += vec3f(du, 0, dv); }
+        case 2u: { p += vec3f(1, dv, du); }
+        case 3u: { p += vec3f(0, dv, du); }
+        case 4u: { p += vec3f(du, dv, 1); }
+        default: { p += vec3f(du, dv, 0); }
+      }
+      let q = p - vec3f(16, 4.5, 16);
+      let shade = array<f32, 6>(1, 0.45, 0.77, 0.58, 0.64, 0.52);
+      let ao = f32((quads[i].y >> (16u + 2u * v)) & 3u);
+      let turf = mix(vec3f(0.27, 0.54, 0.30), vec3f(0.66, 0.79, 0.42), clamp(p.y / 8, 0, 1));
+      let soil = mix(vec3f(0.23, 0.35, 0.27), vec3f(0.47, 0.54, 0.30), clamp(p.y / 8, 0, 1));
+      let color = select(soil, turf, face == 0u) * shade[face] * (0.65 + 0.35 * ao / 3);
+      var position = vec4f((q.x - q.z) * 0.026, q.y * 0.075 - (q.x + q.z) * 0.025,
+        0.5 - (q.x + q.z + q.y) * 0.01, 1);
+      if (camera.perspective.x != 0) { position = camera.matrix * vec4f(p + chunkOrigin.xyz, 1); }
+      return Vertex(position, color);
+    }
+
+    @fragment fn fragment(vertex: Vertex) -> @location(0) vec4f {
+      return vec4f(vertex.color, 1);
+    }
+  ` });
+  const format = navigator.gpu.getPreferredCanvasFormat();
+  const pipeline = await device.createRenderPipelineAsync({
+    layout: 'auto',
+    vertex: { module: shader, entryPoint: 'vertex' },
+    fragment: { module: shader, entryPoint: 'fragment', targets: [{ format }] },
+    primitive: { topology: 'triangle-strip' },
+    depthStencil: { format: 'depth24plus', depthWriteEnabled: true, depthCompare: 'less' },
+  });
+  const context = canvas.getContext('webgpu');
+  context.configure({ device, format });
+  let depth;
+  let playing = false, perspective = false, lost = false;
+  let previous = null, accumulated = 0, frame;
+  const tick = 1000 / 60;
+  const view = new Float32Array(20);
+  const origin = new Float32Array(4);
+  let pendingDraws = 0;
+  const slots = Array.from({ length: core.chunk_capacity() }, () => {
+    const quads = device.createBuffer({
+      size: core.chunk_buffer_bytes(), usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+    });
+    const offset = device.createBuffer({
+      size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    });
+    const group = device.createBindGroup({
+      layout: pipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: quads } },
+        { binding: 1, resource: { buffer: cameraBuffer } },
+        { binding: 2, resource: { buffer: offset } },
+      ],
+    });
+    return { quads, offset, group, revision: 0, bytes: 0 };
+  });
+
+  function uploadChunks() {
+    for (const [i, slot] of slots.entries()) {
+      const revision = core.chunk_revision(i);
+      if (slot.revision === revision) continue;
+      slot.revision = revision;
+      slot.bytes = core.chunk_bytes(i);
+      if (!slot.bytes) continue;
+      device.queue.writeBuffer(slot.quads, 0,
+        new Uint8Array(core.memory.buffer, core.chunk_ptr(i), slot.bytes));
+      origin[0] = core.chunk_x(i) * 32;
+      origin[2] = core.chunk_z(i) * 32;
+      device.queue.writeBuffer(slot.offset, 0, origin);
+    }
+  }
+
+  function draw() {
+    const limit = device.limits.maxTextureDimension2D;
+    const width = Math.min(limit, Math.max(1, Math.round(canvas.clientWidth * devicePixelRatio)));
+    const height = Math.min(limit, Math.max(1, Math.round(canvas.clientHeight * devicePixelRatio)));
+    if (!depth || canvas.width !== width || canvas.height !== height) {
+      canvas.width = width;
+      canvas.height = height;
+      depth?.destroy();
+      depth = device.createTexture({
+        size: [width, height], format: 'depth24plus', usage: GPUTextureUsage.RENDER_ATTACHMENT,
+      });
+    }
+    uploadChunks();
+
+    view.set(new Float32Array(core.memory.buffer, core.camera_ptr(), 16));
+    for (let i = 0; i < 16; i += 4) view[i] *= height / width;
+    view[16] = Number(perspective);
+    device.queue.writeBuffer(cameraBuffer, 0, view);
+    const encoder = device.createCommandEncoder();
+    const pass = encoder.beginRenderPass({
+      colorAttachments: [{
+        view: context.getCurrentTexture().createView(),
+        clearValue: { r: 0.066, g: 0.102, b: 0.110, a: 1 },
+        loadOp: 'clear',
+        storeOp: 'store',
+      }],
+      depthStencilAttachment: {
+        view: depth.createView(), depthClearValue: 1, depthLoadOp: 'clear', depthStoreOp: 'discard',
+      },
+    });
+    pass.setPipeline(pipeline);
+    for (const slot of slots) {
+      if (!slot.bytes) continue;
+      pass.setBindGroup(0, slot.group);
+      pass.draw(4, slot.bytes / 8);
+    }
+    pass.end();
+    device.queue.submit([encoder.finish()]);
+    pendingDraws++;
+    void device.queue.onSubmittedWorkDone().finally(() => { pendingDraws--; }).catch(() => {});
+  }
+
+  function resetClock() {
+    previous = null;
+    accumulated = 0;
+  }
+
+  const input = createInput(canvas, (locked) => {
+    playing = locked;
+    perspective ||= locked;
+    canvas.parentElement.toggleAttribute('data-playing', locked);
+    resetClock();
+    status.textContent = locked
+      ? 'WASD to fly · Space / Shift for height · Left click to remove · Right click to place · Esc to release'
+      : 'Click Fly through terrain to resume.';
+  });
+  const audio = createAudio();
+  const start = async () => {
+    if (lost) return;
+    void audio.resume();
+    if (playing) return;
+    try {
+      await canvas.requestPointerLock();
+    } catch (error) {
+      status.textContent = error.message || 'Could not capture the mouse.';
+    }
+  };
+  play.addEventListener('click', start);
+  canvas.addEventListener('click', start);
+  window.addEventListener('blur', resetClock);
+  document.addEventListener('visibilitychange', resetClock);
+  device.lost.then(({ message }) => {
+    lost = true;
+    cancelAnimationFrame(frame);
+    input.dispose();
+    audio.dispose();
+    if (document.pointerLockElement === canvas) document.exitPointerLock();
+    play.disabled = true;
+    status.textContent = `WebGPU device lost. ${message}`;
+  });
+
+  function animate(now) {
+    if (lost) return;
+    let events = 0;
+    if (playing && !document.hidden && document.hasFocus()) {
+      if (previous !== null) accumulated = Math.min(accumulated + now - previous, 4 * tick);
+      previous = now;
+      if (accumulated >= tick) {
+        const first = input.sample();
+        events = core.step(tick, first.held, first.pressed, first.dx, first.dy);
+        audio.playEvents(events);
+        accumulated -= tick;
+        while (accumulated >= tick) {
+          core.step(tick, first.held, 0, 0, 0);
+          accumulated -= tick;
+        }
+      }
+    } else {
+      resetClock();
+    }
+    // Keep the GPU queue bounded and do at most one remesh this frame.
+    if (pendingDraws < 2) {
+      if (playing && !document.hidden && (events & 1) === 0) core.stream_one();
+      draw();
+    }
+    frame = requestAnimationFrame(animate);
+  }
+
+  draw();
+  await device.queue.onSubmittedWorkDone();
+  if (!lost) {
+    play.disabled = false;
+    status.textContent = `${(core.mesh_bytes() / 8).toLocaleString()} quads · March + FastNoiseLite → WASM → WebGPU`;
+    document.documentElement.dataset.rendered = 'true';
+    frame = requestAnimationFrame(animate);
+  }
+} catch (error) {
+  status.textContent = error.message;
+  console.error(error);
+}
+</script>
+</html>
