@@ -1,0 +1,96 @@
+mod UrBrowser do
+  needs IO.Foreign
+  alias Ur.Sim as CitySim
+
+  alias Ur.BrowserScene as Scene
+  type Motion = { stats : Ur.Sim.Stats, citizens : List(Ur.Citizens.Citizen), fleet : List(Ur.Fleet.Run),
+    routes : List(Ur.Food.Trip), food : List(Ur.Food.Trip), rotors : NativeF32Arr }
+
+  extern "ur_browser" : Cap(IO.Foreign) do
+    fn command() : Int = "ur_command"
+    fn crossing_built(success : Int) : Unit = "ur_crossing_built"
+    fn end_parcel() : Int = "ur_end_parcel"
+    fn parcel() : Int = "ur_parcel"
+    fn load() : Ur.Sim.City = "ur_load"
+    fn load_motion() : Motion = "ur_load_motion"
+    fn save_motion(motion : Motion) : Unit = "ur_save_motion"
+    fn motion_time() : Float = "ur_motion_time"
+    fn motion_dt() : Float = "ur_motion_dt"
+    fn scene_tick() : Int = "ur_scene_tick"
+    fn prior_scene_tick() : Int = "ur_prior_scene_tick"
+    fn prior_phase() : Float = "ur_prior_phase"
+    fn phase() : Float = "ur_phase"
+    fn publish(city : Ur.Sim.City, heights : NativeIntArr, roads : NativeIntArr, zones : NativeIntArr, buildings : NativeIntArr, harbour : Int, month : Int, cash : Int, clock : Int) : Unit = "ur_publish"
+  end
+
+  fn init_motion(c : Ur.Sim.City, previous : List(Ur.Citizens.Citizen)) : Unit do
+    let st = CitySim.stats(c)
+    let citizens = Ur.Citizens.refresh_with(c, previous, st.routes, st.people, st.job_matches)
+    save_motion({ stats: st, citizens: citizens, fleet: Nil,
+      routes: Ur.Fleet.routes_with(c, st.running_transit, st.buses),
+      food: Ur.Food.producer_traffic(c, st), rotors: NativeArray.make_f32(CitySim.count(), 0.0) })
+  end
+
+  fn frame(c : Ur.Sim.City, m : Motion) : Unit do
+    let clock = phase()
+    let hour = CitySim.street_hour(clock)
+    let time = motion_time()
+    let dt = motion_dt()
+    let st = m.stats
+    Scene.daylight(clock, CitySim.weather(c.month, c.calendar_day))
+    if c.harbour < 0 do () else
+      let fleet = Ur.Fleet.step_at(c, st.traffic, m.fleet, m.routes, clock, dt, dt == 0.0, st.junctions, CitySim.signal_tick(time))
+      let bus = { routes: m.routes, active: fleet }
+      let citizens = if dt == 0.0 do m.citizens else
+        Ur.Citizens.step_with_bus(CitySim.operating_city(c, st.buses), st.running_transit, Some(bus),
+          m.citizens, clock, dt, st.junctions, time)
+      end
+      let rotors = Scene.vehicles(c, c, st.running_transit, m.rotors, time, clock, dt, true, 0)
+      Scene.food_vehicles(c, m.food, Nil, time, 0)
+      Scene.fleet(c, fleet, Nil)
+      let citizens = Scene.yield_to_vehicles(c, m.citizens, citizens, 0)
+      Scene.citizen_vehicles(c, citizens, Nil, hour >= 18 || hour < 6, 0)
+      save_motion({ m with citizens: citizens, fleet: fleet, rotors: rotors })
+    end
+  end
+
+  fn main(_cap : Cap(IO.Foreign)) : Unit do
+    let tool = command()
+    if tool == 4 do
+      let m = load_motion()
+      Scene.batch(load(), m.stats.utilities.electric, m.stats.junctions, CitySim.street_hour(phase()), scene_tick(), parcel(), 4)
+    else if tool == 5 do frame(load(), load_motion())
+    else if tool == 7 do
+      let m = load_motion()
+      Scene.relight(load(), m.stats.utilities.electric, m.stats.junctions, CitySim.street_hour(prior_phase()),
+        CitySim.street_hour(phase()), prior_scene_tick(), scene_tick(), 0)
+    else if tool == 6 do
+      let previous = load_motion()
+      let old = load()
+      let c = CitySim.build_grade(old, parcel(), end_parcel(), 50)
+      if c.cash < old.cash && CitySim.grade_kind(c, parcel()) == 1 && CitySim.grade_link(c, parcel(), end_parcel()) do
+        init_motion(c, previous.citizens)
+        publish(c, c.heights, c.roads, c.zones, c.buildings, c.harbour, c.month, c.cash, c.clock_ms)
+        crossing_built(1)
+      else () end
+    else
+      let next = if tool < 0 do
+          Scene.palette()
+          Scene.textures(0)
+          if tool == -3 do Ur.BrowserFixture.city()
+          else if tool == -2 do CitySim.new() else CitySim.unclaimed() end end
+        else
+          let city = load()
+          if tool == 0 do CitySim.tick(city)
+          else if city.harbour < 0 do CitySim.land(city, parcel())
+          else CitySim.act(city, parcel(), tool) end end
+        end
+      let previous = if tool < 0 do Nil else
+        let m = load_motion()
+        m.citizens
+      end
+      init_motion(next, previous)
+      publish(next, next.heights, next.roads, next.zones, next.buildings, next.harbour, next.month, next.cash, next.clock_ms)
+    end end end end
+  end
+end

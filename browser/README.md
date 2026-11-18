@@ -77,19 +77,24 @@ browser.
 
 ## Streaming
 
-While flying, the preview keeps a 3×3 window of horizontal chunks. Terrain
-samples use world coordinates, and the renderer reuses nine GPU mesh
-buffers. Each animation frame can generate one chunk or remesh one edit.
-The renderer keeps at most two submissions in flight. The preview uses one vertical layer of chunks. Meshing reads a one-voxel
+While flying, the preview keeps a 3×3×3 window around the camera. Use
+Space and Left Shift to cross vertical chunk boundaries. Away from the
+starting area, elevated shelves cross the boundary at world y=32.
+The renderer reuses 27 GPU mesh buffers sized for the maximum number of
+generated and edited voxels per chunk. Each frame can generate or remesh
+one chunk, with at most two GPU submissions in flight. Meshing reads a one-voxel
 shell from resident neighbors, including diagonals for corner shading.
 Loading or evicting a chunk queues affected neighbors for refresh. Border
 edits queue only the neighbors that read that cell. Unloaded space is air.
 Refreshes share the one-job-per-frame budget, so a border can take a few
-frames to settle.
+frames to settle. Refreshes caused by an edit take priority over loading
+new terrain while the affected chunk stays in the streaming window.
 
-The browser keeps up to 4,096 distinct edited cells for the current page
-session. An edited chunk restores those cells when it returns to the
-window. Once the journal is full, edits to new cells are rejected.
+The browser saves up to 4,096 distinct edited cells in IndexedDB for the
+current origin and terrain seed. Committed edits survive a reload and
+are restored before the first mesh. Existing saves load in layer zero. Each edit queues an asynchronous
+save. If browser storage is unavailable, play and in-memory edits still
+work. Once the journal is full, edits to new cells are rejected.
 
 The core test flies across ten chunks in both directions on each
 horizontal axis, returns to the edited origin, and repeats the route
@@ -104,13 +109,7 @@ test tab open. Keep the preview server running on port 8765.
 node browser/test/streaming-chrome.mjs
 ```
 
-On the development Mac, a 16-second headless Chrome flight loaded 12
-chunks after warm-up. The p95 and maximum frame intervals were 16.7 ms
-and 16.8 ms. A callback took at most 3.5 ms on the CPU, and WASM linear
-memory held at 16,842,752 bytes. These are observed timings for that
-browser, device, and flight path.
-
-With neighbor meshing enabled, the same flight measured 16.7 ms p95 and
-16.8 ms maximum frame interval, with a 3.4 ms maximum CPU callback and
-the same 16,842,752-byte WASM memory size. The core test also checks that
-removing one of two touching border voxels exposes the exact shared face.
+The browser test warms up on a horizontal flight and a climb, then repeats
+the route. It reports frame intervals, CPU callback times, and WASM memory.
+The core test also checks that an upper chunk hides the lower block’s top
+face until a vertical seam edit exposes it.

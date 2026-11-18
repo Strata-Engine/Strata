@@ -4,8 +4,12 @@
 //   w1: tex 0-15, ao 16-23 (corner i at bits 2i), flags 24-31
 // Faces: 0 +y, 1 -y, 2 +x, 3 -x, 4 +z, 5 -z. In-plane axes (u, v):
 //   +-y: (x, z)   +-x: (z, y)   +-z: (x, y)
+#ifdef STRATA_BATCHED_QUADS
+layout(std430, set = 0, binding = 26) readonly buffer PackedQuads { uint words[]; } packed_quads;
+#else
 layout(location = 0) in uint w0;
 layout(location = 1) in uint w1;
+#endif
 
 
 // The chunk table.
@@ -16,7 +20,14 @@ layout(std430, set = 0, binding = 4) readonly buffer DrawSlot { uint slot[]; } d
 // The block table, then each texture's top texture (strata_vk.c, sv_blocks_set): a far chunk's riser takes its block's top
 struct Block { int tex[6]; int flags; int emission; };
 layout(std430, set = 0, binding = 5) readonly buffer Blocks { Block rows[65536]; uint top_of[]; } blocks;
-layout(push_constant) uniform PC { uint base; uint flags; } pc;
+layout(push_constant) uniform PC {
+    uint base;
+    uint flags;
+#ifdef STRATA_BATCHED_QUADS
+    uint first_quad;
+    uint quad_count;
+#endif
+} pc;
 
 layout(location = 0) out vec2 v_uv;           // in unit faces: 0..w, 0..h (corner shading interpolates in these)
 layout(location = 4) out vec2 v_tex;          // texture coordinate: one tile per world voxel, image rows running downward
@@ -26,6 +37,15 @@ layout(location = 3) flat out uint v_face;        // 0..5; plus 8 for a chunk ab
 layout(location = 5) flat out vec4 v_rot;        // the rotation of the body drawn; identity for the world
 
 void main() {
+#ifdef STRATA_BATCHED_QUADS
+    uint instance = uint(gl_InstanceIndex);
+    uint quad = pc.first_quad + instance % pc.quad_count;
+    uint w0 = packed_quads.words[quad * 2u];
+    uint w1 = packed_quads.words[quad * 2u + 1u];
+    uint slot = draw_slot.slot[pc.base + instance / pc.quad_count];
+#else
+    uint slot = draw_slot.slot[pc.base + uint(gl_DrawID)];
+#endif
     uint face = (w0 >> 25) & 7u;
     vec3 p = vec3(float(w0 & 31u), float((w0 >> 5) & 31u), float((w0 >> 10) & 31u));
     float w = float(((w0 >> 15) & 31u) + 1u);
@@ -51,7 +71,7 @@ void main() {
     if (face < 2u)      q = p + vec3(du, face == 0u ? 1.0 - drop - dip : 0.0, dv);
     else if (face < 4u) q = p + vec3(face == 2u ? 1.0 : 0.0, up, du);
     else                q = p + vec3(du, up, face == 4u ? 1.0 : 0.0);
-    Chunk ch = table.chunks[draw_slot.slot[pc.base + uint(gl_DrawID)]];
+    Chunk ch = table.chunks[slot];
     ivec4 ol = ch.origin_level;
     // a level-L chunk's voxels are 2^L world voxels on a side
     float lod = float(1 << (ol.w & 255));

@@ -27,7 +27,7 @@
 /* Rewritten by build_shaders.sh whenever the shaders change: forge decides
  * whether to recompile this file from its text alone, not from the headers
  * it includes (GAPS S14). */
-#define STRATA_SHADERS_STAMP "4f2b4c10867f1d2e"
+#define STRATA_SHADERS_STAMP "a9df06663ffb1b49"
 #include "strata_shaders.h"
 #include "strata_particles.h"
 #include "strata_alloc.h"
@@ -39,7 +39,7 @@ static inline int64_t narr_len(void *a)  { return *(int64_t *)((char *)a + 16); 
 static inline void   *narr_data(void *a) { return (char *)a + NARR_HDR; }
 
 #define SV_LAYERS 3            /* opaque, cutout, translucent */
-#define SV_MAX_SLOTS 16384
+#define SV_DEFAULT_SLOTS 16480
 #define SV_DEFAULT_QUADS (8u * 1024u * 1024u)   /* 64 MB of 8-byte quads */
 #define SV_FRAMES 2            /* frames in flight */
 #define SV_SPRAY_CAP 65536     /* particles the spray ring holds */
@@ -60,12 +60,13 @@ static inline void   *narr_data(void *a) { return (char *)a + NARR_HDR; }
 
 #define SV_RANGES 6            /* 0 opaque, 1 cutout, 2 translucent, 3 cross, 4 loose, 5 spare */
 #define SV_PAD_MAX 65536       /* extra zero-count commands sv_pad_commands may append */
-#define SV_CMD_STRIDE (SV_MAX_SLOTS + SV_PAD_MAX)   /* commands per region of the indirect buffer */
+#define SV_CMD_STRIDE (g.slot_cap + SV_PAD_MAX)   /* commands per region of the indirect buffer */
 /* Regions of the command buffer: one per compute-culled range, then one per
  * frame in flight for the translucent list, which the CPU writes and so must
  * not share with a frame the GPU is still drawing. */
 #define SV_REGION_TRANS 6
 #define SV_REGIONS (SV_REGION_TRANS + SV_FRAMES)
+#define SV_REGION_BATCH SV_REGIONS
 
 typedef SaRange Range;
 
@@ -91,7 +92,16 @@ typedef struct {
 } ChunkEntry;
 #define SV_IN_USE 256
 #define SV_BODY   512          /* a part of a body: drawn at its pose, never in the light volume */
+#define SV_HAS_LIGHT 2048      /* slot owns a cell in the voxel light volume */
 #define SV_HIDDEN 1024         /* held but not drawn (Strata.Slots' which-chunk-draws rule); kept across uploads, cleared by a free */
+#define SV_SHARED 4096         /* mesh ranges are owned by a pinned prototype */
+#define SV_TEMPLATE 8192       /* its geometry is immutable until close */
+#define SV_BATCHED 16384       /* shared slot rendered in a mesh batch, not by the chunk cull */
+
+typedef struct {
+    float extent[3];            /* conservative upper corner of the prototype's mesh, in voxels */
+    uint32_t count, next;       /* visible count and write cursor for the current frame */
+} MeshBatch;
 
 /* An image a pass renders to and a later pass samples. */
 typedef struct { VkImage img; VkDeviceMemory mem; VkImageView view; } Target;
@@ -117,6 +127,7 @@ typedef struct {
     VkBuffer ui; VkDeviceMemory ui_mem; float *ui_map;   /* this frame's 2D layer */
     VkBuffer gstage; VkDeviceMemory gstage_mem; unsigned char *gstage_map;   /* this frame's new glyph pixels, before they are copied in */
     VkBuffer finst; VkDeviceMemory finst_mem; struct FigInst *finst_map;   /* this frame's figure parts: where each is drawn */
+    uint32_t batch_instances, batch_quads;
     int stats_valid;           /* the cull pass has run for this Frame at least once */
     VkFence fence;             /* signalled when the frame's commands have run */
     VkSemaphore sem_image, sem_done;
@@ -141,6 +152,9 @@ static SaAlloc g_bbytes;       /* ranges of the body class buffer, in 32-bit wor
 #define SV_CHUNK_LAMPS  64               /* glowing voxels a chunk keeps for the light pass to aim at */
 #define SV_LAMP_LIST    65536            /* entries in all cells' lists of nearby lamps, together */
 #define SV_LAMP_REACH   16               /* voxels a lamp's light reaches (the light pass fades it out from 12) */
+#define SV_MOVING_LAMPS 1024
+#define SV_LAMP_MOVING  (1 << 24)
+#define SV_LAMP_BEAM    (1 << 25)
 #define SV_CELL_LAMPS   16               /* lamps a cell lists at most */
 
 #define SV_LOOSE_QUADS 262144  /* 16 MB of 64-byte loose quads */
@@ -192,7 +206,9 @@ static struct {
     VkBuffer ltable; VkDeviceMemory ltable_mem; int32_t *ltable_map;
     float *tex_mean; uint32_t tex_mean_n;   /* each texture layer's mean colour, linear, three floats a layer */
     struct LightCell { int32_t chunk[3]; int valid; int uniform; uint32_t hash, solid; int nlamps; int32_t *lamps; } *cells;   /* lamps: nlamps glowing voxels, 4 ints each (x, y, z voxels, class) */
-    uint32_t lamp_version;        /* bumped whenever any cell's lamps change */
+    uint32_t lamp_version;        /* bumped whenever the lamp lists change */
+    int32_t moving_lamps[SV_MOVING_LAMPS][4];
+    int moving_lamp_count, headlights;
     int vn_old_cells;             /* how many cells g.cells has */   /* per cell, as last queued: its chunk, and its class if it is one class throughout, else -1 */
     struct LightWrite { int cell[3]; int32_t chunk[3]; int valid; int uniform; int edit; unsigned char *bytes; } *lq;   /* writes waiting to be copied in, oldest first */
     uint32_t nlq, lq_cap;
@@ -211,7 +227,7 @@ static struct {
      * image, to the offscreen target); the two final passes are compatible */
     VkRenderPass pass_g, pass_t, pass_l, pass, pass_off;
     VkPipelineLayout layout;
-    VkPipeline pipe_opaque, pipe_blend, pipe_cross, pipe_loose, pipe_cull, pipe_gather, pipe_light, pipe_composite, pipe_spray, pipe_glow;
+    VkPipeline pipe_opaque, pipe_batch, pipe_blend, pipe_cross, pipe_loose, pipe_cull, pipe_gather, pipe_light, pipe_composite, pipe_spray, pipe_glow;
     /* Particles: a ring of records in a mapped buffer (strata_particles.h),
      * drawn twice, shaded (pipe_spray) then glowing (pipe_glow); and the
      * effect table they read, PT_EFFECTS effects of PT_EFFECT_FLOATS, effect
@@ -230,7 +246,7 @@ static struct {
     float *models[SV_MAX_MODELS]; uint32_t model_quads[SV_MAX_MODELS];   /* 21 floats a quad, as Strata.Model lays them out */
     VkDescriptorSetLayout dsl;
     VkDescriptorPool dpool;
-    ChunkEntry *entries;           /* the chunk table as the CPU keeps it, SV_MAX_SLOTS entries; each Frame has the GPU's copy */
+    ChunkEntry *entries;           /* the chunk table as the CPU keeps it, slot_cap entries; each Frame has the GPU's copy */
     BodyRec *bodies;               /* SV_MAX_BODIES */
     VkBuffer bbytes; VkDeviceMemory bbytes_mem; uint32_t *bbytes_map;
     VkBuffer cmds;  VkDeviceMemory cmds_mem;  uint32_t *cmds_map;        /* indirect commands, SV_REGIONS * SV_CMD_STRIDE, 4 words each */
@@ -244,6 +260,12 @@ static struct {
     /* the texture array: one layer per texture id */
     VkImage tex; VkDeviceMemory tex_mem; VkImageView tex_view; VkSampler sampler;
     uint32_t tile_px, layers; unsigned char *tex_staging; int aniso;
+    int batch_shared;
+    uint32_t *batch_slots, *batch_at;        /* dense list of active shared slots, and positions plus one */
+    uint32_t *batch_visible, *batch_keys;    /* this frame's cull results and touched prototypes */
+    MeshBatch *batches;                      /* indexed by prototype slot */
+    uint32_t num_batch_slots, num_batch_keys, batch_draws, batch_visible_count, opaque_commands;
+    uint32_t slot_cap;
     uint32_t hi_slot;              /* one past the highest slot ever used: how many the cull pass looks at */
     uint32_t pad_cmds;             /* zero-count commands appended to each indirect call (measurement) */
     VkCommandPool cpool;
@@ -265,7 +287,7 @@ static struct {
     int64_t drawn_chunks, drawn_quads;
     /* input */
     unsigned char keys[SV_MAX_KEYS];
-    double mx, my, mdx, mdy; int have_mouse;
+    double mx, my, mdx, mdy, scroll_y; int have_mouse;
     int shot_pending; char shot_path[1024];
 } g;
 
@@ -609,13 +631,16 @@ static int make_render_pass(VkImageLayout final, VkRenderPass *out) {
  * 7: the 2D layer (final pass, blended, no depth, last of all);
  * 8: figure pieces (geometry pass; quads read from the quad buffer as words);
  * 9: glowing particles (final pass, added, after the shaded ones of kind 6).
- * Kinds 0, 2, 3 and 8 belong to the geometry pass, 4 to the light pass, 1 and 5
- * to the final pass. */
+ * 10: the gather pass (the light pass's rays, at the trace scale);
+ * 11: shared mesh batches (geometry pass, voxel textures).
+ * Kinds 0, 2, 3, 8 and 11 belong to the geometry pass, 4 to the light pass, 10 to
+ * the trace pass, 1 and 5 to the final pass. */
 static int make_pipeline(int kind, VkPipeline *out) {
-    int glow = kind == 9;
+    int glow = kind == 9, batch = kind == 11;
     int spray = kind == 6 || glow, ui = kind == 7, fig = kind == 8;
-    int blend = kind == 1 || spray || ui, cross = kind == 2, loose = kind == 3, full = kind == 4 || kind == 5 || kind == 10, geom = kind == 0 || cross || loose || fig;
-    VkShaderModule vs = fig ? shader(strata_figure_vert, sizeof(strata_figure_vert))
+    int blend = kind == 1 || spray || ui, cross = kind == 2, loose = kind == 3, full = kind == 4 || kind == 5 || kind == 10, geom = kind == 0 || cross || loose || fig || batch;
+    VkShaderModule vs = batch ? shader(strata_quad_batch_vert, sizeof(strata_quad_batch_vert))
+                      : fig ? shader(strata_figure_vert, sizeof(strata_figure_vert))
                       : ui ? shader(strata_ui_vert, sizeof(strata_ui_vert))
                       : spray ? shader(strata_particle_vert, sizeof(strata_particle_vert))
                       : cross ? shader(strata_cross_vert, sizeof(strata_cross_vert))
@@ -657,14 +682,14 @@ static int make_pipeline(int kind, VkPipeline *out) {
         { .location = 2, .binding = 0, .format = VK_FORMAT_R32G32B32A32_SFLOAT, .offset = 32 },
         { .location = 3, .binding = 0, .format = VK_FORMAT_R32G32B32A32_SFLOAT, .offset = 48 } };
     VkPipelineVertexInputStateCreateInfo vin = { .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
-        .vertexBindingDescriptionCount = (full || fig) ? 0 : 1, .pVertexBindingDescriptions = ui ? &ubind : spray ? &sbind : (loose ? &lbind : &bind),
-        .vertexAttributeDescriptionCount = (full || fig) ? 0 : (ui ? 4 : spray ? 4 : (loose ? 4 : 2)), .pVertexAttributeDescriptions = ui ? uattrs : spray ? sattrs : (loose ? lattrs : attrs) };
+        .vertexBindingDescriptionCount = (full || fig || batch) ? 0 : 1, .pVertexBindingDescriptions = ui ? &ubind : spray ? &sbind : (loose ? &lbind : &bind),
+        .vertexAttributeDescriptionCount = (full || fig || batch) ? 0 : (ui ? 4 : spray ? 4 : (loose ? 4 : 2)), .pVertexAttributeDescriptions = ui ? uattrs : spray ? sattrs : (loose ? lattrs : attrs) };
     VkPipelineInputAssemblyStateCreateInfo ia = { .sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
         .topology = (cross || full || spray) ? VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST : VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP };
     VkPipelineViewportStateCreateInfo vp = { .sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO, .viewportCount = 1, .scissorCount = 1 };
     VkPipelineRasterizationStateCreateInfo rs = { .sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO, .polygonMode = VK_POLYGON_MODE_FILL,
         /* a see-through surface is visible from behind too: water from below */
-        .cullMode = (kind == 0 || fig || spray) ? VK_CULL_MODE_BACK_BIT : VK_CULL_MODE_NONE, .frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE, .lineWidth = 1.0f };
+        .cullMode = (kind == 0 || fig || spray || batch) ? VK_CULL_MODE_BACK_BIT : VK_CULL_MODE_NONE, .frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE, .lineWidth = 1.0f };
     VkPipelineMultisampleStateCreateInfo ms = { .sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO, .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT };
     /* only the geometry pass writes depth; translucent quads test against it; full-screen passes ignore it */
     VkPipelineDepthStencilStateCreateInfo ds = { .sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO, .depthTestEnable = (full || ui) ? VK_FALSE : VK_TRUE,
@@ -1261,6 +1286,7 @@ static void on_cursor(GLFWwindow *w, double x, double y) {
     if (g.have_mouse) { g.mdx += x - g.mx; g.mdy += y - g.my; }
     g.mx = x; g.my = y; g.have_mouse = 1;
 }
+static void on_scroll(GLFWwindow *w, double x, double y) { (void)w; (void)x; g.scroll_y += y; }
 static void on_resize(GLFWwindow *w, int width, int height) { (void)w; (void)width; (void)height; g.resized = 1; }
 
 /* ── Open / close ─────────────────────────────────────────────────────────── */
@@ -1979,8 +2005,12 @@ static int fig_shadow_record(Frame *F, uint32_t q0) {
 }
 
 
-int64_t sv_open(int64_t w, int64_t h, int64_t capture_mouse, int64_t quad_capacity) {
+int64_t sv_open_slots(int64_t w, int64_t h, int64_t capture_mouse, int64_t quad_capacity, int64_t slots) {
     memset(&g, 0, sizeof g);
+    if (slots < SV_DEFAULT_SLOTS || slots > 262144) return 0;
+    g.slot_cap = (uint32_t)slots;
+    const char *batch = getenv("STRATA_BATCH_SHARED");
+    g.batch_shared = !batch || batch[0] != '0';
     if (!glfwInit()) { die("glfwInit", 0); return 0; }
     if (!glfwVulkanSupported()) { die("glfwVulkanSupported (is the Vulkan loader installed?)", 0); return 0; }
     glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
@@ -1994,6 +2024,7 @@ int64_t sv_open(int64_t w, int64_t h, int64_t capture_mouse, int64_t quad_capaci
     if (!g.win) { die("glfwCreateWindow", 0); return 0; }
     glfwSetKeyCallback(g.win, on_key);
     glfwSetCursorPosCallback(g.win, on_cursor);
+    glfwSetScrollCallback(g.win, on_scroll);
     glfwSetFramebufferSizeCallback(g.win, on_resize);
     if (capture_mouse) glfwSetInputMode(g.win, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
 
@@ -2131,6 +2162,7 @@ int64_t sv_open(int64_t w, int64_t h, int64_t capture_mouse, int64_t quad_capaci
         .pushConstantRangeCount = 1, .pPushConstantRanges = &pcr };
     VKOK(vkCreatePipelineLayout(g.dev, &pli, NULL, &g.layout), "pipeline layout");
     if (!make_pipeline(0, &g.pipe_opaque)) return 0;
+    if (g.batch_shared && !make_pipeline(11, &g.pipe_batch)) return 0;
     if (!make_pipeline(1, &g.pipe_blend)) return 0;
     if (!make_pipeline(2, &g.pipe_cross)) return 0;
     if (!make_pipeline(3, &g.pipe_loose)) return 0;
@@ -2174,20 +2206,29 @@ int64_t sv_open(int64_t w, int64_t h, int64_t capture_mouse, int64_t quad_capaci
     if (!make_buffer((VkDeviceSize)SV_LOOSE_QUADS * 64, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, &g.loose, &g.loose_mem, &map)) return 0;
     g.loose_map = map;
     sa_init(&g_loose, SV_LOOSE_QUADS);
-    g.entries = calloc(SV_MAX_SLOTS, sizeof(ChunkEntry));
+    g.entries = calloc(g.slot_cap, sizeof(ChunkEntry));
     if (!g.entries) return 0;
     VkDeviceSize cmd_bytes = (VkDeviceSize)SV_REGIONS * SV_CMD_STRIDE * 16;
     if (!make_buffer(cmd_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, &g.cmds, &g.cmds_mem, &map)) return 0;
     memset(map, 0, (size_t)cmd_bytes);            /* the padding commands stay zero-count for good */
     g.cmds_map = map;
-    if (!make_buffer((VkDeviceSize)SV_REGIONS * SV_CMD_STRIDE * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &g.dslot, &g.dslot_mem, &map)) return 0;
-    memset(map, 0, (size_t)SV_REGIONS * SV_CMD_STRIDE * 4);
+    VkDeviceSize dslot_bytes = (VkDeviceSize)(SV_REGIONS + (g.batch_shared ? SV_FRAMES : 0)) * SV_CMD_STRIDE * 4;
+    if (!make_buffer(dslot_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &g.dslot, &g.dslot_mem, &map)) return 0;
+    memset(map, 0, (size_t)dslot_bytes);
     g.dslot_map = map;
-    g.trans = calloc(SV_MAX_SLOTS, sizeof *g.trans);
-    g.trans_at = malloc(SV_MAX_SLOTS * sizeof *g.trans_at);
-    g.trans_keys = calloc(SV_MAX_SLOTS, sizeof *g.trans_keys);
+    if (g.batch_shared) {
+        g.batch_slots = malloc(g.slot_cap * sizeof *g.batch_slots);
+        g.batch_at = calloc(g.slot_cap, sizeof *g.batch_at);
+        g.batch_visible = malloc(g.slot_cap * sizeof *g.batch_visible);
+        g.batch_keys = malloc(g.slot_cap * sizeof *g.batch_keys);
+        g.batches = calloc(g.slot_cap, sizeof *g.batches);
+        if (!g.batch_slots || !g.batch_at || !g.batch_visible || !g.batch_keys || !g.batches) return 0;
+    }
+    g.trans = calloc(g.slot_cap, sizeof *g.trans);
+    g.trans_at = malloc(g.slot_cap * sizeof *g.trans_at);
+    g.trans_keys = calloc(g.slot_cap, sizeof *g.trans_keys);
     if (!g.trans || !g.trans_at || !g.trans_keys) { die("translucent list", 0); return 0; }
-    for (int i = 0; i < SV_MAX_SLOTS; i++) g.trans_at[i] = -1;
+    for (int i = 0; i < g.slot_cap; i++) g.trans_at[i] = -1;
 
     if (!make_buffer((VkDeviceSize)SV_MAX_BLOCKS * 32 + 65536 * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &g.blocks, &g.blocks_mem, &map)) return 0;
     g.blocks_map = map;
@@ -2212,8 +2253,8 @@ int64_t sv_open(int64_t w, int64_t h, int64_t capture_mouse, int64_t quad_capaci
         VKOK(vkAllocateDescriptorSets(g.dev, &dai, &F->dset), "descriptor set");
         if (!make_buffer(UBO_FLOATS * 4, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, &F->ubo, &F->ubo_mem, &map)) return 0;
         F->ubo_map = map; memset(F->ubo_map, 0, UBO_FLOATS * 4);
-        if (!make_buffer((VkDeviceSize)SV_MAX_SLOTS * sizeof(ChunkEntry), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &F->table, &F->table_mem, &map)) return 0;
-        F->table_map = map; memset(F->table_map, 0, (size_t)SV_MAX_SLOTS * sizeof(ChunkEntry));
+        if (!make_buffer((VkDeviceSize)g.slot_cap * sizeof(ChunkEntry), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &F->table, &F->table_mem, &map)) return 0;
+        F->table_map = map; memset(F->table_map, 0, (size_t)g.slot_cap * sizeof(ChunkEntry));
         if (!make_buffer((VkDeviceSize)SV_LIGHT_PER_FRAME * SV_LIGHT_WRITE_BYTES, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, &F->lstage, &F->lstage_mem, &map)) return 0;
         F->lstage_map = map;
         if (!make_buffer((VkDeviceSize)SV_TABLE_ROWS * sizeof(BodyRow), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &F->btable, &F->btable_mem, &map)) return 0;
@@ -2228,8 +2269,8 @@ int64_t sv_open(int64_t w, int64_t h, int64_t capture_mouse, int64_t quad_capaci
         F->lcells_map = map; memset(F->lcells_map, 0, (size_t)SV_MAX_CELLS * 8);
         if (!make_buffer((VkDeviceSize)SV_LAMP_LIST * 16, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &F->llist, &F->llist_mem, &map)) return 0;
         F->llist_map = map; F->lamp_version = (uint32_t)-1;
-        F->pending = calloc(SV_MAX_SLOTS, sizeof *F->pending);
-        F->is_pending = calloc(SV_MAX_SLOTS, 1);
+        F->pending = calloc(g.slot_cap, sizeof *F->pending);
+        F->is_pending = calloc(g.slot_cap, 1);
         if (!F->pending || !F->is_pending) return 0;
         VkDescriptorBufferInfo bufs[6] = { { F->ubo, 0, UBO_FLOATS * 4 }, { F->table, 0, VK_WHOLE_SIZE }, { g.cmds, 0, VK_WHOLE_SIZE }, { F->stats, 0, 32 }, { g.dslot, 0, VK_WHOLE_SIZE }, { g.blocks, 0, VK_WHOLE_SIZE } };
         VkWriteDescriptorSet wds[6];
@@ -2329,6 +2370,7 @@ void sv_close(void) {
         destroy_swapchain();
         if (g.swap) vkDestroySwapchainKHR(g.dev, g.swap, NULL);
         if (g.pipe_opaque) vkDestroyPipeline(g.dev, g.pipe_opaque, NULL);
+        if (g.pipe_batch) vkDestroyPipeline(g.dev, g.pipe_batch, NULL);
         if (g.pipe_blend) vkDestroyPipeline(g.dev, g.pipe_blend, NULL);
         if (g.pipe_cull) vkDestroyPipeline(g.dev, g.pipe_cull, NULL);
         if (g.pipe_cross) vkDestroyPipeline(g.dev, g.pipe_cross, NULL);
@@ -2410,6 +2452,7 @@ void sv_close(void) {
     if (g.win) glfwDestroyWindow(g.win);
     glfwTerminate();
     free(g.trans); free(g.trans_at); free(g.trans_keys);
+    free(g.batch_slots); free(g.batch_at); free(g.batch_visible); free(g.batch_keys); free(g.batches);
     free(g.spray_births); g.spray_births = NULL;
     free(g.ui_cpu); g.ui_cpu = NULL; g.ui_n = 0;
     free(g.ubo_map); free(g.entries); if (g.cells) for (int i = 0; i < g.vn_old_cells; i++) free(g.cells[i].lamps); free(g.cells); g.vn_old_cells = 0; free(g.cell_page); free(g.free_pages); free(g.stage_light);
@@ -2421,10 +2464,16 @@ void sv_close(void) {
 
 /* ── Window and input queries ─────────────────────────────────────────────── */
 int64_t sv_should_close(void) { return (!g.win || glfwWindowShouldClose(g.win)) ? 1 : 0; }
-void sv_poll(void) { g.mdx = 0; g.mdy = 0; if (g.win) glfwPollEvents(); }
+void sv_poll(void) { g.mdx = 0; g.mdy = 0; g.scroll_y = 0; if (g.win) glfwPollEvents(); }
 int64_t sv_key(int64_t k) { return (k >= 0 && k < SV_MAX_KEYS) ? g.keys[k] : 0; }
 /* Is mouse button b (0 left, 1 right, 2 middle) held? */
+int64_t sv_open(int64_t w, int64_t h, int64_t capture_mouse, int64_t quad_capacity) {
+    return sv_open_slots(w, h, capture_mouse, quad_capacity, SV_DEFAULT_SLOTS);
+}
 int64_t sv_mouse_button(int64_t b) { return (g.win && b >= 0 && b <= 7 && glfwGetMouseButton(g.win, (int)b) == GLFW_PRESS) ? 1 : 0; }
+double sv_mouse_x(void) { if (g.win && g.have_mouse) return g.mx; double x = 0, y = 0; if (g.win) glfwGetCursorPos(g.win, &x, &y); return x; }
+double sv_mouse_y(void) { if (g.win && g.have_mouse) return g.my; double x = 0, y = 0; if (g.win) glfwGetCursorPos(g.win, &x, &y); return y; }
+double sv_scroll_y(void) { return g.scroll_y; }
 double sv_mouse_dx(void) { return g.mdx; }
 double sv_mouse_dy(void) { return g.mdy; }
 double sv_time(void) { return glfwGetTime(); }
@@ -2452,6 +2501,9 @@ void sv_set_vsync(int64_t on) { int off = on ? 0 : 1; if (g.ok && off != g.vsync
  * 25 particles written over a slot still in the live span, since the start
  * (a full ring). */
 double sv_stat(int64_t which) {
+    if (which == 30) return (double)g.batch_visible_count;
+    if (which == 31) return (double)g.batch_draws;
+    if (which == 32) return (double)g.opaque_commands;
     if (which == 6) return (double)g.rebuilds;
     if (which == 22) return (double)(g.npages - g.nfree_pages);   /* light pages in use */
     if (which == 23) return (double)g.pages_refused;               /* chunks that found no light page */
@@ -2621,7 +2673,8 @@ static void touch(uint32_t slot) {
  * sun and sky alone: its rays would start inside the finer world. */
 int64_t sv_chunk_begin(int64_t slot, double ox, double oy, double oz, int64_t level) {
     g.stage.open = 0;
-    if (!g.ok || slot < 0 || slot >= SV_MAX_SLOTS || level < 0 || level > 30) return 0;
+    if (!g.ok || slot < 0 || slot >= g.slot_cap || level < 0 || level > 30 ||
+        (g.entries[slot].level_flags & SV_TEMPLATE)) return 0;
     g.stage.level = (int)level;
     g.stage.slot = slot;
     g.stage.origin[0] = (int32_t)ox; g.stage.origin[1] = (int32_t)oy; g.stage.origin[2] = (int32_t)oz;
@@ -2637,10 +2690,11 @@ int64_t sv_chunk_begin(int64_t slot, double ox, double oy, double oz, int64_t le
 /* Give body [handle] its shape: one light class byte a voxel, x fastest, then
  * y, then z, [sx] x [sy] x [sz]. Replaces any shape it had. */
 int64_t sv_body_shape(int64_t handle, void *bytes, int64_t n, int64_t sx, int64_t sy, int64_t sz) {
-    if (!g.ok || !g.bodies || handle < 0 || handle >= SV_MAX_BODIES || sx < 1 || sy < 1 || sz < 1 || n < sx * sy * sz) return 0;
+    if (!g.ok || !g.bodies || handle < 0 || handle >= SV_MAX_BODIES || !bytes ||
+        sx < 1 || sy < 1 || sz < 1 || n < 1 || n > narr_len(bytes) || sx > n / sy / sz) return 0;
     BodyRec *b = &g.bodies[handle];
     uint32_t words = 0, first = 0;
-    if (!put_shape((const uint8_t *)bytes, sx, sy, sz, &first, &words)) { g.refused++; return 0; }
+    if (!put_shape(narr_data(bytes), sx, sy, sz, &first, &words)) { g.refused++; return 0; }
     if (b->shaped) sa_release(&g_bbytes, (SaRange){ b->first, b->nwords }, g.frame_no);
     b->first = first; b->nwords = words; b->dims[0] = (int32_t)sx; b->dims[1] = (int32_t)sy; b->dims[2] = (int32_t)sz;
     b->shaped = 1;
@@ -2825,7 +2879,7 @@ static int footprint_axis(double start, double end, double half, double *first, 
 
 static int footprint_hit(const struct Footprint *v, double x0, double y0, double z0,
                          double x1, double y1, double z1, int64_t ignore) {
-    if (v->slot == ignore || v->slot < 0 || v->slot >= SV_MAX_SLOTS ||
+    if (v->slot == ignore || v->slot < 0 || v->slot >= g.slot_cap ||
         !(g.entries[v->slot].level_flags & SV_IN_USE)) return 0;
     if (fmin(y0, y1) > v->y + 6.0 || fmax(y0, y1) < v->y - 4.0) return 0;
     double ax = x0 - v->x, az = z0 - v->z, bx = x1 - v->x, bz = z1 - v->z;
@@ -2866,6 +2920,91 @@ int64_t sv_footprint_blocked(double x0, double y0, double z0, double x1, double 
     return 0;
 }
 
+/* Immediate, unshadowed lights. A new batch replaces the previous frame's batch. */
+void sv_moving_lights_begin(int64_t headlights) {
+    if (g.moving_lamp_count) g.lamp_version++;
+    g.moving_lamp_count = 0;
+    g.headlights = headlights != 0;
+}
+
+static void moving_lamp(double x, double y, double z, int64_t cls, int flags) {
+    if (g.light_mode != 8 || cls <= 0 || cls > 255 || g.moving_lamp_count >= SV_MOVING_LAMPS) return;
+    /* Store positions to an eighth of a voxel to keep moving beams smooth. */
+    if (!isfinite(x) || !isfinite(y) || !isfinite(z) ||
+        fabs(x) > 1000000 || fabs(y) > 1000000 || fabs(z) > 1000000) return;
+    int32_t *lamp = g.moving_lamps[g.moving_lamp_count++];
+    lamp[0] = (int32_t)lround(x * 8.0);
+    lamp[1] = (int32_t)lround(y * 8.0);
+    lamp[2] = (int32_t)lround(z * 8.0);
+    lamp[3] = (int32_t)cls | SV_LAMP_MOVING | flags;
+    if (g.moving_lamp_count == 1) g.lamp_version++;
+}
+
+int64_t sv_headlight(double x, double y, double z, double dx, double dz, int64_t cls) {
+    if (!g.headlights || !isfinite(dx) || !isfinite(dz)) return 0;
+    double length = hypot(dx, dz);
+    if (length < 1e-6 || !isfinite(length)) return 0;
+    int sx = 128 + (int)lround(127.0 * (dx / length));
+    int sz = 128 + (int)lround(127.0 * (dz / length));
+    moving_lamp(x, y, z, cls, SV_LAMP_BEAM | (sx << 8) | (sz << 16));
+    return 1;
+}
+
+void sv_beacon(double x, double y, double z, int64_t cls) {
+    moving_lamp(x, y, z, cls, 0);
+}
+
+/* lamp_keep for a stationary lamp in a list that may also hold moving ones:
+ * past the cap it replaces only the farthest stationary lamp, so a vehicle's
+ * light (its position in eighths of a voxel) is never weighed as a voxel's. */
+static void lamp_keep_still(int32_t *list, uint32_t *k, uint32_t cap, const int32_t *l, int cx, int cy, int cz) {
+    if (*k < cap) { lamp_keep(list, k, cap, l, cx, cy, cz); return; }
+    uint32_t far = cap; int64_t fd = -1;
+    for (uint32_t i = 0; i < cap; i++) {
+        if (list[i * 4 + 3] & SV_LAMP_MOVING) continue;
+        int64_t d = lamp_cell_d2(list + i * 4, cx, cy, cz);
+        if (d > fd) { fd = d; far = i; }
+    }
+    if (far < cap && lamp_cell_d2(l, cx, cy, cz) < fd)
+        for (int a = 0; a < 4; a++) list[far * 4 + a] = l[a];
+}
+
+/* List a lamp for each cell whose chunk comes within SV_LAMP_REACH voxels of
+ * it; pass 0 counts, pass 1 writes. Moving lamps are listed first and take at
+ * most half a cell's list, keeping space for stationary lamps on streets
+ * packed with vehicles. Past the cap a cell keeps its nearest stationary
+ * lamps (strata_lamps.h): a cell never loses its own lamp to its neighbours'
+ * (scene 17's post did, to generated ones). */
+static void list_lamp(Frame *F, const int32_t *lamp, int pass, int moving) {
+    int lo[3], hi[3];
+    for (int a = 0; a < 3; a++) {
+        int voxel = moving ? lamp[a] >> 3 : lamp[a];
+        lo[a] = (voxel - SV_LAMP_REACH) >> 5;
+        hi[a] = (voxel + SV_LAMP_REACH) >> 5;
+    }
+    for (int z = lo[2]; z <= hi[2]; z++) {
+        for (int y = lo[1]; y <= hi[1]; y++) {
+            for (int x = lo[0]; x <= hi[0]; x++) {
+                int cell = wrapi(x, g.vn) + g.vn * (wrapi(y, g.vnv) + g.vnv * wrapi(z, g.vn));
+                uint32_t *entry = F->lcells_map + cell * 2;
+                if (moving) {
+                    if (entry[1] >= SV_CELL_LAMPS / 2) continue;
+                    if (pass == 0) { entry[1]++; continue; }
+                    if (entry[0] + entry[1] >= SV_LAMP_LIST) continue;
+                    memcpy(F->llist_map + (entry[0] + entry[1]) * 4, lamp, 16);
+                    entry[1]++;
+                    continue;
+                }
+                if (pass == 0) { entry[1]++; continue; }
+                uint32_t k = entry[1];
+                if (entry[0] + (k < SV_CELL_LAMPS ? k : SV_CELL_LAMPS - 1) >= SV_LAMP_LIST) continue;
+                lamp_keep_still(F->llist_map + entry[0] * 4, &k, SV_CELL_LAMPS, lamp, x, y, z);
+                entry[1] = k;
+            }
+        }
+    }
+}
+
 /* The lamps near each cell of the light volume, into this frame's copy when
  * they have changed: every glowing voxel a chunk keeps is listed for each
  * cell whose chunk comes within SV_LAMP_REACH voxels of it, at most
@@ -2873,40 +3012,37 @@ int64_t sv_footprint_blocked(double x0, double y0, double z0, double x1, double 
  * so a point finds every lamp whose light reaches it while a cell has room. */
 static void lamps_to_frame(Frame *F) {
     float *wt = g.ubo_map + UBO_WATER;
-    if (!g.cells || g.vn <= 0 || g.vnv <= 0) { wt[6] = 0.0f; return; }
-    int nx = g.vn, ny = g.vnv, nz = g.vn;
-    uint32_t ncells = (uint32_t)(nx * ny * nz);
-    if (ncells > SV_MAX_CELLS) { wt[6] = 0.0f; return; }
+    const char *enabled = getenv("STRATA_LAMPS");
+    wt[6] = 0.0f;
+    if ((enabled && *enabled == '0') || !g.cells || g.vn <= 0 || g.vnv <= 0) return;
+    uint32_t ncells = (uint32_t)(g.vn * g.vn * g.vnv);
+    if (ncells > SV_MAX_CELLS) return;
     if (F->lamp_version != g.lamp_version) {
         memset(F->lcells_map, 0, (size_t)ncells * 8);
         for (int pass = 0; pass < 2; pass++) {
-            if (pass == 1) { uint32_t at = 0; for (uint32_t c = 0; c < ncells; c++) { uint32_t k = F->lcells_map[c * 2 + 1]; if (k > SV_CELL_LAMPS) k = SV_CELL_LAMPS; F->lcells_map[c * 2] = at; at += k; F->lcells_map[c * 2 + 1] = 0; } }
+            if (pass == 1) {
+                uint32_t at = 0;
+                for (uint32_t c = 0; c < ncells; c++) {
+                    uint32_t *entry = F->lcells_map + c * 2;
+                    entry[0] = at;
+                    at += entry[1] < SV_CELL_LAMPS ? entry[1] : SV_CELL_LAMPS;
+                    entry[1] = 0;
+                }
+            }
+            if (g.light_mode == 8) {
+                for (int i = 0; i < g.moving_lamp_count; i++) list_lamp(F, g.moving_lamps[i], pass, 1);
+            }
             for (uint32_t c = 0; c < ncells; c++) {
                 struct LightCell *lc = &g.cells[c];
-                if (!lc->valid || lc->nlamps == 0) continue;
-                for (int i = 0; i < lc->nlamps; i++) {
-                    const int32_t *l = lc->lamps + i * 4;
-                    int lo[3], hi[3];
-                    for (int a = 0; a < 3; a++) { lo[a] = (l[a] - SV_LAMP_REACH) >> 5; hi[a] = (l[a] + SV_LAMP_REACH) >> 5; }
-                    for (int cz = lo[2]; cz <= hi[2]; cz++) for (int cy = lo[1]; cy <= hi[1]; cy++) for (int cx = lo[0]; cx <= hi[0]; cx++) {
-                        uint32_t t = (uint32_t)(wrapi(cx, nx) + nx * (wrapi(cy, ny) + ny * wrapi(cz, nz)));
-                        if (pass == 0) { F->lcells_map[t * 2 + 1]++; continue; }
-                        uint32_t k = F->lcells_map[t * 2 + 1];
-                        if (F->lcells_map[t * 2] + (k < SV_CELL_LAMPS ? k : SV_CELL_LAMPS - 1) >= SV_LAMP_LIST) continue;
-                        /* past the cap the nearest lamps stay (strata_lamps.h): a cell never loses
-                         * its own lamp to its neighbours' (scene 17's post did, to generated ones) */
-                        lamp_keep(F->llist_map + F->lcells_map[t * 2] * 4, &k, SV_CELL_LAMPS, l, cx, cy, cz);
-                        F->lcells_map[t * 2 + 1] = k;
-                    }
-                }
+                if (!lc->valid) continue;
+                for (int i = 0; i < lc->nlamps; i++) list_lamp(F, lc->lamps + i * 4, pass, 0);
             }
         }
         F->lamp_version = g.lamp_version;
     }
-    /* how many lamps the light pass may aim at, anywhere (0: none, skip the lists) */
-    uint32_t total = 0;
-    for (uint32_t c = 0; c < ncells && total == 0; c++) total += F->lcells_map[c * 2 + 1];
-    wt[6] = total > 0 && !(getenv("STRATA_LAMPS") && getenv("STRATA_LAMPS")[0] == '0') ? 1.0f : 0.0f;
+    for (uint32_t c = 0; c < ncells; c++) {
+        if (F->lcells_map[c * 2 + 1]) { wt[6] = 1.0f; break; }
+    }
 }
 
 /* Begin uploading one part of a body (a 32-cubed piece of its grid) into
@@ -2919,7 +3055,7 @@ int64_t sv_body_begin(int64_t slot) {
 }
 /* Where a body part is drawn: its low corner in metres, and its rotation. */
 void sv_slot_pose(int64_t slot, double px, double py, double pz, double qx, double qy, double qz, double qw) {
-    if (!g.ok || slot < 0 || slot >= SV_MAX_SLOTS) return;
+    if (!g.ok || slot < 0 || slot >= g.slot_cap) return;
     ChunkEntry *e = &g.entries[slot];
     if (!(e->level_flags & SV_BODY)) return;
     e->pos[0] = (float)px; e->pos[1] = (float)py; e->pos[2] = (float)pz;
@@ -2928,7 +3064,7 @@ void sv_slot_pose(int64_t slot, double px, double py, double pz, double qx, doub
 }
 /* A body part in [slot] has voxels [metres] across; 0 for the world's. */
 void sv_slot_voxel(int64_t slot, double metres) {
-    if (!g.ok || slot < 0 || slot >= SV_MAX_SLOTS) return;
+    if (!g.ok || slot < 0 || slot >= g.slot_cap) return;
     ChunkEntry *e = &g.entries[slot];
     if (!(e->level_flags & SV_BODY)) return;
     e->pos[3] = metres > 0.0 ? (float)metres : 0.0f;
@@ -2965,6 +3101,69 @@ int64_t sv_chunk_light(void *bytes, int64_t n) {
 }
 
 static int64_t fig_commit(void);
+static void release_mesh(const ChunkEntry *e) {
+    if (e->level_flags & SV_SHARED) return;
+    for (int r = 0; r < 4; r++) sa_release(&g_quads, (Range){ e->first[r], e->count[r] }, g.frame_no);
+    sa_release(&g_loose, (Range){ e->first[4], e->count[4] }, g.frame_no);
+}
+
+static void track_batch(uint32_t slot, int batched) {
+    if (!g.batch_shared) return;
+    uint32_t at = g.batch_at[slot];
+    if (batched && !at) {
+        g.batch_slots[g.num_batch_slots++] = slot;
+        g.batch_at[slot] = g.num_batch_slots;
+    } else if (!batched && at) {
+        uint32_t last = g.batch_slots[--g.num_batch_slots];
+        g.batch_slots[at - 1] = last;
+        g.batch_at[last] = at;
+        g.batch_at[slot] = 0;
+    }
+}
+
+static void batch_mesh_extent(uint32_t prototype, const ChunkEntry *source) {
+    float *extent = g.batches[prototype].extent;
+    if (extent[0] > 0) return;
+    for (uint32_t i = 0; i < source->count[0]; i++) {
+        uint32_t w0 = g.giga_map[(size_t)(source->first[0] + i) * 2];
+        uint32_t face = (w0 >> 25) & 7u, w = ((w0 >> 15) & 31u) + 1, h = ((w0 >> 20) & 31u) + 1;
+        float x = (w0 & 31u) + (face < 2 || face >= 4 ? w : 1);
+        float y = ((w0 >> 5) & 31u) + (face < 2 ? 1 : h);
+        float z = ((w0 >> 10) & 31u) + (face < 2 ? h : face < 4 ? w : 1);
+        if (x > extent[0]) extent[0] = x;
+        if (y > extent[1]) extent[1] = y;
+        if (z > extent[2]) extent[2] = z;
+    }
+}
+
+/* Share an opaque level-zero mesh with an independently positioned slot.
+ * Once referenced, the prototype's GPU range stays pinned until close. */
+int64_t sv_chunk_instance(int64_t slot, int64_t prototype, double x, double y, double z) {
+    if (!g.ok || slot < 0 || prototype < 0 || slot >= g.slot_cap || prototype >= g.slot_cap || slot == prototype) return 0;
+    ChunkEntry *source = &g.entries[prototype], *target = &g.entries[slot];
+    if (!(source->level_flags & SV_IN_USE) ||
+        (source->level_flags & (255 | SV_SHARED | SV_BODY | SV_HAS_LIGHT)) ||
+        !source->count[0] || source->count[1] || source->count[2] || source->count[3] || source->count[4] ||
+        (target->level_flags & (SV_TEMPLATE | SV_BODY | SV_HAS_LIGHT))) return 0;
+    if ((target->level_flags & SV_SHARED) && target->first[0] == source->first[0] &&
+        target->origin[0] == (float)x && target->origin[1] == (float)y && target->origin[2] == (float)z) return 1;
+    release_mesh(target);
+    trans_track((uint32_t)slot, 0);
+    source->level_flags |= SV_TEMPLATE;
+    uint32_t hidden = target->level_flags & SV_HIDDEN;
+    *target = *source;
+    target->origin[0] = (float)x; target->origin[1] = (float)y; target->origin[2] = (float)z;
+    /* Use the old slot path when the mesh falls beyond the shader's storage view. */
+    int batched = g.batch_shared && ((VkDeviceSize)source->first[0] + source->count[0]) * 8 <= g.max_ssbo;
+    if (batched) batch_mesh_extent((uint32_t)prototype, source);
+    track_batch((uint32_t)slot, batched);
+    target->first[5] = (uint32_t)prototype;
+    target->level_flags = SV_IN_USE | SV_SHARED | hidden | (batched ? SV_BATCHED : 0);
+    if ((uint32_t)slot + 1 > g.hi_slot) g.hi_slot = (uint32_t)slot + 1;
+    touch((uint32_t)slot);
+    return 1;
+}
+
 int64_t sv_chunk_commit(void) {
     if (!g.stage.open) return 0;
     if (g.stage.fig) return fig_commit();
@@ -3009,8 +3208,8 @@ int64_t sv_chunk_commit(void) {
     }
     /* frames in flight may still read the old ranges: hold them two frames */
     ChunkEntry *e = &g.entries[slot];
-    for (int r = 0; r < 4; r++) sa_release(&g_quads, (Range){ e->first[r], e->count[r] }, g.frame_no);
-    sa_release(&g_loose, (Range){ e->first[4], e->count[4] }, g.frame_no);
+    release_mesh(e);
+    if (e->level_flags & SV_BATCHED) track_batch((uint32_t)slot, 0);
     e->origin[0] = g.stage.origin[0]; e->origin[1] = g.stage.origin[1]; e->origin[2] = g.stage.origin[2];
     for (int r = 0; r < 4; r++) { e->first[r] = firsts[r]; e->count[r] = counts[r]; }
     e->first[4] = lfirst; e->count[4] = nloose;
@@ -3019,7 +3218,8 @@ int64_t sv_chunk_commit(void) {
     if ((uint32_t)slot + 1 > g.hi_slot) g.hi_slot = (uint32_t)slot + 1;
     trans_track((uint32_t)slot, counts[2] > 0);
     touch((uint32_t)slot);
-    if (g.stage.body || g.stage.level > 0) return 1;   /* neither a body nor a coarse chunk is in the light volume */
+    if (g.stage.body || g.stage.level > 0 || g.stage_light_n == 0) return 1;   /* neither a body nor a coarse chunk is in the light volume */
+    e->level_flags |= SV_HAS_LIGHT;
     /* its voxels go into the light volume at the start of the next frame */
     int32_t chunk[3] = { e->origin[0] >> 5, e->origin[1] >> 5, e->origin[2] >> 5 };
     if (g.stage_light_n == 32768) {
@@ -3030,20 +3230,23 @@ int64_t sv_chunk_commit(void) {
 }
 
 void sv_chunk_free(int64_t slot) {
-    if (!g.ok || slot < 0 || slot >= SV_MAX_SLOTS) return;
+    if (!g.ok || slot < 0 || slot >= g.slot_cap) return;
     ChunkEntry *e = &g.entries[slot];
     if (!(e->level_flags & SV_IN_USE)) { e->level_flags = 0; return; }   /* a slot hidden before its first upload landed */
-    int body = (e->level_flags & SV_BODY) != 0, coarse = (e->level_flags & 255) > 0;
+    if (e->level_flags & SV_TEMPLATE) return;
+    int has_light = (e->level_flags & SV_HAS_LIGHT) != 0;
+    release_mesh(e);
+    if (e->level_flags & SV_BATCHED) track_batch((uint32_t)slot, 0);
     e->level_flags = 0;                      /* the cull pass skips it once the frames have their copy */
-    if (!body && !coarse) {   /* and its cell of the light volume empties, if it is still this chunk's */
+    if (has_light) {   /* and its cell of the light volume empties, if it is still this chunk's */
         int32_t chunk[3] = { e->origin[0] >> 5, e->origin[1] >> 5, e->origin[2] >> 5 };
         int cell[3];
         struct LightCell *c = cell_of(chunk, cell);
         if (c->valid && c->chunk[0] == chunk[0] && c->chunk[1] == chunk[1] && c->chunk[2] == chunk[2]) light_queue(chunk, 0, 0, NULL);
     }
     trans_track((uint32_t)slot, 0);
-    for (int r = 0; r < 4; r++) { sa_release(&g_quads, (Range){ e->first[r], e->count[r] }, g.frame_no); e->first[r] = 0; e->count[r] = 0; }
-    sa_release(&g_loose, (Range){ e->first[4], e->count[4] }, g.frame_no); e->first[4] = 0; e->count[4] = 0;
+    memset(e->first, 0, sizeof e->first);
+    memset(e->count, 0, sizeof e->count);
     touch((uint32_t)slot);
 }
 
@@ -3052,7 +3255,7 @@ void sv_chunk_free(int64_t slot) {
  * which-chunk-draws rule of Strata.Slots. Kept across uploads into the slot;
  * a free clears it. The cull pass and the translucent order skip a hidden slot. */
 void sv_chunk_show(int64_t slot, int64_t shown) {
-    if (!g.ok || slot < 0 || slot >= SV_MAX_SLOTS) return;
+    if (!g.ok || slot < 0 || slot >= g.slot_cap) return;
     ChunkEntry *e = &g.entries[slot];
     int32_t was = e->level_flags;
     if (shown) e->level_flags &= ~SV_HIDDEN; else e->level_flags |= SV_HIDDEN;
@@ -3105,7 +3308,10 @@ static void invert4(const float *m, float *out) {
 /* How the light pass shades: 0 is the renderer's shading from before ray
  * tracing, carried through the deferred passes. */
 void sv_set_lighting(int64_t mode) {
-    if ((int)mode != g.light_mode) g.hist_reset = SV_FRAMES;   /* what the pass remembered was gathered another way */
+    if ((int)mode != g.light_mode) {
+        g.hist_reset = SV_FRAMES;
+        g.lamp_version++;
+    }
     g.light_mode = (int)mode;
 }
 /* Light quality: sky rays traced per pixel each time it samples (0..8; 0
@@ -3243,6 +3449,80 @@ static void heal_fence(Frame *F) {
     if (vkCreateFence(g.dev, &fi, NULL, &F->fence) != VK_SUCCESS) { F->fence = VK_NULL_HANDLE; g.ok = 0; }
 }
 
+/* The OpenGL clip planes used by the chunk culler, tested against the mesh bounds. */
+static int batch_in_view(const ChunkEntry *entry, const MeshBatch *batch, float scale,
+                         const float planes[6][4]) {
+    const float lo[3] = { (entry->origin[0] - 1) * scale, (entry->origin[1] - 1) * scale, (entry->origin[2] - 1) * scale };
+    const float hi[3] = { (entry->origin[0] + batch->extent[0]) * scale,
+                          (entry->origin[1] + batch->extent[1]) * scale,
+                          (entry->origin[2] + batch->extent[2]) * scale };
+    for (int i = 0; i < 6; i++) {
+        const float *p = planes[i];
+        float d = p[0] * (p[0] < 0 ? lo[0] : hi[0]) + p[1] * (p[1] < 0 ? lo[1] : hi[1]) +
+                  p[2] * (p[2] < 0 ? lo[2] : hi[2]) + p[3];
+        if (d < -0.0001f) return 0;
+    }
+    return 1;
+}
+
+static void prepare_mesh_batches(Frame *F, uint32_t base) {
+    F->batch_instances = F->batch_quads = 0;
+    g.num_batch_keys = g.batch_visible_count = g.batch_draws = 0;
+    if (!g.num_batch_slots) return;
+    const float *vp = g.ubo_map;
+    float planes[6][4];
+    for (int axis = 0; axis < 3; axis++)
+        for (int col = 0; col < 4; col++) {
+            planes[axis * 2][col] = vp[col * 4 + 3] + vp[col * 4 + axis];
+            planes[axis * 2 + 1][col] = vp[col * 4 + 3] - vp[col * 4 + axis];
+        }
+    for (uint32_t i = 0; i < g.num_batch_slots; i++) {
+        uint32_t slot = g.batch_slots[i];
+        const ChunkEntry *entry = &g.entries[slot];
+        uint32_t prototype = entry->first[5];
+        MeshBatch *batch = &g.batches[prototype];
+        if ((entry->level_flags & SV_HIDDEN) || !batch_in_view(entry, batch, vp[31], planes)) continue;
+        if (!batch->count++) g.batch_keys[g.num_batch_keys++] = prototype;
+        g.batch_visible[g.batch_visible_count++] = slot;
+        F->batch_quads += entry->count[0];
+    }
+    F->batch_instances = g.batch_visible_count;
+    uint32_t next = base;
+    for (uint32_t i = 0; i < g.num_batch_keys; i++) {
+        MeshBatch *batch = &g.batches[g.batch_keys[i]];
+        batch->next = next;
+        next += batch->count;
+    }
+    for (uint32_t i = 0; i < g.batch_visible_count; i++) {
+        uint32_t slot = g.batch_visible[i];
+        MeshBatch *batch = &g.batches[g.entries[slot].first[5]];
+        g.dslot_map[batch->next++] = slot;
+    }
+}
+
+static int draw_mesh_batches(Frame *F) {
+    if (!g.num_batch_keys) return 0;
+    vkCmdBindPipeline(F->cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g.pipe_batch);
+    for (uint32_t i = 0; i < g.num_batch_keys; i++) {
+        uint32_t prototype = g.batch_keys[i];
+        MeshBatch *batch = &g.batches[prototype];
+        const ChunkEntry *mesh = &g.entries[prototype];
+        uint32_t left = batch->count, begin = batch->next - left;
+        uint32_t limit = INT32_MAX / mesh->count[0];
+        while (left) {
+            uint32_t instances = left < limit ? left : limit;
+            uint32_t pc[4] = { begin, 0, mesh->first[0], mesh->count[0] };
+            vkCmdPushConstants(F->cmd, g.layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof pc, pc);
+            vkCmdDraw(F->cmd, 4, instances * mesh->count[0], 0, 0);
+            g.batch_draws++;
+            begin += instances;
+            left -= instances;
+        }
+        batch->count = 0;
+    }
+    return (int)g.batch_draws;
+}
+
 /* Draw every used slot that survives the frustum test: opaque and cutout
  * first, then translucent with blending. Returns 1 when a frame was drawn,
  * 0 when it was skipped (minimised, swapchain being rebuilt, submit failed). */
@@ -3260,7 +3540,9 @@ int64_t sv_frame(void) {
     sa_collect(&g_loose, g.frame_no);
     sa_collect(&g_bbytes, g.frame_no);
     /* what this Frame's cull pass let through, two frames ago */
-    g.drawn_chunks = F->stats_map[6]; g.drawn_quads = F->stats_map[7];
+    g.drawn_chunks = (int64_t)F->stats_map[6] + F->batch_instances;
+    g.drawn_quads = (int64_t)F->stats_map[7] + F->batch_quads;
+    g.opaque_commands = F->stats_map[0];
     /* How many commands to submit for each compacted range: what this Frame's
      * cull pass counted two frames ago, plus a quarter and 256 for a view
      * that has turned since. If that pass overflowed its allowance, or has
@@ -3305,6 +3587,7 @@ int64_t sv_frame(void) {
     /* this Frame's fence has been waited on, so the GPU is done with its region */
     uint32_t trans_region = SV_REGION_TRANS + (uint32_t)(g.frame_no % SV_FRAMES);
     uint32_t ntrans = order_translucent(trans_region);
+    prepare_mesh_batches(F, (SV_REGION_BATCH + (uint32_t)(g.frame_no % SV_FRAMES)) * SV_CMD_STRIDE);
     vkResetCommandBuffer(F->cmd, 0);
     VkCommandBufferBeginInfo bi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
     vkBeginCommandBuffer(F->cmd, &bi);
@@ -3434,6 +3717,7 @@ int64_t sv_frame(void) {
         vkCmdPushConstants(F->cmd, g.layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, 8, pc);
         vkCmdDrawIndirect(F->cmd, g.cmds, (VkDeviceSize)base * 16, n, 16); draws++;
     }
+    draws += draw_mesh_batches(F);
     draws += fig_record(F);
     vkCmdEndRenderPass(F->cmd);
     if (g.have_ts) vkCmdWriteTimestamp(F->cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, g.qpool, q0 + 5);

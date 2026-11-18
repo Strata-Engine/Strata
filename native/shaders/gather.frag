@@ -75,7 +75,7 @@ void main() {
     bool full_sky = u.light.w < 0.0;   // STRATA_SKY_FULL: the schedule of before (stored pictures)
     bool sky_now = full_sky ? sample_now : fresh ? ((px.x & 1) + 2 * (px.y & 1)) == (frame & 3) : (((px.x >> 3) & 3) + 4 * ((px.y >> 3) & 3)) == (frame & 15);
     float sun_vis = old.a;
-    int rays = mode >= 4 ? int(abs(u.light.w)) : 0;
+    int rays = mode >= 4 && mode != 8 ? int(abs(u.light.w)) : 0;   // mode 8: no rays (light.frag, direct_lamps)
     vec3 sky = rays > 0 ? (kept > 0.0 || u.light.w < 0.0 ? old.rgb : sky_flat(n)) : sky_flat(n);
     float count = kept;
     if (sample_now || shade_moves) {

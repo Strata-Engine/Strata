@@ -14,6 +14,35 @@ vec3 class_tint(uint c) {
     return 0.25 + 0.75 * fract((p.xxy + p.yzz) * p.zyx);
 }
 
+// Mode 8 uses the same local lamp lists as traced lighting, with analytic
+// falloff and no visibility rays. The lists bound the work per pixel.
+vec3 direct_lamps(vec3 at, vec3 normal) {
+    ivec3 cell = wrap(ivec3(floor(at)) >> 5, u.vol.xyz);
+    uvec2 entry = lamp_cells.cells[cell.x + u.vol.x * (cell.y + u.vol.y * cell.z)];
+    vec3 light = vec3(0.0);
+    for (uint i = 0u; i < entry.y; ++i) {
+        ivec4 lamp = lamp_list.lamps[entry.x + i];
+        bool moving = (lamp.w & (1 << 24)) != 0;
+        bool beam = (lamp.w & (1 << 25)) != 0;
+        vec3 position = moving ? vec3(lamp.xyz) * 0.125 : vec3(lamp.xyz) + 0.5;
+        vec3 to_lamp = position - at;
+        float distance2 = dot(to_lamp, to_lamp);
+        float facing = dot(normal, to_lamp);
+        if (distance2 >= 256.0 || facing <= 0.0) continue;
+        float inverse_distance = inversesqrt(max(distance2, 0.25));
+        float cone = 1.0;
+        if (beam) {
+            vec2 heading = (vec2((lamp.w >> 8) & 255, (lamp.w >> 16) & 255) - 128.0) / 127.0;
+            vec3 aim = vec3(heading.x * 0.97, -0.24, heading.y * 0.97);
+            cone = smoothstep(0.70, 0.94, dot(aim, -to_lamp) * inverse_distance);
+        }
+        float power = moving ? (beam ? 140.0 : 48.0) : 140.0;
+        float falloff = (1.0 - smoothstep(64.0, 256.0, distance2)) * power / (distance2 + 16.0);
+        light += class_emission(uint(lamp.w & 255)) * facing * inverse_distance * falloff * cone;
+    }
+    return light;
+}
+
 void main() {
     float depth = texture(gb_depth, v_uv).r;
     int mode = int(u.light.x);
@@ -87,7 +116,7 @@ void main() {
                 acc += wb * texelFetch(hist_cur, hq, 0); wsum += wb;
                 if (wb > wbest) { wbest = wb; meta = m; }
             }
-    int rays = mode >= 4 ? int(abs(u.light.w)) : 0;
+    int rays = mode >= 4 && mode != 8 ? int(abs(u.light.w)) : 0;   // mode 8 lights by direct_lamps, without rays
     vec3 sky; float sun_vis;
     if (wsum > 0.0) { sky = acc.rgb / wsum; sun_vis = acc.a / wsum; }
     else { sky = sky_flat(n); sun_vis = sun_visible(at, n, sun_toward(rand2(ivec2(gl_FragCoord.xy), int(u.light.z), 0))); }
@@ -102,6 +131,7 @@ void main() {
     uint cls = figure ? 0u : uint(nm.b * 255.0 + 0.5);
     if (cls == 0u && !figure) cls = class_at(at - n * 0.01);
     vec3 col = albedo * (u.sun_color.rgb * ndl * sun_vis * dim * ripple + sky * dim);
+    if (mode == 8 && u.water2.z > 0.5) col += albedo * direct_lamps(at, n) * dim;
     if (mode >= 4) col += figure ? albedo * (float(fcode & 63) / 63.0) * GLOW : albedo * class_emission(cls) * GLOW;
     if (mode >= 3) {
         // the sun's highlight on anything not fully rough; a mirror ray for what is smooth

@@ -86,44 +86,56 @@ console.log('Removing the final voxel publishes an empty mesh');
 
 const streamed = new WebAssembly.Instance(module).exports;
 assert.equal(streamed.init(12345, 1), 0);
-assert.equal(streamed.chunk_capacity(), 9);
+assert.equal(streamed.chunk_capacity(), 27);
 
-const chunk = (x, z) => {
+const chunk = (x, z, y = 0) => {
   for (let i = 0; i < streamed.chunk_capacity(); i++) {
-    if (streamed.chunk_revision(i) && streamed.chunk_x(i) === x && streamed.chunk_z(i) === z) {
+    if (streamed.chunk_revision(i) && streamed.chunk_x(i) === x && streamed.chunk_y(i) === y && streamed.chunk_z(i) === z) {
       return Buffer.from(new Uint8Array(streamed.memory.buffer, streamed.chunk_ptr(i), streamed.chunk_bytes(i)));
     }
   }
 };
 
-for (let i = 0; i < 8; i++) assert.equal(streamed.stream_one(), 1);
+for (let i = 0; i < 26; i++) assert.equal(streamed.stream_one(), 1);
 function settle() {
-  for (let jobs = 0; jobs < 18; jobs++) if (!streamed.stream_one()) return;
+  for (let jobs = 0; jobs < 54; jobs++) if (!streamed.stream_one()) return;
   assert.fail('Neighbor work did not settle');
 }
 settle();
 assert.notDeepEqual(chunk(0, 0), reference.subarray(28));
 // At z=12 the seed has touching voxels at y=3 on both sides.
-function eastWestFace(mesh) {
+function seamFace(mesh, x, face) {
   for (let offset = 0; offset < mesh.length; offset += 8) {
     const word = mesh.readUInt32LE(offset);
     const y = (word >>> 5) & 31, z = (word >>> 10) & 31;
-    if ((word & 31) === 0 && ((word >>> 25) & 7) === 3 &&
+    if ((word & 31) === x && ((word >>> 25) & 7) === face &&
         y <= 3 && y + ((word >>> 20) & 31) >= 3 &&
         z <= 12 && z + ((word >>> 15) & 31) >= 12) return true;
   }
   return false;
 }
 const turn = Math.PI / (2 * 0.003);
-assert.equal(eastWestFace(chunk(1, 0)), false, 'Touching blocks hide the seam face');
+assert.equal(seamFace(chunk(1, 0), 0, 3), false, 'Touching blocks hide the seam face');
+assert.equal(seamFace(chunk(0, 0), 31, 2), false);
+for (let i = 0; i < 40; i++) streamed.step(62.5, 1 << 3, 0, 0, 0);
+settle();
+assert.equal(chunk(1, 0), undefined);
+assert.equal(seamFace(chunk(0, 0), 31, 2), true, 'Eviction exposes the resident face');
+for (let i = 0; i < 40; i++) streamed.step(62.5, 1 << 1, 0, 0, 0);
+settle();
+assert.equal(seamFace(chunk(0, 0), 31, 2), false, 'Reload hides the shared face again');
 streamed.step(0, 0, 0, turn, 0);
 for (let i = 0; i < 8; i++) streamed.step(62.5, 1 << 1, 0, 0, 0);
 streamed.step(0, 0, 0, -turn, 0);
 for (let i = 0; i < 30; i++) streamed.step(62.5, 1 << 1, 0, 0, 0);
 assert.equal(streamed.step(0, 0, remove, 0, 0), 1);
-assert.equal(streamed.stream_one(), 1, 'A border edit queues the adjacent resident chunk');
+// Crossing into the east chunk also creates missing terrain jobs.
+for (let i = 0; i < 2; i++) streamed.step(62.5, 1 << 1, 0, 0, 0);
+assert.equal(streamed.stream_one(), 1);
+assert.equal(seamFace(chunk(1, 0), 0, 3), true, 'Edit refresh runs before missing terrain jobs');
+assert.equal(streamed.step(0, 0, remove, 0, 0), 1, 'Edit the eastern side too');
+for (let i = 0; i < 2; i++) streamed.step(62.5, 1 << 3, 0, 0, 0);
 settle();
-assert.equal(eastWestFace(chunk(1, 0)), true, 'Removal exposes the neighboring face');
 for (let i = 0; i < 30; i++) streamed.step(62.5, 1 << 3, 0, 0, 0);
 streamed.step(0, 0, 0, turn, 0);
 for (let i = 0; i < 8; i++) streamed.step(62.5, 1 << 3, 0, 0, 0);
@@ -178,3 +190,56 @@ for (let trip = 0; trip < 3; trip++) {
 timings.sort((a, b) => a - b);
 console.log(`Streaming: 4 round trips, ${replacements} mesh jobs, ${steadyPages} bytes WASM, ${steadyScratch} bytes scratch`);
 console.log(`Node chunk work: p95 ${timings[Math.ceil(timings.length * 0.95) - 1].toFixed(2)} ms, max ${timings.at(-1).toFixed(2)} ms`);
+
+const restored = new WebAssembly.Instance(module).exports;
+assert.equal(restored.restore_edit(0, 0, -(18 * 32768), 0), 0);
+const journal = new Int32Array(streamed.memory.buffer, streamed.edit_words(), streamed.edit_count() * 4);
+for (let i = 0; i < journal.length; i += 4)
+  assert.equal(restored.restore_edit(...journal.subarray(i, i + 4)), 1);
+assert.equal(restored.init(12345, 1), 0);
+for (let jobs = 0; jobs < 54 && restored.stream_one(); jobs++) {}
+for (const x of [0, 1]) {
+  const slots = Array.from({ length: restored.chunk_capacity() }, (_, i) => i);
+  const slot = slots.find(i => restored.chunk_x(i) === x && restored.chunk_y(i) === 0 && restored.chunk_z(i) === 0);
+  assert.deepEqual(Buffer.from(new Uint8Array(restored.memory.buffer, restored.chunk_ptr(slot),
+    restored.chunk_bytes(slot))), chunk(x, 0));
+}
+console.log('Restored journal reproduces meshes on both sides of the seam');
+
+const vertical = new WebAssembly.Instance(module).exports;
+const column = 16 + 32 * 16;
+assert.equal(vertical.restore_edit(0, 0, column + 31 * 1024, 1), 1);
+assert.equal(vertical.restore_edit(0, 0, column + 32768, 1), 1);
+assert.equal(vertical.init(12345, 1), 0);
+function settleVertical() {
+  for (let jobs = 0; jobs < 54; jobs++) if (!vertical.stream_one()) return;
+  assert.fail('Vertical streaming did not settle');
+}
+function lowerTopFace() {
+  const data = new DataView(vertical.memory.buffer, vertical.mesh_ptr(), vertical.mesh_bytes());
+  for (let offset = 0; offset < data.byteLength; offset += 8) {
+    const word = data.getUint32(offset, true);
+    if ((word & 32767) === (16 | (31 << 5) | (16 << 10)) && ((word >>> 25) & 7) === 0) return true;
+  }
+  return false;
+}
+assert.equal(lowerTopFace(), true);
+settleVertical();
+assert.equal(lowerTopFace(), false, 'Upper voxel hides the lower top face');
+for (let i = 0; i < 40; i++) vertical.step(100, 1 << 4, 0, 0, 0);
+settleVertical();
+assert.equal(vertical.step(0, 0, remove, 0, 0), 1);
+assert.equal(vertical.stream_one(), 1);
+assert.equal(lowerTopFace(), true, 'Removing the upper voxel exposes the lower face');
+const verticalMemory = vertical.memory.buffer.byteLength;
+for (let trip = 0; trip < 3; trip++) {
+  for (const held of [1 << 4, 1 << 5]) {
+    for (let i = 0; i < 120; i++) {
+      vertical.step(100, held, 0, 0, 0);
+      vertical.stream_one();
+    }
+    settleVertical();
+  }
+  assert.equal(vertical.memory.buffer.byteLength, verticalMemory);
+}
+console.log('Vertical seam edit and repeated ascent/descent passed');

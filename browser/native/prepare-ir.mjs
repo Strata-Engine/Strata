@@ -2,12 +2,12 @@
 import assert from 'node:assert/strict';
 import { readFileSync, writeFileSync } from 'node:fs';
 
-const [input, declarations, output] = process.argv.slice(2);
+const [input, declarations, output, ...externs] = process.argv.slice(2);
 let ir = readFileSync(input, 'utf8');
 assert.match(ir, /^target triple = "wasm32-unknown-unknown"$/m);
 
 // Replace the pointer-only declarations with the types used at the calls.
-for (const name of ['sn_sample2', 'strata_browser_publish']) {
+for (const name of externs.length ? externs : ['sn_sample2', 'strata_browser_publish']) {
   const declaration = new RegExp(`^declare [^\\n@]+@${name}\\([^\\n]*\\)\\n`, 'm');
   assert.match(ir, declaration);
   ir = ir.replace(declaration, '');

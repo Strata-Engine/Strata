@@ -23,6 +23,57 @@ void main() {
     uint face = v_face & 7u;
     bool far = v_face >= 8u;    // a chunk above level 0: lit by the sun and sky, mirroring the sky, without rays
     uint tex = v_w1 & 65535u;
+    // Data overlays use the translucent pass but bypass water lighting and history.
+    uint overlay = v_w1 >> 24;
+    if (overlay == 250u) {
+        float zoom = 1.0 / max(length(vec3(u.vp[0][0], u.vp[1][0], u.vp[2][0])), 0.0001);
+        float fade = mix(0.07, 0.96, smoothstep(28.0, 100.0, zoom));
+        vec3 n = qrot(v_rot, NORMALS[min(face, 5u)]);
+        float daylight = clamp(0.32 + 0.58 * u.sun.y + 0.18 * max(n.y, 0.0), 0.20, 0.98);
+        vec3 colour = mix(vec3(0.42, 0.50, 0.63), vec3(0.98, 0.97, 0.94), daylight);
+        o_color = vec4(colour, fade);
+        return;
+    }
+    if (overlay >= 251u && overlay <= 253u && face == 0u) {
+        // Four six-bit samples of a scalar field on an eight-voxel patch.
+        vec2 uv = clamp(v_uv / 8.0, 0.0, 1.0);
+        vec4 corners = vec4(uvec4(v_w1, v_w1 >> 6, v_w1 >> 12, v_w1 >> 18) & 63u) / 63.0;
+        float concentration = mix(mix(corners.x, corners.y, uv.x),
+                                  mix(corners.z, corners.w, uv.x), uv.y);
+        vec3 low = vec3(1.0, 0.70, 0.29);
+        vec3 high = vec3(0.92, 0.28, 0.13);
+        if (overlay == 252u) {
+            low = vec3(0.31, 0.81, 0.95);
+            high = vec3(0.11, 0.37, 0.76);
+        } else if (overlay == 251u) {
+            low = vec3(0.72, 0.56, 0.86);
+            high = vec3(0.46, 0.22, 0.65);
+        }
+        float alpha = 0.72 * (1.0 - exp(-3.0 * concentration));
+        o_color = vec4(mix(low, high, smoothstep(0.18, 0.90, concentration)), alpha);
+        return;
+    }
+    if ((tex & 0xf000u) == 0xf000u && face == 0u) {
+        uint strip = v_w1 >> 24;
+        bool along_x = (strip & 1u) == 0u;
+        float length = float(max(1u, strip >> 1));
+        float along = along_x ? v_uv.x : v_uv.y;
+        float across = along_x ? v_uv.y : v_uv.x;
+        float start = float((tex >> 6) & 63u) / 63.0;
+        float finish = float(tex & 63u) / 63.0;
+        float heat = mix(start, finish, clamp(along / length, 0.0, 1.0));
+        vec3 green = vec3(0.25, 0.76, 0.49);
+        vec3 amber = vec3(0.96, 0.68, 0.23);
+        vec3 red = vec3(0.94, 0.31, 0.25);
+        vec3 colour = mix(mix(green, amber, clamp(heat * 2.0, 0.0, 1.0)),
+                          red, clamp(heat * 2.0 - 1.0, 0.0, 1.0));
+        float edge = smoothstep(0.5, 2.5, min(across, 10.0 - across));
+        uint ends = (v_w1 >> 16) & 3u;
+        if ((ends & 1u) != 0u) edge *= smoothstep(0.0, 3.0, along);
+        if ((ends & 2u) != 0u) edge *= smoothstep(0.0, 3.0, length - along);
+        o_color = vec4(colour, mix(0.40, 0.72, heat) * edge);
+        return;
+    }
     if (tex >= uint(u.misc.z)) tex = 0u;
     vec4 base = texture(tiles, vec3(v_tex, float(tex)));
     uint ao = (v_w1 >> 16) & 255u;

@@ -87,21 +87,30 @@ try {
   for (const type of ['mousePressed', 'mouseReleased'])
     await call('Input.dispatchMouseEvent', { type, x, y, button: 'left', clickCount: 1 });
   await until('document.pointerLockElement === document.querySelector("canvas")');
-  await until('flight.core.mesh_revision() >= 9');
-  await delay(250); // Let queued seam refreshes finish before measuring the flight.
-  const memory = await evaluate('flight.core.memory.buffer.byteLength');
+  await until('flight.core.mesh_revision() >= flight.core.chunk_capacity()');
+  await delay(550); // Let queued seam refreshes finish before measuring the flight.
 
   async function fly(key, milliseconds) {
-    const code = 'Key' + key.toUpperCase();
+    const code = key === ' ' ? 'Space' : key === 'Shift' ? 'ShiftLeft' : 'Key' + key.toUpperCase();
     await call('Input.dispatchKeyEvent', { type: 'keyDown', code, key });
     await delay(milliseconds);
     await call('Input.dispatchKeyEvent', { type: 'keyUp', code, key });
   }
 
+  async function route() {
+    await fly('a', 4000);
+    await fly('d', 8000);
+    await fly('a', 4000);
+    await fly(' ', 4100);
+    await until('Array.from({length: flight.core.chunk_capacity()}, (_, i) => flight.core.chunk_y(i)).includes(2)');
+    await fly('Shift', 4100);
+  }
+
+  // The first climb can reach meshes larger than any in the initial cache.
+  await route();
+  const memory = await evaluate('flight.core.memory.buffer.byteLength');
   await evaluate('flight.active = true');
-  await fly('a', 4000);
-  await fly('d', 8000);
-  await fly('a', 4000);
+  await route();
   const result = await evaluate(`(() => {
     flight.active = false;
     const summarize = values => {
