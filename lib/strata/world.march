@@ -7,8 +7,9 @@
 --   * the cache: chunks that were unloaded while they differed from their
 --     generation. A chunk nobody edited is dropped, because it generates
 --     again identically; an edited one waits here and is restored when the
---     world returns to it. (Nothing is written to disk yet, so the cache
---     only grows.)
+--     world returns to it. Once a store (Strata.Save) has written a cached
+--     chunk to disk it is released (`release_written`), and only its coarse
+--     copy, a seventh of its size, stays for the far field.
 --   * pending edits: edits made to a chunk that was not loaded. They are
 --     queued on its key, in order, and applied when it arrives.
 --   * for each loaded chunk, the hash it generated to, so a chunk edited
@@ -23,6 +24,10 @@
 -- edit to a level-0 chunk marks its ancestors, up to the generator's level,
 -- stale (`stale`), and Strata.Stream builds them again. A coarse chunk is
 -- never cached: it is made again from its generator and the edits.
+--
+-- For a store, the world keeps a change log (`log_changes`, off unless a
+-- store is open; `take_changes`) and gives up a region's values as they
+-- are (`region_values`).
 --
 -- Loading policy lives in Strata.Stream; editing in Strata.Edit.
 mod Strata.World do
@@ -51,27 +56,29 @@ mod Strata.World do
 
   -- registry, generator, seed, scale, loaded chunks, generation hashes,
   -- chunks touched since they loaded, cache, pending edits (newest first),
-  -- coarse keys made stale by edits
-  type World = World(Strata.Blocks.Registry, Strata.Terrain.Gen, Int, Float, Strata.Store.Store(Strata.Chunk.Chunk), Strata.Store.Store(Int), Strata.Store.Store(Bool), Strata.Store.Store(Strata.Chunk.Chunk), Strata.Store.Store(List(Op)), Strata.Store.Store(Bool))
+  -- coarse keys made stale by edits, the change log (None while off: see
+  -- `log_changes`), the coarse copies of chunks released once written
+  -- (`release_written`)
+  type World = World(Strata.Blocks.Registry, Strata.Terrain.Gen, Int, Float, Strata.Store.Store(Strata.Chunk.Chunk), Strata.Store.Store(Int), Strata.Store.Store(Bool), Strata.Store.Store(Strata.Chunk.Chunk), Strata.Store.Store(List(Op)), Strata.Store.Store(Bool), Option(Strata.Store.Store(Bool)), Strata.Store.Store(HeldCoarse))
 
   doc "An empty world: no chunk loaded. [scale] is metres per voxel."
   fn new(r : Strata.Blocks.Registry, g : Strata.Terrain.Gen, seed : Int, scale : Float) : World do
-    World(r, g, seed, scale, Sr.empty(Ck.uniform(0)), Sr.empty(-1), Sr.empty(false), Sr.empty(Ck.uniform(0)), Sr.empty(Nil), Sr.empty(false))
+    World(r, g, seed, scale, Sr.empty(Ck.uniform(0)), Sr.empty(-1), Sr.empty(false), Sr.empty(Ck.uniform(0)), Sr.empty(Nil), Sr.empty(false), None, Sr.empty(HcOne(0)))
   end
 
-  fn registry(w : World) : Strata.Blocks.Registry do match w do World(r, _, _, _, _, _, _, _, _, _) -> r end end
-  fn terrain(w : World) : Strata.Terrain.Gen do match w do World(_, g, _, _, _, _, _, _, _, _) -> g end end
-  fn seed(w : World) : Int do match w do World(_, _, s, _, _, _, _, _, _, _) -> s end end
+  fn registry(w : World) : Strata.Blocks.Registry do match w do World(r, _, _, _, _, _, _, _, _, _, _, _) -> r end end
+  fn terrain(w : World) : Strata.Terrain.Gen do match w do World(_, g, _, _, _, _, _, _, _, _, _, _) -> g end end
+  fn seed(w : World) : Int do match w do World(_, _, s, _, _, _, _, _, _, _, _, _) -> s end end
   doc "Metres per voxel."
-  fn scale(w : World) : Float do match w do World(_, _, _, sc, _, _, _, _, _, _) -> sc end end
+  fn scale(w : World) : Float do match w do World(_, _, _, sc, _, _, _, _, _, _, _, _) -> sc end end
   doc "The loaded chunks. An absent key reads as an air chunk."
-  fn chunks(w : World) : Strata.Store.Store(Strata.Chunk.Chunk) do match w do World(_, _, _, _, cs, _, _, _, _, _) -> cs end end
+  fn chunks(w : World) : Strata.Store.Store(Strata.Chunk.Chunk) do match w do World(_, _, _, _, cs, _, _, _, _, _, _, _) -> cs end end
   fn is_loaded(w : World, k : Strata.Coord.Key) : Bool do Sr.has(chunks(w), k) end
   fn loaded_count(w : World) : Int do Sr.size(chunks(w)) end
   doc "How many edited chunks wait in the cache."
-  fn cache_size(w : World) : Int do match w do World(_, _, _, _, _, _, _, ca, _, _) -> Sr.size(ca) end end
+  fn cache_size(w : World) : Int do match w do World(_, _, _, _, _, _, _, ca, _, _, _, _) -> Sr.size(ca) end end
   doc "How many chunks have edits queued for their arrival."
-  fn pending_size(w : World) : Int do match w do World(_, _, _, _, _, _, _, _, pe, _) -> Sr.size(pe) end end
+  fn pending_size(w : World) : Int do match w do World(_, _, _, _, _, _, _, _, pe, _, _, _) -> Sr.size(pe) end end
 
   doc "The block at world voxel (x, y, z); air when its chunk is not loaded."
   fn get_block(w : World, x : Int, y : Int, z : Int) : Int do
@@ -152,11 +159,11 @@ mod Strata.World do
   end
 
   doc "The coarse keys whose chunks edits have made stale since `clear_stale`: every ancestor, up to the generator's level, of a level-0 chunk an edit changed (loaded or not). Strata.Stream builds the loaded ones again."
-  fn stale(w : World) : List(Strata.Coord.Key) do match w do World(_, _, _, _, _, _, _, _, _, st) -> Sr.keys(st) end end
+  fn stale(w : World) : List(Strata.Coord.Key) do match w do World(_, _, _, _, _, _, _, _, _, st, _, _) -> Sr.keys(st) end end
 
   doc "The world with no key stale."
   fn clear_stale(w : World) : World do
-    match w do World(r, g, sd, sc, cs, gh, tc, ca, pe, _) -> World(r, g, sd, sc, cs, gh, tc, ca, pe, Sr.empty(false)) end
+    match w do World(r, g, sd, sc, cs, gh, tc, ca, pe, _, lg, sm) -> World(r, g, sd, sc, cs, gh, tc, ca, pe, Sr.empty(false), lg, sm) end
   end
 
   -- is level-0 key f under the level-l key k (n = 2^l level-0 chunks a side)?
@@ -171,18 +178,29 @@ mod Strata.World do
   -- its content, and the hash it generated to (-1 for a cached chunk, which
   -- is edited by definition). Whether a loaded one still differs from its
   -- generation is decided where it is coarsened, not where it is captured.
-  type Fine = Fine(Strata.Coord.Key, Strata.Chunk.Chunk, Int)
+  -- A chunk released once written (`release_written`) is captured as its
+  -- coarse copy (FineHeld), edited by definition, which coarsens to the
+  -- same voxels the chunk did.
+  type Fine = Fine(Strata.Coord.Key, Strata.Chunk.Chunk, Int) | FineHeld(Strata.Coord.Key, HeldCoarse)
 
-  doc "The level-0 chunks under key [k] that may be edited: every loaded chunk touched since it loaded, and every cached chunk. A walk of the touched and cached keys, no voxel read or hash: cheap enough for the caller's thread. `coarsen_over` decides which differ."
+  pfn fine_key(p : Fine) : Strata.Coord.Key do
+    match p do
+      Fine(f, _, _) -> f
+      FineHeld(f, _) -> f
+    end
+  end
+
+  doc "The level-0 chunks under key [k] that may be edited: every loaded chunk touched since it loaded, every cached chunk, and the coarse copy of every chunk released once written (`release_written`). A walk of the touched and cached keys, no voxel read or hash: cheap enough for the caller's thread. `coarsen_over` decides which differ."
   fn edits_under(w : World, k : Strata.Coord.Key) : List(Fine) do
     let l = Kd.level(k)
     if l <= 0 || l > 5 do Nil
     else
       let n = pow2(l)
       match w do
-        World(_, _, _, _, cs, gh, tc, ca, _, _) ->
+        World(_, _, _, _, cs, gh, tc, ca, _, _, _, sm) ->
           let loaded = Sr.fold(tc, Nil, fn (acc, f, _t) -> if under(k, n, f) do Cons(Fine(f, Sr.get(cs, f), Sr.get(gh, f)), acc) else acc end)
-          Sr.fold(ca, loaded, fn (acc, f, c) -> if under(k, n, f) do Cons(Fine(f, c, -1), acc) else acc end)
+          let cached = Sr.fold(ca, loaded, fn (acc, f, c) -> if under(k, n, f) do Cons(Fine(f, c, -1), acc) else acc end)
+          Sr.fold(sm, cached, fn (acc, f, h) -> if under(k, n, f) do Cons(FineHeld(f, h), acc) else acc end)
       end
     end
   end
@@ -279,12 +297,114 @@ mod Strata.World do
     match fs do
       Nil -> a
       Cons(Fine(f, c, _), t) -> lay_all(tab, k, lay(tab, a, k, f, c), t)
+      Cons(FineHeld(f, h), t) -> lay_all(tab, k, lay_held(a, k, f, h), t)
     end
+  end
+
+  -- ── Coarse copies of released chunks ─────────────────────────────────────
+  -- A level-0 chunk released once written keeps, in its place, what it
+  -- coarsens to at every far-field level: level 1 (16^3 voxels, one for each
+  -- 2^3 cube) and, so the coarser levels are not made from the coarse copy
+  -- and come out the same as they did from the chunk, levels 2 to 5 (8^3,
+  -- 4^3, 2^3 and 1 voxel): 4681 voxels, a seventh of a chunk's 32768. Level
+  -- L's voxels follow level 1's in `lay_go`'s order, each the `cube_id` the
+  -- far field gives its 2^L cube. Kept as one id, as a palette of up to 256
+  -- ids with a byte a voxel, or (more ids) as the ids themselves.
+  type HeldCoarse = HcOne(Int) | HcPal(NativeU8Arr, NativeIntArr) | HcAll(NativeI32Arr)
+
+  pfn held_len() : Int do 4681 end
+  -- where level l's voxels start in a coarse copy
+  pfn held_at(l : Int) : Int do
+    if l <= 1 do 0
+    else
+      let n = 32 / pow2(l - 1)
+      held_at(l - 1) + n * n * n
+    end
+  end
+
+  pfn held_level(tab : NativeIntArr, c : Strata.Chunk.Chunk, a : NativeI32Arr, off : Int, s : Int, n : Int, t : Int) : NativeI32Arr do
+    if t >= n * n * n do a
+    else
+      let i = t % n
+      let m = (t / n) % n
+      let j = t / (n * n)
+      held_level(tab, c, NativeArray.set_i32(a, off + t, cube_id(tab, c, i * s, j * s, m * s, s)), off, s, n, t + 1)
+    end
+  end
+  pfn held_levels(tab : NativeIntArr, c : Strata.Chunk.Chunk, a : NativeI32Arr, l : Int) : NativeI32Arr do
+    if l > 5 do a else held_levels(tab, c, held_level(tab, c, a, held_at(l), pow2(l), 32 / pow2(l), 0), l + 1) end
+  end
+
+  pfn held_same(a : NativeI32Arr, i : Int, n : Int, v : Int) : Bool do
+    if i >= n do true else if NativeArray.get_i32(a, i) != v do false else held_same(a, i + 1, n, v) end end
+  end
+  pfn held_top(a : NativeI32Arr, i : Int, n : Int, m : Int) : Int do
+    if i >= n do m else held_top(a, i + 1, n, hi(m, NativeArray.get_i32(a, i))) end
+  end
+  -- a palette of the ids of a (each 0..top): the indices, the palette and its size; None past 256 ids
+  pfn held_pal(a : NativeI32Arr, slot : NativeIntArr, ix : NativeU8Arr, pal : NativeIntArr, count : Int, i : Int, n : Int) : Option((NativeU8Arr, NativeIntArr, Int)) do
+    if i >= n do Some((ix, pal, count))
+    else
+      let id = hi(NativeArray.get_i32(a, i), 0)
+      let sl = NativeArray.get_int(slot, id)
+      if sl > 0 do held_pal(a, slot, NativeArray.set_u8(ix, i, sl - 1), pal, count, i + 1, n)
+      else if count >= 256 do None
+      else held_pal(a, NativeArray.set_int(slot, id, count + 1), NativeArray.set_u8(ix, i, count), NativeArray.set_int(pal, count, id), count + 1, i + 1, n) end end
+    end
+  end
+  pfn held_trim(src : NativeIntArr, dst : NativeIntArr, i : Int, n : Int) : NativeIntArr do
+    if i >= n do dst else held_trim(src, NativeArray.set_int(dst, i, NativeArray.get_int(src, i)), i + 1, n) end
+  end
+
+  -- the coarse copy of chunk c (registry table tab)
+  pfn held_of(tab : NativeIntArr, c : Strata.Chunk.Chunk) : HeldCoarse do
+    let n = held_len()
+    let a = held_levels(tab, c, NativeArray.make_i32(Strata.Size.of(n), 0), 1)
+    let first = NativeArray.get_i32(a, 0)
+    if held_same(a, 1, n, first) do HcOne(first)
+    else
+      let top = held_top(a, 0, n, 0)
+      match held_pal(a, NativeArray.make_int(Strata.Size.of(top + 1), 0), NativeArray.make_u8(Strata.Size.of(n), 0), NativeArray.make_int(256, 0), 0, 0, n) do
+        Some((ix, pal, count)) -> HcPal(ix, held_trim(pal, NativeArray.make_int(Strata.Size.of(count), 0), 0, count))
+        None -> HcAll(a)
+      end
+    end
+  end
+
+  pfn held_get(h : HeldCoarse, i : Int) : Int do
+    match h do
+      HcOne(id) -> id
+      HcPal(ix, pal) -> NativeArray.get_int(pal, NativeArray.get_u8(ix, i))
+      HcAll(a) -> NativeArray.get_i32(a, i)
+    end
+  end
+
+  -- lay coarse copy h of level-0 chunk f into a, the flat voxels of level-l key k, as `lay` lays the chunk
+  pfn lay_held_go(a : NativeI32Arr, h : HeldCoarse, off : Int, n : Int, ox : Int, oy : Int, oz : Int, t : Int) : NativeI32Arr do
+    if t >= n * n * n do a
+    else
+      let i = t % n
+      let m = (t / n) % n
+      let j = t / (n * n)
+      lay_held_go(NativeArray.set_i32(a, (ox + i) + 32 * ((oz + m) + 32 * (oy + j)), held_get(h, off + t)), h, off, n, ox, oy, oz, t + 1)
+    end
+  end
+  pfn lay_held(a : NativeI32Arr, k : Strata.Coord.Key, f : Strata.Coord.Key, h : HeldCoarse) : NativeI32Arr do
+    let l = Kd.level(k)
+    let s = pow2(l)
+    let n = 32 / s
+    lay_held_go(a, h, held_at(l), n, (Kd.kx(f) - s * Kd.kx(k)) * n, (Kd.ky(f) - s * Kd.ky(k)) * n, (Kd.kz(f) - s * Kd.kz(k)) * n, 0)
   end
 
   -- the captured fine chunks that are edited: cached, or differing from their generation
   pfn edited(fs : List(Fine)) : List(Fine) do
-    List.fold_left(fs, Nil, fn (acc, p) -> match p do Fine(f, c, h) -> if h < 0 do Cons(p, acc) else if Ck.hash(c) != h do Cons(p, acc) else acc end end end)
+    List.fold_left(fs, Nil, fn (acc, p) -> if fine_edited(p) do Cons(p, acc) else acc end)
+  end
+  pfn fine_edited(p : Fine) : Bool do
+    match p do
+      Fine(_, c, h) -> if h < 0 do true else Ck.hash(c) != h end
+      FineHeld(_, _) -> true
+    end
   end
 
   doc "The coarse chunk of key [k] (level L, 1..5): [generated] with each edited chunk of [fines] (from `edits_under`; a loaded one is edited if it differs from its generation hash) coarsened over it. Each coarse voxel such a chunk covers takes its 2^L cube's: the most common solid opaque cube block if there is one; else the most common fluid (as its family's full voxel) or other cube block; else air (crosses and models count as air). A tie goes to the lower id. Pure, for a worker task (registry [r])."
@@ -293,7 +413,7 @@ mod Strata.World do
     if l <= 0 || l > 5 do generated
     else
       let n = pow2(l)
-      let mine = List.fold_left(fines, Nil, fn (acc, p) -> match p do Fine(f, _, _) -> if under(k, n, f) do Cons(p, acc) else acc end end)
+      let mine = List.fold_left(fines, Nil, fn (acc, p) -> if under(k, n, fine_key(p)) do Cons(p, acc) else acc end)
       match edited(mine) do
         Nil -> generated
         fs -> Ck.from_flat(lay_all(table(r), k, Ck.to_flat(generated), fs))
@@ -305,21 +425,21 @@ mod Strata.World do
   fn coarsen(w : World, k : Strata.Coord.Key) : Strata.Chunk.Chunk do coarsen_over(registry(w), k, Strata.Terrain.run(terrain(w), k, seed(w)), edits_under(w, k)) end
 
   doc "The hash the loaded chunk at [k] generated to, as `insert_hashed` was given it (for a coarse chunk, the hash of what was put); -1 when it is not loaded."
-  fn gen_hash(w : World, k : Strata.Coord.Key) : Int do match w do World(_, _, _, _, _, gh, _, _, _, _) -> Sr.get(gh, k) end end
+  fn gen_hash(w : World, k : Strata.Coord.Key) : Int do match w do World(_, _, _, _, _, gh, _, _, _, _, _, _) -> Sr.get(gh, k) end end
 
   -- ── Loading and unloading ────────────────────────────────────────────────
-  doc "Load the chunk at [k], given what the generator produced for it. A cached edited chunk takes the generated one's place, and edits queued for the key are applied (its ancestors are then stale). A coarser chunk is put as it is given, with no coarsening here: give it `coarsen`'s or `coarsen_over`'s chunk to show the edits under it."
+  doc "Load the chunk at [k], given what the generator produced for it. A cached edited chunk takes the generated one's place, and edits queued for the key are applied (its ancestors are then stale); a coarse copy kept for the key (`release_written`) is dropped. A coarser chunk is put as it is given, with no coarsening here: give it `coarsen`'s or `coarsen_over`'s chunk to show the edits under it."
   fn insert(w : World, k : Strata.Coord.Key, generated : Strata.Chunk.Chunk) : World do insert_hashed(w, k, generated, Ck.hash(generated)) end
 
   doc "As `insert`, for a caller that has already hashed the generated chunk (`Strata.Chunk.hash`): the stream's workers do, so the hash is not paid for on the caller's thread."
   fn insert_hashed(w : World, k : Strata.Coord.Key, generated : Strata.Chunk.Chunk, hash : Int) : World do
     if Kd.level(k) > 0 do
       match w do
-        World(r, g, sd, sc, cs, gh, tc, ca, pe, st) -> World(r, g, sd, sc, Sr.put(cs, k, generated), Sr.put(gh, k, hash), Sr.remove(tc, k), ca, pe, st)
+        World(r, g, sd, sc, cs, gh, tc, ca, pe, st, lg, sm) -> World(r, g, sd, sc, Sr.put(cs, k, generated), Sr.put(gh, k, hash), Sr.remove(tc, k), ca, pe, st, lg, sm)
       end
     else
       match w do
-        World(r, g, sd, sc, cs, gh, tc, ca, pe, st) ->
+        World(r, g, sd, sc, cs, gh, tc, ca, pe, st, lg, sm) ->
           let cached = Sr.has(ca, k)
           let base = if cached do Sr.get(ca, k) else generated end
           let queued = Sr.get(pe, k)
@@ -328,7 +448,7 @@ mod Strata.World do
             _ -> true
           end
           let c = apply_queued(base, k, queued)
-          World(r, g, sd, sc, Sr.put(cs, k, c), Sr.put(gh, k, hash), if cached || had_queue do Sr.put(tc, k, true) else Sr.remove(tc, k) end, Sr.remove(ca, k), Sr.remove(pe, k), if had_queue do mark(st, g, k) else st end)
+          World(r, g, sd, sc, Sr.put(cs, k, c), Sr.put(gh, k, hash), if cached || had_queue do Sr.put(tc, k, true) else Sr.remove(tc, k) end, Sr.remove(ca, k), Sr.remove(pe, k), if had_queue do mark(st, g, k) else st end, lg, Sr.remove(sm, k))
       end
     end
   end
@@ -342,29 +462,28 @@ mod Strata.World do
   doc "Unload the chunk at [k]. One that differs from its generation moves to the cache; any other is dropped (a coarse chunk always is). Unloading a chunk that is not loaded changes nothing."
   fn unload(w : World, k : Strata.Coord.Key) : World do
     match w do
-      World(r, g, sd, sc, cs, gh, tc, ca, pe, st) ->
+      World(r, g, sd, sc, cs, gh, tc, ca, pe, st, lg, sm) ->
         if !Sr.has(cs, k) do w
-        else
-          let ca2 = if differs(cs, gh, tc, k) do Sr.put(ca, k, Ck.compact(Sr.get(cs, k))) else ca end
-          World(r, g, sd, sc, Sr.remove(cs, k), Sr.remove(gh, k), Sr.remove(tc, k), ca2, pe, st)
-        end
+        else if differs(cs, gh, tc, k) do
+          World(r, g, sd, sc, Sr.remove(cs, k), Sr.remove(gh, k), Sr.remove(tc, k), Sr.put(ca, k, Ck.compact(Sr.get(cs, k))), pe, st, note(lg, k), sm)
+        else World(r, g, sd, sc, Sr.remove(cs, k), Sr.remove(gh, k), Sr.remove(tc, k), ca, pe, st, lg, sm) end end
     end
   end
 
   doc "Has the chunk at [k] been edited: loaded and different from its generation, waiting in the cache, or with edits queued?"
   fn is_edited(w : World, k : Strata.Coord.Key) : Bool do
     match w do
-      World(_, _, _, _, cs, gh, tc, ca, pe, _) ->
+      World(_, _, _, _, cs, gh, tc, ca, pe, _, _, _) ->
         if Sr.has(cs, k) do differs(cs, gh, tc, k) else Sr.has(ca, k) || Sr.has(pe, k) end
     end
   end
 
-  doc "The world with every loaded chunk that does not differ from its generation dropped (every coarse chunk among them) and generator [g] in place of its own: edited chunks stay loaded, the cache and queued edits are kept, nothing is stale. Returns the world and the dropped keys; a stream loads them again from [g]."
+  doc "The world with every loaded chunk that does not differ from its generation dropped (every coarse chunk among them) and generator [g] in place of its own: edited chunks stay loaded, the cache, queued edits, coarse copies of released chunks and the change log are kept, nothing is stale. Returns the world and the dropped keys; a stream loads them again from [g]."
   fn regenerate(w : World, g : Strata.Terrain.Gen) : (World, List(Strata.Coord.Key)) do
     match w do
-      World(r, _, sd, sc, cs, gh, tc, ca, pe, _) ->
+      World(r, _, sd, sc, cs, gh, tc, ca, pe, _, lg, sm) ->
         let gone = Sr.fold(cs, Nil, fn (acc, k, _c) -> if differs(cs, gh, tc, k) do acc else Cons(k, acc) end)
-        let w2 = List.fold_left(gone, World(r, g, sd, sc, cs, gh, tc, ca, pe, Sr.empty(false)), fn (acc, k) -> unload(acc, k))
+        let w2 = List.fold_left(gone, World(r, g, sd, sc, cs, gh, tc, ca, pe, Sr.empty(false), lg, sm), fn (acc, k) -> unload(acc, k))
         (w2, gone)
     end
   end
@@ -373,16 +492,95 @@ mod Strata.World do
   doc "Replace the loaded chunk at [k] and mark it touched, and its ancestors stale. Nothing happens if [k] is not loaded."
   fn replace_chunk(w : World, k : Strata.Coord.Key, c : Strata.Chunk.Chunk) : World do
     match w do
-      World(r, g, sd, sc, cs, gh, tc, ca, pe, st) ->
+      World(r, g, sd, sc, cs, gh, tc, ca, pe, st, lg, sm) ->
         if !Sr.has(cs, k) do w
-        else World(r, g, sd, sc, Sr.put(cs, k, c), gh, Sr.put(tc, k, true), ca, pe, mark(st, g, k)) end
+        else World(r, g, sd, sc, Sr.put(cs, k, c), gh, Sr.put(tc, k, true), ca, pe, mark(st, g, k), note(lg, k), sm) end
     end
   end
 
   doc "Queue [op] for the chunk at [k], to be applied when it is inserted."
   fn enqueue(w : World, k : Strata.Coord.Key, op : Op) : World do
     match w do
-      World(r, g, sd, sc, cs, gh, tc, ca, pe, st) -> World(r, g, sd, sc, cs, gh, tc, ca, Sr.put(pe, k, Cons(op, Sr.get(pe, k))), st)
+      World(r, g, sd, sc, cs, gh, tc, ca, pe, st, lg, sm) -> World(r, g, sd, sc, cs, gh, tc, ca, Sr.put(pe, k, Cons(op, Sr.get(pe, k))), st, note(lg, k), sm)
     end
   end
+
+  -- ── What a store builds on ───────────────────────────────────────────────
+  -- the log with level-0 key k recorded; a log that is off stays off
+  pfn note(lg : Option(Strata.Store.Store(Bool)), k : Strata.Coord.Key) : Option(Strata.Store.Store(Bool)) do
+    match lg do
+      None -> lg
+      Some(s) -> if Kd.level(k) != 0 do lg else Some(Sr.put(s, k, true)) end
+    end
+  end
+
+  doc "The world with its change log turned on ([enabled]) or off. Off, as a new world starts, nothing is recorded and nothing is paid for. Turning it on when it is on keeps what it holds; turning it off drops it. Strata.Save turns it on at `open`."
+  fn log_changes(w : World, enabled : Bool) : World do
+    match w do
+      World(r, g, sd, sc, cs, gh, tc, ca, pe, st, lg, sm) ->
+        let lg2 = if !enabled do None
+          else
+            match lg do
+              None -> Some(Sr.empty(false))
+              Some(_) -> lg
+            end
+          end
+        World(r, g, sd, sc, cs, gh, tc, ca, pe, st, lg2, sm)
+    end
+  end
+
+  doc "The level-0 keys changed since the last take, each once, and the world with its log emptied: a loaded chunk edited (`replace_chunk`, so a chunk edited back to its generation is among them and a store can delete its saved copy), an edited chunk unloaded to the cache, an edit queued for a chunk not loaded. Nothing while the log is off."
+  fn take_changes(w : World) : (World, List(Strata.Coord.Key)) do
+    match w do
+      World(r, g, sd, sc, cs, gh, tc, ca, pe, st, lg, sm) ->
+        match lg do
+          None -> (w, Nil)
+          Some(log) -> (World(r, g, sd, sc, cs, gh, tc, ca, pe, st, Some(Sr.empty(false)), sm), Sr.keys(log))
+        end
+    end
+  end
+
+  doc "What a store saves for [keys] (each key once): every chunk among them that differs from its generation, loaded (compacted) or cached, and every queue of edits waiting for a chunk not loaded, oldest edit first (`enqueue` them in that order to queue them again). A key whose chunk is loaded and edited back to its generation gives nothing, nor does one held only as a coarse copy (`release_written`): that chunk is on disk. Both lists follow the order of [keys]. Pure: the world is not changed."
+  fn region_values(w : World, keys : List(Strata.Coord.Key)) : (List((Strata.Coord.Key, Strata.Chunk.Chunk)), List((Strata.Coord.Key, List(Op)))) do
+    match w do
+      World(_, _, _, _, cs, gh, tc, ca, pe, _, _, _) ->
+        let (_, chs, qs) = List.fold_left(keys, (Sr.empty(false), Nil, Nil), fn (acc, k) ->
+          let (seen, chs0, qs0) = acc
+          if Sr.has(seen, k) do acc
+          else
+            let chs1 = if Sr.has(cs, k) do (if differs(cs, gh, tc, k) do Cons((k, Ck.compact(Sr.get(cs, k))), chs0) else chs0 end)
+              else if Sr.has(ca, k) do Cons((k, Sr.get(ca, k)), chs0)
+              else chs0 end end
+            let qs1 = if Sr.has(pe, k) do Cons((k, List.reverse(Sr.get(pe, k))), qs0) else qs0 end
+            (Sr.put(seen, k, true), chs1, qs1)
+          end)
+        (List.reverse(chs), List.reverse(qs))
+    end
+  end
+
+  doc "The world after a store has written [written], (key, `Strata.Chunk.hash` of the chunk written) pairs: each key whose chunk is cached (not loaded) and still has that hash is dropped from the cache, and its coarse copy (what it coarsens to at levels 1 to 5, a seventh of its size) kept in its place, so the far field shows it as before (`edits_under`). A key edited since the write (another hash), loaded, or not cached is left as it is. Loading the key later generates it as any other (the store supplies the saved chunk) and drops the coarse copy."
+  fn release_written(w : World, written : List((Strata.Coord.Key, Int))) : World do
+    match written do
+      Nil -> w
+      _ ->
+        match w do
+          World(r, g, sd, sc, cs, gh, tc, ca, pe, st, lg, sm) ->
+            let tab = table(r)
+            let (ca2, sm2) = List.fold_left(written, (ca, sm), fn (acc, p) ->
+              let (cacc, sacc) = acc
+              let (k, h) = p
+              if Sr.has(cs, k) do acc
+              else if !Sr.has(cacc, k) do acc
+              else
+                let c = Sr.get(cacc, k)
+                if Ck.hash(c) != h do acc
+                else (Sr.remove(cacc, k), Sr.put(sacc, k, held_of(tab, c))) end
+              end end)
+            World(r, g, sd, sc, cs, gh, tc, ca2, pe, st, lg, sm2)
+        end
+    end
+  end
+
+  doc "How many coarse copies of released chunks the world keeps (`release_written`)."
+  fn held_coarsened(w : World) : Int do match w do World(_, _, _, _, _, _, _, _, _, _, _, sm) -> Sr.size(sm) end end
 end

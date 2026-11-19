@@ -495,3 +495,13 @@ and 29 instructions on March main against C's 0.85 ns and 20 (2.9 times; on
 0.5.0 each is a runtime call). Met in the cover placer's loop, which
 recovers a column's x and z from its index (Task 3). Small; the Strata code
 is left plain.
+
+## S48: `IO.Random` in a library module is charged to every test module
+
+Met writing `Strata.Save`'s lock (save Task 2): a module declaring `needs
+IO.Random` and calling `Crypto.random_hex` built alone, but the test build
+then stopped at an unrelated test module: "Module `AcousticsTest` uses
+`IO.Random` but does not declare `needs IO.Random`" (the S3 charge, for
+another capability). Workaround: the lock's token is the process id and the
+clock's microseconds (`IO.Process` and `IO.Clock`, which every test module
+declares already for S3), not random bytes.
