@@ -6,6 +6,13 @@
 //   +-y: (x, z)   +-x: (z, y)   +-z: (x, y)
 #ifdef STRATA_BATCHED_QUADS
 layout(std430, set = 0, binding = 26) readonly buffer PackedQuads { uint words[]; } packed_quads;
+// A moving slot's record (strata_vk.c, sv_chunk_motion): start and end time, start and end
+// progress, key count (plus 256: step a walker's legs), then keys packed dx 10, dz 10, dy 8
+// (signed voxels from the slot's origin) and the key's place in eighths of the motion.
+layout(std430, set = 0, binding = 37) readonly buffer Motion { uint words[]; } motion;
+ivec3 motion_key(uint word) {
+    return ivec3(bitfieldExtract(int(word), 0, 10), bitfieldExtract(int(word), 20, 8), bitfieldExtract(int(word), 10, 10));
+}
 #else
 layout(location = 0) in uint w0;
 layout(location = 1) in uint w1;
@@ -73,10 +80,34 @@ void main() {
     else                q = p + vec3(du, up, face == 4u ? 1.0 : 0.0);
     Chunk ch = table.chunks[slot];
     ivec4 ol = ch.origin_level;
+    vec3 moved = vec3(0.0);
+#ifdef STRATA_BATCHED_QUADS
+    if ((ol.w & 32768) != 0) {
+        uint base = slot * 16u;
+        float t0 = uintBitsToFloat(motion.words[base]), t1 = uintBitsToFloat(motion.words[base + 1u]);
+        float p0 = uintBitsToFloat(motion.words[base + 2u]), p1 = uintBitsToFloat(motion.words[base + 3u]);
+        uint head = motion.words[base + 4u], n = head & 255u;
+        float along = t1 > t0 ? clamp((u.trace.y - t0) / (t1 - t0), 0.0, 1.0) : 1.0;
+        float at = along * 8.0;
+        uint prev = motion.words[base + 5u];
+        vec3 pos = vec3(motion_key(prev));
+        for (uint k = 1u; k < n; k++) {
+            uint next = motion.words[base + 5u + k];
+            float a = float(prev >> 28), b = float(next >> 28);
+            if (at <= b) { pos = mix(vec3(motion_key(prev)), vec3(motion_key(next)), (at - a) / (b - a)); break; }
+            pos = vec3(motion_key(next));
+            prev = next;
+        }
+        moved = pos;
+        // a walker's legs: the left (x 0) and right (x 1) bottom two rows trade places in z every twelfth of its progress
+        if ((head & 256u) != 0u && p.y < 2.0 && (int(floor((p0 + (p1 - p0) * along) * 12.0)) & 1) == 1)
+            moved.z += p.x < 0.5 ? 1.0 : -1.0;
+    }
+#endif
     // a level-L chunk's voxels are 2^L world voxels on a side
     float lod = float(1 << (ol.w & 255));
     bool body = (ol.w & 512) != 0;
-    vec3 world = body ? ch.pos.xyz + qrot(ch.rot, q * (ch.pos.w > 0.0 ? ch.pos.w : u.eye.w)) : (vec3(ol.xyz) + q * lod) * u.eye.w;
+    vec3 world = body ? ch.pos.xyz + qrot(ch.rot, q * (ch.pos.w > 0.0 ? ch.pos.w : u.eye.w)) : (vec3(ol.xyz) + moved + q * lod) * u.eye.w;
     v_rot = body ? ch.rot : vec4(0.0, 0.0, 0.0, 1.0);
     // side faces have v running up the world; an image's rows run down
     v_tex = (face < 2u ? vec2(du, dv) : vec2(du, h - up)) * lod;
