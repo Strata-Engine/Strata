@@ -1177,6 +1177,11 @@ let (sh4, fallen) = Strata.Shapes.unrooted(sh3, Strata.Edit.world(o), o)
   16,384; a slot numbered above that is drawn but not traced.
 - A prototype is meshed on the main thread the first time one of its
   instances appears.
+- `Strata.Shapes.sync` takes the stream's change lists
+  (`Strata.Stream.take_changed`), which have one reader. A game that also
+  runs `Strata.Entities` must take them once and hand them to both
+  (`Strata.Shapes.changed`); the viewer does not yet, so its match and
+  its props are not run together.
 - The viewer places props only with `STRATA_PROPS=1` (the stored goldens
   show stamped trees), and rereading the settings (`R`) puts the forest
   back to stamps until the next run.
