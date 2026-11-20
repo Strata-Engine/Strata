@@ -27,7 +27,7 @@
  * themselves on the monotonic clock (an_x_timing). The kernel never reads a
  * clock, so no answer depends on it. */
 /* Rewritten by stamp_anim.sh whenever strata_anim.h changes (GAPS S14). */
-#define STRATA_ANIM_STAMP "346baf8a9b2c3499"
+#define STRATA_ANIM_STAMP "364eddaffe461be3"
 #include <stdint.h>
 #include <time.h>
 #include "strata_anim.h"
@@ -90,10 +90,28 @@ int64_t an_x_rig(int64_t n, void *parent, void *floats) {
     return an_rig(g_w, (int)n, an_x_i32(parent), pivot, rest, box);
 }
 
+/* rig replaced under the same id (an_rig_replace): parent n i32, floats 13 a part as an_x_rig; the rig or -1 */
+int64_t an_x_rig_replace(int64_t rig, int64_t n, void *parent, void *floats) {
+    if (!g_w) return -1;
+    if (n < 1 || n > AN_PARTS || an_x_len(parent) < n || an_x_len(floats) < 13 * n) return an_refuse(g_w, AN_R_PARTS);
+    const float *f = an_x_f32(floats);
+    float pivot[AN_PARTS * 3], rest[AN_PARTS * 4], box[AN_PARTS * 6];
+    for (int i = 0; i < n; i++) {
+        memcpy(pivot + 3 * i, f + 13 * i, 3 * sizeof(float));
+        memcpy(rest + 4 * i, f + 13 * i + 3, 4 * sizeof(float));
+        memcpy(box + 6 * i, f + 13 * i + 7, 6 * sizeof(float));
+    }
+    return an_rig_replace(g_w, (int)rig, (int)n, an_x_i32(parent), pivot, rest, box);
+}
+/* 1 freed, 0 refused (no such rig, or figures use it) */
+int64_t an_x_rig_free(int64_t rig) { return g_w ? an_rig_free(g_w, (int)rig) : 0; }
+/* figures of the rig */
+int64_t an_x_rig_users(int64_t rig) { return g_w ? an_rig_users(g_w, (int)rig) : 0; }
+
 /* a rig's masks, all at once: counts[i] roots each, the roots one after another.
  * Answers how many were made; a refused one stops the upload there. */
 int64_t an_x_masks(int64_t rig, int64_t n, void *counts, void *roots) {
-    if (!g_w || rig < 0 || rig >= g_w->nrigs) { if (g_w) an_refuse(g_w, AN_R_RIG); return 0; }
+    if (!g_w || !an_rig_ok(g_w, (int)rig)) { if (g_w) an_refuse(g_w, AN_R_RIG); return 0; }
     if (n <= 0) return 0;
     if (an_x_len(counts) < n) return an_refuse(g_w, AN_R_MASK) + 1;
     const int32_t *c = an_x_i32(counts), *r = an_x_i32(roots);
