@@ -64,3 +64,7 @@ Branch `claude/recursing-volhard-8b2976`, not merged into main.
   paths (south, east, bumpers, d-pad, stick) are covered by tests on raw
   input; GLFW's reading of them, the cursor freeing on F1 and how it feels
   are unverified.
+- Final gate (`scripts/verify.sh`, main merged: main is an ancestor of the
+  branch): every step passes up to `scripts/golden.sh`, which fails only on
+  `tilted-slab-lit`, `body-by-lake` and `combat-burning`, the three physics
+  goldens the brief says fail on main; `gui-settings` passes.
