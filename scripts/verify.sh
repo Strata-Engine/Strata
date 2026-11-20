@@ -40,6 +40,10 @@ if ! scripts/save_times.sh > .verify.log 2>&1; then echo "FAIL: scripts/save_tim
 if [ "${STRATA_NO_GPU:-0}" != "1" ]; then
   if ! scripts/save_check.sh > .verify.log 2>&1; then echo "FAIL: scripts/save_check.sh"; tail -20 .verify.log; exit 1; fi
 fi
+# props through a save: the viewer cuts a standing tree with STRATA_PROPS=1 and a store, quits, and a second run must find it cut (needs a GPU)
+if [ "${STRATA_NO_GPU:-0}" != "1" ]; then
+  if ! scripts/props_check.sh > .verify.log 2>&1; then echo "FAIL: scripts/props_check.sh"; tail -20 .verify.log; exit 1; fi
+fi
 # the match: hidden scripted runs of the viewer with STRATA_COMBAT=1 (needs a GPU)
 if [ "${STRATA_NO_GPU:-0}" != "1" ]; then
   if ! scripts/combat_check.sh > .verify.log 2>&1; then echo "FAIL: scripts/combat_check.sh"; tail -20 .verify.log; exit 1; fi

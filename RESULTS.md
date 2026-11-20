@@ -1413,3 +1413,56 @@ hence its factor of 7.7.
 Not measured: a world with many glass-heavy chunks (the viewer has one
 see-through block that collides), and flowing water in a chunk that also
 needs lists, which is re-meshed as it moves.
+
+## Props as shapes (population stage 4), against the design's budget
+
+Design: `docs/2026-11-19-shapes-design.md`, section 10. The viewer with
+`STRATA_PROPS=1`: the forest's twelve tree variants stand as shapes of
+0.25 m voxels on the 1 m island, drawn and traced by the body path from
+shared meshes. March main, release build, 1280 x 800 offscreen, light mode
+4, seed 7. Load average 8 to 10 (1 min) while these ran, after hours above
+200: at the edge of what is judged, so they are a first reading and not a
+verdict. Frame figures are one frame each, the last of a 300-frame run
+(`STRATA_SLOW=1`), not medians.
+
+| what | budget | measured |
+|---|---|---|
+| a standing prop, March a frame | none | none: 0.06 ms of March a frame stamped, 0.07 as props (sync 0.01) |
+| the default view (radius 10, four levels), scene 3 | holds the frame budget | 1,382 props standing in 9,369 renderer slots; GPU 6.5 ms a frame (geometry 3.3, light 1.5) against 2.7 (1.1, 0.6) stamped; the shim 0.83 ms against 0.46 |
+| 5,000 props in view | holds the frame budget | not reached: the island's near field holds 1,382, and 5,000 would need about 34,000 slots and rows against the 16,384 the rays' table holds |
+| listing a chunk's props (worker) | within the scatter layer's cost | over: 2.37 ms a surface chunk (441 chunks, 1,054 props, 1,046 ms on one thread), because the listing works out its chunk column's ground again |
+| a cut through a trunk (0.9 m sphere) | under 5 ms of March | 1.42 ms: 53 voxels taken, the tree split into a standing stump, 3 loose parts and 46 crumbs |
+| the cut drawn | within two frames | the frame after: the carved shape is meshed and uploaded in `Strata.Render.shapes` on the main thread |
+| start-up | none set | the twelve trees at 0.25 m built in about 40 ms more; their 48 prototypes (four turns each) in 47 ms |
+| streaming the near and far field from cold | none set | 7.9 s for 11,971 chunks as props, 8.2 s stamped: no slower |
+
+What the numbers say:
+
+- Standing costs nothing in March, as designed. The cost is in the GPU:
+  a tree at 0.25 m has many times the quads of its 1 m stamp, and each is
+  a row the rays step through. 6.5 ms leaves room at 60 frames a second
+  on this machine.
+- The slots are the limit that will be met first. An instance takes a
+  slot for each 32-cubed part of its prototype that draws, 4.4 on
+  average here (a tree 43 voxels wide is 2 x 2 x 2 parts). Drawing every
+  instance of a prototype part in one batch, as the shared-mesh batch
+  does for chunks, would take the slots back.
+- The listing is the one budget missed. It should come out of the column
+  stage, which already holds the ground it needs.
+
+Not measured: the frame while many chunks load (each new prototype is
+meshed on the main thread once, 48 in all); a blast of the ground under
+several trees; frame time over a run rather than at its end; anything at a
+load under 8.
+
+**Goldens.** `props-tree` (scene 130, one oak as a prop), `props-forest`
+(scene 3), `props-tree-cut` (the oak 20 frames after a scripted cut: the
+stump standing, the crown a falling body) and `props-tree-fallen` (the
+same run at 5 s). Each rendered twice differs by at most 0.05% of pixels.
+`props-tree-fallen` rests on physics' stepping, which another session is
+repairing; if it moves, look at the picture and store it again.
+
+**Through a save.** `scripts/props_check.sh`: the viewer cuts scene 130's
+tree with a store open and quits; a second run of the store, which cuts
+nothing, stands the same number of shapes with one prop remembered, read
+from the region's `shapes` section.
