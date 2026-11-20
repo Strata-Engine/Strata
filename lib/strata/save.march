@@ -68,7 +68,9 @@ mod Strata.Save do
   -- and players) last started a write; the player records; the dirty
   -- regions; the decoded regions (at most `cache_cap`, each with the stamp
   -- of its last use) and the regions that have a file; the writes in
-  -- flight; written chunks the world has yet to release; region files read.
+  -- flight; written chunks the world has yet to release; region files read;
+  -- how many region writes have been folded in (the epoch) and, for each
+  -- region written, the epoch of its last write (Strata.Regions).
   type SaveStore = { sv_dir : String, sv_token : String, sv_header : Strata.Savefile.SaveHeader, sv_generator : Int,
                  sv_failed : Int, sv_aside : Int, sv_reason : String,
                  sv_time : Float, sv_sections : List((String, Bytes)), sv_entities : Option((NativeI32Arr, NativeF32Arr, NativeFloatArr)),
@@ -76,7 +78,8 @@ mod Strata.Save do
                  sv_dirty : Strata.Store.Store(SvDirty), sv_cache : Strata.Store.Store(Strata.Savefile.Region), sv_used : Strata.Store.Store(Int), sv_clock : Int,
                  sv_present : Strata.Store.Store(Bool),
                  sv_writes : List(SvWrite), sv_heads : List(SvHead), sv_player_writes : List(SvPlayerWrite),
-                 sv_owed : List((Strata.Coord.Key, Int)), sv_reads : Int }
+                 sv_owed : List((Strata.Coord.Key, Int)), sv_reads : Int,
+                 sv_epoch : Int, sv_epochs : Strata.Store.Store(Int) }
 
   pfn header_path(d : String) : String do d ++ "/store.bin" end
   pfn lock_path(d : String) : String do d ++ "/store.lock" end
@@ -299,7 +302,7 @@ mod Strata.Save do
                       sv_head_dirty: h.sh_generator != gv, sv_slow_last: 0.0, sv_players: players,
                       sv_dirty: Sto.empty(SvDirty(0.0, Sto.empty(false), Nil)), sv_cache: Sto.empty(Rgn.no_region()), sv_used: Sto.empty(0), sv_clock: 0,
                       sv_present: present_in(names_in(regions_dir(dir)), Sto.empty(false)),
-                      sv_writes: Nil, sv_heads: Nil, sv_player_writes: Nil, sv_owed: Nil, sv_reads: 0 }, Strata.World.log_changes(w, true)))
+                      sv_writes: Nil, sv_heads: Nil, sv_player_writes: Nil, sv_owed: Nil, sv_reads: 0, sv_epoch: 0, sv_epochs: Sto.empty(0) }, Strata.World.log_changes(w, true)))
             end
           end
       end
@@ -316,10 +319,10 @@ mod Strata.Save do
     open_with(dir, w, generator_version, true)
   end
 
-  doc "Release the store: if its lock still holds this store's token, write the header (its counter raised, the generator version the game opened with) and remove the lock. A store whose lock another game has taken over (`open_forcing`) writes nothing and leaves that lock in place."
-  fn close(s : SaveStore) : Unit do
+  doc "Release the store without a stream to flush: if its lock still holds this store's token, write the header as it stands (its counter raised; the sections, entity snapshot and generator version as last set) on this thread and remove the lock. Changes of the world that `tick` has not yet written are not written: a game that has played calls `close`. A store whose lock another game has taken over (`open_forcing`) writes nothing and leaves that lock in place."
+  fn close_unflushed(s : SaveStore) : Unit do
     if lock_holds(s.sv_dir, s.sv_token) do
-      let _written = write_header(s.sv_dir, { s.sv_header with sh_generator: s.sv_generator })
+      let _written = write_header(s.sv_dir, { s.sv_header with sh_generator: s.sv_generator, sh_sections: s.sv_sections, sh_entities: s.sv_entities })
       let _unlocked = delete_file(lock_path(s.sv_dir))
       ()
     else () end
@@ -835,8 +838,10 @@ mod Strata.Save do
         if !ok do dirty_again(failed, rk, d)
         else
           let owed = List.append(hs, s.sv_owed)
-          if holds_nothing(g) do cache_drop({ s with sv_present: Sto.remove(s.sv_present, rk), sv_owed: owed }, rk)
-          else cache_put({ s with sv_present: Sto.put(s.sv_present, rk, true), sv_owed: owed }, rk, g) end
+          let e = s.sv_epoch + 1
+          let ep = Sto.put(s.sv_epochs, rk, e)
+          if holds_nothing(g) do cache_drop({ s with sv_present: Sto.remove(s.sv_present, rk), sv_owed: owed, sv_epoch: e, sv_epochs: ep }, rk)
+          else cache_put({ s with sv_present: Sto.put(s.sv_present, rk, true), sv_owed: owed, sv_epoch: e, sv_epochs: ep }, rk, g) end
         end
     end
   end
@@ -989,17 +994,148 @@ mod Strata.Save do
   doc "Once a frame, after `Strata.Stream.tick`; [dt] is the frame's seconds (the store's only clock). Takes the world's changes and marks their regions dirty, each with a quiet clock every new change starts again; folds in the writes that have finished (it never waits for one) and lets the world give up chunks now on disk, a few a tick; starts at most one region write, the dirty region whose quiet time (2 s) ran out longest ago, on a worker, which encodes and writes the file, or deletes it when the region holds nothing; and on the header interval (5 s) writes the header, if a section, the entity snapshot or the generator version changed, and each changed player record, on workers too. A region's file is read on this thread before its first write if nothing has loaded it yet. A failed write is counted (`stats`), named (`reason`) and tried again after another quiet time; its chunks stay in the world."
   fn tick(s : SaveStore, st : Strata.Stream.Stream, dt : Float) : (SaveStore, Strata.Stream.Stream) do
     let step = if dt > 0.0 do dt else 0.0 end
-    let (w1, keys) = Wv.take_changes(Strata.Stream.world(st))
-    let s1 = collect(mark_dirty({ s with sv_time: s.sv_time +. step }, keys), false)
-    let (s2, w2) = release(s1, w1, st, release_budget())
+    let (st0, got) = Strata.Stream.take_regions(st)
+    let (w1, keys) = Wv.take_changes(Strata.Stream.world(st0))
+    let s1 = collect(mark_dirty(adopt_regions({ s with sv_time: s.sv_time +. step }, got), keys), false)
+    let (s2, w2) = release(s1, w1, st0, release_budget())
     let s3 = slow_pass(start_regions(s2, w2, false), false)
-    (s3, Strata.Stream.put_world(st, w2))
+    (s3, Strata.Stream.with_store(Strata.Stream.put_world(st0, w2), region_source(s3)))
   end
 
   doc "Wait for every write in flight and fold it in; the world gives up every chunk now on disk that the stream is not generating. For tests and `flush`: a game's frame calls `tick`, which never waits."
   fn wait_writes(s : SaveStore, st : Strata.Stream.Stream) : (SaveStore, Strata.Stream.Stream) do
-    let s1 = collect(s, true)
-    let (s2, w2) = release(s1, Strata.Stream.world(st), st, 1000000000)
-    (s2, Strata.Stream.put_world(st, w2))
+    let (st0, got) = Strata.Stream.take_regions(st)
+    let s1 = collect(adopt_regions(s, got), true)
+    let (s2, w2) = release(s1, Strata.Stream.world(st0), st0, 1000000000)
+    (s2, Strata.Stream.with_store(Strata.Stream.put_world(st0, w2), region_source(s2)))
+  end
+
+  -- ── Loading through the stream ───────────────────────────────────────────
+
+  doc "What the stream's generation tasks are handed (`Strata.Stream.with_store`): the folder, the regions that have a file, and the regions decoded so far, as values. Give it to the stream right after `open`; `tick` renews it every frame."
+  fn region_source(s : SaveStore) : Strata.Regions.RegionSource do
+    Rgn.source(s.sv_dir, s.sv_present, s.sv_cache, s.sv_epoch, s.sv_epochs)
+  end
+
+  doc "Fold in the region files the stream's generation tasks read (`Strata.Stream.take_regions`), on the caller's thread, the only place the decoded regions change: a decoded region joins the cache, unless a write of that region has finished since the task was started (the file read may be the older one) or one is in flight. A region reported damaged is read again here and, if it still does not decode, set aside as .bad and counted; its chunks have generated as if it were absent. `tick` calls this."
+  fn adopt_regions(s : SaveStore, got : List(Strata.Regions.Loaded)) : SaveStore do
+    match got do
+      Nil -> s
+      Cons(l, t) ->
+        let (rk, e, rd) = Rgn.loaded_parts(l)
+        let s1 = { s with sv_reads: s.sv_reads + 1 }
+        let skip = if !Rgn.current(s1.sv_epochs, rk, e) do true else if Sto.has(s1.sv_cache, rk) do true else writing(s1.sv_writes, rk) end end
+        if skip do adopt_regions(s1, t)
+        else
+          match rd do
+            RrGot(g) -> adopt_regions(cache_put(s1, rk, g), t)
+            RrAbsent -> adopt_regions({ s1 with sv_present: Sto.remove(s1.sv_present, rk) }, t)
+            RrDamaged ->
+              let (s2, _) = region_now(s1, rk)
+              adopt_regions(s2, t)
+          end
+        end
+    end
+  end
+
+  doc "Region files read since `open`, by generation tasks and by the store itself."
+  fn reads(s : SaveStore) : Int do s.sv_reads end
+
+  pfn add_keys(seen : Strata.Store.Store(Bool), acc : List(Strata.Coord.Key), g : Strata.Savefile.Region) : (Strata.Store.Store(Bool), List(Strata.Coord.Key)) do
+    let (seen1, acc1) = List.fold_left(g.sr_chunks, (seen, acc), fn (a, p) ->
+      let (sn, ks) = a
+      let (k, _) = p
+      if Sto.has(sn, k) do a else (Sto.put(sn, k, true), Cons(k, ks)) end)
+    List.fold_left(g.sr_ops, (seen1, acc1), fn (a, p) ->
+      let (sn, ks) = a
+      let (k, _) = p
+      if Sto.has(sn, k) do a else (Sto.put(sn, k, true), Cons(k, ks)) end)
+  end
+  pfn edited_go(s : SaveStore, rks : List(Strata.Coord.Key), seen : Strata.Store.Store(Bool), acc : List(Strata.Coord.Key)) : List(Strata.Coord.Key) do
+    match rks do
+      Nil -> acc
+      Cons(rk, t) ->
+        if Sto.has(s.sv_cache, rk) do
+          let (seen2, acc2) = add_keys(seen, acc, Sto.get(s.sv_cache, rk))
+          edited_go(s, t, seen2, acc2)
+        else
+          match Rgn.read(s.sv_dir, rk) do
+            RrGot(g) ->
+              let (seen2, acc2) = add_keys(seen, acc, g)
+              edited_go(s, t, seen2, acc2)
+            _ -> edited_go(s, t, seen, acc)
+          end
+        end
+    end
+  end
+
+  doc "Every level-0 key the store holds a saved chunk or queued edits for, each once, from the region files present. Reads every region file not already decoded, on the caller's thread: call it once after `open` (to wake the fluid, `wake_outcome`), not every frame."
+  fn edited_keys(s : SaveStore) : List(Strata.Coord.Key) do edited_go(s, Sto.keys(s.sv_present), Sto.empty(false), Nil) end
+
+  -- eight boxes of 16 voxels a side filling chunk k
+  pfn chunk_boxes(k : Strata.Coord.Key, i : Int, acc : List(Strata.Edit.Change)) : List(Strata.Edit.Change) do
+    if i >= 8 do acc
+    else
+      let x = 32 * Kv.kx(k) + 16 * (i % 2)
+      let y = 32 * Kv.ky(k) + 16 * ((i / 2) % 2)
+      let z = 32 * Kv.kz(k) + 16 * (i / 4)
+      chunk_boxes(k, i + 1, Cons(Strata.Edit.box_change(x, y, z, x + 15, y + 15, z + 15, 0), acc))
+    end
+  end
+
+  doc "An outcome that says every chunk of `edited_keys` changed, for `Strata.Fluid.wake(fluid, w, wake_outcome(store, w))` after a load: fluid in the chunks the player edited becomes active again, so water that was disturbed goes on moving. Its dirty chunks are exactly `edited_keys`; each is covered by eight boxes of 16 voxels a side, small enough that the fluid looks at every cell. The fluid finds only fluid in chunks that are loaded: call it once the stream has loaded the surroundings. The world is [w], unchanged."
+  fn wake_outcome(s : SaveStore, w : Strata.World.World) : Strata.Edit.Outcome do
+    let keys = edited_keys(s)
+    Strata.Edit.outcome_of(w, keys, List.fold_left(keys, Nil, fn (acc, k) -> chunk_boxes(k, 0, acc)))
+  end
+
+  -- ── Flush and close ──────────────────────────────────────────────────────
+
+  pfn int_in(l : List(Int), v : Int) : Bool do
+    match l do
+      Nil -> false
+      Cons(h, t) -> if h == v do true else int_in(t, v) end
+    end
+  end
+
+  -- every dynamic body not in [held] written into the world as blocks
+  pfn settle(ids : List(Int), held : List(Int), st : Strata.Stream.Stream, p : Strata.Physics.Physics) : (Strata.Stream.Stream, Strata.Physics.Physics) do
+    match ids do
+      Nil -> (st, p)
+      Cons(id, t) ->
+        if int_in(held, id) do settle(t, held, st, p)
+        else if Strata.Physics.kind_of(p, id) != Strata.Physics.dynamic() do settle(t, held, st, p)
+        else
+          let (p2, o) = Strata.Physics.to_blocks(p, Strata.Stream.world(st), id)
+          settle(t, held, Strata.Stream.apply(st, o), p2)
+        end end
+    end
+  end
+
+  doc "Put everything on disk now, and wait for it: every dynamic body of [p] not in [held_bodies] (the bodies entities hold: `Strata.Entities.body` of each) is written into the world as blocks (`Strata.Physics.to_blocks`, applied through the stream) and removed; the snapshot [snap], if given, is set; every dirty region, changed player record and the header are written whatever their clocks say, and every write is waited for. A write that fails is counted and stays dirty. What a game calls when it quits or leaves a world."
+  fn flush(s : SaveStore, st : Strata.Stream.Stream, p : Strata.Physics.Physics, snap : Option((NativeI32Arr, NativeF32Arr, NativeFloatArr)), held_bodies : List(Int)) : (SaveStore, Strata.Stream.Stream, Strata.Physics.Physics) do
+    let (st1, p1) = settle(Strata.Physics.ids(p), held_bodies, st, p)
+    let s0 = match snap do
+      Some(arrays) -> set_entities(s, arrays)
+      None -> s
+    end
+    let (st2, got) = Strata.Stream.take_regions(st1)
+    let (w1, keys) = Wv.take_changes(Strata.Stream.world(st2))
+    -- writes in flight first, so every dirty region may start; then the header and the players
+    let s1 = collect(mark_dirty(adopt_regions(s0, got), keys), true)
+    let s2 = collect(slow_pass(start_regions(s1, w1, true), true), true)
+    let (s3, w2) = release(s2, w1, st2, 1000000000)
+    (s3, Strata.Stream.with_store(Strata.Stream.put_world(st2, w2), region_source(s3)), p1)
+  end
+
+  doc "`flush`, then release the store: the lock is removed if it still holds this store's token (a store another game took over with `open_forcing` leaves that game's lock). The stream and the physics are handed back as `flush` left them."
+  fn close(s : SaveStore, st : Strata.Stream.Stream, p : Strata.Physics.Physics, snap : Option((NativeI32Arr, NativeF32Arr, NativeFloatArr)), held_bodies : List(Int)) : (Strata.Stream.Stream, Strata.Physics.Physics) do
+    let taken = !lock_holds(s.sv_dir, s.sv_token)
+    if taken do (st, p)
+    else
+      let (s1, st1, p1) = flush(s, st, p, snap, held_bodies)
+      let _unlocked = delete_file(lock_path(s1.sv_dir))
+      (st1, p1)
+    end
   end
 end

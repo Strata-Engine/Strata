@@ -85,19 +85,61 @@ mod Strata.Regions do
     end
   end
 
+  -- A region file a generation task read: the region, the source's epoch
+  -- when the task was started, what the file gave.
+  type Loaded = RgLoaded(Strata.Coord.Key, Int, RegionRead)
+
+  fn loaded(rk : Strata.Coord.Key, epoch : Int, rd : RegionRead) : Loaded do RgLoaded(rk, epoch, rd) end
+  fn loaded_parts(l : Loaded) : (Strata.Coord.Key, Int, RegionRead) do match l do RgLoaded(rk, e, rd) -> (rk, e, rd) end end
+
+  doc "What [reads] holds for region [rk], if a task has read it."
+  fn loaded_in(reads : List(Loaded), rk : Strata.Coord.Key) : Option(RegionRead) do
+    match reads do
+      Nil -> None
+      Cons(RgLoaded(k, _, rd), t) -> if Rk.key_eq(k, rk) do Some(rd) else loaded_in(t, rk) end
+    end
+  end
+
   -- What a generation task is handed: the store's folder, the regions that
-  -- have a file, and the regions already decoded (a value: the task shares
-  -- nothing with the store).
-  type RegionSource = { rs_dir : String, rs_present : Strata.Store.Store(Bool), rs_cache : Strata.Store.Store(Strata.Savefile.Region) }
+  -- have a file, the regions already decoded (a value: the task shares
+  -- nothing with the store), and the store's epoch: how many region writes
+  -- it had folded in when the source was made, with, for each region
+  -- written since the store opened, the epoch of its last write. A file
+  -- read by a task started before a region's last write may be the older
+  -- file; its epoch says so (`current`).
+  type RegionSource = { rs_dir : String, rs_present : Strata.Store.Store(Bool), rs_cache : Strata.Store.Store(Strata.Savefile.Region),
+                        rs_epoch : Int, rs_epochs : Strata.Store.Store(Int) }
 
   doc "An empty region, as a store's fill value."
   fn no_region() : Strata.Savefile.Region do
     { sr_generator: 0, sr_counter: 0, sr_chunks: Nil, sr_ops: Nil, sr_sections: Nil }
   end
 
-  doc "A source over the folder [dir]: [present] the regions with a file, [cache] those already decoded."
-  fn source(dir : String, present : Strata.Store.Store(Bool), cache : Strata.Store.Store(Strata.Savefile.Region)) : RegionSource do
-    { rs_dir: dir, rs_present: present, rs_cache: cache }
+  doc "A source over the folder [dir]: [present] the regions with a file, [cache] those already decoded, [epoch] the store's count of region writes folded in and [epochs] each written region's epoch."
+  fn source(dir : String, present : Strata.Store.Store(Bool), cache : Strata.Store.Store(Strata.Savefile.Region), epoch : Int, epochs : Strata.Store.Store(Int)) : RegionSource do
+    { rs_dir: dir, rs_present: present, rs_cache: cache, rs_epoch: epoch, rs_epochs: epochs }
+  end
+
+  doc "The epoch of [src]."
+  fn epoch(src : RegionSource) : Int do src.rs_epoch end
+
+  doc "Was a read made at [epoch] made after the last write of region [rk] that [epochs] knows of?"
+  fn current(epochs : Strata.Store.Store(Int), rk : Strata.Coord.Key, epoch : Int) : Bool do
+    if Rst.has(epochs, rk) do epoch >= Rst.get(epochs, rk) else true end
+  end
+
+  doc "[src] knowing what a task read: a decoded region joins the decoded ones (unless the source already has it, or the read is older than the region's last write); a region whose file was missing or damaged no longer counts as having one."
+  fn with_loaded(src : RegionSource, l : Loaded) : RegionSource do
+    match l do
+      RgLoaded(rk, e, rd) ->
+        if !current(src.rs_epochs, rk, e) do src
+        else
+          match rd do
+            RrGot(g) -> if Rst.has(src.rs_cache, rk) do src else { src with rs_cache: Rst.put(src.rs_cache, rk, g) } end
+            _ -> if Rst.has(src.rs_cache, rk) do src else { src with rs_present: Rst.remove(src.rs_present, rk) } end
+          end
+        end
+    end
   end
 
   doc "Does region [rk] have a file, as far as [src] knows?"
