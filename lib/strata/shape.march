@@ -1,0 +1,518 @@
+-- Shape — one voxel object that is not terrain: a grid of the registry's
+-- blocks (`Strata.Body.Grid`), the size of its voxels in metres, a pose, and
+-- a mode. A prop standing on the ground, a loose body and (later) a part of
+-- a character are all this, in different modes. Design:
+-- docs/2026-11-19-shapes-design.md.
+--
+-- The pose is where the grid's low corner is, in metres, and a rotation
+-- about that corner: the world point of grid point L (metres from the low
+-- corner) is corner + R L. A voxel's index is x + sx * (y + sy * z), as in
+-- `Strata.Body` and `Strata.Template`.
+--
+-- A grid is a value: every unedited instance of a prop holds the same one,
+-- and carving answers a new grid and leaves the old as it was.
+mod Strata.Shape do
+
+  alias Strata.Body as Bg
+  alias Strata.Math.Quat as Qt
+
+  -- grid, metres a voxel, corner x y z (metres), rotation, mode
+  type Shape = VxShape(Strata.Body.Grid, Float, Float, Float, Float, Strata.Math.Quat.Quat, Int)
+
+  doc "A shape nothing moves: it stands where it is."
+  fn fixed() : Int do 0 end
+  doc "A shape something other than physics moves."
+  fn kinematic() : Int do 1 end
+  doc "A shape physics moves."
+  fn dynamic() : Int do 2 end
+
+  doc "The voxel size a prop has unless its layer says otherwise: 0.25 m."
+  fn default_voxel() : Float do 0.25 end
+
+  doc "A shape of grid g, [vs] metres a voxel, its low corner at (x, y, z) metres, turned by q about that corner, in [mode] (`fixed()`, `kinematic()` or `dynamic()`; anything else is fixed)."
+  fn make(g : Strata.Body.Grid, vs : Float, x : Float, y : Float, z : Float, q : Strata.Math.Quat.Quat, mode : Int) : Shape do
+    VxShape(g, vs, x, y, z, Qt.normalize(q), if mode == 1 do 1 else if mode == 2 do 2 else 0 end end)
+  end
+
+  fn grid(s : Shape) : Strata.Body.Grid do match s do VxShape(g, _, _, _, _, _, _) -> g end end
+  doc "Metres a voxel."
+  fn voxel(s : Shape) : Float do match s do VxShape(_, v, _, _, _, _, _) -> v end end
+  fn corner_x(s : Shape) : Float do match s do VxShape(_, _, x, _, _, _, _) -> x end end
+  fn corner_y(s : Shape) : Float do match s do VxShape(_, _, _, y, _, _, _) -> y end end
+  fn corner_z(s : Shape) : Float do match s do VxShape(_, _, _, _, z, _, _) -> z end end
+  fn rotation(s : Shape) : Strata.Math.Quat.Quat do match s do VxShape(_, _, _, _, _, q, _) -> q end end
+  fn mode(s : Shape) : Int do match s do VxShape(_, _, _, _, _, _, m) -> m end end
+
+  doc "s with another grid at the same pose."
+  fn with_grid(s : Shape, g : Strata.Body.Grid) : Shape do match s do VxShape(_, v, x, y, z, q, m) -> VxShape(g, v, x, y, z, q, m) end end
+  doc "s in another mode."
+  fn with_mode(s : Shape, mode : Int) : Shape do match s do VxShape(g, v, x, y, z, q, _) -> make(g, v, x, y, z, q, mode) end end
+
+  -- ── Rotation without a vector value (GAPS S43) ───────────────────────────
+  pfn rot_x(q : Strata.Math.Quat.Quat, x : Float, y : Float, z : Float) : Float do
+    let a = Qt.x(q)
+    let b = Qt.y(q)
+    let c = Qt.z(q)
+    let w = Qt.w(q)
+    (1.0 -. 2.0 *. (b *. b +. c *. c)) *. x +. 2.0 *. (a *. b -. c *. w) *. y +. 2.0 *. (a *. c +. b *. w) *. z
+  end
+  pfn rot_y(q : Strata.Math.Quat.Quat, x : Float, y : Float, z : Float) : Float do
+    let a = Qt.x(q)
+    let b = Qt.y(q)
+    let c = Qt.z(q)
+    let w = Qt.w(q)
+    2.0 *. (a *. b +. c *. w) *. x +. (1.0 -. 2.0 *. (a *. a +. c *. c)) *. y +. 2.0 *. (b *. c -. a *. w) *. z
+  end
+  pfn rot_z(q : Strata.Math.Quat.Quat, x : Float, y : Float, z : Float) : Float do
+    let a = Qt.x(q)
+    let b = Qt.y(q)
+    let c = Qt.z(q)
+    let w = Qt.w(q)
+    2.0 *. (a *. c -. b *. w) *. x +. 2.0 *. (b *. c +. a *. w) *. y +. (1.0 -. 2.0 *. (a *. a +. b *. b)) *. z
+  end
+
+  pfn fmin(a : Float, b : Float) : Float do if a < b do a else b end end
+  pfn fmax(a : Float, b : Float) : Float do if a > b do a else b end end
+  pfn imin(a : Int, b : Int) : Int do if a < b do a else b end end
+  pfn imax(a : Int, b : Int) : Int do if a > b do a else b end end
+  pfn fl(v : Float) : Int do float_to_int(Math.floor(v)) end
+
+  doc "The world point (metres) of grid point (lx, ly, lz), in voxels from the low corner."
+  fn point(s : Shape, lx : Float, ly : Float, lz : Float) : (Float, Float, Float) do
+    match s do
+      VxShape(_, vs, cx, cy, cz, q, _) ->
+        (cx +. rot_x(q, lx *. vs, ly *. vs, lz *. vs), cy +. rot_y(q, lx *. vs, ly *. vs, lz *. vs), cz +. rot_z(q, lx *. vs, ly *. vs, lz *. vs))
+    end
+  end
+
+  doc "The shape's box in the world, metres: low x, y, z, high x, y, z, round its grid's eight corners."
+  fn bounds(s : Shape) : (Float, Float, Float, Float, Float, Float) do
+    let g = grid(s)
+    let sx = int_to_float(Bg.size_x(g))
+    let sy = int_to_float(Bg.size_y(g))
+    let sz = int_to_float(Bg.size_z(g))
+    List.fold_left(List.range(1, 8), match point(s, 0.0, 0.0, 0.0) do (x, y, z) -> (x, y, z, x, y, z) end, fn (acc, c) ->
+      match (acc, point(s, if int_and(c, 1) != 0 do sx else 0.0 end, if int_and(c, 2) != 0 do sy else 0.0 end, if int_and(c, 4) != 0 do sz else 0.0 end)) do
+        ((x0, y0, z0, x1, y1, z1), (x, y, z)) -> (fmin(x0, x), fmin(y0, y), fmin(z0, z), fmax(x1, x), fmax(y1, y), fmax(z1, z))
+      end)
+  end
+
+  -- ── From a template ──────────────────────────────────────────────────────
+  pfn turn_go(ids : NativeI32Arr, sx : Int, sy : Int, sz : Int, rot : Int, ox : Int, out : NativeI32Arr, i : Int, n : Int) : NativeI32Arr do
+    if i >= n do out
+    else
+      let id = NativeArray.get_i32(ids, i)
+      if id == 0 do turn_go(ids, sx, sy, sz, rot, ox, out, i + 1, n)
+      else
+        let x = i % sx
+        let y = (i / sx) % sy
+        let z = i / (sx * sy)
+        let rx = if rot == 0 do x else if rot == 1 do sz - 1 - z else if rot == 2 do sx - 1 - x else z end end end
+        let rz = if rot == 0 do z else if rot == 1 do x else if rot == 2 do sz - 1 - z else sx - 1 - x end end end
+        turn_go(ids, sx, sy, sz, rot, ox, NativeArray.set_i32(out, rx + ox * (y + sy * rz), id), i + 1, n)
+      end
+    end
+  end
+
+  doc "Template t's blocks as a grid, turned rot quarter turns about Y as `Strata.Template.blit` turns it (rot taken mod 4), every voxel that is not a hole kept: a template's probabilities are not drawn, since every instance of a prop shares the grid. None when a side is over `Strata.Body.max_side()`."
+  fn grid_of(t : Strata.Template.Template, rot : Int) : Option(Strata.Body.Grid) do
+    let sx = Strata.Template.t_sx(t)
+    let sy = Strata.Template.t_sy(t)
+    let sz = Strata.Template.t_sz(t)
+    let r = int_and(rot, 3)
+    if sx < 1 || sy < 1 || sz < 1 || sx > Bg.max_side() || sy > Bg.max_side() || sz > Bg.max_side() do None
+    else
+      let ox = if r == 1 || r == 3 do sz else sx end
+      let oz = if r == 1 || r == 3 do sx else sz end
+      Some(Strata.Body.Grid(ox, sy, oz, turn_go(Strata.Template.t_ids(t), sx, sy, sz, r, ox, NativeArray.make_i32(Strata.Size.of(sx * sy * sz), 0), 0, sx * sy * sz)))
+    end
+  end
+
+  -- ── Counting and the palette ─────────────────────────────────────────────
+  pfn full_go(a : NativeI32Arr, i : Int, n : Int, acc : Int) : Int do
+    if i >= n do acc else full_go(a, i + 1, n, if NativeArray.get_i32(a, i) != 0 do acc + 1 else acc end) end
+  end
+  doc "How many of the grid's voxels are not air."
+  fn voxel_count(g : Strata.Body.Grid) : Int do
+    let a = Bg.ids(g)
+    full_go(a, 0, NativeArray.length_i32(a), 0)
+  end
+
+  -- where id is among pal[0 .. n), or -1
+  pfn pal_find(pal : NativeI32Arr, n : Int, id : Int, k : Int) : Int do
+    if k >= n do -1 else if NativeArray.get_i32(pal, k) == id do k else pal_find(pal, n, id, k + 1) end end
+  end
+  -- the distinct ids of a from i, air first; n is 257 once there are more than 256
+  pfn pal_go(a : NativeI32Arr, i : Int, len : Int, last : Int, pal : NativeI32Arr, n : Int) : (NativeI32Arr, Int) do
+    if i >= len do (pal, n)
+    else
+      let id = NativeArray.get_i32(a, i)
+      if id == last do pal_go(a, i + 1, len, last, pal, n)
+      else if pal_find(pal, n, id, 0) >= 0 do pal_go(a, i + 1, len, id, pal, n)
+      else if n >= 256 do (pal, 257)
+      else pal_go(a, i + 1, len, id, NativeArray.set_i32(pal, n, id), n + 1) end end end
+    end
+  end
+
+  doc "The grid's palette: its distinct block ids in the order first met, air (0) always entry 0, and how many there are. A grid of more than 256 distinct ids has no palette: the count is 257."
+  fn palette(g : Strata.Body.Grid) : (NativeI32Arr, Int) do
+    let a = Bg.ids(g)
+    pal_go(a, 0, NativeArray.length_i32(a), 0, NativeArray.make_i32(256, 0), 1)
+  end
+
+  -- ── A ray ────────────────────────────────────────────────────────────────
+  pfn absf(v : Float) : Float do if v < 0.0 do 0.0 -. v else v end end
+  pfn far() : Float do 1000000000000000000.0 end
+  -- where a ray p + t u is inside 0 .. size along one axis: the low and the high t
+  pfn slab_lo(p : Float, u : Float, size : Float) : Float do
+    if absf(u) < 0.000000000001 do (if p < 0.0 || p > size do far() else 0.0 -. far() end)
+    else fmin((0.0 -. p) /. u, (size -. p) /. u) end
+  end
+  pfn slab_hi(p : Float, u : Float, size : Float) : Float do
+    if absf(u) < 0.000000000001 do (if p < 0.0 || p > size do 0.0 -. far() else far() end)
+    else fmax((0.0 -. p) /. u, (size -. p) /. u) end
+  end
+  pfn clampi(v : Int, hi : Int) : Int do if v < 0 do 0 else if v > hi do hi else v end end end
+  -- t to the next voxel boundary along one axis from p, moving by u
+  pfn first_t(p : Float, u : Float, cell : Int) : Float do
+    if absf(u) < 0.000000000001 do far()
+    else if u > 0.0 do (int_to_float(cell + 1) -. p) /. u
+    else (int_to_float(cell) -. p) /. u end end
+  end
+  pfn sign(u : Float) : Int do if u > 0.0 do 1 else if u < 0.0 do -1 else 0 end end end
+
+  -- step from voxel (x, y, z), entered at t through [face], until a voxel stops the ray, the grid is left or t passes t1
+  pfn dda(ids : NativeI32Arr, sx : Int, sy : Int, sz : Int, stop : Int -> Bool, x : Int, y : Int, z : Int, stx : Int, sty : Int, stz : Int,
+          tnx : Float, tny : Float, tnz : Float, tdx : Float, tdy : Float, tdz : Float, face : Int, t : Float, t1 : Float, vs : Float) : Strata.Query.Hit do
+    if x < 0 || y < 0 || z < 0 || x >= sx || y >= sy || z >= sz || t > t1 do Strata.Query.Miss
+    else
+      let id = NativeArray.get_i32(ids, x + sx * (y + sy * z))
+      if (if id == 0 do false else stop(id) end) do Strata.Query.Struck(x, y, z, face, t *. vs)
+      else if tnx <= tny && tnx <= tnz do dda(ids, sx, sy, sz, stop, x + stx, y, z, stx, sty, stz, tnx +. tdx, tny, tnz, tdx, tdy, tdz, if stx > 0 do 3 else 2 end, tnx, t1, vs)
+      else if tny <= tnz do dda(ids, sx, sy, sz, stop, x, y + sty, z, stx, sty, stz, tnx, tny +. tdy, tnz, tdx, tdy, tdz, if sty > 0 do 1 else 0 end, tny, t1, vs)
+      else dda(ids, sx, sy, sz, stop, x, y, z + stz, stx, sty, stz, tnx, tny, tnz +. tdz, tdx, tdy, tdz, if stz > 0 do 5 else 4 end, tnz, t1, vs) end end end
+    end
+  end
+
+  doc "The nearest voxel of s a ray from (ox, oy, oz) metres along (dx, dy, dz) enters within [max] metres, for which stop(block id) holds: the voxel in the grid, the face of it the ray came through (0 +y, 1 -y, 2 +x, 3 -x, 4 +z, 5 -z, in the grid's own frame) and the distance in metres. A ray that starts inside a stopping voxel hits it at distance 0 through face 0."
+  fn ray(s : Shape, ox : Float, oy : Float, oz : Float, dx : Float, dy : Float, dz : Float, max : Float, stop : Int -> Bool) : Strata.Query.Hit do
+    match s do
+      VxShape(g, vs, cx, cy, cz, q, _) ->
+        let len = Math.sqrt(dx *. dx +. dy *. dy +. dz *. dz)
+        if len <= 0.0 || vs <= 0.0 do Strata.Query.Miss
+        else
+          let qi = Qt.conjugate(q)
+          let px = rot_x(qi, ox -. cx, oy -. cy, oz -. cz) /. vs
+          let py = rot_y(qi, ox -. cx, oy -. cy, oz -. cz) /. vs
+          let pz = rot_z(qi, ox -. cx, oy -. cy, oz -. cz) /. vs
+          let ux = rot_x(qi, dx /. len, dy /. len, dz /. len)
+          let uy = rot_y(qi, dx /. len, dy /. len, dz /. len)
+          let uz = rot_z(qi, dx /. len, dy /. len, dz /. len)
+          let sx = Bg.size_x(g)
+          let sy = Bg.size_y(g)
+          let sz = Bg.size_z(g)
+          let lx = slab_lo(px, ux, int_to_float(sx))
+          let ly = slab_lo(py, uy, int_to_float(sy))
+          let lz = slab_lo(pz, uz, int_to_float(sz))
+          let t0 = fmax(0.0, fmax(lx, fmax(ly, lz)))
+          let t1 = fmin(max /. vs, fmin(slab_hi(px, ux, int_to_float(sx)), fmin(slab_hi(py, uy, int_to_float(sy)), slab_hi(pz, uz, int_to_float(sz)))))
+          if t0 > t1 do Strata.Query.Miss
+          else
+            -- the voxel entered: a hair inside, held to the grid
+            let e = t0 +. 0.00001
+            let x = clampi(fl(px +. ux *. e), sx - 1)
+            let y = clampi(fl(py +. uy *. e), sy - 1)
+            let z = clampi(fl(pz +. uz *. e), sz - 1)
+            let face = if t0 <= 0.0 do 0
+              else if lx >= ly && lx >= lz do (if ux > 0.0 do 3 else 2 end)
+              else if ly >= lz do (if uy > 0.0 do 1 else 0 end)
+              else (if uz > 0.0 do 5 else 4 end) end end end
+            dda(Bg.ids(g), sx, sy, sz, stop, x, y, z, sign(ux), sign(uy), sign(uz), first_t(px, ux, x), first_t(py, uy, y), first_t(pz, uz, z),
+                if absf(ux) < 0.000000000001 do far() else 1.0 /. absf(ux) end, if absf(uy) < 0.000000000001 do far() else 1.0 /. absf(uy) end, if absf(uz) < 0.000000000001 do far() else 1.0 /. absf(uz) end,
+                face, t0, t1, vs)
+          end
+        end
+    end
+  end
+
+  -- ── Carving ──────────────────────────────────────────────────────────────
+  -- voxels x0..x1 of row (y, z): those within r2 (voxels squared) of (lx, ly, lz) are taken
+  pfn sphere_x(a : NativeI32Arr, sx : Int, sy : Int, x : Int, x1 : Int, y : Int, z : Int, lx : Float, ly : Float, lz : Float, r2 : Float, taken : Int) : (NativeI32Arr, Int) do
+    if x > x1 do (a, taken)
+    else
+      let i = x + sx * (y + sy * z)
+      let ex = int_to_float(x) +. 0.5 -. lx
+      let ey = int_to_float(y) +. 0.5 -. ly
+      let ez = int_to_float(z) +. 0.5 -. lz
+      if ex *. ex +. ey *. ey +. ez *. ez > r2 do sphere_x(a, sx, sy, x + 1, x1, y, z, lx, ly, lz, r2, taken)
+      else if NativeArray.get_i32(a, i) == 0 do sphere_x(a, sx, sy, x + 1, x1, y, z, lx, ly, lz, r2, taken)
+      else sphere_x(NativeArray.set_i32(a, i, 0), sx, sy, x + 1, x1, y, z, lx, ly, lz, r2, taken + 1) end end
+    end
+  end
+  pfn sphere_yz(a : NativeI32Arr, sx : Int, sy : Int, x0 : Int, x1 : Int, y0 : Int, y1 : Int, y : Int, z : Int, z1 : Int, lx : Float, ly : Float, lz : Float, r2 : Float, taken : Int) : (NativeI32Arr, Int) do
+    if z > z1 do (a, taken)
+    else if y > y1 do sphere_yz(a, sx, sy, x0, x1, y0, y1, y0, z + 1, z1, lx, ly, lz, r2, taken)
+    else
+      match sphere_x(a, sx, sy, x0, x1, y, z, lx, ly, lz, r2, taken) do
+        (a2, t2) -> sphere_yz(a2, sx, sy, x0, x1, y0, y1, y + 1, z, z1, lx, ly, lz, r2, t2)
+      end
+    end end
+  end
+
+  doc "s without the voxels whose centres lie within [r] metres of (x, y, z) metres, and how many were taken. With none taken the shape comes back holding the very grid it had."
+  fn carve_sphere(s : Shape, x : Float, y : Float, z : Float, r : Float) : (Shape, Int) do
+    match s do
+      VxShape(g, vs, cx, cy, cz, q, _) ->
+        if r <= 0.0 || vs <= 0.0 do (s, 0)
+        else
+          let qi = Qt.conjugate(q)
+          let lx = rot_x(qi, x -. cx, y -. cy, z -. cz) /. vs
+          let ly = rot_y(qi, x -. cx, y -. cy, z -. cz) /. vs
+          let lz = rot_z(qi, x -. cx, y -. cy, z -. cz) /. vs
+          let rv = r /. vs
+          let sx = Bg.size_x(g)
+          let sy = Bg.size_y(g)
+          let sz = Bg.size_z(g)
+          let x0 = imax(0, fl(lx -. rv))
+          let x1 = imin(sx - 1, fl(lx +. rv))
+          let y0 = imax(0, fl(ly -. rv))
+          let y1 = imin(sy - 1, fl(ly +. rv))
+          let z0 = imax(0, fl(lz -. rv))
+          let z1 = imin(sz - 1, fl(lz +. rv))
+          if x0 > x1 || y0 > y1 || z0 > z1 do (s, 0)
+          else
+            match sphere_yz(Bg.ids(g), sx, sy, x0, x1, y0, y1, y0, z0, z1, lx, ly, lz, rv *. rv, 0) do
+              (a2, taken) -> if taken == 0 do (s, 0) else (with_grid(s, Strata.Body.Grid(sx, sy, sz, a2)), taken) end
+            end
+          end
+        end
+    end
+  end
+
+  pfn where_go(s : Shape, a : NativeI32Arr, sx : Int, sy : Int, gone : (Float, Float, Float) -> Bool, i : Int, n : Int, taken : Int) : (NativeI32Arr, Int) do
+    if i >= n do (a, taken)
+    else if NativeArray.get_i32(a, i) == 0 do where_go(s, a, sx, sy, gone, i + 1, n, taken)
+    else if gone(point(s, int_to_float(i % sx) +. 0.5, int_to_float((i / sx) % sy) +. 0.5, int_to_float(i / (sx * sy)) +. 0.5)) do where_go(s, NativeArray.set_i32(a, i, 0), sx, sy, gone, i + 1, n, taken + 1)
+    else where_go(s, a, sx, sy, gone, i + 1, n, taken) end end end
+  end
+
+  doc "s without the voxels whose centres (world metres) [gone] holds for, and how many were taken: any region an edit can describe. Every voxel is asked; `carve_sphere` asks only those near its sphere."
+  fn carve_where(s : Shape, gone : (Float, Float, Float) -> Bool) : (Shape, Int) do
+    let g = grid(s)
+    let sx = Bg.size_x(g)
+    let sy = Bg.size_y(g)
+    match where_go(s, Bg.ids(g), sx, sy, gone, 0, sx * sy * Bg.size_z(g), 0) do
+      (a2, taken) -> if taken == 0 do (s, 0) else (with_grid(s, Strata.Body.Grid(sx, sy, Bg.size_z(g), a2)), taken) end
+    end
+  end
+
+  doc "s without the voxels whose centres lie in the box (x0, y0, z0) .. (x1, y1, z1) metres, and how many were taken."
+  fn carve_box(s : Shape, x0 : Float, y0 : Float, z0 : Float, x1 : Float, y1 : Float, z1 : Float) : (Shape, Int) do
+    carve_where(s, fn p -> match p do (x, y, z) -> x >= x0 && x <= x1 && y >= y0 && y <= y1 && z >= z0 && z <= z1 end)
+  end
+
+  -- ── Held by the ground ───────────────────────────────────────────────────
+  -- rows from the bottom up, so a trunk's foot is met before its crown
+  pfn held_go(r : Strata.Blocks.Registry, w : Strata.World.World, s : Shape, g : Strata.Body.Grid, ws : Float, sx : Int, sy : Int, sz : Int, x : Int, y : Int, z : Int) : Bool do
+    if y >= sy do false
+    else if z >= sz do held_go(r, w, s, g, ws, sx, sy, sz, 0, y + 1, 0)
+    else if x >= sx do held_go(r, w, s, g, ws, sx, sy, sz, 0, y, z + 1)
+    else
+      let here = Strata.Blocks.collides(r, Bg.grid_get(g, x, y, z))
+      let under = if y > 0 do Strata.Blocks.collides(r, Bg.grid_get(g, x, y - 1, z)) else false end
+      if !here || under do held_go(r, w, s, g, ws, sx, sy, sz, x + 1, y, z)
+      else
+        match point(s, int_to_float(x) +. 0.5, int_to_float(y) -. 0.5, int_to_float(z) +. 0.5) do
+          (px, py, pz) ->
+            if Strata.Blocks.collides(r, Strata.World.get_block(w, fl(px /. ws), fl(py /. ws), fl(pz /. ws))) do true
+            else held_go(r, w, s, g, ws, sx, sy, sz, x + 1, y, z) end
+        end
+      end
+    end end end
+  end
+
+  doc "Is s held by world w, whose voxels are [ws] metres: does one of its bottom voxels (a colliding voxel with no colliding voxel under it in its own grid) lie on a colliding world voxel, the one holding the point half a voxel under the middle of its bottom face? `Strata.Physics`' rule for a pinned body."
+  fn held(r : Strata.Blocks.Registry, w : Strata.World.World, s : Shape, ws : Float) : Bool do
+    let g = grid(s)
+    if ws <= 0.0 do false else held_go(r, w, s, g, ws, Bg.size_x(g), Bg.size_y(g), Bg.size_z(g), 0, 0, 0) end
+  end
+
+  doc "The fewest colliding voxels a loose part has: smaller parts are crumbs, counted and dropped. 8, as physics' fragments."
+  fn min_part() : Int do 8 end
+
+  -- part pc (its grid and its low corner in s's grid) as a shape of its own, where it is in s
+  pfn part_shape(s : Shape, pc : (Strata.Body.Grid, Int, Int, Int)) : Shape do
+    match pc do
+      (g, ox, oy, oz) ->
+        match (s, point(s, int_to_float(ox), int_to_float(oy), int_to_float(oz))) do
+          (VxShape(_, vs, _, _, _, q, _), (x, y, z)) -> VxShape(g, vs, x, y, z, q, 2)
+        end
+    end
+  end
+  -- part pc written into a (a grid of s's size)
+  pfn part_into(a : NativeI32Arr, sx : Int, sy : Int, pc : (Strata.Body.Grid, Int, Int, Int)) : NativeI32Arr do
+    match pc do
+      (g, ox, oy, oz) ->
+        let px = Bg.size_x(g)
+        let py = Bg.size_y(g)
+        into_go(a, sx, sy, Bg.ids(g), px, py, ox, oy, oz, 0, px * py * Bg.size_z(g))
+    end
+  end
+  pfn into_go(a : NativeI32Arr, sx : Int, sy : Int, src : NativeI32Arr, px : Int, py : Int, ox : Int, oy : Int, oz : Int, i : Int, n : Int) : NativeI32Arr do
+    if i >= n do a
+    else
+      let id = NativeArray.get_i32(src, i)
+      if id == 0 do into_go(a, sx, sy, src, px, py, ox, oy, oz, i + 1, n)
+      else into_go(NativeArray.set_i32(a, (ox + i % px) + sx * ((oy + (i / px) % py) + sy * (oz + i / (px * py))), id), sx, sy, src, px, py, ox, oy, oz, i + 1, n) end
+    end
+  end
+
+  -- what a shape that has been carved leaves: the part that stands (None when nothing is held), the loose parts, and the crumbs dropped
+  type Parted = VxParted(Option(Shape), List(Shape), Int)
+
+  doc "The shape that still stands, if any part does."
+  fn standing(p : Parted) : Option(Shape) do match p do VxParted(s, _, _) -> s end end
+  doc "The loose parts, each a dynamic shape where it was."
+  fn loose(p : Parted) : List(Shape) do match p do VxParted(_, l, _) -> l end end
+  doc "How many loose parts were smaller than `min_part()` and were dropped."
+  fn crumbs(p : Parted) : Int do match p do VxParted(_, _, c) -> c end end
+
+  doc "s split into what the ground of world w (voxels of [ws] metres) still holds and what it does not. The grid's face-connected parts of colliding voxels (`Strata.Body.split`) are each asked `held`: the held ones together are the standing shape, at s's pose in a grid of s's size; every other part of at least `min_part()` colliding voxels is a loose shape in dynamic mode, in its own bounding box, where it was. Voxels that do not collide belong to no part and are dropped. A shape of one part that is held comes back as it is, its grid untouched."
+  fn parts(r : Strata.Blocks.Registry, w : Strata.World.World, s : Shape, ws : Float) : Parted do
+    let g = grid(s)
+    let sx = Bg.size_x(g)
+    let sy = Bg.size_y(g)
+    let sz = Bg.size_z(g)
+    let ps = Bg.split(r, g)
+    let judged = List.map(ps, fn pc -> (pc, held(r, w, part_shape(s, pc), ws)))
+    let kept = List.filter(judged, fn j -> match j do (_, h) -> h end)
+    let free = List.filter(judged, fn j -> match j do (_, h) -> !h end)
+    let big = List.filter(free, fn j -> match j do ((pg, _, _, _), _) -> Bg.solid_count(r, pg) >= min_part() end)
+    let loose_ = List.map(big, fn j -> match j do (pc, _) -> part_shape(s, pc) end)
+    let dropped = List.length(free) - List.length(big)
+    if List.is_empty(kept) do VxParted(None, loose_, dropped)
+    else if List.length(ps) == 1 do VxParted(Some(s), Nil, 0)
+    else
+      let a = List.fold_left(kept, NativeArray.make_i32(Strata.Size.of(sx * sy * sz), 0), fn (acc, j) -> match j do (pc, _) -> part_into(acc, sx, sy, pc) end)
+      VxParted(Some(with_mode(with_grid(s, Strata.Body.Grid(sx, sy, sz, a)), 0)), loose_, dropped)
+    end end
+  end
+
+  -- ── Bytes ────────────────────────────────────────────────────────────────
+  -- A grid on disk: sizes x y z (a byte each), form (0 palette, 1 ids), then
+  --   form 0: the palette's length less one (a byte: entries 1 ..), each
+  --           entry's id (4 bytes, little-endian), then runs of (length 2
+  --           bytes, palette index 1 byte)
+  --   form 1: runs of (length 2 bytes, id 4 bytes), for a grid of more than
+  --           256 distinct ids
+  -- The runs cover the voxels in index order and add up to x * y * z.
+
+  -- a growing byte buffer: the array and how much of it is written
+  type Out = VxOut(NativeU8Arr, Int)
+
+  pfn out_copy(dst : NativeU8Arr, src : NativeU8Arr, i : Int, n : Int) : NativeU8Arr do
+    if i >= n do dst else out_copy(NativeArray.set_u8(dst, i, NativeArray.get_u8(src, i)), src, i + 1, n) end
+  end
+  pfn put(o : Out, v : Int) : Out do
+    match o do
+      VxOut(a, n) ->
+        if n < NativeArray.length_u8(a) do VxOut(NativeArray.set_u8(a, n, int_and(v, 255)), n + 1)
+        else VxOut(NativeArray.set_u8(out_copy(NativeArray.make_u8(Strata.Size.of(2 * n + 64), 0), a, 0, n), n, int_and(v, 255)), n + 1) end
+    end
+  end
+  pfn put2(o : Out, v : Int) : Out do put(put(o, v), int_shr(v, 8)) end
+  pfn put4(o : Out, v : Int) : Out do put2(put2(o, v), int_shr(v, 16)) end
+
+  -- runs of a from i: the id of the run in hand and its length so far
+  pfn runs_go(o : Out, a : NativeI32Arr, pal : NativeI32Arr, np : Int, form : Int, i : Int, n : Int, cur : Int, len : Int) : Out do
+    if i >= n do run_out(o, pal, np, form, cur, len)
+    else
+      let id = NativeArray.get_i32(a, i)
+      if id == cur && len < 65535 do runs_go(o, a, pal, np, form, i + 1, n, cur, len + 1)
+      else runs_go(run_out(o, pal, np, form, cur, len), a, pal, np, form, i + 1, n, id, 1) end
+    end
+  end
+  pfn run_out(o : Out, pal : NativeI32Arr, np : Int, form : Int, id : Int, len : Int) : Out do
+    if len <= 0 do o
+    else if form == 0 do put(put2(o, len), pal_find(pal, np, id, 0))
+    else put4(put2(o, len), id) end end
+  end
+  pfn pal_out(o : Out, pal : NativeI32Arr, k : Int, n : Int) : Out do
+    if k >= n do o else pal_out(put4(o, NativeArray.get_i32(pal, k)), pal, k + 1, n) end
+  end
+  pfn trimmed(o : Out) : NativeU8Arr do
+    match o do VxOut(a, n) -> out_copy(NativeArray.make_u8(Strata.Size.of(n), 0), a, 0, n) end
+  end
+
+  doc "Grid g as bytes: its sizes, its palette and a run-length list of palette bytes (or of ids, for a grid of more than 256 kinds of block). `decode` reads them back."
+  fn encode(g : Strata.Body.Grid) : NativeU8Arr do
+    let a = Bg.ids(g)
+    let n = Bg.size_x(g) * Bg.size_y(g) * Bg.size_z(g)
+    let o0 = put(put(put(VxOut(NativeArray.make_u8(256, 0), 0), Bg.size_x(g)), Bg.size_y(g)), Bg.size_z(g))
+    match palette(g) do
+      (pal, np) ->
+        if np > 256 do trimmed(runs_go(put(o0, 1), a, pal, 0, 1, 0, n, 0, 0))
+        else trimmed(runs_go(pal_out(put(put(o0, 0), np - 1), pal, 1, np), a, pal, np, 0, 0, n, 0, 0)) end
+    end
+  end
+
+  pfn get2(b : NativeU8Arr, p : Int) : Int do NativeArray.get_u8(b, p) + 256 * NativeArray.get_u8(b, p + 1) end
+  pfn get4(b : NativeU8Arr, p : Int) : Int do get2(b, p) + 65536 * get2(b, p + 2) end
+  pfn pal_in(b : NativeU8Arr, p : Int, pal : NativeI32Arr, k : Int, n : Int) : NativeI32Arr do
+    if k >= n do pal else pal_in(b, p + 4, NativeArray.set_i32(pal, k, get4(b, p)), k + 1, n) end
+  end
+  pfn fill_run(a : NativeI32Arr, i : Int, n : Int, id : Int) : NativeI32Arr do
+    if n <= 0 do a else fill_run(NativeArray.set_i32(a, i, id), i + 1, n - 1, id) end
+  end
+  -- runs read from p into a from voxel i: the array and where the runs ended, or why not
+  pfn runs_in(b : NativeU8Arr, len : Int, p : Int, pal : NativeI32Arr, np : Int, form : Int, a : NativeI32Arr, i : Int, n : Int) : Result((NativeI32Arr, Int), String) do
+    if i >= n do Ok((a, p))
+    else
+      let each = if form == 0 do 3 else 6 end
+      if p + each > len do Err("shape: the runs end before the grid is full")
+      else
+        let run = get2(b, p)
+        if run < 1 || run > n - i do Err("shape: a run of " ++ int_to_string(run) ++ " voxels with " ++ int_to_string(n - i) ++ " left")
+        else if form == 0 do
+          let k = NativeArray.get_u8(b, p + 2)
+          if k >= np do Err("shape: palette entry " ++ int_to_string(k) ++ " of " ++ int_to_string(np))
+          else
+            let id = NativeArray.get_i32(pal, k)
+            runs_in(b, len, p + 3, pal, np, form, if id == 0 do a else fill_run(a, i, run, id) end, i + run, n)
+          end
+        else
+          let id = get4(b, p + 2)
+          if id < 0 || id > 65535 do Err("shape: block id " ++ int_to_string(id))
+          else runs_in(b, len, p + 6, pal, np, form, if id == 0 do a else fill_run(a, i, run, id) end, i + run, n) end
+        end end
+      end
+    end
+  end
+
+  doc "The grid `encode` wrote at b[at ..], and the position after it; or why the bytes are not one. Nothing is read past b's end, and nothing larger than 128 cubed is made."
+  fn decode(b : NativeU8Arr, at : Int) : Result((Strata.Body.Grid, Int), String) do
+    let len = NativeArray.length_u8(b)
+    if at < 0 || at + 4 > len do Err("shape: too short for a grid's sizes")
+    else
+      let sx = NativeArray.get_u8(b, at)
+      let sy = NativeArray.get_u8(b, at + 1)
+      let sz = NativeArray.get_u8(b, at + 2)
+      let form = NativeArray.get_u8(b, at + 3)
+      if sx < 1 || sy < 1 || sz < 1 || sx > Bg.max_side() || sy > Bg.max_side() || sz > Bg.max_side() do Err("shape: a grid of " ++ int_to_string(sx) ++ " x " ++ int_to_string(sy) ++ " x " ++ int_to_string(sz))
+      else if form > 1 do Err("shape: form " ++ int_to_string(form))
+      else
+        let n = sx * sy * sz
+        let np = if form == 0 do (if at + 5 > len do -1 else NativeArray.get_u8(b, at + 4) + 1 end) else 0 end
+        let p0 = if form == 0 do at + 5 + 4 * (np - 1) else at + 4 end
+        if np < 0 || p0 > len do Err("shape: the palette runs past the end")
+        else
+          let pal = if form == 0 do pal_in(b, at + 5, NativeArray.make_i32(256, 0), 1, np) else NativeArray.make_i32(1, 0) end
+          match runs_in(b, len, p0, pal, np, form, NativeArray.make_i32(Strata.Size.of(n), 0), 0, n) do
+            Ok((a, p)) -> Ok((Strata.Body.Grid(sx, sy, sz, a), p))
+            Err(e) -> Err(e)
+          end
+        end
+      end end
+    end
+  end
+end
