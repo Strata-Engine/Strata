@@ -3058,6 +3058,76 @@ int64_t sv_footprint_blocked(double x0, double y0, double z0, double x1, double 
     return 0;
 }
 
+/* A frozen copy of both footprint frames, for a simulation step running on a worker
+ * thread while the main thread renders. sv_footprints_freeze copies the live sets
+ * (main thread only), dropping footprints whose slot is no longer in use, so
+ * sv_frozen_footprint_blocked reads nothing the renderer touches and never calls into
+ * Vulkan. The caller must not freeze again while a worker may still be querying. */
+static struct {
+    struct Footprint prints[2][SV_FOOTPRINTS];
+    unsigned count[2];
+    uint64_t grid[2][SV_FOOTPRINT_CELLS][SV_FOOTPRINT_WORDS];
+    uint64_t wide[2][SV_FOOTPRINT_WORDS];
+} frozen;
+
+void sv_footprints_freeze(void) {
+    for (unsigned frame = 0; frame < 2; frame++) {
+        unsigned n = g.ok ? footprint_count[frame] : 0;
+        frozen.count[frame] = n;
+        memcpy(frozen.prints[frame], footprints[frame], n * sizeof footprints[0][0]);
+        for (unsigned i = 0; i < n; i++) {
+            int64_t slot = frozen.prints[frame][i].slot;
+            if (slot < 0 || slot >= g.slot_cap || !(g.entries[slot].level_flags & SV_IN_USE))
+                frozen.prints[frame][i].slot = -1;
+        }
+        memcpy(frozen.grid[frame], footprint_grid[frame], sizeof frozen.grid[0]);
+        memcpy(frozen.wide[frame], footprint_wide[frame], sizeof frozen.wide[0]);
+    }
+}
+
+/* footprint_hit without the live slot check: freezing already cleared dead slots. */
+static int frozen_hit(const struct Footprint *v, double x0, double y0, double z0,
+                      double x1, double y1, double z1, int64_t ignore) {
+    if (v->slot < 0 || v->slot == ignore) return 0;
+    if (fmin(y0, y1) > v->y + 6.0 || fmax(y0, y1) < v->y - 4.0) return 0;
+    double ax = x0 - v->x, az = z0 - v->z, bx = x1 - v->x, bz = z1 - v->z;
+    double a = ax * v->dx + az * v->dz, b = bx * v->dx + bz * v->dz;
+    double side_a = az * v->dx - ax * v->dz, side_b = bz * v->dx - bx * v->dz;
+    if (fabs(a) <= v->half_length && fabs(side_a) <= v->half_width &&
+        bx * bx + bz * bz > ax * ax + az * az) return 0;
+    double first = 0.0, last = 1.0;
+    return footprint_axis(a, b, v->half_length, &first, &last) &&
+        footprint_axis(side_a, side_b, v->half_width, &first, &last);
+}
+
+/* sv_footprint_blocked against the frozen copy: safe on any thread. */
+int64_t sv_frozen_footprint_blocked(double x0, double y0, double z0, double x1, double y1, double z1, int64_t ignore) {
+    int cx0, cx1, cz0, cz1;
+    int gridded = footprint_cells(fmin(x0, x1), fmax(x0, x1), &cx0, &cx1) &&
+        footprint_cells(fmin(z0, z1), fmax(z0, z1), &cz0, &cz1);
+    for (unsigned frame = 0; frame < 2; frame++) {
+        if (!gridded) {
+            for (unsigned i = 0; i < frozen.count[frame]; i++)
+                if (frozen_hit(&frozen.prints[frame][i], x0, y0, z0, x1, y1, z1, ignore)) return 1;
+            continue;
+        }
+        uint64_t selected[SV_FOOTPRINT_WORDS];
+        memcpy(selected, frozen.wide[frame], sizeof selected);
+        for (int cz = cz0; cz <= cz1; cz++)
+            for (int cx = cx0; cx <= cx1; cx++) {
+                const uint64_t *cell = frozen.grid[frame][footprint_hash(cx, cz)];
+                for (unsigned w = 0; w < SV_FOOTPRINT_WORDS; w++) selected[w] |= cell[w];
+            }
+        for (unsigned w = 0; w < SV_FOOTPRINT_WORDS; w++)
+            for (uint64_t bits = selected[w]; bits; bits &= bits - 1) {
+                unsigned i = w * 64 + (unsigned)__builtin_ctzll(bits);
+                if (i < frozen.count[frame] &&
+                    frozen_hit(&frozen.prints[frame][i], x0, y0, z0, x1, y1, z1, ignore)) return 1;
+            }
+    }
+    return 0;
+}
+
 /* Immediate, unshadowed lights. A new batch replaces the previous frame's batch. */
 void sv_moving_lights_begin(int64_t headlights) {
     if (g.moving_lamp_count) g.lamp_version++;
