@@ -3128,6 +3128,39 @@ int64_t sv_frozen_footprint_blocked(double x0, double y0, double z0, double x1, 
     return 0;
 }
 
+/* Read back the footprints footprint_blocked tests, for a caller that wants to
+ * know where no vehicle can block before it builds a segment: set 0 is the
+ * current frame's, set 1 the previous frame's. */
+int64_t sv_footprint_count(int64_t set) {
+    if (set < 0 || set > 1) return 0;
+    return (int64_t)footprint_count[footprint_frame ^ (unsigned)set];
+}
+
+/* Bounds that hold every point the footprint can block: 0 the least x, 1 the
+ * greatest x, 2 the least z, 3 the greatest z, in voxels, as the broad phase
+ * grids them (a voxel wider than the footprint). A footprint the broad phase
+ * cannot grid answers -1e30 / 1e30, so it bounds everything. */
+double sv_footprint_bound(int64_t set, int64_t index, int64_t which) {
+    if (set < 0 || set > 1) return 0.0;
+    unsigned frame = footprint_frame ^ (unsigned)set;
+    if (index < 0 || index >= (int64_t)footprint_count[frame]) return 0.0;
+    const struct Footprint *v = &footprints[frame][index];
+    double n = v->dx * v->dx + v->dz * v->dz;
+    double hl = fabs(v->half_length), hw = fabs(v->half_width);
+    double rx = (hl * fabs(v->dx) + hw * fabs(v->dz)) / n + 1.0;
+    double rz = (hl * fabs(v->dz) + hw * fabs(v->dx)) / n + 1.0;
+    int c0, c1;
+    int gridded = n >= 0.25 && footprint_cells(v->x - rx, v->x + rx, &c0, &c1) &&
+        footprint_cells(v->z - rz, v->z + rz, &c0, &c1);
+    if (!gridded) return (which % 2 == 0) ? -1e30 : 1e30;
+    switch (which) {
+    case 0: return v->x - rx;
+    case 1: return v->x + rx;
+    case 2: return v->z - rz;
+    default: return v->z + rz;
+    }
+}
+
 /* Immediate, unshadowed lights. A new batch replaces the previous frame's batch. */
 void sv_moving_lights_begin(int64_t headlights) {
     if (g.moving_lamp_count) g.lamp_version++;
