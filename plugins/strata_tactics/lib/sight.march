@@ -1,0 +1,118 @@
+-- Sight — whether one tile sees another, and how much cover a tile has.
+--
+-- A line of sight is five voxel rays between points [eye] voxels above each
+-- tile's floor: the tiles' centres, and the centres moved a quarter tile
+-- along each diagonal (both ends alike). Clear when all five arrive, blocked
+-- when none does, partial otherwise. Only blocks that collide stop a ray, so
+-- water and glass-like see-through blocks the game makes non-colliding do
+-- not; a wall shot away opens the line at once.
+--
+-- Cover (XCOM's) is read per tile edge: over the columns just across the
+-- edge, the tallest run of colliding cells from the tile's floor up. Full
+-- when it reaches cs_full of the unit's height, half when it reaches
+-- cs_half, else none. The game decides what cover does.
+mod StrataTactics.Sight do
+
+  alias StrataTactics.Grid as SgG
+
+  doc "Every ray arrives."
+  fn clear() : Int do 0 end
+  doc "Some rays arrive."
+  fn partial() : Int do 1 end
+  doc "No ray arrives."
+  fn blocked() : Int do 2 end
+
+  pfn hits(w : Strata.World.World, a : (Float, Float, Float), b : (Float, Float, Float)) : Bool do
+    match (a, b) do
+      ((ax, ay, az), (bx, by0, bz)) ->
+        let dx = bx -. ax
+        let dy = by0 -. ay
+        let dz = bz -. az
+        let d = Math.sqrt(dx *. dx +. dy *. dy +. dz *. dz)
+        if d < 0.000001 do false
+        else
+          let r = Strata.World.registry(w)
+          let h = Strata.Query.raycast(w, ax, ay, az, dx, dy, dz, d, fn id -> Strata.Blocks.collides(r, id))
+          Strata.Query.is_hit(h) && Strata.Query.hit_dist(h) < d -. 0.0001
+        end
+    end
+  end
+
+  pfn eye_point(g : StrataTactics.Grid.TileGrid, t : (Int, Int), eye : Int, ox : Float, oz : Float) : (Float, Float, Float) do
+    match SgG.centre(g, t) do (x, _, z) -> (x +. ox, int_to_float(SgG.floor(g, t) + eye) *. SgG.scale(g) +. 0.0001, z +. oz) end
+  end
+
+  doc "Does tile [a], seen from [eye_a] voxels above its floor, see tile [b] at [eye_b] above its floor? clear, partial or blocked; a tile off the grid is blocked."
+  fn line(w : Strata.World.World, g : StrataTactics.Grid.TileGrid, a : (Int, Int), eye_a : Int, b : (Int, Int), eye_b : Int) : Int do
+    if !SgG.inside(g, a) || !SgG.inside(g, b) do blocked()
+    else
+      let q = int_to_float((SgG.settings_of(g)).gs_tile) *. SgG.scale(g) /. 4.0
+      let offs = [(0.0, 0.0), (q, q), (0.0 -. q, 0.0 -. q), (q, 0.0 -. q), (0.0 -. q, q)]
+      let arrived = List.length(List.filter(offs, fn o -> match o do (ox, oz) -> !hits(w, eye_point(g, a, eye_a, ox, oz), eye_point(g, b, eye_b, ox, oz)) end))
+      if arrived == 5 do clear() else if arrived == 0 do blocked() else partial() end end
+    end
+  end
+
+  doc "No cover."
+  fn none() : Int do 0 end
+  doc "Half cover."
+  fn half() : Int do 1 end
+  doc "Full cover."
+  fn full() : Int do 2 end
+
+  -- the share of a unit's height that gives half and full cover
+  type CoverSettings = { cs_half : Float, cs_full : Float }
+
+  doc "Cover thresholds: half from 0.4 of the unit's height, full from 0.8."
+  fn cover_settings() : CoverSettings do { cs_half: 0.4, cs_full: 0.8 } end
+
+  pfn run_up(w : Strata.World.World, x : Int, y : Int, z : Int, cap : Int, n : Int) : Int do
+    if n >= cap do cap
+    else if Strata.Blocks.collides(Strata.World.registry(w), Strata.World.get_block(w, x, y + n, z)) do run_up(w, x, y, z, cap, n + 1) else n end end
+  end
+
+  -- the columns just across edge dir of tile t: 0 +x, 1 -x, 2 +z, 3 -z
+  pfn edge_columns(g : StrataTactics.Grid.TileGrid, t : (Int, Int), dir : Int) : List((Int, Int)) do
+    let s = SgG.settings_of(g)
+    let n = s.gs_tile
+    match t do
+      (tx, tz) ->
+        let x0 = s.gs_x0 + tx * n
+        let z0 = s.gs_z0 + tz * n
+        if dir == 0 do List.map(List.range(0, n), fn i -> (x0 + n, z0 + i))
+        else if dir == 1 do List.map(List.range(0, n), fn i -> (x0 - 1, z0 + i))
+        else if dir == 2 do List.map(List.range(0, n), fn i -> (x0 + i, z0 + n))
+        else List.map(List.range(0, n), fn i -> (x0 + i, z0 - 1)) end end end
+    end
+  end
+
+  doc "The cover tile t's edge [dir] (0 +x, 1 -x, 2 +z, 3 -z) gives a unit [height] voxels tall: none, half or full."
+  fn edge(w : Strata.World.World, g : StrataTactics.Grid.TileGrid, t : (Int, Int), dir : Int, height : Int, s : CoverSettings) : Int do
+    if !SgG.inside(g, t) do none()
+    else
+      let f = SgG.floor(g, t)
+      let tallest = List.fold_left(edge_columns(g, t, dir), 0, fn (acc, c) -> match c do (x, z) -> Math.max_int(acc, run_up(w, x, f, z, height, 0)) end)
+      let h = int_to_float(height)
+      if int_to_float(tallest) >= s.cs_full *. h do full() else if int_to_float(tallest) >= s.cs_half *. h do half() else none() end end
+    end
+  end
+
+  doc "The cover tile t gives a unit [height] voxels tall against an attacker on tile [from]: the best of the edges facing it (both edges when the attacker is more than 22.5 degrees off an axis); none when [from] is t."
+  fn against(w : Strata.World.World, g : StrataTactics.Grid.TileGrid, t : (Int, Int), from : (Int, Int), height : Int, s : CoverSettings) : Int do
+    match (t, from) do
+      ((tx, tz), (fx, fz)) ->
+        let dx = fx - tx
+        let dz = fz - tz
+        if dx == 0 && dz == 0 do none()
+        else
+          let ax = int_to_float(int_abs(dx))
+          let az = int_to_float(int_abs(dz))
+          let xedge = if dx > 0 do 0 else 1 end
+          let zedge = if dz > 0 do 2 else 3 end
+          let both = Math.min_int(int_abs(dx), int_abs(dz)) > 0 && (if ax < az do ax /. az else az /. ax end) > 0.41421356
+          let edges = if both do [xedge, zedge] else if ax >= az do [xedge] else [zedge] end end
+          List.fold_left(edges, none(), fn (acc, e) -> Math.max_int(acc, edge(w, g, t, e, height, s)))
+        end
+    end
+  end
+end
