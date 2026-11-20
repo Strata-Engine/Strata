@@ -147,4 +147,57 @@ mod StrataKit.Damage do
         (rest, List.flat_map(rps, fn rp -> loose_of(rig, rp, pose, debris, shatter)))
     end
   end
+
+  -- ── Settling into rubble ─────────────────────────────────────────────────
+
+  -- count fine voxel [id] into world cell c: cells as (cell, [(id, count)])
+  pfn tally(acc : List(((Int, Int, Int), List((Int, Int)))), c : (Int, Int, Int), id : Int) : List(((Int, Int, Int), List((Int, Int)))) do
+    match acc do
+      Nil -> [(c, [(id, 1)])]
+      Cons((k, ids), rest) ->
+        if k == c do Cons((k, bump(ids, id)), rest) else Cons((k, ids), tally(rest, c, id)) end
+    end
+  end
+  pfn bump(ids : List((Int, Int)), id : Int) : List((Int, Int)) do
+    match ids do Nil -> [(id, 1)] | Cons((i, n), rest) -> if i == id do Cons((i, n + 1), rest) else Cons((i, n), bump(rest, id)) end end
+  end
+  pfn total_of(ids : List((Int, Int))) : Int do List.fold_left(ids, 0, fn (a, e) -> match e do (_, n) -> a + n end) end
+  -- the most common id; ties go to the lower id
+  pfn commonest(ids : List((Int, Int))) : Int do
+    match List.fold_left(ids, (0, -1), fn (best, e) -> match (best, e) do ((bi, bn), (i, n)) -> if n > bn || (n == bn && i < bi) do (i, n) else (bi, bn) end end) do (i, _) -> i end
+  end
+  pfn floor_div(v : Float, s : Float) : Int do float_to_int(Math.floor(v /. s)) end
+
+  pfn cell_free(w : Strata.World.World, x : Int, y : Int, z : Int) : Bool do
+    let loaded = Strata.World.is_loaded(w, Strata.Coord.key(Strata.Coord.chunk_of(x), Strata.Coord.chunk_of(y), Strata.Coord.chunk_of(z)))
+    loaded && !Strata.Blocks.collides(Strata.World.registry(w), Strata.World.get_block(w, x, y, z))
+  end
+
+  pfn before(a : (Int, Int, Int), b : (Int, Int, Int)) : Bool do
+    match (a, b) do ((ax, ay, az), (bx, by0, bz)) -> ax < bx || (ax == bx && (ay < by0 || (ay == by0 && az < bz))) end
+  end
+
+  doc "The edits that stamp a resting loose piece into the world as blocks: its fine grid (k x k x k fine voxels to a world voxel; k is 1, 2, 4 or 8) at [corner] (metres) turned by [q], resampled to the world's voxels. A world cell is filled when at least half its fine voxels are solid, with the commonest block among them; cells already solid, in chunks not loaded, or that [occupied] says a figure stands in are left alone. One edit per filled cell, in x, y, z order, for Strata.Plugin.apply; the game then removes the piece's body."
+  fn settle(w : Strata.World.World, g : Strata.Body.Grid, corner : (Float, Float, Float), q : (Float, Float, Float, Float), k : Int, occupied : Int -> Int -> Int -> Bool) : List(Strata.Plugin.Request) do
+    let sc = Strata.World.scale(w)
+    let fv = sc /. int_to_float(if k < 1 do 1 else k end)
+    let sx = Strata.Body.size_x(g)
+    let sy = Strata.Body.size_y(g)
+    let sz = Strata.Body.size_z(g)
+    let cells = List.fold_left(List.range(0, sx * sy * sz), Nil, fn (acc, i) ->
+      let x = i % sx
+      let y = (i / sx) % sy
+      let z = i / (sx * sy)
+      let id = Strata.Body.grid_get(g, x, y, z)
+      if id == 0 do acc
+      else
+        match add3(corner, rot(q, ((int_to_float(x) +. 0.5) *. fv, (int_to_float(y) +. 0.5) *. fv, (int_to_float(z) +. 0.5) *. fv))) do
+          (px, py, pz) -> tally(acc, (floor_div(px, sc), floor_div(py, sc), floor_div(pz, sc)), id)
+        end
+      end)
+    let half = (k * k * k + 1) / 2
+    let kept = List.filter(cells, fn e -> match e do ((x, y, z), ids) -> total_of(ids) >= half && cell_free(w, x, y, z) && !occupied(x, y, z) end)
+    let sorted = List.sort_by(kept, fn (a, b) -> match (a, b) do ((ca, _), (cb, _)) -> before(ca, cb) end)
+    List.map(sorted, fn e -> match e do ((x, y, z), ids) -> Strata.Plugin.edit(Strata.World.op_cell(x, y, z, commonest(ids))) end)
+  end
 end
