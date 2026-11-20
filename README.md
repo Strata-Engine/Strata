@@ -434,8 +434,7 @@ Strata.Render.draw_ui(u4)                                  -- one draw call, in 
 
 Limits:
 
-- Few widgets: a slider and a one-line text field (`Strata.Controls`; typing
-  is under Input below); no layout engine.
+- Widgets and layout are the toolkit's (`Strata.Gui`, below).
 - The whole display is rebuilt each frame. The layer holds 16 384 quads;
   more are dropped from the end and `Strata.Render.ui_dropped` says how many.
 - Lines break at spaces and between Chinese, Japanese and Korean
@@ -458,6 +457,68 @@ Limits:
 ![Text from 8 to 200 pixels](docs/ui-text-sheet.png)
 ![Wrapping, alignment, outline, shadow, mixed runs](docs/ui-text-styles.png)
 ![Six scripts, mixed direction, kerning and ligatures](docs/ui-text-scripts.png)
+## Interface toolkit
+
+`Strata.Gui` builds menus, settings screens and inventories on top of the
+display layer. A game describes a screen afresh each frame as data; Strata
+works out the rectangles, what the pointer, keys and pad did, and what to
+draw. The values shown stay the game's.
+
+```
+let t = Strata.GuiDraw.theme()                                   -- the plain default, measured by Strata.Text
+let screen = [Strata.Gui.place(Strata.Ui.centre(), 0.0, 0.0,
+  Strata.Gui.panel(Strata.Gui.fixed(480.0), Strata.Gui.fit(), [
+    Strata.Gui.label("Settings"),
+    Strata.Gui.slider("volume", "Volume", volume, 0.0, 1.0, 0.05),
+    Strata.Gui.toggle("shadows", "Shadows", shadows),
+    Strata.Gui.choice("quality", "Quality", ["low", "high"], quality),
+    Strata.Gui.field("name", "Name", name, 24),
+    Strata.Gui.row(Strata.Gui.share(1.0), Strata.Gui.fit(), [Strata.Gui.button("ok", "OK")])]))]
+let frame = Strata.GuiDraw.sample(ui_input, 1.0, true)          -- pointer, button, wheel, typing, the ui_ actions
+let (gui, r) = Strata.Gui.run(gui0, t, frame, Strata.Ui.width(u0), Strata.Ui.height(u0), screen)
+let volume2 = unwrap_or(Strata.Gui.changed(r, "volume"), volume)
+let u1 = Strata.GuiDraw.paint(u0, r)
+```
+
+- **Layout.** `row`, `column`, `panel` and `scroll` hold children with the
+  theme's padding and gap (`with_pad`, `with_gap`). A size is `fixed(px)`,
+  `fit()` or `share(weight)` of what the parent has left (across its axis, the
+  parent's whole inside; at the top of a layer, a share of the window). A
+  layer is placed by one of `Strata.Ui`'s nine anchors; the UI scale is
+  `Strata.Ui`'s.
+- **Widgets.** `label`, `button`, `toggle`, `slider` (range and step),
+  `field` (one line, through `Strata.Controls.text_edit`), `choice` (drops
+  down a list over everything), `scroll` (a list with a wheel, a draggable
+  bar, and focus kept in view), `space`.
+- **Interaction** by a stable string id: `hovered`, `active` (holding the
+  pointer: a dragged slider follows it anywhere), `clicked`, `changed`,
+  `toggled`, `chose`, `edited`, `submitted`, `went_back`, `rect`, and
+  `pointer_over` so the game does not act on the world under a menu.
+- **Keys and pad** come through `Strata.Input` actions a game may rebind:
+  `Strata.Gui.bindings()` maps `ui_next` (Tab, right bumper), `ui_prev` (left
+  bumper, Shift-Tab), `ui_up/down/left/right` (arrows, d-pad, left stick),
+  `ui_activate` (Enter, Space, pad south) and `ui_back` (Escape, pad east).
+  Focus moves in tree order or to the nearest control in a direction; a
+  focused slider steps on left and right; an open list takes up and down.
+- **Theme** is a record (`gt_` fields: font, size, padding, gap, control
+  height, label column, colours); `Strata.Gui.theme(measure)` is a plain dark
+  default.
+- **Headless.** `Strata.Gui` calls no C: with `pitch_measure` a test feeds a
+  layout and raw input and gets rectangles and events (`test/gui_test.march`).
+
+The viewer's settings screen (F1, or the pad's right stick click;
+`viewer/lib/settings.march`) is built with it: four generation settings
+applied by regenerating, the light mode, the voxel scale (on the next
+start), the readout, and the settings file to read.
+
+Limits:
+
+- No scissor: text crossing a scroll region's edge is left out, not cut.
+- No retained tree, animation, tooltips, drag and drop, or windows the player
+  moves; a field is one line, without selection or clipboard.
+- Ids must be stable and unique on a screen; the game keeps them so.
+- The pad paths are tested on raw states; no physical pad was used.
+
 ## Input
 
 `Strata.Ffi.Vk` reads the window raw: is a key held, is a mouse button
@@ -1174,6 +1235,7 @@ boundary over the ground; their numbers are in `RESULTS.md`.
 | `Strata.Template`, `Strata.Ffi.Vox` | voxel templates (holes, probabilities, turns) blitted into chunks; MagicaVoxel `.vox` import (`native/strata_vox.cpp`, link with `-fno-exceptions`) |
 | `Strata.Entities`, `Strata.Ffi.Ent` | entity kinds, and entities kept as rows by the C kernel in `native/strata_ent.h` |
 | `Strata.Input` | a game's named actions bound as data to keys, mouse buttons and a gamepad: held, pressed, released, value; dead zones |
+| `Strata.Gui`, `Strata.GuiDraw` | the interface toolkit: rows, columns, sizes, anchors; widgets; hover, capture, focus by key and pad, scrolling, typing; theme as data; painting into `Strata.Ui` |
 | `Strata.Controls` | immediate-mode controls: a slider, a text field, and typed input applied to a string |
 | `Strata.Particles` | particle effects as data, emitters, the bursts a frame hands the renderer |
 | `Strata.Ffi.Vk` | window, raw input (keys, mouse, gamepads, typed characters) and the Vulkan renderer |

@@ -1,0 +1,380 @@
+-- Gui: layout, hit testing, capture, focus, scrolling, text entry and
+-- choice lists, fed raw input with no window. Text is measured at a fixed
+-- pitch: at the default 16-pixel size a byte is 8 pixels wide, a line 20 high.
+-- The default theme: padding 10, gap 8, control height 30, least width 120.
+mod Strata.Test.Gui do
+  needs IO.Clock
+  needs IO.Process
+  import Test
+  alias Strata.Gui as G
+
+  pfn th() : Strata.Gui.GTheme do G.theme(G.pitch_measure(0.5)) end
+
+  pfn near(a : Float, b : Float) : Bool do Math.abs(a -. b) < 0.01 end
+
+  pfn is_rect(r : Strata.Gui.GResult, id : String, x : Float, y : Float, w : Float, h : Float) : Bool do
+    match G.rect(r, id) do
+      Some((rx, ry, rw, rh)) -> near(rx, x) && near(ry, y) && near(rw, w) && near(rh, h)
+      None -> false
+    end
+  end
+
+  -- the actions pressed on this frame (held now, not on the frame before)
+  pfn keys(ks : List(Int)) : Strata.Input.Input do
+    let i0 = Strata.Input.start(Strata.Input.new(G.bindings()))
+    Strata.Input.step(Strata.Input.step(i0, Strata.Input.idle()), Strata.Input.raw(ks, Nil, Nil, Nil))
+  end
+
+  pfn pad(bs : List(Int)) : Strata.Input.Input do
+    let i0 = Strata.Input.start(Strata.Input.new(G.bindings()))
+    Strata.Input.step(Strata.Input.step(i0, Strata.Input.idle()), Strata.Input.raw(Nil, Nil, bs, Nil))
+  end
+
+  pfn none() : Strata.Input.Input do keys(Nil) end
+
+  -- a frame on an 800 x 600 screen
+  pfn go(st : Strata.Gui.GState, layers : List(Strata.Gui.GLayer), p : Option((Float, Float)), down : Bool, wheel : Float, typed : List(Int), inp : Strata.Input.Input) : (Strata.Gui.GState, Strata.Gui.GResult) do
+    G.run(st, th(), G.frame(p, down, wheel, typed, inp), 800.0, 600.0, layers)
+  end
+
+  pfn look(st : Strata.Gui.GState, layers : List(Strata.Gui.GLayer)) : Strata.Gui.GResult do
+    match go(st, layers, None, false, 0.0, Nil, none()) do (_, r) -> r end
+  end
+
+  pfn at(x : Float, y : Float) : Option((Float, Float)) do Some((x, y)) end
+
+  -- press then release at a point: the state and both frames' events
+  pfn click(st : Strata.Gui.GState, layers : List(Strata.Gui.GLayer), x : Float, y : Float) : (Strata.Gui.GState, List(Strata.Gui.GEvent)) do
+    let (s1, r1) = go(st, layers, at(x, y), true, 0.0, Nil, none())
+    let (s2, r2) = go(s1, layers, at(x, y), false, 0.0, Nil, none())
+    (s2, List.append(G.events(r1), G.events(r2)))
+  end
+
+  pfn key(st : Strata.Gui.GState, layers : List(Strata.Gui.GLayer), ks : List(Int)) : (Strata.Gui.GState, Strata.Gui.GResult) do
+    go(st, layers, None, false, 0.0, Nil, keys(ks))
+  end
+
+  pfn has(evs : List(Strata.Gui.GEvent), e : Strata.Gui.GEvent) : Bool do List.any(evs, fn x -> x == e) end
+
+  pfn three() : List(Strata.Gui.GLayer) do
+    [G.place(0, 0.0, 0.0, G.column(G.fit(), G.fit(), [G.button("a", "A"), G.button("b", "B"), G.button("c", "C")]))]
+  end
+
+  pfn grid() : List(Strata.Gui.GLayer) do
+    [G.place(0, 0.0, 0.0, G.column(G.fit(), G.fit(), [
+      G.row(G.fit(), G.fit(), [G.button("a", "A"), G.button("b", "B")]),
+      G.row(G.fit(), G.fit(), [G.button("c", "C"), G.button("d", "D")])]))]
+  end
+
+  pfn ten() : List(Strata.Gui.GNode) do List.map(List.range(0, 10), fn i -> G.button("b" ++ int_to_string(i), "item " ++ int_to_string(i))) end
+
+  pfn list_screen() : List(Strata.Gui.GLayer) do
+    [G.place(0, 0.0, 0.0, G.scroll("list", G.fixed(200.0), G.fixed(100.0), ten()))]
+  end
+
+  pfn words_count(r : Strata.Gui.GResult) : Int do
+    List.length(List.filter(G.draws(r), fn d -> Option.is_some(G.draw_text(d))))
+  end
+
+  pfn form(v : String) : List(Strata.Gui.GLayer) do
+    [G.place(0, 0.0, 0.0, G.column(G.fit(), G.fit(), [G.field("f", "Name", v, 8), G.button("ok", "OK")]))]
+  end
+
+  pfn pick() : List(Strata.Gui.GLayer) do
+    [G.place(0, 0.0, 0.0, G.column(G.fit(), G.fit(), [G.choice("light", "Light", ["off", "sun", "shadows"], 0), G.button("ok", "OK")]))]
+  end
+
+  describe "Gui layout" do
+    test "a column fits its children, with padding and a gap" do
+      let r = look(G.start(), three())
+      Test.assert_true(is_rect(r, "a", 10.0, 10.0, 120.0, 30.0), "the first button: padding in, the least width")
+      Test.assert_true(is_rect(r, "b", 10.0, 48.0, 120.0, 30.0), "the second: one gap down")
+      Test.assert_true(match G.roots(r) do Cons((_, _, w, h), _) -> near(w, 140.0) && near(h, 126.0) | _ -> false end, "the column: 120 + 20 wide, 3 x 30 + 2 x 8 + 20 high")
+    end
+
+    test "fixed and fitted children take theirs first, and shares split the rest by weight" do
+      let r = look(G.start(), [G.place(0, 0.0, 0.0, G.row(G.fixed(400.0), G.fit(), [
+        G.sized(G.button("p", "P"), G.fixed(100.0), G.fit()),
+        G.space(G.share(1.0), G.fit()),
+        G.sized(G.button("q", "Q"), G.share(2.0), G.fit())]))])
+      -- inside 380, two gaps 16: 364 left, 100 fixed, 264 for three weights
+      Test.assert_true(is_rect(r, "p", 10.0, 10.0, 100.0, 30.0), "fixed")
+      Test.assert_true(is_rect(r, "q", 214.0, 10.0, 176.0, 30.0), "two shares of 88, after one share of space")
+    end
+
+    test "a share across fills the parent's inside, and a share never goes below nothing" do
+      let r = look(G.start(), [G.place(0, 0.0, 0.0, G.column(G.fixed(300.0), G.fit(), [G.sized(G.button("w", "Wide"), G.share(1.0), G.fit())]))])
+      Test.assert_true(is_rect(r, "w", 10.0, 10.0, 280.0, 30.0), "across a column")
+      let r2 = look(G.start(), [G.place(0, 0.0, 0.0, G.row(G.fixed(100.0), G.fit(), [G.sized(G.button("x", "X"), G.fixed(200.0), G.fit()), G.sized(G.button("y", "Y"), G.share(1.0), G.fit())]))])
+      Test.assert_true(match G.rect(r2, "y") do Some((_, _, w, _)) -> near(w, 0.0) | None -> false end, "no room left: zero wide")
+    end
+
+    test "padding and gap can be set on a group" do
+      let r = look(G.start(), [G.place(0, 0.0, 0.0, G.with_gap(G.with_pad(G.column(G.fit(), G.fit(), [G.button("a", "A"), G.button("b", "B")]), 0.0), 2.0))])
+      Test.assert_true(is_rect(r, "a", 0.0, 0.0, 120.0, 30.0), "no padding")
+      Test.assert_true(is_rect(r, "b", 0.0, 32.0, 120.0, 30.0), "a gap of 2")
+    end
+
+    test "a layer sits by its anchor, and a share at the top is a share of the window" do
+      let b = G.sized(G.button("k", "K"), G.fixed(100.0), G.fixed(50.0))
+      Test.assert_true(is_rect(look(G.start(), [G.place(8, -5.0, -5.0, b)]), "k", 695.0, 545.0, 100.0, 50.0), "bottom right")
+      Test.assert_true(is_rect(look(G.start(), [G.place(4, 0.0, 0.0, b)]), "k", 350.0, 275.0, 100.0, 50.0), "centre")
+      Test.assert_true(is_rect(look(G.start(), [G.place(1, 0.0, 12.0, b)]), "k", 350.0, 12.0, 100.0, 50.0), "top middle")
+      let r = look(G.start(), [G.place(2, 0.0, 0.0, G.panel(G.share(0.5), G.share(1.0), Nil))])
+      Test.assert_true(match G.roots(r) do Cons((x, y, w, h), _) -> near(x, 400.0) && near(y, 0.0) && near(w, 400.0) && near(h, 600.0) | _ -> false end, "half the window, at the right")
+    end
+
+    test "widgets fit their labels, and a theme's label column lines them up" do
+      let r = look(G.start(), [G.place(0, 0.0, 0.0, G.column(G.fit(), G.fit(), [G.toggle("t", "Shadows", false), G.label("Hello")]))])
+      Test.assert_true(match G.roots(r) do Cons((_, _, w, _), _) -> near(w, 18.0 +. 8.0 +. 56.0 +. 20.0) | _ -> false end, "a toggle: box, gap, seven letters")
+      let t2 = { th() with gt_label_w: 100.0 }
+      let (_, r2) = G.run(G.start(), t2, G.frame(None, false, 0.0, Nil, none()), 800.0, 600.0, [G.place(0, 0.0, 0.0, G.column(G.fit(), G.fit(), [G.field("f", "Name", "", 10)]))])
+      Test.assert_true(match G.rect(r2, "f") do Some((_, _, w, _)) -> near(w, 108.0 +. 240.0) | None -> false end, "label column, gap, two least widths")
+    end
+  end
+
+  describe "Gui hit testing" do
+    test "the control under the pointer is hovered, and the pointer is over the layer" do
+      let (_, r) = go(G.start(), three(), at(20.0, 55.0), false, 0.0, Nil, none())
+      Test.assert_true(G.hovered(r) == "b", "over b")
+      Test.assert_true(G.pointer_over(r), "over the column")
+      let (_, r2) = go(G.start(), three(), at(500.0, 500.0), false, 0.0, Nil, none())
+      Test.assert_true(G.hovered(r2) == "" && !G.pointer_over(r2), "over nothing")
+      let (_, r3) = go(G.start(), three(), at(5.0, 5.0), false, 0.0, Nil, none())
+      Test.assert_true(G.hovered(r3) == "" && G.pointer_over(r3), "in the padding: over the layer, no control")
+    end
+
+    test "a later layer is over an earlier one" do
+      let ls = [G.place(0, 0.0, 0.0, G.sized(G.button("under", "U"), G.fixed(200.0), G.fixed(200.0))),
+                G.place(0, 50.0, 50.0, G.sized(G.button("over", "O"), G.fixed(50.0), G.fixed(50.0)))]
+      let (_, r) = go(G.start(), ls, at(60.0, 60.0), false, 0.0, Nil, none())
+      Test.assert_true(G.hovered(r) == "over", "the top one")
+      let (_, r2) = go(G.start(), ls, at(150.0, 150.0), false, 0.0, Nil, none())
+      Test.assert_true(G.hovered(r2) == "under", "beside it, the one under")
+    end
+  end
+
+  describe "Gui press, capture and click" do
+    test "a click is down and up over the same control" do
+      let (_, evs) = click(G.start(), three(), 20.0, 55.0)
+      Test.assert_true(has(evs, Strata.Gui.Clicked("b")), "clicked b")
+      Test.assert_eq_int(List.length(evs), 1, "once")
+    end
+
+    test "released somewhere else is no click, and the control stays active while held" do
+      let (s1, r1) = go(G.start(), three(), at(20.0, 55.0), true, 0.0, Nil, none())
+      Test.assert_true(G.active(r1) == "b", "b went active")
+      let (s2, r2) = go(s1, three(), at(20.0, 15.0), true, 0.0, Nil, none())
+      Test.assert_true(G.active(r2) == "b" && G.hovered(r2) == "a", "still b while over a")
+      let (_, r3) = go(s2, three(), at(20.0, 15.0), false, 0.0, Nil, none())
+      Test.assert_true(is_nil(G.events(r3)) && G.active(r3) == "", "no click, nothing active")
+    end
+
+    test "a slider follows a dragged pointer past its ends, snapped to its step" do
+      -- 300 wide, no label: the track runs from 6 for 264 (the value's text "10" and a gap take 24)
+      let ls = [G.place(0, 0.0, 0.0, G.sized(G.slider("s", "", 2.0, 0.0, 10.0, 1.0), G.fixed(300.0), G.fit()))]
+      let (s1, r1) = go(G.start(), ls, at(140.0, 15.0), true, 0.0, Nil, none())
+      Test.assert_true(has(G.events(r1), Strata.Gui.Changed("s", 5.0)), "half way: 5")
+      let (s2, r2) = go(s1, ls, at(1000.0, 400.0), true, 0.0, Nil, none())
+      Test.assert_true(has(G.events(r2), Strata.Gui.Changed("s", 10.0)), "dragged off the end and away: 10")
+      let (_, r3) = go(s2, ls, at(-50.0, 15.0), true, 0.0, Nil, none())
+      Test.assert_true(has(G.events(r3), Strata.Gui.Changed("s", 0.0)), "the other way: 0")
+    end
+
+    test "a press focuses what it lands on; a press on nothing clears focus" do
+      let (s1, _) = click(G.start(), three(), 20.0, 95.0)
+      Test.assert_true(G.focused(s1) == "c", "c focused")
+      let (s2, _) = click(s1, three(), 600.0, 500.0)
+      Test.assert_true(G.focused(s2) == "", "cleared")
+    end
+  end
+
+  describe "Gui focus" do
+    test "next and previous walk the controls in order and wrap" do
+      let (s1, _) = key(G.start(), three(), [258])
+      Test.assert_true(G.focused(s1) == "a", "Tab from nothing: the first")
+      let (s2, _) = key(s1, three(), [258])
+      Test.assert_true(G.focused(s2) == "b", "Tab: the next")
+      let (s3, _) = go(s2, three(), None, false, 0.0, Nil, pad([4]))
+      Test.assert_true(G.focused(s3) == "a", "the left bumper: back one")
+      let (s4, _) = key(s3, three(), [340, 258])
+      Test.assert_true(G.focused(s4) == "c", "Shift-Tab from the first wraps to the last")
+      let (s5, _) = go(s4, three(), None, false, 0.0, Nil, pad([5]))
+      Test.assert_true(G.focused(s5) == "a", "the right bumper from the last wraps to the first")
+      Test.assert_true(match look(G.start(), three()) do r -> G.focus_order(r) == ["a", "b", "c"] end, "the order")
+    end
+
+    test "a direction moves to the nearest control that way" do
+      let s0 = G.focus(G.start(), "a")
+      let (s1, _) = key(s0, grid(), [262])
+      Test.assert_true(G.focused(s1) == "b", "right")
+      let (s2, _) = key(s1, grid(), [264])
+      Test.assert_true(G.focused(s2) == "d", "down")
+      let (s3, _) = go(s2, grid(), None, false, 0.0, Nil, pad([14]))
+      Test.assert_true(G.focused(s3) == "c", "the d-pad's left")
+      let (s4, _) = key(s3, grid(), [265])
+      Test.assert_true(G.focused(s4) == "a", "up")
+      let (s5, _) = key(s4, grid(), [265])
+      Test.assert_true(G.focused(s5) == "a", "nothing above: stays")
+    end
+
+    test "the left stick moves focus as the d-pad does" do
+      let i0 = Strata.Input.start(Strata.Input.new(G.bindings()))
+      let stick = Strata.Input.step(Strata.Input.step(i0, Strata.Input.idle()), Strata.Input.raw(Nil, Nil, Nil, [0.9, 0.0]))
+      let (s1, _) = go(G.focus(G.start(), "a"), grid(), None, false, 0.0, Nil, stick)
+      Test.assert_true(G.focused(s1) == "b", "pushed right")
+    end
+
+    test "focus on a control that has gone falls to the first when a key moves it" do
+      let (s1, _) = key(G.focus(G.start(), "gone"), three(), [264])
+      Test.assert_true(G.focused(s1) == "a", "recovered")
+    end
+
+    test "a key shows the focus ring and a moving pointer hides it" do
+      let (s1, _) = key(G.start(), three(), [258])
+      let (s2, _) = go(s1, three(), at(300.0, 300.0), false, 0.0, Nil, none())
+      let (s3, _) = go(s2, three(), at(320.0, 300.0), false, 0.0, Nil, none())
+      Test.assert_true(s1.gs_ring && s2.gs_ring && !s3.gs_ring, "shown, kept while still, hidden on moving")
+    end
+  end
+
+  describe "Gui activation" do
+    test "Enter, Space and pad south press the focused control" do
+      let ls = [G.place(0, 0.0, 0.0, G.column(G.fit(), G.fit(), [G.button("go", "Go"), G.toggle("t", "Shadows", false), G.slider("s", "Sea", 40.0, 20.0, 60.0, 2.0)]))]
+      let (_, r1) = key(G.focus(G.start(), "go"), ls, [257])
+      Test.assert_true(has(G.events(r1), Strata.Gui.Clicked("go")), "Enter clicks")
+      let (_, r2) = key(G.focus(G.start(), "t"), ls, [32])
+      Test.assert_true(has(G.events(r2), Strata.Gui.Toggled("t", true)), "Space flips")
+      let (_, r3) = go(G.focus(G.start(), "go"), ls, None, false, 0.0, Nil, pad([0]))
+      Test.assert_true(has(G.events(r3), Strata.Gui.Clicked("go")), "pad south clicks")
+      let (s4, r4) = key(G.focus(G.start(), "s"), ls, [262])
+      Test.assert_true(has(G.events(r4), Strata.Gui.Changed("s", 42.0)) && G.focused(s4) == "s", "right steps a slider and keeps focus")
+      let (_, r5) = key(G.focus(G.start(), "s"), ls, [263])
+      Test.assert_true(has(G.events(r5), Strata.Gui.Changed("s", 38.0)), "left steps it down")
+    end
+
+    test "back is reported for the game" do
+      let (_, r) = key(G.start(), three(), [256])
+      Test.assert_true(G.went_back(r), "Escape")
+    end
+
+    test "the wheel steps a slider under the pointer" do
+      let ls = [G.place(0, 0.0, 0.0, G.sized(G.slider("s", "", 5.0, 0.0, 10.0, 1.0), G.fixed(300.0), G.fit()))]
+      let (_, r) = go(G.start(), ls, at(100.0, 15.0), false, 1.0, Nil, none())
+      Test.assert_true(has(G.events(r), Strata.Gui.Changed("s", 6.0)), "up one")
+    end
+
+    test "the drawn value is this frame's new one" do
+      let ls = [G.place(0, 0.0, 0.0, G.sized(G.slider("s", "", 2.0, 0.0, 10.0, 1.0), G.fixed(300.0), G.fit()))]
+      let (_, r) = key(G.focus(G.start(), "s"), ls, [262])
+      Test.assert_true(List.any(G.draws(r), fn d -> G.draw_text(d) == Some("3")), "shows 3")
+    end
+  end
+
+  describe "Gui scrolling" do
+    test "the wheel moves a region, held at both ends" do
+      -- ten buttons 30 high with gaps of 8 and padding: 392 tall in a view of 100, so it moves 292 at most
+      let (s1, _) = go(G.start(), list_screen(), at(50.0, 50.0), false, -1.0, Nil, none())
+      Test.assert_true(near(G.scroll_offset(s1, "list"), 45.0), "down one notch: a line and a half")
+      let (s2, _) = go(G.start(), list_screen(), at(50.0, 50.0), false, 1.0, Nil, none())
+      Test.assert_true(near(G.scroll_offset(s2, "list"), 0.0), "up from the top: stays")
+      let (s3, _) = go(G.set_scroll(G.start(), "list", 280.0), list_screen(), at(50.0, 50.0), false, -1.0, Nil, none())
+      Test.assert_true(near(G.scroll_offset(s3, "list"), 292.0), "past the end: held at the end")
+    end
+
+    test "a scrolled region moves its contents, and what is outside is neither drawn nor hit" do
+      let r = look(G.set_scroll(G.start(), "list", 38.0), list_screen())
+      Test.assert_true(match G.rect(r, "b1") do Some((_, y, _, _)) -> near(y, 10.0) | None -> false end, "b1 where b0 was")
+      Test.assert_true(words_count(r) < 10, "only the rows inside the view have text")
+      let (_, r2) = go(G.start(), list_screen(), at(50.0, 120.0), false, 0.0, Nil, none())
+      Test.assert_true(G.hovered(r2) == "", "a row below the view is not hit")
+    end
+
+    test "dragging the thumb scrolls" do
+      -- the bar: 8 wide at x 190, from y 4 for 92; the thumb 100/392 of it at the top
+      let (s1, _) = go(G.start(), list_screen(), at(194.0, 10.0), true, 0.0, Nil, none())
+      let (s2, r2) = go(s1, list_screen(), at(194.0, 400.0), true, 0.0, Nil, none())
+      Test.assert_true(near(G.scroll_offset(s2, "list"), 292.0), "dragged to the bottom")
+      Test.assert_true(G.active(r2) == "list#bar", "the bar holds the pointer")
+    end
+
+    test "focus moved by key is kept inside the view" do
+      let (s1, _) = key(G.focus(G.start(), "b3"), list_screen(), [264])
+      Test.assert_true(G.focused(s1) == "b4", "down to b4")
+      -- b4 sits at 10 + 4 x 38 = 162 to 192; the view keeps 4 pixels clear of its bottom at 100
+      Test.assert_true(near(G.scroll_offset(s1, "list"), 96.0), "scrolled so b4 ends just inside")
+      let (s2, _) = key(s1, list_screen(), [340, 258])
+      let (s3, _) = key(G.focus(s2, "b1"), list_screen(), [265])
+      Test.assert_true(G.focused(s3) == "b0" && near(G.scroll_offset(s3, "list"), 0.0), "back up to the top")
+    end
+  end
+
+  describe "Gui text entry" do
+    test "typing goes into the focused field only" do
+      let (_, r) = go(G.focus(G.start(), "f"), form(""), None, false, 0.0, [104, 105], none())
+      Test.assert_true(has(G.events(r), Strata.Gui.Edited("f", "hi")), "typed in")
+      let (_, r2) = go(G.focus(G.start(), "ok"), form(""), None, false, 0.0, [104, 105], none())
+      Test.assert_true(is_nil(G.events(r2)), "not focused: nothing")
+    end
+
+    test "the caret is kept from frame to frame, and the limit holds" do
+      let (s1, _) = go(G.focus(G.start(), "f"), form(""), None, false, 0.0, [104, 105], none())
+      let (_, r2) = go(s1, form("hi"), None, false, 0.0, [-263, 120], none())
+      Test.assert_true(has(G.events(r2), Strata.Gui.Edited("f", "hxi")), "left, then x, before the i")
+      let (_, r3) = go(G.focus(G.start(), "f"), form("abcdefgh"), None, false, 0.0, [105], none())
+      Test.assert_true(is_nil(G.events(r3)), "full: nothing goes in")
+    end
+
+    test "Enter submits; a typed space is a space; a pad's activation submits" do
+      let (_, r1) = go(G.focus(G.start(), "f"), form("hi"), None, false, 0.0, [-257], keys([257]))
+      Test.assert_true(has(G.events(r1), Strata.Gui.Submitted("f")), "Enter")
+      let (_, r2) = go(G.focus(G.start(), "f"), form("hi"), None, false, 0.0, [32], keys([32]))
+      Test.assert_true(has(G.events(r2), Strata.Gui.Edited("f", "hi ")) && !has(G.events(r2), Strata.Gui.Submitted("f")), "Space types")
+      let (_, r3) = go(G.focus(G.start(), "f"), form("hi"), None, false, 0.0, Nil, pad([0]))
+      Test.assert_true(has(G.events(r3), Strata.Gui.Submitted("f")), "pad south")
+    end
+
+    test "left and right move the caret, not the focus, while up and down leave the field" do
+      let (s1, _) = go(G.focus(G.start(), "f"), form("hi"), None, false, 0.0, [-263], keys([263]))
+      Test.assert_true(G.focused(s1) == "f", "left stays in the field")
+      let (s2, _) = key(G.focus(G.start(), "f"), form("hi"), [264])
+      Test.assert_true(G.focused(s2) == "ok", "down leaves")
+    end
+  end
+
+  describe "Gui choice lists" do
+    test "a click opens it below its box, and a click on an option picks it" do
+      let (s1, evs) = click(G.start(), pick(), 20.0, 20.0)
+      Test.assert_true(is_nil(evs), "opening is no event")
+      let r1 = look(s1, pick())
+      Test.assert_eq_int(List.length(G.list_rects(r1)), 3, "three options")
+      Test.assert_true(match G.list_rects(r1) do Cons((_, y, _, _), _) -> near(y, 40.0) | Nil -> false end, "under the box")
+      let (_, evs2) = click(s1, pick(), 100.0, 105.0)
+      Test.assert_true(has(evs2, Strata.Gui.Chose("light", 2)), "the third")
+    end
+
+    test "the open list is over everything under it" do
+      let (s1, _) = click(G.start(), pick(), 20.0, 20.0)
+      let (_, r) = go(s1, pick(), at(100.0, 55.0), false, 0.0, Nil, none())
+      Test.assert_true(G.hovered(r) == "light", "the option over the OK button")
+      let (_, evs) = click(s1, pick(), 100.0, 55.0)
+      Test.assert_true(has(evs, Strata.Gui.Chose("light", 0)) && !has(evs, Strata.Gui.Clicked("ok")), "picks, does not click OK")
+    end
+
+    test "keys open it, move the highlight, pick, and back closes it" do
+      let (s1, _) = key(G.focus(G.start(), "light"), pick(), [257])
+      Test.assert_true(s1.gs_open == "light", "Enter opens")
+      let (s2, _) = key(s1, pick(), [264])
+      let (_, r3) = key(s2, pick(), [257])
+      Test.assert_true(has(G.events(r3), Strata.Gui.Chose("light", 1)), "down, Enter: the second")
+      let (s4, r4) = key(s1, pick(), [256])
+      Test.assert_true(s4.gs_open == "" && !G.went_back(r4), "Escape closes, and is not passed on")
+    end
+
+    test "a click outside closes it without picking" do
+      let (s1, _) = click(G.start(), pick(), 20.0, 20.0)
+      let (s2, evs) = click(s1, pick(), 600.0, 500.0)
+      Test.assert_true(s2.gs_open == "" && is_nil(evs), "closed, nothing chosen")
+    end
+  end
+end
