@@ -84,4 +84,67 @@ mod StrataKit.Damage do
   fn carve_hit(rig : Strata.Rig.Rig, h : Strata.Anim.FigureHit, radius : Float, s : CarveSettings) : (Strata.Rig.Rig, Int) do
     carve(rig, h.part, h.x, h.y, h.z, radius, s)
   end
+
+  -- ── Breaking off ─────────────────────────────────────────────────────────
+
+  -- a grid of block ids, its low corner in metres, its rotation (x, y, z, w)
+  type KitLoose = KLoose(Strata.Body.Grid, (Float, Float, Float), (Float, Float, Float, Float))
+
+  doc "A loose piece's grid of block ids."
+  fn loose_grid(l : KitLoose) : Strata.Body.Grid do match l do KLoose(g, _, _) -> g end end
+  doc "A loose piece's low corner in metres."
+  fn loose_corner(l : KitLoose) : (Float, Float, Float) do match l do KLoose(_, c, _) -> c end end
+  doc "A loose piece's rotation (x, y, z, w)."
+  fn loose_turn(l : KitLoose) : (Float, Float, Float, Float) do match l do KLoose(_, _, q) -> q end end
+
+  pfn rot(q : (Float, Float, Float, Float), v : (Float, Float, Float)) : (Float, Float, Float) do
+    match (q, v) do
+      ((qx, qy, qz, qw), (x, y, z)) ->
+        let r = Strata.Math.Quat.rotate(Strata.Math.Quat.Quat(qx, qy, qz, qw), Strata.Math.Vec3.new(x, y, z))
+        (Strata.Math.Vec3.x(r), Strata.Math.Vec3.y(r), Strata.Math.Vec3.z(r))
+    end
+  end
+  pfn add3(a : (Float, Float, Float), b : (Float, Float, Float)) : (Float, Float, Float) do match (a, b) do ((ax, ay, az), (bx, by0, bz)) -> (ax +. bx, ay +. by0, az +. bz) end end
+
+  -- a rig part's grid as block ids
+  pfn body_of(rig : Strata.Rig.Rig, rp : Int, debris : Int -> Int) : Strata.Body.Grid do
+    match Strata.Rig.size(rig, rp) do
+      (sx, sy, sz) ->
+        let g = Strata.Rig.grid(rig, rp)
+        List.fold_left(List.range(0, sx * sy * sz), Strata.Body.grid(sx, sy, sz), fn (b, i) ->
+          let c = NativeArray.get_u8(g, i)
+          if c == 0 do b else Strata.Body.grid_set(b, i % sx, (i / sx) % sy, i / (sx * sy), debris(c)) end)
+    end
+  end
+
+  pfn is_under(p : List(String), prefix : List(String)) : Bool do List.take(p, List.length(prefix)) == prefix end
+
+  pfn loose_of(rig : Strata.Rig.Rig, rp : Int, pose : Int -> ((Float, Float, Float), (Float, Float, Float, Float)), debris : Int -> Int, shatter : Option((Int, Int, Int, Int, Float, Strata.Blocks.Registry))) : List(KitLoose) do
+    let v = Strata.Rig.voxel_size(rig)
+    let (ax, ay, az) = Strata.Rig.anchor_at(rig, rp)
+    match pose(rp) do
+      (origin, q) ->
+        let corner = add3(origin, rot(q, (0.0 -. ax *. v, 0.0 -. ay *. v, 0.0 -. az *. v)))
+        let g = body_of(rig, rp, debris)
+        match shatter do
+          Some((srp, x, y, z, excess, reg)) ->
+            if srp == rp do
+              List.map(Strata.Fracture.pieces(reg, g, x, y, z, excess, v, rp), fn pc -> match pc do
+                (pg, lx, ly, lz) -> KLoose(pg, add3(corner, rot(q, (int_to_float(lx) *. v, int_to_float(ly) *. v, int_to_float(lz) *. v))), q)
+              end)
+            else [KLoose(g, corner, q)] end
+          None -> [KLoose(g, corner, q)]
+        end
+    end
+  end
+
+  doc "Break off the node at [path]: the build without it (StrataKit.Build.detach), and every rig part of the removed subtree (as carved) as a loose grid of block ids ([debris] maps a palette index to a block id) at its pose ([pose] gives a rig part's world origin and rotation, from Strata.Anim). With Some((rig part, x, y, z, excess, registry)) the struck part is first cut round its voxel (x, y, z) by Strata.Fracture.pieces. The grids are at the rig's voxel size: add them with Strata.Physics.add_fine. The root cannot be broken off ((b, none))."
+  fn break_off(m : StrataKit.Assemble.KitMap, b : StrataKit.Build.KitBuild, rig : Strata.Rig.Rig, pose : Int -> ((Float, Float, Float), (Float, Float, Float, Float)), path : List(String), debris : Int -> Int, shatter : Option((Int, Int, Int, Int, Float, Strata.Blocks.Registry))) : (StrataKit.Build.KitBuild, List(KitLoose)) do
+    match StrataKit.Build.detach(b, path) do
+      (rest, None) -> (rest, Nil)
+      (rest, Some(_)) ->
+        let rps = List.filter_map(StrataKit.Assemble.entries(m), fn e -> match e do (rp, p, _) -> if is_under(p, path) do Some(rp) else None end end)
+        (rest, List.flat_map(rps, fn rp -> loose_of(rig, rp, pose, debris, shatter)))
+    end
+  end
 end
