@@ -27,7 +27,7 @@
 /* Rewritten by build_shaders.sh whenever the shaders change: forge decides
  * whether to recompile this file from its text alone, not from the headers
  * it includes (GAPS S14). */
-#define STRATA_SHADERS_STAMP "fcca6d4a2395215a"
+#define STRATA_SHADERS_STAMP "585f8322f8fbc9d5"
 #include "strata_shaders.h"
 #include "strata_particles.h"
 #include "strata_alloc.h"
@@ -99,6 +99,13 @@ typedef struct {
 #define SV_SHARED 4096         /* mesh ranges are owned by a pinned prototype */
 #define SV_TEMPLATE 8192       /* its geometry is immutable until close */
 #define SV_BATCHED 16384       /* shared slot rendered in a mesh batch, not by the chunk cull */
+#define SV_MOTION 32768        /* batched slot whose origin the vertex shader moves along a motion record (sv_chunk_motion) */
+/* A motion record, as the batched quad shader reads it (16 words a slot): start and end time
+ * (seconds since the motion epoch), start and end progress, key count plus 256 for a walker's
+ * gait, then up to SV_MOTION_KEYS keys, each dx 10 bits, dz 10, dy 8 (signed, voxels from
+ * the slot's origin) and the key's place 0..8 eighths of the way from start to end. */
+#define SV_MOTION_WORDS 16
+#define SV_MOTION_KEYS 9
 
 typedef struct {
     float extent[3];            /* conservative upper corner of the prototype's mesh, in voxels */
@@ -118,6 +125,7 @@ typedef struct {
      * copied into it. */
     VkBuffer ubo; VkDeviceMemory ubo_mem; float *ubo_map;
     VkBuffer table; VkDeviceMemory table_mem; ChunkEntry *table_map;
+    VkBuffer motion; VkDeviceMemory motion_mem; uint32_t *motion_map;   /* the motion records, synced with the table */
     VkBuffer btable, bcells, blist, bmovers; VkDeviceMemory btable_mem, bcells_mem, blist_mem, bmovers_mem;
     BodyRow *btable_map; uint32_t *bcells_map, *blist_map; float *bmovers_map;
     /* lamps near each cell of the light volume, for the light pass to aim at: per cell (first, count), then the list */
@@ -269,6 +277,9 @@ static struct {
     uint32_t tile_px, layers; unsigned char *tex_staging; int aniso;
     int batch_shared;
     uint32_t *batch_slots, *batch_at;        /* dense list of active shared slots, and positions plus one */
+    uint32_t *motion;                        /* each slot's motion record (SV_MOTION_WORDS words) */
+    int16_t *motion_box;                     /* each moving slot's low and high corner, voxels from its origin */
+    double motion_epoch; int motion_epoch_set;
     uint32_t *batch_visible, *batch_keys;    /* this frame's cull results and touched prototypes */
     MeshBatch *batches;                      /* indexed by prototype slot */
     uint32_t num_batch_slots, num_batch_keys, batch_draws, batch_visible_count, opaque_commands;
@@ -2127,7 +2138,7 @@ int64_t sv_open_slots(int64_t w, int64_t h, int64_t capture_mouse, int64_t quad_
     g.swap_ok = 1;
 
     /* one set layout for every pipeline: 0 uniforms, 1 chunk table, 2 indirect commands, 3 cull statistics, 4 command -> slot */
-    VkDescriptorSetLayoutBinding dslb[38] = {
+    VkDescriptorSetLayoutBinding dslb[39] = {
         { .binding = 0, .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, .descriptorCount = 1,
           .stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT },
         { .binding = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1,
@@ -2184,8 +2195,10 @@ int64_t sv_open_slots(int64_t w, int64_t h, int64_t capture_mouse, int64_t quad_
         { .binding = 35, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT },
         { .binding = 36, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT },
         /* 37 the particles' ring, for the pass that looks for what each new particle will meet (collide.comp) */
-        { .binding = 37, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT } };
-    VkDescriptorSetLayoutCreateInfo dsli = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 38, .pBindings = dslb };
+        { .binding = 37, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT },
+        /* 38 the motion records of moving batched slots */
+        { .binding = 38, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_VERTEX_BIT } };
+    VkDescriptorSetLayoutCreateInfo dsli = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 39, .pBindings = dslb };
     VKOK(vkCreateDescriptorSetLayout(g.dev, &dsli, NULL, &g.dsl), "descriptor set layout");
     /* where the call's range starts in draw_slot, and per-call flags (bit 0: cutout, bit 1: a figure);
      * a figure piece's draw adds eight words more (fig_record) */
@@ -2257,7 +2270,9 @@ int64_t sv_open_slots(int64_t w, int64_t h, int64_t capture_mouse, int64_t quad_
         g.batch_visible = malloc(g.slot_cap * sizeof *g.batch_visible);
         g.batch_keys = malloc(g.slot_cap * sizeof *g.batch_keys);
         g.batches = calloc(g.slot_cap, sizeof *g.batches);
-        if (!g.batch_slots || !g.batch_at || !g.batch_visible || !g.batch_keys || !g.batches) return 0;
+        g.motion = calloc((size_t)g.slot_cap * SV_MOTION_WORDS, sizeof *g.motion);
+        g.motion_box = calloc((size_t)g.slot_cap * 6, sizeof *g.motion_box);
+        if (!g.batch_slots || !g.batch_at || !g.batch_visible || !g.batch_keys || !g.batches || !g.motion || !g.motion_box) return 0;
     }
     g.trans = calloc(g.slot_cap, sizeof *g.trans);
     g.trans_at = malloc(g.slot_cap * sizeof *g.trans_at);
@@ -2270,7 +2285,7 @@ int64_t sv_open_slots(int64_t w, int64_t h, int64_t capture_mouse, int64_t quad_
     g.blocks_map = map;
     memset(g.blocks_map, 0, (size_t)SV_MAX_BLOCKS * 32);
     for (uint32_t t = 0; t < 65536; t++) ((uint32_t *)g.blocks_map)[SV_TOP_OF + t] = t;
-    VkDescriptorPoolSize dps[4] = { { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, SV_FRAMES }, { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 18 * SV_FRAMES }, { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 15 * SV_FRAMES },
+    VkDescriptorPoolSize dps[4] = { { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, SV_FRAMES }, { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 19 * SV_FRAMES }, { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 15 * SV_FRAMES },
                                     { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 4 * SV_FRAMES } };
     VkDescriptorPoolCreateInfo dpi = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = SV_FRAMES, .poolSizeCount = 4, .pPoolSizes = dps };
     VKOK(vkCreateDescriptorPool(g.dev, &dpi, NULL, &g.dpool), "descriptor pool");
@@ -2291,6 +2306,8 @@ int64_t sv_open_slots(int64_t w, int64_t h, int64_t capture_mouse, int64_t quad_
         F->ubo_map = map; memset(F->ubo_map, 0, UBO_FLOATS * 4);
         if (!make_buffer((VkDeviceSize)g.slot_cap * sizeof(ChunkEntry), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &F->table, &F->table_mem, &map)) return 0;
         F->table_map = map; memset(F->table_map, 0, (size_t)g.slot_cap * sizeof(ChunkEntry));
+        if (!make_buffer((VkDeviceSize)g.slot_cap * SV_MOTION_WORDS * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &F->motion, &F->motion_mem, &map)) return 0;
+        F->motion_map = map; memset(F->motion_map, 0, (size_t)g.slot_cap * SV_MOTION_WORDS * 4);
         if (!make_buffer((VkDeviceSize)SV_LIGHT_PER_FRAME * SV_LIGHT_WRITE_BYTES, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, &F->lstage, &F->lstage_mem, &map)) return 0;
         F->lstage_map = map;
         if (!make_buffer((VkDeviceSize)SV_TABLE_ROWS * sizeof(BodyRow), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &F->btable, &F->btable_mem, &map)) return 0;
@@ -2314,6 +2331,10 @@ int64_t sv_open_slots(int64_t w, int64_t h, int64_t capture_mouse, int64_t quad_
             wds[b] = (VkWriteDescriptorSet){ .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = F->dset, .dstBinding = b, .descriptorCount = 1,
                 .descriptorType = b == 0 ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &bufs[b] };
         vkUpdateDescriptorSets(g.dev, 6, wds, 0, NULL);
+        VkDescriptorBufferInfo mb = { F->motion, 0, VK_WHOLE_SIZE };
+        VkWriteDescriptorSet mw = { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = F->dset, .dstBinding = 38, .descriptorCount = 1,
+            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &mb };
+        vkUpdateDescriptorSets(g.dev, 1, &mw, 0, NULL);
     }
     if (!make_buffer((VkDeviceSize)SV_BODY_WORDS * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &g.bbytes, &g.bbytes_mem, &map)) return 0;
     g.bbytes_map = map;
@@ -2482,6 +2503,8 @@ void sv_close(void) {
             if (g.frames[f].ubo_mem) vkFreeMemory(g.dev, g.frames[f].ubo_mem, NULL);
             if (g.frames[f].table) vkDestroyBuffer(g.dev, g.frames[f].table, NULL);
             if (g.frames[f].table_mem) vkFreeMemory(g.dev, g.frames[f].table_mem, NULL);
+            if (g.frames[f].motion) vkDestroyBuffer(g.dev, g.frames[f].motion, NULL);
+            if (g.frames[f].motion_mem) vkFreeMemory(g.dev, g.frames[f].motion_mem, NULL);
             free(g.frames[f].pending); free(g.frames[f].is_pending);
         }
         for (int f = 0; f < SV_FRAMES; f++) {
@@ -2499,7 +2522,7 @@ void sv_close(void) {
     if (g.win) glfwDestroyWindow(g.win);
     glfwTerminate();
     free(g.trans); free(g.trans_at); free(g.trans_keys); free(g.trans_ord);
-    free(g.batch_slots); free(g.batch_at); free(g.batch_visible); free(g.batch_keys); free(g.batches);
+    free(g.batch_slots); free(g.batch_at); free(g.motion); free(g.motion_box); g.motion = NULL; g.motion_box = NULL; free(g.batch_visible); free(g.batch_keys); free(g.batches);
     free(g.spray_births); g.spray_births = NULL;
     free(g.ui_cpu); g.ui_cpu = NULL; g.ui_n = 0;
     free(g.ubo_map); free(g.entries); if (g.cells) for (int i = 0; i < g.vn_old_cells; i++) free(g.cells[i].lamps); free(g.cells); g.vn_old_cells = 0; free(g.cell_page); free(g.free_pages); free(g.stage_light);
@@ -3271,7 +3294,7 @@ int64_t sv_chunk_instance(int64_t slot, int64_t prototype, double x, double y, d
         (source->level_flags & (255 | SV_SHARED | SV_BODY | SV_HAS_LIGHT)) ||
         !source->count[0] || source->count[1] || source->count[2] || source->count[3] || source->count[4] ||
         (target->level_flags & (SV_TEMPLATE | SV_BODY | SV_HAS_LIGHT))) return 0;
-    if ((target->level_flags & SV_SHARED) && target->first[0] == source->first[0] &&
+    if ((target->level_flags & SV_SHARED) && !(target->level_flags & SV_MOTION) && target->first[0] == source->first[0] &&
         target->origin[0] == (float)x && target->origin[1] == (float)y && target->origin[2] == (float)z) return 1;
     release_mesh(target);
     trans_track((uint32_t)slot, 0);
@@ -3312,6 +3335,68 @@ int64_t sv_body_instance(int64_t slot, int64_t prototype) {
     if ((uint32_t)slot + 1 > g.hi_slot) g.hi_slot = (uint32_t)slot + 1;
     touch((uint32_t)slot);
     return 1;
+}
+
+/* Draw slot [slot] as prototype [prototype] moving along [n] keys (x, y, z, place: four ints
+ * each in [keys_i32], places 0..8 rising from 0 to 8, eighths of the way through the motion),
+ * from time [t0] to [t1] (the clock sv_motion_clock sets), its progress going from [p0] to
+ * [p1]. With [gait], the shader steps a walker's legs (the mesh's two bottom voxel rows, x 0
+ * and x 1) as its progress passes each twelfth. The slot is shown. Returns 0 when a key lies too
+ * far from the first (the slot is left as it was) or the prototype cannot be batched (the slot
+ * then stands still at the first key). */
+int64_t sv_chunk_motion(int64_t slot, int64_t prototype, double t0, double t1, double p0, double p1, void *keys_i32, int64_t n, int64_t gait) {
+    if (!g.ok || !g.motion || n < 1 || n > SV_MOTION_KEYS || !keys_i32 || narr_len(keys_i32) < n * 4) return 0;
+    if (slot < 0 || slot >= g.slot_cap) return 0;
+    const int32_t *k = narr_data(keys_i32);
+    int32_t ox = k[0], oy = k[1], oz = k[2];
+    uint32_t rec[SV_MOTION_WORDS] = { 0 };
+    int16_t box[6] = { 0, 0, 0, 0, 0, 0 };
+    int last = -1;
+    for (int64_t i = 0; i < n; i++) {
+        int32_t dx = k[i * 4] - ox, dy = k[i * 4 + 1] - oy, dz = k[i * 4 + 2] - oz, place = k[i * 4 + 3];
+        if (dx < -512 || dx > 511 || dz < -512 || dz > 511 || dy < -128 || dy > 127 || place <= last || place > 8) return 0;
+        last = place;
+        rec[5 + i] = ((uint32_t)dx & 1023u) | (((uint32_t)dz & 1023u) << 10) | (((uint32_t)dy & 255u) << 20) | ((uint32_t)place << 28);
+        if (dx < box[0]) box[0] = (int16_t)dx;
+        if (dy < box[1]) box[1] = (int16_t)dy;
+        if (dz < box[2]) box[2] = (int16_t)dz;
+        if (dx > box[3]) box[3] = (int16_t)dx;
+        if (dy > box[4]) box[4] = (int16_t)dy;
+        if (dz > box[5]) box[5] = (int16_t)dz;
+    }
+    if (k[3] != 0) return 0;
+    if (!sv_chunk_instance(slot, prototype, (double)ox, (double)oy, (double)oz)) return 0;
+    ChunkEntry *e = &g.entries[slot];
+    if (!(e->level_flags & SV_BATCHED)) return 0;
+    if (!g.motion_epoch_set) { g.motion_epoch = t0; g.motion_epoch_set = 1; }
+    float ft0 = (float)(t0 - g.motion_epoch), ft1 = (float)(t1 - g.motion_epoch), fp0 = (float)p0, fp1 = (float)p1;
+    memcpy(&rec[0], &ft0, 4); memcpy(&rec[1], &ft1, 4); memcpy(&rec[2], &fp0, 4); memcpy(&rec[3], &fp1, 4);
+    rec[4] = (uint32_t)n | (gait ? 256u : 0u);
+    memcpy(g.motion + (size_t)slot * SV_MOTION_WORDS, rec, sizeof rec);
+    memcpy(g.motion_box + (size_t)slot * 6, box, sizeof box);
+    e->level_flags = (e->level_flags | SV_MOTION) & ~SV_HIDDEN;
+    touch((uint32_t)slot);
+    return 1;
+}
+
+/* The time moving slots are drawn at (the clock sv_chunk_motion's times are on). Times go to
+ * the GPU as floats from an epoch; once the clock is 4096 s past it, the epoch moves up to the
+ * clock and every motion record is shifted to match, so a long game keeps its precision. */
+void sv_motion_clock(double t) {
+    if (!g.ok) return;
+    if (!g.motion_epoch_set) { g.motion_epoch = t; g.motion_epoch_set = 1; }
+    if (g.motion && fabs(t - g.motion_epoch) > 4096.0) {
+        float shift = (float)(t - g.motion_epoch);
+        for (uint32_t i = 0; i < g.num_batch_slots; i++) {
+            uint32_t slot = g.batch_slots[i];
+            if (!(g.entries[slot].level_flags & SV_MOTION)) continue;
+            float *rec = (float *)(g.motion + (size_t)slot * SV_MOTION_WORDS);
+            rec[0] -= shift; rec[1] -= shift;
+            touch(slot);
+        }
+        g.motion_epoch = t;
+    }
+    g.ubo_map[UBO_TRACE + 1] = (float)(t - g.motion_epoch);
 }
 
 int64_t sv_chunk_commit(void) {
@@ -3612,12 +3697,15 @@ static void heal_fence(Frame *F) {
 }
 
 /* The OpenGL clip planes used by the chunk culler, tested against the mesh bounds. */
-static int batch_in_view(const ChunkEntry *entry, const MeshBatch *batch, float scale,
+static int batch_in_view(uint32_t slot, const ChunkEntry *entry, const MeshBatch *batch, float scale,
                          const float planes[6][4]) {
-    const float lo[3] = { (entry->origin[0] - 1) * scale, (entry->origin[1] - 1) * scale, (entry->origin[2] - 1) * scale };
-    const float hi[3] = { (entry->origin[0] + batch->extent[0]) * scale,
-                          (entry->origin[1] + batch->extent[1]) * scale,
-                          (entry->origin[2] + batch->extent[2]) * scale };
+    /* a moving slot can be anywhere in its motion's box */
+    const int16_t *box = (entry->level_flags & SV_MOTION) ? g.motion_box + (size_t)slot * 6 : NULL;
+    const float lo[3] = { (entry->origin[0] - 1 + (box ? box[0] : 0)) * scale, (entry->origin[1] - 1 + (box ? box[1] : 0)) * scale,
+                          (entry->origin[2] - 1 + (box ? box[2] : 0)) * scale };
+    const float hi[3] = { (entry->origin[0] + batch->extent[0] + (box ? box[3] : 0)) * scale,
+                          (entry->origin[1] + batch->extent[1] + (box ? box[4] : 0)) * scale,
+                          (entry->origin[2] + batch->extent[2] + (box ? box[5] : 0)) * scale };
     for (int i = 0; i < 6; i++) {
         const float *p = planes[i];
         float d = p[0] * (p[0] < 0 ? lo[0] : hi[0]) + p[1] * (p[1] < 0 ? lo[1] : hi[1]) +
@@ -3643,7 +3731,7 @@ static void prepare_mesh_batches(Frame *F, uint32_t base) {
         const ChunkEntry *entry = &g.entries[slot];
         uint32_t prototype = entry->first[5];
         MeshBatch *batch = &g.batches[prototype];
-        if ((entry->level_flags & SV_HIDDEN) || !batch_in_view(entry, batch, vp[31], planes)) continue;
+        if ((entry->level_flags & SV_HIDDEN) || !batch_in_view(slot, entry, batch, vp[31], planes)) continue;
         if (!batch->count++) g.batch_keys[g.num_batch_keys++] = prototype;
         g.batch_visible[g.batch_visible_count++] = slot;
         F->batch_quads += entry->count[0];
@@ -3824,6 +3912,7 @@ int64_t sv_frame(void) {
     for (uint32_t i = 0; i < F->npending; i++) {
         uint32_t slot = F->pending[i];
         F->table_map[slot] = g.entries[slot];
+        if (g.entries[slot].level_flags & SV_MOTION) memcpy(F->motion_map + (size_t)slot * SV_MOTION_WORDS, g.motion + (size_t)slot * SV_MOTION_WORDS, SV_MOTION_WORDS * 4);
         F->is_pending[slot] = 0;
     }
     F->npending = 0;
