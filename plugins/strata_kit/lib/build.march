@@ -1,0 +1,105 @@
+-- Build — a modular figure as a tree: a part (by its index in the game's
+-- list of parts) and, for each of its mounts, the build in it.
+--
+-- A path is the mount names from the root to a node. Fitting is the game's:
+-- it is handed the mount's slot type and size and the part's slot types and
+-- size. A part drawn for one side placed on a mount of the other (a mount
+-- named ..._l takes left parts) is mirrored, so its own mounts are renamed
+-- with it and its children are looked up by the mirrored names.
+mod StrataKit.Build do
+
+  alias StrataKit.Part as BdP
+
+  type KitBuild = KNode(Int, List((String, KitBuild)))
+
+  doc "A node: part [part] with [children] by the mount they sit in."
+  fn node(part : Int, children : List((String, KitBuild))) : KitBuild do KNode(part, children) end
+  doc "A node with nothing mounted on it."
+  fn leaf(part : Int) : KitBuild do KNode(part, Nil) end
+  doc "The node's part index."
+  fn part_of(b : KitBuild) : Int do match b do KNode(p, _) -> p end end
+  doc "The node's children, by mount name."
+  fn children(b : KitBuild) : List((String, KitBuild)) do match b do KNode(_, cs) -> cs end end
+
+  doc "The node at [path], if there is one."
+  fn at(b : KitBuild, path : List(String)) : Option(KitBuild) do
+    match path do
+      Nil -> Some(b)
+      Cons(m, rest) -> match List.find(children(b), fn c -> match c do (n, _) -> n == m end) do Some((_, c)) -> at(c, rest) | None -> None end
+    end
+  end
+
+  doc "The build with the mount at [path] holding [child] (None empties it). A path through a mount that holds nothing changes nothing; the root is never emptied."
+  fn put(b : KitBuild, path : List(String), child : Option(KitBuild)) : KitBuild do
+    match path do
+      Nil -> match child do Some(c) -> c | None -> b end
+      Cons(m, Nil) ->
+        let others = List.filter(children(b), fn c -> match c do (n, _) -> n != m end)
+        match child do
+          Some(c) -> if List.any(children(b), fn e -> match e do (n, _) -> n == m end) do KNode(part_of(b), List.map(children(b), fn e -> match e do (n, x) -> if n == m do (n, c) else (n, x) end end)) else KNode(part_of(b), List.append(children(b), [(m, c)])) end
+          None -> KNode(part_of(b), others)
+        end
+      Cons(m, rest) -> KNode(part_of(b), List.map(children(b), fn e -> match e do (n, x) -> if n == m do (n, put(x, rest, child)) else (n, x) end end))
+    end
+  end
+
+  pfn nth_part(parts : List(StrataKit.Part.KitPart), i : Int) : Option(StrataKit.Part.KitPart) do List.nth_opt(parts, i) end
+
+  doc "The part as it is placed on mount [m]: mirrored when it is drawn for the other side (a right part on a left mount, or a left part on a right one)."
+  fn placed(p : StrataKit.Part.KitPart, m : StrataKit.Part.KitMount) : StrataKit.Part.KitPart do
+    let left = BdP.mount_left(m)
+    let right = String.ends_with(BdP.mount_name(m), "_r")
+    if (left && BdP.side(p) == "r") || (right && BdP.side(p) == "l") do BdP.mirror(p) else p end
+  end
+
+  pfn fits_go(parts : List(StrataKit.Part.KitPart), here : StrataKit.Part.KitPart, path : List(String), cs : List((String, KitBuild)), ok : String -> String -> List(String) -> String -> Bool, acc : List((List(String), String))) : List((List(String), String)) do
+    match cs do
+      Nil -> acc
+      Cons((mname, child), rest) ->
+        let p2 = List.append(path, [mname])
+        let found = match nth_part(parts, part_of(child)) do
+          None -> List.append(acc, [(p2, "no part " ++ int_to_string(part_of(child)))])
+          Some(cp) ->
+            match BdP.mount(here, mname) do
+              None -> List.append(acc, [(p2, "no mount " ++ mname ++ " on the part it hangs from")])
+              Some(m) ->
+                if !ok(BdP.mount_slot(m), BdP.mount_size(m), BdP.slots(cp), BdP.size(cp)) do
+                  List.append(acc, [(p2, "part " ++ int_to_string(part_of(child)) ++ " (" ++ BdP.size(cp) ++ ") does not fit " ++ BdP.mount_slot(m) ++ ":" ++ BdP.mount_size(m))])
+                else fits_go(parts, placed(cp, m), p2, children(child), ok, acc) end
+            end
+        end
+        fits_go(parts, here, path, rest, ok, found)
+    end
+  end
+
+  doc "Every node that does not fit where it is, with a reason: a mount the parent does not offer, or a part the game's [ok] refuses (given the mount's slot and size and the part's slots and size). What hangs below a misfit is not checked."
+  fn fits(parts : List(StrataKit.Part.KitPart), b : KitBuild, ok : String -> String -> List(String) -> String -> Bool) : List((List(String), String)) do
+    match nth_part(parts, part_of(b)) do
+      None -> [(Nil, "no part " ++ int_to_string(part_of(b)))]
+      Some(root) -> fits_go(parts, root, Nil, children(b), ok, Nil)
+    end
+  end
+
+  doc "The tag [key] summed over every node (a part not in the list counts 0)."
+  fn sum(parts : List(StrataKit.Part.KitPart), b : KitBuild, key : String) : Float do
+    let mine = match nth_part(parts, part_of(b)) do Some(p) -> BdP.tag(p, key) | None -> 0.0 end
+    List.fold_left(children(b), mine, fn (acc, c) -> match c do (_, x) -> acc +. sum(parts, x, key) end)
+  end
+
+  doc "How many nodes the build has."
+  fn count(b : KitBuild) : Int do List.fold_left(children(b), 1, fn (acc, c) -> match c do (_, x) -> acc + count(x) end) end
+
+  pfn paths_go(b : KitBuild, here : List(String)) : List(List(String)) do
+    Cons(here, List.flat_map(children(b), fn c -> match c do (n, x) -> paths_go(x, List.append(here, [n])) end))
+  end
+  doc "Every node's path, depth first, children in mount order (the root's is empty)."
+  fn paths(b : KitBuild) : List(List(String)) do paths_go(b, Nil) end
+
+  doc "The build without the subtree at [path], and that subtree; the root cannot be detached ((b, None))."
+  fn detach(b : KitBuild, path : List(String)) : (KitBuild, Option(KitBuild)) do
+    match path do
+      Nil -> (b, None)
+      _ -> match at(b, path) do Some(sub) -> (put(b, path, None), Some(sub)) | None -> (b, None) end
+    end
+  end
+end
