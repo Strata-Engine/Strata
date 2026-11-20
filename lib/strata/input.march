@@ -1,0 +1,204 @@
+-- Input: a game's named actions, bound as data to keys, mouse buttons and a
+-- gamepad, and read each frame.
+--
+-- A game lists bindings, (action, source, weight), and steps an Input once a
+-- frame with a raw state: what is held and where the pad's axes are. It then
+-- asks of each action whether it is held, whether it went down or came up on
+-- this frame, and for a value from -1 to 1. Nothing here touches a window: a
+-- raw state is plain data, written by hand in a test and filled from the
+-- window by Strata.Render.input. The action names are the game's; the module
+-- knows none.
+--
+-- Codes are GLFW's: key codes (W is 87, Space 32), mouse buttons (0 left,
+-- 1 right, 2 middle), and the gamepad's buttons and axes as
+-- Strata.Ffi.Vk.pad_button and pad_axis number them. Every axis rests at 0.
+mod Strata.Input do
+
+  -- where a binding reads from: a key, a mouse button, a pad button (all held or not), or a pad axis (a number)
+  type Source = Key(Int) | MouseButton(Int) | PadButton(Int) | PadAxis(Int)
+
+  -- one frame's raw state: key codes held, mouse buttons held, pad buttons held, and the pad's axes from axis 0 up (a missing axis is at rest)
+  type Raw = Raw(List(Int), List(Int), List(Int), List(Float))
+
+  -- the bindings, the dead zone, the press point
+  type Map = Map(List((String, Source, Float)), Float, Float)
+
+  -- per action, in the order first bound: its name, held now, held on the frame before, its value
+  type Input = Input(Map, List((String, Bool, Bool, Float)))
+
+  doc "A map from bindings: each is (action, source, weight). A held key or button adds its weight to its action's value; an axis adds its value times its weight. The dead zone is 0.15 of an axis's throw and an axis holds its action from half throw; `with_dead_zone` and `with_press_point` change them."
+  fn new(bindings : List((String, Source, Float))) : Map do Map(bindings, 0.15, 0.5) end
+
+  doc "The map with a dead zone of [zone], 0 to just under 1, as a share of an axis's throw."
+  fn with_dead_zone(m : Map, zone : Float) : Map do
+    match m do Map(b, _, p) -> Map(b, clampf(zone, 0.0, 0.99), p) end
+  end
+
+  doc "The map with an axis holding its action once it is at least [point] from rest (after the dead zone), either way."
+  fn with_press_point(m : Map, point : Float) : Map do
+    match m do Map(b, z, _) -> Map(b, z, point) end
+  end
+
+  pfn clampf(v : Float, lo : Float, hi : Float) : Float do if v < lo do lo else if v > hi do hi else v end end end
+
+  doc "An axis reading with a dead zone taken out: 0 while within [zone] of rest, then rising evenly from 0 at the zone's edge to 1 (or -1) at full throw."
+  fn dead_zone(v : Float, zone : Float) : Float do
+    let a = Math.abs(v)
+    if a <= zone || zone >= 1.0 do 0.0 else
+      let out = clampf((a -. zone) /. (1.0 -. zone), 0.0, 1.0)
+      if v < 0.0 do 0.0 -. out else out end
+    end
+  end
+
+  doc "A stick's two axes with a round dead zone: (0, 0) while the stick is within [zone] of its centre, then its direction kept and its length rising evenly from 0 at the zone's edge to 1 at full throw. A diagonal push keeps its direction where two `dead_zone`s would square it off."
+  fn stick(x : Float, y : Float, zone : Float) : (Float, Float) do
+    let len = Math.sqrt(x *. x +. y *. y)
+    if len <= zone || zone >= 1.0 do (0.0, 0.0) else
+      let k = clampf((len -. zone) /. (1.0 -. zone), 0.0, 1.0) /. len
+      (x *. k, y *. k)
+    end
+  end
+
+  doc "A raw state from the key codes held, the mouse buttons held, the pad buttons held and the pad's axes from axis 0 up."
+  fn raw(keys : List(Int), mouse : List(Int), pad_buttons : List(Int), pad_axes : List(Float)) : Raw do
+    Raw(keys, mouse, pad_buttons, pad_axes)
+  end
+
+  doc "The raw state with nothing held and every axis at rest."
+  fn idle() : Raw do Raw(Nil, Nil, Nil, Nil) end
+
+  pfn has_name(names : List(String), name : String) : Bool do
+    match names do
+      Nil -> false
+      Cons(n, rest) -> if n == name do true else has_name(rest, name) end
+    end
+  end
+
+  pfn names_of(b : List((String, Source, Float)), acc : List(String)) : List(String) do
+    match b do
+      Nil -> List.reverse(acc)
+      Cons((name, _, _), rest) -> if has_name(acc, name) do names_of(rest, acc) else names_of(rest, Cons(name, acc)) end
+    end
+  end
+
+  doc "The actions the map binds, each once, in the order first bound."
+  fn actions(m : Map) : List(String) do
+    match m do Map(b, _, _) -> names_of(b, Nil) end
+  end
+
+  doc "An Input for the map with nothing held: the state before the first frame."
+  fn start(m : Map) : Input do
+    Input(m, List.map(actions(m), fn name -> (name, false, false, 0.0)))
+  end
+
+  pfn has_int(xs : List(Int), x : Int) : Bool do
+    match xs do
+      Nil -> false
+      Cons(h, rest) -> if h == x do true else has_int(rest, x) end
+    end
+  end
+
+  pfn axis_raw(axes : List(Float), a : Int) : Float do
+    match axes do
+      Nil -> 0.0
+      Cons(v, rest) -> if a <= 0 do v else axis_raw(rest, a - 1) end
+    end
+  end
+
+  -- axis [a] after the dead zone: 0 with 1 and 2 with 3 are sticks, the rest stand alone
+  pfn axis_read(axes : List(Float), a : Int, zone : Float) : Float do
+    if a < 0 do 0.0
+    else if a < 4 do
+      let ax = a - a % 2
+      match stick(axis_raw(axes, ax), axis_raw(axes, ax + 1), zone) do
+        (sx, sy) -> if a % 2 == 0 do sx else sy end
+      end
+    else dead_zone(axis_raw(axes, a), zone) end end
+  end
+
+  -- one action's (held, value) from every binding of it
+  pfn read(b : List((String, Source, Float)), name : String, r : Raw, zone : Float, point : Float, held : Bool, sum : Float) : (Bool, Float) do
+    match b do
+      Nil -> (held, clampf(sum, -1.0, 1.0))
+      Cons((n, src, weight), rest) ->
+        if n != name do read(rest, name, r, zone, point, held, sum) else
+          match r do
+            Raw(keys, mouse, buttons, axes) ->
+              match src do
+                PadAxis(a) ->
+                  let v = axis_read(axes, a, zone) *. weight
+                  read(rest, name, r, zone, point, held || Math.abs(v) >= point, sum +. v)
+                Key(k) -> digital(rest, name, r, zone, point, held, sum, has_int(keys, k), weight)
+                MouseButton(k) -> digital(rest, name, r, zone, point, held, sum, has_int(mouse, k), weight)
+                PadButton(k) -> digital(rest, name, r, zone, point, held, sum, has_int(buttons, k), weight)
+              end
+          end
+        end
+    end
+  end
+
+  pfn digital(rest : List((String, Source, Float)), name : String, r : Raw, zone : Float, point : Float, held : Bool, sum : Float, down : Bool, weight : Float) : (Bool, Float) do
+    read(rest, name, r, zone, point, held || down, if down do sum +. weight else sum end)
+  end
+
+  doc "The Input after one frame with raw state [r]: each action's held and value are read afresh, and what was held becomes what was held before, which `pressed` and `released` compare with. Call once a frame."
+  fn step(i : Input, r : Raw) : Input do
+    match i do
+      Input(m, states) ->
+        match m do
+          Map(b, zone, point) ->
+            Input(m, List.map(states, fn st ->
+              match st do
+                (name, was, _, _) ->
+                  match read(b, name, r, zone, point, false, 0.0) do (h, v) -> (name, h, was, v) end
+              end))
+        end
+    end
+  end
+
+  pfn find(states : List((String, Bool, Bool, Float)), name : String) : (Bool, Bool, Float) do
+    match states do
+      Nil -> (false, false, 0.0)
+      Cons((n, h, was, v), rest) -> if n == name do (h, was, v) else find(rest, name) end
+    end
+  end
+
+  doc "Is the action held: a key or button of it down, or an axis of it at or past the press point? False for an action the map does not bind."
+  fn held(i : Input, action : String) : Bool do
+    match i do Input(_, states) -> match find(states, action) do (h, _, _) -> h end end
+  end
+
+  doc "Did the action go from not held to held on the latest step?"
+  fn pressed(i : Input, action : String) : Bool do
+    match i do Input(_, states) -> match find(states, action) do (h, was, _) -> h && !was end end
+  end
+
+  doc "Did the action go from held to not held on the latest step?"
+  fn released(i : Input, action : String) : Bool do
+    match i do Input(_, states) -> match find(states, action) do (h, was, _) -> was && !h end end
+  end
+
+  doc "The action's value, -1 to 1: the weights of its held keys and buttons plus each of its axes times its weight, clamped. 0 for an action the map does not bind."
+  fn value(i : Input, action : String) : Float do
+    match i do Input(_, states) -> match find(states, action) do (_, _, v) -> v end end
+  end
+
+  doc "The Input's map."
+  fn map_of(i : Input) : Map do match i do Input(m, _) -> m end end
+
+  pfn keys_from(b : List((String, Source, Float)), acc : List(Int)) : List(Int) do
+    match b do
+      Nil -> List.reverse(acc)
+      Cons((_, src, _), rest) ->
+        match src do
+          Key(k) -> if has_int(acc, k) do keys_from(rest, acc) else keys_from(rest, Cons(k, acc)) end
+          _ -> keys_from(rest, acc)
+        end
+    end
+  end
+
+  doc "The key codes the map binds, each once: all a raw state need ask the window about."
+  fn keys(m : Map) : List(Int) do
+    match m do Map(b, _, _) -> keys_from(b, Nil) end
+  end
+end

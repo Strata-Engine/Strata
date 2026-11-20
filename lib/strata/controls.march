@@ -30,6 +30,109 @@ mod Strata.Controls do
       text ++ (if focused do "|" else "" end))
   end
 
+  doc "Draw a single-line field with its caret at byte [caret] of [text] while focused: the caret `text_edit` keeps."
+  fn text_field_at(u : Strata.Ui.Ui, x : Float, y : Float, width : Float, height : Float,
+    text : String, caret : Int, focused : Bool, background : (Float, Float, Float, Float),
+    foreground : (Float, Float, Float, Float), size : Float) : Strata.Ui.Ui do
+    let n = string_byte_length(text)
+    let c = if caret < 0 do 0 else if caret > n do n else caret end end
+    let shown = if focused do string_slice(text, 0, c) ++ "|" ++ string_slice(text, c, n - c) else text end
+    let u = U.rect(u, 0, x, y, width, height, background)
+    T.text(u, 0, x +. 10.0, y +. (height -. size) *. 0.5, T.default_font(), size, foreground, shown)
+  end
+
+  -- Text is edited as bytes either side of the caret: [before] nearest the caret first, [after] in reading order.
+  -- A UTF-8 character is a lead byte and its continuation bytes (10xxxxxx), and the caret never sits inside one.
+  pfn continues(b : Int) : Bool do int_and(b, 192) == 128 end
+
+  pfn utf8(cp : Int) : List(Int) do
+    if cp < 128 do [cp]
+    else if cp < 2048 do [192 + cp / 64, 128 + cp % 64]
+    else if cp < 65536 do [224 + cp / 4096, 128 + (cp / 64) % 64, 128 + cp % 64]
+    else [240 + cp / 262144, 128 + (cp / 4096) % 64, 128 + (cp / 64) % 64, 128 + cp % 64] end end end
+  end
+
+  pfn push_all(bytes : List(Int), onto : List(Int)) : List(Int) do
+    match bytes do
+      Nil -> onto
+      Cons(b, rest) -> push_all(rest, Cons(b, onto))
+    end
+  end
+
+  pfn count_chars(bytes : List(Int), n : Int) : Int do
+    match bytes do
+      Nil -> n
+      Cons(b, rest) -> count_chars(rest, if continues(b) do n else n + 1 end)
+    end
+  end
+
+  -- move the first [n] bytes of [after] onto [before]
+  pfn split_at(n : Int, before : List(Int), after : List(Int)) : (List(Int), List(Int)) do
+    match after do
+      Nil -> (before, after)
+      Cons(b, rest) -> if n <= 0 do (before, after) else split_at(n - 1, Cons(b, before), rest) end
+    end
+  end
+
+  -- the caret back to the start of the character it is inside, if any
+  pfn settle(before : List(Int), after : List(Int)) : (List(Int), List(Int)) do
+    match (before, after) do
+      (Cons(b, rest), Cons(a, _)) -> if continues(a) do settle(rest, Cons(b, after)) else (before, after) end
+      _ -> (before, after)
+    end
+  end
+
+  -- one character off the end of [before]: (what is left, the character's bytes in reading order)
+  pfn take_back(before : List(Int), taken : List(Int)) : (List(Int), List(Int)) do
+    match before do
+      Nil -> (before, taken)
+      Cons(b, rest) -> if continues(b) do take_back(rest, Cons(b, taken)) else (rest, Cons(b, taken)) end
+    end
+  end
+
+  -- one character off the front of [after]: (the character's bytes, nearest the caret last; what is left)
+  pfn take_ahead(after : List(Int), taken : List(Int), first : Bool) : (List(Int), List(Int)) do
+    match after do
+      Nil -> (taken, after)
+      Cons(b, rest) -> if first || continues(b) do take_ahead(rest, Cons(b, taken), false) else (taken, after) end
+    end
+  end
+
+  pfn edit_go(events : List(Int), before : List(Int), after : List(Int), chars : Int, limit : Int) : (List(Int), List(Int)) do
+    match events do
+      Nil -> (before, after)
+      Cons(e, rest) ->
+        if e >= 32 && e != 127 && e <= 1114111 do
+          (if chars >= limit do edit_go(rest, before, after, chars, limit)
+           else edit_go(rest, push_all(utf8(e), before), after, chars + 1, limit) end)
+        else if e == -259 do
+          (match take_back(before, Nil) do
+            (left, taken) -> edit_go(rest, left, after, if is_nil(taken) do chars else chars - 1 end, limit)
+          end)
+        else if e == -261 do
+          (match take_ahead(after, Nil, true) do
+            (taken, left) -> edit_go(rest, before, left, if is_nil(taken) do chars else chars - 1 end, limit)
+          end)
+        else if e == -263 do
+          (match take_back(before, Nil) do (left, taken) -> edit_go(rest, left, List.append(taken, after), chars, limit) end)
+        else if e == -262 do
+          (match take_ahead(after, Nil, true) do (taken, left) -> edit_go(rest, List.append(taken, before), left, chars, limit) end)
+        else if e == -268 do edit_go(rest, Nil, push_all(before, after), chars, limit)
+        else if e == -269 do edit_go(rest, push_all(after, before), Nil, chars, limit)
+        else edit_go(rest, before, after, chars, limit) end end end end end end end
+    end
+  end
+
+  doc "Apply a frame's typing (Strata.Ffi.Vk.typed) to [text] with its caret at byte [caret], and answer the new text and caret. A positive event is a Unicode code point, inserted at the caret as UTF-8 unless the text already holds [limit] characters; -259 (Backspace) and -261 (Delete) remove the character before and after the caret; -263 and -262 (Left, Right) move it one character; -268 and -269 (Home, End) to either end. Control characters and every other key are passed over: Enter (-257) and Escape (-256) are the caller's to act on. The caret is a byte offset that always sits between characters; one given out of range or inside a character is moved back to the nearest place it may be."
+  fn text_edit(text : String, caret : Int, events : List(Int), limit : Int) : (String, Int) do
+    let bytes = List.map(string_chars(text), fn c -> char_to_int(c))
+    let (b0, a0) = split_at(caret, Nil, bytes)
+    let (b1, a1) = settle(b0, a0)
+    let (b2, a2) = edit_go(events, b1, a1, count_chars(bytes, 0), limit)
+    let out = push_all(b2, a2)
+    (string_from_chars(List.map(out, fn b -> char_from_int(b))), List.length(b2))
+  end
+
   doc "Encode a nonnegative integer in uppercase base 36."
   fn base36(value : Int) : String do
     if value <= 0 do "0" else base36_digits(value, "") end

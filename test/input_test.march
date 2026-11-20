@@ -1,0 +1,139 @@
+-- Input: named actions over raw key, button and axis states.
+mod Strata.Test.Input do
+
+  needs IO.Clock      -- charged to every test module once any uses Check.all (GAPS S3)
+  needs IO.Process
+  import Test
+  alias Strata.Input as Ipt
+
+  pfn near(a : Float, b : Float) : Bool do Math.abs(a -. b) < 0.0001 end
+
+  -- a map of made-up actions: two axes, a button with three sources, a trigger
+  pfn a_map() : Strata.Input.Map do
+    Ipt.new([
+      ("ahead", Strata.Input.Key(87), 1.0), ("ahead", Strata.Input.Key(83), -1.0), ("ahead", Strata.Input.PadAxis(1), -1.0),
+      ("side", Strata.Input.Key(68), 1.0), ("side", Strata.Input.Key(65), -1.0), ("side", Strata.Input.PadAxis(0), 1.0),
+      ("hop", Strata.Input.Key(32), 1.0), ("hop", Strata.Input.PadButton(0), 1.0), ("hop", Strata.Input.MouseButton(2), 1.0),
+      ("squeeze", Strata.Input.PadAxis(5), 1.0),
+      ("half", Strata.Input.Key(70), 0.5)])
+  end
+
+  pfn keys(ks : List(Int)) : Strata.Input.Raw do Ipt.raw(ks, Nil, Nil, Nil) end
+  pfn axes(vs : List(Float)) : Strata.Input.Raw do Ipt.raw(Nil, Nil, Nil, vs) end
+
+  describe "Input.dead_zone and stick" do
+    test "an axis is 0 inside the zone, starts from 0 at its edge and reaches 1 at full throw" do
+      Test.assert_true(near(Ipt.dead_zone(0.1, 0.2), 0.0), "inside")
+      Test.assert_true(near(Ipt.dead_zone(-0.2, 0.2), 0.0), "on the edge")
+      Test.assert_true(near(Ipt.dead_zone(0.6, 0.2), 0.5), "midway from 0.2 to 1")
+      Test.assert_true(near(Ipt.dead_zone(-0.6, 0.2), -0.5), "the same the other way")
+      Test.assert_true(near(Ipt.dead_zone(1.0, 0.2), 1.0), "full throw")
+      Test.assert_true(near(Ipt.dead_zone(1.3, 0.2), 1.0), "a reading past 1 is 1")
+      Test.assert_true(near(Ipt.dead_zone(0.4, 0.0), 0.4), "no zone, no change")
+      Test.assert_true(near(Ipt.dead_zone(0.9, 1.0), 0.0), "a zone of everything")
+    end
+
+    test "a stick's zone is round: a diagonal keeps its direction" do
+      Test.assert_true(match Ipt.stick(0.1, 0.1, 0.2) do (x, y) -> near(x, 0.0) && near(y, 0.0) end, "at rest")
+      Test.assert_true(match Ipt.stick(0.6, 0.0, 0.2) do (x, y) -> near(x, 0.5) && near(y, 0.0) end, "along x, as dead_zone")
+      Test.assert_true(match Ipt.stick(0.3, 0.4, 0.2) do (x, y) -> near(x, 0.225) && near(y, 0.3) end, "length 0.5 becomes 0.375, direction 3:4 kept")
+      Test.assert_true(match Ipt.stick(0.15, 0.15, 0.2) do (x, y) -> x > 0.0 && near(x, y) end, "each axis inside the zone, the stick outside it")
+      Test.assert_true(match Ipt.stick(1.0, 1.0, 0.2) do (x, y) -> near(Math.sqrt(x *. x +. y *. y), 1.0) end, "a corner reading is length 1")
+    end
+  end
+
+  describe "Input.step: values" do
+    test "nothing held is nothing; an unbound action reads as nothing" do
+      let i = Ipt.step(Ipt.start(a_map()), Ipt.idle())
+      Test.assert_true(near(Ipt.value(i, "ahead"), 0.0), "value")
+      Test.assert_false(Ipt.held(i, "hop"), "held")
+      Test.assert_false(Ipt.pressed(i, "hop"), "pressed")
+      Test.assert_false(Ipt.released(i, "hop"), "released")
+      Test.assert_false(Ipt.held(i, "no such action"), "unbound held")
+      Test.assert_true(near(Ipt.value(i, "no such action"), 0.0), "unbound value")
+    end
+
+    test "keys add their weights, opposite keys cancel, and the sum is clamped" do
+      let m = a_map()
+      Test.assert_true(near(Ipt.value(Ipt.step(Ipt.start(m), keys([87])), "ahead"), 1.0), "W")
+      Test.assert_true(near(Ipt.value(Ipt.step(Ipt.start(m), keys([83])), "ahead"), -1.0), "S")
+      Test.assert_true(near(Ipt.value(Ipt.step(Ipt.start(m), keys([87, 83])), "ahead"), 0.0), "both")
+      Test.assert_true(Ipt.held(Ipt.step(Ipt.start(m), keys([87, 83])), "ahead"), "both cancel in value and still hold")
+      Test.assert_true(near(Ipt.value(Ipt.step(Ipt.start(m), keys([70])), "half"), 0.5), "a weight of a half")
+      let both = Ipt.step(Ipt.start(m), Ipt.raw([87], Nil, Nil, [0.0, -1.0]))
+      Test.assert_true(near(Ipt.value(both, "ahead"), 1.0), "W and the stick forward: 1, not 2")
+      Test.assert_true(near(Ipt.value(both, "side"), 0.0), "the other axis is untouched")
+    end
+
+    test "an axis is read through the dead zone and its weight" do
+      let m = Ipt.with_dead_zone(a_map(), 0.2)
+      Test.assert_true(near(Ipt.value(Ipt.step(Ipt.start(m), axes([0.0, -0.6])), "ahead"), 0.5), "stick up is ahead")
+      Test.assert_true(near(Ipt.value(Ipt.step(Ipt.start(m), axes([0.6, 0.0])), "side"), 0.5), "stick right")
+      Test.assert_true(near(Ipt.value(Ipt.step(Ipt.start(m), axes([0.1, 0.1])), "side"), 0.0), "inside the zone")
+      Test.assert_true(near(Ipt.value(Ipt.step(Ipt.start(m), axes([0.0, 0.0, 0.0, 0.0, 0.0, 0.6])), "squeeze"), 0.5), "a trigger alone")
+      Test.assert_true(near(Ipt.value(Ipt.step(Ipt.start(m), axes([0.5])), "squeeze"), 0.0), "an axis the pad did not give is at rest")
+      let d = Ipt.step(Ipt.start(m), axes([0.3, 0.4]))
+      Test.assert_true(near(Ipt.value(d, "side"), 0.225) && near(Ipt.value(d, "ahead"), -0.3), "the stick's two axes share one round zone")
+    end
+
+    test "each kind of source holds its action" do
+      let m = a_map()
+      Test.assert_true(Ipt.held(Ipt.step(Ipt.start(m), keys([32])), "hop"), "key")
+      Test.assert_true(Ipt.held(Ipt.step(Ipt.start(m), Ipt.raw(Nil, Nil, [0], Nil)), "hop"), "pad button")
+      Test.assert_true(Ipt.held(Ipt.step(Ipt.start(m), Ipt.raw(Nil, [2], Nil, Nil)), "hop"), "mouse button")
+      Test.assert_false(Ipt.held(Ipt.step(Ipt.start(m), Ipt.raw([0], [0], [2], Nil)), "hop"), "a code of another kind is not it")
+    end
+
+    test "an axis holds its action from the press point, either way" do
+      let m = Ipt.with_dead_zone(a_map(), 0.0)
+      Test.assert_false(Ipt.held(Ipt.step(Ipt.start(m), axes([0.0, 0.0, 0.0, 0.0, 0.0, 0.4])), "squeeze"), "short of half")
+      Test.assert_true(Ipt.held(Ipt.step(Ipt.start(m), axes([0.0, 0.0, 0.0, 0.0, 0.0, 0.5])), "squeeze"), "at half")
+      Test.assert_true(Ipt.held(Ipt.step(Ipt.start(m), axes([0.0, 0.8])), "ahead"), "stick back holds ahead too")
+      let light = Ipt.with_press_point(m, 0.2)
+      Test.assert_true(Ipt.held(Ipt.step(Ipt.start(light), axes([0.0, 0.0, 0.0, 0.0, 0.0, 0.3])), "squeeze"), "a lighter press point")
+    end
+  end
+
+  describe "Input.step: edges" do
+    test "pressed is the frame it goes down, released the frame it comes up" do
+      let i0 = Ipt.start(a_map())
+      let i1 = Ipt.step(i0, keys([32]))
+      Test.assert_true(Ipt.pressed(i1, "hop") && Ipt.held(i1, "hop") && !Ipt.released(i1, "hop"), "down: pressed and held")
+      let i2 = Ipt.step(i1, keys([32]))
+      Test.assert_true(!Ipt.pressed(i2, "hop") && Ipt.held(i2, "hop") && !Ipt.released(i2, "hop"), "still down: held only")
+      let i3 = Ipt.step(i2, Ipt.idle())
+      Test.assert_true(!Ipt.pressed(i3, "hop") && !Ipt.held(i3, "hop") && Ipt.released(i3, "hop"), "up: released")
+      let i4 = Ipt.step(i3, Ipt.idle())
+      Test.assert_true(!Ipt.pressed(i4, "hop") && !Ipt.released(i4, "hop"), "still up: nothing")
+    end
+
+    test "passing from one source to another without a gap is one press" do
+      let i1 = Ipt.step(Ipt.start(a_map()), keys([32]))
+      let i2 = Ipt.step(i1, Ipt.raw([32], Nil, [0], Nil))
+      let i3 = Ipt.step(i2, Ipt.raw(Nil, Nil, [0], Nil))
+      Test.assert_true(Ipt.held(i3, "hop") && !Ipt.pressed(i3, "hop") && !Ipt.released(i3, "hop"), "key let go while the button is down")
+    end
+
+    test "an axis crossing the press point is an edge" do
+      let m = Ipt.with_dead_zone(a_map(), 0.0)
+      let t = fn v -> axes([0.0, 0.0, 0.0, 0.0, 0.0, v])
+      let i1 = Ipt.step(Ipt.start(m), t(0.3))
+      let i2 = Ipt.step(i1, t(0.7))
+      let i3 = Ipt.step(i2, t(0.9))
+      let i4 = Ipt.step(i3, t(0.1))
+      Test.assert_false(Ipt.pressed(i1, "squeeze"), "short of the point")
+      Test.assert_true(Ipt.pressed(i2, "squeeze"), "crossed")
+      Test.assert_false(Ipt.pressed(i3, "squeeze"), "further in is no new press")
+      Test.assert_true(Ipt.released(i4, "squeeze"), "let out")
+    end
+  end
+
+  describe "Input: the map" do
+    test "actions and keys are each listed once, in the order bound" do
+      let m = a_map()
+      Test.assert_true(Ipt.actions(m) == ["ahead", "side", "hop", "squeeze", "half"], "actions")
+      Test.assert_true(Ipt.keys(m) == [87, 83, 68, 65, 32, 70], "keys")
+      Test.assert_true(Ipt.keys(Ipt.map_of(Ipt.start(m))) == Ipt.keys(m), "the Input keeps its map")
+    end
+  end
+end

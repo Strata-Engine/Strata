@@ -40,6 +40,7 @@ click blasts a crater (with a spray in the colour of what it threw up),
 right click builds a sphere, escape quits. Blast the rim of a lake in the
 hills and it drains. `L` steps through the light modes, `[` and `]` lower
 and raise the sun, and `R` rereads the island's settings and regenerates.
+A gamepad works beside them: the sticks walk and look (see Input).
 
 ## The island
 
@@ -433,7 +434,8 @@ Strata.Render.draw_ui(u4)                                  -- one draw call, in 
 
 Limits:
 
-- No widgets: nothing a pointer acts on, no text entry, no layout engine.
+- Few widgets: a slider and a one-line text field (`Strata.Controls`; typing
+  is under Input below); no layout engine.
 - The whole display is rebuilt each frame. The layer holds 16 384 quads;
   more are dropped from the end and `Strata.Render.ui_dropped` says how many.
 - Lines break at spaces and between Chinese, Japanese and Korean
@@ -456,6 +458,96 @@ Limits:
 ![Text from 8 to 200 pixels](docs/ui-text-sheet.png)
 ![Wrapping, alignment, outline, shadow, mixed runs](docs/ui-text-styles.png)
 ![Six scripts, mixed direction, kerning and ligatures](docs/ui-text-scripts.png)
+## Input
+
+`Strata.Ffi.Vk` reads the window raw: is a key held, is a mouse button
+held, where the pointer is. `Strata.Input` puts a game's own names over
+that. A game lists bindings, each an action, a source and a weight, and
+asks each frame about its actions, not about keys:
+
+```
+let map = Strata.Input.new([
+    ("ahead", Strata.Input.Key(87), 1.0),          -- W
+    ("ahead", Strata.Input.Key(83), -1.0),         -- S
+    ("ahead", Strata.Input.PadAxis(1), -1.0),      -- left stick; up is negative
+    ("jump", Strata.Input.Key(32), 1.0),
+    ("jump", Strata.Input.PadButton(0), 1.0),      -- south
+    ("fire", Strata.Input.MouseButton(0), 1.0),
+    ("fire", Strata.Input.PadAxis(5), 1.0)])       -- right trigger
+let input0 = Strata.Input.start(map)
+-- each frame, after Strata.Ffi.Vk.poll()
+let input = Strata.Input.step(input0, Strata.Render.input(input0, Strata.Ffi.Vk.first_pad()))
+Strata.Input.value(input, "ahead")      -- -1 .. 1
+Strata.Input.held(input, "fire")
+Strata.Input.pressed(input, "jump")     -- true on the frame it went down
+Strata.Input.released(input, "jump")    -- and on the frame it came up
+```
+
+- **Actions are the game's.** The names are strings of its choosing and the
+  bindings are a list it could as well read from a file. The library knows
+  no action and ships no default map.
+- **Sources.** `Key` and `MouseButton` take GLFW's codes. `PadButton` takes
+  GLFW's gamepad buttons, Xbox layout: 0 south, 1 east, 2 west, 3 north,
+  4 and 5 the bumpers, 6 back, 7 start, 8 guide, 9 and 10 the stick clicks,
+  11 to 14 the d-pad up, right, down, left. `PadAxis` 0 and 1 are the left
+  stick's x and y, 2 and 3 the right stick's, -1 to 1 with y positive
+  downward; 4 and 5 are the left and right triggers, 0 at rest to 1.
+- **Value.** A held key or button adds its weight; an axis adds its reading
+  times its weight; the sum is clamped to -1..1. Opposite keys cancel, and a
+  key with the stick is still 1.
+- **Held, pressed, released.** An action is held while any key or button of
+  it is down or an axis of it is at least half way out (`with_press_point`),
+  so a trigger works as a button. `pressed` and `released` are the frames
+  on which that changed; `step` keeps the frame before to tell.
+- **Dead zone.** 0.15 of an axis's throw unless `with_dead_zone` says
+  otherwise. Inside it an axis reads exactly 0, and from its edge it rises
+  evenly from 0 to 1. A stick's two axes share one round zone (`stick`), so
+  a diagonal push keeps its direction; a trigger has its own (`dead_zone`).
+- **Headless.** `Strata.Input` is pure: `step` takes a raw state that is
+  plain data (`Strata.Input.raw(keys, mouse_buttons, pad_buttons, pad_axes)`),
+  so a test or a replay feeds it without a window. `Strata.Render.input`
+  fills one from the window, asking only about the keys the map binds.
+- **Pads.** `Strata.Ffi.Vk.pad_connected`, `pad_button`, `pad_axis` and
+  `first_pad` read up to 16 pads as of the last `poll`. A game with several
+  players steps one `Input` a pad.
+- **Typing.** `Strata.Ffi.Vk.typed()` is what was typed since the last
+  `poll`, in order: Unicode code points, and the keys that type nothing
+  (Backspace, Delete, the arrows, Home, End, Enter) as negative key codes,
+  repeated as the system repeats them. `Strata.Controls.text_edit(text,
+  caret, events, limit)` applies that list to a string and its caret and
+  answers the new pair; `Strata.Controls.text_field_at` draws the field
+  with the caret where it is. Enter and Escape are left in the list for
+  the game.
+
+```
+let (name, caret) = Strata.Controls.text_edit(name0, caret0, Strata.Ffi.Vk.typed(), 24)
+let u1 = Strata.Controls.text_field_at(u0, 20.0, 20.0, 240.0, 32.0, name, caret, true, back, fore, 16.0)
+```
+
+The viewer's controls are one such list (`controls()` in
+`viewer/lib/strata_viewer.march`). On a gamepad: left stick walks, right
+stick looks, south jumps (rises when flying, east sinks), the right trigger
+digs and the left builds, the bumpers step through the hotbar, north
+switches flying, the left stick's click sprints. A scripted run reads
+Escape and nothing else, so a pad left plugged in cannot change a picture.
+
+Limits:
+
+- A pad is one GLFW has a mapping for; any other joystick is not seen.
+  There is no rumble and no gyro.
+- Pointer motion and scroll are not bindable: they are per-frame deltas and
+  are read from `Strata.Ffi.Vk` as before.
+- No chords, double taps or hold timers, and no rebinding screen.
+- Typing takes at most 64 events a frame and drops the rest. There is no
+  input method support (composed Chinese or Japanese), no selection and no
+  clipboard; a field is one line.
+- `text_field_at` shows the caret as a bar character put into the text, so
+  in right-to-left or shaped text it can part joined letters.
+- The gamepad and typing paths in the C shim were built without a physical
+  pad and without typing into a window: the mapping, edges, dead zones and
+  text editing are covered by tests on raw states, the shim's reading of
+  GLFW is not.
+
 ## Animation
 
 Jointed voxel figures (people, creatures, vehicles) built and animated in
@@ -1081,8 +1173,10 @@ boundary over the ground; their numbers are in `RESULTS.md`.
 | `Strata.PopulationFile` | a population read from a text file |
 | `Strata.Template`, `Strata.Ffi.Vox` | voxel templates (holes, probabilities, turns) blitted into chunks; MagicaVoxel `.vox` import (`native/strata_vox.cpp`, link with `-fno-exceptions`) |
 | `Strata.Entities`, `Strata.Ffi.Ent` | entity kinds, and entities kept as rows by the C kernel in `native/strata_ent.h` |
+| `Strata.Input` | a game's named actions bound as data to keys, mouse buttons and a gamepad: held, pressed, released, value; dead zones |
+| `Strata.Controls` | immediate-mode controls: a slider, a text field, and typed input applied to a string |
 | `Strata.Particles` | particle effects as data, emitters, the bursts a frame hands the renderer |
-| `Strata.Ffi.Vk` | window, input and the Vulkan renderer |
+| `Strata.Ffi.Vk` | window, raw input (keys, mouse, gamepads, typed characters) and the Vulkan renderer |
 | `Strata.Math.*`, `Strata.Noise`, `Strata.Tree` | vectors, matrices, noise, a persistent tree |
 
 ## Known limits

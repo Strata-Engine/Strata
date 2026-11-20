@@ -57,6 +57,8 @@ static inline void   *narr_data(void *a) { return (char *)a + NARR_HDR; }
 #define SV_PAGES_X 16
 #define SV_PAGES_Y 16
 #define SV_MAX_KEYS 512
+#define SV_MAX_TYPED 64
+#define SV_MAX_PADS 16
 
 #define SV_RANGES 6            /* 0 opaque, 1 cutout, 2 translucent, 3 cross, 4 loose, 5 spare */
 #define SV_PAD_MAX 65536       /* extra zero-count commands sv_pad_commands may append */
@@ -293,6 +295,10 @@ static struct {
     /* input */
     unsigned char keys[SV_MAX_KEYS];
     double mx, my, mdx, mdy, scroll_y; int have_mouse;
+    /* this frame's typing, in order: a code point, or minus the code of a key from 256 up (press or repeat) */
+    int32_t typed[SV_MAX_TYPED]; int ntyped;
+    /* gamepads as of the last poll: GLFW's 15 buttons; axes 0..3 the sticks, 4 and 5 the triggers as 0..1 */
+    struct { unsigned char on; unsigned char button[15]; float axis[6]; } pad[SV_MAX_PADS];
     int shot_pending; char shot_path[1024];
 } g;
 
@@ -1285,6 +1291,22 @@ static void light_flush(Frame *F) {
 static void on_key(GLFWwindow *w, int key, int sc, int action, int mods) {
     (void)w; (void)sc; (void)mods;
     if (key >= 0 && key < SV_MAX_KEYS) g.keys[key] = (action != GLFW_RELEASE);
+    if (key >= 256 && action != GLFW_RELEASE && g.ntyped < SV_MAX_TYPED) g.typed[g.ntyped++] = -key;
+}
+static void on_char(GLFWwindow *w, unsigned int cp) {
+    (void)w;
+    if (cp > 0 && cp <= 0x10FFFF && g.ntyped < SV_MAX_TYPED) g.typed[g.ntyped++] = (int32_t)cp;
+}
+/* Read every connected gamepad into g.pad. A joystick GLFW has no mapping for is not a gamepad and reads as absent. */
+static void pads_read(void) {
+    for (int p = 0; p < SV_MAX_PADS; p++) {
+        GLFWgamepadstate st;
+        if (!glfwJoystickIsGamepad(GLFW_JOYSTICK_1 + p) || !glfwGetGamepadState(GLFW_JOYSTICK_1 + p, &st)) { memset(&g.pad[p], 0, sizeof g.pad[p]); continue; }
+        g.pad[p].on = 1;
+        for (int b = 0; b < 15; b++) g.pad[p].button[b] = (st.buttons[b] == GLFW_PRESS);
+        for (int a = 0; a < 4; a++) g.pad[p].axis[a] = st.axes[a];
+        for (int a = 4; a < 6; a++) g.pad[p].axis[a] = (st.axes[a] + 1.0f) * 0.5f;   /* GLFW rests a trigger at -1 */
+    }
 }
 static void on_cursor(GLFWwindow *w, double x, double y) {
     (void)w;
@@ -2029,6 +2051,7 @@ int64_t sv_open_slots(int64_t w, int64_t h, int64_t capture_mouse, int64_t quad_
     g.win = glfwCreateWindow((int)w, (int)h, "Strata", NULL, NULL);
     if (!g.win) { die("glfwCreateWindow", 0); return 0; }
     glfwSetKeyCallback(g.win, on_key);
+    glfwSetCharCallback(g.win, on_char);
     glfwSetCursorPosCallback(g.win, on_cursor);
     glfwSetScrollCallback(g.win, on_scroll);
     glfwSetFramebufferSizeCallback(g.win, on_resize);
@@ -2488,7 +2511,16 @@ void sv_close(void) {
 
 /* ── Window and input queries ─────────────────────────────────────────────── */
 int64_t sv_should_close(void) { return (!g.win || glfwWindowShouldClose(g.win)) ? 1 : 0; }
-void sv_poll(void) { g.mdx = 0; g.mdy = 0; g.scroll_y = 0; if (g.win) glfwPollEvents(); }
+void sv_poll(void) { g.mdx = 0; g.mdy = 0; g.scroll_y = 0; g.ntyped = 0; if (g.win) { glfwPollEvents(); pads_read(); } }
+/* Typing during the latest poll, in order: sv_typed(i) is a Unicode code point, or minus a GLFW key code (256 up) pressed or repeated. */
+int64_t sv_typed_count(void) { return g.ntyped; }
+int64_t sv_typed(int64_t i) { return (i >= 0 && i < g.ntyped) ? g.typed[i] : 0; }
+/* Gamepad p (0..15) as of the latest poll. Buttons 0..14 in GLFW's order (0 south, 1 east, 2 west, 3 north, 4 and 5 the
+ * bumpers, 6 back, 7 start, 8 guide, 9 and 10 the stick clicks, 11..14 the d-pad up, right, down, left). Axes 0 and 1 the
+ * left stick's x and y, 2 and 3 the right stick's, -1..1 with y positive downward; 4 and 5 the left and right triggers, 0..1. */
+int64_t sv_pad_connected(int64_t p) { return (p >= 0 && p < SV_MAX_PADS) ? g.pad[p].on : 0; }
+int64_t sv_pad_button(int64_t p, int64_t b) { return (p >= 0 && p < SV_MAX_PADS && b >= 0 && b < 15) ? g.pad[p].button[b] : 0; }
+double sv_pad_axis(int64_t p, int64_t a) { return (p >= 0 && p < SV_MAX_PADS && a >= 0 && a < 6) ? (double)g.pad[p].axis[a] : 0.0; }
 int64_t sv_key(int64_t k) { return (k >= 0 && k < SV_MAX_KEYS) ? g.keys[k] : 0; }
 /* Is mouse button b (0 left, 1 right, 2 middle) held? */
 int64_t sv_open(int64_t w, int64_t h, int64_t capture_mouse, int64_t quad_capacity) {
