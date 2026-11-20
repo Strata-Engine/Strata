@@ -1,0 +1,169 @@
+-- Props: a scatter layer whose instances stand as fine grids instead of
+-- being stamped (Strata.Population.props, Strata.Populate.props_with).
+mod Strata.Test.Props do
+
+  -- this module uses no Check.all; the suite compiles as one program and
+  -- other test modules do (GAPS S3)
+  needs IO.Clock
+  needs IO.Process
+  import Test
+  alias Strata.Population as Pn
+  alias Strata.Populate as Pq
+  alias Strata.PopulationFile as Pfl
+
+  -- a solid template of block 5
+  pfn block(sx : Int, sy : Int, sz : Int, vs : Float) : Strata.Template.Template do
+    Strata.Template.make(sx, sy, sz, NativeArray.make_i32(sx * sy * sz, 5), vs)
+  end
+  -- "trees": two variants at 1 m (shape set "s"), scattered thickly
+  pfn base_pop() : Strata.Population.Pop do
+    Pn.layer_scatter(Pn.shapes_templates(Pn.new(), "s", [block(3, 5, 3, 1.0), block(1, 4, 1, 1.0)]), "trees", "s", Pn.rule(0.02, Nil, Nil, Nil), 6.0, 0.4, 21)
+  end
+  -- the same with the variants again at 0.25 m (shape set "sf") as the layer's props
+  pfn prop_pop() : Strata.Population.Pop do
+    Pn.props(Pn.shapes_templates(base_pop(), "sf", [block(12, 20, 12, 0.25), block(4, 16, 4, 0.25)]), "trees", "sf")
+  end
+  pfn err_of(p : Strata.Population.Pop) : String do
+    match Pn.freeze(p) do
+      Ok(_) -> ""
+      Err(m) -> m
+    end
+  end
+  pfn fit_of(p : Strata.Population.Pop, scale : Float) : Strata.Population.Frozen do
+    match Pn.freeze(p) do
+      Ok(f) ->
+        match Pn.fit_all(f, scale) do
+          Ok(f2) -> f2
+          Err(m) -> panic("expected the population to fit: " ++ m)
+        end
+      Err(m) -> panic("expected the population to freeze: " ++ m)
+    end
+  end
+  pfn fit_err(p : Strata.Population.Pop, scale : Float) : String do
+    match Pn.freeze(p) do
+      Ok(f) ->
+        match Pn.fit_all(f, scale) do
+          Ok(_) -> ""
+          Err(m) -> m
+        end
+      Err(m) -> m
+    end
+  end
+
+  -- world column tops from 5 to 15, so every instance stands in chunk y 0
+  pfn top_at(wx : Int, wz : Int) : Int do 5 + ((3 * wx + 7 * wz) % 11 + 11) % 11 end
+  pfn tops_go(a : NativeIntArr, x0 : Int, z0 : Int, n : Int, lift : Int, i : Int) : NativeIntArr do
+    if i >= n * n do a else tops_go(NativeArray.set_int(a, i, lift + top_at(x0 + i % n, z0 + i / n)), x0, z0, n, lift, i + 1) end
+  end
+  -- chunk column (kx, kz)'s columns and m more on each side, every top lifted by lift
+  pfn col_ground(kx : Int, kz : Int, m : Int, scale : Float, lift : Int) : Strata.Populate.Ground do
+    let n = 32 + 2 * m
+    Pq.ground(32 * kx - m, 32 * kz - m, n, scale, 0, tops_go(NativeArray.make_int(n * n, 0), 32 * kx - m, 32 * kz - m, n, lift, 0), NativeArray.make_int(n * n, -1))
+  end
+  pfn count5(c : Strata.Chunk.Chunk) : Int do
+    List.fold_left(List.range(0, 32768), 0, fn (acc, i) -> if Strata.Chunk.get_idx(c, Strata.Chunk.index(i)) == 5 do acc + 1 else acc end)
+  end
+  pfn col(m : Float, voxel : Float) : Int do float_to_int(Math.floor(m /. voxel)) end
+  pfn in_cols(i : Strata.Populate.PopInstance, x0 : Int, z0 : Int) : Bool do
+    let x = col(Pq.i_xm(i), 1.0) - x0
+    let z = col(Pq.i_zm(i), 1.0) - z0
+    x >= 0 && x < 32 && z >= 0 && z < 32
+  end
+
+  describe "Population.props" do
+    test "freeze refuses a prop layer that cannot be one, naming it" do
+      Test.assert_eq_str(err_of(prop_pop()), "", "the fixture freezes")
+      Test.assert_true(string_contains(err_of(Pn.props(base_pop(), "nope", "s")), "undeclared layer 'nope'"), "no such layer")
+      Test.assert_true(string_contains(err_of(Pn.props(base_pop(), "trees", "nope")), "undeclared shape set 'nope'"), "no such set")
+      Test.assert_true(string_contains(err_of(Pn.props(Pn.shapes_blocks(base_pop(), "b", [7, 8]), "trees", "b")), "holds blocks"), "a set of blocks")
+      Test.assert_true(string_contains(err_of(Pn.props(Pn.shapes_templates(base_pop(), "one", [block(4, 4, 4, 0.25)]), "trees", "one")), "1 variants"), "another count of variants")
+      Test.assert_true(string_contains(err_of(Pn.props(Pn.shapes_templates(base_pop(), "mix", [block(4, 4, 4, 0.25), block(4, 4, 4, 0.5)]), "trees", "mix")), "one voxel size"), "two voxel sizes")
+      Test.assert_true(string_contains(err_of(Pn.props(Pn.shapes_templates(base_pop(), "big", [block(129, 4, 4, 0.25), block(4, 4, 4, 0.25)]), "trees", "big")), "over 128"), "too wide for a grid")
+      Test.assert_true(string_contains(err_of(Pn.props(Pn.layer_cover(Pn.shapes_blocks(prop_pop(), "b", [7]), "moss", "b", Pn.rule(0.5, Nil, Nil, Nil), 3), "moss", "sf")), "only a scatter layer"), "a cover layer")
+      Test.assert_true(string_contains(err_of(Pn.props(prop_pop(), "trees", "sf")), "props"), "twice for one layer")
+      match Pn.freeze_subject(err_of(Pn.props(base_pop(), "trees", "nope"))) do
+        Some((kind, names)) -> Test.assert_eq_str(kind ++ ":" ++ string_join(names, ","), "props:trees", "the message is about the layer's props")
+        None -> Test.assert_true(false, "a subject")
+      end
+    end
+    test "the detail scale, and where a prop layer is one" do
+      let f = fit_of(prop_pop(), 1.0)
+      let l = Pn.layer_index(f, "trees")
+      Test.assert_eq_int(Pn.layer_props(f, l), Pn.shape_set_index(f, "sf"), "its prop set")
+      Test.assert_true(Pn.layer_detail(f, l) == 0.25, "detail 0.25 m")
+      Test.assert_true(Pn.layer_is_prop(f, l, 1.0) && Pn.layer_is_prop(f, l, 0.5) && !Pn.layer_is_prop(f, l, 0.25) && !Pn.layer_is_prop(f, l, 0.125), "props only in a coarser world")
+      Test.assert_eq_int(Pn.layer_props(fit_of(base_pop(), 1.0), 0), -1, "none without props")
+      -- fit_all leaves the prop set at its own size and fits the layer's own
+      match Pn.shape_set_templates(f, Pn.shape_set_index(f, "sf")) do
+        Cons(t, _) -> Test.assert_eq_int(Strata.Template.t_sx(t), 12, "the prop set is not refitted")
+        Nil -> Test.assert_true(false, "templates")
+      end
+      let three = Pn.props(Pn.shapes_templates(Pn.layer_scatter(Pn.shapes_templates(Pn.new(), "s", [block(3, 5, 3, 0.75)]), "trees", "s", Pn.rule(0.02, Nil, Nil, Nil), 6.0, 0.4, 21), "sf", [block(9, 15, 9, 0.25)]), "trees", "sf")
+      Test.assert_true(string_contains(fit_err(three, 0.75), "2, 4 or 8"), "a world of three detail voxels is refused")
+      Test.assert_true(string_contains(fit_err(Pn.props(Pn.shapes_templates(base_pop(), "tiny", [block(4, 4, 4, 0.0625), block(4, 4, 4, 0.0625)]), "trees", "tiny"), 1.0), "2, 4 or 8"), "sixteen is refused")
+    end
+    test "a population file says props = SET" do
+      let text = "[shapes s] kind = templates from = coarse\n[shapes sf] kind = templates from = fine\n[layer trees] kind = scatter shapes = s base = 0.02 cell = 6.0 jitter = 0.4 salt = 21 props = sf\n"
+      let nm = Pfl.named([("coarse", [block(3, 5, 3, 1.0)]), ("fine", [block(12, 20, 12, 0.25)])], Nil)
+      match Pfl.read_into(Pn.new(), text, nm) do
+        Ok(p) ->
+          let f = fit_of(p, 1.0)
+          Test.assert_eq_int(Pn.layer_props(f, 0), Pn.shape_set_index(f, "sf"), "the layer's prop set")
+        Err(m) -> Test.assert_true(false, m)
+      end
+      match Pfl.read_into(Pn.new(), "[shapes b] kind = blocks ids = 7\n[layer moss] kind = cover shapes = b base = 0.5 salt = 1 props = b\n", nm) do
+        Ok(_) -> Test.assert_true(false, "a cover layer took props")
+        Err(m) -> Test.assert_true(string_contains(m, "props"), "props on a cover layer: " ++ m)
+      end
+    end
+  end
+
+  describe "Populate.props_with" do
+    test "a prop layer stamps nothing at level 0 and lists each instance in one chunk" do
+      let f = fit_of(prop_pop(), 1.0)
+      let p = Pq.plan(f)
+      let m = Pq.plan_pad(p, 1.0)
+      let g = col_ground(2, -1, m, 1.0, 0)
+      let t = Pq.fields_with(p, 11, g)
+      let k0 = Strata.Coord.key(2, 0, -1)
+      Test.assert_true(Pq.layer_is_prop(p, g, 0), "a prop layer on this Ground")
+      Test.assert_eq_int(count5(Pq.place_with(p, 11, k0, Strata.Chunk.uniform(0), g, t)), 0, "nothing stamped")
+      -- the same layer without props stamps
+      let pb = Pq.plan(fit_of(base_pop(), 1.0))
+      Test.assert_true(count5(Pq.place_with(pb, 11, k0, Strata.Chunk.uniform(0), g, Pq.fields_with(pb, 11, g))) > 20, "without props it stamps")
+      let all = List.filter(Pq.instances_with(p, 11, t, g, 0), fn i -> in_cols(i, 64, -32))
+      let ps = Pq.props_with(p, 11, k0, g, t)
+      Test.assert_true(List.length(all) > 5, "the column holds instances (" ++ int_to_string(List.length(all)) ++ ")")
+      Test.assert_eq_int(List.length(ps), List.length(all), "every one a prop of chunk y 0")
+      Test.assert_true(List.all(List.zip(ps, all), fn e -> match e do (pr, i) ->
+        Pq.pr_hash(pr) == Pq.i_stream(i) && Pq.pr_variant(pr) == Pq.i_variant(i) && Pq.pr_rot(pr) == Pq.i_rot(i) && Pq.pr_top(pr) == Pq.i_top(i) && Pq.pr_xm(pr) == Pq.i_xm(i) && Pq.pr_zm(pr) == Pq.i_zm(i) && Pq.pr_layer(pr) == 0 end), "each as its instance, in order")
+      Test.assert_eq_int(List.length(Pq.props_with(p, 11, Strata.Coord.key(2, 1, -1), g, t)) + List.length(Pq.props_with(p, 11, Strata.Coord.key(2, -1, -1), g, t)), 0, "none in the chunks above and below")
+      Test.assert_eq_int(List.length(Pq.props_with(p, 11, Strata.Coord.key_at(2, 0, -1, 1), g, t)), 0, "none for a key above level 0")
+      Test.assert_eq_int(List.length(Pq.props_with(p, 12, k0, g, t)), 0, "none for another seed's Table")
+    end
+    test "tops across a chunk border: the chunks of a column share its instances out" do
+      let f = fit_of(prop_pop(), 1.0)
+      let p = Pq.plan(f)
+      let m = Pq.plan_pad(p, 1.0)
+      -- tops 25 .. 35: a root at top + 1 = 32 or more is chunk y 1's
+      let g = col_ground(0, 0, m, 1.0, 20)
+      let t = Pq.fields_with(p, 11, g)
+      let all = List.filter(Pq.instances_with(p, 11, t, g, 0), fn i -> in_cols(i, 0, 0))
+      let low = Pq.props_with(p, 11, Strata.Coord.key(0, 0, 0), g, t)
+      let high = Pq.props_with(p, 11, Strata.Coord.key(0, 1, 0), g, t)
+      Test.assert_true(List.length(low) > 0 && List.length(high) > 0, "both chunks hold some (" ++ int_to_string(List.length(low)) ++ ", " ++ int_to_string(List.length(high)) ++ ")")
+      Test.assert_eq_int(List.length(low) + List.length(high), List.length(all), "together all of them")
+      Test.assert_true(List.all(low, fn pr -> Pq.pr_top(pr) <= 30) && List.all(high, fn pr -> Pq.pr_top(pr) >= 31), "split at the root voxel")
+    end
+    test "in a world at the detail scale the same declaration stamps" do
+      let f = fit_of(prop_pop(), 0.25)
+      let p = Pq.plan(f)
+      let m = Pq.plan_pad(p, 0.25)
+      let g = col_ground(0, 0, m, 0.25, 0)
+      let t = Pq.fields_with(p, 11, g)
+      Test.assert_true(!Pq.layer_is_prop(p, g, 0), "not a prop layer here")
+      Test.assert_eq_int(List.length(Pq.props_with(p, 11, Strata.Coord.key(0, 0, 0), g, t)), 0, "no props")
+      Test.assert_true(count5(Pq.place_with(p, 11, Strata.Coord.key(0, 0, 0), Strata.Chunk.uniform(0), g, t)) > 20, "stamped")
+    end
+  end
+end
