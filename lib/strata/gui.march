@@ -1,0 +1,1114 @@
+-- Gui: an immediate-mode interface toolkit over Strata.Ui, Strata.Text,
+-- Strata.Controls and Strata.Input.
+--
+-- A game describes a screen afresh each frame as data: layers, each a node
+-- placed by one of Strata.Ui's nine anchors, and nodes that are rows,
+-- columns, panels, scroll regions and widgets. `run` lays the screen out,
+-- applies a frame's input (a pointer, typed events and the toolkit's
+-- Strata.Input actions) and answers rectangles by id, events, and a list of
+-- boxes and words to draw (Strata.GuiDraw.paint draws it). The values shown
+-- are the game's; the toolkit keeps only focus, the control holding the
+-- pointer, a field's caret, scroll offsets and which choice list is open.
+--
+-- Pure: nothing here calls C. Text width comes from the theme's measure
+-- function, which a test writes and a game takes from Strata.GuiDraw.
+-- Lengths are interface pixels, as in Strata.Ui. Design:
+-- docs/2026-11-19-gui-design.md; rulings: docs/gui-ledger.md.
+mod Strata.Gui do
+
+  -- ── Sizes and nodes ─────────────────────────────────────────────────────
+
+  -- a length: fixed pixels, the content's own, or a share by weight of what the parent has left
+  type GSize = GFixed(Float) | GFit | GShare(Float)
+
+  -- a node. Groups: direction (0 a row, 1 a column), background drawn, scroll id ("" for none), padding and gap (negative: the theme's)
+  type GNode = GLabel(String, GSize, GSize)
+    | GButton(String, String, GSize, GSize)
+    | GToggle(String, String, Bool, GSize, GSize)
+    | GSlider(String, String, Float, Float, Float, Float, GSize, GSize)
+    | GField(String, String, String, Int, GSize, GSize)
+    | GChoice(String, String, List(String), Int, GSize, GSize)
+    | GSpace(GSize, GSize)
+    | GGroup(Int, Bool, String, Float, Float, GSize, GSize, List(GNode))
+
+  -- a node placed on the screen: anchor, offset
+  type GLayer = GLayer(Int, Float, Float, GNode)
+
+  doc "A length of [px] interface pixels."
+  fn fixed(px : Float) : GSize do GFixed(px) end
+  doc "A length fitted to the content."
+  fn fit() : GSize do GFit end
+  doc "A share by [weight] of what the parent has left along its axis; across it, the parent's whole inner size. At the top of a layer, [weight] is the share of the window (at most 1)."
+  fn share(weight : Float) : GSize do GShare(weight) end
+
+  doc "A line of text."
+  fn label(text : String) : GNode do GLabel(text, GFit, GFit) end
+  doc "A button. Clicked(id) when clicked or activated."
+  fn button(id : String, text : String) : GNode do GButton(id, text, GFit, GFit) end
+  doc "A box that is on or off, and its label. Toggled(id, new) when clicked or activated."
+  fn toggle(id : String, text : String, lit : Bool) : GNode do GToggle(id, text, lit, GFit, GFit) end
+  doc "A labelled slider over [lo, hi] showing [value], moving in steps of [step] (0: none). Changed(id, new) as it moves."
+  fn slider(id : String, text : String, value : Float, lo : Float, hi : Float, step : Float) : GNode do GSlider(id, text, value, lo, hi, step, GFit, GFit) end
+  doc "A labelled one-line field holding [value], at most [limit] characters. Edited(id, new) as it is typed into, Submitted(id) on Enter or activation."
+  fn field(id : String, text : String, value : String, limit : Int) : GNode do GField(id, text, value, limit, GFit, GFit) end
+  doc "A labelled choice of [options] showing option [chosen]; it drops down a list to pick from. Chose(id, i) when one is picked."
+  fn choice(id : String, text : String, options : List(String), chosen : Int) : GNode do GChoice(id, text, options, chosen, GFit, GFit) end
+  doc "Empty room."
+  fn space(w : GSize, h : GSize) : GNode do GSpace(w, h) end
+  doc "Children side by side, left to right."
+  fn row(w : GSize, h : GSize, children : List(GNode)) : GNode do GGroup(0, false, "", -1.0, -1.0, w, h, children) end
+  doc "Children one under another."
+  fn column(w : GSize, h : GSize, children : List(GNode)) : GNode do GGroup(1, false, "", -1.0, -1.0, w, h, children) end
+  doc "A column on a background."
+  fn panel(w : GSize, h : GSize, children : List(GNode)) : GNode do GGroup(1, true, "", -1.0, -1.0, w, h, children) end
+  doc "A column seen through a viewport [w] x [h] that scrolls up and down, with a scroll bar when the children are taller than it. [id] keeps its offset from frame to frame."
+  fn scroll(id : String, w : GSize, h : GSize, children : List(GNode)) : GNode do GGroup(1, true, id, -1.0, -1.0, w, h, children) end
+
+  doc "The node with width [w] and height [h]."
+  fn sized(n : GNode, w : GSize, h : GSize) : GNode do
+    match n do
+      GLabel(t, _, _) -> GLabel(t, w, h)
+      GButton(i, t, _, _) -> GButton(i, t, w, h)
+      GToggle(i, t, lit, _, _) -> GToggle(i, t, lit, w, h)
+      GSlider(i, t, v, lo, hi, st, _, _) -> GSlider(i, t, v, lo, hi, st, w, h)
+      GField(i, t, v, lim, _, _) -> GField(i, t, v, lim, w, h)
+      GChoice(i, t, os, c, _, _) -> GChoice(i, t, os, c, w, h)
+      GSpace(_, _) -> GSpace(w, h)
+      GGroup(d, bg, sid, p, g, _, _, cs) -> GGroup(d, bg, sid, p, g, w, h, cs)
+    end
+  end
+
+  doc "A group with padding [pad] inside its edges (other nodes are unchanged)."
+  fn with_pad(n : GNode, pad : Float) : GNode do
+    match n do
+      GGroup(d, bg, sid, _, g, w, h, cs) -> GGroup(d, bg, sid, pad, g, w, h, cs)
+      _ -> n
+    end
+  end
+
+  doc "A group with [gap] between its children (other nodes are unchanged)."
+  fn with_gap(n : GNode, gap : Float) : GNode do
+    match n do
+      GGroup(d, bg, sid, p, _, w, h, cs) -> GGroup(d, bg, sid, p, gap, w, h, cs)
+      _ -> n
+    end
+  end
+
+  doc "A layer: [node] placed so that its own [anchor] point (Strata.Ui.top_left() .. bottom_right()) sits at the window's, plus (x, y)."
+  fn place(anchor : Int, x : Float, y : Float, node : GNode) : GLayer do GLayer(anchor, x, y, node) end
+
+  -- ── Theme ────────────────────────────────────────────────────────────────
+
+  type GTheme = { gt_measure : Int -> Float -> String -> (Float, Float), gt_font : Int, gt_size : Float, gt_pad : Float, gt_gap : Float,
+                  gt_line : Float, gt_bar : Float, gt_min_w : Float, gt_label_w : Float, gt_ring : Float,
+                  gt_text : (Float, Float, Float, Float), gt_dim : (Float, Float, Float, Float), gt_panel : (Float, Float, Float, Float),
+                  gt_control : (Float, Float, Float, Float), gt_hover : (Float, Float, Float, Float), gt_press : (Float, Float, Float, Float),
+                  gt_accent : (Float, Float, Float, Float), gt_focus : (Float, Float, Float, Float), gt_field : (Float, Float, Float, Float),
+                  gt_track : (Float, Float, Float, Float) }
+
+  doc "The plain default: dark panels, light text, a blue accent, 16-pixel text in font 0 (the built-in font), measured by [measure] (font, size, text) -> (width, height). Change any field with `{ t with gt_... }`: gt_pad (inside groups), gt_gap (between children), gt_line (a control's height), gt_bar (a scroll bar's width), gt_min_w (a control's least width), gt_label_w (the width of a widget's label; 0 fits each), gt_ring (the focus ring's width), and the colours."
+  fn theme(measure : Int -> Float -> String -> (Float, Float)) : GTheme do
+    { gt_measure: measure, gt_font: 0, gt_size: 16.0, gt_pad: 10.0, gt_gap: 8.0, gt_line: 30.0, gt_bar: 8.0, gt_min_w: 120.0, gt_label_w: 0.0, gt_ring: 2.0,
+      gt_text: (0.93, 0.94, 0.96, 1.0), gt_dim: (0.62, 0.65, 0.70, 1.0), gt_panel: (0.08, 0.09, 0.11, 0.88),
+      gt_control: (0.20, 0.22, 0.26, 1.0), gt_hover: (0.28, 0.31, 0.37, 1.0), gt_press: (0.14, 0.15, 0.18, 1.0),
+      gt_accent: (0.33, 0.62, 0.98, 1.0), gt_focus: (0.98, 0.80, 0.30, 1.0), gt_field: (0.04, 0.05, 0.06, 1.0),
+      gt_track: (0.32, 0.34, 0.38, 1.0) }
+  end
+
+  doc "A measure for tests and fixed-pitch text: each byte [k] times the size wide, lines 1.25 times the size high."
+  fn pitch_measure(k : Float) : Int -> Float -> String -> (Float, Float) do
+    fn (_f, size, s) -> (int_to_float(string_byte_length(s)) *. size *. k, size *. 1.25)
+  end
+
+  -- ── Input and state ──────────────────────────────────────────────────────
+
+  doc "The toolkit's actions as bindings, for a game to append to its own map (or to bind the same names its own way): ui_next Tab and the right bumper; ui_prev the left bumper (and Tab with ui_shift); ui_shift either Shift; ui_up/down/left/right the arrows, the d-pad and the left stick; ui_activate Enter, Space and pad south; ui_back Escape and pad east."
+  fn bindings() : List((String, Strata.Input.Source, Float)) do
+    [("ui_next", Strata.Input.Key(258), 1.0), ("ui_next", Strata.Input.PadButton(5), 1.0),
+     ("ui_prev", Strata.Input.PadButton(4), 1.0),
+     ("ui_shift", Strata.Input.Key(340), 1.0), ("ui_shift", Strata.Input.Key(344), 1.0),
+     ("ui_up", Strata.Input.Key(265), 1.0), ("ui_up", Strata.Input.PadButton(11), 1.0), ("ui_up", Strata.Input.PadAxis(1), -1.0),
+     ("ui_down", Strata.Input.Key(264), 1.0), ("ui_down", Strata.Input.PadButton(13), 1.0), ("ui_down", Strata.Input.PadAxis(1), 1.0),
+     ("ui_left", Strata.Input.Key(263), 1.0), ("ui_left", Strata.Input.PadButton(14), 1.0), ("ui_left", Strata.Input.PadAxis(0), -1.0),
+     ("ui_right", Strata.Input.Key(262), 1.0), ("ui_right", Strata.Input.PadButton(12), 1.0), ("ui_right", Strata.Input.PadAxis(0), 1.0),
+     ("ui_activate", Strata.Input.Key(257), 1.0), ("ui_activate", Strata.Input.Key(335), 1.0), ("ui_activate", Strata.Input.Key(32), 1.0), ("ui_activate", Strata.Input.PadButton(0), 1.0),
+     ("ui_back", Strata.Input.Key(256), 1.0), ("ui_back", Strata.Input.PadButton(1), 1.0)]
+  end
+
+  -- one frame's input: the pointer (when there is one) in interface pixels, its button down, the wheel, typed events, the actions
+  type GFrame = { gf_pointer : Option((Float, Float)), gf_down : Bool, gf_wheel : Float, gf_typed : List(Int), gf_input : Strata.Input.Input }
+
+  doc "A frame's input: [pointer] in interface pixels (None while the cursor is captured), whether its button is down, the wheel's delta (positive away from the player), the typed events (Strata.Ffi.Vk.typed), and an Input stepped this frame with a map holding the ui_ actions."
+  fn frame(pointer : Option((Float, Float)), down : Bool, wheel : Float, typed : List(Int), input : Strata.Input.Input) : GFrame do
+    { gf_pointer: pointer, gf_down: down, gf_wheel: wheel, gf_typed: typed, gf_input: input }
+  end
+
+  -- what the toolkit keeps between frames
+  type GState = { gs_focus : String, gs_active : String, gs_open : String, gs_light : Int, gs_caret : Int, gs_caret_of : String,
+                  gs_scrolls : List((String, Float)), gs_was_down : Bool, gs_last : Option((Float, Float)), gs_ring : Bool, gs_grab : Float }
+
+  doc "The state before the first frame: nothing focused, nothing held, nothing scrolled."
+  fn start() : GState do
+    { gs_focus: "", gs_active: "", gs_open: "", gs_light: 0, gs_caret: 0, gs_caret_of: "", gs_scrolls: Nil, gs_was_down: false, gs_last: None, gs_ring: false, gs_grab: 0.0 }
+  end
+
+  doc "The state with [id] focused and its ring shown, as if moved to by key: a screen that opens for a pad focuses its first control."
+  fn focus(s : GState, id : String) : GState do { s with gs_focus: id, gs_ring: true } end
+
+  doc "The focused control's id; \"\" for none."
+  fn focused(s : GState) : String do s.gs_focus end
+
+  doc "The scroll region [id]'s offset: how far its content is moved up."
+  fn scroll_offset(s : GState, id : String) : Float do lookup_f(s.gs_scrolls, id, 0.0) end
+
+  doc "The state with scroll region [id] moved to [offset] (clamped when next laid out)."
+  fn set_scroll(s : GState, id : String, offset : Float) : GState do { s with gs_scrolls: put_f(s.gs_scrolls, id, offset) } end
+
+  -- ── Results ──────────────────────────────────────────────────────────────
+
+  type GEvent = Clicked(String) | Toggled(String, Bool) | Changed(String, Float) | Edited(String, String) | Submitted(String) | Chose(String, Int) | Back
+  derive Eq for GEvent
+
+  type GDraw = GBox(Float, Float, Float, Float, (Float, Float, Float, Float))
+    | GWords(Float, Float, Int, Float, (Float, Float, Float, Float), String)
+
+  -- an item laid out: id ("" for none), the node, its rectangle, the clip it is seen through, the scroll region it is in
+  type GItem = GItem(String, GNode, (Float, Float, Float, Float), (Float, Float, Float, Float), String)
+
+  -- a scroll region laid out: id, viewport, content height, offset, clip, depth
+  type GRegion = GRegion(String, (Float, Float, Float, Float), Float, Float, (Float, Float, Float, Float), Int)
+
+  type GResult = { gr_items : List(GItem), gr_regions : List(GRegion), gr_roots : List((Float, Float, Float, Float)), gr_events : List(GEvent),
+                   gr_hovered : String, gr_active : String, gr_focus : String, gr_over : Bool, gr_draws : List(GDraw), gr_overlay : List((Float, Float, Float, Float)) }
+
+  doc "The events of the frame, in the order they happened."
+  fn events(r : GResult) : List(GEvent) do r.gr_events end
+  doc "The draw list: boxes and words in drawing order (Strata.GuiDraw.paint)."
+  fn draws(r : GResult) : List(GDraw) do r.gr_draws end
+  doc "Fold a result's draw list in order: [on_box](acc, x, y, w, h, colour) for a box, [on_words](acc, x, y, font, size, colour, text) for text."
+  fn fold_draws(r : GResult, acc : a, on_box : a -> Float -> Float -> Float -> Float -> (Float, Float, Float, Float) -> a, on_words : a -> Float -> Float -> Int -> Float -> (Float, Float, Float, Float) -> String -> a) : a do
+    List.fold_left(r.gr_draws, acc, fn (u, d) ->
+      match d do
+        GBox(x, y, w, h, c) -> on_box(u, x, y, w, h, c)
+        GWords(x, y, f, sz, c, s) -> on_words(u, x, y, f, sz, c, s)
+      end)
+  end
+
+  doc "The text a draw writes, if it writes any."
+  fn draw_text(d : GDraw) : Option(String) do
+    match d do
+      GWords(_, _, _, _, _, s) -> Some(s)
+      GBox(_, _, _, _, _) -> None
+    end
+  end
+  doc "The control under the pointer; \"\" for none."
+  fn hovered(r : GResult) : String do r.gr_hovered end
+  doc "The control holding the pointer (pressed and not yet released); \"\" for none."
+  fn active(r : GResult) : String do r.gr_active end
+  doc "The focused control after this frame."
+  fn focus_of(r : GResult) : String do r.gr_focus end
+  doc "Is the pointer over any layer or open list? A game does not also act on the world under it."
+  fn pointer_over(r : GResult) : Bool do r.gr_over end
+  doc "Was [id] clicked or activated this frame?"
+  fn clicked(r : GResult, id : String) : Bool do List.any(r.gr_events, fn e -> match e do Clicked(i) -> i == id | _ -> false end) end
+  doc "The last value slider [id] was moved to this frame, if it moved."
+  fn changed(r : GResult, id : String) : Option(Float) do List.fold_left(r.gr_events, None, fn (a, e) -> match e do Changed(i, x) -> if i == id do Some(x) else a end | _ -> a end) end
+  doc "What toggle [id] was flipped to this frame, if it was."
+  fn toggled(r : GResult, id : String) : Option(Bool) do List.fold_left(r.gr_events, None, fn (a, e) -> match e do Toggled(i, x) -> if i == id do Some(x) else a end | _ -> a end) end
+  doc "The option picked in choice [id] this frame, if one was."
+  fn chose(r : GResult, id : String) : Option(Int) do List.fold_left(r.gr_events, None, fn (a, e) -> match e do Chose(i, x) -> if i == id do Some(x) else a end | _ -> a end) end
+  doc "The text field [id] holds after this frame's typing, if it changed."
+  fn edited(r : GResult, id : String) : Option(String) do List.fold_left(r.gr_events, None, fn (a, e) -> match e do Edited(i, x) -> if i == id do Some(x) else a end | _ -> a end) end
+  doc "Was field [id] submitted this frame?"
+  fn submitted(r : GResult, id : String) : Bool do List.any(r.gr_events, fn e -> match e do Submitted(i) -> i == id | _ -> false end) end
+  doc "Did the game's back action arrive with no list open to close?"
+  fn went_back(r : GResult) : Bool do List.any(r.gr_events, fn e -> match e do Back -> true | _ -> false end) end
+
+  doc "The rectangle (x, y, w, h) of control or scroll region [id] as laid out this frame, if it is on the screen."
+  fn rect(r : GResult, id : String) : Option((Float, Float, Float, Float)) do
+    match List.find(r.gr_items, fn it -> match it do GItem(i, _, _, _, _) -> i == id end) do
+      Some(GItem(_, _, rc, _, _)) -> Some(rc)
+      None ->
+        match List.find(r.gr_regions, fn g -> match g do GRegion(i, _, _, _, _, _) -> i == id end) do
+          Some(GRegion(_, rc, _, _, _, _)) -> Some(rc)
+          None -> None
+        end
+    end
+  end
+
+  doc "The rectangles of every layer's top node, in layer order."
+  fn roots(r : GResult) : List((Float, Float, Float, Float)) do r.gr_roots end
+
+  doc "The ids of the controls that take focus, in the order next walks them."
+  fn focus_order(r : GResult) : List(String) do
+    List.filter_map(r.gr_items, fn it -> match it do GItem(i, n, _, _, _) -> if focusable(n) do Some(i) else None end end)
+  end
+
+  -- ── Small helpers ────────────────────────────────────────────────────────
+
+  pfn maxf(a : Float, b : Float) : Float do if a > b do a else b end end
+  pfn minf(a : Float, b : Float) : Float do if a < b do a else b end end
+  pfn clampf(v : Float, lo : Float, hi : Float) : Float do if v < lo do lo else if v > hi do hi else v end end end
+
+  pfn lookup_f(xs : List((String, Float)), k : String, d : Float) : Float do
+    match xs do
+      Nil -> d
+      Cons((k2, v), rest) -> if k2 == k do v else lookup_f(rest, k, d) end
+    end
+  end
+
+  pfn put_f(xs : List((String, Float)), k : String, v : Float) : List((String, Float)) do
+    Cons((k, v), List.filter(xs, fn kv -> match kv do (k2, _) -> k2 != k end))
+  end
+
+  pfn inside(p : (Float, Float), r : (Float, Float, Float, Float)) : Bool do
+    match (p, r) do ((px, py), (x, y, w, h)) -> px >= x && px < x +. w && py >= y && py < y +. h end
+  end
+
+  pfn meet(a : (Float, Float, Float, Float), b : (Float, Float, Float, Float)) : (Float, Float, Float, Float) do
+    match (a, b) do
+      ((ax, ay, aw, ah), (bx, stp, bw, bh)) ->
+        let x0 = maxf(ax, bx)
+        let y0 = maxf(ay, stp)
+        let x1 = minf(ax +. aw, bx +. bw)
+        let y1 = minf(ay +. ah, stp +. bh)
+        (x0, y0, maxf(0.0, x1 -. x0), maxf(0.0, y1 -. y0))
+    end
+  end
+
+  pfn text_w(t : GTheme, s : String) : Float do match (t.gt_measure)(t.gt_font, t.gt_size, s) do (w, _) -> w end end
+  pfn text_h(t : GTheme, s : String) : Float do match (t.gt_measure)(t.gt_font, t.gt_size, s) do (_, h) -> h end end
+
+  pfn focusable(n : GNode) : Bool do
+    match n do
+      GButton(_, _, _, _) -> true
+      GToggle(_, _, _, _, _) -> true
+      GSlider(_, _, _, _, _, _, _, _) -> true
+      GField(_, _, _, _, _, _) -> true
+      GChoice(_, _, _, _, _, _) -> true
+      _ -> false
+    end
+  end
+
+  pfn id_of(n : GNode) : String do
+    match n do
+      GButton(i, _, _, _) -> i
+      GToggle(i, _, _, _, _) -> i
+      GSlider(i, _, _, _, _, _, _, _) -> i
+      GField(i, _, _, _, _, _) -> i
+      GChoice(i, _, _, _, _, _) -> i
+      GGroup(_, _, sid, _, _, _, _, _) -> sid
+      _ -> ""
+    end
+  end
+
+  pfn sizes_of(n : GNode) : (GSize, GSize) do
+    match n do
+      GLabel(_, w, h) -> (w, h)
+      GButton(_, _, w, h) -> (w, h)
+      GToggle(_, _, _, w, h) -> (w, h)
+      GSlider(_, _, _, _, _, _, w, h) -> (w, h)
+      GField(_, _, _, _, w, h) -> (w, h)
+      GChoice(_, _, _, _, w, h) -> (w, h)
+      GSpace(w, h) -> (w, h)
+      GGroup(_, _, _, _, _, w, h, _) -> (w, h)
+    end
+  end
+
+  doc "A slider's value as shown: whole when its step is whole, else to two places."
+  fn format_value(v : Float, step : Float) : String do
+    if step >= 1.0 && Math.abs(step -. Math.round(step)) < 0.0001 do int_to_string(float_to_int(Math.round(v)))
+    else
+      let neg = v < 0.0
+      let c = float_to_int(Math.round(Math.abs(v) *. 100.0))
+      let frac = c % 100
+      (if neg do "-" else "" end) ++ int_to_string(c / 100) ++ "." ++ (if frac < 10 do "0" else "" end) ++ int_to_string(frac)
+    end
+  end
+
+  -- a widget's label column: the theme's width, or the label's own
+  pfn label_w(t : GTheme, s : String) : Float do
+    if t.gt_label_w > 0.0 do t.gt_label_w else if string_byte_length(s) == 0 do 0.0 else text_w(t, s) end end
+  end
+
+  -- where a widget's own part starts, after its label and a gap
+  pfn body_x(t : GTheme, s : String) : Float do
+    let l = label_w(t, s)
+    if l > 0.0 do l +. t.gt_gap else 0.0 end
+  end
+
+  -- ── Layout ───────────────────────────────────────────────────────────────
+
+  -- a node with what it needs (w, h) and its children's
+  type GSized = GSized(GNode, Float, Float, List(GSized))
+
+  pfn pad_of(t : GTheme, p : Float) : Float do if p < 0.0 do t.gt_pad else p end end
+  pfn gap_of(t : GTheme, g : Float) : Float do if g < 0.0 do t.gt_gap else g end end
+
+  pfn widest(os : List(String), t : GTheme, w : Float) : Float do
+    match os do
+      Nil -> w
+      Cons(o, rest) -> widest(rest, t, maxf(w, text_w(t, o)))
+    end
+  end
+
+  -- the content's own size
+  pfn content(t : GTheme, n : GNode, kids : List(GSized)) : (Float, Float) do
+    let line = t.gt_line
+    match n do
+      GLabel(s, _, _) -> (text_w(t, s), maxf(line, text_h(t, s)))
+      GButton(_, s, _, _) -> (maxf(t.gt_min_w, text_w(t, s) +. 2.0 *. t.gt_pad), line)
+      GToggle(_, s, _, _, _) -> (line *. 0.6 +. t.gt_gap +. text_w(t, s), line)
+      GSlider(_, s, _, _, hi, st, _, _) -> (body_x(t, s) +. 2.0 *. t.gt_min_w +. t.gt_gap +. value_w(t, hi, st), line)
+      GField(_, s, _, _, _, _) -> (body_x(t, s) +. 2.0 *. t.gt_min_w, line)
+      GChoice(_, s, os, _, _, _) -> (body_x(t, s) +. maxf(t.gt_min_w, widest(os, t, 0.0) +. 2.0 *. t.gt_pad +. line *. 0.5), line)
+      GSpace(_, _) -> (0.0, 0.0)
+      GGroup(dir, _, sid, p, g, _, _, _) ->
+        let pad = pad_of(t, p)
+        let gap = gap_of(t, g)
+        let n_k = List.length(kids)
+        let gaps = if n_k > 1 do gap *. int_to_float(n_k - 1) else 0.0 end
+        let bar = if string_byte_length(sid) > 0 do t.gt_bar +. t.gt_gap *. 0.5 else 0.0 end
+        let (along, across) = List.fold_left(kids, (0.0, 0.0), fn (acc, k) ->
+          match (acc, k) do
+            ((a, c), GSized(_, kw, kh, _)) -> if dir == 0 do (a +. kw, maxf(c, kh)) else (a +. kh, maxf(c, kw)) end
+          end)
+        if dir == 0 do (along +. gaps +. 2.0 *. pad +. bar, across +. 2.0 *. pad)
+        else (across +. 2.0 *. pad +. bar, along +. gaps +. 2.0 *. pad) end
+    end
+  end
+
+  pfn want(s : GSize, own : Float) : Float do match s do GFixed(px) -> px | _ -> own end end
+
+  pfn size_up(t : GTheme, n : GNode) : GSized do
+    let kids = match n do GGroup(_, _, _, _, _, _, _, cs) -> List.map(cs, fn c -> size_up(t, c)) | _ -> Nil end
+    let (cw, ch) = content(t, n, kids)
+    let (sw, sh) = sizes_of(n)
+    GSized(n, want(sw, cw), want(sh, ch), kids)
+  end
+
+  -- what a child takes along its parent's axis, [unit] a share's pixels a weight
+  pfn take(s : GSize, need : Float, unit : Float) : Float do
+    match s do
+      GFixed(px) -> px
+      GFit -> need
+      GShare(w) -> maxf(0.0, w *. unit)
+    end
+  end
+
+  pfn across(s : GSize, need : Float, room : Float) : Float do
+    match s do
+      GFixed(px) -> px
+      GFit -> minf(need, maxf(room, 0.0))
+      GShare(_) -> maxf(room, 0.0)
+    end
+  end
+
+  -- the layout's output so far, items and regions in reverse
+  type GOut = GOut(List(GItem), List(GRegion))
+
+  pfn place_kids(t : GTheme, st : GState, dir : Int, kids : List(GSized), x : Float, y : Float, inner_w : Float, inner_h : Float, gap : Float, unit : Float, clip : (Float, Float, Float, Float), sid : String, depth : Int, out : GOut) : GOut do
+    match kids do
+      Nil -> out
+      Cons(GSized(n, nw, nh, ks), rest) ->
+        let (sw, sh) = sizes_of(n)
+        let w = if dir == 0 do take(sw, nw, unit) else across(sw, nw, inner_w) end
+        let h = if dir == 1 do take(sh, nh, unit) else across(sh, nh, inner_h) end
+        let out2 = place_node(t, st, GSized(n, nw, nh, ks), x, y, w, h, clip, sid, depth, out)
+        if dir == 0 do place_kids(t, st, dir, rest, x +. w +. gap, y, inner_w, inner_h, gap, unit, clip, sid, depth, out2)
+        else place_kids(t, st, dir, rest, x, y +. h +. gap, inner_w, inner_h, gap, unit, clip, sid, depth, out2) end
+    end
+  end
+
+  -- the pixels a weight is worth when [kids] share [room] along [dir]
+  pfn share_unit(dir : Int, kids : List(GSized), room : Float) : Float do
+    let (used, weight) = List.fold_left(kids, (0.0, 0.0), fn (acc, k) ->
+      match (acc, k) do
+        ((u, wt), GSized(n, nw, nh, _)) ->
+          let (sw, sh) = sizes_of(n)
+          let s = if dir == 0 do sw else sh end
+          let need = if dir == 0 do nw else nh end
+          match s do
+            GShare(w) -> (u, wt +. maxf(w, 0.0))
+            GFixed(px) -> (u +. px, wt)
+            GFit -> (u +. need, wt)
+          end
+      end)
+    if weight > 0.0 do maxf(0.0, room -. used) /. weight else 0.0 end
+  end
+
+  pfn place_node(t : GTheme, st : GState, s : GSized, x : Float, y : Float, w : Float, h : Float, clip : (Float, Float, Float, Float), sid : String, depth : Int, out : GOut) : GOut do
+    match s do
+      GSized(n, _, _, kids) ->
+        match out do
+          GOut(items, regions) ->
+            let me = GItem(id_of(n), n, (x, y, w, h), clip, sid)
+            match n do
+              GGroup(dir, _, gid, p, g, _, _, _) ->
+                let pad = pad_of(t, p)
+                let gap = gap_of(t, g)
+                let n_k = List.length(kids)
+                let gaps = if n_k > 1 do gap *. int_to_float(n_k - 1) else 0.0 end
+                let scrolls = string_byte_length(gid) > 0
+                let bar = if scrolls do t.gt_bar +. t.gt_gap *. 0.5 else 0.0 end
+                let inner_w = maxf(0.0, w -. 2.0 *. pad -. bar)
+                let inner_h = maxf(0.0, h -. 2.0 *. pad)
+                if scrolls do
+                  -- the content is as tall as it needs; the viewport shows part of it
+                  let tall = List.fold_left(kids, 0.0, fn (a, k) -> match k do GSized(_, _, kh, _) -> a +. kh end) +. gaps
+                  let view = (x, y, w, h)
+                  let most = maxf(0.0, tall +. 2.0 *. pad -. h)
+                  let off = clampf(lookup_f(st.gs_scrolls, gid, 0.0), 0.0, most)
+                  let inner_clip = meet(clip, (x, y +. pad *. 0.5, w, maxf(0.0, h -. pad)))
+                  match place_kids(t, st, 1, kids, x +. pad, y +. pad -. off, inner_w, inner_h, gap, 0.0, inner_clip, gid, depth + 1, GOut(Cons(me, items), regions)) do
+                    GOut(i2, r2) -> GOut(i2, Cons(GRegion(gid, view, tall +. 2.0 *. pad, off, clip, depth + 1), r2))
+                  end
+                else
+                  let unit = share_unit(dir, kids, (if dir == 0 do inner_w else inner_h end) -. gaps)
+                  place_kids(t, st, dir, kids, x +. pad, y +. pad, inner_w, inner_h, gap, unit, clip, sid, depth, GOut(Cons(me, items), regions))
+                end
+              _ -> GOut(Cons(me, items), regions)
+            end
+        end
+    end
+  end
+
+  pfn top_size(s : GSize, need : Float, screen : Float) : Float do
+    match s do
+      GFixed(px) -> px
+      GFit -> need
+      GShare(w) -> clampf(w, 0.0, 1.0) *. screen
+    end
+  end
+
+  doc "Lay [layers] out on a screen [sw] x [sh] interface pixels with scroll offsets from [st]: every item (tree order, layer after layer), the scroll regions, and each layer's rectangle. Interaction is `run`; this is the layout alone."
+  fn layout(t : GTheme, st : GState, sw : Float, sh : Float, layers : List(GLayer)) : (List(GItem), List(GRegion), List((Float, Float, Float, Float))) do
+    let screen = (0.0, 0.0, sw, sh)
+    let (out, roots) = List.fold_left(layers, (GOut(Nil, Nil), Nil), fn (acc, l) ->
+      match (acc, l) do
+        ((o, rs), GLayer(anchor, ox, oy, node)) ->
+          let sz = size_up(t, node)
+          match sz do
+            GSized(_, nw, nh, _) ->
+              let (swz, shz) = sizes_of(node)
+              let w = top_size(swz, nw, sw)
+              let h = top_size(shz, nh, sh)
+              let x = sw *. int_to_float(anchor % 3) *. 0.5 +. ox -. w *. int_to_float(anchor % 3) *. 0.5
+              let y = sh *. int_to_float(anchor / 3) *. 0.5 +. oy -. h *. int_to_float(anchor / 3) *. 0.5
+              (place_node(t, st, sz, x, y, w, h, screen, "", 0, o), Cons((x, y, w, h), rs))
+          end
+      end)
+    match out do GOut(items, regions) -> (List.reverse(items), List.reverse(regions), List.reverse(roots)) end
+  end
+
+  -- ── Interaction ──────────────────────────────────────────────────────────
+
+  pfn hittable(it : GItem, p : (Float, Float)) : Bool do
+    match it do GItem(i, n, rc, clip, _) -> string_byte_length(i) > 0 && focusable(n) && inside(p, rc) && inside(p, clip) end
+  end
+
+  -- a scroll region's bar track and thumb
+  pfn bar_rects(t : GTheme, g : GRegion) : ((Float, Float, Float, Float), (Float, Float, Float, Float)) do
+    match g do
+      GRegion(_, (x, y, w, h), tall, off, _, _) ->
+        let bw = t.gt_bar
+        let track = (x +. w -. bw -. t.gt_gap *. 0.25, y +. t.gt_gap *. 0.5, bw, maxf(0.0, h -. t.gt_gap))
+        match track do
+          (tx, ty, _, th) ->
+            let frac = if tall > h do h /. tall else 1.0 end
+            let thumb_h = maxf(bw *. 2.0, th *. frac)
+            let most = maxf(0.0, tall -. h)
+            let at = if most > 0.0 do off /. most else 0.0 end
+            (track, (tx, ty +. (th -. thumb_h) *. at, bw, thumb_h))
+        end
+    end
+  end
+
+  pfn scrolls(g : GRegion) : Bool do match g do GRegion(_, (_, _, _, h), tall, _, _, _) -> tall > h +. 0.5 end end
+
+  -- the choice list's option rectangles when open, below its box or above it when there is no room
+  pfn options_rects(t : GTheme, it : GItem, sh : Float) : List((Float, Float, Float, Float)) do
+    match it do
+      GItem(_, GChoice(_, s, os, _, _, _), (x, y, w, h), _, _) ->
+        let bx = x +. body_x(t, s)
+        let bw = maxf(0.0, w -. body_x(t, s))
+        let n_o = List.length(os)
+        let total = int_to_float(n_o) *. t.gt_line
+        let top = if y +. h +. total > sh && y -. total >= 0.0 do y -. total else y +. h end
+        List.map(List.range(0, n_o), fn i -> (bx, top +. int_to_float(i) *. t.gt_line, bw, t.gt_line))
+      _ -> Nil
+    end
+  end
+
+  pfn index_hit(rs : List((Float, Float, Float, Float)), p : (Float, Float), i : Int) : Int do
+    match rs do
+      Nil -> -1
+      Cons(r, rest) -> if inside(p, r) do i else index_hit(rest, p, i + 1) end
+    end
+  end
+
+  pfn find_item(items : List(GItem), id : String) : Option(GItem) do
+    if string_byte_length(id) == 0 do None else List.find(items, fn it -> match it do GItem(i, _, _, _, _) -> i == id end) end
+  end
+
+  pfn find_region(rs : List(GRegion), id : String) : Option(GRegion) do
+    if string_byte_length(id) == 0 do None else List.find(rs, fn g -> match g do GRegion(i, _, _, _, _, _) -> i == id end) end
+  end
+
+  pfn centre(r : (Float, Float, Float, Float)) : (Float, Float) do match r do (x, y, w, h) -> (x +. w *. 0.5, y +. h *. 0.5) end end
+
+  pfn focusables(items : List(GItem)) : List(GItem) do
+    List.filter(items, fn it -> match it do GItem(i, n, _, _, _) -> string_byte_length(i) > 0 && focusable(n) end)
+  end
+
+  pfn index_of(fs : List(GItem), id : String, i : Int) : Int do
+    match fs do
+      Nil -> -1
+      Cons(GItem(k, _, _, _, _), rest) -> if k == id do i else index_of(rest, id, i + 1) end
+    end
+  end
+
+  pfn nth_id(fs : List(GItem), i : Int) : String do
+    match List.nth_opt(fs, i) do
+      Some(GItem(k, _, _, _, _)) -> k
+      None -> ""
+    end
+  end
+
+  -- next ([by] 1) or previous (-1) in tree order, wrapping; from no focus, the first (or last)
+  pfn step_focus(fs : List(GItem), id : String, stp : Int) : String do
+    let n_f = List.length(fs)
+    if n_f == 0 do ""
+    else
+      let i = index_of(fs, id, 0)
+      if i < 0 do nth_id(fs, if stp > 0 do 0 else n_f - 1 end)
+      else nth_id(fs, (i + stp + n_f) % n_f) end
+    end
+  end
+
+  -- the nearest control whose centre lies in direction (dx, dy): along it plus twice across it
+  pfn aim_focus(fs : List(GItem), id : String, dx : Float, dy : Float) : String do
+    match List.find(fs, fn it -> match it do GItem(k, _, _, _, _) -> k == id end) do
+      None -> step_focus(fs, "", 1)
+      Some(GItem(_, _, from, _, _)) ->
+        let (cx, cy) = centre(from)
+        let (best, _) = List.fold_left(fs, (id, 0.0 -. 1.0), fn (acc, it) ->
+          match (acc, it) do
+            ((b, score), GItem(k, _, r, _, _)) ->
+              let (ox, oy) = centre(r)
+              let along = (ox -. cx) *. dx +. (oy -. cy) *. dy
+              let side = Math.abs((ox -. cx) *. dy -. (oy -. cy) *. dx)
+              let sc = along +. 2.0 *. side
+              if k != id && along > 0.5 && (score < 0.0 || sc < score) do (k, sc) else (b, score) end
+          end)
+        best
+    end
+  end
+
+  pfn snap_value(v : Float, lo : Float, hi : Float, step : Float) : Float do
+    let a = minf(lo, hi)
+    let b = maxf(lo, hi)
+    let stepped = if step > 0.0 do lo +. Math.round((v -. lo) /. step) *. step else v end
+    clampf(stepped, a, b)
+  end
+
+  -- the room a slider's value takes: its widest value, and at least five digits, so sliders in a column line up
+  pfn value_w(t : GTheme, hi : Float, st : Float) : Float do maxf(text_w(t, format_value(hi, st)), text_w(t, "00000")) end
+
+  -- the end of [s] from byte [k] on that fits in [room]: (the byte it starts at); a character is never cut
+  pfn fit_from(t : GTheme, s : String, k : Int, room : Float) : Int do
+    let n = string_byte_length(s)
+    if k >= n || text_w(t, string_slice(s, k, n - k)) <= room do k
+    else fit_from(t, s, next_char(s, k + 1), room) end
+  end
+
+  pfn next_char(s : String, k : Int) : Int do
+    if k >= string_byte_length(s) do k
+    else if int_and(char_to_int(head(string_chars(string_slice(s, k, 1)))), 192) == 128 do next_char(s, k + 1) else k end end
+  end
+
+  -- a slider's track (x, width) in its rectangle
+  pfn track_of(t : GTheme, n : GNode, r : (Float, Float, Float, Float)) : (Float, Float) do
+    match (n, r) do
+      (GSlider(_, s, _, _, hi, st, _, _), (x, _, w, _)) ->
+        let x0 = x +. body_x(t, s) +. t.gt_line *. 0.2
+        let vw = value_w(t, hi, st) +. t.gt_gap
+        (x0, maxf(1.0, w -. body_x(t, s) -. vw -. t.gt_line *. 0.4))
+      _ -> (0.0, 1.0)
+    end
+  end
+
+  pfn value_at(t : GTheme, n : GNode, r : (Float, Float, Float, Float), px : Float) : Float do
+    match n do
+      GSlider(_, _, _, lo, hi, step, _, _) ->
+        let (tx, tw) = track_of(t, n, r)
+        snap_value(lo +. clampf((px -. tx) /. tw, 0.0, 1.0) *. (hi -. lo), lo, hi, step)
+      _ -> 0.0
+    end
+  end
+
+  -- a slider moved [by] steps (a hundredth of its range when it has no step)
+  pfn nudge(n : GNode, v : Float, stp : Float) : Float do
+    match n do
+      GSlider(_, _, _, lo, hi, step, _, _) ->
+        let s = if step > 0.0 do step else Math.abs(hi -. lo) /. 100.0 end
+        snap_value(v +. stp *. s, lo, hi, step)
+      _ -> v
+    end
+  end
+
+  -- the value a control holds this frame, after the events so far: a slider's, a toggle's, a field's text, a choice
+  pfn slider_now(evs : List(GEvent), id : String, v : Float) : Float do
+    List.fold_left(evs, v, fn (a, e) -> match e do Changed(i, x) -> if i == id do x else a end | _ -> a end)
+  end
+  pfn toggle_now(evs : List(GEvent), id : String, lit : Bool) : Bool do
+    List.fold_left(evs, lit, fn (a, e) -> match e do Toggled(i, x) -> if i == id do x else a end | _ -> a end)
+  end
+  pfn text_now(evs : List(GEvent), id : String, s : String) : String do
+    List.fold_left(evs, s, fn (a, e) -> match e do Edited(i, x) -> if i == id do x else a end | _ -> a end)
+  end
+  pfn choice_now(evs : List(GEvent), id : String, c : Int) : Int do
+    List.fold_left(evs, c, fn (a, e) -> match e do Chose(i, x) -> if i == id do x else a end | _ -> a end)
+  end
+
+  -- the work of a frame, threaded: state, events in reverse
+  type GStep = GStep(GState, List(GEvent))
+
+  pfn emit(g : GStep, e : GEvent) : GStep do match g do GStep(s, evs) -> GStep(s, Cons(e, evs)) end end
+  pfn state_of(g : GStep) : GState do match g do GStep(s, _) -> s end end
+  pfn evs_of(g : GStep) : List(GEvent) do match g do GStep(_, evs) -> List.reverse(evs) end end
+  pfn with_state(g : GStep, s : GState) : GStep do match g do GStep(_, evs) -> GStep(s, evs) end end
+
+  -- a click or activation of [it]
+  pfn activate(_t : GTheme, g : GStep, it : GItem, typed : List(Int), by_key : Bool) : GStep do
+    let s = state_of(g)
+    match it do
+      GItem(id, n, _, _, _) ->
+        match n do
+          GButton(_, _, _, _) -> emit(g, Clicked(id))
+          GToggle(_, _, lit, _, _) -> emit(g, Toggled(id, !toggle_now(evs_of(g), id, lit)))
+          GChoice(_, _, _, c, _, _) -> with_state(g, { s with gs_open: id, gs_light: choice_now(evs_of(g), id, c) })
+          -- a field takes a key's activation only from Enter or a pad: a typed Space is a space
+          GField(_, _, _, _, _, _) -> if by_key && (is_nil(typed) || List.member(typed, -257)) do emit(g, Submitted(id)) else g end
+          _ -> g
+        end
+    end
+  end
+
+  pfn pressed(f : GFrame, a : String) : Bool do Strata.Input.pressed(f.gf_input, a) end
+
+  -- a direction pressed: its value must point its way, since an axis holds an action pushed either way
+  pfn aimed(f : GFrame, a : String) : Bool do Strata.Input.pressed(f.gf_input, a) && Strata.Input.value(f.gf_input, a) > 0.0 end
+
+  -- the pointer's part: press, capture, drag, release, wheel
+  pfn pointer_step(t : GTheme, g0 : GStep, f : GFrame, items : List(GItem), regions : List(GRegion), sh : Float) : GStep do
+    let s0 = state_of(g0)
+    let down = f.gf_down
+    let went_down = down && !s0.gs_was_down
+    let went_up = !down && s0.gs_was_down
+    match f.gf_pointer do
+      None -> with_state(g0, { s0 with gs_active: if down do s0.gs_active else "" end })
+      Some(p) ->
+        let (px, py) = p
+        let open_item = find_item(items, s0.gs_open)
+        let opts = match open_item do Some(it) -> options_rects(t, it, sh) | None -> Nil end
+        let on_opt = index_hit(opts, p, 0)
+        let over_list = on_opt >= 0
+        let hover = List.fold_left(items, None, fn (a, it) -> if hittable(it, p) do Some(it) else a end)
+        let bar_hit = List.fold_left(regions, "", fn (a, rg) ->
+          match rg do GRegion(rid, _, _, _, clip, _) -> match bar_rects(t, rg) do (track, _) -> if scrolls(rg) && inside(p, track) && inside(p, clip) do rid else a end end end)
+        -- the button going down
+        let g1 = if !went_down do g0
+          else if string_byte_length(s0.gs_open) > 0 do
+            -- a list is open: a pick, or a click anywhere else closes it
+            (match open_item do
+              Some(GItem(oid, _, _, _, _)) ->
+                let s1 = { s0 with gs_open: "", gs_active: "#closed" }
+                if over_list do emit(with_state(g0, s1), Chose(oid, on_opt)) else with_state(g0, s1) end
+              None -> with_state(g0, { s0 with gs_open: "" })
+            end)
+          else if string_byte_length(bar_hit) > 0 do
+            (match find_region(regions, bar_hit) do
+              Some(rg) ->
+                match bar_rects(t, rg) do
+                  (_, (_, ty, _, th)) -> with_state(g0, { s0 with gs_active: bar_hit ++ "#bar", gs_grab: if py >= ty && py < ty +. th do py -. ty else th *. 0.5 end })
+                end
+              None -> g0
+            end)
+          else
+            match hover do
+              Some(GItem(hid, hn, hr, _, _)) ->
+                let g2 = with_state(g0, { s0 with gs_active: hid, gs_focus: hid, gs_ring: false })
+                match hn do
+                  GSlider(_, _, v, _, _, _, _, _) ->
+                    let nv = value_at(t, hn, hr, px)
+                    if nv != slider_now(evs_of(g2), hid, v) do emit(g2, Changed(hid, nv)) else g2 end
+                  _ -> g2
+                end
+              None -> with_state(g0, { s0 with gs_active: "", gs_focus: "", gs_ring: false })
+            end
+          end end end
+        let s1 = state_of(g1)
+        -- held: a slider follows the pointer, a thumb drags its region
+        let g3 = if !down || went_down do g1
+          else if String.ends_with(s1.gs_active, "#bar") do
+            let rid = string_slice(s1.gs_active, 0, string_byte_length(s1.gs_active) - 4)
+            match find_region(regions, rid) do
+              Some(GRegion(_, (_, _, _, h), tall, _, _, _) as rg) ->
+                match bar_rects(t, rg) do
+                  ((_, ty, _, th), (_, _, _, thumb_h)) ->
+                    let room = maxf(1.0, th -. thumb_h)
+                    let at = clampf((py -. s1.gs_grab -. ty) /. room, 0.0, 1.0)
+                    with_state(g1, set_scroll(s1, rid, at *. maxf(0.0, tall -. h)))
+                end
+              None -> g1
+            end
+          else
+            match find_item(items, s1.gs_active) do
+              Some(GItem(aid, GSlider(_, _, v, _, _, _, _, _) as an, ar, _, _)) ->
+                let nv = value_at(t, an, ar, px)
+                if nv != slider_now(evs_of(g1), aid, v) do emit(g1, Changed(aid, nv)) else g1 end
+              _ -> g1
+            end
+          end end
+        -- the button coming up: a click on the control that went down, if it is still under the pointer
+        let s3 = state_of(g3)
+        let g4 = if !went_up do g3
+          else
+            let g5 = with_state(g3, { s3 with gs_active: "" })
+            match hover do
+              Some(GItem(hid, _, _, _, _) as hit) -> if hid == s3.gs_active do activate(t, g5, hit, Nil, false) else g5 end
+              None -> g5
+            end
+          end
+        -- the wheel: steps a slider under the pointer, else moves the innermost region under it
+        if f.gf_wheel == 0.0 || over_list do g4
+        else
+          let s4 = state_of(g4)
+          match hover do
+            Some(GItem(hid, GSlider(_, _, v, _, _, _, _, _) as hn, _, _, _)) ->
+              let nv = nudge(hn, slider_now(evs_of(g4), hid, v), if f.gf_wheel > 0.0 do 1.0 else -1.0 end)
+              if nv != slider_now(evs_of(g4), hid, v) do emit(g4, Changed(hid, nv)) else g4 end
+            _ ->
+              let (inner, _) = List.fold_left(regions, ("", -1), fn (a, rg) ->
+                match (a, rg) do ((b, d), GRegion(rid, view, _, _, clip, depth)) -> if inside(p, view) && inside(p, clip) && depth > d do (rid, depth) else (b, d) end end)
+              match find_region(regions, inner) do
+                Some(GRegion(rid, (_, _, _, h), tall, off, _, _)) ->
+                  with_state(g4, set_scroll(s4, rid, clampf(off -. f.gf_wheel *. t.gt_line *. 1.5, 0.0, maxf(0.0, tall -. h))))
+                None -> g4
+              end
+          end
+        end
+    end
+  end
+
+  -- keys and pad: focus moves, activation, slider steps, an open list's highlight, typing
+  pfn key_step(t : GTheme, g0 : GStep, f : GFrame, items : List(GItem)) : GStep do
+    let s0 = state_of(g0)
+    let fs = focusables(items)
+    let up = aimed(f, "ui_up")
+    let down = aimed(f, "ui_down")
+    let left = aimed(f, "ui_left")
+    let right = aimed(f, "ui_right")
+    let next = pressed(f, "ui_next") && !Strata.Input.held(f.gf_input, "ui_shift")
+    let prev = pressed(f, "ui_prev") || (pressed(f, "ui_next") && Strata.Input.held(f.gf_input, "ui_shift"))
+    let act = pressed(f, "ui_activate")
+    let back = pressed(f, "ui_back")
+    let moved = up || down || left || right || next || prev || act
+    if string_byte_length(s0.gs_open) > 0 do
+      -- an open list takes the keys
+      match find_item(items, s0.gs_open) do
+        Some(GItem(oid, GChoice(_, _, os, _, _, _), _, _, _)) ->
+          let n_o = List.length(os)
+          let light = if down do (s0.gs_light + 1) % maxi(n_o, 1) else if up do (s0.gs_light + n_o - 1) % maxi(n_o, 1) else s0.gs_light end end
+          if act do emit(with_state(g0, { s0 with gs_open: "", gs_light: light, gs_ring: true }), Chose(oid, light))
+          else if back || next || prev do with_state(g0, { s0 with gs_open: "", gs_ring: true })
+          else with_state(g0, { s0 with gs_light: light, gs_ring: s0.gs_ring || moved }) end end
+        _ -> with_state(g0, { s0 with gs_open: "" })
+      end
+    else
+      let cur = find_item(items, s0.gs_focus)
+      let lost = Option.is_none(cur)
+      let in_field = match cur do Some(GItem(_, GField(_, _, _, _, _, _), _, _, _)) -> true | _ -> false end
+      let on_slider = match cur do Some(GItem(_, GSlider(_, _, _, _, _, _, _, _), _, _, _)) -> true | _ -> false end
+      -- focus moving
+      let target = if next do step_focus(fs, s0.gs_focus, 1)
+        else if prev do step_focus(fs, s0.gs_focus, -1)
+        else if lost && (up || down || left || right || act) do step_focus(fs, "", 1)
+        else if up do aim_focus(fs, s0.gs_focus, 0.0, -1.0)
+        else if down do aim_focus(fs, s0.gs_focus, 0.0, 1.0)
+        else if (left || right) && (on_slider || in_field) do s0.gs_focus
+        else if left do aim_focus(fs, s0.gs_focus, -1.0, 0.0)
+        else if right do aim_focus(fs, s0.gs_focus, 1.0, 0.0)
+        else s0.gs_focus end end end end end end end end
+      let s1 = { s0 with gs_focus: target, gs_ring: s0.gs_ring || moved }
+      let g1 = with_state(g0, s1)
+      -- a focused slider steps on left and right
+      let g2 = match cur do
+          Some(GItem(cid, GSlider(_, _, v, _, _, _, _, _) as cn, _, _, _)) ->
+            if (left || right) && target == cid do
+              let was = slider_now(evs_of(g1), cid, v)
+              let nv = nudge(cn, was, if right do 1.0 else -1.0 end)
+              if nv != was do emit(g1, Changed(cid, nv)) else g1 end
+            else g1 end
+          _ -> g1
+        end
+      -- activation of the control focused before this frame's move (or found by it when none was)
+      let g3 = if act do
+          match find_item(items, if lost do target else s0.gs_focus end) do
+            Some(it) -> activate(t, g2, it, f.gf_typed, true)
+            None -> g2
+          end
+        else g2 end
+      let g4 = if back do emit(g3, Back) else g3 end
+      -- typing into the focused field
+      let s4f = state_of(g4)
+      match find_item(items, s4f.gs_focus) do
+        Some(GItem(fid, GField(_, _, v, limit, _, _), _, _, _)) ->
+          let s4 = state_of(g4)
+          let text = text_now(evs_of(g4), fid, v)
+          let caret = if s4.gs_caret_of == fid do s4.gs_caret else string_byte_length(text) end
+          let (nt, nc) = Strata.Controls.text_edit(text, caret, f.gf_typed, limit)
+          let g5 = with_state(g4, { s4 with gs_caret: nc, gs_caret_of: fid })
+          if nt != text do emit(g5, Edited(fid, nt)) else g5 end
+        _ -> g4
+      end
+    end
+  end
+
+  pfn maxi(a : Int, b : Int) : Int do if a > b do a else b end end
+
+  -- move a region so the focused control is inside its viewport, clear of its edges by the padding
+  pfn keep_seen(t : GTheme, g : GStep, items : List(GItem), regions : List(GRegion)) : GStep do
+    let s = state_of(g)
+    match find_item(items, s.gs_focus) do
+      Some(GItem(_, _, (_, y, _, h), _, sid)) ->
+        match find_region(regions, sid) do
+          Some(GRegion(rid, (_, vy, _, vh), tall, off, _, _)) ->
+            let pad = t.gt_pad
+            let top = vy +. pad
+            let bottom = vy +. vh -. pad
+            let off2 = if y < top do off -. (top -. y) else if y +. h > bottom do off +. (y +. h -. bottom) else off end end
+            let off3 = clampf(off2, 0.0, maxf(0.0, tall -. vh))
+            if off3 != off do with_state(g, set_scroll(s, rid, off3)) else g end
+          None -> g
+        end
+      None -> g
+    end
+  end
+
+  -- ── Drawing ──────────────────────────────────────────────────────────────
+
+  -- a box cut to a clip; nothing when nothing is left
+  pfn box(ds : List(GDraw), r : (Float, Float, Float, Float), clip : (Float, Float, Float, Float), c : (Float, Float, Float, Float)) : List(GDraw) do
+    match meet(r, clip) do
+      (x, y, w, h) -> if w > 0.0 && h > 0.0 do Cons(GBox(x, y, w, h, c), ds) else ds end
+    end
+  end
+
+  -- text whose box lies wholly inside the clip; otherwise left out (no scissor)
+  pfn words(t : GTheme, ds : List(GDraw), x : Float, y : Float, clip : (Float, Float, Float, Float), c : (Float, Float, Float, Float), s : String) : List(GDraw) do
+    if string_byte_length(s) == 0 do ds
+    else
+      let (w, h) = (t.gt_measure)(t.gt_font, t.gt_size, s)
+      match clip do
+        (cx, cy, cw, ch) -> if x >= cx -. 0.5 && y >= cy -. 0.5 && x +. w <= cx +. cw +. 0.5 && y +. h <= cy +. ch +. 0.5 do Cons(GWords(x, y, t.gt_font, t.gt_size, c, s), ds) else ds end
+      end
+    end
+  end
+
+  -- text set left in a rectangle, centred up and down
+  pfn words_in(t : GTheme, ds : List(GDraw), x : Float, r : (Float, Float, Float, Float), clip : (Float, Float, Float, Float), c : (Float, Float, Float, Float), s : String) : List(GDraw) do
+    match r do (_, y, _, h) -> words(t, ds, x, y +. (h -. text_h(t, s)) *. 0.5, clip, c, s) end
+  end
+
+  pfn ring(t : GTheme, ds : List(GDraw), r : (Float, Float, Float, Float), clip : (Float, Float, Float, Float)) : List(GDraw) do
+    match r do
+      (x, y, w, h) ->
+        let k = t.gt_ring
+        let c = t.gt_focus
+        box(box(box(box(ds, (x -. k, y -. k, w +. 2.0 *. k, k), clip, c), (x -. k, y +. h, w +. 2.0 *. k, k), clip, c), (x -. k, y, k, h), clip, c), (x +. w, y, k, h), clip, c)
+    end
+  end
+
+  pfn shade(t : GTheme, id : String, hovered : String, active : String) : (Float, Float, Float, Float) do
+    if id == active do t.gt_press else if id == hovered do t.gt_hover else t.gt_control end end
+  end
+
+  pfn draw_item(t : GTheme, ds : List(GDraw), it : GItem, evs : List(GEvent), s : GState, hovered : String, active : String) : List(GDraw) do
+    match it do
+      GItem(id, n, r, clip, _) ->
+        let (x, y, w, h) = r
+        let ringed = id == s.gs_focus && string_byte_length(id) > 0 && (s.gs_ring || (match n do GField(_, _, _, _, _, _) -> true | _ -> false end))
+        let lab = fn (d, txt) -> words_in(t, d, x, r, clip, t.gt_text, txt)
+        let d1 = match n do
+          GLabel(txt, _, _) -> words_in(t, ds, x, r, clip, t.gt_text, txt)
+          GSpace(_, _) -> ds
+          GGroup(_, bg, _, _, _, _, _, _) -> if bg do box(ds, r, clip, t.gt_panel) else ds end
+          GButton(_, txt, _, _) ->
+            let d = box(ds, r, clip, shade(t, id, hovered, active))
+            words(t, d, x +. (w -. text_w(t, txt)) *. 0.5, y +. (h -. text_h(t, txt)) *. 0.5, clip, t.gt_text, txt)
+          GToggle(_, txt, lit, _, _) ->
+            let side = h *. 0.6
+            let bx = (x, y +. (h -. side) *. 0.5, side, side)
+            let d = box(ds, bx, clip, shade(t, id, hovered, active))
+            let d2 = if toggle_now(evs, id, lit) do (match bx do (qx, qy, qw, _) -> box(d, (qx +. qw *. 0.22, qy +. qw *. 0.22, qw *. 0.56, qw *. 0.56), clip, t.gt_accent) end) else d end
+            let d3 = words_in(t, d2, x +. side +. t.gt_gap, r, clip, t.gt_text, txt)
+            if ringed do ring(t, d3, bx, clip) else d3 end
+          GSlider(_, txt, v, lo, hi, step, _, _) ->
+            let now = slider_now(evs, id, v)
+            let (tx, tw) = track_of(t, n, r)
+            let frac = if hi != lo do clampf((now -. lo) /. (hi -. lo), 0.0, 1.0) else 0.0 end
+            let th = maxf(2.0, h *. 0.16)
+            let d = lab(ds, txt)
+            let d2 = box(d, (tx, y +. (h -. th) *. 0.5, tw, th), clip, t.gt_track)
+            let d3 = box(d2, (tx, y +. (h -. th) *. 0.5, tw *. frac, th), clip, t.gt_accent)
+            let kw = h *. 0.4
+            let knob = (tx +. tw *. frac -. kw *. 0.5, y +. h *. 0.1, kw, h *. 0.8)
+            let d4 = box(d3, knob, clip, shade(t, id, hovered, active))
+            let d5 = words_in(t, d4, tx +. tw +. t.gt_line *. 0.2 +. t.gt_gap, r, clip, t.gt_dim, format_value(now, step))
+            if ringed do ring(t, d5, knob, clip) else d5 end
+          GField(_, txt, v, _, _, _) ->
+            let now = text_now(evs, id, v)
+            let bx0 = x +. body_x(t, txt)
+            let fr = (bx0, y, maxf(0.0, w -. body_x(t, txt)), h)
+            let d = box(lab(ds, txt), fr, clip, t.gt_field)
+            let caret = clampi(if s.gs_caret_of == id do s.gs_caret else string_byte_length(now) end, 0, string_byte_length(now))
+            -- a text wider than the field shows its end (the part up to the caret when focused)
+            let room = maxf(0.0, w -. body_x(t, txt) -. 2.0 *. t.gt_pad)
+            let upto = if id == s.gs_focus do caret else string_byte_length(now) end
+            let k = fit_from(t, string_slice(now, 0, upto), 0, room)
+            let shown0 = string_slice(now, k, string_byte_length(now) - k)
+            let shown = string_slice(shown0, 0, fit_len(t, shown0, string_byte_length(shown0), room))
+            let d2 = words_in(t, d, bx0 +. t.gt_pad, fr, clip, t.gt_text, shown)
+            let cx = bx0 +. t.gt_pad +. text_w(t, string_slice(now, k, caret - k))
+            let d3 = if id == s.gs_focus do box(d2, (cx, y +. h *. 0.2, 2.0, h *. 0.6), clip, t.gt_accent) else d2 end
+            if ringed do ring(t, d3, fr, clip) else d3 end
+          GChoice(_, txt, os, c, _, _) ->
+            let now = choice_now(evs, id, c)
+            let bx0 = x +. body_x(t, txt)
+            let fr = (bx0, y, maxf(0.0, w -. body_x(t, txt)), h)
+            let d = box(lab(ds, txt), fr, clip, shade(t, id, hovered, active))
+            let d2 = words_in(t, d, bx0 +. t.gt_pad, fr, clip, t.gt_text, match List.nth_opt(os, now) do Some(o) -> o | None -> "" end)
+            let mark = h *. 0.24
+            let d3 = box(d2, (bx0 +. maxf(0.0, w -. body_x(t, txt)) -. t.gt_pad -. mark, y +. (h -. mark) *. 0.5, mark, mark), clip, t.gt_dim)
+            if ringed do ring(t, d3, fr, clip) else d3 end
+        end
+        match n do
+          GButton(_, _, _, _) -> if ringed do ring(t, d1, r, clip) else d1 end
+          _ -> d1
+        end
+    end
+  end
+
+  -- the longest start of [s] that fits in [room], in bytes, on a character boundary
+  pfn fit_len(t : GTheme, s : String, n : Int, room : Float) : Int do
+    if n <= 0 || text_w(t, string_slice(s, 0, n)) <= room do (if n < 0 do 0 else n end)
+    else fit_len(t, s, back_char(s, n - 1), room) end
+  end
+
+  pfn back_char(s : String, k : Int) : Int do
+    if k <= 0 do 0
+    else if int_and(char_to_int(head(string_chars(string_slice(s, k, 1)))), 192) == 128 do back_char(s, k - 1) else k end end
+  end
+
+  pfn clampi(v : Int, lo : Int, hi : Int) : Int do if v < lo do lo else if v > hi do hi else v end end end
+
+  pfn draw_bar(t : GTheme, ds : List(GDraw), g : GRegion, hovered : String, active : String) : List(GDraw) do
+    if !scrolls(g) do ds
+    else
+      match g do
+        GRegion(rid, _, _, _, clip, _) ->
+          match bar_rects(t, g) do
+            (track, thumb) -> box(box(ds, track, clip, t.gt_field), thumb, clip, if active == rid ++ "#bar" do t.gt_press else if hovered == rid ++ "#bar" do t.gt_hover else t.gt_track end end)
+          end
+      end
+    end
+  end
+
+  -- items and bars in drawing order: a region's bar after the last item inside it
+  pfn draw_all(t : GTheme, items : List(GItem), regions : List(GRegion), evs : List(GEvent), s : GState, hovered : String, active : String, ds : List(GDraw)) : List(GDraw) do
+    match items do
+      Nil -> List.fold_left(regions, ds, fn (d, g) -> draw_bar(t, d, g, hovered, active))
+      Cons(it, rest) ->
+        let d = draw_item(t, ds, it, evs, s, hovered, active)
+        -- a bar is drawn as soon as no later item is inside its region
+        let (done, left) = List.partition(regions, fn g -> match g do GRegion(rid, _, _, _, _, _) -> !List.any(rest, fn r2 -> match r2 do GItem(_, _, _, _, sid) -> inside_region(regions, sid, rid) end) end)
+        draw_all(t, rest, left, evs, s, hovered, active, List.fold_left(done, d, fn (d2, g) -> draw_bar(t, d2, g, hovered, active)))
+    end
+  end
+
+  -- is scroll region [sid] the region [rid] or inside it? (regions nest through their clips: a region inside another starts within its view)
+  pfn inside_region(regions : List(GRegion), sid : String, rid : String) : Bool do
+    if sid == rid do true
+    else
+      match (find_region(regions, sid), find_region(regions, rid)) do
+        (Some(GRegion(_, (sx, sy, _, _), _, _, _, sd)), Some(GRegion(_, rv, _, _, _, rd))) -> sd > rd && inside((sx +. 0.5, sy +. 0.5), rv)
+        _ -> false
+      end
+    end
+  end
+
+  pfn option_draw(t : GTheme, d : List(GDraw), e : (Int, (String, (Float, Float, Float, Float))), screen : (Float, Float, Float, Float), light : Int, hover_i : Int) : List(GDraw) do
+    let (oi, pair) = e
+    let (ot, orc) = pair
+    let (x, _, _, _) = orc
+    let d2 = if oi == light || oi == hover_i do box(d, orc, screen, if oi == hover_i do t.gt_hover else t.gt_control end) else d end
+    words_in(t, d2, x +. t.gt_pad, orc, screen, t.gt_text, ot)
+  end
+
+  pfn draw_list(t : GTheme, ds : List(GDraw), it : GItem, rs : List((Float, Float, Float, Float)), light : Int, hover_i : Int) : List(GDraw) do
+    match it do
+      GItem(_, GChoice(_, _, os, _, _, _), _, _, _) ->
+        let all = if is_nil(rs) do (0.0, 0.0, 0.0, 0.0) else match (List.head_opt(rs), List.last(rs)) do (Some((x, y, w, _)), (_, ly, _, lh)) -> (x, y, w, ly +. lh -. y) | _ -> (0.0, 0.0, 0.0, 0.0) end end
+        let screen = (0.0 -. 100000.0, 0.0 -. 100000.0, 200000.0, 200000.0)
+        let d0 = box(ds, all, screen, t.gt_field)
+        List.fold_left(List.zip(List.range(0, List.length(os)), List.zip(os, rs)), d0, fn (d, e) -> option_draw(t, d, e, screen, light, hover_i))
+      _ -> ds
+    end
+  end
+
+  -- ── A frame ──────────────────────────────────────────────────────────────
+
+  doc "Lay out [layers] on a screen [sw] x [sh] interface pixels (Strata.Ui.width and height), apply frame [f] to them, and answer the state to keep for the next frame and this frame's result: rectangles, events, hover, focus and the draw list. Call once a frame."
+  fn run(st : GState, t : GTheme, f : GFrame, sw : Float, sh : Float, layers : List(GLayer)) : (GState, GResult) do
+    let (items0, regions0, roots) = layout(t, st, sw, sh, layers)
+    let g0 = GStep(st, Nil)
+    let g1 = pointer_step(t, g0, f, items0, regions0, sh)
+    let keyed = pressed(f, "ui_next") || pressed(f, "ui_prev") || aimed(f, "ui_up") || aimed(f, "ui_down") || aimed(f, "ui_left") || aimed(f, "ui_right")
+    let g2 = key_step(t, g1, f, items0)
+    let g3 = if keyed do keep_seen(t, g2, items0, regions0) else g2 end
+    let s3 = state_of(g3)
+    -- a moved pointer hides the ring a key showed
+    let moved = match (f.gf_pointer, st.gs_last) do (Some((ax, ay)), Some((bx, stp))) -> Math.abs(ax -. bx) +. Math.abs(ay -. stp) > 2.0 | _ -> false end
+    let s4 = { s3 with gs_was_down: f.gf_down, gs_last: f.gf_pointer, gs_ring: s3.gs_ring && !(moved && !keyed),
+               gs_active: if s3.gs_active == "#closed" && f.gf_down do "#closed" else if s3.gs_active == "#closed" do "" else s3.gs_active end end }
+    -- lay out again if a region moved, so this frame draws and reports where things now are
+    let (items, regions, _) = if s4.gs_scrolls == st.gs_scrolls do (items0, regions0, roots) else layout(t, s4, sw, sh, layers) end
+    let evs = evs_of(g3)
+    let open_item = find_item(items, s4.gs_open)
+    let opts = match open_item do Some(it) -> options_rects(t, it, sh) | None -> Nil end
+    let hovered = match f.gf_pointer do
+        None -> ""
+        Some(p) ->
+          if index_hit(opts, p, 0) >= 0 do s4.gs_open
+          else
+            let bar = List.fold_left(regions, "", fn (a, rg) -> match rg do GRegion(rid, _, _, _, clip, _) -> match bar_rects(t, rg) do (track, _) -> if scrolls(rg) && inside(p, track) && inside(p, clip) do rid ++ "#bar" else a end end end)
+            if string_byte_length(bar) > 0 do bar
+            else match List.fold_left(items, None, fn (a, it) -> if hittable(it, p) do Some(it) else a end) do Some(GItem(h, _, _, _, _)) -> h | None -> "" end end
+          end
+      end
+    let over = match f.gf_pointer do
+        Some(p) -> List.any(roots, fn r -> inside(p, r)) || index_hit(opts, p, 0) >= 0
+        None -> false
+      end
+    let hover_i = match f.gf_pointer do Some(p) -> index_hit(opts, p, 0) | None -> -1 end
+    let body = draw_all(t, items, regions, evs, s4, hovered, s4.gs_active, Nil)
+    let ds = match open_item do Some(it) -> draw_list(t, body, it, opts, s4.gs_light, hover_i) | None -> body end
+    (s4, { gr_items: items, gr_regions: regions, gr_roots: roots, gr_events: evs, gr_hovered: hovered, gr_active: s4.gs_active, gr_focus: s4.gs_focus,
+           gr_over: over, gr_draws: List.reverse(ds), gr_overlay: opts })
+  end
+
+  doc "The open choice list's option rectangles this frame, top to bottom; empty when none is open."
+  fn list_rects(r : GResult) : List((Float, Float, Float, Float)) do r.gr_overlay end
+end

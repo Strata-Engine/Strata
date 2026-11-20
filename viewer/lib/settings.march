@@ -1,0 +1,125 @@
+-- Settings: the viewer's settings screen, built with Strata.Gui. F1 or the
+-- pad's right stick click opens it. Generation settings (applied over
+-- island.gen by regenerating), the light mode (at once), the voxel scale
+-- (on the next start: the walker and physics are built for the start scale),
+-- the readout, and the settings file to read.
+mod StrataViewer.Settings do
+
+  type SetValues = { sv_detail : Float, sv_density : Float, sv_tunnel : Float, sv_cavern : Float, sv_light : Int, sv_scale : Float, sv_readout : Bool, sv_file : String }
+
+  -- open, the toolkit's state, the values shown, the values last applied
+  type SetScreen = { ss_input : Strata.Input.Input, ss_open : Bool, ss_gui : Strata.Gui.GState, ss_vals : SetValues, ss_applied : SetValues }
+
+  -- what the frame asks of the viewer
+  type SetAsk = AskNothing | AskApply | AskClose
+  derive Eq for SetAsk
+
+  pfn get(p : StrataViewer.Params.Params, k : String, d : Float) : Float do
+    match StrataViewer.Params.get(p, k) do
+      Some(v) -> v
+      None -> d
+    end
+  end
+
+  doc "The screen, closed, showing the values in [p] and the run's light mode, voxel scale and settings file."
+  fn start(p : StrataViewer.Params.Params, light : Int, scale : Float, file : String) : SetScreen do
+    let v = { sv_detail: get(p, "detail_amplitude", 6.0), sv_density: get(p, "density_amplitude", 12.0), sv_tunnel: get(p, "tunnel_width", 0.08),
+              sv_cavern: get(p, "cavern_open", 0.45), sv_light: light, sv_scale: scale, sv_readout: true, sv_file: file }
+    { ss_input: Strata.Input.start(ui_map()), ss_open: false, ss_gui: Strata.Gui.start(), ss_vals: v, ss_applied: v }
+  end
+
+  doc "The screen's own actions: the toolkit's (Strata.Gui.bindings) and `settings`, F1 or the right stick's click, which opens and closes it."
+  fn ui_map() : Strata.Input.Map do
+    Strata.Input.new(List.append(Strata.Gui.bindings(), [("settings", Strata.Input.Key(290), 1.0), ("settings", Strata.Input.PadButton(10), 1.0)]))
+  end
+
+  doc "The keys a scripted run (the golden picture) presses on [frame]: down a row, a step right, down to the light mode, Enter to open its list, down one."
+  fn script_keys(frame : Int) : List(Int) do
+    if frame == 20 || frame == 34 || frame == 38 || frame == 42 || frame == 46 || frame == 54 do [264]
+    else if frame == 30 do [262] else if frame == 50 do [257] else Nil end end end
+  end
+
+  doc "One frame: read the screen's actions (a scripted run presses `script_keys`), open or close it on `settings` (or [open_now]), and run it while open. Answers the screen, the result to paint while open, and what the viewer is asked to do. The cursor is freed while it is open in a live run."
+  fn tick(s : SetScreen, scripted : Bool, frame : Int, open_now : Bool, sw : Float, sh : Float, ui_scale : Float, scale_now : Float, light_now : Int) : (SetScreen, Option(Strata.Gui.GResult), SetAsk) do
+    let raw = if scripted do Strata.Input.raw(script_keys(frame), Nil, Nil, Nil) else Strata.Render.input(s.ss_input, Strata.Ffi.Vk.first_pad()) end
+    let inp = Strata.Input.step(s.ss_input, raw)
+    let flip = open_now || Strata.Input.pressed(inp, "settings")
+    let s1 = if flip do
+        let o = !s.ss_open
+        if !scripted do Strata.Ffi.Vk.set_cursor(!o) else () end
+        let opened = set_open(s, o)
+        { opened with ss_input: inp, ss_vals: { (opened.ss_vals) with sv_light: light_now } }
+      else { s with ss_input: inp } end
+    if !s1.ss_open do (s1, None, AskNothing)
+    else
+      let f = if scripted do Strata.Gui.frame(None, false, 0.0, Nil, inp) else Strata.GuiDraw.sample(inp, ui_scale, true) end
+      let (s2, r, ask) = step(s1, theme(), f, sw, sh, scale_now)
+      if ask == AskClose do
+        if !scripted do Strata.Ffi.Vk.set_cursor(true) else () end
+        (set_open(s2, false), Some(r), ask)
+      else (s2, Some(r), ask) end
+    end
+  end
+
+  doc "Is the screen open?"
+  fn is_open(s : SetScreen) : Bool do s.ss_open end
+  doc "The values shown."
+  fn values(s : SetScreen) : SetValues do s.ss_vals end
+  doc "The screen opened (focused on its first control, for a pad or keys) or closed."
+  fn set_open(s : SetScreen, o : Bool) : SetScreen do
+    { s with ss_open: o, ss_gui: if o do Strata.Gui.focus(Strata.Gui.start(), "detail") else Strata.Gui.start() end }
+  end
+
+  doc "The generation overrides to lay over the settings file."
+  fn overrides(v : SetValues) : List((String, Float)) do
+    [("detail_amplitude", v.sv_detail), ("density_amplitude", v.sv_density), ("tunnel_width", v.sv_tunnel), ("cavern_open", v.sv_cavern)]
+  end
+
+  pfn lights() : List(String) do ["0  flat", "1  sky and sun", "2  shadows", "3  reflections", "4  sky light", "5"] end
+
+  doc "The screen's layers: a panel at the centre, its settings in a scroll region."
+  fn layers(v : SetValues, scale_now : Float) : List(Strata.Gui.GLayer) do
+    let rows = [
+      Strata.Gui.label("Generation, on Apply"),
+      Strata.Gui.slider("detail", "Detail height", v.sv_detail, 0.0, 20.0, 0.5),
+      Strata.Gui.slider("density", "Density reach", v.sv_density, 0.0, 30.0, 1.0),
+      Strata.Gui.slider("tunnel", "Tunnel width", v.sv_tunnel, 0.0, 0.3, 0.01),
+      Strata.Gui.slider("cavern", "Cavern open", v.sv_cavern, 0.0, 1.0, 0.05),
+      Strata.Gui.field("file", "Settings file", v.sv_file, 64),
+      Strata.Gui.label("View"),
+      Strata.Gui.choice("light", "Light mode", lights(), v.sv_light),
+      Strata.Gui.slider("scale", "Voxel scale", v.sv_scale, 0.25, 2.0, 0.25),
+      Strata.Gui.label(if v.sv_scale != scale_now do "the voxel scale takes effect on the next start" else " " end),
+      Strata.Gui.toggle("readout", "Show the readout", v.sv_readout)]
+    let wide = Strata.Gui.share(1.0)
+    [Strata.Gui.place(4, 0.0, 0.0, Strata.Gui.panel(Strata.Gui.fixed(560.0), Strata.Gui.fit(), [
+      Strata.Gui.label("Settings"),
+      Strata.Gui.scroll("rows", wide, Strata.Gui.fixed(300.0), List.map(rows, fn n -> Strata.Gui.sized(n, wide, Strata.Gui.fit()))),
+      Strata.Gui.row(wide, Strata.Gui.fit(), [Strata.Gui.space(wide, Strata.Gui.fit()), Strata.Gui.button("apply", "Apply"), Strata.Gui.button("close", "Close")])]))]
+  end
+
+  pfn or_f(o : Option(Float), d : Float) : Float do match o do Some(x) -> x | None -> d end end
+
+  pfn apply_result(v : SetValues, r : Strata.Gui.GResult) : SetValues do
+    { sv_detail: or_f(Strata.Gui.changed(r, "detail"), v.sv_detail), sv_density: or_f(Strata.Gui.changed(r, "density"), v.sv_density),
+      sv_tunnel: or_f(Strata.Gui.changed(r, "tunnel"), v.sv_tunnel), sv_cavern: or_f(Strata.Gui.changed(r, "cavern"), v.sv_cavern),
+      sv_light: unwrap_or(Strata.Gui.chose(r, "light"), v.sv_light), sv_scale: or_f(Strata.Gui.changed(r, "scale"), v.sv_scale),
+      sv_readout: unwrap_or(Strata.Gui.toggled(r, "readout"), v.sv_readout), sv_file: unwrap_or(Strata.Gui.edited(r, "file"), v.sv_file) }
+  end
+
+  doc "The theme the viewer uses: the default with a label column."
+  fn theme() : Strata.Gui.GTheme do
+    let t = Strata.GuiDraw.theme()
+    { t with gt_label_w: 150.0 }
+  end
+
+  doc "One frame of the open screen: the new screen, the result to paint, and what the viewer is asked to do."
+  fn step(s : SetScreen, t : Strata.Gui.GTheme, f : Strata.Gui.GFrame, sw : Float, sh : Float, scale_now : Float) : (SetScreen, Strata.Gui.GResult, SetAsk) do
+    let (g, r) = Strata.Gui.run(s.ss_gui, t, f, sw, sh, layers(s.ss_vals, scale_now))
+    let v = apply_result(s.ss_vals, r)
+    let ask = if Strata.Gui.clicked(r, "apply") || Strata.Gui.submitted(r, "file") do AskApply
+      else if Strata.Gui.clicked(r, "close") || Strata.Gui.went_back(r) do AskClose else AskNothing end end
+    let s2 = { s with ss_gui: g, ss_vals: v }
+    (if ask == AskApply do { s2 with ss_applied: v } else s2 end, r, ask)
+  end
+end

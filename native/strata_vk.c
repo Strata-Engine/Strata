@@ -2527,6 +2527,13 @@ int64_t sv_open(int64_t w, int64_t h, int64_t capture_mouse, int64_t quad_capaci
     return sv_open_slots(w, h, capture_mouse, quad_capacity, SV_DEFAULT_SLOTS);
 }
 int64_t sv_mouse_button(int64_t b) { return (g.win && b >= 0 && b <= 7 && glfwGetMouseButton(g.win, (int)b) == GLFW_PRESS) ? 1 : 0; }
+/* Capture the cursor (hidden and locked, for looking) or free it (shown, for pointing at an interface). The
+ * motion delta restarts so the switch is not read as a jump. */
+void sv_set_cursor(int64_t captured) {
+    if (!g.win) return;
+    glfwSetInputMode(g.win, GLFW_CURSOR, captured ? GLFW_CURSOR_DISABLED : GLFW_CURSOR_NORMAL);
+    g.have_mouse = 0; g.mdx = 0; g.mdy = 0;
+}
 double sv_mouse_x(void) { if (g.win && g.have_mouse) return g.mx; double x = 0, y = 0; if (g.win) glfwGetCursorPos(g.win, &x, &y); return x; }
 double sv_mouse_y(void) { if (g.win && g.have_mouse) return g.my; double x = 0, y = 0; if (g.win) glfwGetCursorPos(g.win, &x, &y); return y; }
 double sv_scroll_y(void) { return g.scroll_y; }
