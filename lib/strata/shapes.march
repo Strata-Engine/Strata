@@ -1,0 +1,507 @@
+-- Shapes — the standing shapes of a world: what a game keeps beside its
+-- stream and physics for everything that is a fine grid of its own and is
+-- not moving (docs/2026-11-19-shapes-design.md).
+--
+-- Prototypes are registered once: the grids props are instances of. Each
+-- loaded level-0 chunk has a list of standing shapes, made from the props
+-- its generator lists (`Strata.Terrain.props`); an unedited one holds its
+-- prototype's grid and no other. A carve gives a shape a grid of its own
+-- and hands back what the carving left loose, as dynamic shapes for
+-- `Strata.Physics.add_shape`. What has happened to a chunk's props is kept
+-- by their hashes (the memory), survives the chunk unloading, and is what a
+-- save writes.
+--
+-- A shape's id is given when its chunk's props arrive and is good until
+-- they leave.
+mod Strata.Shapes do
+
+  needs IO.Spawn      -- a chunk's props are listed on a worker
+
+  alias Strata.Shape as Shp
+  alias Strata.Body as Bg
+  alias Strata.Store as So
+  alias Strata.Math.Quat as Qt
+
+  -- id, hash, prototype (-1: a grid of its own), the shape
+  type ShStanding = ShStanding(Int, Int, Int, Strata.Shape.Shape)
+  -- what happened to the prop of a hash: it left, or it stands carved as this grid of this voxel size
+  type ShMemo = ShGone(Int) | ShCarved(Int, Strata.Body.Grid, Float)
+  type ShJob = ShJob(Strata.Coord.Key, Task(List(Strata.Terrain.PropAt)))
+
+  type Shapes = { sh_reg : Strata.Blocks.Registry, sh_scale : Float, sh_protos : List(Strata.Shape.Shape), sh_ptree : Strata.Tree.Tree(Strata.Shape.Shape), sh_reach : Float,
+                  sh_chunks : Strata.Store.Store(List(ShStanding)), sh_props : Strata.Store.Store(List(Strata.Terrain.PropAt)), sh_where : Strata.Store.Store(Strata.Coord.Key), sh_next : Int, sh_count : Int,
+                  sh_memo : Strata.Store.Store(List(ShMemo)), sh_dirty : Strata.Store.Store(Bool), sh_met : Strata.Store.Store(Bool), sh_new_regions : List((Int, Int, Int)),
+                  sh_fresh : List(Int), sh_gone : List(Int), sh_jobs : List(ShJob), sh_asked : Strata.Store.Store(Bool), sh_refused : Int }
+
+  pfn nothing() : Strata.Shape.Shape do Shp.make(Bg.grid(1, 1, 1), 1.0, 0.0, 0.0, 0.0, Qt.identity(), 0) end
+
+  doc "No shapes, in a world of registry r whose voxels are [world_scale] metres."
+  fn new(r : Strata.Blocks.Registry, world_scale : Float) : Shapes do
+    { sh_reg: r, sh_scale: world_scale, sh_protos: Nil, sh_ptree: Strata.Tree.from_list(Nil, nothing()), sh_reach: 0.0,
+      sh_chunks: So.empty(Nil), sh_props: So.empty(Nil), sh_where: So.empty(Strata.Coord.key(0, 0, 0)), sh_next: 1, sh_count: 0,
+      sh_memo: So.empty(Nil), sh_dirty: So.empty(false), sh_met: So.empty(false), sh_new_regions: Nil,
+      sh_fresh: Nil, sh_gone: Nil, sh_jobs: Nil, sh_asked: So.empty(false), sh_refused: 0 }
+  end
+
+  pfn with_index(s : Shapes, i : Int) : (Shapes, Int) do (s, i) end
+  pfn fmax(a : Float, b : Float) : Float do if a > b do a else b end end
+  pfn fl(v : Float) : Int do float_to_int(Math.floor(v)) end
+
+  -- ── Prototypes ───────────────────────────────────────────────────────────
+  doc "Register grid g at [vs] metres a voxel as a prototype; answers its index. Prototypes are registered before any chunk's props are added, and their indices are what a generator's props name."
+  fn add_proto(s : Shapes, g : Strata.Body.Grid, vs : Float) : (Shapes, Int) do
+    let ps = List.append(s.sh_protos, Cons(Shp.make(g, vs, 0.0, 0.0, 0.0, Qt.identity(), 0), Nil))
+    let wide = int_to_float(Math.max_int(Bg.size_x(g), Math.max_int(Bg.size_y(g), Bg.size_z(g)))) *. vs
+    with_index({ s with sh_protos: ps, sh_ptree: Strata.Tree.from_list(ps, nothing()), sh_reach: fmax(s.sh_reach, wide) }, List.length(ps) - 1)
+  end
+
+  doc "Register a shape set's templates as prototypes, four a variant: variant v turned r quarter turns is prototype `proto_index(base, v, r)`, where base is the index answered. A template too large to be a grid is registered as a single voxel of air."
+  fn add_set(s : Shapes, ts : List(Strata.Template.Template)) : (Shapes, Int) do
+    let base = List.length(s.sh_protos)
+    let s2 = List.fold_left(ts, s, fn (acc, t) -> List.fold_left(List.range(0, 4), acc, fn (a2, r) ->
+      match add_proto(a2, match Shp.grid_of(t, r) do
+          Some(g) -> g
+          None -> Bg.grid(1, 1, 1)
+        end, Strata.Template.t_voxel_size(t)) do (a3, _) -> a3 end))
+    with_index(s2, base)
+  end
+
+  doc "The prototype of variant v turned rot quarter turns, in a set registered at [base]."
+  fn proto_index(base : Int, v : Int, rot : Int) : Int do base + 4 * v + int_and(rot, 3) end
+  fn proto_count(s : Shapes) : Int do List.length(s.sh_protos) end
+  doc "Prototype i's grid and voxel size, as a shape at the origin; a single voxel of air for no such prototype."
+  fn proto(s : Shapes, i : Int) : Strata.Shape.Shape do if i < 0 || i >= List.length(s.sh_protos) do nothing() else Strata.Tree.get(s.sh_ptree, i) end end
+
+  doc "Where prototype [proto] stands as a prop of hash [hash] on the column holding (xm, zm) metres whose top is world voxel [top]: centred on the middle of that column, its low corner on a whole voxel of its own, its bottom row on the voxel above the top. A stamp of the same variant stands on the same column."
+  fn stand(s : Shapes, proto_ : Int, hash : Int, xm : Float, zm : Float, top : Int) : Strata.Terrain.PropAt do
+    let p = proto(s, proto_)
+    let vs = Shp.voxel(p)
+    let ws = s.sh_scale
+    let cx = (Math.floor(xm /. ws) +. 0.5) *. ws -. int_to_float(Bg.size_x(Shp.grid(p))) *. vs *. 0.5
+    let cz = (Math.floor(zm /. ws) +. 0.5) *. ws -. int_to_float(Bg.size_z(Shp.grid(p))) *. vs *. 0.5
+    Strata.Terrain.placed(proto_, hash, Math.floor(cx /. vs +. 0.5) *. vs, int_to_float(top + 1) *. ws, Math.floor(cz /. vs +. 0.5) *. vs)
+  end
+
+  -- ── Regions (as Strata.Save cuts them: 8 chunks a side) ──────────────────
+  pfn floor8(v : Int) : Int do if v >= 0 do v / 8 else 0 - ((7 - v) / 8) end end
+  doc "The save region holding chunk k, as `Strata.Save.region_of_key` answers it."
+  fn region_of(k : Strata.Coord.Key) : (Int, Int, Int) do (floor8(Strata.Coord.kx(k)), floor8(Strata.Coord.ky(k)), floor8(Strata.Coord.kz(k))) end
+  pfn region_key(k : Strata.Coord.Key) : Strata.Coord.Key do Strata.Coord.key_at(floor8(Strata.Coord.kx(k)), floor8(Strata.Coord.ky(k)), floor8(Strata.Coord.kz(k)), 97) end
+  pfn id_key(id : Int) : Strata.Coord.Key do Strata.Coord.key_at(id, 0, 0, 98) end
+
+  -- ── Chunks ───────────────────────────────────────────────────────────────
+  pfn memo_hash(m : ShMemo) : Int do
+    match m do
+      ShGone(h) -> h
+      ShCarved(h, _, _) -> h
+    end
+  end
+  pfn memo_of(ms : List(ShMemo), hash : Int) : Option(ShMemo) do List.find(ms, fn m -> memo_hash(m) == hash) end
+
+  pfn st_id(e : ShStanding) : Int do match e do ShStanding(i, _, _, _) -> i end end
+  pfn st_shape(e : ShStanding) : Strata.Shape.Shape do match e do ShStanding(_, _, _, sp) -> sp end end
+
+  -- one prop stood (or not, when the memory says it left): the entries so far, the next id
+  pfn stand_one(s : Shapes, ms : List(ShMemo), acc : (List(ShStanding), Int), p : Strata.Terrain.PropAt) : (List(ShStanding), Int) do
+    match acc do
+      (es, next) ->
+        let hash = Strata.Terrain.placed_hash(p)
+        let pi = Strata.Terrain.placed_proto(p)
+        let pr = proto(s, pi)
+        let x = Strata.Terrain.placed_x(p)
+        let y = Strata.Terrain.placed_y(p)
+        let z = Strata.Terrain.placed_z(p)
+        match memo_of(ms, hash) do
+          Some(ShGone(_)) -> acc
+          Some(ShCarved(_, g, vs)) -> (Cons(ShStanding(next, hash, -1, Shp.make(g, vs, x, y, z, Qt.identity(), 0)), es), next + 1)
+          None ->
+            if pi < 0 || pi >= List.length(s.sh_protos) do acc
+            else (Cons(ShStanding(next, hash, pi, Shp.make(Shp.grid(pr), Shp.voxel(pr), x, y, z, Qt.identity(), 0)), es), next + 1) end
+        end
+    end
+  end
+
+  doc "Chunk k's shapes gone: each is listed as gone for the renderer. What happened to them stays in the memory."
+  fn drop_chunk(s : Shapes, k : Strata.Coord.Key) : Shapes do
+    if !So.has(s.sh_chunks, k) do s
+    else
+      let es = So.get(s.sh_chunks, k)
+      { s with sh_chunks: So.remove(s.sh_chunks, k), sh_props: So.remove(s.sh_props, k),
+               sh_where: List.fold_left(es, s.sh_where, fn (w, e) -> So.remove(w, id_key(st_id(e)))),
+               sh_gone: List.fold_left(es, s.sh_gone, fn (g, e) -> Cons(st_id(e), g)), sh_count: s.sh_count - List.length(es) }
+    end
+  end
+
+  doc "Stand chunk k's props: each as an instance of its prototype, unless the memory says it left (then it is not stood) or was carved (then it stands as the carved grid). A chunk stood before is dropped first. A prop naming no prototype is not stood."
+  fn add_chunk(s : Shapes, k : Strata.Coord.Key, props : List(Strata.Terrain.PropAt)) : Shapes do
+    let s0 = drop_chunk(s, k)
+    match List.fold_left(props, (Nil, s0.sh_next), fn (acc, p) -> stand_one(s0, So.get(s0.sh_memo, k), acc, p)) do
+      (rev, next) ->
+        let es = List.reverse(rev)
+        { s0 with sh_chunks: So.put(s0.sh_chunks, k, es), sh_props: So.put(s0.sh_props, k, props), sh_next: next, sh_count: s0.sh_count + List.length(es),
+                  sh_where: List.fold_left(es, s0.sh_where, fn (w, e) -> So.put(w, id_key(st_id(e)), k)),
+                  sh_fresh: List.fold_left(es, s0.sh_fresh, fn (f, e) -> Cons(st_id(e), f)) }
+    end
+  end
+
+  fn has_chunk(s : Shapes, k : Strata.Coord.Key) : Bool do So.has(s.sh_chunks, k) end
+  doc "How many shapes stand."
+  fn count(s : Shapes) : Int do s.sh_count end
+  doc "The ids of chunk k's standing shapes, in the order its props were listed."
+  fn ids_in(s : Shapes, k : Strata.Coord.Key) : List(Int) do List.map(So.get(s.sh_chunks, k), st_id) end
+
+  pfn entry(s : Shapes, id : Int) : Option(ShStanding) do
+    if !So.has(s.sh_where, id_key(id)) do None
+    else List.find(So.get(s.sh_chunks, So.get(s.sh_where, id_key(id))), fn e -> st_id(e) == id) end
+  end
+  doc "Standing shape [id], or None once it is gone."
+  fn shape(s : Shapes, id : Int) : Option(Strata.Shape.Shape) do
+    match entry(s, id) do
+      Some(e) -> Some(st_shape(e))
+      None -> None
+    end
+  end
+  doc "The prototype shape [id] is an unedited instance of, or -1: a shape with a grid of its own, or none."
+  fn proto_of(s : Shapes, id : Int) : Int do
+    match entry(s, id) do
+      Some(ShStanding(_, _, p, _)) -> p
+      None -> -1
+    end
+  end
+  doc "The chunk shape [id] belongs to; chunk (0, 0, 0) for none."
+  fn chunk_of(s : Shapes, id : Int) : Strata.Coord.Key do So.get(s.sh_where, id_key(id)) end
+
+  -- ── The chunks near a box ────────────────────────────────────────────────
+  -- every chunk whose shapes can reach the box (metres): the box widened by the widest prototype
+  pfn near_keys(s : Shapes, x0 : Float, y0 : Float, z0 : Float, x1 : Float, y1 : Float, z1 : Float) : List(Strata.Coord.Key) do
+    let side = 32.0 *. s.sh_scale
+    let r = s.sh_reach
+    let ax = fl((x0 -. r) /. side)
+    let bx = fl((x1 +. r) /. side)
+    let ay = fl((y0 -. r) /. side)
+    let ay1 = fl((y1 +. r) /. side)
+    let az = fl((z0 -. r) /. side)
+    let bz = fl((z1 +. r) /. side)
+    -- a box of very many chunks is walked through the chunks that hold shapes instead
+    if (bx - ax + 1) * (ay1 - ay + 1) * (bz - az + 1) > 4 * So.size(s.sh_chunks) + 64 do
+      List.filter(So.keys(s.sh_chunks), fn k -> Strata.Coord.kx(k) >= ax && Strata.Coord.kx(k) <= bx && Strata.Coord.ky(k) >= ay && Strata.Coord.ky(k) <= ay1 && Strata.Coord.kz(k) >= az && Strata.Coord.kz(k) <= bz)
+    else
+      List.filter(List.flat_map(List.range(ax, bx + 1), fn x -> List.flat_map(List.range(ay, ay1 + 1), fn y -> List.map(List.range(az, bz + 1), fn z -> Strata.Coord.key(x, y, z)))), fn k -> So.has(s.sh_chunks, k))
+    end
+  end
+
+  -- ── Rays ─────────────────────────────────────────────────────────────────
+  pfn fminf(a : Float, b : Float) : Float do if a < b do a else b end end
+
+  doc "The nearest standing shape a ray from (ox, oy, oz) metres along (dx, dy, dz) enters within [max] metres, at a voxel stop(block id) holds for: the hit (the voxel in the shape's grid, the face, the distance; `Strata.Shape.ray`) and the shape's id, or a miss and -1."
+  fn raycast(s : Shapes, ox : Float, oy : Float, oz : Float, dx : Float, dy : Float, dz : Float, max : Float, stop : Int -> Bool) : (Strata.Query.Hit, Int) do
+    let len = Math.sqrt(dx *. dx +. dy *. dy +. dz *. dz)
+    if len <= 0.0 || max <= 0.0 || s.sh_count == 0 do (Strata.Query.Miss, -1)
+    else
+      let ex = ox +. dx /. len *. max
+      let ey = oy +. dy /. len *. max
+      let ez = oz +. dz /. len *. max
+      let ks = near_keys(s, fminf(ox, ex), fminf(oy, ey), fminf(oz, ez), fmax(ox, ex), fmax(oy, ey), fmax(oz, ez))
+      List.fold_left(ks, (Strata.Query.Miss, -1), fn (best, k) -> List.fold_left(So.get(s.sh_chunks, k), best, fn (b2, e) -> nearer(b2, e, ox, oy, oz, dx, dy, dz, max, stop)))
+    end
+  end
+  pfn nearer(best : (Strata.Query.Hit, Int), e : ShStanding, ox : Float, oy : Float, oz : Float, dx : Float, dy : Float, dz : Float, max : Float, stop : Int -> Bool) : (Strata.Query.Hit, Int) do
+    match best do
+      (bh, _) ->
+        let limit = if Strata.Query.is_hit(bh) do Strata.Query.hit_dist(bh) else max end
+        let h = Shp.ray(st_shape(e), ox, oy, oz, dx, dy, dz, limit, stop)
+        if Strata.Query.is_hit(h) do (h, st_id(e)) else best end
+    end
+  end
+
+  doc "A ray against the world, the bodies of physics p and the standing shapes together: the nearest hit and what it struck: 0 the world (the hit is `Strata.Query.raycast`'s), 1 a body (its id; `Strata.Physics.raycast`), 2 a standing shape (its id), or a miss (kind -1)."
+  fn raycast_all(s : Shapes, p : Strata.Physics.Physics, w : Strata.World.World, ox : Float, oy : Float, oz : Float, dx : Float, dy : Float, dz : Float, max : Float, stop : Int -> Bool) : (Strata.Query.Hit, Int, Int) do
+    match Strata.Physics.raycast(p, w, ox, oy, oz, dx, dy, dz, max, stop) do
+      (ph, body) ->
+        let limit = if Strata.Query.is_hit(ph) do Strata.Query.hit_dist(ph) else max end
+        match raycast(s, ox, oy, oz, dx, dy, dz, limit, stop) do
+          (sh, id) ->
+            if id >= 0 do (sh, 2, id)
+            else if !Strata.Query.is_hit(ph) do (ph, -1, -1)
+            else if body >= 0 do (ph, 1, body)
+            else (ph, 0, -1) end end end
+        end
+    end
+  end
+
+  -- ── Carving ──────────────────────────────────────────────────────────────
+  pfn mark_dirty(s : Shapes, k : Strata.Coord.Key) : Shapes do { s with sh_dirty: So.put(s.sh_dirty, region_key(k), true) } end
+  -- chunk k's memory of hash set to m
+  pfn remember(s : Shapes, k : Strata.Coord.Key, m : ShMemo) : Shapes do
+    let rest = List.filter(So.get(s.sh_memo, k), fn x -> memo_hash(x) != memo_hash(m))
+    mark_dirty({ s with sh_memo: So.put(s.sh_memo, k, Cons(m, rest)) }, k)
+  end
+
+  -- what a carve or an unrooting did: the shapes, the loose parts so far, voxels taken, crumbs dropped
+  type ShCut = ShCut(Shapes, List(Strata.Shape.Shape), Int, Int)
+
+  -- entry e of chunk k replaced by what `parted` left of it
+  pfn settle_entry(s : Shapes, k : Strata.Coord.Key, e : ShStanding, parted : Strata.Shape.Parted) : Shapes do
+    match e do
+      ShStanding(id, hash, _, _) ->
+        let es = So.get(s.sh_chunks, k)
+        match Shp.standing(parted) do
+          Some(st) ->
+            let s1 = { s with sh_chunks: So.put(s.sh_chunks, k, List.map(es, fn x -> if st_id(x) == id do ShStanding(id, hash, -1, st) else x end)), sh_fresh: Cons(id, s.sh_fresh) }
+            remember(s1, k, ShCarved(hash, Shp.grid(st), Shp.voxel(st)))
+          None ->
+            let s1 = { s with sh_chunks: So.put(s.sh_chunks, k, List.filter(es, fn x -> st_id(x) != id)), sh_where: So.remove(s.sh_where, id_key(id)), sh_gone: Cons(id, s.sh_gone), sh_count: s.sh_count - 1 }
+            remember(s1, k, ShGone(hash))
+        end
+    end
+  end
+
+  pfn carve_one(w : Strata.World.World, k : Strata.Coord.Key, x : Float, y : Float, z : Float, r : Float, acc : ShCut, e : ShStanding) : ShCut do
+    match Shp.carve_sphere(st_shape(e), x, y, z, r) do
+      (cut, taken) ->
+        if taken == 0 do acc
+        else
+          match acc do
+            ShCut(s, loose_, n, crumbs_) ->
+              let parted = Shp.parts(s.sh_reg, w, cut, s.sh_scale)
+              -- a shape left whole and held is still carved: it takes the cut grid
+              let parted2 = parted
+              ShCut(settle_entry(s, k, e, parted2), List.append(loose_, Shp.loose(parted)), n + taken, crumbs_ + Shp.crumbs(parted))
+          end
+        end
+    end
+  end
+
+  doc "Take every voxel of every standing shape whose centre lies within [r] metres of (x, y, z), as a blast or a blade would. A shape that lost voxels stands on as the parts the ground of world w still holds (`Strata.Shape.parts`), in a grid of its own, and is remembered as carved; one with nothing held is gone and remembered so. Answers the shapes, the loose parts (dynamic shapes, for `Strata.Physics.add_shape`), how many voxels were taken, and how many crumbs were dropped."
+  fn carve_sphere(s : Shapes, w : Strata.World.World, x : Float, y : Float, z : Float, r : Float) : (Shapes, List(Strata.Shape.Shape), Int, Int) do
+    if r <= 0.0 || s.sh_count == 0 do (s, Nil, 0, 0)
+    else
+      let ks = near_keys(s, x -. r, y -. r, z -. r, x +. r, y +. r, z +. r)
+      match List.fold_left(ks, ShCut(s, Nil, 0, 0), fn (acc, k) -> List.fold_left(So.get(s.sh_chunks, k), acc, fn (a2, e) -> carve_one(w, k, x, y, z, r, a2, e))) do
+        ShCut(s2, loose_, n, c) -> (s2, loose_, n, c)
+      end
+    end
+  end
+
+  pfn boxes_meet(b : (Float, Float, Float, Float, Float, Float), x0 : Float, y0 : Float, z0 : Float, x1 : Float, y1 : Float, z1 : Float) : Bool do
+    match b do (a0, b0, c0, a1, b1, c1) -> a0 <= x1 && a1 >= x0 && b0 <= y1 && b1 >= y0 && c0 <= z1 && c1 >= z0 end
+  end
+  pfn unroot_one(w : Strata.World.World, k : Strata.Coord.Key, x0 : Float, y0 : Float, z0 : Float, x1 : Float, y1 : Float, z1 : Float, acc : ShCut, e : ShStanding) : ShCut do
+    match acc do
+      ShCut(s, loose_, n, c) ->
+        -- gone already (two changes of one edit can reach one shape)
+        if !So.has(s.sh_where, id_key(st_id(e))) do acc
+        else if !boxes_meet(Shp.bounds(st_shape(e)), x0, y0, z0, x1, y1, z1) do acc
+        else if Shp.held(s.sh_reg, w, st_shape(e), s.sh_scale) do acc
+        else ShCut(settle_entry(s, k, e, Shp.parts(s.sh_reg, w, st_shape(e), s.sh_scale)), Cons(Shp.with_mode(st_shape(e), Shp.dynamic()), loose_), n, c) end end end
+    end
+  end
+
+  doc "After edit o of world w (o's world): the standing shapes whose bounds meet one of the edit's changes, widened by a voxel, and that the ground no longer holds (`Strata.Shape.held`). Each is gone from the shapes, remembered as gone, and answered whole as a dynamic shape holding the grid it had, for `Strata.Physics.add_shape`."
+  fn unrooted(s : Shapes, w : Strata.World.World, o : Strata.Edit.Outcome) : (Shapes, List(Strata.Shape.Shape)) do
+    if s.sh_count == 0 do (s, Nil)
+    else
+      let ws = s.sh_scale
+      match List.fold_left(Strata.Edit.changes(o), ShCut(s, Nil, 0, 0), fn (acc, ch) ->
+        match (Strata.Edit.low(ch), Strata.Edit.high(ch)) do
+          ((ax, ay, az), (bx, by_, bz)) ->
+            let x0 = int_to_float(ax - 1) *. ws
+            let y0 = int_to_float(ay - 1) *. ws
+            let z0 = int_to_float(az - 1) *. ws
+            let x1 = int_to_float(bx + 2) *. ws
+            let y1 = int_to_float(by_ + 2) *. ws
+            let z1 = int_to_float(bz + 2) *. ws
+            match acc do
+              ShCut(sa, _, _, _) -> List.fold_left(near_keys(sa, x0, y0, z0, x1, y1, z1), acc, fn (a2, k) -> match a2 do ShCut(sb, _, _, _) -> List.fold_left(So.get(sb.sh_chunks, k), a2, fn (a3, e) -> unroot_one(w, k, x0, y0, z0, x1, y1, z1, a3, e)) end)
+            end
+        end) do
+        ShCut(s2, loose_, _, _) -> (s2, List.reverse(loose_))
+      end
+    end
+  end
+
+  -- ── For the renderer ─────────────────────────────────────────────────────
+  doc "The ids of shapes that appeared or changed, and of shapes that left, since the last take; a shape in both lists left after it appeared. `Strata.Render.shapes` empties them."
+  fn take_drawn(s : Shapes) : (Shapes, List(Int), List(Int)) do ({ s with sh_fresh: Nil, sh_gone: Nil }, List.reverse(s.sh_fresh), List.reverse(s.sh_gone)) end
+
+  -- ── In step with the stream ──────────────────────────────────────────────
+  pfn poll(s : Shapes, js : List(ShJob), still : List(ShJob)) : Shapes do
+    match js do
+      Nil -> { s with sh_jobs: List.reverse(still) }
+      Cons(ShJob(k, t), rest) ->
+        match task_poll(t) do
+          None -> poll(s, rest, Cons(ShJob(k, t), still))
+          Some(r) ->
+            -- a chunk that unloaded while its props were listed is no longer asked for
+            if !So.has(s.sh_asked, k) do poll(s, rest, still)
+            else
+              match r do
+                Ok(props) -> poll(add_chunk(s, k, props), rest, still)
+                Err(_) -> poll({ s with sh_refused: s.sh_refused + 1 }, rest, still)
+              end
+            end
+        end
+    end
+  end
+  pfn meet_region(s : Shapes, k : Strata.Coord.Key) : Shapes do
+    if So.has(s.sh_met, region_key(k)) do s else { s with sh_met: So.put(s.sh_met, region_key(k), true), sh_new_regions: Cons(region_of(k), s.sh_new_regions) } end
+  end
+  pfn ask(s : Shapes, g : Strata.Terrain.Gen, seed : Int, k : Strata.Coord.Key) : Shapes do
+    if Strata.Coord.level(k) != 0 || So.has(s.sh_asked, k) do s
+    else
+      let s1 = meet_region(s, k)
+      { s1 with sh_asked: So.put(s1.sh_asked, k, true), sh_jobs: Cons(ShJob(k, task_spawn(fn _ -> Strata.Terrain.props(g, k, seed))), s1.sh_jobs) }
+    end
+  end
+
+  doc "Keep the shapes in step with chunks: for each level-0 chunk of [loaded] not asked for yet, its props are listed by world w's generator on a worker; each chunk of [dropped] loses its shapes; listings that have finished are stood. Hand it `Strata.Stream.take_changed`'s two lists each frame (a chunk listed again because it was edited is not asked for twice)."
+  fn changed(s : Shapes, w : Strata.World.World, loaded : List(Strata.Coord.Key), dropped : List(Strata.Coord.Key)) : Shapes do
+    let g = Strata.World.terrain(w)
+    let seed = Strata.World.seed(w)
+    let s1 = List.fold_left(dropped, s, fn (acc, k) -> if So.has(acc.sh_asked, k) do { drop_chunk(acc, k) with sh_asked: So.remove(acc.sh_asked, k) } else acc end)
+    let s2 = List.fold_left(loaded, s1, fn (acc, k) -> ask(acc, g, seed, k))
+    poll(s2, s2.sh_jobs, Nil)
+  end
+
+  doc "As `changed`, the lists taken from stream st."
+  fn sync(s : Shapes, st : Strata.Stream.Stream) : (Shapes, Strata.Stream.Stream) do
+    match Strata.Stream.take_changed(st) do
+      (st2, loaded, dropped) -> (changed(s, Strata.Stream.world(st2), loaded, dropped), st2)
+    end
+  end
+
+  doc "How many chunks' props are still being listed."
+  fn pending(s : Shapes) : Int do List.length(s.sh_jobs) end
+  doc "How many listings failed and memories did not decode."
+  fn refused(s : Shapes) : Int do s.sh_refused end
+
+  doc "Every standing shape gone and nothing asked for (a regenerated world): the memory and the prototypes stay."
+  fn clear(s : Shapes) : Shapes do
+    let s1 = List.fold_left(So.keys(s.sh_chunks), s, fn (acc, k) -> drop_chunk(acc, k))
+    { s1 with sh_asked: So.empty(false), sh_jobs: Nil }
+  end
+
+  -- ── The memory, for a save ───────────────────────────────────────────────
+  -- A region's memory as bytes: "SHP" and a version byte; the number of
+  -- chunks (4 bytes); for each its key x, y, z (4 bytes each, two's
+  -- complement) and its number of records (2 bytes); for each record a kind
+  -- (0 gone, 1 carved) and its hash (8 bytes, two's complement); a carved
+  -- record then holds the voxel size in micrometres (4 bytes) and the grid
+  -- (`Strata.Shape.encode`).
+  type ShOut = ShOut(NativeU8Arr, Int)
+  pfn o_copy(dst : NativeU8Arr, src : NativeU8Arr, at : Int, i : Int, n : Int) : NativeU8Arr do
+    if i >= n do dst else o_copy(NativeArray.set_u8(dst, at + i, NativeArray.get_u8(src, i)), src, at, i + 1, n) end
+  end
+  pfn o_room(o : ShOut, k : Int) : ShOut do
+    match o do
+      ShOut(a, n) -> if n + k <= NativeArray.length_u8(a) do o else ShOut(o_copy(NativeArray.make_u8(Strata.Size.of(2 * (n + k) + 64), 0), a, 0, 0, n), n) end
+    end
+  end
+  pfn o1(o : ShOut, v : Int) : ShOut do match o_room(o, 1) do ShOut(a, n) -> ShOut(NativeArray.set_u8(a, n, int_and(v, 255)), n + 1) end end
+  pfn o2(o : ShOut, v : Int) : ShOut do o1(o1(o, v), int_shr(v, 8)) end
+  pfn o4(o : ShOut, v : Int) : ShOut do o2(o2(o, v), int_shr(v, 16)) end
+  pfn o8(o : ShOut, v : Int) : ShOut do o4(o4(o, v), int_shr(v, 32)) end
+  pfn o_arr(o : ShOut, b : NativeU8Arr) : ShOut do
+    let k = NativeArray.length_u8(b)
+    match o_room(o, k) do ShOut(a, n) -> ShOut(o_copy(a, b, n, 0, k), n + k) end
+  end
+  pfn o_memo(o : ShOut, m : ShMemo) : ShOut do
+    match m do
+      ShGone(h) -> o8(o1(o, 0), h)
+      ShCarved(h, g, vs) -> o_arr(o4(o8(o1(o, 1), h), float_to_int(Math.floor(vs *. 1000000.0 +. 0.5))), Shp.encode(g))
+    end
+  end
+  pfn o_chunk(o : ShOut, k : Strata.Coord.Key, ms : List(ShMemo)) : ShOut do
+    List.fold_left(ms, o2(o4(o4(o4(o, Strata.Coord.kx(k)), Strata.Coord.ky(k)), Strata.Coord.kz(k)), List.length(ms)), fn (acc, m) -> o_memo(acc, m))
+  end
+  pfn region_bytes(s : Shapes, rk : Strata.Coord.Key) : NativeU8Arr do
+    let ks = List.filter(So.keys(s.sh_memo), fn k -> Strata.Coord.key_eq(region_key(k), rk) && !List.is_empty(So.get(s.sh_memo, k)))
+    match List.fold_left(ks, o4(o1(o1(o1(o1(ShOut(NativeArray.make_u8(256, 0), 0), 83), 72), 80), 1), List.length(ks)), fn (acc, k) -> o_chunk(acc, k, So.get(s.sh_memo, k))) do
+      ShOut(a, n) -> o_copy(NativeArray.make_u8(Strata.Size.of(n), 0), a, 0, 0, n)
+    end
+  end
+
+  doc "The memory of each region changed since the last take, as (region, bytes): what a game hands `Strata.Save.set_region_section(store, region, \"shapes\", Bytes.from_u8_arr(bytes))`. A region whose memory is now empty answers bytes holding no chunks."
+  fn take_dirty(s : Shapes) : (Shapes, List(((Int, Int, Int), NativeU8Arr))) do
+    let rks = So.keys(s.sh_dirty)
+    ({ s with sh_dirty: So.empty(false) }, List.map(rks, fn rk -> ((Strata.Coord.kx(rk), Strata.Coord.ky(rk), Strata.Coord.kz(rk)), region_bytes(s, rk))))
+  end
+
+  doc "The regions met since the last take: each the first time a chunk of it is asked for. A game reads each one's \"shapes\" section from its store and hands it to `adopt`."
+  fn take_regions(s : Shapes) : (Shapes, List((Int, Int, Int))) do ({ s with sh_new_regions: Nil }, List.reverse(s.sh_new_regions)) end
+
+  pfn g2(b : NativeU8Arr, p : Int) : Int do NativeArray.get_u8(b, p) + 256 * NativeArray.get_u8(b, p + 1) end
+  pfn g4(b : NativeU8Arr, p : Int) : Int do g2(b, p) + 65536 * g2(b, p + 2) end
+  pfn s4(b : NativeU8Arr, p : Int) : Int do
+    let v = g4(b, p)
+    if v >= 2147483648 do v - 4294967296 else v end
+  end
+  pfn s8(b : NativeU8Arr, p : Int) : Int do s4(b, p + 4) * 4294967296 + g4(b, p) end
+
+  -- n records from p: the records and where they end
+  pfn memos_in(b : NativeU8Arr, len : Int, p : Int, n : Int, acc : List(ShMemo)) : Result((List(ShMemo), Int), String) do
+    if n <= 0 do Ok((List.reverse(acc), p))
+    else if p + 9 > len do Err("shapes: a record runs past the end")
+    else
+      let kind = NativeArray.get_u8(b, p)
+      let h = s8(b, p + 1)
+      if kind == 0 do memos_in(b, len, p + 9, n - 1, Cons(ShGone(h), acc))
+      else if kind != 1 do Err("shapes: record kind " ++ int_to_string(kind))
+      else if p + 13 > len do Err("shapes: a carved record runs past the end")
+      else
+        let um = g4(b, p + 9)
+        if um < 1 do Err("shapes: a voxel size of 0")
+        else
+          match Shp.decode(b, p + 13) do
+            Ok((g, p2)) -> memos_in(b, len, p2, n - 1, Cons(ShCarved(h, g, int_to_float(um) /. 1000000.0), acc))
+            Err(e) -> Err(e)
+          end
+        end
+      end end end
+    end end
+  end
+  pfn chunks_in(b : NativeU8Arr, len : Int, p : Int, n : Int, acc : List((Strata.Coord.Key, List(ShMemo)))) : Result(List((Strata.Coord.Key, List(ShMemo))), String) do
+    if n <= 0 do Ok(List.reverse(acc))
+    else if p + 14 > len do Err("shapes: a chunk's memory runs past the end")
+    else
+      match memos_in(b, len, p + 14, g2(b, p + 12), Nil) do
+        Ok((ms, p2)) -> chunks_in(b, len, p2, n - 1, Cons((Strata.Coord.key(s4(b, p), s4(b, p + 4), s4(b, p + 8)), ms), acc))
+        Err(e) -> Err(e)
+      end
+    end end
+  end
+  pfn decode(b : NativeU8Arr) : Result(List((Strata.Coord.Key, List(ShMemo))), String) do
+    let len = NativeArray.length_u8(b)
+    if len < 8 do Err("shapes: too short")
+    else if NativeArray.get_u8(b, 0) != 83 || NativeArray.get_u8(b, 1) != 72 || NativeArray.get_u8(b, 2) != 80 do Err("shapes: not a shapes memory")
+    else if NativeArray.get_u8(b, 3) != 1 do Err("shapes: version " ++ int_to_string(NativeArray.get_u8(b, 3)))
+    else chunks_in(b, len, 8, g4(b, 4), Nil) end end end
+  end
+
+  doc "Take in a region's memory as `take_dirty` wrote it: each chunk it names gets that memory unless it has some already, and a chunk whose props stand is stood again by it. Bytes that do not decode change nothing, are counted (`refused`) and answer why."
+  fn adopt(s : Shapes, b : NativeU8Arr) : Result(Shapes, String) do
+    match decode(b) do
+      Err(e) -> Err(e)
+      Ok(cs) ->
+        Ok(List.fold_left(cs, s, fn (acc, c) ->
+          match c do
+            (k, ms) ->
+              if !List.is_empty(So.get(acc.sh_memo, k)) do acc
+              else
+                let a2 = { acc with sh_memo: So.put(acc.sh_memo, k, ms) }
+                if So.has(a2.sh_chunks, k) do add_chunk(a2, k, So.get(a2.sh_props, k)) else a2 end
+              end
+          end))
+    end
+  end
+  doc "As `adopt`, counting bytes that do not decode instead of answering why."
+  fn adopt_or_count(s : Shapes, b : NativeU8Arr) : Shapes do
+    match adopt(s, b) do
+      Ok(s2) -> s2
+      Err(_) -> { s with sh_refused: s.sh_refused + 1 }
+    end
+  end
+
+  doc "How many props the memory holds something about."
+  fn remembered(s : Shapes) : Int do So.fold(s.sh_memo, 0, fn (acc, _, ms) -> acc + List.length(ms)) end
+end
