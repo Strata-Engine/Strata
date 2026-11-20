@@ -287,6 +287,9 @@ static struct {
     uint32_t *batch_visible, *batch_keys;    /* this frame's cull results and touched prototypes */
     MeshBatch *batches;                      /* indexed by prototype slot */
     uint32_t num_batch_slots, num_batch_keys, batch_draws, batch_visible_count, opaque_commands;
+    /* churn between two frames, for devtools' detectors: chunk_instance calls, chunk_motion calls,
+     * chunk_commit uploads, chunk-table entries synced; counting now, and the last frame's */
+    uint32_t churn[4], churn_last[4];
     uint32_t slot_cap;
     uint32_t hi_slot;              /* one past the highest slot ever used: how many the cull pass looks at */
     uint32_t pad_cmds;             /* zero-count commands appended to each indirect call (measurement) */
@@ -2667,6 +2670,7 @@ double sv_stat(int64_t which) {
     if (which == 33) return (double)g.meet_last;
     if (which == 34) return (double)g.meet_total;
     if (which == 35) return (double)g.ovl_dropped;
+    if (which >= 36 && which <= 39) return (double)g.churn_last[which - 36];
     return (which >= 0 && which < 6) ? g.stat[which] : -1.0;
 }
 int64_t sv_drawn_chunks(void) { return g.drawn_chunks; }
@@ -3442,6 +3446,7 @@ static void batch_mesh_extent(uint32_t prototype, const ChunkEntry *source) {
 /* Share an opaque level-zero mesh with an independently positioned slot.
  * Once referenced, the prototype's GPU range stays pinned until close. */
 int64_t sv_chunk_instance(int64_t slot, int64_t prototype, double x, double y, double z) {
+    g.churn[0]++;
     if (!g.ok || slot < 0 || prototype < 0 || slot >= g.slot_cap || prototype >= g.slot_cap || slot == prototype) return 0;
     ChunkEntry *source = &g.entries[prototype], *target = &g.entries[slot];
     if (!(source->level_flags & SV_IN_USE) ||
@@ -3499,6 +3504,7 @@ int64_t sv_body_instance(int64_t slot, int64_t prototype) {
  * far from the first (the slot is left as it was) or the prototype cannot be batched (the slot
  * then stands still at the first key). */
 int64_t sv_chunk_motion(int64_t slot, int64_t prototype, double t0, double t1, double p0, double p1, void *keys_i32, int64_t n, int64_t gait) {
+    g.churn[1]++;
     if (!g.ok || !g.motion || n < 1 || n > SV_MOTION_KEYS || !keys_i32 || narr_len(keys_i32) < n * 4) return 0;
     if (slot < 0 || slot >= g.slot_cap) return 0;
     const int32_t *k = narr_data(keys_i32);
@@ -3519,6 +3525,7 @@ int64_t sv_chunk_motion(int64_t slot, int64_t prototype, double t0, double t1, d
         if (dz > box[5]) box[5] = (int16_t)dz;
     }
     if (k[3] != 0) return 0;
+    g.churn[0]--;   /* the instance below is the motion's own, not a chunk_instance call */
     if (!sv_chunk_instance(slot, prototype, (double)ox, (double)oy, (double)oz)) return 0;
     ChunkEntry *e = &g.entries[slot];
     if (!(e->level_flags & SV_BATCHED)) return 0;
@@ -3554,6 +3561,7 @@ void sv_motion_clock(double t) {
 }
 
 int64_t sv_chunk_commit(void) {
+    g.churn[2]++;
     if (!g.stage.open) return 0;
     if (g.stage.fig) return fig_commit();
     g.stage.open = 0;
@@ -3936,6 +3944,7 @@ int64_t sv_frame(void) {
     Frame *F = &g.frames[g.frame_no % SV_FRAMES];
     uint32_t q0 = (uint32_t)(g.frame_no % SV_FRAMES) * 8;
     double t_start = glfwGetTime();
+    memcpy(g.churn_last, g.churn, sizeof g.churn); memset(g.churn, 0, sizeof g.churn);
     /* this Frame was last used two frames ago; when its fence is signalled,
      * everything released up to then is idle */
     vkWaitForFences(g.dev, 1, &F->fence, VK_TRUE, UINT64_MAX);
@@ -4063,6 +4072,7 @@ int64_t sv_frame(void) {
     lamps_to_frame(F);
     g.ubo_map[UBO_WATER + 5] = g.water_mem ? 1.0f : 0.0f;
     memcpy(F->ubo_map, g.ubo_map, UBO_FLOATS * 4);
+    g.churn[3] += F->npending;
     for (uint32_t i = 0; i < F->npending; i++) {
         uint32_t slot = F->pending[i];
         F->table_map[slot] = g.entries[slot];

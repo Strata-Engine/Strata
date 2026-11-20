@@ -4,6 +4,7 @@
 // the answers. Needs a GPU. Run from anywhere: node tools/strata-mcp/check.mjs
 
 import { spawn } from "node:child_process";
+import os from "node:os";
 import path from "node:path";
 import readline from "node:readline";
 import { fileURLToPath } from "node:url";
@@ -40,7 +41,7 @@ try {
   const init = await rpc("initialize", { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "check", version: "0" } });
   check("initialize", init.result?.serverInfo?.name === "strata-devtools");
   const list = await rpc("tools/list", {});
-  check("tools/list", list.result.tools.length >= 18, `${list.result.tools.length} tools`);
+  check("tools/list", list.result.tools.length >= 24, `${list.result.tools.length} tools`);
 
   const l = json(await tool("launch", { size: "640x400", radius: 4, levels: 0, scene: 1 }));
   check("launch answers", typeof l.frame === "number" && l.voxel === 1, `frame ${l.frame}`);
@@ -88,6 +89,18 @@ try {
 
   const lg = json(await tool("log", { grep: "devtools" }));
   check("log carries the viewer's output", lg.lines.some((s) => s.includes("taking requests")));
+
+  await new Promise((r2) => setTimeout(r2, 1500));
+  const rep = json(await tool("perf_report", { frames: 60 }));
+  check("perf_report covers frames with the renderer's numbers", rep.frames > 5 && rep.fields.frame_ms && rep.fields.gpu_ms && Array.isArray(rep.findings), `${rep.frames} frames`);
+
+  const shotFile = path.join(os.tmpdir(), `strata-check-${process.pid}.png`);
+  await tool("screenshot", { save: shotFile });
+  const same = json(await tool("screenshot_diff", { a: shotFile, b: shotFile }));
+  check("screenshot_diff of an image with itself", same.identical === true);
+
+  const prof = json(await tool("profile", { seconds: 2, top: 10 }));
+  check("profile answers where the work goes", prof.top.length > 3 && prof.busy_samples > 0, `${prof.busy_samples} busy samples`);
 
   const q = json(await tool("quit"));
   check("quit", q.running === false);
