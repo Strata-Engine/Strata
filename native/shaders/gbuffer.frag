@@ -23,6 +23,7 @@ layout(location = 0) out vec4 o_albedo;
 layout(location = 1) out vec4 o_nm;
 
 void main() {
+    if (cut_hidden(v_world)) discard;
     if ((pc.flags & 2u) != 0u) {
         uint fao = (v_w1 >> 16) & 255u;
         vec2 ff = fract(v_uv);

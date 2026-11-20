@@ -1,0 +1,103 @@
+-- Clock: Final Fantasy Tactics' charge-time turns (The Ivalice Chronicles;
+-- docs/tactics-ledger.md has the sources). Each sequence is worked out by hand
+-- in the comment beside it.
+mod StrataTactics.Test.Clock do
+
+  needs IO.Clock      -- charged to every test module once any uses Check.all (GAPS S3)
+
+  needs IO.Console
+
+  needs IO.FileRead
+
+  needs IO.FileWrite
+  needs IO.Process
+  import Test
+  alias StrataTactics.Clock as TacCk
+
+  -- advance and end every turn (moved and acted), collecting the units whose turns start, until n
+  pfn turns(c : StrataTactics.Clock.TurnClock, n : Int, acc : List(Int)) : List(Int) do
+    if List.length(acc) >= n do List.reverse(acc)
+    else
+      match TacCk.advance(c) do
+        (c2, evs) ->
+          match TacCk.active(c2) do
+            Some(u) -> turns(TacCk.end_turn(c2, true, true), n, Cons(u, acc))
+            None -> if List.is_empty(evs) do List.reverse(acc) else turns(c2, n, acc) end
+          end
+      end
+    end
+  end
+  pfn two() : StrataTactics.Clock.TurnClock do TacCk.add(TacCk.add(TacCk.start(TacCk.settings()), 1, 10, 0), 2, 8, 0) end
+
+  describe "Clock turns" do
+    test "speed 10 and speed 8 from 0: turn order for the first 6 turns" do
+      -- tick 10: A 100, B 80 -> A (A 0). tick 13: A 30, B 104 -> B (B 4). tick 20: A 100, B 60 -> A.
+      -- tick 25: A 50, B 100 -> B. tick 30: A 100, B 40 -> A. tick 38: A 80, B 104 -> B.
+      Test.assert_true(turns(two(), 6, Nil) == [1, 2, 1, 2, 1, 2], "A B A B A B")
+    end
+    test "waiting costs 60, moving or acting 80, both 100" do
+      let at10 = fn () -> match TacCk.advance(TacCk.add(TacCk.start(TacCk.settings()), 1, 10, 0)) do (c, _) -> c end
+      Test.assert_true(TacCk.ct(TacCk.end_turn(at10(), false, false), 1) == 40, "wait: 100 - 60")
+      Test.assert_true(TacCk.ct(TacCk.end_turn(at10(), true, false), 1) == 20, "move: 100 - 80")
+      Test.assert_true(TacCk.ct(TacCk.end_turn(at10(), false, true), 1) == 20, "act: 100 - 80")
+      Test.assert_true(TacCk.ct(TacCk.end_turn(at10(), true, true), 1) == 0, "both: 100 - 100")
+    end
+    test "the cap, when set, limits CT after a turn" do
+      let s = { TacCk.settings() with ck_cap: Some(60) }
+      match TacCk.advance(TacCk.add(TacCk.start(s), 1, 10, 150)) do
+        (c, evs) ->
+          Test.assert_true(TacCk.active(c) == Some(1), "a turn at once, no tick")
+          Test.assert_true(TacCk.ct(TacCk.end_turn(c, false, false), 1) == 60, "150 - 60 = 90, capped at 60")
+      end
+      match TacCk.advance(TacCk.add(TacCk.start(TacCk.settings()), 1, 10, 150)) do
+        (c, _) -> Test.assert_true(TacCk.ct(TacCk.end_turn(c, false, false), 1) == 90, "no cap by default: 90")
+      end
+    end
+    test "equal speed and CT: the first added goes first, every time" do
+      let c = TacCk.add(TacCk.add(TacCk.start(TacCk.settings()), 5, 10, 0), 3, 10, 0)
+      Test.assert_true(turns(c, 4, Nil) == [5, 3, 5, 3], "5 then 3")
+    end
+    test "a unit at speed 0 never acts and advance stops at max_ticks" do
+      let s = { TacCk.settings() with ck_max_ticks: 50 }
+      match TacCk.advance(TacCk.add(TacCk.start(s), 1, 0, 0)) do
+        (c, evs) -> Test.assert_true(Option.is_none(TacCk.active(c)) && List.is_empty(evs) && TacCk.ticks(c) == 50, "no turn after 50 ticks")
+      end
+    end
+  end
+
+  describe "Clock charges and timers" do
+    test "a charge of speed 25 resolves on the 4th tick, before CT rises" do
+      -- unit 1 at speed 25 would reach 100 on tick 4 too: the charge resolves first (CT still 75), then the turn
+      let c0 = TacCk.charge(TacCk.add(TacCk.start(TacCk.settings()), 1, 25, 0), 7, 1, 25)
+      Test.assert_true(TacCk.charging(c0, 1), "charging")
+      match TacCk.advance(c0) do
+        (c1, evs) ->
+          Test.assert_true(List.map(evs, fn e -> TacCk.event_index(e)) == [1] && TacCk.ticks(c1) == 4 && TacCk.ct(c1, 1) == 75, "resolved on tick 4, CT 75")
+          Test.assert_true(!TacCk.charging(c1, 1), "no longer charging")
+          match TacCk.advance(c1) do (c2, evs2) -> Test.assert_true(TacCk.active(c2) == Some(1) && TacCk.ct(c2, 1) == 100 && TacCk.ticks(c2) == 4, "then the turn, same tick") end
+      end
+    end
+    test "timers end before charges resolve on the same tick" do
+      let c0 = TacCk.charge(TacCk.start_timer(TacCk.add(TacCk.start(TacCk.settings()), 1, 0, 0), 9, 1, "poison", 4, 1, 1), 7, 1, 25)
+      match TacCk.advance(c0) do (_, evs) -> Test.assert_true(List.map(evs, fn e -> TacCk.event_index(e)) == [0, 1], "timer, then charge") end
+    end
+    test "haste 3/2 on speed 8 gives 12, starting on the tick it was set" do
+      let c0 = TacCk.start_timer(TacCk.add(TacCk.add(TacCk.start(TacCk.settings()), 1, 8, 0), 2, 100, 0), 4, 1, "haste", 100, 3, 2)
+      Test.assert_true(TacCk.speed(c0, 1) == 12, "effective speed 12")
+      match TacCk.advance(c0) do (c1, _) -> Test.assert_true(TacCk.active(c1) == Some(2) && TacCk.ct(c1, 1) == 12, "12 after one tick") end
+    end
+  end
+
+  describe "Clock forecast" do
+    test "forecast does not change the clock and matches advancing" do
+      let c = two()
+      let f = TacCk.forecast(c, 6)
+      Test.assert_true(List.filter_map(f, fn e -> TacCk.turn_of(e)) == [1, 2, 1, 2, 1, 2], "same order")
+      Test.assert_true(TacCk.ct(c, 1) == 0 && TacCk.ticks(c) == 0, "unchanged")
+    end
+    test "defaults are the ledger's" do
+      let s = TacCk.settings()
+      Test.assert_true(s.ck_turn_at == 100 && s.ck_base == 60 && s.ck_move == 20 && s.ck_act == 20 && Option.is_none(s.ck_cap) && s.ck_charge_full == 100 && s.ck_max_ticks == 10000, "100, 60, 20, 20, no cap, 100, 10000")
+    end
+  end
+end

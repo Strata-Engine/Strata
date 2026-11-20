@@ -1,0 +1,362 @@
+-- The strata_kit example: a turntable for a modular figure.
+--
+-- A placeholder figure built in code from parts on a light core: two arms
+-- (a right arm, mirrored on the left), a rifle in the right hand, a shield in
+-- the left, a pod on the back, and legs. Keys: 1-6 choose a mount (arm_r's
+-- hand, arm_l's hand, shoulder_r, shoulder_l, back, hip); [ and ] swap the
+-- part on it for another that fits (assembled anew, the rig replaced and
+-- uploaded again: the model changes at once); M cycles the movement piece
+-- (legs, treads, hover) and the figure walks, rolls or hovers in a circle;
+-- left click carves where the pointer meets the figure; X breaks off the
+-- right arm, which falls in pieces and settles as rubble. The mouse turns
+-- the camera round the stage with the right button held. Escape quits.
+--
+-- STRATA_FRAMES=n runs a fixed sequence (a gun swapped, two carves, the arm
+-- broken off and left to settle) and writes frame n - 3 to STRATA_SHOT.
+mod KitExample do
+
+  needs IO
+  needs IO.Process
+  needs IO.Spawn
+  needs IO.Foreign
+  needs Audio
+  needs IO.FileSystem
+  needs Anim
+
+  alias StrataKit.Part as KxP
+  alias StrataKit.Build as KxB
+  alias StrataKit.Assemble as KxA
+  alias StrataKit.Motion as KxMo
+  alias StrataKit.Damage as KxD
+  alias Strata.Math.Mat4 as KxM
+  alias Strata.Math.Vec3 as KxV
+  alias Strata.Math.Quat as KxQ
+
+  -- ── The world: 0.4 m voxels; 1 stone, 2 dark metal, 3 light metal, 4 trim, 5 scorch ─────────
+  pfn registry() : Strata.Blocks.Registry do
+    List.fold_left(List.range(1, 6), Strata.Blocks.empty(), fn (r, i) -> match Strata.Blocks.register(r, Strata.Blocks.with_faces(Strata.Blocks.def(), i, i, i)) do Ok((r2, _)) -> r2 | Err(_) -> r end)
+  end
+  pfn gen() : Strata.Terrain.Gen do
+    Strata.Terrain.gen(fn (k, seed) -> if Strata.Coord.ky(k) < 0 do Strata.Chunk.uniform(1) else Strata.Chunk.uniform(0) end)
+  end
+  pfn tile_px(a : NativeU8Arr, i : Int, r : Int, g : Int, b : Int) : NativeU8Arr do
+    if i >= 256 do a
+    else
+      let n = ((i * 2654435761) / 65536) % 16 - 8
+      let c = fn v -> if v + n < 0 do 0 else if v + n > 255 do 255 else v + n end end
+      tile_px(NativeArray.set_u8(NativeArray.set_u8(NativeArray.set_u8(NativeArray.set_u8(a, i * 4, c(r)), i * 4 + 1, c(g)), i * 4 + 2, c(b)), i * 4 + 3, 255), i + 1, r, g, b)
+    end
+  end
+  pfn textures(reg : Strata.Blocks.Registry) : Bool do
+    let cs = [(255, 0, 255), (120, 118, 112), (60, 64, 72), (150, 156, 164), (200, 120, 40), (30, 26, 24)]
+    Strata.Ffi.Vk.textures_create(16, 6) && List.all(List.enumerate(cs), fn e -> match e do (i, (r, g, b)) -> Strata.Ffi.Vk.texture_set(i, tile_px(NativeArray.make_u8(1024, 0), 0, r, g, b)) end)
+      && Strata.Ffi.Vk.textures_commit() && Strata.Render.upload_blocks(reg)
+  end
+  pfn settle_stream(s : Strata.Stream.Stream, n : Int) : Strata.Stream.Stream do
+    if n >= 100000 do s else let s2 = Strata.Stream.tick(s)
+      if Strata.Stream.settled(s2) do s2 else settle_stream(s2, n + 1) end end
+  end
+
+  -- ── The parts (placeholders, built in code); the palette: 1 hull, 2 arm, 3 forearm, 4 weapon, 5 shield, 6 legs, 7 feet, 8 trim, 9 interior
+  pfn fwd() : (Float, Float, Float) do (0.0, 0.0, 1.0) end
+  pfn upv() : (Float, Float, Float) do (0.0, 1.0, 0.0) end
+  pfn filled(sx : Int, sy : Int, sz : Int, c : Int) : NativeU8Arr do NativeArray.make_u8(sx * sy * sz, c) end
+  pfn mk(name : String, piece : String, x : Float, y : Float, z : Float) : StrataKit.Part.KitMarker do KxP.marker(name, piece, x, y, z, fwd(), upv()) end
+  pfn mt(slot : String, size : String, name : String, piece : String, x : Float, y : Float, z : Float) : StrataKit.Part.KitMount do KxP.mount_of(slot, size, name, mk(name, piece, x, y, z)) end
+  -- the core with a trim band
+  pfn core() : StrataKit.Part.KitPart do
+    let g = List.fold_left(List.range(0, 14 * 16 * 10), filled(14, 16, 10, 1), fn (a, i) -> if (i / 14) % 16 == 11 do NativeArray.set_u8(a, i, 8) else a end)
+    KxP.from_grid(14, 16, 10, g, mk("attach", "part", 7.0, 0.0, 5.0),
+      [mt("shoulder", "L", "shoulder_l", "part", 12.0, 16.0, 5.0), mt("shoulder", "L", "shoulder_r", "part", 2.0, 16.0, 5.0),
+       mt("arm", "M", "arm_l", "part", 14.0, 13.0, 5.0), mt("arm", "M", "arm_r", "part", 0.0, 13.0, 5.0),
+       mt("back", "M", "back", "part", 7.0, 10.0, 0.0), mt("hip", "M", "hip", "part", 7.0, 0.0, 5.0)],
+      Nil, ["core"], "M", "", [("weight", 30.0)])
+  end
+  pfn arm_r() : StrataKit.Part.KitPart do
+    let p0 = KxP.from_grid(5, 5, 5, filled(5, 5, 5, 2), mk("attach", "part", 5.0, 2.5, 2.5),
+      [mt("hand", "L", "hand_r", "fore", 2.5, 0.0, 2.5)], Nil, ["arm"], "M", "r", [("weight", 9.0)])
+    let p1 = KxP.with_piece(p0, "upper", "part", 4, 9, 4, filled(4, 9, 4, 2), (2.5, 0.0, 2.5), (2.0, 9.0, 2.0))
+    KxP.with_piece(p1, "fore", "upper", 4, 9, 4, filled(4, 9, 4, 3), (2.0, 0.0, 2.0), (2.0, 9.0, 2.0))
+  end
+  pfn rifle() : StrataKit.Part.KitPart do KxP.from_grid(2, 3, 14, filled(2, 3, 14, 4), mk("attach", "part", 1.0, 3.0, 3.0), Nil, [mk("muzzle", "part", 1.0, 1.5, 14.0)], ["hand", "shoulder"], "L", "", [("weight", 4.0)]) end
+  pfn smg() : StrataKit.Part.KitPart do KxP.from_grid(3, 4, 8, filled(3, 4, 8, 8), mk("attach", "part", 1.5, 4.0, 2.0), Nil, [mk("muzzle", "part", 1.5, 2.0, 8.0)], ["hand", "shoulder"], "L", "", [("weight", 3.0)]) end
+  pfn shield() : StrataKit.Part.KitPart do KxP.from_grid(2, 14, 9, filled(2, 14, 9, 5), mk("attach", "part", 1.0, 10.0, 4.5), Nil, Nil, ["hand"], "L", "", [("weight", 6.0)]) end
+  pfn pod() : StrataKit.Part.KitPart do KxP.from_grid(10, 8, 5, filled(10, 8, 5, 4), mk("attach", "part", 5.0, 4.0, 5.0), Nil, Nil, ["back"], "M", "", [("weight", 8.0)]) end
+  pfn cannon() : StrataKit.Part.KitPart do KxP.from_grid(4, 4, 12, filled(4, 4, 12, 4), mk("attach", "part", 2.0, 0.0, 4.0), Nil, Nil, ["shoulder"], "L", "", [("weight", 7.0)]) end
+  pfn legs() : StrataKit.Part.KitPart do
+    let p0 = KxP.from_grid(12, 3, 6, filled(12, 3, 6, 6), mk("attach", "part", 6.0, 3.0, 3.0), Nil, Nil, ["hip"], "M", "", [("weight", 20.0)])
+    let leg = fn (p, s, x) -> KxP.with_piece(KxP.with_piece(KxP.with_piece(p, "thigh_" ++ s, "part", 4, 9, 4, filled(4, 9, 4, 6), (x, 0.0, 3.0), (2.0, 9.0, 2.0)),
+      "shin_" ++ s, "thigh_" ++ s, 4, 9, 4, filled(4, 9, 4, 6), (2.0, 0.0, 2.0), (2.0, 9.0, 2.0)), "foot_" ++ s, "shin_" ++ s, 4, 2, 7, filled(4, 2, 7, 7), (2.0, 0.0, 2.0), (2.0, 2.0, 2.0))
+    leg(leg(p0, "l", 10.0), "r", 2.0)
+  end
+  pfn treads() : StrataKit.Part.KitPart do
+    let p0 = KxP.from_grid(16, 6, 18, filled(16, 6, 18, 6), mk("attach", "part", 8.0, 6.0, 9.0), Nil, Nil, ["hip"], "M", "", [("weight", 30.0)])
+    List.fold_left(List.range(0, 4), p0, fn (p, i) -> KxP.with_piece(p, "wheel" ++ int_to_string(i), "part", 2, 5, 5, filled(2, 5, 5, 7), (if i % 2 == 0 do 0.0 else 16.0 end, 1.0, if i < 2 do 4.0 else 14.0 end), (1.0, 2.5, 2.5)))
+  end
+  pfn hover() : StrataKit.Part.KitPart do KxP.from_grid(14, 4, 14, filled(14, 4, 14, 6), mk("attach", "part", 7.0, 4.0, 7.0), Nil, [mk("thrust", "part", 3.0, 0.0, 3.0), mk("thrust", "part", 11.0, 0.0, 11.0)], ["hip"], "M", "", [("weight", 18.0)]) end
+
+  -- 0 core, 1 arm, 2 rifle, 3 smg, 4 shield, 5 pod, 6 cannon, 7 legs, 8 treads, 9 hover
+  pfn parts() : List(StrataKit.Part.KitPart) do [core(), arm_r(), rifle(), smg(), shield(), pod(), cannon(), legs(), treads(), hover()] end
+  pfn rank(s : String) : Int do if s == "L" do 0 else if s == "M" do 1 else 2 end end end
+  pfn ok(slot : String, size : String, slots : List(String), psize : String) : Bool do List.any(slots, fn s -> s == slot) && rank(psize) <= rank(size) end
+  pfn palette() : List((Int, Float, Float, Float, Float, Float)) do
+    [(1, 0.32, 0.36, 0.42, 0.7, 0.0), (2, 0.24, 0.28, 0.34, 0.7, 0.0), (3, 0.42, 0.45, 0.5, 0.6, 0.0), (4, 0.18, 0.18, 0.2, 0.5, 0.0),
+     (5, 0.5, 0.52, 0.55, 0.6, 0.0), (6, 0.26, 0.29, 0.33, 0.8, 0.0), (7, 0.12, 0.12, 0.13, 0.9, 0.0), (8, 0.8, 0.45, 0.1, 0.5, 0.0), (9, 0.05, 0.04, 0.04, 1.0, 0.0)]
+  end
+  pfn debris(c : Int) : Int do if c == 8 do 4 else if c == 9 do 5 else if c == 3 || c == 5 do 3 else 2 end end end end
+
+  pfn start_build() : StrataKit.Build.KitBuild do
+    KxB.node(0, [("arm_l", KxB.node(1, [("hand_l", KxB.leaf(4))])), ("arm_r", KxB.node(1, [("hand_r", KxB.leaf(2))])), ("back", KxB.leaf(5)), ("hip", KxB.leaf(7))])
+  end
+  -- the mounts keys 1-6 choose
+  pfn mount_path(i : Int) : List(String) do
+    if i == 0 do ["arm_r", "hand_r"] else if i == 1 do ["arm_l", "hand_l"] else if i == 2 do ["shoulder_r"] else if i == 3 do ["shoulder_l"] else if i == 4 do ["back"] else ["hip"] end end end end end
+  end
+
+  -- ── The figure ───────────────────────────────────────────────────────────
+  -- build, rig, map, gait, rig id, figure, the chosen mount, movement (0 legs, 1 treads, 2 hover), the walk's angle
+  type Fig = { fg_build : StrataKit.Build.KitBuild, fg_rig : Strata.Rig.Rig, fg_map : StrataKit.Assemble.KitMap, fg_gait : StrataKit.Motion.KitGait, fg_id : Int, fg_f : Int, fg_mount : Int, fg_angle : Float, fg_moved : Float }
+
+  pfn settings() : StrataKit.Assemble.AssembleSettings do KxA.settings(0.1, palette(), [(8, (0.85, 0.5, 0.1))]) end
+
+  -- assemble [b] and put it on the figure's rig (replaced, uploaded again)
+  pfn rebuild(a : Strata.Anim.Anim, sl : Strata.Render.Render, fg : Fig, b : StrataKit.Build.KitBuild) : (Strata.Anim.Anim, Strata.Render.Render, Fig) do
+    let t0 = Strata.Ffi.Vk.time()
+    match KxA.assemble(parts(), b, ok, settings()) do
+      (rig0, m, probs) ->
+        let rig = KxA.carry_damage(fg.fg_rig, fg.fg_map, rig0, m)
+        let _said = List.map(probs, fn pr -> match pr do (_, why) -> Authority.must(println("kit_example: left out: " ++ why)) end)
+        match Strata.Anim.replace_rig(a, fg.fg_id, rig) do
+          (a2, _) ->
+            let sl2 = Strata.Render.refresh_rig(sl, a2, fg.fg_id)
+            Authority.must(println("kit_example: swap (assemble, replace, upload) in " ++ int_to_string(float_to_int((Strata.Ffi.Vk.time() -. t0) *. 1000000.0)) ++ " us; weight " ++ float_to_string(KxB.sum(parts(), b, "weight"))))
+            (a2, sl2, { fg with fg_build: b, fg_rig: rig, fg_map: m, fg_gait: KxMo.gait(rig) })
+        end
+    end
+  end
+
+  -- the next part that fits the mount at [path] after the one there (or none), [step] +1 or -1
+  pfn cycle(fg : Fig, path : List(String), step : Int) : StrataKit.Build.KitBuild do
+    let here = match KxB.at(fg.fg_build, path) do Some(n) -> KxB.part_of(n) | None -> -1 end
+    let parent_path = List.take(path, List.length(path) - 1)
+    let mname = List.last(path)
+    let candidates = List.filter(List.range(1, 10), fn i -> List.is_empty(KxB.fits(parts(), KxB.put(fg.fg_build, path, Some(KxB.leaf(i))), ok)))
+    match candidates do
+      Nil -> fg.fg_build
+      _ ->
+        let n = List.length(candidates)
+        let pos = match List.find_index(candidates, fn c -> c == here) do Some(k) -> k | None -> if step > 0 do -1 else 0 end end
+        let next = List.nth(candidates, ((pos + step) % n + n) % n)
+        let _p = parent_path
+        let _m = mname
+        KxB.put(fg.fg_build, path, Some(KxB.leaf(next)))
+    end
+  end
+
+  -- a rig part's world origin and rotation, from the figure's last pose
+  pfn pose_of(a : Strata.Anim.Anim, f : Int) : Int -> ((Float, Float, Float), (Float, Float, Float, Float)) do
+    let m = Strata.Anim.matrices(a, f)
+    fn rp -> if (rp + 1) * 12 > NativeArray.length_f32(m) do ((0.0, 0.0, 0.0), (0.0, 0.0, 0.0, 1.0))
+      else
+        let q = KxA.matrix_turn(m, rp * 12)
+        ((NativeArray.get_f32(m, rp * 12 + 9), NativeArray.get_f32(m, rp * 12 + 10), NativeArray.get_f32(m, rp * 12 + 11)), (KxQ.x(q), KxQ.y(q), KxQ.z(q), KxQ.w(q)))
+      end
+  end
+
+  -- ── The frame loop ───────────────────────────────────────────────────────
+  type Scene = { sc_stream : Strata.Stream.Stream, sc_render : Strata.Render.Render, sc_anim : Strata.Anim.Anim, sc_phys : Strata.Physics.Physics,
+                 sc_loose : List((Int, Strata.Body.Grid)), sc_fig : Fig, sc_input : Strata.Input.Input, sc_yaw : Float, sc_last_x : Float, sc_vp : NativeF32Arr, sc_reg : Strata.Blocks.Registry }
+
+  pfn bindings() : List((String, Strata.Input.Source, Float)) do
+    List.append(List.map(List.range(0, 6), fn i -> ("mount" ++ int_to_string(i), Strata.Input.Key(49 + i), 1.0)),
+      [("prev", Strata.Input.Key(91), 1.0), ("next", Strata.Input.Key(93), 1.0), ("move", Strata.Input.Key(77), 1.0), ("break", Strata.Input.Key(88), 1.0),
+       ("carve", Strata.Input.MouseButton(0), 1.0), ("turn", Strata.Input.MouseButton(1), 1.0), ("quit", Strata.Input.Key(256), 1.0)])
+  end
+
+  pfn eye_of(yaw : Float) : (Float, Float, Float) do (Math.sin(yaw) *. 9.0, 4.5, Math.cos(yaw) *. 9.0) end
+
+  -- carve along a ray, if it meets the figure
+  pfn carve_ray(sc : Scene, ray : ((Float, Float, Float), (Float, Float, Float))) : Scene do
+    match ray do
+      ((ox, oy, oz), (dx, dy, dz)) ->
+        match Strata.Anim.hit_ray(sc.sc_anim, ox, oy, oz, dx, dy, dz, 40.0, -1) do
+          Some(h) ->
+            if h.fig != sc.sc_fig.fg_f do sc
+            else
+              let t0 = Strata.Ffi.Vk.time()
+              match KxD.carve_hit(sc.sc_fig.fg_rig, h, 3.0, KxD.carve_settings(9)) do
+                (rig2, n) ->
+                  if n == 0 do sc
+                  else
+                    match Strata.Anim.replace_rig(sc.sc_anim, sc.sc_fig.fg_id, rig2) do
+                      (a2, _) ->
+                        let sl2 = Strata.Render.refresh_rig(sc.sc_render, a2, sc.sc_fig.fg_id)
+                        Authority.must(println("kit_example: carved " ++ int_to_string(n) ++ " voxels (carve, replace, upload) in " ++ int_to_string(float_to_int((Strata.Ffi.Vk.time() -. t0) *. 1000000.0)) ++ " us"))
+                        { sc with sc_anim: a2, sc_render: sl2, sc_fig: { sc.sc_fig with fg_rig: rig2 } }
+                    end
+                  end
+              end
+            end
+          None -> sc
+        end
+    end
+  end
+
+  pfn add_loose(acc : (Strata.Physics.Physics, List((Int, Strata.Body.Grid))), l : StrataKit.Damage.KitLoose) : (Strata.Physics.Physics, List((Int, Strata.Body.Grid))) do
+    match acc do
+      (p, is) -> match (KxD.loose_corner(l), KxD.loose_turn(l)) do
+        ((x, y, z), (qx, qy, qz, qw)) -> match Strata.Physics.add_fine(p, KxD.loose_grid(l), 4, x, y, z, Strata.Math.Quat.Quat(qx, qy, qz, qw), Strata.Physics.dynamic()) do
+          (p3, id) -> (p3, if id >= 0 do Cons((id, KxD.loose_grid(l)), is) else is end)
+        end
+      end
+    end
+  end
+
+  -- break off the right arm: loose pieces into physics, the figure rebuilt without it
+  pfn break_arm(sc : Scene) : Scene do
+    let fg = sc.sc_fig
+    match KxB.at(fg.fg_build, ["arm_r"]) do
+      None -> sc
+      Some(_) ->
+        let struck = match KxA.rig_part(fg.fg_map, ["arm_r"], "upper") do Some(rp) -> Some((rp, 2, 4, 2, 3.0, sc.sc_reg)) | None -> None end
+        match KxD.break_off(fg.fg_map, fg.fg_build, fg.fg_rig, pose_of(sc.sc_anim, fg.fg_f), ["arm_r"], debris, struck) do
+          (b2, loose) ->
+            let (p2, ids) = List.fold_left(loose, (sc.sc_phys, Nil), fn (acc, l) -> add_loose(acc, l))
+            Authority.must(println("kit_example: the right arm broke into " ++ int_to_string(List.length(ids)) ++ " pieces"))
+            match rebuild(sc.sc_anim, sc.sc_render, fg, b2) do
+              (a2, sl2, fg2) -> { sc with sc_anim: a2, sc_render: sl2, sc_fig: fg2, sc_phys: p2, sc_loose: List.append(sc.sc_loose, ids) }
+            end
+        end
+    end
+  end
+
+  -- loose pieces at rest become blocks
+  pfn settle_loose(sc : Scene, t : Float) : Scene do
+    let resting = List.filter(sc.sc_loose, fn e -> match e do (id, _) -> Strata.Physics.exists(sc.sc_phys, id) && Strata.Physics.is_asleep(sc.sc_phys, id) end)
+    List.fold_left(resting, sc, fn (acc, e) -> settle_one(acc, e, t))
+  end
+  pfn no_one(x : Int, y : Int, z : Int) : Bool do false end
+  pfn drop_id(ls : List((Int, Strata.Body.Grid)), id : Int) : List((Int, Strata.Body.Grid)) do
+    match ls do Nil -> Nil | Cons((i, g), rest) -> if i == id do drop_id(rest, id) else Cons((i, g), drop_id(rest, id)) end end
+  end
+  pfn settle_one(sc : Scene, e : (Int, Strata.Body.Grid), t : Float) : Scene do
+    match e do
+      (id, g) ->
+        match Strata.Physics.pose(sc.sc_phys, id, t) do
+          (x, y, z, q) ->
+            let reqs = KxD.settle(Strata.Stream.world(sc.sc_stream), g, (x, y, z), (KxQ.x(q), KxQ.y(q), KxQ.z(q), KxQ.w(q)), 4, no_one)
+            match Strata.Plugin.apply(Strata.Stream.world(sc.sc_stream), reqs) do
+              (_, outs, _) ->
+                let s2 = List.fold_left(outs, sc.sc_stream, fn (s, o) -> Strata.Stream.apply(s, o))
+                { sc with sc_stream: s2, sc_phys: Strata.Physics.remove(sc.sc_phys, id), sc_loose: drop_id(sc.sc_loose, id) }
+            end
+        end
+    end
+  end
+
+  pfn frame_loop(sc : Scene, frame : Int, frames : Int, t_prev : Float) : Unit do
+    Strata.Ffi.Vk.poll()
+    let scripted = frames > 0
+    let now = Strata.Ffi.Vk.time()
+    let dt = if scripted do 1.0 /. 60.0 else (if now -. t_prev > 0.1 do 0.1 else now -. t_prev end) end
+    let inp = Strata.Input.step(sc.sc_input, if scripted do Strata.Input.idle() else Strata.Render.input(sc.sc_input, 0) end)
+    if Strata.Ffi.Vk.should_close() || Strata.Input.held(inp, "quit") || (scripted && frame >= frames) do ()
+    else
+      let ww = int_to_float(Strata.Ffi.Vk.win_w())
+      let wh = int_to_float(Strata.Ffi.Vk.win_h())
+      let mx = Strata.Ffi.Vk.mouse_x()
+      let yaw = if !scripted && Strata.Input.held(inp, "turn") do sc.sc_yaw +. (mx -. sc.sc_last_x) *. 0.01 else sc.sc_yaw end
+      let fg0 = sc.sc_fig
+      -- choosing a mount and swapping its part; the movement piece
+      let chosen = List.fold_left(List.range(0, 6), fg0.fg_mount, fn (c, i) -> if Strata.Input.pressed(inp, "mount" ++ int_to_string(i)) do i else c end)
+      let swap_step = if scripted do (if frame == 20 do 1 else 0 end) else (if Strata.Input.pressed(inp, "next") do 1 else if Strata.Input.pressed(inp, "prev") do -1 else 0 end end) end
+      let move_now = !scripted && Strata.Input.pressed(inp, "move")
+      let fg1 = { fg0 with fg_mount: chosen }
+      let (a1, sl1, fg2) = if swap_step != 0 do rebuild(sc.sc_anim, sc.sc_render, fg1, cycle(fg1, mount_path(chosen), swap_step))
+        else if move_now do rebuild(sc.sc_anim, sc.sc_render, fg1, cycle(fg1, ["hip"], 1))
+        else (sc.sc_anim, sc.sc_render, fg1) end end
+      let sc1 = { sc with sc_anim: a1, sc_render: sl1, sc_fig: fg2, sc_yaw: yaw, sc_last_x: mx, sc_input: inp }
+      -- carving: a click, or frames 40 and 50 of the script
+      let (ex, ey, ez) = eye_of(yaw)
+      let vp = KxM.mul(KxM.perspective(0.9, if wh > 0.0 do ww /. wh else 1.6 end, 0.1, 400.0), KxM.look_at(KxV.new(ex, ey, ez), KxV.new(0.0, 2.2, 0.0), KxV.new(0.0, 1.0, 0.0)))
+      let ray = if scripted do (if frame == 40 do Some(((ex, ey, ez), (0.0 -. ex, 2.6 -. ey, 0.0 -. ez))) else if frame == 50 do Some(((ex, ey, ez), (0.6 -. ex, 3.2 -. ey, 0.0 -. ez))) else None end end)
+        else (if Strata.Input.pressed(inp, "carve") do Strata.Math.Ray.from_screen(vp, mx, Strata.Ffi.Vk.mouse_y(), ww, wh) else None end) end
+      let sc2 = match ray do Some(r) -> carve_ray(sc1, r) | None -> sc1 end
+      let sc3 = if (scripted && frame == 60) || (!scripted && Strata.Input.pressed(inp, "break")) do break_arm(sc2) else sc2 end
+      -- the figure moves: a slow circle (in place in the script)
+      let fg3 = sc3.sc_fig
+      let speed = if scripted do 0.0 else 0.8 end
+      let ang = fg3.fg_angle +. speed *. dt /. 3.0
+      let px = if scripted do 0.0 else Math.sin(ang) *. 3.0 end
+      let pz = if scripted do 0.0 else Math.cos(ang) *. 3.0 end
+      let heading = ang +. Math.pi() /. 2.0
+      let hip = match KxB.at(fg3.fg_build, ["hip"]) do Some(n) -> KxB.part_of(n) | None -> 7 end
+      let ground_y = if hip == 7 do 1.95 else if hip == 8 do 1.1 else 1.4 end end
+      let a2 = Strata.Anim.place(sc3.sc_anim, fg3.fg_f, px, ground_y, pz, KxQ.from_axis_angle(0.0, 1.0, 0.0, heading))
+      let (a3, fg4) = if hip == 7 do
+          match KxMo.gait_step(fg3.fg_gait, dt, (px, 0.0, pz), heading, speed, if scripted do 0.0 else speed /. 3.0 end) do
+            (g2, ts, bob) -> (KxMo.gait_apply(a2, fg3.fg_f, g2, ts, bob, (px, 0.0, pz), heading), { fg3 with fg_gait: g2 })
+          end
+        else if hip == 8 do (KxMo.treads_apply(a2, fg3.fg_f, fg3.fg_map, fg3.fg_moved, 0.25, speed /. 3.0), fg3)
+        else (KxMo.hover_apply(a2, fg3.fg_f, now), fg3) end end
+      let fg5 = { fg4 with fg_angle: ang, fg_moved: fg4.fg_moved +. speed *. dt }
+      let a4 = Strata.Anim.update(a3, dt)
+      -- physics, rubble, the stream and the renderer
+      let (p2, s2) = Strata.Physics.step(sc3.sc_phys, sc3.sc_stream, [(0.0, 0.0, 0.0)])
+      let sc4 = settle_loose({ sc3 with sc_anim: a4, sc_fig: fg5, sc_phys: p2, sc_stream: s2 }, now)
+      let s3 = Strata.Stream.tick(sc4.sc_stream)
+      match Strata.Render.sync(sc4.sc_render, s3) do
+        (sl3, s4) ->
+          match Strata.Render.bodies(sl3, sc4.sc_phys, now) do
+            (sl4, p3) ->
+              let vpb = KxM.write_f32(vp, sc4.sc_vp)
+              Strata.Ffi.Vk.set_camera(vpb)
+              Strata.Ffi.Vk.set_eye(ex, ey, ez, 0.4)
+              let u0 = Strata.Render.ui_begin(1.0)
+              let label = "mount " ++ int_to_string(fg5.fg_mount + 1) ++ ": " ++ String.join(mount_path(fg5.fg_mount), "/") ++ "   weight " ++ float_to_string(KxB.sum(parts(), fg5.fg_build, "weight")) ++ "\n1-6 mount   [ ] swap   M movement   click carve   X break the right arm   right drag turn"
+              let u1 = Strata.Text.text(u0, Strata.Ui.top_left(), 12.0, 10.0, Strata.Text.default_font(), 14.0, (1.0, 1.0, 1.0, 1.0), label)
+              if Strata.Render.draw_ui(u1) do () else () end
+              Strata.Render.set_time(if scripted do int_to_float(frame) /. 60.0 else now end)
+              if scripted && frame == frames - 3 do Strata.Ffi.Vk.request_shot() else () end
+              let next = if Strata.Render.draw(1.0) do frame + 1 else frame end
+              frame_loop({ sc4 with sc_stream: s4, sc_render: sl4, sc_phys: p3, sc_vp: vpb }, next, frames, now)
+          end
+      end
+    end
+  end
+
+  fn main(_cap : Cap(IO)) : Unit do
+    let frames = Authority.must(Env.get_int("STRATA_FRAMES", 0))
+    if !Strata.Ffi.Vk.open(1280, 800, false, 0) do Authority.must(println("kit_example: could not open a Vulkan window"))
+    else
+      Strata.Ffi.Vk.set_offscreen(Authority.must(Env.get_int("STRATA_OFFSCREEN", 0)) == 1)
+      Strata.Ffi.Vk.set_lighting(4)
+      let reg = registry()
+      if Strata.Render.set_light_box(4, 3) do () else () end
+      if textures(reg) do () else Authority.must(println("kit_example: could not upload textures")) end
+      Strata.Render.set_sun(0.5, 0.75, 0.43, 1.0, 0.93, 0.82)
+      Strata.Ffi.Vk.set_fog(60.0, 120.0)
+      let w0 = Strata.World.new(reg, gen(), 7, 0.4)
+      let s0 = settle_stream(Strata.Stream.set_focus(Strata.Stream.start(w0, Strata.Stream.config(4, 3, 64, 8)), [(0.0, 0.0, 0.0)]), 0)
+      match KxA.assemble(parts(), start_build(), ok, settings()) do
+        (rig, m, _) ->
+          match Strata.Anim.finish_rig(Strata.Anim.open(16), rig) do
+            (a0, id) ->
+              match Strata.Anim.spawn_at(a0, id, 0.0, 1.95, 0.0, KxQ.identity()) do
+                (a1, f) ->
+                  let fg = { fg_build: start_build(), fg_rig: rig, fg_map: m, fg_gait: KxMo.gait(rig), fg_id: id, fg_f: f, fg_mount: 0, fg_angle: 0.0, fg_moved: 0.0 }
+                  let phys = Strata.Physics.new(reg, Strata.Physics.with_scale(Strata.Physics.config(), 0.4))
+                  match Strata.Render.sync(Strata.Render.new(16384), s0) do
+                    (sl, s1) ->
+                      let sl2 = Strata.Render.figures(sl, a1, [rig])
+                      let sc = { sc_stream: s1, sc_render: sl2, sc_anim: a1, sc_phys: phys, sc_loose: Nil, sc_fig: fg, sc_input: Strata.Input.start(Strata.Input.new(bindings())),
+                                 sc_yaw: 0.6, sc_last_x: 0.0, sc_vp: NativeArray.make_f32(16, 0.0), sc_reg: reg }
+                      frame_loop(sc, 0, frames, Strata.Ffi.Vk.time())
+                  end
+              end
+          end
+      end
+      Strata.Ffi.Vk.close()
+    end
+  end
+end

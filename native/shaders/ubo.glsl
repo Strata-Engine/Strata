@@ -20,7 +20,28 @@ layout(set = 0, binding = 0) uniform U {
     mat4 sun_vp;     // the plain figures' shadow map: world (metres) to its clip space, orthographic from the sun, OpenGL conventions
     vec4 fshadow;    // x 1 when the map holds figures this frame (else it is not read), y one texel in its 0..1 coordinates, z depth per metre toward the sun
     vec4 trace;      // x screen pixels along each side of one the gather pass traces for (1 or 2)
+    vec4 cut[9];     // the cutaway (Strata.Overlay.cut_floats): has height, y, x0, z0, x1, z1, capsules, 0, then four capsules of 7 floats
 } u;
+
+// The cutaway: is the surface at p (metres) hidden this frame? Above the
+// height inside its box, or inside a capsule and above the capsule's lower
+// end (so the floor round the point the capsule reaches stays).
+float cutf(int i) { return u.cut[i >> 2][i & 3]; }
+bool cut_hidden(vec3 p) {
+    if (cutf(0) > 0.5 && p.y > cutf(1) && p.x >= cutf(2) && p.x <= cutf(4) && p.z >= cutf(3) && p.z <= cutf(5)) return true;
+    int n = int(cutf(6) + 0.5);
+    for (int k = 0; k < 4; k++) {
+        if (k >= n) break;
+        int b = 8 + 7 * k;
+        vec3 a = vec3(cutf(b), cutf(b + 1), cutf(b + 2)), c = vec3(cutf(b + 3), cutf(b + 4), cutf(b + 5));
+        float r = cutf(b + 6);
+        if (p.y <= min(a.y, c.y)) continue;
+        vec3 ab = c - a;
+        float t = clamp(dot(p - a, ab) / max(dot(ab, ab), 1e-6), 0.0, 1.0);
+        if (length(p - (a + t * ab)) < r) return true;
+    }
+    return false;
+}
 
 // OpenGL clip space to Vulkan's: y points down, depth runs 0..1.
 vec4 to_clip(vec4 gl) { return vec4(gl.x, -gl.y, (gl.z + gl.w) * 0.5, gl.w); }

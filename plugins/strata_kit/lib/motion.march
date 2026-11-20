@@ -1,0 +1,170 @@
+-- Motion — how assembled figures move: a procedural walk for any legs,
+-- treads and hover, and arms that aim.
+--
+-- The walk is worked out here as plain numbers (gait_step) and handed to
+-- Strata.Anim (gait_apply: a two-bone reach per leg, the root's bob); the
+-- game then calls Strata.Anim.ground so the feet meet the ground. A leg's
+-- home is under its hip, a little ahead when moving. A planted foot stays
+-- put until it is more than half a stride from home while the other foot is
+-- planted; then it swings to a point half a stride ahead of home, lifting a
+-- quarter of the leg's length. Stride is 0.8 of the leg's length. Standing
+-- still, each foot steps back under its hip in turn; turning in place, the
+-- homes turn and the feet follow.
+--
+-- Heading is an angle about y; forward is (sin h, 0, cos h).
+mod StrataKit.Motion do
+
+  alias StrataKit.Assemble as MoA
+  alias Strata.Math.Quat as MoQ
+
+  -- per leg: upper, lower, foot rig parts; length (m); hip offset across (m); planted point; swing (from, to, t 0..1, length s) or none
+  type KitLeg = KLeg(Int, Int, Int, Float, Float, (Float, Float, Float), Option(((Float, Float, Float), (Float, Float, Float), Float, Float)))
+  -- legs, the walk's phase (0..1 a step pair), whether the gait has been placed yet
+  type KitGait = KGait(List(KitLeg), Float, Bool)
+
+  pfn leg_len(l : KitLeg) : Float do match l do KLeg(_, _, _, n, _, _, _) -> n end end
+
+  doc "A gait for the rig's legs (Strata.Rig.legs): each leg's length and how far across its hip is from the anchor of the part it hangs from (the legs' own root)."
+  fn gait(rig : Strata.Rig.Rig) : KitGait do
+    let v = Strata.Rig.voxel_size(rig)
+    let legs = List.map(Strata.Rig.legs(rig), fn l -> match l do
+      (up, lo, ft, _) ->
+        let hip = NativeArray.get_i32(Strata.Rig.parents(rig), up)
+        let across = match (Strata.Rig.pivot_at(rig, up), Strata.Rig.anchor_at(rig, if hip < 0 do 0 else hip end)) do ((px, _, _), (ax, _, _)) -> (px -. ax) *. v end
+        KLeg(up, lo, ft, Strata.Rig.reach_length(rig, up, ft), across, (0.0, 0.0, 0.0), None)
+    end)
+    KGait(legs, 0.0, false)
+  end
+
+  pfn home(pos : (Float, Float, Float), heading : Float, across : Float, ahead : Float) : (Float, Float, Float) do
+    match pos do
+      (x, y, z) ->
+        let fx = Math.sin(heading)
+        let fz = Math.cos(heading)
+        -- across is along the figure's right: (cos h, 0, -sin h)
+        (x +. Math.cos(heading) *. across +. fx *. ahead, y, z -. Math.sin(heading) *. across +. fz *. ahead)
+    end
+  end
+  pfn dist2(a : (Float, Float, Float), b : (Float, Float, Float)) : Float do
+    match (a, b) do ((ax, _, az), (bx, _, bz)) -> Math.sqrt((ax -. bx) *. (ax -. bx) +. (az -. bz) *. (az -. bz)) end
+  end
+  pfn lerp(a : (Float, Float, Float), b : (Float, Float, Float), t : Float) : (Float, Float, Float) do
+    match (a, b) do ((ax, ay, az), (bx, by0, bz)) -> (ax +. (bx -. ax) *. t, ay +. (by0 -. ay) *. t, az +. (bz -. az) *. t) end
+  end
+
+  pfn target(l : KitLeg) : (Float, Float, Float) do
+    match l do
+      KLeg(_, _, _, n, _, planted, sw) ->
+        match sw do
+          None -> planted
+          Some((from, to, t, _)) -> match lerp(from, to, t) do (x, y, z) -> (x, y +. 0.25 *. n *. Math.sin(Math.pi() *. t), z) end
+        end
+    end
+  end
+
+  -- one leg's step: swings run on; a planted leg may start a swing when [may_lift]
+  pfn step_leg(l : KitLeg, dt : Float, pos : (Float, Float, Float), heading : Float, speed : Float, may_lift : Bool) : (KitLeg, Bool) do
+    match l do
+      KLeg(u, lo, ft, n, across, planted, sw) ->
+        let stride = 0.8 *. n
+        match sw do
+          Some((from, to, t, len)) ->
+            let h0 = home(pos, heading, across, 0.0)
+            if speed <= 0.01 && dist2(to, h0) > 0.01 do
+              -- stopped mid-swing: the swing goes home from where the foot is, quickly
+              let here = lerp(from, to, t)
+              (KLeg(u, lo, ft, n, across, planted, Some((here, h0, 0.0, 0.15))), true)
+            else
+              let t2 = t +. dt /. len
+              if t2 >= 1.0 do (KLeg(u, lo, ft, n, across, to, None), false) else (KLeg(u, lo, ft, n, across, planted, Some((from, to, t2, len))), true) end
+            end
+          None ->
+            let moving = speed > 0.01
+            let h = home(pos, heading, across, 0.0)
+            let far = dist2(planted, h)
+            let limit = if moving do stride /. 2.0 else 0.05 end
+            if may_lift && far > limit do
+              let len = if moving do stride /. 2.0 /. (if speed > 0.1 do speed else 0.1 end) else 0.2 end
+              let dest = home(pos, heading, across, if moving do stride /. 2.0 else 0.0 end)
+              (KLeg(u, lo, ft, n, across, planted, Some((planted, dest, 0.0, if len > 0.6 do 0.6 else len end))), true)
+            else (l, false) end
+        end
+    end
+  end
+
+  pfn step_all(ls : List(KitLeg), dt : Float, pos : (Float, Float, Float), heading : Float, speed : Float, any_swing : Bool, acc : List(KitLeg)) : List(KitLeg) do
+    match ls do
+      Nil -> List.reverse(acc)
+      Cons(l, rest) ->
+        let swinging_now = match l do KLeg(_, _, _, _, _, _, sw) -> Option.is_some(sw) end
+        let others_swing = any_swing || List.any(rest, fn r -> match r do KLeg(_, _, _, _, _, _, sw) -> Option.is_some(sw) end)
+        match step_leg(l, dt, pos, heading, speed, swinging_now || !others_swing) do
+          (l2, swinging) -> step_all(rest, dt, pos, heading, speed, any_swing || swinging, Cons(l2, acc))
+        end
+    end
+  end
+
+  doc "One frame of the walk for a figure at [pos] facing [heading], moving at [speed] m/s and turning at [turn] rad/s: the gait, each leg's foot target (metres) in leg order, and the root's height offset (a bob down while walking)."
+  fn gait_step(g : KitGait, dt : Float, pos : (Float, Float, Float), heading : Float, speed : Float, turn : Float) : (KitGait, List((Float, Float, Float)), Float) do
+    match g do
+      KGait(legs, phase, placed) ->
+        let legs0 = if placed do legs else List.map(legs, fn l -> match l do KLeg(u, lo, ft, n, across, _, _) -> KLeg(u, lo, ft, n, across, home(pos, heading, across, 0.0), None) end) end
+        let legs2 = step_all(legs0, dt, pos, heading, if Math.abs(turn) > 0.01 && speed < 0.01 do 0.0 else speed end, false, Nil)
+        let len = match legs2 do Cons(l, _) -> leg_len(l) | Nil -> 1.0 end
+        let phase2 = phase +. dt *. speed /. (if len > 0.0 do 1.6 *. len else 1.0 end)
+        let bob = if speed > 0.01 do 0.0 -. 0.05 *. len *. Math.abs(Math.sin(2.0 *. Math.pi() *. phase2)) else 0.0 end
+        (KGait(legs2, phase2 -. Math.floor(phase2), true), List.map(legs2, fn l -> target(l)), bob)
+    end
+  end
+
+  doc "Is any leg mid-swing?"
+  fn swinging(g : KitGait) : List(Bool) do match g do KGait(legs, _, _) -> List.map(legs, fn l -> match l do KLeg(_, _, _, _, _, _, sw) -> Option.is_some(sw) end) end end
+
+  doc "Each leg's (hip offset across, length), in leg order."
+  fn leg_shape(g : KitGait) : List((Float, Float)) do match g do KGait(legs, _, _) -> List.map(legs, fn l -> match l do KLeg(_, _, _, n, a, _, _) -> (a, n) end) end end
+
+  pfn apply_legs(a : Strata.Anim.Anim, f : Int, legs : List(KitLeg), targets : List((Float, Float, Float)), pos : (Float, Float, Float), heading : Float, slot : Int) : Strata.Anim.Anim do
+    match (legs, targets) do
+      (Cons(KLeg(u, lo, ft, n, across, _, _), lr), Cons((tx, ty, tz), tr)) ->
+        let (px, py, pz) = home(pos, heading, across, n)
+        apply_legs(Strata.Anim.reach(a, f, slot, u, lo, ft, tx, ty, tz, px, py +. n *. 0.5, pz, 1.0), f, lr, tr, pos, heading, slot + 1)
+      _ -> a
+    end
+  end
+
+  doc "Hand the walk to the animation: a two-bone reach per leg to its target (the knee bending forward), and the root lowered by [bob]. Then call Strata.Anim.ground."
+  fn gait_apply(a : Strata.Anim.Anim, f : Int, g : KitGait, targets : List((Float, Float, Float)), bob : Float, pos : (Float, Float, Float), heading : Float) : Strata.Anim.Anim do
+    match g do KGait(legs, _, _) -> Strata.Anim.override(apply_legs(a, f, legs, targets, pos, heading, 0), f, 0, MoQ.identity(), 0.0, bob, 0.0, 1.0) end
+  end
+
+  doc "The rig parts of pieces named wheel..., in rig order."
+  fn wheels(m : StrataKit.Assemble.KitMap) : List(Int) do
+    List.filter_map(MoA.entries(m), fn e -> match e do (i, _, n) -> if String.starts_with(n, "wheel") do Some(i) else None end end)
+  end
+
+  doc "Treads: each wheel turned about x by [distance] / [radius] (metres travelled, wheel radius), the root rolled by 0.02 x [turn] radians."
+  fn treads_apply(a : Strata.Anim.Anim, f : Int, m : StrataKit.Assemble.KitMap, distance : Float, radius : Float, turn : Float) : Strata.Anim.Anim do
+    let ang = distance /. (if radius > 0.0 do radius else 1.0 end)
+    let a1 = List.fold_left(wheels(m), a, fn (acc, w) -> Strata.Anim.override(acc, f, w, MoQ.from_axis_angle(1.0, 0.0, 0.0, ang), 0.0, 0.0, 0.0, 1.0))
+    Strata.Anim.override(a1, f, 0, MoQ.from_axis_angle(0.0, 0.0, 1.0, 0.02 *. turn), 0.0, 0.0, 0.0, 1.0)
+  end
+
+  doc "Hover's bob at time [t] seconds: (height offset in metres, pitch in radians), 0.15 m and 0.02 rad, a two-second period."
+  fn hover_offset(t : Float) : (Float, Float) do
+    let w = 2.0 *. Math.pi() *. t /. 2.0
+    (0.15 *. Math.sin(w), 0.02 *. Math.sin(w +. 0.7))
+  end
+
+  doc "Hover: the root raised and pitched by hover_offset(t). Thrusters' places are StrataKit.Assemble.markers(map, \"thrust\")."
+  fn hover_apply(a : Strata.Anim.Anim, f : Int, t : Float) : Strata.Anim.Anim do
+    match hover_offset(t) do (h, p) -> Strata.Anim.override(a, f, 0, MoQ.from_axis_angle(1.0, 0.0, 0.0, p), 0.0, h, 0.0, 1.0) end
+  end
+
+  doc "Aim the arm at [path] (its pieces, shoulder to hand, as Strata.Anim.aim's chain, at most four) so its last piece turns [muzzle_axis] (its own frame) toward [target]; each piece turns at most 70 degrees. Aim slot [slot]."
+  fn aim_arm(a : Strata.Anim.Anim, f : Int, m : StrataKit.Assemble.KitMap, path : List(String), target : (Float, Float, Float), muzzle_axis : (Float, Float, Float), slot : Int) : Strata.Anim.Anim do
+    let chain = List.take(MoA.pieces_of(m, path), 4)
+    match (target, muzzle_axis) do
+      ((tx, ty, tz), (ax, ay, az)) -> Strata.Anim.aim(a, f, slot, chain, ax, ay, az, tx, ty, tz, 70.0, 1.0)
+    end
+  end
+end

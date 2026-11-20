@@ -1,0 +1,74 @@
+-- Area — the tiles an action covers, and the tile under the pointer.
+--
+-- Areas are FFT's: a radius (Manhattan distance), a line, a cone, each
+-- optionally limited by height (FFT's vertical tolerance: tiles whose floor
+-- differs from the origin's by more voxels are left out). Every area is
+-- clipped to the grid.
+mod StrataTactics.Area do
+
+  alias StrataTactics.Grid as ArG
+
+  pfn level_ok(g : StrataTactics.Grid.TileGrid, origin : (Int, Int), t : (Int, Int), vertical : Option(Int)) : Bool do
+    match vertical do None -> true | Some(v) -> int_abs(ArG.floor(g, t) - ArG.floor(g, origin)) <= v end
+  end
+
+  doc "The tiles within Manhattan distance [r] of [centre], the centre included; with Some(v), only those whose floor is within v voxels of the centre's."
+  fn radius(g : StrataTactics.Grid.TileGrid, centre : (Int, Int), r : Int, vertical : Option(Int)) : List((Int, Int)) do
+    match centre do
+      (cx, cz) ->
+        let span = List.range(0 - r, r + 1)
+        List.filter(List.flat_map(span, fn dz -> List.filter_map(span, fn dx -> if int_abs(dx) + int_abs(dz) <= r do Some((cx + dx, cz + dz)) else None end)),
+                    fn t -> ArG.inside(g, t) && level_ok(g, centre, t, vertical))
+    end
+  end
+
+  pfn step_of(dir : Int) : (Int, Int) do if dir == 0 do (1, 0) else if dir == 1 do (-1, 0) else if dir == 2 do (0, 1) else (0, -1) end end end end
+
+  doc "The [length] tiles in a row from [from] heading [dir] (0 +x, 1 -x, 2 +z, 3 -z), [from] left out."
+  fn line(g : StrataTactics.Grid.TileGrid, from : (Int, Int), dir : Int, length : Int, vertical : Option(Int)) : List((Int, Int)) do
+    match (from, step_of(dir)) do
+      ((fx, fz), (sx, sz)) ->
+        List.filter(List.map(List.range(1, length + 1), fn k -> (fx + sx * k, fz + sz * k)), fn t -> ArG.inside(g, t) && level_ok(g, from, t, vertical))
+    end
+  end
+
+  doc "A cone from [from] heading [dir]: step k (1 .. length) ahead covers 2k - 1 tiles across."
+  fn cone(g : StrataTactics.Grid.TileGrid, from : (Int, Int), dir : Int, length : Int, vertical : Option(Int)) : List((Int, Int)) do
+    match (from, step_of(dir)) do
+      ((fx, fz), (sx, sz)) ->
+        let raw = List.flat_map(List.range(1, length + 1), fn k ->
+          List.map(List.range(1 - k, k), fn j -> (fx + sx * k + sz * j, fz + sz * k + sx * j)))
+        List.filter(raw, fn t -> ArG.inside(g, t) && level_ok(g, from, t, vertical))
+    end
+  end
+
+  doc "The tile the ray (origin, direction, metres) points at: the first targetable voxel it meets within [max] metres, if that voxel is over a tile of the grid. With Some(cut_y), the ray starts where it crosses that height, so what the cutaway hides cannot be picked (capsule cuts are not considered); a ray rising from above the cut picks nothing."
+  fn pick(w : Strata.World.World, g : StrataTactics.Grid.TileGrid, ray : ((Float, Float, Float), (Float, Float, Float)), cut_y : Option(Float), max : Float) : Option((Int, Int)) do
+    match ray do
+      ((ox, oy, oz), (dx, dy, dz)) ->
+        let start = match cut_y do
+          Some(cy) ->
+            if oy <= cy do Some((ox, oy, oz, 0.0))
+            else if dy >= 0.0 do None
+            else
+              let t = (cy -. oy) /. dy
+              Some((ox +. dx *. t, cy, oz +. dz *. t, t))
+            end end
+          None -> Some((ox, oy, oz, 0.0))
+        end
+        match start do
+          None -> None
+          Some((sx, sy, sz, used)) ->
+            if used >= max do None
+            else
+              let h = Strata.Query.raycast(w, sx, sy, sz, dx, dy, dz, max -. used, Strata.Query.targetable(Strata.World.registry(w)))
+              if !Strata.Query.is_hit(h) do None
+              else
+                let s = ArG.scale(g)
+                ArG.tile_of(g, (int_to_float(Strata.Query.hit_x(h)) +. 0.5) *. s, (int_to_float(Strata.Query.hit_z(h)) +. 0.5) *. s)
+              end
+            end
+        end
+    end
+  end
+end

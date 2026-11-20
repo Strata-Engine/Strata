@@ -1,0 +1,276 @@
+-- Assemble — a build turned into a Strata.Rig.
+--
+-- Depth first, every piece of every placed part becomes a rig part. A part's
+-- root piece hangs from the piece its mount is on: pivoted at the mount's
+-- position, turning about the part's attach point, turned so the attach
+-- marker's facing and up line up with the mount's. Its other pieces hang from
+-- their parent pieces at their joints. A part drawn for the other side is
+-- mirrored first (StrataKit.Build.placed). Effect markers become rig sockets,
+-- and three pieces named thigh_<s>, shin_<s>, foot_<s> become a rig leg. A
+-- node that does not fit, or would take the rig past 64 parts or 32 sockets,
+-- is left out with its subtree and reported; the rest is assembled.
+mod StrataKit.Assemble do
+
+  alias StrataKit.Part as AsP
+  alias StrataKit.Build as AsB
+  alias Strata.Math.Quat as AsQ
+
+  -- metres per voxel; the shared palette (index, r, g, b, roughness, emission); trim index to this figure's colour
+  type AssembleSettings = { as_voxel : Float, as_palette : List((Int, Float, Float, Float, Float, Float)), as_trim : List((Int, (Float, Float, Float))) }
+
+  doc "Settings: [voxel] metres a voxel, the game's shared [palette], and the colours this figure wears at the trim indices."
+  fn settings(voxel : Float, palette : List((Int, Float, Float, Float, Float, Float)), trim : List((Int, (Float, Float, Float)))) : AssembleSettings do
+    { as_voxel: voxel, as_palette: palette, as_trim: trim }
+  end
+
+  -- each rig part's (index, path, piece); each socket's (id, path, marker name)
+  -- ...; and each node's (path, part index, mirrored)
+  type KitMap = KMap(List((Int, List(String), String)), List((Int, List(String), String)), List((List(String), Int, Bool)))
+
+  doc "Every rig part's (index, path, piece name), in rig order."
+  fn entries(m : KitMap) : List((Int, List(String), String)) do match m do KMap(ps, _, _) -> ps end end
+
+  doc "The part index at the node at [path], and whether it was mirrored there."
+  fn node_part(m : KitMap, path : List(String)) : Option((Int, Bool)) do
+    match m do KMap(_, _, ns) -> match List.find(ns, fn e -> match e do (p, _, _) -> p == path end) do Some((_, i, mi)) -> Some((i, mi)) | None -> None end end
+  end
+
+  doc "The rig part of piece [piece] of the node at [path]."
+  fn rig_part(m : KitMap, path : List(String), piece : String) : Option(Int) do
+    match m do KMap(ps, _, _) -> match List.find(ps, fn e -> match e do (_, p, n) -> p == path && n == piece end) do Some((i, _, _)) -> Some(i) | None -> None end end
+  end
+  doc "The path of the node rig part [rp] belongs to."
+  fn path_of(m : KitMap, rp : Int) : Option(List(String)) do
+    match m do KMap(ps, _, _) -> match List.find(ps, fn e -> match e do (i, _, _) -> i == rp end) do Some((_, p, _)) -> Some(p) | None -> None end end
+  end
+  doc "The piece name of rig part [rp]."
+  fn piece_of(m : KitMap, rp : Int) : Option(String) do
+    match m do KMap(ps, _, _) -> match List.find(ps, fn e -> match e do (i, _, _) -> i == rp end) do Some((_, _, n)) -> Some(n) | None -> None end end
+  end
+  doc "Every rig part of the node at [path], the root piece first."
+  fn pieces_of(m : KitMap, path : List(String)) : List(Int) do
+    match m do KMap(ps, _, _) -> List.filter_map(ps, fn e -> match e do (i, p, _) -> if p == path do Some(i) else None end end) end
+  end
+  doc "The sockets of effect markers named [name], with the path of the node each is on (for Strata.Anim.socket)."
+  fn markers(m : KitMap, name : String) : List((List(String), Int)) do
+    match m do KMap(_, ss, _) -> List.filter_map(ss, fn e -> match e do (i, p, n) -> if n == name do Some((p, i)) else None end end) end
+  end
+
+  -- ── Frames ─────────────────────────────────────────────────────────────
+  pfn cross(a : (Float, Float, Float), b : (Float, Float, Float)) : (Float, Float, Float) do
+    match (a, b) do ((ax, ay, az), (bx, by0, bz)) -> (ay *. bz -. az *. by0, az *. bx -. ax *. bz, ax *. by0 -. ay *. bx) end
+  end
+  pfn unit(a : (Float, Float, Float)) : (Float, Float, Float) do
+    match a do (x, y, z) -> let l = Math.sqrt(x *. x +. y *. y +. z *. z)
+      if l < 0.000001 do (0.0, 0.0, 1.0) else (x /. l, y /. l, z /. l) end end
+  end
+  -- a rotation matrix (rows) to a quaternion
+  pfn quat_of(m00 : Float, m01 : Float, m02 : Float, m10 : Float, m11 : Float, m12 : Float, m20 : Float, m21 : Float, m22 : Float) : Strata.Math.Quat.Quat do
+    let tr = m00 +. m11 +. m22
+    if tr > 0.0 do
+      let s = Math.sqrt(tr +. 1.0) *. 2.0
+      AsQ.normalize(Strata.Math.Quat.Quat((m21 -. m12) /. s, (m02 -. m20) /. s, (m10 -. m01) /. s, 0.25 *. s))
+    else if m00 > m11 && m00 > m22 do
+      let s = Math.sqrt(1.0 +. m00 -. m11 -. m22) *. 2.0
+      AsQ.normalize(Strata.Math.Quat.Quat(0.25 *. s, (m01 +. m10) /. s, (m02 +. m20) /. s, (m21 -. m12) /. s))
+    else if m11 > m22 do
+      let s = Math.sqrt(1.0 +. m11 -. m00 -. m22) *. 2.0
+      AsQ.normalize(Strata.Math.Quat.Quat((m01 +. m10) /. s, 0.25 *. s, (m12 +. m21) /. s, (m02 -. m20) /. s))
+    else
+      let s = Math.sqrt(1.0 +. m22 -. m00 -. m11) *. 2.0
+      AsQ.normalize(Strata.Math.Quat.Quat((m02 +. m20) /. s, (m12 +. m21) /. s, 0.25 *. s, (m10 -. m01) /. s))
+    end end end
+  end
+
+  doc "The rotation of a figure part's world matrix as Strata.Anim.matrices gives it (12 floats a part, column-major 3x4; [i] is the part's first float)."
+  fn matrix_turn(m : NativeF32Arr, i : Int) : Strata.Math.Quat.Quat do
+    let g = fn k -> NativeArray.get_f32(m, i + k)
+    quat_of(g(0), g(3), g(6), g(1), g(4), g(7), g(2), g(5), g(8))
+  end
+
+  doc "The rotation that takes the frame (facing [f1], up [u1]) to the frame (facing [f2], up [u2])."
+  fn frame_turn(f1 : (Float, Float, Float), u1 : (Float, Float, Float), f2 : (Float, Float, Float), u2 : (Float, Float, Float)) : Strata.Math.Quat.Quat do
+    -- B = [right, up, forward] as columns; R = B2 B1^T
+    let fa = unit(f1)
+    let ra = unit(cross(u1, fa))
+    let ua = cross(fa, ra)
+    let fb = unit(f2)
+    let rb = unit(cross(u2, fb))
+    let ub = cross(fb, rb)
+    match (ra, ua, fa) do
+      ((a0, a1, a2), (b0, b1, b2), (c0, c1, c2)) ->
+        match (rb, ub, fb) do
+          ((d0, d1, d2), (e0, e1, e2), (g0, g1, g2)) ->
+            -- R[i][j] = rb_i ra_j + ub_i ua_j + fb_i fa_j
+            quat_of(d0 *. a0 +. e0 *. b0 +. g0 *. c0, d0 *. a1 +. e0 *. b1 +. g0 *. c1, d0 *. a2 +. e0 *. b2 +. g0 *. c2,
+                    d1 *. a0 +. e1 *. b0 +. g1 *. c0, d1 *. a1 +. e1 *. b1 +. g1 *. c1, d1 *. a2 +. e1 *. b2 +. g1 *. c2,
+                    d2 *. a0 +. e2 *. b0 +. g2 *. c0, d2 *. a1 +. e2 *. b1 +. g2 *. c1, d2 *. a2 +. e2 *. b2 +. g2 *. c2)
+        end
+    end
+  end
+
+  -- ── Assembly ───────────────────────────────────────────────────────────
+  -- the walk's state: the rig, the map's part and socket entries, problems
+  type AsState = AsState(Strata.Rig.Rig, List((Int, List(String), String)), List((Int, List(String), String)), List((List(String), String)), List((List(String), Int, Bool)))
+
+  pfn add_piece(st : AsState, path : List(String), pc : StrataKit.Part.KitPiece, parent_rp : Int, pivot : (Float, Float, Float), anchor : (Float, Float, Float), q : Strata.Math.Quat.Quat) : (AsState, Int) do
+    match st do
+      AsState(r, ps, ss, probs, ns) ->
+        match AsP.piece_size(pc) do
+          (sx, sy, sz) ->
+            match pivot do
+              (px, py, pz) ->
+                match Strata.Rig.part(r, parent_rp, px, py, pz, sx, sy, sz) do
+                  (r1, rp) ->
+                    if rp < 0 do (AsState(r, ps, ss, List.append(probs, [(path, "piece " ++ AsP.piece_name(pc) ++ ": " ++ Strata.Rig.why(r1))]), ns), -1)
+                    else
+                      match anchor do
+                        (ax, ay, az) ->
+                          let r2 = Strata.Rig.rest(Strata.Rig.anchor(Strata.Rig.with_grid(r1, rp, AsP.piece_grid(pc)), rp, ax, ay, az), rp, q)
+                          (AsState(r2, List.append(ps, [(rp, path, AsP.piece_name(pc))]), ss, probs, ns), rp)
+                      end
+                    end
+                end
+            end
+        end
+    end
+  end
+
+  -- the part's pieces after its root, each from its parent piece
+  pfn add_rest(st : AsState, path : List(String), pcs : List(StrataKit.Part.KitPiece)) : AsState do
+    match pcs do
+      Nil -> st
+      Cons(pc, rest) ->
+        match st do
+          AsState(_, ps, _, _, _) ->
+            match List.find(ps, fn e -> match e do (_, p, n) -> p == path && n == AsP.piece_parent(pc) end) do
+              None -> add_rest(st, path, rest)
+              Some((prp, _, _)) -> match add_piece(st, path, pc, prp, AsP.piece_pivot(pc), AsP.piece_anchor(pc), AsQ.identity()) do (st2, _) -> add_rest(st2, path, rest) end
+            end
+        end
+    end
+  end
+
+  pfn add_sockets(st : AsState, path : List(String), fx : List(StrataKit.Part.KitMarker)) : AsState do
+    match fx do
+      Nil -> st
+      Cons(k, rest) ->
+        match st do
+          AsState(r, ps, ss, probs, ns) ->
+            match List.find(ps, fn e -> match e do (_, p, n) -> p == path && n == AsP.marker_piece(k) end) do
+              None -> add_sockets(st, path, rest)
+              Some((rp, _, _)) ->
+                match AsP.marker_at(k) do
+                  (x, y, z) ->
+                    match Strata.Rig.socket(r, rp, x, y, z, frame_turn((0.0, 0.0, 1.0), (0.0, 1.0, 0.0), AsP.marker_facing(k), AsP.marker_up(k))) do
+                      (r2, sid) ->
+                        if sid < 0 do add_sockets(AsState(r, ps, ss, List.append(probs, [(path, "marker " ++ AsP.marker_name(k) ++ ": " ++ Strata.Rig.why(r2))]), ns), path, rest)
+                        else add_sockets(AsState(r2, ps, List.append(ss, [(sid, path, AsP.marker_name(k))]), probs, ns), path, rest) end
+                    end
+                end
+            end
+        end
+    end
+  end
+
+  pfn add_legs(st : AsState, path : List(String), p : StrataKit.Part.KitPart, voxel : Float) : AsState do
+    List.fold_left(["l", "r"], st, fn (acc, s) -> add_leg(acc, path, p, voxel, s))
+  end
+  pfn add_leg(st : AsState, path : List(String), p : StrataKit.Part.KitPart, voxel : Float, s : String) : AsState do
+    match st do
+      AsState(r, ps, ss, probs, ns) ->
+        let find = fn n -> match List.find(ps, fn e -> match e do (_, pp, pn) -> pp == path && pn == n end) do Some((i, _, _)) -> i | None -> -1 end
+        let up = find("thigh_" ++ s)
+        let lo = find("shin_" ++ s)
+        let ft = find("foot_" ++ s)
+        if up < 0 || lo < 0 || ft < 0 do st
+        else
+          let sole = match AsP.piece(p, "foot_" ++ s) do Some(fp) -> match AsP.piece_anchor(fp) do (_, ay, _) -> ay *. voxel end | None -> 0.0 end
+          AsState(Strata.Rig.leg(r, up, lo, ft, sole), ps, ss, probs, ns)
+        end
+    end
+  end
+
+  -- one node, placed as [p], hanging from rig part [parent_rp] at [mount] (None for the root)
+  pfn note_node(st : AsState, path : List(String), part : Int, mirrored : Bool) : AsState do
+    match st do AsState(r, ps, ss, probs, ns) -> AsState(r, ps, ss, probs, List.append(ns, [(path, part, mirrored)])) end
+  end
+  pfn add_node(parts : List(StrataKit.Part.KitPart), ok : String -> String -> List(String) -> String -> Bool, voxel : Float, st0 : AsState, path : List(String), p : StrataKit.Part.KitPart, b : StrataKit.Build.KitBuild, parent_rp : Int, mount : Option(StrataKit.Part.KitMount)) : AsState do
+    let mirrored = match (mount, List.nth_opt(parts, AsB.part_of(b))) do (Some(_), Some(orig)) -> AsP.side(orig) != AsP.side(p) | _ -> false end
+    let st = note_node(st0, path, AsB.part_of(b), mirrored)
+    let att = AsP.attach(p)
+    let root = List.head(AsP.pieces(p))
+    let (pivot, q) = match mount do
+      None -> ((0.0, 0.0, 0.0), AsQ.identity())
+      Some(m) -> (AsP.marker_at(AsP.mount_marker(m)), frame_turn(AsP.marker_facing(att), AsP.marker_up(att), AsP.marker_facing(AsP.mount_marker(m)), AsP.marker_up(AsP.mount_marker(m))))
+    end
+    match add_piece(st, path, root, parent_rp, pivot, AsP.marker_at(att), q) do
+      (st1, rp) ->
+        if rp < 0 do st1
+        else
+          let st2 = add_legs(add_sockets(add_rest(st1, path, List.tail(AsP.pieces(p))), path, AsP.fx(p)), path, p, voxel)
+          List.fold_left(AsB.children(b), st2, fn (acc, c) -> add_child(parts, ok, voxel, acc, path, p, c))
+        end
+    end
+  end
+
+  pfn add_child(parts : List(StrataKit.Part.KitPart), ok : String -> String -> List(String) -> String -> Bool, voxel : Float, st : AsState, path : List(String), here : StrataKit.Part.KitPart, c : (String, StrataKit.Build.KitBuild)) : AsState do
+    match c do
+      (mname, child) ->
+        let p2 = List.append(path, [mname])
+        let problem = fn why -> match st do AsState(r, ps, ss, probs, ns) -> AsState(r, ps, ss, List.append(probs, [(p2, why)]), ns) end
+        match List.nth_opt(parts, AsB.part_of(child)) do
+          None -> problem("no part " ++ int_to_string(AsB.part_of(child)))
+          Some(cp) ->
+            match AsP.mount(here, mname) do
+              None -> problem("no mount " ++ mname ++ " on the part it hangs from")
+              Some(m) ->
+                if !ok(AsP.mount_slot(m), AsP.mount_size(m), AsP.slots(cp), AsP.size(cp)) do problem("part " ++ int_to_string(AsB.part_of(child)) ++ " (" ++ AsP.size(cp) ++ ") does not fit " ++ AsP.mount_slot(m) ++ ":" ++ AsP.mount_size(m))
+                else
+                  match st do
+                    AsState(_, ps, _, _, _) ->
+                      match List.find(ps, fn e -> match e do (_, pp, pn) -> pp == path && pn == AsP.marker_piece(AsP.mount_marker(m)) end) do
+                        None -> problem("the mount " ++ mname ++ " is on a piece that was left out")
+                        Some((prp, _, _)) -> add_node(parts, ok, voxel, st, p2, AsB.placed(cp, m), child, prp, Some(m))
+                      end
+                  end
+                end
+            end
+        end
+    end
+  end
+
+  pfn colours(r : Strata.Rig.Rig, s : AssembleSettings) : Strata.Rig.Rig do
+    let r1 = List.fold_left(s.as_palette, r, fn (acc, c) -> match c do (i, cr, cg, cb, ro, em) -> Strata.Rig.colour(acc, i, cr, cg, cb, ro, em) end)
+    List.fold_left(s.as_trim, r1, fn (acc, t) -> match t do
+      (i, (tr, tg, tb)) ->
+        let (ro, em) = match List.find(s.as_palette, fn c -> match c do (j, _, _, _, _, _) -> j == i end) do Some((_, _, _, _, a, b)) -> (a, b) | None -> (0.8, 0.0) end
+        Strata.Rig.colour(acc, i, tr, tg, tb, ro, em)
+    end)
+  end
+
+  doc "The rig of build [b] (parts by index in [parts]; [ok] the game's fitting rule), the map from its parts and sockets to the build, and what was left out with why."
+  fn assemble(parts : List(StrataKit.Part.KitPart), b : StrataKit.Build.KitBuild, ok : String -> String -> List(String) -> String -> Bool, s : AssembleSettings) : (Strata.Rig.Rig, KitMap, List((List(String), String))) do
+    let r0 = colours(Strata.Rig.new(s.as_voxel), s)
+    match List.nth_opt(parts, AsB.part_of(b)) do
+      None -> (r0, KMap(Nil, Nil, Nil), [(Nil, "no part " ++ int_to_string(AsB.part_of(b)))])
+      Some(p) ->
+        match add_node(parts, ok, s.as_voxel, AsState(r0, Nil, Nil, Nil, Nil), Nil, p, b, -1, None) do
+          AsState(r, ps, ss, probs, ns) -> (r, KMap(ps, ss, ns), probs)
+        end
+    end
+  end
+
+  doc "The new rig with the old rig's grids carried over for every piece both have (the same path, the same part there mirrored the same way, the same piece name and size): damage carved into the old rig survives a re-assembly after a swap or a part broken off. Pieces new to the build keep their fresh grids."
+  fn carry_damage(old_rig : Strata.Rig.Rig, old_map : KitMap, new_rig : Strata.Rig.Rig, new_map : KitMap) : Strata.Rig.Rig do
+    List.fold_left(entries(new_map), new_rig, fn (r, e) -> match e do
+      (rp, path, piece) ->
+        match rig_part(old_map, path, piece) do
+          Some(orp) ->
+            let same_part = Option.is_some(node_part(new_map, path)) && node_part(old_map, path) == node_part(new_map, path)
+            if same_part && Strata.Rig.size(old_rig, orp) == Strata.Rig.size(r, rp) do Strata.Rig.with_grid(r, rp, Strata.Rig.grid(old_rig, orp)) else r end
+          None -> r
+        end
+    end)
+  end
+end

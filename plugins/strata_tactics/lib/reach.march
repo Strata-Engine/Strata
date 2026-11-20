@@ -1,0 +1,133 @@
+-- Reach — where a unit can get to this turn, and the way there.
+--
+-- Moves are FFT's: four ways, each step costing the game's cost of the
+-- tile it enters. A step is allowed when the unit fits the tile (its
+-- clearance), the floor rises by at most jump height steps and falls by at
+-- most drop steps, and the game's pass function does not block the tile. A
+-- tile the pass function marks pass-through can be crossed but not stopped
+-- on (allies, say). The search is Dijkstra's, ties broken by the order
+-- +x, -x, +z, -z, so the same question always gets the same answer.
+mod StrataTactics.Reach do
+
+  alias StrataTactics.Grid as RcG
+
+  -- tiles of movement, height steps up, height steps down, height in voxels
+  type Mover = { mv_move : Int, mv_jump : Int, mv_drop : Int, mv_height : Int }
+
+  doc "A mover: [move] tiles of movement (cost), up [jump] and down [drop] height steps a step, [height] voxels tall."
+  fn mover(move : Int, jump : Int, drop : Int, height : Int) : Mover do { mv_move: move, mv_jump: jump, mv_drop: drop, mv_height: height } end
+
+  doc "The pass answer for a tile a mover may cross and stop on."
+  fn pass_open() : Int do 0 end
+  doc "The pass answer for a tile a mover may cross but not stop on."
+  fn pass_through() : Int do 1 end
+  doc "The pass answer for a tile a mover may not enter."
+  fn pass_blocked() : Int do 2 end
+
+  -- width, the start, then per tile: cost to reach (-1 unreached), the tile it came from (index, -1), may stop (0/1)
+  type Reach = { rc_width : Int, rc_depth : Int, rc_start : (Int, Int), rc_cost : NativeIntArr, rc_prev : NativeIntArr, rc_stop : NativeIntArr }
+
+  pfn idx(r : Reach, t : (Int, Int)) : Int do match t do (x, z) -> z * r.rc_width + x end end
+  pfn on_map(r : Reach, t : (Int, Int)) : Bool do match t do (x, z) -> x >= 0 && z >= 0 && x < r.rc_width && z < r.rc_depth end end
+
+  pfn neighbours(t : (Int, Int)) : List((Int, Int)) do match t do (x, z) -> [(x + 1, z), (x - 1, z), (x, z + 1), (x, z - 1)] end end
+
+  -- may the mover step from a to b, and at what cost (0 when it may not)?
+  pfn step_cost(g : StrataTactics.Grid.TileGrid, m : Mover, cost : Int -> Int, pass : (Int, Int) -> Int, a : (Int, Int), b : (Int, Int)) : Int do
+    if !RcG.inside(g, b) || !RcG.fits(g, b, m.mv_height) || pass(b) == pass_blocked() do 0
+    else
+      let st = (RcG.settings_of(g)).gs_step
+      let dh = RcG.floor(g, b) - RcG.floor(g, a)
+      if dh > m.mv_jump * st || 0 - dh > m.mv_drop * st do 0
+      else
+        let c = cost(RcG.kind(g, b))
+        if c <= 0 do 0 else c end
+      end
+    end
+  end
+
+  -- buckets by cost: bucket k holds the tiles first reached at cost k, in the order reached
+  pfn relax(g : StrataTactics.Grid.TileGrid, m : Mover, cost : Int -> Int, pass : (Int, Int) -> Int, r : Reach, from : (Int, Int), c0 : Int, ns : List((Int, Int)), buckets : List((Int, (Int, Int)))) : (Reach, List((Int, (Int, Int)))) do
+    match ns do
+      Nil -> (r, buckets)
+      Cons(b, rest) ->
+        let sc = step_cost(g, m, cost, pass, from, b)
+        if sc <= 0 do relax(g, m, cost, pass, r, from, c0, rest, buckets)
+        else
+          let c = c0 + sc
+          let i = idx(r, b)
+          let old = NativeArray.get_int(r.rc_cost, i)
+          if c > m.mv_move || (old >= 0 && old <= c) do relax(g, m, cost, pass, r, from, c0, rest, buckets)
+          else
+            let r2 = { r with rc_cost: NativeArray.set_int(r.rc_cost, i, c), rc_prev: NativeArray.set_int(r.rc_prev, i, idx(r, from)),
+                              rc_stop: NativeArray.set_int(r.rc_stop, i, if pass(b) == pass_through() do 0 else 1 end) }
+            relax(g, m, cost, pass, r2, from, c0, rest, List.append(buckets, [(c, b)]))
+          end
+        end
+    end
+  end
+
+  -- take the cheapest waiting tile (first among equals), skipping stale entries
+  pfn take_min(bs : List((Int, (Int, Int)))) : Option(((Int, (Int, Int)), List((Int, (Int, Int))))) do
+    match bs do
+      Nil -> None
+      _ ->
+        let best = List.fold_left(List.tail(bs), List.head(bs), fn (acc, e) -> match (acc, e) do ((ca, _), (ce, _)) -> if ce < ca do e else acc end end)
+        Some((best, remove_first(bs, best)))
+    end
+  end
+  pfn remove_first(bs : List((Int, (Int, Int))), e : (Int, (Int, Int))) : List((Int, (Int, Int))) do
+    match bs do
+      Nil -> Nil
+      Cons(h, t) -> if h == e do t else Cons(h, remove_first(t, e)) end
+    end
+  end
+
+  pfn search(g : StrataTactics.Grid.TileGrid, m : Mover, cost : Int -> Int, pass : (Int, Int) -> Int, r : Reach, waiting : List((Int, (Int, Int)))) : Reach do
+    match take_min(waiting) do
+      None -> r
+      Some(((c, t), rest)) ->
+        if NativeArray.get_int(r.rc_cost, idx(r, t)) != c do search(g, m, cost, pass, r, rest)
+        else
+          match relax(g, m, cost, pass, r, t, c, neighbours(t), rest) do (r2, w2) -> search(g, m, cost, pass, r2, w2) end
+        end
+    end
+  end
+
+  doc "Where mover [m] on tile [from] can get to: [cost] gives a terrain kind's cost to enter (0 or less: impassable), [pass] says whether a tile is open, pass-through or blocked (pass_open, pass_through, pass_blocked; the game's units and teams). Nothing off the grid is ever reached."
+  fn find(g : StrataTactics.Grid.TileGrid, from : (Int, Int), m : Mover, cost : Int -> Int, pass : (Int, Int) -> Int) : Reach do
+    let w = RcG.width(g)
+    let d = RcG.depth(g)
+    let n = w * d
+    let r0 = { rc_width: w, rc_depth: d, rc_start: from, rc_cost: NativeArray.make_int(n, -1), rc_prev: NativeArray.make_int(n, -1), rc_stop: NativeArray.make_int(n, 0) }
+    if !on_map(r0, from) do r0
+    else search(g, m, cost, pass, { r0 with rc_cost: NativeArray.set_int(r0.rc_cost, idx(r0, from), 0) }, [(0, from)])
+    end
+  end
+
+  doc "The tiles the mover may stop on: reached, not pass-through, not the start; in row order."
+  fn tiles(r : Reach) : List((Int, Int)) do
+    List.filter_map(List.range(0, r.rc_width * r.rc_depth), fn i ->
+      let t = (i % r.rc_width, i / r.rc_width)
+      if t != r.rc_start && NativeArray.get_int(r.rc_cost, i) > 0 && NativeArray.get_int(r.rc_stop, i) == 1 do Some(t) else None end)
+  end
+
+  doc "What reaching tile t costs, if it is reached (the start costs 0)."
+  fn cost_to(r : Reach, t : (Int, Int)) : Option(Int) do
+    if !on_map(r, t) do None else
+      let c = NativeArray.get_int(r.rc_cost, idx(r, t))
+      if c < 0 do None else Some(c) end
+    end
+  end
+
+  pfn back(r : Reach, i : Int, acc : List((Int, Int))) : List((Int, Int)) do
+    let t = (i % r.rc_width, i / r.rc_width)
+    let p = NativeArray.get_int(r.rc_prev, i)
+    if p < 0 do Cons(t, acc) else back(r, p, Cons(t, acc)) end
+  end
+
+  doc "The way from the start to tile t, both included; empty when t is not reached."
+  fn path(r : Reach, t : (Int, Int)) : List((Int, Int)) do
+    match cost_to(r, t) do None -> Nil | Some(_) -> back(r, idx(r, t), Nil) end
+  end
+end

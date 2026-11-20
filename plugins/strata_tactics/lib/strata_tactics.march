@@ -1,0 +1,118 @@
+-- StrataTactics — a tactical layer over any Strata world, as a plugin
+-- (docs/plugins.md): a grid of tiles read from the voxels
+-- (StrataTactics.Grid, Reach, Sight, Area), an FFT turn clock
+-- (StrataTactics.Clock) and an XCOM-style camera (StrataTactics.Camera), with
+-- overlay marks (StrataTactics.Marks). It uses only Strata's public modules.
+--
+-- The plugin's own part is this module: setup, update, overlay and gui in the
+-- shape of docs/plugins.md. It moves no figures and decides no damage: it
+-- answers questions, keeps the clock, and reports what the pointer does.
+-- The game keeps the clock moving (Clock.advance, end_turn) and passes edit
+-- outcomes back (world_changed).
+mod StrataTactics do
+
+  doc "The plugin's version."
+  fn version() : String do "0.1.0" end
+
+  -- the grid's, camera's and clock's settings
+  type TacticsConfig = { tx_grid : StrataTactics.Grid.GridSettings, tx_camera : StrataTactics.Camera.CameraSettings, tx_clock : StrataTactics.Clock.ClockSettings }
+
+  doc "A configuration with the given grid and the camera's and clock's defaults."
+  fn config(g : StrataTactics.Grid.GridSettings) : TacticsConfig do
+    { tx_grid: g, tx_camera: StrataTactics.Camera.settings(), tx_clock: StrataTactics.Clock.settings() }
+  end
+
+  -- the pointer came onto a tile; left the grid; select went down over a tile; a camera shot finished
+  type TacticsEvent = Hovered((Int, Int)) | Unhovered | Clicked((Int, Int)) | ShotDone(Int)
+
+  doc "0 hovered, 1 unhovered, 2 clicked, 3 a shot done."
+  fn event_index(e : TacticsEvent) : Int do match e do Hovered(_) -> 0 | Unhovered -> 1 | Clicked(_) -> 2 | ShotDone(_) -> 3 end end
+  doc "The tile of a Hovered or Clicked event."
+  fn event_tile(e : TacticsEvent) : Option((Int, Int)) do match e do Hovered(t) -> Some(t) | Clicked(t) -> Some(t) | _ -> None end end
+
+  -- grid, clock, camera, the tile under the pointer, the marks the game chose for this frame
+  type TacticsState = { ts_grid : StrataTactics.Grid.TileGrid, ts_clock : StrataTactics.Clock.TurnClock, ts_camera : StrataTactics.Camera.TacticsCamera,
+                        ts_hover : Option((Int, Int)), ts_marks : List(Strata.Overlay.Item) }
+
+  doc "Set up: read the grid from [w], start the clock, put the camera over the grid's middle; the registry is passed through (the plugin registers no blocks) and the camera's bindings are proposed."
+  fn setup(cfg : TacticsConfig, r : Strata.Blocks.Registry, w : Strata.World.World) : (TacticsState, Strata.Blocks.Registry, List((String, Strata.Input.Source, Float))) do
+    let g = StrataTactics.Grid.build(w, cfg.tx_grid)
+    let mid = StrataTactics.Grid.centre(g, (StrataTactics.Grid.width(g) / 2, StrataTactics.Grid.depth(g) / 2))
+    let st = { ts_grid: g, ts_clock: StrataTactics.Clock.start(cfg.tx_clock), ts_camera: StrataTactics.Camera.start(cfg.tx_camera, mid, 0.0), ts_hover: None, ts_marks: Nil }
+    (st, r, StrataTactics.Camera.bindings())
+  end
+
+  pfn ground_of(g : StrataTactics.Grid.TileGrid, fallback : Float) : Float -> Float -> Float do
+    fn (x, z) -> match StrataTactics.Grid.tile_of(g, x, z) do
+      Some(t) -> if StrataTactics.Grid.standable(g, t) do int_to_float(StrataTactics.Grid.floor(g, t)) *. StrataTactics.Grid.scale(g) else fallback end
+      None -> fallback
+    end
+  end
+
+  doc "One frame: steps the camera (the grid's floor is its ground), picks the tile under the pointer's ray (nothing the cutaway hides), and reports Hovered when the pointer comes onto a tile, Unhovered when it leaves the grid, Clicked when select goes down over a tile, and ShotDone for each finished camera shot. The marks shown last frame are cleared. No requests yet: the list is there for the shape."
+  fn update(s : TacticsState, f : Strata.Plugin.PluginFrame) : (TacticsState, List(Strata.Plugin.Request), List(TacticsEvent)) do
+    let fy = match StrataTactics.Camera.focus(s.ts_camera) do (_, y, _) -> y end
+    let cam = StrataTactics.Camera.step(s.ts_camera, f.pf_input, f.pf_pointer, f.pf_wheel, f.pf_width, f.pf_height, f.pf_dt, ground_of(s.ts_grid, fy))
+    let picked = match f.pf_ray do
+      Some(ray) -> StrataTactics.Area.pick(f.pf_world, s.ts_grid, ray, Some(StrataTactics.Camera.cut_height(cam)), 500.0)
+      None -> None
+    end
+    let hover_evs = if picked == s.ts_hover do Nil else match picked do Some(t) -> [Hovered(t)] | None -> [Unhovered] end end
+    let click_evs = match picked do Some(t) -> if Strata.Input.pressed(f.pf_input, "tactics.select") do [Clicked(t)] else Nil end | None -> Nil end
+    let shot_evs = List.map(StrataTactics.Camera.shot_done(cam), fn id -> ShotDone(id))
+    ({ s with ts_camera: cam, ts_hover: picked, ts_marks: Nil }, Nil, List.append(hover_evs, List.append(click_evs, shot_evs)))
+  end
+
+  doc "The grid read again where edits changed the world (their outcomes, as Strata.Plugin.apply answers them)."
+  fn world_changed(s : TacticsState, w : Strata.World.World, outcomes : List(Strata.Edit.Outcome)) : TacticsState do
+    let changes = List.flat_map(outcomes, fn o -> Strata.Edit.changes(o))
+    match StrataTactics.Grid.refresh(s.ts_grid, w, changes) do (g, _) -> { s with ts_grid: g } end
+  end
+
+  doc "The grid."
+  fn grid(s : TacticsState) : StrataTactics.Grid.TileGrid do s.ts_grid end
+  doc "The turn clock."
+  fn clock(s : TacticsState) : StrataTactics.Clock.TurnClock do s.ts_clock end
+  doc "The camera."
+  fn camera(s : TacticsState) : StrataTactics.Camera.TacticsCamera do s.ts_camera end
+  doc "The state with its clock replaced (after the game advances it or ends a turn)."
+  fn with_clock(s : TacticsState, c : StrataTactics.Clock.TurnClock) : TacticsState do { s with ts_clock: c } end
+  doc "The state with its camera replaced (to follow a unit, or play a shot)."
+  fn with_camera(s : TacticsState, c : StrataTactics.Camera.TacticsCamera) : TacticsState do { s with ts_camera: c } end
+  doc "The tile under the pointer."
+  fn hovered(s : TacticsState) : Option((Int, Int)) do s.ts_hover end
+  doc "The state showing [items] this frame (StrataTactics.Marks), after any shown already; `update` clears them."
+  fn show(s : TacticsState, items : List(Strata.Overlay.Item)) : TacticsState do { s with ts_marks: List.append(s.ts_marks, items) } end
+
+  doc "The grid's extent in metres: (x0, z0, x1, z1)."
+  fn extent(s : TacticsState) : (Float, Float, Float, Float) do
+    let gs = StrataTactics.Grid.settings_of(s.ts_grid)
+    let sc = StrataTactics.Grid.scale(s.ts_grid)
+    (int_to_float(gs.gs_x0) *. sc, int_to_float(gs.gs_z0) *. sc, int_to_float(gs.gs_x0 + gs.gs_width * gs.gs_tile) *. sc, int_to_float(gs.gs_z0 + gs.gs_depth * gs.gs_tile) *. sc)
+  end
+
+  doc "What the plugin draws this frame: the marks shown, the tile under the pointer, and the camera's cutaway over the grid, the capsule reaching [subject] (the focus when None)."
+  fn overlay(s : TacticsState, subject : Option((Float, Float, Float))) : Strata.Overlay.Overlay do
+    let cur = match s.ts_hover do Some(t) -> StrataTactics.Marks.cursor(s.ts_grid, t, (StrataTactics.Marks.colours()).mc_cursor) | None -> Nil end
+    Strata.Overlay.with_cut(Strata.Overlay.add_all(Strata.Overlay.empty(), List.append(s.ts_marks, cur)), StrataTactics.Camera.cut(s.ts_camera, subject, extent(s)))
+  end
+
+  doc "The camera's view-projection for a window of [aspect]: for the game to hand the renderer when this camera is shown."
+  fn view_proj(s : TacticsState, aspect : Float) : NativeFloatArr do StrataTactics.Camera.view_proj(s.ts_camera, aspect) end
+
+  doc "The turn order's lines: the active unit first, then the next [k] forecast entries, units by [label] and charges as \"<label> (charge)\"."
+  fn turn_lines(s : TacticsState, label : Int -> String, k : Int) : List(String) do
+    let first = match StrataTactics.Clock.active(s.ts_clock) do Some(u) -> [label(u)] | None -> Nil end
+    let rest = List.filter_map(StrataTactics.Clock.forecast(s.ts_clock, k), fn e ->
+      match StrataTactics.Clock.turn_of(e) do
+        Some(u) -> Some(label(u))
+        None -> match StrataTactics.Clock.charge_of(e) do Some((_, u)) -> Some(label(u) ++ " (charge)") | None -> None end
+      end)
+    List.append(first, rest)
+  end
+
+  doc "The turn order as a column for the game's screen: a \"Turn order\" heading, then `turn_lines`."
+  fn gui(s : TacticsState, label : Int -> String, k : Int) : Strata.Gui.GNode do
+    Strata.Gui.column(Strata.Gui.fit(), Strata.Gui.fit(), Cons(Strata.Gui.label("Turn order"), List.map(turn_lines(s, label, k), fn t -> Strata.Gui.label(t))))
+  end
+end

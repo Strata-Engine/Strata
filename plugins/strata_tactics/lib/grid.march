@@ -1,0 +1,199 @@
+-- Grid — the tiles of a tactical map, read from a world's voxels.
+--
+-- A tile is a square of N x N voxel columns; tile (tx, tz) covers voxels
+-- x0 + tx N .. x0 + tx N + N - 1 across and the same from z0 in depth. Each
+-- tile has one standing height: the voxel y a unit's feet are in.
+--
+-- The column rule. Each column of a tile is scanned from yhi down for the
+-- highest cell whose block below collides and that has at least min_height
+-- cells above it that do not collide (fluid does not); that cell's y is the
+-- column's floor, or it has none. Where a column has more than one such
+-- place (a roof over a room, a bridge over a street) the highest is taken.
+-- The tile's floor is the median of its columns' floors (the lower of the
+-- two middle ones for an even count); the tile is standable when at least
+-- half its columns have a floor within one height step of it. Its clearance
+-- is the least, over those columns, of the free cells above the tile's
+-- floor (capped at yhi - floor). Its kind is the game's kind of the block
+-- under the centre column's floor; its fluid is how many fluid cells stand
+-- from the floor up in the centre column.
+--
+-- Every reader answers nothing (0, false, None) for a tile outside the grid.
+mod StrataTactics.Grid do
+
+  -- voxel origin of tile (0, 0), size in tiles, tile edge in voxels, height step in voxels,
+  -- the y range scanned, the smallest unit's height in voxels, block id to terrain kind
+  type GridSettings = { gs_x0 : Int, gs_z0 : Int, gs_width : Int, gs_depth : Int, gs_tile : Int, gs_step : Int,
+                    gs_ylo : Int, gs_yhi : Int, gs_min_height : Int, gs_kind : Int -> Int }
+
+  doc "Settings: tile (0, 0)'s low corner at voxel (x0, z0); width x depth tiles of tile x tile columns; a height step of [step] voxels; columns scanned from yhi down to ylo; the smallest unit [min_height] voxels tall; [kind] gives a block id's terrain kind."
+  fn settings(x0 : Int, z0 : Int, width : Int, depth : Int, tile : Int, step : Int, ylo : Int, yhi : Int, min_height : Int, kind : Int -> Int) : GridSettings do
+    { gs_x0: x0, gs_z0: z0, gs_width: if width < 0 do 0 else width end, gs_depth: if depth < 0 do 0 else depth end, gs_tile: if tile < 1 do 1 else tile end,
+      gs_step: if step < 1 do 1 else step end, gs_ylo: ylo, gs_yhi: yhi, gs_min_height: if min_height < 1 do 1 else min_height end, gs_kind: kind }
+  end
+
+  -- settings, metres per voxel, then per tile (index tz * width + tx): floor, clearance, fluid, kind, standable (0/1)
+  type TileGrid = { g_set : GridSettings, g_scale : Float, g_floor : NativeIntArr, g_clear : NativeIntArr, g_fluid : NativeIntArr, g_kind : NativeIntArr, g_stand : NativeIntArr }
+
+  doc "The grid's settings."
+  fn settings_of(g : TileGrid) : GridSettings do g.g_set end
+  doc "Tiles across."
+  fn width(g : TileGrid) : Int do g.g_set.gs_width end
+  doc "Tiles in depth."
+  fn depth(g : TileGrid) : Int do g.g_set.gs_depth end
+  doc "Metres per voxel of the world the grid was read from."
+  fn scale(g : TileGrid) : Float do g.g_scale end
+
+  doc "Is tile t on the grid?"
+  fn inside(g : TileGrid, t : (Int, Int)) : Bool do
+    match t do (tx, tz) -> tx >= 0 && tz >= 0 && tx < width(g) && tz < depth(g) end
+  end
+  pfn index(g : TileGrid, t : (Int, Int)) : Int do match t do (tx, tz) -> tz * width(g) + tx end end
+  pfn read(g : TileGrid, a : NativeIntArr, t : (Int, Int)) : Int do if inside(g, t) do NativeArray.get_int(a, index(g, t)) else 0 end end
+
+  doc "The voxel y a unit on tile t has its feet in; 0 off the grid."
+  fn floor(g : TileGrid, t : (Int, Int)) : Int do read(g, g.g_floor, t) end
+  doc "Free cells above tile t's floor; 0 off the grid."
+  fn clearance(g : TileGrid, t : (Int, Int)) : Int do read(g, g.g_clear, t) end
+  doc "Fluid cells from tile t's floor up in its centre column."
+  fn fluid(g : TileGrid, t : (Int, Int)) : Int do read(g, g.g_fluid, t) end
+  doc "The game's terrain kind of the block under tile t's centre column."
+  fn kind(g : TileGrid, t : (Int, Int)) : Int do read(g, g.g_kind, t) end
+  doc "Can a unit stand on tile t at all?"
+  fn standable(g : TileGrid, t : (Int, Int)) : Bool do read(g, g.g_stand, t) == 1 end
+  doc "Can a unit [height] voxels tall stand on tile t?"
+  fn fits(g : TileGrid, t : (Int, Int), height : Int) : Bool do standable(g, t) && clearance(g, t) >= height end
+
+  doc "The middle of tile t on its floor, in metres."
+  fn centre(g : TileGrid, t : (Int, Int)) : (Float, Float, Float) do
+    match t do
+      (tx, tz) ->
+        let n = int_to_float(g.g_set.gs_tile)
+        let s = g.g_scale
+        ((int_to_float(g.g_set.gs_x0 + tx * g.g_set.gs_tile) +. n /. 2.0) *. s, int_to_float(floor(g, t)) *. s, (int_to_float(g.g_set.gs_z0 + tz * g.g_set.gs_tile) +. n /. 2.0) *. s)
+    end
+  end
+
+  doc "The tile under (x, z) metres, if it is on the grid."
+  fn tile_of(g : TileGrid, x : Float, z : Float) : Option((Int, Int)) do
+    let n = int_to_float(g.g_set.gs_tile)
+    let tx = float_to_int(Math.floor((x /. g.g_scale -. int_to_float(g.g_set.gs_x0)) /. n))
+    let tz = float_to_int(Math.floor((z /. g.g_scale -. int_to_float(g.g_set.gs_z0)) /. n))
+    if inside(g, (tx, tz)) do Some((tx, tz)) else None end
+  end
+
+  -- ── Reading the voxels ──────────────────────────────────────────────────
+  pfn solid(w : Strata.World.World, x : Int, y : Int, z : Int) : Bool do Strata.Blocks.collides(Strata.World.registry(w), Strata.World.get_block(w, x, y, z)) end
+
+  -- are cells y .. y + n - 1 free (none collides)?
+  pfn free_run(w : Strata.World.World, x : Int, y : Int, z : Int, n : Int) : Bool do
+    if n <= 0 do true else if solid(w, x, y, z) do false else free_run(w, x, y + 1, z, n - 1) end end
+  end
+
+  -- the column's floor: from y down to ylo + 1, the highest cell with a solid cell under it and room above
+  pfn column_floor(w : Strata.World.World, s : GridSettings, x : Int, y : Int, z : Int) : Option(Int) do
+    if y <= s.gs_ylo do None
+    else if solid(w, x, y - 1, z) && !solid(w, x, y, z) && free_run(w, x, y, z, s.gs_min_height) do Some(y)
+    else column_floor(w, s, x, y - 1, z) end end
+  end
+
+  -- free cells from y up, at most cap
+  pfn free_up(w : Strata.World.World, x : Int, y : Int, z : Int, cap : Int, n : Int) : Int do
+    if n >= cap do cap else if solid(w, x, y + n, z) do n else free_up(w, x, y, z, cap, n + 1) end end
+  end
+
+  pfn fluid_up(w : Strata.World.World, x : Int, y : Int, z : Int, cap : Int, n : Int) : Int do
+    if n >= cap do n else if Strata.Blocks.is_fluid(Strata.World.registry(w), Strata.World.get_block(w, x, y + n, z)) do fluid_up(w, x, y, z, cap, n + 1) else n end end
+  end
+
+  pfn columns(s : GridSettings, tx : Int, tz : Int) : List((Int, Int)) do
+    let n = s.gs_tile
+    let x0 = s.gs_x0 + tx * n
+    let z0 = s.gs_z0 + tz * n
+    List.map(List.range(0, n * n), fn i -> (x0 + i % n, z0 + i / n))
+  end
+
+  pfn lower_median(xs : List(Int)) : Int do
+    let sorted = List.sort_by(xs, fn (a, b) -> a < b)
+    List.nth(sorted, (List.length(sorted) - 1) / 2)
+  end
+
+  -- (floor, clearance, fluid, kind, standable) of one tile
+  pfn read_tile(w : Strata.World.World, s : GridSettings, tx : Int, tz : Int) : (Int, Int, Int, Int, Int) do
+    let cs = columns(s, tx, tz)
+    let floors = List.filter_map(cs, fn c -> match c do (x, z) -> match column_floor(w, s, x, s.gs_yhi, z) do Some(y) -> Some((x, z, y)) | None -> None end end)
+    match floors do
+      Nil -> (0, 0, 0, 0, 0)
+      _ ->
+        let f = lower_median(List.map(floors, fn t -> match t do (_, _, y) -> y end))
+        let near = List.filter(floors, fn t -> match t do (_, _, y) -> int_abs(y - f) <= s.gs_step end)
+        let n = s.gs_tile * s.gs_tile
+        let stand = if List.length(near) * 2 >= n do 1 else 0 end
+        let cap = s.gs_yhi - f
+        let clear = List.fold_left(near, cap, fn (acc, t) -> match t do (x, z, _) -> let c = free_up(w, x, f, z, cap, 0)
+          if c < acc do c else acc end end)
+        let cx = s.gs_x0 + tx * s.gs_tile + s.gs_tile / 2
+        let cz = s.gs_z0 + tz * s.gs_tile + s.gs_tile / 2
+        let k = s.gs_kind(Strata.World.get_block(w, cx, f - 1, cz))
+        let fl = fluid_up(w, cx, f, cz, cap, 0)
+        (f, if stand == 1 do clear else 0 end, fl, k, stand)
+    end
+  end
+
+  pfn write_tile(g : TileGrid, i : Int, v : (Int, Int, Int, Int, Int)) : TileGrid do
+    match v do
+      (f, c, fl, k, st) ->
+        { g with g_floor: NativeArray.set_int(g.g_floor, i, f), g_clear: NativeArray.set_int(g.g_clear, i, c),
+                 g_fluid: NativeArray.set_int(g.g_fluid, i, fl), g_kind: NativeArray.set_int(g.g_kind, i, k), g_stand: NativeArray.set_int(g.g_stand, i, st) }
+    end
+  end
+
+  pfn build_go(w : Strata.World.World, g : TileGrid, i : Int, n : Int) : TileGrid do
+    if i >= n do g
+    else
+      let wd = width(g)
+      build_go(w, write_tile(g, i, read_tile(w, g.g_set, i % wd, i / wd)), i + 1, n)
+    end
+  end
+
+  doc "Read every tile of the grid [s] describes from world [w]."
+  fn build(w : Strata.World.World, s : GridSettings) : TileGrid do
+    let n = s.gs_width * s.gs_depth
+    let g = { g_set: s, g_scale: Strata.World.scale(w), g_floor: NativeArray.make_int(n, 0), g_clear: NativeArray.make_int(n, 0),
+              g_fluid: NativeArray.make_int(n, 0), g_kind: NativeArray.make_int(n, 0), g_stand: NativeArray.make_int(n, 0) }
+    build_go(w, g, 0, n)
+  end
+
+  doc "Read tile t again from [w]; a tile off the grid changes nothing."
+  fn reread(g : TileGrid, w : Strata.World.World, t : (Int, Int)) : TileGrid do
+    if inside(g, t) do match t do (tx, tz) -> write_tile(g, index(g, t), read_tile(w, g.g_set, tx, tz)) end else g end
+  end
+
+  -- the tiles whose columns meet the voxel box [lo, hi] widened by one tile, clipped to the grid
+  pfn tiles_over(g : TileGrid, lo : (Int, Int, Int), hi : (Int, Int, Int)) : List((Int, Int)) do
+    match (lo, hi) do
+      ((x0, _, z0), (x1, _, z1)) ->
+        let s = g.g_set
+        let n = s.gs_tile
+        let fl = fn (v, o) -> float_to_int(Math.floor(int_to_float(v - o) /. int_to_float(n)))
+        let tx0 = Math.max_int(0, fl(x0, s.gs_x0) - 1)
+        let tx1 = Math.min_int(width(g) - 1, fl(x1, s.gs_x0) + 1)
+        let tz0 = Math.max_int(0, fl(z0, s.gs_z0) - 1)
+        let tz1 = Math.min_int(depth(g) - 1, fl(z1, s.gs_z0) + 1)
+        if tx0 > tx1 || tz0 > tz1 do Nil
+        else List.flat_map(List.range(tz0, tz1 + 1), fn tz -> List.map(List.range(tx0, tx1 + 1), fn tx -> (tx, tz))) end
+    end
+  end
+
+  pfn add_new(acc : List((Int, Int)), ts : List((Int, Int))) : List((Int, Int)) do
+    match ts do
+      Nil -> acc
+      Cons(t, rest) -> if List.any(acc, fn u -> u == t) do add_new(acc, rest) else add_new(Cons(t, acc), rest) end
+    end
+  end
+
+  doc "Read again only the tiles an edit touched: those whose columns meet a change's box (Strata.Edit.low, high), widened by one tile so neighbours' clearance follows, clipped to the grid. Answers the grid and the tiles read, each once."
+  fn refresh(g : TileGrid, w : Strata.World.World, changes : List(Strata.Edit.Change)) : (TileGrid, List((Int, Int))) do
+    let ts = List.reverse(List.fold_left(changes, Nil, fn (acc, c) -> add_new(acc, tiles_over(g, Strata.Edit.low(c), Strata.Edit.high(c)))))
+    (List.fold_left(ts, g, fn (h, t) -> reread(h, w, t)), ts)
+  end
+end

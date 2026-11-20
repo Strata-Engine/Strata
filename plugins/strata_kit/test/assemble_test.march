@@ -1,0 +1,129 @@
+-- Assemble: builds into rigs.
+mod StrataKit.Test.Assemble do
+
+  needs IO.Clock      -- charged to every test module once any uses Check.all (GAPS S3)
+
+  needs IO.Console
+
+  needs IO.FileRead
+
+  needs IO.FileWrite
+  needs IO.Process
+  import Test
+  alias StrataKit.Assemble as KitA
+  alias StrataKit.Build as KitAb
+  alias StrataKit.Test.Parts as KitAp
+
+  pfn near(a : Float, b : Float) : Bool do Math.abs(a -. b) < 0.00001 end
+  pfn same_u8(a : NativeU8Arr, b : NativeU8Arr) : Bool do NativeArray.length_u8(a) == NativeArray.length_u8(b) && List.all(List.range(0, NativeArray.length_u8(a)), fn i -> NativeArray.get_u8(a, i) == NativeArray.get_u8(b, i)) end
+  pfn pal() : List((Int, Float, Float, Float, Float, Float)) do List.map(List.range(1, 10), fn i -> (i, 0.5, 0.5, 0.5, 0.8, 0.0)) end
+  pfn set() : StrataKit.Assemble.AssembleSettings do KitA.settings(0.1, pal(), Nil) end
+  pfn asm(b : StrataKit.Build.KitBuild) : (Strata.Rig.Rig, StrataKit.Assemble.KitMap, List((List(String), String))) do KitA.assemble(KitAp.all(), b, KitAp.ok, set()) end
+  pfn full() : StrataKit.Build.KitBuild do
+    KitAb.node(0, [("arm_l", KitAb.node(1, [("hand_l", KitAb.leaf(3))])), ("arm_r", KitAb.node(1, [("hand_r", KitAb.leaf(2))])),
+                   ("shoulder_l", KitAb.leaf(9)), ("shoulder_r", KitAb.leaf(9)), ("back", KitAb.leaf(7)), ("hip", KitAb.leaf(4))])
+  end
+
+  describe "Assemble" do
+    test "a core alone is one rig part" do
+      match asm(KitAb.leaf(0)) do (r, _, probs) -> Test.assert_true(Strata.Rig.part_count(r) == 1 && List.is_empty(probs), "one part") end
+    end
+    test "the arm's attach lands on the core's shoulder mount" do
+      match asm(KitAb.node(0, [("arm_r", KitAb.leaf(1))])) do
+        (r, m, _) ->
+          match KitA.rig_part(m, ["arm_r"], "part") do
+            Some(rp) -> Test.assert_true(Strata.Rig.pivot_at(r, rp) == (0.0, 10.0, 4.0) && Strata.Rig.anchor_at(r, rp) == (4.0, 2.0, 2.0), "pivot at the mount, anchor at the attach")
+            None -> Test.fail("no rig part")
+          end
+      end
+    end
+    test "a part facing +z on a mount facing +x is turned a quarter about y" do
+      let q = KitA.frame_turn((0.0, 0.0, 1.0), (0.0, 1.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0))
+      let h = Math.sqrt(0.5)
+      Test.assert_true(near(Strata.Math.Quat.x(q), 0.0) && near(Strata.Math.Quat.y(q), h) && near(Strata.Math.Quat.z(q), 0.0) && near(Strata.Math.Quat.w(q), h), "y quarter turn")
+    end
+    test "a right arm on the left mount is mirrored" do
+      match asm(KitAb.node(0, [("arm_l", KitAb.leaf(1))])) do
+        (r, m, _) ->
+          match KitA.rig_part(m, ["arm_l"], "part") do
+            Some(rp) -> Test.assert_true(Strata.Rig.anchor_at(r, rp) == (0.0, 2.0, 2.0) && same_u8(Strata.Rig.grid(r, rp), StrataKit.Part.piece_grid(List.head(StrataKit.Part.pieces(StrataKit.Part.mirror(KitAp.arm_r()))))), "mirrored")
+            None -> Test.fail("no rig part")
+          end
+      end
+    end
+    test "legs register two rig legs" do
+      match asm(KitAb.node(0, [("hip", KitAb.leaf(4))])) do (r, _, _) -> Test.assert_true(List.length(Strata.Rig.legs(r)) == 2, "two legs") end
+    end
+    test "muzzle markers become sockets and markers finds them" do
+      match asm(KitAb.node(0, [("arm_r", KitAb.node(1, [("hand_r", KitAb.leaf(2))]))])) do
+        (r, m, _) -> Test.assert_true(List.length(Strata.Rig.sockets(r)) == 1 && List.map(KitA.markers(m, "muzzle"), fn e -> match e do (p, _) -> p end) == [["arm_r", "hand_r"]], "one muzzle")
+      end
+    end
+    test "a misfit node and its subtree are skipped and reported, the rest assembled" do
+      match asm(KitAb.node(0, [("shoulder_r", KitAb.leaf(8)), ("back", KitAb.leaf(7))])) do
+        (r, m, probs) -> Test.assert_true(List.length(probs) == 1 && Option.is_none(KitA.rig_part(m, ["shoulder_r"], "part")) && Option.is_some(KitA.rig_part(m, ["back"], "part")) && Strata.Rig.part_count(r) == 2, "pod kept, gun left out")
+      end
+    end
+    test "past 64 parts the rest is reported, not silently dropped" do
+      -- 22 cores chained arm_r to arm_r is not a fit; use pods on a core of many back mounts instead
+      let many = { KitAp.core() with kp_mounts: List.map(List.range(0, 70), fn i -> StrataKit.Part.mount_of("back", "M", "b" ++ int_to_string(i), StrataKit.Part.marker("b" ++ int_to_string(i), "part", 5.0, 8.0, 0.0, KitAp.fwd(), KitAp.upv()))) }
+      let b = KitAb.node(0, List.map(List.range(0, 70), fn i -> ("b" ++ int_to_string(i), KitAb.leaf(1))))
+      match KitA.assemble([many, KitAp.pod()], b, KitAp.ok, set()) do
+        (r, _, probs) -> Test.assert_true(Strata.Rig.part_count(r) == 64 && List.length(probs) == 7, "64 parts, 7 reported")
+      end
+    end
+    test "trim colours replace the palette entries at trim indices" do
+      match KitA.assemble(KitAp.all(), KitAb.leaf(0), KitAp.ok, KitA.settings(0.1, pal(), [(2, (1.0, 0.0, 0.0))])) do
+        (r, _, _) -> Test.assert_true(List.any(Strata.Rig.palette(r), fn c -> match c do (i, cr, cg, cb, _, _) -> i == 2 && cr == 1.0 && cg == 0.0 && cb == 0.0 end), "trim")
+      end
+    end
+    test "a full build assembles within the budget" do
+      let t0 = Authority.must(System.now_ms())
+      match asm(full()) do
+        (r, _, probs) ->
+          let ms = Authority.must(System.now_ms()) - t0
+          println("kit: assembled " ++ int_to_string(Strata.Rig.part_count(r)) ++ " rig parts in " ++ int_to_string(ms) ++ " ms (budget 5)")
+          Test.assert_true(List.is_empty(probs) && ms < 20, "within four times the budget")
+      end
+    end
+    test "carry_damage keeps carved grids across a re-assembly" do
+      match asm(full()) do
+        (r1, m1, _) ->
+          match StrataKit.Damage.carve(r1, 0, 5, 6, 7, 2.0, StrataKit.Damage.carve_settings(9)) do
+            (r1c, n) ->
+              -- the right hand's rifle swapped for the light gun: the core is the same node
+              let b2 = KitAb.put(full(), ["arm_r", "hand_r"], Some(KitAb.leaf(9)))
+              match asm(b2) do
+                (r2, m2, _) ->
+                  let r3 = KitA.carry_damage(r1c, m1, r2, m2)
+                  Test.assert_true(n > 0 && same_u8(Strata.Rig.grid(r3, 0), Strata.Rig.grid(r1c, 0)) && !same_u8(Strata.Rig.grid(r2, 0), Strata.Rig.grid(r1c, 0)), "the core keeps its hole")
+              end
+          end
+      end
+    end
+    test "carry_damage does not carry a part's damage onto a different part of the same size" do
+      -- part 10: the rifle's size and shape in another colour
+      let variant = { KitAp.rifle() with kp_pieces: [StrataKit.Part.piece_of("part", "", 2, 2, 10, NativeArray.make_u8(40, 5), (0.0, 0.0, 0.0), (1.0, 1.0, 2.0))] }
+      let ps = List.append(KitAp.all(), [variant])
+      match KitA.assemble(ps, full(), KitAp.ok, set()) do
+        (r1, m1, _) ->
+          match KitA.rig_part(m1, ["arm_r", "hand_r"], "part") do
+            Some(rp) ->
+              match StrataKit.Damage.carve(r1, rp, 1, 1, 9, 1.5, StrataKit.Damage.carve_settings(9)) do
+                (r1c, n) ->
+                  let b2 = KitAb.put(full(), ["arm_r", "hand_r"], Some(KitAb.leaf(10)))
+                  match KitA.assemble(ps, b2, KitAp.ok, set()) do
+                    (r2, m2, _) ->
+                      let r3 = KitA.carry_damage(r1c, m1, r2, m2)
+                      match KitA.rig_part(m2, ["arm_r", "hand_r"], "part") do
+                        Some(rp2) -> Test.assert_true(n > 0 && same_u8(Strata.Rig.grid(r3, rp2), Strata.Rig.grid(r2, rp2)) && same_u8(Strata.Rig.grid(r3, 0), Strata.Rig.grid(r1c, 0)), "the new gun is fresh, the core kept")
+                        None -> Test.fail("no new gun")
+                      end
+                  end
+              end
+            None -> Test.fail("no rifle")
+          end
+      end
+    end
+  end
+end

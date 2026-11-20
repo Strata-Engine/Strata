@@ -1,0 +1,245 @@
+-- PartFile — a part from a MagicaVoxel file and its sidecar.
+--
+-- One part per .vox file, drawn with the game's shared palette. Models by
+-- name: `part`, the root piece; `piece:<name>:<parent>`, a piece jointed to
+-- an earlier one, with a marker `joint:<name>` whose centre is the joint;
+-- `attach` (exactly one), where the part joins its parent;
+-- `mount:<slot>:<size>:<name>`, a mount it offers; `fx:<name>`, an effect
+-- marker. A marker is a small model whose centre is the point. A marker's
+-- facing and up follow its name as `@<axis>^<axis>` in the file's axes
+-- (`@+y^+z`, forward and up, when absent), because Strata.Vox reads a
+-- model's position but not its rotation.
+--
+-- Axes are changed as Strata.Character changes them: the rig's x is the
+-- file's -x, its y the file's z (up), its z the file's y. A model's low
+-- corner is its translation less floor(size / 2).
+--
+-- The sidecar beside it (<name>.part) is `key = value` lines (`#` comments):
+-- `slots` (space-separated), `size`, `side`, and numeric tags.
+mod StrataKit.PartFile do
+
+  needs IO.FileRead
+  needs IO.Foreign
+
+  alias StrataKit.Part as PfP
+
+  doc "The sidecar's (key, value) lines; an error names the first line that is not `key = value`."
+  fn parse_sidecar(text : String) : Result(List((String, String)), String) do
+    sidecar_go(String.split(text, "\n"), 1, Nil)
+  end
+  pfn sidecar_go(lines : List(String), n : Int, acc : List((String, String))) : Result(List((String, String)), String) do
+    match lines do
+      Nil -> Ok(List.reverse(acc))
+      Cons(raw, rest) ->
+        let l = String.trim(match String.split_first(raw, "#") do Some((before, _)) -> before | None -> raw end)
+        if String.is_empty(l) do sidecar_go(rest, n + 1, acc)
+        else
+          match String.split_first(l, "=") do
+            Some((k, v)) ->
+              let key = String.trim(k)
+              if String.is_empty(key) do Err("part sidecar: line " ++ int_to_string(n) ++ " has no key") else sidecar_go(rest, n + 1, Cons((key, String.trim(v)), acc)) end
+            None -> Err("part sidecar: line " ++ int_to_string(n) ++ " is not key = value: " ++ l)
+          end
+        end
+    end
+  end
+
+  -- a model in the rig's axes: name without the suffix, the suffix, low corner, size, voxels
+  type PfModel = PfModel(String, String, (Float, Float, Float), (Int, Int, Int), Strata.Vox.VoxModel)
+
+  pfn rig_model(m : Strata.Vox.VoxModel) : PfModel do
+    let (base, orient) = match String.split_first(m.name, "@") do Some((b, o)) -> (b, o) | None -> (m.name, "") end
+    let lx = 0 - (m.tx - m.sx / 2) - m.sx
+    let ly = m.tz - m.sz / 2
+    let lz = m.ty - m.sy / 2
+    PfModel(base, orient, (int_to_float(lx), int_to_float(ly), int_to_float(lz)), (m.sx, m.sz, m.sy), m)
+  end
+  pfn model_name(m : PfModel) : String do match m do PfModel(n, _, _, _, _) -> n end end
+  pfn model_centre(m : PfModel) : (Float, Float, Float) do
+    match m do PfModel(_, _, (x, y, z), (sx, sy, sz), _) -> (x +. int_to_float(sx) /. 2.0, y +. int_to_float(sy) /. 2.0, z +. int_to_float(sz) /. 2.0) end
+  end
+
+  -- a file axis (+x, -z, ...) as a rig direction
+  pfn axis(s : String) : Option((Float, Float, Float)) do
+    if s == "+x" do Some((-1.0, 0.0, 0.0)) else if s == "-x" do Some((1.0, 0.0, 0.0))
+    else if s == "+y" do Some((0.0, 0.0, 1.0)) else if s == "-y" do Some((0.0, 0.0, -1.0))
+    else if s == "+z" do Some((0.0, 1.0, 0.0)) else if s == "-z" do Some((0.0, -1.0, 0.0))
+    else None end end end end end end
+  end
+  pfn orientation(o : String) : Result(((Float, Float, Float), (Float, Float, Float)), String) do
+    if String.is_empty(o) do Ok(((0.0, 0.0, 1.0), (0.0, 1.0, 0.0)))
+    else
+      match String.split_first(o, "^") do
+        Some((f, u)) -> match (axis(f), axis(u)) do (Some(fv), Some(uv)) -> Ok((fv, uv)) | _ -> Err("part: the facing @" ++ o ++ " does not parse") end
+        None -> match axis(o) do Some(fv) -> Ok((fv, (0.0, 1.0, 0.0))) | None -> Err("part: the facing @" ++ o ++ " does not parse") end
+      end
+    end
+  end
+
+  -- the model's voxels as a rig-axis grid; an error for a colour past the palette
+  pfn grid_of(m : PfModel, palette_size : Int) : Result(NativeU8Arr, String) do
+    match m do
+      PfModel(n, _, _, (sx, sy, sz), vm) ->
+        let k = NativeArray.length_u8(vm.voxels) / 4
+        grid_go(vm.voxels, 0, k, sx, sy, NativeArray.make_u8(sx * sy * sz, 0), palette_size, n)
+    end
+  end
+  pfn grid_go(v : NativeU8Arr, i : Int, k : Int, sx : Int, sy : Int, g : NativeU8Arr, palette_size : Int, name : String) : Result(NativeU8Arr, String) do
+    if i >= k do Ok(g)
+    else
+      let fx = NativeArray.get_u8(v, i * 4)
+      let fy = NativeArray.get_u8(v, i * 4 + 1)
+      let fz = NativeArray.get_u8(v, i * 4 + 2)
+      let c = NativeArray.get_u8(v, i * 4 + 3)
+      if c >= palette_size do Err("part: model " ++ name ++ " uses colour " ++ int_to_string(c) ++ ", past the palette's " ++ int_to_string(palette_size))
+      else grid_go(v, i + 1, k, sx, sy, NativeArray.set_u8(g, (sx - 1 - fx) + sx * (fz + sy * fy), c), palette_size, name) end
+    end
+  end
+
+  pfn sub3(a : (Float, Float, Float), b : (Float, Float, Float)) : (Float, Float, Float) do match (a, b) do ((ax, ay, az), (bx, by0, bz)) -> (ax -. bx, ay -. by0, az -. bz) end end
+  pfn contains(m : PfModel, p : (Float, Float, Float)) : Bool do
+    match (m, p) do
+      (PfModel(_, _, (x, y, z), (sx, sy, sz), _), (px, py, pz)) ->
+        px >= x && py >= y && pz >= z && px < x +. int_to_float(sx) && py < y +. int_to_float(sy) && pz < z +. int_to_float(sz)
+    end
+  end
+
+  -- pieces as (piece name, parent, model); the root is named "part"
+  pfn piece_models(ms : List(PfModel)) : Result(List((String, String, PfModel)), String) do
+    match List.filter(ms, fn m -> model_name(m) == "part") do
+      Cons(root, Nil) -> pieces_go(List.filter(ms, fn m -> String.starts_with(model_name(m), "piece:")), [("part", "", root)])
+      Nil -> Err("part: no model named part")
+      _ -> Err("part: more than one model named part")
+    end
+  end
+  pfn pieces_go(ms : List(PfModel), acc : List((String, String, PfModel))) : Result(List((String, String, PfModel)), String) do
+    match ms do
+      Nil -> Ok(acc)
+      Cons(m, rest) ->
+        match String.split(model_name(m), ":") do
+          [_, n, parent] ->
+            if List.any(acc, fn e -> match e do (pn, _, _) -> pn == parent end) do pieces_go(rest, List.append(acc, [(n, parent, m)]))
+            else Err("part: piece " ++ n ++ "'s parent " ++ parent ++ " is not an earlier piece") end
+          _ -> Err("part: the piece name " ++ model_name(m) ++ " is not piece:<name>:<parent>")
+        end
+    end
+  end
+
+  -- the piece a point is in (the first whose box holds it, else the root): its name and low corner
+  pfn owner(ps : List((String, String, PfModel)), p : (Float, Float, Float)) : (String, (Float, Float, Float)) do
+    match List.find(ps, fn e -> match e do (_, _, m) -> contains(m, p) end) do
+      Some((n, _, PfModel(_, _, low, _, _))) -> (n, low)
+      None -> match List.head(ps) do (n, _, PfModel(_, _, low, _, _)) -> (n, low) end
+    end
+  end
+
+  pfn marker_of(ps : List((String, String, PfModel)), name : String, m : PfModel) : Result(StrataKit.Part.KitMarker, String) do
+    match m do
+      PfModel(_, o, _, _, _) ->
+        match orientation(o) do
+          Err(e) -> Err(e)
+          Ok((f, u)) ->
+            let c = model_centre(m)
+            match owner(ps, c) do (pn, low) -> match sub3(c, low) do (x, y, z) -> Ok(PfP.marker(name, pn, x, y, z, f, u)) end end
+        end
+    end
+  end
+
+  pfn collect(rs : List(Result(a, String)), acc : List(a)) : Result(List(a), String) do
+    match rs do Nil -> Ok(List.reverse(acc)) | Cons(Ok(x), t) -> collect(t, Cons(x, acc)) | Cons(Err(e), _) -> Err(e) end
+  end
+
+  pfn num(s : String) : Option(Float) do
+    match String.to_float(s) do Ok(v) -> Some(v) | Err(_) -> match String.to_int(s) do Ok(i) -> Some(int_to_float(i)) | Err(_) -> None end end
+  end
+
+  pfn build_piece(ps : List((String, String, PfModel)), joints : List(PfModel), palette_size : Int, e : (String, String, PfModel)) : Result(StrataKit.Part.KitPiece, String) do
+    match e do
+      (n, parent, m) ->
+        match grid_of(m, palette_size) do
+          Err(err) -> Err(err)
+          Ok(g) ->
+            match m do
+              PfModel(_, _, low, (sx, sy, sz), _) ->
+                if parent == "" do Ok(PfP.piece_of(n, "", sx, sy, sz, g, (0.0, 0.0, 0.0), (0.0, 0.0, 0.0)))
+                else
+                  match List.find(joints, fn j -> model_name(j) == "joint:" ++ n) do
+                    None -> Err("part: piece " ++ n ++ " has no joint:" ++ n)
+                    Some(j) ->
+                      let c = model_centre(j)
+                      let plow = match List.find(ps, fn q -> match q do (qn, _, _) -> qn == parent end) do Some((_, _, PfModel(_, _, pl, _, _))) -> pl | None -> low end
+                      Ok(PfP.piece_of(n, parent, sx, sy, sz, g, sub3(c, plow), sub3(c, low)))
+                  end
+                end
+            end
+        end
+    end
+  end
+
+  doc "A part from a parsed .vox and its sidecar's lines, with colours below [palette_size]. Errors: no `part` or two; not exactly one `attach`; a piece whose parent is unknown or later, or without its joint; a marker name or facing that does not parse; a colour past the palette; a tag that is not a number."
+  fn from_vox(v : Strata.Vox.Vox, sidecar : List((String, String)), palette_size : Int) : Result(StrataKit.Part.KitPart, String) do
+    let ms = List.map(v.models, fn m -> rig_model(m))
+    let known = fn n -> n == "part" || n == "attach" || String.starts_with(n, "piece:") || String.starts_with(n, "joint:") || String.starts_with(n, "mount:") || String.starts_with(n, "fx:")
+    match List.find(ms, fn m -> !known(model_name(m))) do
+      Some(m) -> Err("part: the model name " ++ model_name(m) ++ " is not part, piece:, joint:, attach, mount: or fx:")
+      None ->
+        match piece_models(ms) do
+          Err(e) -> Err(e)
+          Ok(ps) ->
+            let joints = List.filter(ms, fn m -> String.starts_with(model_name(m), "joint:"))
+            match List.filter(ms, fn m -> model_name(m) == "attach") do
+              Cons(am, Nil) ->
+                match collect(List.map(ps, fn e -> build_piece(ps, joints, palette_size, e)), Nil) do
+                  Err(e) -> Err(e)
+                  Ok(pieces) ->
+                    match marker_of(ps, "attach", am) do
+                      Err(e) -> Err(e)
+                      Ok(att) -> assemble_part(ps, ms, pieces, att, sidecar)
+                    end
+                end
+              Nil -> Err("part: no attach marker")
+              _ -> Err("part: more than one attach marker")
+            end
+        end
+    end
+  end
+
+  pfn mount_of_model(ps : List((String, String, PfModel)), m : PfModel) : Result(StrataKit.Part.KitMount, String) do
+    match String.split(model_name(m), ":") do
+      [_, slot, size, name] -> match marker_of(ps, name, m) do Ok(k) -> Ok(PfP.mount_of(slot, size, name, k)) | Err(e) -> Err(e) end
+      _ -> Err("part: the mount name " ++ model_name(m) ++ " is not mount:<slot>:<size>:<name>")
+    end
+  end
+
+  pfn assemble_part(ps : List((String, String, PfModel)), ms : List(PfModel), pieces : List(StrataKit.Part.KitPiece), att : StrataKit.Part.KitMarker, sidecar : List((String, String))) : Result(StrataKit.Part.KitPart, String) do
+    let root = PfP.with_anchor(List.head(pieces), PfP.marker_at(att))
+    match collect(List.map(List.filter(ms, fn m -> String.starts_with(model_name(m), "mount:")), fn m -> mount_of_model(ps, m)), Nil) do
+      Err(e) -> Err(e)
+      Ok(mounts) ->
+        match collect(List.map(List.filter(ms, fn m -> String.starts_with(model_name(m), "fx:")), fn m -> marker_of(ps, String.slice_bytes(model_name(m), 3, String.byte_size(model_name(m)) - 3), m)), Nil) do
+          Err(e) -> Err(e)
+          Ok(fx) ->
+            let get = fn k -> match List.find(sidecar, fn kv -> match kv do (key, _) -> key == k end) do Some((_, v)) -> v | None -> "" end
+            let slots = List.filter(String.split(get("slots"), " "), fn s -> !String.is_empty(s))
+            let tag_lines = List.filter(sidecar, fn kv -> match kv do (key, _) -> key != "slots" && key != "size" && key != "side" end)
+            match collect(List.map(tag_lines, fn kv -> match kv do (key, v) -> match num(v) do Some(x) -> Ok((key, x)) | None -> Err("part sidecar: " ++ key ++ " = " ++ v ++ " is not a number") end end), Nil) do
+              Err(e) -> Err(e)
+              Ok(tags) -> Ok({ kp_pieces: Cons(root, List.tail(pieces)), kp_attach: att, kp_mounts: mounts, kp_fx: fx, kp_slots: slots, kp_size: get("size"), kp_side: get("side"), kp_tags: tags })
+            end
+        end
+    end
+  end
+
+  doc "Read [path] (a .vox) and its sidecar (the same path with .part for .vox) as a part, colours below [palette_size]."
+  fn load(path : String, palette_size : Int) : Result(StrataKit.Part.KitPart, String) do
+    let side = (if String.ends_with(path, ".vox") do String.slice_bytes(path, 0, String.byte_size(path) - 4) else path end) ++ ".part"
+    match Strata.Vox.read(path) do
+      Err(e) -> Err(e)
+      Ok(v) ->
+        match Authority.must(File.read(side)) do
+          Err(_) -> Err("part: can't read " ++ side)
+          Ok(text) -> match parse_sidecar(text) do Ok(kv) -> from_vox(v, kv, palette_size) | Err(e) -> Err(e) end
+        end
+    end
+  end
+end

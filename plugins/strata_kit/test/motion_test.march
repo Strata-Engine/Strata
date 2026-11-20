@@ -1,0 +1,129 @@
+-- Motion: the walk, treads and hover.
+mod StrataKit.Test.Motion do
+
+  needs IO.Clock      -- charged to every test module once any uses Check.all (GAPS S3)
+
+  needs IO.Console
+
+  needs IO.FileRead
+
+  needs IO.FileWrite
+  needs IO.Process
+  import Test
+  alias StrataKit.Motion as KitMo
+  alias StrataKit.Build as KitMb
+  alias StrataKit.Test.Parts as KitMp
+
+  pfn pal() : List((Int, Float, Float, Float, Float, Float)) do List.map(List.range(1, 10), fn i -> (i, 0.5, 0.5, 0.5, 0.8, 0.0)) end
+  pfn rig_of(b : StrataKit.Build.KitBuild) : (Strata.Rig.Rig, StrataKit.Assemble.KitMap) do
+    match StrataKit.Assemble.assemble(KitMp.all(), b, KitMp.ok, StrataKit.Assemble.settings(0.1, pal(), Nil)) do (r, m, _) -> (r, m) end
+  end
+  pfn walker() : StrataKit.Motion.KitGait do match rig_of(KitMb.node(0, [("hip", KitMb.leaf(4))])) do (r, _) -> KitMo.gait(r) end end
+  pfn hdist(a : (Float, Float, Float), b : (Float, Float, Float)) : Float do match (a, b) do ((ax, _, az), (bx, _, bz)) -> Math.sqrt((ax -. bx) *. (ax -. bx) +. (az -. bz) *. (az -. bz)) end end
+
+  -- walk at [speed] along +z for n frames of dt: the gait, the targets at each frame, the swing flags at each frame, the position
+  pfn walk(g : StrataKit.Motion.KitGait, n : Int, dt : Float, speed : Float, z : Float, heading : Float, turn : Float, acc : List((List((Float, Float, Float)), List(Bool), Float))) : (StrataKit.Motion.KitGait, List((List((Float, Float, Float)), List(Bool), Float))) do
+    if n <= 0 do (g, List.reverse(acc))
+    else
+      match KitMo.gait_step(g, dt, (0.0, 0.0, z), heading, speed, turn) do
+        (g2, ts, _) -> walk(g2, n - 1, dt, speed, z +. speed *. dt, heading +. turn *. dt, turn, Cons((ts, KitMo.swinging(g2), z), acc))
+      end
+    end
+  end
+
+
+  pfn reach_ok(ts : List((Float, Float, Float)), shape : List((Float, Float)), z : Float) : Bool do
+    match (ts, shape) do
+      (Cons((tx, _, tz), tr), Cons((across, len), sr)) -> Math.sqrt((tx -. across) *. (tx -. across) +. (tz -. z) *. (tz -. z)) <= len +. 0.0001 && reach_ok(tr, sr, z)
+      _ -> true
+    end
+  end
+  pfn frames_ok(fs : List((List((Float, Float, Float)), List(Bool), Float)), shape : List((Float, Float))) : Bool do
+    match fs do Nil -> true | Cons((ts, _, z), rest) -> reach_ok(ts, shape, z) && frames_ok(rest, shape) end
+  end
+  pfn under(ts : List((Float, Float, Float)), shape : List((Float, Float)), z : Float) : Bool do
+    match (ts, shape) do
+      (Cons((tx, _, tz), tr), Cons((across, _), sr)) -> Math.abs(tx -. across) < 0.06 && Math.abs(tz -. z) < 0.06 && under(tr, sr, z)
+      _ -> true
+    end
+  end
+  pfn start_of(a : List(Bool), b : List(Bool)) : Option(Int) do
+    if !List.nth(a, 0) && List.nth(b, 0) do Some(0) else if !List.nth(a, 1) && List.nth(b, 1) do Some(1) else None end end
+  end
+  pfn starts(fs : List((List((Float, Float, Float)), List(Bool), Float))) : List(Int) do
+    match fs do
+      Cons((_, a, _), Cons((tb, b, zb), rest)) -> match start_of(a, b) do Some(i) -> Cons(i, starts(Cons((tb, b, zb), rest))) | None -> starts(Cons((tb, b, zb), rest)) end
+      _ -> Nil
+    end
+  end
+  pfn plants(fs : List((List((Float, Float, Float)), List(Bool), Float))) : List((Float, Float, Float)) do
+    match fs do Nil -> Nil | Cons((ts, sw, _), rest) -> if !List.nth(sw, 0) do Cons(List.nth(ts, 0), plants(rest)) else plants(rest) end end
+  end
+  pfn moves(ps : List((Float, Float, Float))) : List(Float) do
+    match ps do Cons(a, Cons(b, rest)) -> let d = hdist(a, b)
+      if d > 0.01 do Cons(d, moves(Cons(b, rest))) else moves(Cons(b, rest)) end | _ -> Nil end
+  end
+  pfn any_moved(a : List((Float, Float, Float)), b : List((Float, Float, Float))) : Bool do
+    match (a, b) do (Cons(x, xs), Cons(y, ys)) -> hdist(x, y) > 0.05 || any_moved(xs, ys) | _ -> false end
+  end
+  pfn alternate(xs : List(Int)) : Bool do match xs do Cons(a, Cons(b, rest)) -> a != b && alternate(Cons(b, rest)) | _ -> true end end
+
+  describe "Motion" do
+    test "standing still keeps both feet planted" do
+      match walk(walker(), 60, 1.0 /. 60.0, 0.0, 0.0, 0.0, 0.0, Nil) do
+        (_, frames) -> Test.assert_true(List.all(frames, fn f -> match f do (ts, sw, _) -> !List.any(sw, fn b -> b) && ts == (match List.head(frames) do (t0, _, _) -> t0 end) end), "still")
+      end
+    end
+    test "walking forward, feet alternate and each step is one stride" do
+      match walk(walker(), 240, 1.0 /. 60.0, 1.0, 0.0, 0.0, 0.0, Nil) do
+        (g, frames) ->
+          let n = match KitMo.leg_shape(g) do Cons((_, len), _) -> len | Nil -> 1.0 end
+          let st = starts(frames)
+          Test.assert_true(List.length(st) >= 4 && alternate(st), "alternating steps")
+          Test.assert_true(List.all(List.drop(moves(plants(frames)), 1), fn d -> Math.abs(d -. 0.8 *. n) < 0.25 *. n), "a stride a step")
+      end
+    end
+    test "no foot target is more than leg length from its hip" do
+      match walk(walker(), 240, 1.0 /. 60.0, 1.0, 0.0, 0.0, 0.0, Nil) do
+        (g, frames) -> Test.assert_true(frames_ok(frames, KitMo.leg_shape(g)), "within reach")
+      end
+    end
+    test "speed 0 after walking settles the feet under the hips within half a second" do
+      match walk(walker(), 100, 1.0 /. 60.0, 1.0, 0.0, 0.0, 0.0, Nil) do
+        (g1, frames) ->
+          let z = match List.last(frames) do (_, _, zz) -> zz +. 1.0 /. 60.0 end
+          match walk(g1, 30, 1.0 /. 60.0, 0.0, z, 0.0, 0.0, Nil) do
+            (g2, after) ->
+              match List.last(after) do
+                (ts, sw, _) -> Test.assert_true(!List.any(sw, fn b -> b) && under(ts, KitMo.leg_shape(g2), z), "under the hips")
+              end
+          end
+      end
+    end
+    test "turning in place moves the feet round the hips" do
+      match walk(walker(), 60, 1.0 /. 60.0, 0.0, 0.0, 0.0, Math.pi() /. 2.0, Nil) do
+        (_, frames) ->
+          let first = match List.head(frames) do (ts, _, _) -> ts end
+          let last = match List.last(frames) do (ts, _, _) -> ts end
+          Test.assert_true(any_moved(first, last), "feet moved")
+      end
+    end
+    test "hips are placed from the legs' own anchor, not the core's" do
+      -- legs whose attach (anchor) is at x 7: thighs at x 8 and 2 are +1 and -5 voxels (0.1 m) from it
+      let legs7 = { KitMp.legs() with kp_attach: StrataKit.Part.marker("attach", "part", 7.0, 2.0, 2.0, KitMp.fwd(), KitMp.upv()) }
+      let ps = List.append(KitMp.all(), [legs7])
+      match StrataKit.Assemble.assemble(ps, KitMb.node(0, [("hip", KitMb.leaf(10))]), KitMp.ok, StrataKit.Assemble.settings(0.1, pal(), Nil)) do
+        (r, _, _) ->
+          let acr = List.map(KitMo.leg_shape(KitMo.gait(r)), fn e -> match e do (a, _) -> float_to_int(Math.round(a *. 10.0)) end)
+          Test.assert_true(acr == [1, -5], "across +0.1 and -0.5 m")
+      end
+    end
+    test "wheels finds the wheel pieces" do
+      match rig_of(KitMb.node(0, [("hip", KitMb.leaf(5))])) do (_, m) -> Test.assert_true(List.length(KitMo.wheels(m)) == 2, "two wheels") end
+    end
+    test "hover's offset is within 0.15 m and periodic in 2 s" do
+      Test.assert_true(List.all(List.range(0, 40), fn i -> match KitMo.hover_offset(int_to_float(i) *. 0.1) do (h, _) -> Math.abs(h) <= 0.15 end), "within 0.15")
+      Test.assert_true(match (KitMo.hover_offset(0.3), KitMo.hover_offset(2.3)) do ((a, p), (b, q)) -> Math.abs(a -. b) < 0.0001 && Math.abs(p -. q) < 0.0001 end, "period 2 s")
+    end
+  end
+end

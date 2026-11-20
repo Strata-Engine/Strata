@@ -1,0 +1,157 @@
+-- Camera: the XCOM-style orbit, pan, zoom, levels and cutaway.
+mod StrataTactics.Test.Camera do
+
+  needs IO.Clock      -- charged to every test module once any uses Check.all (GAPS S3)
+
+  needs IO.Console
+
+  needs IO.FileRead
+
+  needs IO.FileWrite
+  needs IO.Process
+  import Test
+  alias StrataTactics.Camera as TacCam
+
+  pfn near(a : Float, b : Float) : Bool do Math.abs(a -. b) < 0.001 end
+  pfn flat0(x : Float, z : Float) : Float do 0.0 end
+  pfn keys(held : List(Int)) : Strata.Input.Raw do Strata.Input.raw(held, Nil, Nil, Nil) end
+  -- an input stepped through raw states in turn
+  pfn inputs(rs : List(Strata.Input.Raw)) : Strata.Input.Input do
+    List.fold_left(rs, Strata.Input.start(Strata.Input.new(TacCam.bindings())), fn (i, r) -> Strata.Input.step(i, r))
+  end
+  pfn cam() : StrataTactics.Camera.TacticsCamera do TacCam.start(TacCam.settings(), (0.0, 0.0, 0.0), 0.0) end
+  pfn run(c : StrataTactics.Camera.TacticsCamera, i : Strata.Input.Input, n : Int, dt : Float) : StrataTactics.Camera.TacticsCamera do
+    if n <= 0 do c else run(TacCam.step(c, i, None, 0.0, 800.0, 600.0, dt, flat0), i, n - 1, dt) end
+  end
+
+  describe "Camera turning" do
+    test "rotate_right turns 45 degrees over a quarter second, not at once" do
+      let c1 = TacCam.step(cam(), inputs([keys([69])]), None, 0.0, 800.0, 600.0, 0.125, flat0)
+      Test.assert_true(TacCam.yaw(c1) > 1.0 && TacCam.yaw(c1) < 44.0, "partway after 0.125 s")
+      let c2 = run(c1, inputs([keys([69]), keys(Nil)]), 10, 0.02)
+      Test.assert_true(near(TacCam.yaw(c2), 45.0), "45 after 0.325 s")
+    end
+    test "two presses queue to 90 degrees" do
+      let c1 = TacCam.step(cam(), inputs([keys([69])]), None, 0.0, 800.0, 600.0, 0.01, flat0)
+      let c2 = TacCam.step(c1, inputs([keys([69]), keys(Nil)]), None, 0.0, 800.0, 600.0, 0.01, flat0)
+      let c3 = TacCam.step(c2, inputs([keys(Nil), keys([69])]), None, 0.0, 800.0, 600.0, 0.01, flat0)
+      Test.assert_true(near(TacCam.yaw(run(c3, inputs([keys([69]), keys(Nil)]), 60, 0.01)), 90.0), "90")
+    end
+    test "with free on, drag turns by pointer motion" do
+      let c0 = TacCam.start({ TacCam.settings() with cm_free: true }, (0.0, 0.0, 0.0), 0.0)
+      let i = inputs([keys(Nil)])
+      let c1 = TacCam.step(c0, i, Some((100.0, 300.0)), 0.0, 800.0, 600.0, 0.01, flat0)
+      let c2 = TacCam.step(c1, i, Some((200.0, 300.0)), 0.0, 800.0, 600.0, 0.01, flat0)
+      Test.assert_true(near(TacCam.yaw(c2), 30.0), "100 px is 30 degrees")
+    end
+  end
+
+  describe "Camera panning and zoom" do
+    test "pan +x after a 90 degree turn moves the focus along the turned axis" do
+      let c0 = TacCam.start(TacCam.settings(), (0.0, 0.0, 0.0), 90.0)
+      let c1 = TacCam.step(c0, inputs([keys([68])]), None, 0.0, 800.0, 600.0, 0.1, flat0)
+      match TacCam.focus(c1) do (x, _, z) -> Test.assert_true(Math.abs(x) < 0.001 && z < -1.0, "along -z") end
+    end
+    test "the focus rides the ground height" do
+      let c1 = TacCam.step(cam(), inputs([keys([87])]), None, 0.0, 800.0, 600.0, 0.1, fn (x, z) -> 3.0)
+      match TacCam.focus(c1) do (_, y, _) -> Test.assert_true(near(y, 3.0), "on the ground") end
+    end
+    test "zoom stays within near and far; pitch at near is 35, at far 60" do
+      let far = run(cam(), inputs([keys([70])]), 300, 0.02)
+      Test.assert_true(near(TacCam.distance(far), 40.0) && near(TacCam.pitch(far), 60.0), "far")
+      let close = run(cam(), inputs([keys([82])]), 300, 0.02)
+      Test.assert_true(near(TacCam.distance(close), 10.0) && near(TacCam.pitch(close), 35.0), "near")
+    end
+    test "with tilt off the pitch never changes" do
+      let c0 = TacCam.start({ TacCam.settings() with cm_tilt: false }, (0.0, 0.0, 0.0), 0.0)
+      Test.assert_true(near(TacCam.pitch(run(c0, inputs([keys([70])]), 300, 0.02)), TacCam.pitch(run(c0, inputs([keys([82])]), 300, 0.02))), "same pitch")
+    end
+    test "edge scroll pans when the pointer is within edge_px of a side" do
+      let c1 = TacCam.step(cam(), inputs([keys(Nil)]), Some((5.0, 300.0)), 0.0, 800.0, 600.0, 0.1, flat0)
+      match TacCam.focus(c1) do (x, _, z) -> Test.assert_true(x < -1.0 && Math.abs(z) < 0.001, "left") end
+    end
+  end
+
+  describe "Camera view and cut" do
+    test "view_proj puts the focus at the screen centre" do
+      let c = TacCam.start(TacCam.settings(), (5.0, 2.0, -3.0), 30.0)
+      let p = Strata.Math.Mat4.transform_point(TacCam.view_proj(c, 1.5), Strata.Math.Vec3.new(5.0, 2.0, -3.0))
+      let w = Strata.Math.Mat4.w4(p)
+      Test.assert_true(Math.abs(Strata.Math.Mat4.x4(p) /. w) < 0.0001 && Math.abs(Strata.Math.Mat4.y4(p) /. w) < 0.0001, "centre")
+    end
+    test "cut at level 0 is level_m above the focus floor; the capsule runs eye to subject" do
+      let c = TacCam.start(TacCam.settings(), (0.0, 2.0, 0.0), 0.0)
+      let a = Strata.Overlay.cut_floats(TacCam.cut(c, Some((1.0, 3.0, 1.0)), (-10.0, -10.0, 10.0, 10.0)))
+      Test.assert_true(near(NativeArray.get_f32(a, 1), 5.0) && near(NativeArray.get_f32(a, 6), 1.0), "height 5, one capsule")
+      match TacCam.eye(c) do (ex, ey, ez) -> Test.assert_true(near(NativeArray.get_f32(a, 8), ex) && near(NativeArray.get_f32(a, 9), ey) && near(NativeArray.get_f32(a, 11), 1.0) && near(NativeArray.get_f32(a, 12), 3.0), "eye to subject") end
+      Test.assert_true(near(NativeArray.get_f32(Strata.Overlay.cut_floats(TacCam.cut(TacCam.set_level(c, 2), None, (0.0, 0.0, 1.0, 1.0))), 1), 11.0), "level 2: 2 + 3 x 3")
+    end
+  end
+
+  pfn ndc(c : StrataTactics.Camera.TacticsCamera, p : (Float, Float, Float)) : (Float, Float) do
+    match p do (x, y, z) ->
+      let q = Strata.Math.Mat4.transform_point(TacCam.view_proj(c, 1.5), Strata.Math.Vec3.new(x, y, z))
+      (Strata.Math.Mat4.x4(q) /. Strata.Math.Mat4.w4(q), Strata.Math.Mat4.y4(q) /. Strata.Math.Mat4.w4(q))
+    end
+  end
+  pfn done_ids(c : StrataTactics.Camera.TacticsCamera, i : Strata.Input.Input, n : Int, acc : List(Int)) : (StrataTactics.Camera.TacticsCamera, List(Int)) do
+    if n <= 0 do (c, acc) else
+      let c2 = TacCam.step(c, i, None, 0.0, 800.0, 600.0, 0.05, flat0)
+      done_ids(c2, i, n - 1, List.append(acc, TacCam.shot_done(c2)))
+    end
+  end
+
+  describe "Camera shots" do
+    test "a look shot travels, holds, returns and reports done once" do
+      let c0 = TacCam.look(cam(), 7, (10.0, 0.0, 0.0), 0.5)
+      Test.assert_true(TacCam.in_shot(c0), "in a shot")
+      match done_ids(c0, inputs([keys(Nil)]), 40, Nil) do
+        (c1, ids) ->
+          Test.assert_true(ids == [7] && !TacCam.in_shot(c1), "done once")
+          Test.assert_true(TacCam.eye(c1) == TacCam.eye(cam()), "back to the orbit view")
+      end
+    end
+    test "input is ignored during a shot" do
+      let c0 = TacCam.look(cam(), 1, (10.0, 0.0, 0.0), 1.0)
+      let c1 = TacCam.step(c0, inputs([keys([69, 68])]), None, 0.0, 800.0, 600.0, 0.1, flat0)
+      Test.assert_true(near(TacCam.yaw(c1), 0.0) && TacCam.focus(c1) == (0.0, 0.0, 0.0), "no turn, no pan")
+    end
+    test "over the shoulder puts a in front-left of centre and b ahead" do
+      let w = StrataTactics.Test.Worlds.ground()
+      let a = (0.0, 1.5, 0.0)
+      let b = (0.0, 1.5, -12.0)
+      let c0 = TacCam.frame_two(cam(), 2, a, b, false, 1.0, w)
+      -- after the travel, the shot's own view
+      let c1 = run(c0, inputs([keys(Nil)]), 12, 0.05)
+      match (ndc(c1, a), ndc(c1, b)) do
+        ((ax, _), (bx, by0)) -> Test.assert_true(ax < 0.0 && Math.abs(bx) < 0.01 && Math.abs(by0) < 0.01, "a left, b centred")
+      end
+    end
+    test "a shot whose eye is inside a wall falls back and still reports done" do
+      -- a wall where the over-the-shoulder eye would be (behind and right of a)
+      let w = StrataTactics.Test.Worlds.box(StrataTactics.Test.Worlds.ground(), -3, 0, -1, 3, 6, 4, 1)
+      let c0 = TacCam.frame_two(cam(), 5, (0.0, 1.5, -2.0), (0.0, 1.5, -14.0), false, 0.2, w)
+      match done_ids(c0, inputs([keys(Nil)]), 40, Nil) do (_, ids) -> Test.assert_true(ids == [5], "done") end
+      let c1 = run(c0, inputs([keys(Nil)]), 10, 0.05)
+      match TacCam.eye(c1) do (ex, ey, ez) -> Test.assert_true(!(ex >= -3.0 && ex <= 4.0 && ey >= 0.0 && ey <= 7.0 && ez >= -1.0 && ez <= 5.0), "not in the wall") end
+    end
+    test "when the fallback look is blocked too, the camera keeps the orbit view and reports done" do
+      -- a block filling everywhere a shot's eye could go near the points, open only where the orbit eye is not
+      let w = StrataTactics.Test.Worlds.box(StrataTactics.Test.Worlds.ground(), -40, 0, -40, 40, 30, 40, 1)
+      let c0 = TacCam.frame_two(cam(), 6, (0.0, 1.5, -2.0), (0.0, 1.5, -14.0), false, 0.2, w)
+      let e0 = TacCam.eye(cam())
+      let c1 = run(c0, inputs([keys(Nil)]), 6, 0.05)
+      Test.assert_true(TacCam.eye(c1) == e0, "the orbit view stays")
+      match done_ids(c0, inputs([keys(Nil)]), 40, Nil) do (_, ids) -> Test.assert_true(ids == [6], "done") end
+    end
+    test "a shot started during another reports the first done and returns to the orbit view" do
+      let c1 = run(TacCam.look(cam(), 1, (10.0, 0.0, 0.0), 1.0), inputs([keys(Nil)]), 4, 0.05)
+      let c2 = TacCam.look(c1, 2, (-10.0, 0.0, 0.0), 0.2)
+      let c3 = TacCam.step(c2, inputs([keys(Nil)]), None, 0.0, 800.0, 600.0, 0.05, flat0)
+      Test.assert_true(TacCam.shot_done(c3) == [1], "the first is reported done")
+      match done_ids(c3, inputs([keys(Nil)]), 40, Nil) do
+        (c4, ids) -> Test.assert_true(ids == [2] && TacCam.eye(c4) == TacCam.eye(cam()), "the second ends on the orbit view")
+      end
+    end
+  end
+end

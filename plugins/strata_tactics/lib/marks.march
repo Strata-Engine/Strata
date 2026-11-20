@@ -1,0 +1,108 @@
+-- Marks — what the tactical layer draws over the ground, as overlay items
+-- (Strata.Overlay): reachable tiles, a region's outline, a path, a line of
+-- sight, the tile under the pointer, cover on tile edges. The game chooses
+-- which to show (StrataTactics.show).
+mod StrataTactics.Marks do
+
+  alias StrataTactics.Grid as MkG
+  alias Strata.Overlay as MkO
+
+  -- reach fill, outline, path, clear / partial / blocked sight, cursor, half and full cover
+  type MarkColours = { mc_reach : (Float, Float, Float, Float), mc_outline : (Float, Float, Float, Float), mc_path : (Float, Float, Float, Float),
+                       mc_clear : (Float, Float, Float, Float), mc_partial : (Float, Float, Float, Float), mc_blocked : (Float, Float, Float, Float),
+                       mc_cursor : (Float, Float, Float, Float), mc_half : (Float, Float, Float, Float), mc_full : (Float, Float, Float, Float) }
+
+  doc "The default colours (r, g, b, a)."
+  fn colours() : MarkColours do
+    { mc_reach: (0.25, 0.6, 1.0, 0.35), mc_outline: (0.4, 0.75, 1.0, 0.9), mc_path: (1.0, 0.85, 0.3, 0.9), mc_clear: (0.3, 1.0, 0.4, 0.9),
+      mc_partial: (1.0, 0.75, 0.2, 0.9), mc_blocked: (1.0, 0.25, 0.2, 0.9), mc_cursor: (1.0, 1.0, 1.0, 0.9), mc_half: (0.3, 0.6, 1.0, 0.6), mc_full: (0.2, 0.4, 1.0, 0.8) }
+  end
+
+  -- the tile's corners in metres: low x, low z, high x, high z, and its floor's height
+  pfn bounds(g : StrataTactics.Grid.TileGrid, t : (Int, Int)) : (Float, Float, Float, Float, Float) do
+    let s = MkG.settings_of(g)
+    let sc = MkG.scale(g)
+    match t do
+      (tx, tz) ->
+        let x0 = int_to_float(s.gs_x0 + tx * s.gs_tile) *. sc
+        let z0 = int_to_float(s.gs_z0 + tz * s.gs_tile) *. sc
+        let e = int_to_float(s.gs_tile) *. sc
+        (x0, z0, x0 +. e, z0 +. e, int_to_float(MkG.floor(g, t)) *. sc)
+    end
+  end
+
+  -- a quad over tile t inset by [inset] of a tile, [up] metres above its floor
+  pfn tile_quad(g : StrataTactics.Grid.TileGrid, t : (Int, Int), inset : Float, up : Float, rgba : (Float, Float, Float, Float), through : Bool) : Strata.Overlay.Item do
+    match bounds(g, t) do
+      (x0, z0, x1, z1, y) ->
+        let i = (x1 -. x0) *. inset
+        let h = y +. up
+        MkO.quad([(x0 +. i, h, z0 +. i), (x1 -. i, h, z0 +. i), (x0 +. i, h, z1 -. i), (x1 -. i, h, z1 -. i)], rgba, through)
+    end
+  end
+
+  doc "A filled quad 3 cm above each tile's floor, inset 5% of a tile."
+  fn tiles(g : StrataTactics.Grid.TileGrid, ts : List((Int, Int)), rgba : (Float, Float, Float, Float)) : List(Strata.Overlay.Item) do
+    List.map(ts, fn t -> tile_quad(g, t, 0.05, 0.03, rgba, false))
+  end
+
+  pfn side_line(ts : List((Int, Int)), n : (Int, Int), a : (Float, Float, Float), b : (Float, Float, Float), rgba : (Float, Float, Float, Float)) : Option(Strata.Overlay.Item) do
+    if List.any(ts, fn u -> u == n) do None else Some(MkO.line(a, b, 0.06, rgba, false)) end
+  end
+
+  pfn outline_tile(g : StrataTactics.Grid.TileGrid, ts : List((Int, Int)), t : (Int, Int), rgba : (Float, Float, Float, Float)) : List(Strata.Overlay.Item) do
+    match (t, bounds(g, t)) do
+      ((tx, tz), (x0, z0, x1, z1, y)) ->
+        let h = y +. 0.04
+        List.filter_map([side_line(ts, (tx + 1, tz), (x1, h, z0), (x1, h, z1), rgba), side_line(ts, (tx - 1, tz), (x0, h, z0), (x0, h, z1), rgba),
+                         side_line(ts, (tx, tz + 1), (x0, h, z1), (x1, h, z1), rgba), side_line(ts, (tx, tz - 1), (x0, h, z0), (x1, h, z0), rgba)], fn o -> o)
+    end
+  end
+
+  doc "Lines along the outer edges of a region of tiles only (no edge between two of its tiles), 4 cm above each tile's floor."
+  fn outline(g : StrataTactics.Grid.TileGrid, ts : List((Int, Int)), rgba : (Float, Float, Float, Float)) : List(Strata.Overlay.Item) do
+    List.flat_map(ts, fn t -> outline_tile(g, ts, t, rgba))
+  end
+
+  pfn lifted(g : StrataTactics.Grid.TileGrid, t : (Int, Int), up : Float) : (Float, Float, Float) do
+    match MkG.centre(g, t) do (x, y, z) -> (x, y +. up, z) end
+  end
+
+  doc "A path: a line through the tiles' centres 0.3 m up and a marker on the last tile, all drawn through what hides them."
+  fn path(g : StrataTactics.Grid.TileGrid, ps : List((Int, Int)), rgba : (Float, Float, Float, Float)) : List(Strata.Overlay.Item) do
+    match ps do
+      Nil -> Nil
+      _ ->
+        let segs = List.map(List.zip(ps, List.tail(ps)), fn pr -> MkO.line(lifted(g, Tuple.first(pr), 0.3), lifted(g, Tuple.second(pr), 0.3), 0.12, rgba, true))
+        List.append(segs, [tile_quad(g, List.last(ps), 0.3, 0.05, rgba, true)])
+    end
+  end
+
+  doc "A line of sight from tile a to tile b, 1.5 m up, coloured by the result (StrataTactics.Sight: clear, partial, blocked)."
+  fn sight(g : StrataTactics.Grid.TileGrid, a : (Int, Int), b : (Int, Int), result : Int, c : MarkColours) : List(Strata.Overlay.Item) do
+    let rgba = if result == 0 do c.mc_clear else if result == 1 do c.mc_partial else c.mc_blocked end end
+    [MkO.line(lifted(g, a, 1.5), lifted(g, b, 1.5), 0.05, rgba, true)]
+  end
+
+  doc "The tile under the pointer: its outline."
+  fn cursor(g : StrataTactics.Grid.TileGrid, t : (Int, Int), rgba : (Float, Float, Float, Float)) : List(Strata.Overlay.Item) do outline(g, [t], rgba) end
+
+  pfn cover_edge(w : Strata.World.World, g : StrataTactics.Grid.TileGrid, t : (Int, Int), height : Int, s : StrataTactics.Sight.CoverSettings, c : MarkColours, y : Float, dir : Int, a : (Float, Float), b : (Float, Float)) : Option(Strata.Overlay.Item) do
+    let k = StrataTactics.Sight.edge(w, g, t, dir, height, s)
+    if k == 0 do None
+    else
+      let top = y +. (if k == 2 do 1.0 else 0.5 end)
+      let rgba = if k == 2 do c.mc_full else c.mc_half end
+      match (a, b) do ((ax, az), (bx, bz)) -> Some(MkO.quad([(ax, y, az), (bx, y, bz), (ax, top, az), (bx, top, bz)], rgba, false)) end
+    end
+  end
+
+  doc "Cover on tile t's edges for a unit [height] voxels tall: an upright quad on each edge with cover, 0.5 m tall for half and 1 m for full."
+  fn cover(w : Strata.World.World, g : StrataTactics.Grid.TileGrid, t : (Int, Int), height : Int, s : StrataTactics.Sight.CoverSettings, c : MarkColours) : List(Strata.Overlay.Item) do
+    match bounds(g, t) do
+      (x0, z0, x1, z1, y) ->
+        List.filter_map([cover_edge(w, g, t, height, s, c, y, 0, (x1, z0), (x1, z1)), cover_edge(w, g, t, height, s, c, y, 1, (x0, z0), (x0, z1)),
+                         cover_edge(w, g, t, height, s, c, y, 2, (x0, z1), (x1, z1)), cover_edge(w, g, t, height, s, c, y, 3, (x0, z0), (x1, z0))], fn o -> o)
+    end
+  end
+end

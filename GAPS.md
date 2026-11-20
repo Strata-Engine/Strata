@@ -536,3 +536,32 @@ every read before writing, with the same arithmetic in the same order, so
 results are bit for bit as before. The same step now takes about 3 s, which
 is contact generation for that many bodies. Rule for Strata code: read
 first, then write.
+
+## S51: `within` cannot be a function name
+
+`pfn within(r : Reach, t : (Int, Int)) : Bool do ... end` is "I got stuck
+here" at the name, as `on` is (S4). Workaround: another name
+(`plugins/strata_tactics/lib/reach.march` uses `on_map`).
+
+## S52: a program's type named `Unit` shadows March's `Unit` everywhere
+
+A consumer declaring `type Unit = Unit(Int, Int, (Int, Int))` breaks every
+function in Strata that answers `Unit`: "expected `Unit` but got `()`" in
+render.march, save.march, entities.march, from the one global type namespace.
+Workaround: never name a type `Unit` (the tactics example's is `Squaddie`).
+
+## S53: a lambda inside another lambda's `let` chain is misparsed
+
+In `fn t -> match t do (a, b) -> let h = ... \n List.filter_map(xs, fn sd -> match sd do (n, x, y) -> ... end)`
+the inner `match sd do` is read as the condition form `match do`
+("I cannot find `sd`", "Each condition in `match do` must be Bool"). The
+same shape fails after a `let` inside a test's arm, and with a trailing
+lambda argument at the end of a `let` line followed by more lines.
+Workaround: lift the inner work into a named helper (strata_tactics' Marks,
+strata_kit's motion tests and example).
+
+## S54: `(Int, Int, Int) -> Bool` is a function of one tuple
+
+A parameter typed `occupied : (Int, Int, Int) -> Bool` refuses the
+three-argument lambda `fn (x, y, z) -> ...`: the type is a function of one
+tuple. A function of three Ints is `Int -> Int -> Int -> Bool`.

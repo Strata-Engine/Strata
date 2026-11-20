@@ -260,6 +260,8 @@ typedef struct { int32_t fig, part, x, y, z, colour; float dist, nx, ny, nz; } A
 struct AnWorld {
     int capacity;
     AnRig *rigs; int nrigs;
+    uint8_t rig_live[AN_RIGS];   /* a rig slot in use (an_rig_free empties it) */
+    int32_t rig_free[AN_RIGS]; int nrig_free;   /* freed rig slots, taken again before new ones */
     AnMask *masks; int nmasks;
     AnClip *clips; int nclips;
     AnKey *keys; uint8_t *key_interp; int nkeys;
@@ -395,20 +397,23 @@ static inline AnWorld *an_reopen(AnWorld *old, int capacity) {
 }
 
 /* ---- rigs and masks ---- */
-static inline int an_rig(AnWorld *w, int nparts, const int32_t *parent, const float *pivot,
-                         const float *rest_q, const float *box) {
-    if (nparts < 1 || nparts > AN_PARTS) return an_refuse(w, AN_R_PARTS);
-    if (!parent || !pivot || !rest_q || !box) return an_refuse(w, AN_R_VALUE);
-    if (parent[0] != -1) return an_refuse(w, AN_R_PARENT);
-    for (int i = 1; i < nparts; i++) if (parent[i] < 0 || parent[i] >= i) return an_refuse(w, AN_R_PARENT);
-    if (!an_finite(pivot, 3 * nparts) || !an_finite(rest_q, 4 * nparts) || !an_finite(box, 6 * nparts)) return an_refuse(w, AN_R_VALUE);
+static inline int an_rig_ok(const AnWorld *w, int rig) { return rig >= 0 && rig < w->nrigs && w->rig_live[rig]; }
+/* a rig's description checked: 0, or the refusal reason */
+static inline int an_rig_check(int nparts, const int32_t *parent, const float *pivot, const float *rest_q, const float *box) {
+    if (nparts < 1 || nparts > AN_PARTS) return AN_R_PARTS;
+    if (!parent || !pivot || !rest_q || !box) return AN_R_VALUE;
+    if (parent[0] != -1) return AN_R_PARENT;
+    for (int i = 1; i < nparts; i++) if (parent[i] < 0 || parent[i] >= i) return AN_R_PARENT;
+    if (!an_finite(pivot, 3 * nparts) || !an_finite(rest_q, 4 * nparts) || !an_finite(box, 6 * nparts)) return AN_R_VALUE;
     for (int i = 0; i < nparts; i++) {
         float q[4] = {rest_q[i * 4], rest_q[i * 4 + 1], rest_q[i * 4 + 2], rest_q[i * 4 + 3]};
-        if (!an_qnorm(q)) return an_refuse(w, AN_R_VALUE);
-        for (int k = 0; k < 3; k++) if (box[i * 6 + k] > box[i * 6 + 3 + k]) return an_refuse(w, AN_R_VALUE);
+        if (!an_qnorm(q)) return AN_R_VALUE;
+        for (int k = 0; k < 3; k++) if (box[i * 6 + k] > box[i * 6 + 3 + k]) return AN_R_VALUE;
     }
-    if (w->nrigs >= AN_RIGS) return an_refuse(w, AN_R_FULL);
-    AnRig *r = &w->rigs[w->nrigs];
+    return 0;
+}
+static inline void an_rig_write(AnRig *r, int nparts, const int32_t *parent, const float *pivot, const float *rest_q, const float *box) {
+    memset(r, 0, sizeof *r);
     r->nparts = nparts;
     for (int i = 0; i < nparts; i++) {
         r->parent[i] = (int8_t)parent[i];
@@ -417,11 +422,23 @@ static inline int an_rig(AnWorld *w, int nparts, const int32_t *parent, const fl
         an_qnorm(r->rest[i]);
         memcpy(r->box[i], box + i * 6, sizeof r->box[i]);
     }
-    return w->nrigs++;
+}
+static inline int an_rig(AnWorld *w, int nparts, const int32_t *parent, const float *pivot,
+                         const float *rest_q, const float *box) {
+    int bad = an_rig_check(nparts, parent, pivot, rest_q, box);
+    if (bad) return an_refuse(w, bad);
+    int slot;
+    if (w->nrig_free > 0) slot = w->rig_free[--w->nrig_free];
+    else if (w->nrigs < AN_RIGS) slot = w->nrigs++;
+    else return an_refuse(w, AN_R_FULL);
+    an_rig_write(&w->rigs[slot], nparts, parent, pivot, rest_q, box);
+    w->rig_live[slot] = 1;
+    w->nsockets[slot] = 0;
+    return slot;
 }
 
 static inline int an_mask(AnWorld *w, int rig, int nroots, const int32_t *roots) {
-    if (rig < 0 || rig >= w->nrigs) return an_refuse(w, AN_R_RIG);
+    if (!an_rig_ok(w, rig)) return an_refuse(w, AN_R_RIG);
     const AnRig *r = &w->rigs[rig];
     if (nroots < 0 || (nroots > 0 && !roots)) return an_refuse(w, AN_R_MASK);
     uint64_t bits = 0;
@@ -440,7 +457,7 @@ static inline int an_mask(AnWorld *w, int rig, int nroots, const int32_t *roots)
 static inline int an_clip(AnWorld *w, int rig, float duration, int loops, float stride,
                           int nkeys, const int32_t *key_ints, const float *key_floats,
                           int nmarks, const float *mark_t, const int32_t *mark_tag) {
-    if (rig < 0 || rig >= w->nrigs) return an_refuse(w, AN_R_RIG);
+    if (!an_rig_ok(w, rig)) return an_refuse(w, AN_R_RIG);
     const AnRig *r = &w->rigs[rig];
     if (!isfinite(duration) || duration < 0 || !isfinite(stride)) return an_refuse(w, AN_R_VALUE);
     if (nkeys < 0 || nmarks < 0 || (nkeys > 0 && (!key_ints || !key_floats)) || (nmarks > 0 && (!mark_t || !mark_tag)))
@@ -547,7 +564,7 @@ static inline void an_settle(AnWorld *w, AnFig *f) {
 }
 
 static inline int an_spawn(AnWorld *w, int rig) {
-    if (rig < 0 || rig >= w->nrigs) return an_refuse(w, AN_R_RIG);
+    if (!an_rig_ok(w, rig)) return an_refuse(w, AN_R_RIG);
     if (w->nfree == 0) return an_refuse(w, AN_R_FULL);
     while (an_slot(w, w->next_id) >= 0) w->next_id = (w->next_id + 1) & (AN_IDS - 1);   /* at most capacity live ids */
     int id = w->next_id;
@@ -1674,7 +1691,7 @@ static inline uint64_t an_hash(const AnWorld *w) {
 /* a socket on rig's part at pos (metres in the part's frame) turned by q; its
  * id within the rig (0, 1, ...), or -1 */
 static inline int an_socket_def(AnWorld *w, int rig, int part, const float pos[3], const float q[4]) {
-    if (rig < 0 || rig >= w->nrigs) return an_refuse(w, AN_R_RIG);
+    if (!an_rig_ok(w, rig)) return an_refuse(w, AN_R_RIG);
     if (part < 0 || part >= w->rigs[rig].nparts) return an_refuse(w, AN_R_PART);
     float n[4];
     if (!pos || !q || !an_finite(pos, 3) || !an_finite(q, 4)) return an_refuse(w, AN_R_VALUE);
@@ -1693,7 +1710,7 @@ static inline int an_socket_def(AnWorld *w, int rig, int part, const float pos[3
  * (its low corner is the box's minimum, so it lands on the drawn voxels).
  * Set once a part. Its shape number, or -1. */
 static inline int an_shape(AnWorld *w, int rig, int part, int sx, int sy, int sz, float voxel, const uint8_t *palette_idx) {
-    if (rig < 0 || rig >= w->nrigs) return an_refuse(w, AN_R_RIG);
+    if (!an_rig_ok(w, rig)) return an_refuse(w, AN_R_RIG);
     const AnRig *r = &w->rigs[rig];
     if (part < 0 || part >= r->nparts) return an_refuse(w, AN_R_PART);
     int sz3[3] = {sx, sy, sz};
@@ -2224,10 +2241,91 @@ static inline int an_draw_list(AnWorld *w, float blend, const int32_t **rig_part
     return n;
 }
 
+/* ---- replacing and freeing rigs ---- */
+/* the rig's part grids dropped and the pools closed up behind them: shapes and
+ * their bricks are laid down in the order made, so one pass forward moves
+ * every kept one down in place */
+static inline void an_drop_shapes(AnWorld *w, int rig) {
+    int32_t remap[AN_SHAPES];
+    int ns = 0, nbi = 0, nb = 0;
+    for (int s = 0; s < w->nshapes; s++) {
+        int owned = 0;
+        for (int p = 0; p < AN_PARTS && !owned; p++) owned = w->shape_of[rig * AN_PARTS + p] == s;
+        AnShape sh = w->shapes[s];
+        int n = sh.nbx * sh.nby * sh.nbz;
+        if (owned) { remap[s] = -1; continue; }
+        for (int i = 0; i < n; i++) {
+            int b = w->brick_index[sh.index + i];
+            if (b >= 0) {
+                if (b != nb) memmove(w->bricks + (size_t)nb * 512, w->bricks + (size_t)b * 512, 512);
+                b = nb++;
+            }
+            w->brick_index[nbi + i] = b;
+        }
+        sh.index = nbi;
+        nbi += n;
+        w->shapes[ns] = sh;
+        remap[s] = ns++;
+    }
+    for (int p = 0; p < AN_PARTS; p++) w->shape_of[rig * AN_PARTS + p] = -1;
+    for (int i = 0; i < AN_RIGS * AN_PARTS; i++) if (w->shape_of[i] >= 0) w->shape_of[i] = remap[w->shape_of[i]];
+    w->nshapes = ns; w->nbrick_index = nbi; w->nbricks = nb;
+    w->grid_dirty = 1;
+}
+static inline int an_rig_users(const AnWorld *w, int rig) {
+    int n = 0;
+    for (int s = 0; s < w->capacity; s++) if (w->figs[s].id >= 0 && w->figs[s].rig == rig) n++;
+    return n;
+}
+/* rig [rig] replaced by a new description under the same id: its grids and
+ * sockets are dropped (upload them again); each of its figures keeps its
+ * placement and drop, loses its layers, procedural records and what hangs
+ * from it (unhung where it stands), and is posed at rest. Answers the rig, or
+ * a refusal. */
+static inline int an_rig_replace(AnWorld *w, int rig, int nparts, const int32_t *parent, const float *pivot,
+                                 const float *rest_q, const float *box) {
+    if (!an_rig_ok(w, rig)) return an_refuse(w, AN_R_RIG);
+    int bad = an_rig_check(nparts, parent, pivot, rest_q, box);
+    if (bad) return an_refuse(w, bad);
+    an_drop_shapes(w, rig);
+    w->nsockets[rig] = 0;
+    an_rig_write(&w->rigs[rig], nparts, parent, pivot, rest_q, box);
+    for (int s = 0; s < w->capacity; s++) {
+        AnFig *f = &w->figs[s];
+        if (f->id < 0 || f->rig != rig) continue;
+        if (w->nattached) {
+            for (int c = 0; c < w->capacity; c++) {
+                AnFig *ch = &w->figs[c];
+                if (ch->id >= 0 && ch->att == s) { an_place_chain(w, ch); an_unhang(ch); }
+            }
+        }
+        for (int i = f->proc; i >= 0; i = w->procs[i].next) w->proc_free[w->nproc_free++] = i;
+        f->proc = -1;
+        memset(f->layer, 0, sizeof f->layer);
+        f->unposed = 1;
+        an_settle(w, f);
+    }
+    if (w->nattached) an_recount(w);
+    w->grid_dirty = 1;
+    return rig;
+}
+/* rig [rig] freed: its grids and sockets dropped and its id free for the next
+ * rig made. 1, or 0 refused (no such rig, or figures still use it). Its masks
+ * and clips are not reclaimed. */
+static inline int an_rig_free(AnWorld *w, int rig) {
+    if (!an_rig_ok(w, rig)) { an_refuse(w, AN_R_RIG); return 0; }
+    if (an_rig_users(w, rig) > 0) { an_refuse(w, AN_R_VALUE); return 0; }
+    an_drop_shapes(w, rig);
+    w->nsockets[rig] = 0;
+    w->rig_live[rig] = 0;
+    w->rig_free[w->nrig_free++] = rig;
+    return 1;
+}
+
 /* 0 figures, 1 posed by the last update, 2 stale, 3 refused calls, 4 negative dt, 5 last refusal reason,
  * 6 marks dropped, 7 procedural records in use, 8 passes queries made over the figures to pose stale ones,
  * 9 figures traced past the cap of AN_TRACED (drawn plain), 10 parts left out of the last draw list,
- * 11 figures the last update did not pose (out of view or far) */
+ * 11 figures the last update did not pose (out of view or far), 12 live rigs, 13 part grids held, 14 bricks used */
 static inline double an_stat(const AnWorld *w, int which) {
     switch (which) {
     case 0: return w->live;
@@ -2242,6 +2340,9 @@ static inline double an_stat(const AnWorld *w, int which) {
     case 9: return w->nwaiting;
     case 10: return w->draw_over;
     case 11: return w->skipped;
+    case 12: { int n = 0; for (int i = 0; i < w->nrigs; i++) n += w->rig_live[i]; return n; }
+    case 13: return w->nshapes;
+    case 14: return w->nbricks;
     default: return 0;
     }
 }

@@ -31,7 +31,8 @@ mod Strata.Rig do
   alias Strata.Math.Quat as Qt
 
   -- a box of voxels set to a colour, corners inclusive
-  type RgEdit = RgEdit(Int, Int, Int, Int, Int, Int, Int)
+  -- or a whole grid that replaces what was painted before it (with_grid)
+  type RgEdit = RgEdit(Int, Int, Int, Int, Int, Int, Int) | RgBase(NativeU8Arr)
   -- parent, pivot (parent's voxels), grid size, anchor (own voxels), rest rotation, edits newest first
   type RgPart = RgPart(Int, Float, Float, Float, Int, Int, Int, Float, Float, Float, (Float, Float, Float, Float), List(RgEdit))
   -- part, position (part's voxels), rotation
@@ -161,6 +162,18 @@ mod Strata.Rig do
     end end
   end
 
+  doc "Replace part [p]'s voxels with [g]: palette indices (0 empty) at x + sx * (y + sy * z), the part's own size; what was painted before is forgotten, and later `box` and `voxel` edits paint over it. Refused (nothing changed) for no such part or a grid of the wrong length."
+  fn with_grid(r : Rig, p : Int, g : NativeU8Arr) : Rig do
+    if !has_part(r, p) do refuse(r, "no such part")
+    else
+      match part_at(r, p) do
+        RgPart(par, px, py, pz, sx, sy, sz, ax, ay, az, q, _) ->
+          if NativeArray.length_u8(g) != sx * sy * sz do refuse(r, "a part's grid must have sx * sy * sz voxels")
+          else with_part(r, p, RgPart(par, px, py, pz, sx, sy, sz, ax, ay, az, q, Cons(RgBase(g), Nil))) end
+      end
+    end
+  end
+
   doc "Set the voxel (x, y, z) of part [p] to palette index [colour] (0 empties it)."
   fn voxel(r : Rig, p : Int, x : Int, y : Int, z : Int, colour : Int) : Rig do box(r, p, x, y, z, x, y, z, colour) end
 
@@ -214,10 +227,15 @@ mod Strata.Rig do
   pfn q_same(a : (Float, Float, Float, Float), b : (Float, Float, Float, Float)) : Bool do
     match a do (ax, ay, az, aw) -> match b do (bx, b_y, bz, bw) -> ax == bx && ay == b_y && az == bz && aw == bw end end
   end
+  pfn u8_same(a : NativeU8Arr, b : NativeU8Arr, i : Int, n : Int) : Bool do
+    if i >= n do true else if NativeArray.get_u8(a, i) != NativeArray.get_u8(b, i) do false else u8_same(a, b, i + 1, n) end end
+  end
   pfn edit_same(a : RgEdit, b : RgEdit) : Bool do
     match a do
       RgEdit(a0, a1, a2, a3, a4, a5, a6) ->
-        match b do RgEdit(b0, b1, b2, b3, b4, b5, b6) -> a0 == b0 && a1 == b1 && a2 == b2 && a3 == b3 && a4 == b4 && a5 == b5 && a6 == b6 end
+        match b do RgEdit(b0, b1, b2, b3, b4, b5, b6) -> a0 == b0 && a1 == b1 && a2 == b2 && a3 == b3 && a4 == b4 && a5 == b5 && a6 == b6 | RgBase(_) -> false end
+      RgBase(ga) ->
+        match b do RgBase(gb) -> NativeArray.length_u8(ga) == NativeArray.length_u8(gb) && u8_same(ga, gb, 0, NativeArray.length_u8(ga)) | RgEdit(_, _, _, _, _, _, _) -> false end
     end
   end
   pfn part_same(a : RgPart, b : RgPart) : Bool do
@@ -313,17 +331,25 @@ mod Strata.Rig do
   pfn paint_plane(g : NativeU8Arr, sx : Int, sy : Int, e : RgEdit, y : Int, z : Int) : NativeU8Arr do
     match e do
       RgEdit(x0, _, _, x1, y1, _, c) -> if y > y1 do g else paint_plane(paint_row(g, sx, sy, x0, x1, y, z, c), sx, sy, e, y + 1, z) end
+      RgBase(_) -> g
     end
   end
   pfn paint(g : NativeU8Arr, sx : Int, sy : Int, e : RgEdit, z : Int) : NativeU8Arr do
     match e do
       RgEdit(_, y0, _, _, _, z1, _) -> if z > z1 do g else paint(paint_plane(g, sx, sy, e, y0, z), sx, sy, e, z + 1) end
+      RgBase(_) -> g
     end
+  end
+  pfn copy_u8(src : NativeU8Arr, dst : NativeU8Arr, i : Int, n : Int) : NativeU8Arr do
+    if i >= n do dst else copy_u8(src, NativeArray.set_u8(dst, i, NativeArray.get_u8(src, i)), i + 1, n) end
   end
   pfn paint_all(g : NativeU8Arr, sx : Int, sy : Int, edits : List(RgEdit)) : NativeU8Arr do
     match edits do
       Nil -> g
-      Cons(e, rest) -> match e do RgEdit(_, _, z0, _, _, _, _) -> paint_all(paint(g, sx, sy, e, z0), sx, sy, rest) end
+      Cons(e, rest) -> match e do
+        RgEdit(_, _, z0, _, _, _, _) -> paint_all(paint(g, sx, sy, e, z0), sx, sy, rest)
+        RgBase(b) -> paint_all(copy_u8(b, g, 0, NativeArray.length_u8(g)), sx, sy, rest)
+      end
     end
   end
 

@@ -1,0 +1,125 @@
+-- Damage: carving, breaking off.
+mod StrataKit.Test.Damage do
+
+  needs IO.Clock      -- charged to every test module once any uses Check.all (GAPS S3)
+
+  needs IO.Console
+
+  needs IO.FileRead
+
+  needs IO.FileWrite
+  needs IO.Process
+  import Test
+  alias StrataKit.Damage as KitD
+
+  -- a rig of one solid part of n^3 voxels, colour 1, its anchor at (ax, ay, az)
+  pfn solid(sx : Int, sy : Int, sz : Int, ax : Float, ay : Float, az : Float) : Strata.Rig.Rig do
+    match Strata.Rig.part(Strata.Rig.colour(Strata.Rig.new(0.1), 1, 0.5, 0.5, 0.5, 0.8, 0.0), -1, 0.0, 0.0, 0.0, sx, sy, sz) do
+      (r, p) -> Strata.Rig.anchor(Strata.Rig.with_grid(r, p, NativeArray.make_u8(sx * sy * sz, 1)), p, ax, ay, az)
+    end
+  end
+  pfn filled(r : Strata.Rig.Rig) : Int do
+    let g = Strata.Rig.grid(r, 0)
+    List.length(List.filter(List.range(0, NativeArray.length_u8(g)), fn i -> NativeArray.get_u8(g, i) != 0))
+  end
+  pfn far() : Strata.Rig.Rig do solid(9, 9, 9, -50.0, -50.0, -50.0) end
+
+  describe "Damage.carve" do
+    test "a carve removes a ball of voxels and counts them" do
+      -- radius 2 round the face voxel (4, 4, 0): z 0 has 13 cells within 2, z 1 has 9, z 2 has 1: 23
+      match KitD.carve(far(), 0, 4, 4, 0, 2.0, KitD.carve_settings(9)) do
+        (r, n) -> Test.assert_true(n == 23 && filled(r) == 729 - 23, "23 removed")
+      end
+    end
+    test "new faces take the interior colour" do
+      match KitD.carve(far(), 0, 4, 4, 0, 2.0, KitD.carve_settings(9)) do
+        (r, _) -> Test.assert_true(Strata.Rig.get(r, 0, 4, 4, 3) == 9 && Strata.Rig.get(r, 0, 4, 4, 2) == 0 && Strata.Rig.get(r, 0, 0, 0, 8) == 1, "interior on the new faces only")
+      end
+    end
+    test "the anchor region is never removed" do
+      match KitD.carve(solid(9, 9, 9, 4.0, 4.0, 0.0), 0, 4, 4, 0, 3.0, KitD.carve_settings(9)) do
+        (r, n) -> Test.assert_true(n > 0 && Strata.Rig.get(r, 0, 4, 4, 0) != 0 && Strata.Rig.get(r, 0, 3, 3, 0) != 0, "kept round the anchor")
+      end
+    end
+    test "carving everything leaves a pure joint" do
+      match KitD.carve(solid(9, 9, 9, 4.5, 4.5, 4.5), 0, 4, 4, 4, 20.0, KitD.carve_settings(9)) do
+        (r, n) ->
+          let left = filled(r)
+          Test.assert_true(Strata.Rig.part_count(r) == 1 && left > 0 && left + n == 729 && left <= 33, "only the keep ball")
+          match KitD.carve(r, 0, 4, 4, 4, 20.0, KitD.carve_settings(9)) do (r2, n2) -> Test.assert_true(n2 == 0 && filled(r2) == left, "the keep ball stays") end
+      end
+    end
+    test "a carve of a 40 x 60 x 30 part and its meshing within a frame" do
+      let r = solid(40, 60, 30, 20.0, 0.0, 15.0)
+      let t0 = Authority.must(System.now_ms())
+      match KitD.carve(r, 0, 20, 30, 0, 4.0, KitD.carve_settings(9)) do
+        (r2, _) ->
+          let ms_carve = Authority.must(System.now_ms()) - t0
+          let quads = List.length(Strata.Rig.meshes(r2))
+          let ms = Authority.must(System.now_ms()) - t0
+          println("kit: carve in " ++ int_to_string(ms_carve) ++ " ms, carve and mesh (" ++ int_to_string(quads) ++ " pieces) in " ++ int_to_string(ms) ++ " ms (budget 16)")
+          Test.assert_true(ms < 64, "within four times the budget")
+      end
+    end
+  end
+
+  pfn pal() : List((Int, Float, Float, Float, Float, Float)) do List.map(List.range(1, 10), fn i -> (i, 0.5, 0.5, 0.5, 0.8, 0.0)) end
+  pfn mech() : StrataKit.Build.KitBuild do
+    StrataKit.Build.node(0, [("arm_l", StrataKit.Build.leaf(1)), ("arm_r", StrataKit.Build.node(1, [("hand_r", StrataKit.Build.leaf(2))]))])
+  end
+  pfn assembled() : (Strata.Rig.Rig, StrataKit.Assemble.KitMap) do
+    match StrataKit.Assemble.assemble(StrataKit.Test.Parts.all(), mech(), StrataKit.Test.Parts.ok, StrataKit.Assemble.settings(0.1, pal(), Nil)) do (r, m, _) -> (r, m) end
+  end
+  pfn still(rp : Int) : ((Float, Float, Float), (Float, Float, Float, Float)) do ((0.0, 0.0, 0.0), (0.0, 0.0, 0.0, 1.0)) end
+  pfn stone(c : Int) : Int do 1 end
+  pfn solid_count(l : StrataKit.Damage.KitLoose) : Int do Strata.Body.solid_count(reg(), KitD.loose_grid(l)) end
+  pfn reg() : Strata.Blocks.Registry do match Strata.Blocks.register(Strata.Blocks.empty(), Strata.Blocks.def()) do Ok((r, _)) -> r | Err(_) -> Strata.Blocks.empty() end end
+  pfn total(ls : List(StrataKit.Damage.KitLoose)) : Int do List.fold_left(ls, 0, fn (a, l) -> a + solid_count(l)) end
+
+  describe "Damage.break_off" do
+    test "breaking off the right arm returns it and its rifle as loose grids" do
+      match assembled() do
+        (r, m) -> match KitD.break_off(m, mech(), r, still, ["arm_r"], stone, None) do
+          (_, ls) -> Test.assert_true(List.length(ls) == 4 && total(ls) == 64 + 128 + 128 + 40, "shoulder, upper, fore and rifle")
+        end
+      end
+    end
+    test "the remaining build no longer has the arm" do
+      match assembled() do
+        (r, m) -> match KitD.break_off(m, mech(), r, still, ["arm_r"], stone, None) do
+          (b2, _) -> Test.assert_true(Option.is_none(StrataKit.Build.at(b2, ["arm_r"])) && Option.is_some(StrataKit.Build.at(b2, ["arm_l"])), "gone")
+        end
+      end
+    end
+    test "a carved arm breaks off carved" do
+      match assembled() do
+        (r, m) ->
+          match StrataKit.Assemble.rig_part(m, ["arm_r"], "fore") do
+            Some(fore) ->
+              match KitD.carve(r, fore, 2, 4, 2, 1.5, KitD.carve_settings(9)) do
+                (r2, n) -> match KitD.break_off(m, mech(), r2, still, ["arm_r"], stone, None) do
+                  (_, ls) -> Test.assert_true(n > 0 && total(ls) == 360 - n, "carved voxels absent")
+                end
+              end
+            None -> Test.fail("no forearm")
+          end
+      end
+    end
+    test "shatter splits the struck piece into several grids whose voxels sum to the original" do
+      match assembled() do
+        (r, m) ->
+          match StrataKit.Assemble.rig_part(m, ["arm_r"], "upper") do
+            Some(up) -> match KitD.break_off(m, mech(), r, still, ["arm_r"], stone, Some((up, 2, 4, 2, 4.0, reg()))) do
+              (_, ls) -> Test.assert_true(List.length(ls) > 4 && total(ls) == 360, "more pieces, same voxels")
+            end
+            None -> Test.fail("no upper arm")
+          end
+      end
+    end
+    test "breaking off the root changes nothing" do
+      match assembled() do
+        (r, m) -> match KitD.break_off(m, mech(), r, still, Nil, stone, None) do (b2, ls) -> Test.assert_true(StrataKit.Build.count(b2) == 4 && List.is_empty(ls), "unchanged") end
+      end
+    end
+  end
+end

@@ -1,0 +1,89 @@
+-- Plugin — the shape a shareable game element takes (docs/plugins.md).
+--
+-- A plugin is a forge package whose main module offers four parts, named by
+-- convention. The game keeps each plugin's state and calls it; Strata runs no
+-- loop of its own.
+--
+--   setup(config, registry, ...) : (state, registry, bindings)
+--       once, at start-up: the plugin registers what it needs in the block
+--       registry and proposes input bindings, their action names prefixed
+--       with the plugin's name and a dot ("tactics.rotate_left"). The game
+--       merges every owner's bindings with Strata.Input.merge.
+--   update(state, frame : PluginFrame, ...) : (state, List(Request), List(event))
+--       once a frame: the plugin reads the frame and answers new state, the
+--       requests it makes of the game, and events of its own type.
+--   overlay(state, ...) : Strata.Overlay.Overlay
+--       what it draws over the world this frame; the game merges the
+--       overlays of its plugins and hands them to Strata.Render.overlay.
+--   gui(state, ...) : Strata.Gui.GNode
+--       its part of the interface, for the game to place.
+--
+-- The `...` are arguments a plugin asks of the game (a label function, say).
+--
+-- A plugin never changes the world: it asks, with requests, and the game
+-- applies the ones it accepts (`apply` applies the edits). A plugin never
+-- sets the renderer's camera either: one that has a camera answers
+-- `view_proj(state, aspect)`, the game chooses which camera is shown, and it
+-- passes that matrix back in the next frame, so every plugin's pointer ray
+-- comes from the camera on screen. A plugin uses only Strata's public
+-- modules, as any package can.
+mod Strata.Plugin do
+
+  -- what a plugin may look at this frame: the world (for queries), the frame's input, the pointer
+  -- (window points) and its ray in metres (from the shown camera), the scroll wheel, the time step
+  -- in seconds, the window's size in points, and the shown camera's view-projection
+  type PluginFrame = { pf_world : Strata.World.World, pf_input : Strata.Input.Input, pf_pointer : Option((Float, Float)),
+                 pf_ray : Option(((Float, Float, Float), (Float, Float, Float))), pf_wheel : Float, pf_dt : Float,
+                 pf_width : Float, pf_height : Float, pf_view_proj : NativeFloatArr }
+
+  doc "A frame for plugins: the world, the input, the pointer (window points, None when outside), the wheel, the time step, the window's size in points and the view-projection the frame was drawn with; the pointer's ray is worked out from them (Strata.Math.Ray.from_screen)."
+  fn frame(world : Strata.World.World, input : Strata.Input.Input, pointer : Option((Float, Float)), wheel : Float, dt : Float, width : Float, height : Float, view_proj : NativeFloatArr) : PluginFrame do
+    let ray = match pointer do
+      None -> None
+      Some((px, py)) -> Strata.Math.Ray.from_screen(view_proj, px, py, width, height)
+    end
+    { pf_world: world, pf_input: input, pf_pointer: pointer, pf_ray: ray, pf_wheel: wheel, pf_dt: dt, pf_width: width, pf_height: height, pf_view_proj: view_proj }
+  end
+
+  -- an edit of the world; a blast (x, y, z, radius, seed, id) as Strata.Edit.blast takes it;
+  -- a sound (patch, x, y, z, gain) for the game to play
+  type Request = ReqEdit(Strata.World.Op) | ReqBlast(Int, Int, Int, Int, Int, Int) | ReqSound(Int, Float, Float, Float, Float)
+
+  doc "A request to make an edit (Strata.World.op_cell, op_box, op_sphere)."
+  fn edit(op : Strata.World.Op) : Request do ReqEdit(op) end
+  doc "A request for a blast at voxel (x, y, z) of [radius] voxels, as Strata.Edit.blast takes it."
+  fn blast(x : Int, y : Int, z : Int, radius : Int, seed : Int, id : Int) : Request do ReqBlast(x, y, z, radius, seed, id) end
+  doc "A request to play sound [patch] at (x, y, z) metres with [gain]; the game decides what a patch is."
+  fn sound(patch : Int, x : Float, y : Float, z : Float, gain : Float) : Request do ReqSound(patch, x, y, z, gain) end
+  doc "0 an edit, 1 a blast, 2 a sound."
+  fn request_index(r : Request) : Int do match r do ReqEdit(_) -> 0 | ReqBlast(_, _, _, _, _, _) -> 1 | ReqSound(_, _, _, _, _) -> 2 end end
+  doc "A sound request's (patch, x, y, z, gain); None for another kind."
+  fn sound_of(r : Request) : Option((Int, Float, Float, Float, Float)) do match r do ReqSound(p, x, y, z, g) -> Some((p, x, y, z, g)) | _ -> None end end
+
+  pfn apply_op(w : Strata.World.World, op : Strata.World.Op) : Strata.Edit.Outcome do
+    match Strata.World.op_fields(op) do
+      (0, [x, y, z, id]) -> Strata.Edit.set_block(w, x, y, z, id)
+      (1, [x0, y0, z0, x1, y1, z1, id]) -> Strata.Edit.fill_box(w, x0, y0, z0, x1, y1, z1, id)
+      (2, [cx, cy, cz, r, id]) -> Strata.Edit.fill_sphere(w, cx, cy, cz, r, id)
+      _ -> Strata.Edit.outcome_of(w, Nil, Nil)
+    end
+  end
+
+  pfn apply_go(w : Strata.World.World, rs : List(Request), outs : List(Strata.Edit.Outcome), rest : List(Request)) : (Strata.World.World, List(Strata.Edit.Outcome), List(Request)) do
+    match rs do
+      Nil -> (w, List.reverse(outs), List.reverse(rest))
+      Cons(ReqEdit(op), t) ->
+        let o = apply_op(w, op)
+        apply_go(Strata.Edit.world(o), t, Cons(o, outs), rest)
+      Cons(ReqBlast(x, y, z, r, seed, id), t) ->
+        let o = Strata.Edit.blast(w, x, y, z, r, seed, id)
+        apply_go(Strata.Edit.world(o), t, Cons(o, outs), rest)
+      Cons(other, t) -> apply_go(w, t, outs, Cons(other, rest))
+    end
+  end
+
+  doc "Apply the edits and blasts among [reqs] in order, each on the world the one before left: the world after them, their outcomes in order (for meshing, light, and plugins that track the world), and the requests left for the game (sounds), in order."
+  fn apply(w : Strata.World.World, reqs : List(Request)) : (Strata.World.World, List(Strata.Edit.Outcome), List(Request)) do
+    apply_go(w, reqs, Nil, Nil)
+  end
+end
