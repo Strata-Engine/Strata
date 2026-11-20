@@ -11,3 +11,9 @@
 - Task 10: Ruling: lines of sight stop only at blocks that collide (Strata.Blocks.collides), not every drawn block, so water does not block sight. Cost if wrong: a game wanting glass to block sight registers it colliding.
 - Task 10: Ruling: the five rays are the centres and the centres moved a quarter tile along each of the four diagonals.
 - Task 11: picking with a cut starts the ray where it crosses the cut height; capsule cuts are not considered for picking.
+- Task 12 research (The Ivalice Chronicles, Enhanced; 2026-11-20):
+  - Turn cost: 60 a turn, +20 if the unit moved, +20 if it acted (Game8, "CT (Charge Time) Explained", https://game8.co/games/Final-Fantasy-Tactics/archives/543470). A Steam guide gives a different model (https://steamcommunity.com/sharedfiles/filedetails/?id=3581203978); the PS1 forum account (move+act 100, one of them 80, wait 60; https://gamefaqs.gamespot.com/boards/197339-final-fantasy-tactics/74387490) agrees with Game8, so 60/20/20 is the default.
+  - Cap: Game8 says CT may pass 100 and the spillover is carried into the next turn; no source for the Ivalice Chronicles gives a cap after a turn. Ruling: no cap by default (`ck_cap = None`); the setting stays for games wanting the older cap. Cost if wrong: fast units bank slightly more CT than in the remake.
+  - Tie-break: the order of units on the battle's unit list (GameFAQs, above) — the order units were added.
+  - Charged actions: speed counts ticks (a 25-speed spell takes 4 ticks; Neoseeker, https://www.neoseeker.com/final-fantasy-tactics-the-ivalice-chronicles/Turn_Order_&_Charging_Abilities). The remake shortened charge times, which are content, not clock rules. No source gives the resolution order of two charges due on one tick. Ruling: the order they were queued. Cost if wrong: two simultaneous spells resolve in the other order.
+  - Classic and Enhanced: no source separates them for these rules; both are taken to agree.

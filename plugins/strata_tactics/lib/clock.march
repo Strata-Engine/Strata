@@ -1,0 +1,207 @@
+-- Clock — Final Fantasy Tactics' charge-time turns, as The Ivalice
+-- Chronicles plays them (sources in docs/tactics-ledger.md).
+--
+-- Every unit has a speed and a charge time (CT). The clock runs in ticks; a
+-- tick has four steps, in this order:
+--   1. status timers count down by one; those that reach zero end;
+--   2. charged actions count down by their speed; those at or below zero
+--      resolve, in the order they were queued;
+--   3. every unit's CT rises by its effective speed (its base speed scaled
+--      by the speed modifiers of its live timers: Haste and Slow);
+--   4. the first unit, in the order units were added, with CT at or above
+--      the turn mark gets its turn, and the clock stops while it has it.
+-- `advance` runs ticks until something happens and reports it: when timers
+-- end or charges resolve it stops after step 2, so the game can apply them
+-- (a Haste that resolves speeds the unit up in the same tick's step 3), and
+-- the next `advance` goes on from step 3. When a turn ends, any other unit
+-- already at the mark gets its turn before another tick.
+--
+-- A turn costs CT: the base cost, plus the move cost if the unit moved, plus
+-- the act cost if it acted (60, 20, 20). Every number is a setting.
+mod StrataTactics.Clock do
+
+  -- the turn mark, the base, move and act costs, an optional cap on CT after a turn, a charge's
+  -- starting count, and how many ticks one advance may run
+  type ClockSettings = { ck_turn_at : Int, ck_base : Int, ck_move : Int, ck_act : Int, ck_cap : Option(Int), ck_charge_full : Int, ck_max_ticks : Int }
+
+  doc "FFT's numbers: a turn at 100 CT; a turn costs 60, +20 for moving, +20 for acting; no cap after a turn; a charge counts down from 100; an advance runs at most 10 000 ticks."
+  fn settings() : ClockSettings do { ck_turn_at: 100, ck_base: 60, ck_move: 20, ck_act: 20, ck_cap: None, ck_charge_full: 100, ck_max_ticks: 10000 } end
+
+  -- units (id, base speed, CT) in the order added; timers (id, unit, name, ticks left, num, den);
+  -- charges (id, unit, speed, count) in the order queued; the unit with its turn; ticks run;
+  -- whether the current tick's step 3 is still to come
+  type TurnClock = { tk_set : ClockSettings, tk_units : List((Int, Int, Int)), tk_timers : List((Int, Int, String, Int, Int, Int)),
+                     tk_charges : List((Int, Int, Int, Int)), tk_active : Option(Int), tk_ticks : Int, tk_mid : Bool }
+
+  -- a timer (id) on a unit ended; a charge (id) of a unit resolved; a unit's turn started
+  type ClockEvent = TimerEnded(Int, Int) | ChargeResolved(Int, Int) | TurnStarted(Int)
+
+  doc "0 a timer ended, 1 a charge resolved, 2 a turn started."
+  fn event_index(e : ClockEvent) : Int do match e do TimerEnded(_, _) -> 0 | ChargeResolved(_, _) -> 1 | TurnStarted(_) -> 2 end end
+  doc "The unit whose turn started, for a TurnStarted event."
+  fn turn_of(e : ClockEvent) : Option(Int) do match e do TurnStarted(u) -> Some(u) | _ -> None end end
+  doc "The (charge id, unit) of a ChargeResolved event."
+  fn charge_of(e : ClockEvent) : Option((Int, Int)) do match e do ChargeResolved(i, u) -> Some((i, u)) | _ -> None end end
+  doc "The (timer id, unit) of a TimerEnded event."
+  fn timer_of(e : ClockEvent) : Option((Int, Int)) do match e do TimerEnded(i, u) -> Some((i, u)) | _ -> None end end
+
+  doc "A clock with no units."
+  fn start(s : ClockSettings) : TurnClock do { tk_set: s, tk_units: Nil, tk_timers: Nil, tk_charges: Nil, tk_active: None, tk_ticks: 0, tk_mid: false } end
+
+  doc "The clock with unit [id] added at [speed] and [ct] (after every unit already there; an id already there is replaced in place)."
+  fn add(c : TurnClock, id : Int, speed : Int, ct : Int) : TurnClock do
+    if List.any(c.tk_units, fn u -> match u do (i, _, _) -> i == id end) do
+      { c with tk_units: List.map(c.tk_units, fn u -> match u do (i, s, t) -> if i == id do (id, speed, ct) else (i, s, t) end end) }
+    else { c with tk_units: List.append(c.tk_units, [(id, speed, ct)]) } end
+  end
+
+  doc "The clock without unit [id], its timers and charges."
+  fn remove(c : TurnClock, id : Int) : TurnClock do
+    { c with tk_units: List.filter(c.tk_units, fn u -> match u do (i, _, _) -> i != id end),
+             tk_timers: List.filter(c.tk_timers, fn t -> match t do (_, u, _, _, _, _) -> u != id end),
+             tk_charges: List.filter(c.tk_charges, fn h -> match h do (_, u, _, _) -> u != id end),
+             tk_active: if c.tk_active == Some(id) do None else c.tk_active end }
+  end
+
+  doc "The clock with unit [id]'s base speed set to [speed]."
+  fn set_speed(c : TurnClock, id : Int, speed : Int) : TurnClock do
+    { c with tk_units: List.map(c.tk_units, fn u -> match u do (i, s, t) -> if i == id do (i, speed, t) else (i, s, t) end end) }
+  end
+
+  doc "Unit [id]'s CT (0 if it is not on the clock)."
+  fn ct(c : TurnClock, id : Int) : Int do match List.find(c.tk_units, fn u -> match u do (i, _, _) -> i == id end) do Some((_, _, t)) -> t | None -> 0 end end
+
+  pfn base_speed(c : TurnClock, id : Int) : Int do match List.find(c.tk_units, fn u -> match u do (i, _, _) -> i == id end) do Some((_, s, _)) -> s | None -> 0 end end
+
+  doc "Unit [id]'s effective speed: its base speed times the product of its live timers' numerators over the product of their denominators, rounded down."
+  fn speed(c : TurnClock, id : Int) : Int do
+    let mine = List.filter(c.tk_timers, fn t -> match t do (_, u, _, _, _, _) -> u == id end)
+    let num = List.fold_left(mine, 1, fn (a, t) -> match t do (_, _, _, _, n, _) -> a * n end)
+    let den = List.fold_left(mine, 1, fn (a, t) -> match t do (_, _, _, _, _, d) -> a * d end)
+    if den <= 0 do 0 else base_speed(c, id) * num / den end
+  end
+
+  doc "The clock with timer [id] started on [unit]: [name] (the game's), lasting [ticks] ticks, scaling the unit's speed by num/den (1/1 for a status that does not touch speed)."
+  fn start_timer(c : TurnClock, id : Int, unit : Int, name : String, ticks : Int, num : Int, den : Int) : TurnClock do
+    { c with tk_timers: List.append(List.filter(c.tk_timers, fn t -> match t do (i, _, _, _, _, _) -> i != id end), [(id, unit, name, ticks, num, den)]) }
+  end
+
+  doc "The clock with timer [id] stopped (no event)."
+  fn stop_timer(c : TurnClock, id : Int) : TurnClock do { c with tk_timers: List.filter(c.tk_timers, fn t -> match t do (i, _, _, _, _, _) -> i != id end) } end
+
+  doc "The clock with charged action [id] of [unit] queued: it counts down from the charge mark by [speed] a tick and resolves at or below zero."
+  fn charge(c : TurnClock, id : Int, unit : Int, speed : Int) : TurnClock do
+    { c with tk_charges: List.append(List.filter(c.tk_charges, fn h -> match h do (i, _, _, _) -> i != id end), [(id, unit, speed, c.tk_set.ck_charge_full)]) }
+  end
+
+  doc "The clock with charged action [id] cancelled (no event)."
+  fn cancel(c : TurnClock, id : Int) : TurnClock do { c with tk_charges: List.filter(c.tk_charges, fn h -> match h do (i, _, _, _) -> i != id end) } end
+
+  doc "Is unit [id] charging an action?"
+  fn charging(c : TurnClock, id : Int) : Bool do List.any(c.tk_charges, fn h -> match h do (_, u, _, _) -> u == id end) end
+
+  doc "The unit whose turn it is."
+  fn active(c : TurnClock) : Option(Int) do c.tk_active end
+
+  doc "Ticks run so far."
+  fn ticks(c : TurnClock) : Int do c.tk_ticks end
+
+  -- step 4: the first unit at the mark
+  pfn ready(c : TurnClock) : Option(Int) do
+    match List.find(c.tk_units, fn u -> match u do (_, _, t) -> t >= c.tk_set.ck_turn_at end) do Some((i, _, _)) -> Some(i) | None -> None end
+  end
+
+  -- steps 1 and 2 of a new tick: the clock and what ended or resolved
+  pfn first_half(c : TurnClock) : (TurnClock, List(ClockEvent)) do
+    let counted = List.map(c.tk_timers, fn t -> match t do (i, u, n, k, a, b) -> (i, u, n, k - 1, a, b) end)
+    let ended = List.filter_map(counted, fn t -> match t do (i, u, _, k, _, _) -> if k <= 0 do Some(TimerEnded(i, u)) else None end end)
+    let live = List.filter(counted, fn t -> match t do (_, _, _, k, _, _) -> k > 0 end)
+    let charged = List.map(c.tk_charges, fn h -> match h do (i, u, s, k) -> (i, u, s, k - s) end)
+    let resolved = List.filter_map(charged, fn h -> match h do (i, u, _, k) -> if k <= 0 do Some(ChargeResolved(i, u)) else None end end)
+    let waiting = List.filter(charged, fn h -> match h do (_, _, _, k) -> k > 0 end)
+    ({ c with tk_timers: live, tk_charges: waiting, tk_ticks: c.tk_ticks + 1, tk_mid: true }, List.append(ended, resolved))
+  end
+
+  -- step 3
+  pfn rise(c : TurnClock) : TurnClock do
+    { c with tk_units: List.map(c.tk_units, fn u -> match u do (i, s, t) -> (i, s, t + speed(c, i)) end), tk_mid: false }
+  end
+
+  pfn run(c : TurnClock, left : Int) : (TurnClock, List(ClockEvent)) do
+    if c.tk_mid do
+      let c3 = rise(c)
+      match ready(c3) do
+        Some(u) -> ({ c3 with tk_active: Some(u) }, [TurnStarted(u)])
+        None -> run(c3, left)
+      end
+    else if left <= 0 do (c, Nil)
+    else
+      match first_half(c) do
+        (c2, evs) -> if List.is_empty(evs) do run(c2, left - 1) else (c2, evs) end
+      end
+    end end
+  end
+
+  doc "Run the clock until something happens: answers the clock and what happened, in order — timers that ended and charges that resolved (the clock then stops before CT rises, and the next advance goes on from there), or the turn that started. A unit already at the mark gets its turn with no tick. While a unit has its turn nothing runs. After the settings' max_ticks ticks with nothing happening it stops and answers no events."
+  fn advance(c : TurnClock) : (TurnClock, List(ClockEvent)) do
+    match c.tk_active do
+      Some(_) -> (c, Nil)
+      None ->
+        if !c.tk_mid do
+          match ready(c) do
+            Some(u) -> ({ c with tk_active: Some(u) }, [TurnStarted(u)])
+            None -> run(c, c.tk_set.ck_max_ticks)
+          end
+        else run(c, c.tk_set.ck_max_ticks) end
+    end
+  end
+
+  -- CT after a turn costing [cost], capped, never below 0
+  pfn spent(t : Int, cost : Int, cap : Option(Int)) : Int do
+    let left = t - cost
+    let capped = match cap do Some(m) -> if left > m do m else left end | None -> left end
+    if capped < 0 do 0 else capped end
+  end
+
+  doc "End the active unit's turn: its CT falls by the base cost, plus the move cost if it [moved], plus the act cost if it [acted]; then the cap, if set; never below 0."
+  fn end_turn(c : TurnClock, moved : Bool, acted : Bool) : TurnClock do
+    match c.tk_active do
+      None -> c
+      Some(id) ->
+        let s = c.tk_set
+        let mv = if moved do s.ck_move else 0 end
+        let ac = if acted do s.ck_act else 0 end
+        let cost = s.ck_base + mv + ac
+        let units = List.map(c.tk_units, fn u -> match u do (i, sp, t) -> if i == id do (i, sp, spent(t, cost, s.ck_cap)) else (i, sp, t) end end)
+        { c with tk_active: None, tk_units: units }
+    end
+  end
+
+  pfn forecast_go(c : TurnClock, k : Int, acc : List(ClockEvent)) : List(ClockEvent) do
+    if List.length(acc) >= k do List.reverse(acc)
+    else
+      match advance(c) do
+        (c2, evs) ->
+          let kept = List.filter(evs, fn e -> event_index(e) != 0)
+          if List.is_empty(evs) do List.reverse(acc)
+          else
+            let acc2 = List.fold_left(kept, acc, fn (a, e) -> Cons(e, a))
+            match c2.tk_active do
+              Some(_) -> forecast_go(end_turn(c2, true, true), k, acc2)
+              None -> forecast_go(c2, k, acc2)
+            end
+          end
+      end
+    end
+  end
+
+  doc "The next [k] turns and charge resolutions, in order, assuming every unit moves and acts on its turn; the clock is not changed. An active unit's turn is ended (moved and acted) first."
+  fn forecast(c : TurnClock, k : Int) : List(ClockEvent) do
+    List.take(forecast_go(end_turn(c, true, true), k, Nil), k)
+  end
+
+  doc "The same forecast after the active unit ends its turn having [moved] and [acted] as given: what waiting, say, would do to the order."
+  fn forecast_if(c : TurnClock, moved : Bool, acted : Bool, k : Int) : List(ClockEvent) do
+    List.take(forecast_go(end_turn(c, moved, acted), k, Nil), k)
+  end
+end
