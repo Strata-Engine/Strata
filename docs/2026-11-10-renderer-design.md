@@ -330,3 +330,88 @@ Two plans, each ending in something to run.
 - **March-side per-frame cost.** `Strata.Stream` and `Strata.Render` must
   not walk every loaded chunk each frame; with rings the loaded count
   nearly triples. The soak run measures it.
+
+## Addendum, 2026-11-19: translucent order within a chunk
+
+The "Translucency" paragraph above left quads inside one chunk unsorted and
+drew them from both sides, so a one-voxel pane blended twice and two
+see-through blocks in one chunk blended in mesh order. This replaces that
+part of it. The packed 8-byte quad, the single buffer and the one indirect
+draw of the translucent range all stay.
+
+**What was weighed.**
+
+- *Order-independent blending.* Weighted blending needs two more targets
+  and a resolve pass, changes the look of every water surface (water's
+  alpha runs to 1 where it mirrors, which the weighting handles worst),
+  and gives an approximation from every angle rather than the right answer.
+  Rejected.
+- *Sorting quads each frame.* Per-chunk CPU work every frame, which the
+  design rules out, and a sort by centre is wrong for a merged quad anyway
+  (a lake's surface is one quad a chunk).
+- *Culling back faces, then one fixed order for the chunk.* Tried first,
+  and wrong: an order that is right from above one corner and one that is
+  right from below the opposite corner contradict each other. A model of
+  the test scene found rings of five quads, each rightly ahead of the next
+  from somewhere. No single order exists.
+- *A few orders per chunk, picked by view direction, the chunk drawn once
+  with the one that fits the eye.* Right only for an eye outside the chunk
+  along all three axes. The chunk the eye stands in, and every chunk at
+  its height, are the ones seen closest and the ones it gets wrong.
+- *Eight orders per chunk, each drawn only where it is the right one.*
+  Chosen.
+
+**Eight lists, one for each way a ray can run.** A ray from the eye runs
+up or down each of the three axes: eight octants. Rays of one octant only
+meet quads that face against them, and, from either side, quads of a block
+the eye can be inside: a fluid, or a block that does not collide (the
+viewer's sea). Within one octant, quad B can come between the eye and quad
+A only if some point of A is farther along all three axes than some point
+of B. That test needs no eye. It cannot hold both ways unless the two
+quads cut each other, which voxel faces never do, so no quad is split. The
+mesher (`Strata.Mesh`, "The translucent layer's order") writes each
+octant's quads once, sorted by a depth-first topological sort so that
+every A is ahead of its B. A quad faces against four of the eight octants
+and is in those four lists; one seen from both sides is in all eight.
+
+**Each list is drawn only where its rays run.** The C side, which already
+writes one command per translucent chunk each frame, writes one per list
+instead, with the octant in the top bits of the slot word, and leaves out
+a list when no ray of its octant from the eye meets the chunk's box: one
+list for a chunk the eye is outside of along all three axes, two, four or
+eight as the eye comes inside its extent along one, two or three. The
+vertex shader (`quad.vert`, flag 4 of the push constant) gives each corner
+its offset to the eye along the three axes, signed for the octant, and the
+fragment shader (`water.frag`) drops a fragment where any is negative. The
+three planes through the eye cut the screen into the octants' regions, so
+each pixel is covered by exactly one list, in that list's order.
+
+**A pane blends once.** The same clip does the culling: a quad is only in
+lists whose rays meet its front, so its back is never drawn, and a
+one-voxel pane blends through its near face alone. A block the eye can be
+inside keeps both sides, so the sea's surface still shows from underneath.
+
+**No lists where none are needed.** A chunk whose translucent quads all
+lie in one plane and are all seen from both sides (a lake's or the sea's
+surface: nearly every translucent chunk there is) carries no lists and is
+drawn as before, one command, no clip.
+
+**What it costs.** The translucent range of a chunk with lists holds each
+quad four or eight times. Meshing such a chunk sorts eight times, and the
+sort compares every pair. Both are measured in RESULTS.md.
+
+**What it does not do.**
+
+- Chunks are still ordered among themselves by the distance of their
+  centres, so a long quad in one chunk and a pane just across the border
+  can blend in the wrong order.
+- Three or more quads can cover each other in a ring (a pinwheel of three
+  mutually perpendicular quads). The sort breaks the ring at an arbitrary
+  quad.
+- The sort is bounded: a chunk with more than 1024 translucent quads
+  carries no lists and is drawn as before, in mesh order and from both
+  sides.
+- A fluid's lowered surface is taken to lie on its voxel's top when
+  sorting; the clip uses where it is drawn.
+- Crosses, models and particles are not part of this order.
+- The browser preview has its own renderer and does not use the lists.

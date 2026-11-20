@@ -1035,8 +1035,13 @@ boundary over the ground; their numbers are in `RESULTS.md`.
 - The far field is lit without rays: no shadows, sky light or reflections
   past the near chunks. Where two levels meet the ground can step by one
   coarse voxel; the levels meet on whole coarse chunks.
-- Translucent quads are ordered by chunk, not within one, and draw from
-  both sides, so a one-block pane blends twice.
+- Translucent quads are in the right order inside a chunk, and a pane
+  blends once, but chunks are still ordered among themselves by the
+  distance of their centres: a long quad in one chunk and a pane just
+  across the border can blend in the wrong order. A chunk with more than
+  512 translucent quads is drawn in mesh order. Crosses, models and
+  particles are not sorted against translucent quads, and the browser
+  preview does not sort at all.
 - Model faces light as the nearest of the six axis directions.
 - On MoltenVK presentation paces to the display even with vsync off;
   uncapped timing uses `STRATA_OFFSCREEN=1`.
