@@ -40,7 +40,7 @@ mod StrataTactics.Camera do
   -- the pointer last frame; the shot (Task 14) as (kind, id, phase, time, a, b, side, hold, eye, look); shots done last step
   type TacticsCamera = { tc_set : CameraSettings, tc_focus : (Float, Float, Float), tc_yaw : Float, tc_yaw_to : Float,
                          tc_dist : Float, tc_dist_to : Float, tc_level : Int, tc_follow : Option(((Float, Float, Float), (Float, Float, Float), Float)),
-                         tc_last_pointer : Option((Float, Float)), tc_shot : Option(CameraShot), tc_done : List(Int) }
+                         tc_last_pointer : Option((Float, Float)), tc_shot : Option(CameraShot), tc_done : List(Int), tc_ended : List(Int) }
 
   -- a camera move the game asked for: its id; where the eye and look point go; how long the travel and hold take;
   -- the elapsed time; the orbit view to return to (eye, look)
@@ -49,7 +49,7 @@ mod StrataTactics.Camera do
   doc "A camera looking at [focus] from [yaw_deg], halfway between near and far, floor level 0."
   fn start(s : CameraSettings, focus : (Float, Float, Float), yaw_deg : Float) : TacticsCamera do
     let d = (s.cm_near +. s.cm_far) /. 2.0
-    { tc_set: s, tc_focus: focus, tc_yaw: yaw_deg, tc_yaw_to: yaw_deg, tc_dist: d, tc_dist_to: d, tc_level: 0, tc_follow: None, tc_last_pointer: None, tc_shot: None, tc_done: Nil }
+    { tc_set: s, tc_focus: focus, tc_yaw: yaw_deg, tc_yaw_to: yaw_deg, tc_dist: d, tc_dist_to: d, tc_level: 0, tc_follow: None, tc_last_pointer: None, tc_shot: None, tc_done: Nil, tc_ended: Nil }
   end
 
   pfn clampf(v : Float, lo : Float, hi : Float) : Float do if v < lo do lo else if v > hi do hi else v end end end
@@ -181,10 +181,10 @@ mod StrataTactics.Camera do
   doc "The ids of the shots that finished on the last `step` (each once)."
   fn shot_done(c : TacticsCamera) : List(Int) do c.tc_done end
 
+  -- a shot from the orbit view and back to it; a shot already playing ends (its id is reported on the next step)
   pfn begin_shot(c : TacticsCamera, id : Int, eye_to : (Float, Float, Float), look_to : (Float, Float, Float), hold_s : Float) : TacticsCamera do
-    match view(c) do
-      (e, l) -> { c with tc_shot: Some(CamShot(id, eye_to, look_to, 2.0 *. c.tc_set.cm_turn_s, hold_s, 0.0, e, l)) }
-    end
+    let ended = match c.tc_shot do Some(CamShot(old, _, _, _, _, _, _, _)) -> List.append(c.tc_ended, [old]) | None -> c.tc_ended end
+    { c with tc_shot: Some(CamShot(id, eye_to, look_to, 2.0 *. c.tc_set.cm_turn_s, hold_s, 0.0, orbit_eye(c), c.tc_focus)), tc_ended: ended }
   end
 
   doc "A shot [id]: travel to frame [at] as the orbit frames its focus (over twice the turn time), hold [hold_s] seconds, and travel back to the orbit view."
@@ -218,7 +218,7 @@ mod StrataTactics.Camera do
     end
   end
 
-  doc "A shot [id] framing two points, [a] (the shooter) and [b] (the target): over a's shoulder toward b (1.5 m behind and 0.8 m right of a, 1.8 m up, looking at b), or from the side when [side] (square to a-b at its middle, back far enough to frame both). If the shot's eye is inside a block or cannot see a and b, it becomes a `look` at the middle instead. It holds [hold_s] seconds."
+  doc "A shot [id] framing two points, [a] (the shooter) and [b] (the target): over a's shoulder toward b (1.5 m behind and 0.8 m right of a, 1.8 m up, looking at b), or from the side when [side] (square to a-b at its middle, back far enough to frame both). If the shot's eye is inside a block or cannot see a and b, it becomes a `look` at the middle, and if that eye is blocked too the orbit view is held for the shot's time; either way the id is reported done. A shot started while another plays ends that one (reported done on the next step). It holds [hold_s] seconds."
   fn frame_two(c : TacticsCamera, id : Int, a : (Float, Float, Float), b : (Float, Float, Float), side : Bool, hold_s : Float, w : Strata.World.World) : TacticsCamera do
     match (a, b) do
       ((ax, ay, az), (bx, by0, bz)) ->
@@ -233,7 +233,11 @@ mod StrataTactics.Camera do
             let back = (hl /. 2.0) /. Math.tan(rad(c.tc_set.cm_fov_deg) /. 2.0) *. 1.3 +. 2.0
             match mid do (mx, my, mz) -> ((mx +. rx *. back, my +. 1.5, mz +. rz *. back), mid) end
           else ((ax -. fx *. 1.5 +. rx *. 0.8, ay +. 1.8, az -. fz *. 1.5 +. rz *. 0.8), b) end
-        if solid_at(w, eye_to) || !sees(w, eye_to, a) || !sees(w, eye_to, b) do look(c, id, mid, hold_s)
+        if solid_at(w, eye_to) || !sees(w, eye_to, a) || !sees(w, eye_to, b) do
+          -- the fallback: a look at the middle, or, if that eye is blocked too, the orbit view held
+          let look_eye = match (orbit_eye(c), c.tc_focus, mid) do ((ex, ey, ez), (fx, fy, fz), (mx, my, mz)) -> (mx +. ex -. fx, my +. ey -. fy, mz +. ez -. fz) end
+          if solid_at(w, look_eye) || !sees(w, look_eye, mid) do begin_shot(c, id, orbit_eye(c), c.tc_focus, hold_s)
+          else begin_shot(c, id, look_eye, mid, hold_s) end
         else begin_shot(c, id, eye_to, look_to, hold_s) end
     end
   end
@@ -243,14 +247,15 @@ mod StrataTactics.Camera do
       None -> c
       Some(CamShot(id, e, l, travel, hold, t, oe, ol)) ->
         let t2 = t +. dt
-        if t2 >= 2.0 *. travel +. hold do { c with tc_shot: None, tc_done: [id], tc_last_pointer: pointer }
+        if t2 >= 2.0 *. travel +. hold do { c with tc_shot: None, tc_done: List.append(c.tc_done, [id]), tc_last_pointer: pointer }
         else { c with tc_shot: Some(CamShot(id, e, l, travel, hold, t2, oe, ol)), tc_last_pointer: pointer } end
     end
   end
 
   doc "One frame of the camera from the frame's input ([i], the pointer in window points, the wheel), the window's size, the time step and the ground's height (metres) under a point (the grid's floor)."
   fn step(c : TacticsCamera, i : Strata.Input.Input, pointer : Option((Float, Float)), wheel : Float, width : Float, height : Float, dt : Float, ground : Float -> Float -> Float) : TacticsCamera do
-    if in_shot(c) do shot_step({ c with tc_done: Nil }, pointer, dt)
-    else orbit_step({ c with tc_done: Nil }, i, pointer, wheel, width, height, dt, ground) end
+    let c0 = { c with tc_done: c.tc_ended, tc_ended: Nil }
+    if in_shot(c0) do shot_step(c0, pointer, dt)
+    else orbit_step(c0, i, pointer, wheel, width, height, dt, ground) end
   end
 end
