@@ -52,3 +52,15 @@ Branch `claude/recursing-volhard-8b2976`, not merged into main.
   one line separates its arms with `|`. Worked round with accessors
   (`changed`, `toggled`, `chose`, `edited`, `submitted`, `fold_draws`,
   `draw_text`).
+- Measured: the settings screen (225 quads, a list open) costs 55 to 79 us to
+  lay out and run and 17 to 30 us to paint a frame (RESULTS.md).
+- Checked: the golden scene `gui-settings` drives the screen with keys
+  through the same `Strata.Input` path a player's keys take (down, right,
+  down to the light mode, Enter, down), stored after looking at it.
+- Not checked: a live window driven by a real mouse, keyboard or pad. The
+  viewer ran live (120 fps) but this session's desktop control could not
+  grant a bare binary, and no physical pad was connected. Mouse paths
+  (hover, press, capture, drag, wheel, thumb, list clicks), key paths and pad
+  paths (south, east, bumpers, d-pad, stick) are covered by tests on raw
+  input; GLFW's reading of them, the cursor freeing on F1 and how it feels
+  are unverified.

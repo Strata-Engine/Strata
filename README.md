@@ -511,6 +511,8 @@ The viewer's settings screen (F1, or the pad's right stick click;
 applied by regenerating, the light mode, the voxel scale (on the next
 start), the readout, and the settings file to read.
 
+![The viewer's settings screen, a list open](docs/gui-settings.png)
+
 Limits:
 
 - No scissor: text crossing a scroll region's edge is left out, not cut.
