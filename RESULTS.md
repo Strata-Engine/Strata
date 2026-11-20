@@ -1233,3 +1233,38 @@ Not targets, recorded with them:
   island 19 of 20 trees in the level-1 forest chunk are level 0's. Open.
 - **The March share.** Every per-column cost above is plain March code. Its
   gaps have reduced cases: GAPS S43 to S47.
+
+## Save and load (Strata.Save), measured against the design's budget
+
+`scripts/save_times.sh` builds `savecheck` and prints these rows; release
+build, a flat world of two blocks at 1 m, a stream of radius 2 x 1 (75
+chunks over 8 regions). Judged on 2026-11-19 at a load average of 7.5 (the
+rule: only under 8); two runs before it, at loads 8.4 and 8.6, gave the
+same figures within a tenth.
+
+| What | Target | Measured | |
+|---|---|---|---|
+| `Strata.Save.tick` on the frame, nothing to write | under 0.05 ms | 0.001 ms (mean of 2000 ticks) | met |
+| `Strata.Save.tick` on the frame, starting a region write | under 0.5 ms | 0.012 ms mean, 0.016 ms worst (7 ticks, each starting a region of about 9 edited chunks) | met |
+| A region of 512 edited paletted chunks, encoded and written on a worker | under 50 ms | 183 ms: 169 ms encoding 16.4 MB, 14 ms writing (the write was 2.3 to 2.6 ms in the other runs) | missed |
+| First frame of a loaded world, compared with a new one | no slower than one extra region read per wanted region | 8.3 ms slower (12.5 ms against 4.3 ms to settle the 75 chunks); 8 region files read, one read and decode 4.0 ms, so the allowance was 32 ms | met |
+| `flush` with 100 dirty regions | under 2 s | 164 ms (100 regions of one edited chunk each) | met |
+
+- **The miss.** Encoding is one March loop over each chunk's 32768 voxels
+  (the palette rebuilt from content, Task 1's ruling) and CRC-32 over the
+  file, about 10 ns a voxel in all; Task 1 measured the same encode at 266
+  ms under load 71. This is GAPS S45 (a loop pays per turn for array calls,
+  a scheduler poll and a stack save), not something the store can order
+  differently: the Strata code is left plain. It runs on a worker, so the
+  frame does not see it; what it bounds is how soon a heavily edited region
+  is on disk. The design's lever if it matters first is the region's size.
+- **Starting a write** was 2.2 ms mean and 3.1 ms worst when the frame
+  compacted each loaded chunk and hashed it to see whether it still
+  differed from its generation. The worker does both now
+  (`Strata.World.region_raw` hands chunks over as they are).
+- **Not measured here:** `release_written` costs a hash and a coarse copy
+  (five passes over a chunk) on the frame for each written chunk the world
+  gives up; `tick` gives up at most 2 a frame.
+- `set_section` with a 4 MB value costs what it costs with 10 bytes: 20000
+  calls in 5.5 ms either way (printed by the library's test, not judged).
+

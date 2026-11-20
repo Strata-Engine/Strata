@@ -1,0 +1,195 @@
+-- savecheck — Strata.Save timed against the five rows of the save design's
+-- budget (docs/2026-11-12-save-design.md), headless, in a scratch folder it
+-- makes and removes.
+--
+--   SAVECHECK_DIR=folder SAVECHECK_LOAD=n ./savecheck
+--
+-- SAVECHECK_LOAD is the machine's load average (its whole part): at 8 or
+-- more a row is printed "not judged (load n)", else "met" or "missed".
+-- Exits 0 unless a step fails outright (a store that will not open, a
+-- write that fails).
+mod Savecheck do
+
+  needs IO
+  needs IO.Process
+  needs IO.Spawn
+  needs IO.FileSystem
+  needs IO.Clock
+
+  alias Strata.Save as Sc
+  alias Strata.Stream as Scm
+  alias Strata.World as Scw
+  alias Strata.Chunk as Scc
+  alias Strata.Coord as Sck
+
+  pfn now() : Float do Authority.must(System.now()) end
+  pfn ms(seconds : Float) : String do float_to_string(Math.round(seconds *. 1000000.0) /. 1000.0) end
+
+  pfn reg() : Strata.Blocks.Registry do
+    let one = match Strata.Blocks.register(Strata.Blocks.empty(), Strata.Blocks.def()) do
+      Ok((r, _)) -> r
+      Err(_) -> Strata.Blocks.empty()
+    end
+    match Strata.Blocks.register(one, Strata.Blocks.def()) do
+      Ok((r, _)) -> r
+      Err(_) -> one
+    end
+  end
+  -- stone below y = 0 with a layer of the second block on top, air above
+  pfn ground() : Strata.Terrain.Gen do
+    Strata.Terrain.gen(fn (k, seed) ->
+      if Sck.ky(k) < -1 do Scc.uniform(1)
+      else if Sck.ky(k) == -1 do Scc.fill_box(Scc.uniform(1), 0, 28, 0, 31, 31, 31, 2)
+      else Scc.uniform(0) end end)
+  end
+  pfn world() : Strata.World.World do Scw.new(reg(), ground(), 7, 1.0) end
+
+  pfn verdict(value : Float, target : Float, load : Int) : String do
+    if load >= 8 do "not judged (load " ++ int_to_string(load) ++ ")" else if value <= target do "met" else "missed" end end
+  end
+  pfn row(name : String, value : Float, target : Float, load : Int) : Unit do
+    Authority.must(println("save: " ++ name ++ ": " ++ ms(value) ++ " ms (target under " ++ ms(target) ++ " ms): " ++ verdict(value, target, load)))
+  end
+
+  pfn settle(st : Strata.Stream.Stream, x : Float, y : Float, z : Float) : Strata.Stream.Stream do
+    Scm.run_until_settled(Scm.set_focus(st, Cons((x, y, z), Nil)), 1000000)
+  end
+  pfn put(st : Strata.Stream.Stream, x : Int, y : Int, z : Int, id : Int) : Strata.Stream.Stream do
+    Scm.apply(st, Strata.Edit.set_block(Scm.world(st), x, y, z, id))
+  end
+  pfn edit_all(st : Strata.Stream.Stream, ks : List(Strata.Coord.Key)) : Strata.Stream.Stream do
+    match ks do
+      Nil -> st
+      Cons(k, t) -> edit_all(put(st, 32 * Sck.kx(k) + 5, 32 * Sck.ky(k) + 5, 32 * Sck.kz(k) + 5, 2), t)
+    end
+  end
+  pfn ticks(s : Strata.Save.SaveStore, st : Strata.Stream.Stream, n : Int, dt : Float) : (Strata.Save.SaveStore, Strata.Stream.Stream) do
+    if n <= 0 do (s, st)
+    else
+      let (s2, st2) = Sc.tick(s, st, dt)
+      ticks(s2, st2, n - 1, dt)
+    end
+  end
+  pfn dirty(s : Strata.Save.SaveStore) : Int do
+    let (d, _, _, _) = Sc.stats(s)
+    d
+  end
+  pfn failed(s : Strata.Save.SaveStore) : Int do
+    let (_, _, x, _) = Sc.stats(s)
+    x
+  end
+
+  -- ticks that each start a region write, while any region is dirty: (the store, the stream, how many, their total seconds, the worst)
+  pfn start_ticks(s : Strata.Save.SaveStore, st : Strata.Stream.Stream, n : Int, total : Float, worst : Float) : (Strata.Save.SaveStore, Strata.Stream.Stream, Int, Float, Float) do
+    if dirty(s) <= 0 do (s, st, n, total, worst)
+    else
+      let t0 = now()
+      let (s2, st2) = Sc.tick(s, st, 0.0)
+      let t = now() -. t0
+      start_ticks(s2, st2, n + 1, total +. t, if t > worst do t else worst end)
+    end
+  end
+
+  -- a paletted chunk: ground with a few blocks of the second id, differing by n
+  pfn paletted(n : Int) : Strata.Chunk.Chunk do
+    Scc.compact(Scc.fill_box(Scc.fill_box(Scc.uniform(0), 0, 0, 0, 31, 15 + n % 8, 31, 1), n % 20, 16, 3, 31, 16 + n % 8, 9 + n % 16, 2))
+  end
+  pfn region_of_512(i : Int, acc : List((Strata.Coord.Key, Strata.Chunk.Chunk))) : List((Strata.Coord.Key, Strata.Chunk.Chunk)) do
+    if i >= 512 do acc else region_of_512(i + 1, Cons((Sck.key(i % 8, (i / 8) % 8, i / 64), paletted(i)), acc)) end
+  end
+
+  -- one chunk edited in each of n regions along x, each unloaded as the focus moves on (radius 0)
+  pfn spread(st : Strata.Stream.Stream, i : Int, n : Int) : Strata.Stream.Stream do
+    if i >= n do settle(st, -4000.0, 16.0, -4000.0)
+    else
+      let x = 256 * i + 16
+      spread(put(settle(st, int_to_float(x), 16.0, 16.0), x, 5, 5, 2), i + 1, n)
+    end
+  end
+
+  pfn run(dir : String, load : Int) : Int do
+    let _clean = Authority.must(Dir.rm_rf(dir))
+    match Sc.open(dir ++ "/a", world(), 1) do
+      Err(e) ->
+        Authority.must(println("savecheck: FAIL: open: " ++ e))
+        1
+      Ok((s0, w0)) ->
+        let st0 = settle(Scm.with_store(Scm.start(w0, Scm.config(2, 1, 64, 4)), Sc.region_source(s0)), 16.0, 16.0, 16.0)
+        -- row 1: a tick with nothing to write
+        let (s1, st1) = ticks(s0, st0, 100, 0.016667)
+        let t0 = now()
+        let (s2, st2) = ticks(s1, st1, 2000, 0.016667)
+        row("tick, nothing to write (mean of 2000)", (now() -. t0) /. 2000.0, 0.00005, load)
+        -- row 2: ticks that each start a region write: every loaded chunk edited (75 chunks over 8 regions)
+        let st3 = Scm.run_until_settled(edit_all(st2, List.filter(Strata.Store.keys(Scw.chunks(Scm.world(st2))), fn k -> Sck.level(k) == 0)), 1000000)
+        let (s4, st4) = Sc.tick(s2, st3, 0.5)
+        let (s5, st5) = Sc.tick(s4, st4, 2.5)
+        let (s6, st6, n, total, worst) = start_ticks(s5, st5, 0, 0.0, 0.0)
+        row("tick starting a region write (mean of " ++ int_to_string(n) ++ ", " ++ int_to_string(Scm.loaded_count(st6)) ++ " chunks edited; worst " ++ ms(worst) ++ " ms)", total /. int_to_float(if n > 0 do n else 1 end), 0.0005, load)
+        let (s7, st7) = Sc.wait_writes(s6, st6)
+        -- row 3: a region of 512 edited paletted chunks, encoded and written (the work a worker does)
+        let g = { sr_generator: 65537, sr_counter: 1, sr_chunks: region_of_512(0, Nil), sr_ops: Nil, sr_sections: Nil }
+        let t1 = now()
+        let bytes = Strata.Savefile.encode_region(g)
+        let t2 = now()
+        let wrote = Sc.write_atomic(dir ++ "/region512.bin", bytes)
+        let t3 = now()
+        Authority.must(println("save: (encode " ++ ms(t2 -. t1) ++ " ms, write " ++ ms(t3 -. t2) ++ " ms, " ++ int_to_string(Bytes.length(bytes) / 1024) ++ " KB)"))
+        row("a region of 512 edited paletted chunks, encoded and written", t3 -. t1, 0.05, load)
+        -- row 5: flush with 100 dirty regions (one edited chunk each, unloaded)
+        match Sc.open(dir ++ "/b", world(), 1) do
+          Err(e) ->
+            Authority.must(println("savecheck: FAIL: open b: " ++ e))
+            1
+          Ok((sb, wb)) ->
+            let stb = spread(Scm.with_store(Scm.start(wb, Scm.config(0, 0, 64, 4)), Sc.region_source(sb)), 0, 100)
+            let (sb1, stb1) = Sc.tick(sb, stb, 0.016667)
+            let nd = dirty(sb1)
+            let ph = Strata.Physics.new(reg(), Strata.Physics.config())
+            let t4 = now()
+            let (sb2, stb2, ph2) = Sc.flush(sb1, stb1, ph, None, Nil)
+            row("flush with " ++ int_to_string(nd) ++ " dirty regions", now() -. t4, 2.0, load)
+            let (stb3, _) = Sc.close(sb2, stb2, ph2, None, Nil)
+            Scm.stop(stb3)
+            -- row 4: the first frame of a loaded world against a new one: settling the same 75 chunks
+            let (st8, _) = Sc.close(s7, st7, ph, None, Nil)
+            Scm.stop(st8)
+            let t5 = now()
+            let fresh = settle(Scm.start(world(), Scm.config(2, 1, 64, 4)), 16.0, 16.0, 16.0)
+            let new_s = now() -. t5
+            Scm.stop(fresh)
+            match Sc.open(dir ++ "/a", world(), 1) do
+              Err(e) ->
+                Authority.must(println("savecheck: FAIL: open a again: " ++ e))
+                1
+              Ok((sl, wl)) ->
+                let t6 = now()
+                let loaded = settle(Scm.with_store(Scm.start(wl, Scm.config(2, 1, 64, 4)), Sc.region_source(sl)), 16.0, 16.0, 16.0)
+                let load_s = now() -. t6
+                let (sl2, loaded2) = Sc.wait_writes(sl, loaded)
+                let nr = Sc.reads(sl2)
+                let t7 = now()
+                let _one = Strata.Regions.read(dir ++ "/a", Strata.Regions.key_of(0, 0, 0))
+                let read_s = now() -. t7
+                Authority.must(println("save: (a new world settles its 75 chunks in " ++ ms(new_s) ++ " ms, the loaded one in " ++ ms(load_s) ++ " ms; " ++ int_to_string(nr) ++ " region files read; one read and decode " ++ ms(read_s) ++ " ms)"))
+                row("first frame of a loaded world, over a new one's", load_s -. new_s, int_to_float(nr) *. read_s, load)
+                let bad = failed(s7) + failed(sb2) + failed(sl2) + (if wrote do 0 else 1 end) + (if Scm.world_hash(loaded2) == Scm.world_hash(st7) do 0 else 1 end)
+                let (loaded3, _) = Sc.close(sl2, loaded2, ph, None, Nil)
+                Scm.stop(loaded3)
+                let _gone = Authority.must(Dir.rm_rf(dir))
+                if bad > 0 do
+                  Authority.must(println("savecheck: FAIL: a write failed, or the loaded world is not the saved one"))
+                  1
+                else
+                  Authority.must(println("savecheck: ok"))
+                  0
+                end
+            end
+        end
+    end
+  end
+
+  fn main(_cap : Cap(IO)) : Unit do
+    process_exit(run(Authority.must(Env.get("SAVECHECK_DIR", ".scratch-savecheck")), Authority.must(Env.get_int("SAVECHECK_LOAD", 0))))
+  end
+end

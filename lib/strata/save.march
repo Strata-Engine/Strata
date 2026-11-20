@@ -42,10 +42,13 @@ mod Strata.Save do
   -- changed since its last write, and the region sections set since then.
   type SvDirty = SvDirty(Float, Strata.Store.Store(Bool), List((String, Bytes)))
   -- One changed key as a write task takes it: the key; 0 keep the saved
-  -- chunk, 1 put this chunk, 2 drop the saved chunk; the chunk; whether the
-  -- world's queue is the whole truth (the chunk is in memory) or follows
-  -- the saved queue; the world's queue, oldest first.
-  type SvChange = SvChange(Strata.Coord.Key, Int, Strata.Chunk.Chunk, Bool, List(Strata.World.Op))
+  -- chunk, 1 put this chunk, 2 drop the saved chunk, 3 a loaded chunk as it
+  -- is, for the worker to judge (put it compacted if it differs from the
+  -- hash it generated to, else drop the saved chunk); the chunk; whether
+  -- the world's queue is the whole truth (the chunk is in memory) or
+  -- follows the saved queue; the world's queue, oldest first; the hash the
+  -- chunk generated to (kind 3).
+  type SvChange = SvChange(Strata.Coord.Key, Int, Strata.Chunk.Chunk, Bool, List(Strata.World.Op), Int)
   -- What a region write answers: done?, the region now on disk (holding
   -- nothing: its file is gone), and each chunk put with its content hash.
   type SvWrote = SvWrote(Bool, Strata.Savefile.Region, List((Strata.Coord.Key, Int)))
@@ -647,11 +650,21 @@ mod Strata.Save do
   -- from the old region
   type SvFold = SvFold(Strata.Store.Store(Int), List((Strata.Coord.Key, Strata.Chunk.Chunk)), List((Strata.Coord.Key, List(Strata.World.Op))), List((Strata.Coord.Key, Int)), Bool)
 
+  -- a loaded chunk judged: put, compacted, if it differs from its generation, else dropped
+  pfn judged(c : SvChange) : SvChange do
+    match c do
+      SvChange(k, kind, chunk, whole, mem, gen) ->
+        if kind != 3 do c
+        else if Ckv.hash(chunk) == gen do SvChange(k, 2, Ckv.uniform(0), whole, mem, gen)
+        else SvChange(k, 1, Ckv.compact(chunk), whole, mem, gen) end end
+    end
+  end
+
   pfn fold_change(old : Strata.Savefile.Region, f : SvFold, c : SvChange) : SvFold do
     match f do
       SvFold(kinds, chs, qs, hs, same) ->
-        match c do
-          SvChange(k, kind, chunk, whole, mem) ->
+        match judged(c) do
+          SvChange(k, kind, chunk, whole, mem, _) ->
             let was = Rgn.chunk_in(old, k)
             let disk_q = Rgn.ops_in(old, k)
             let q = if whole do mem else merge_ops(disk_q, mem) end
@@ -764,9 +777,10 @@ mod Strata.Save do
   end
 
   -- the changes of [keys], each with what the world holds for it: chs and
-  -- qs are `Strata.World.region_values` of the same keys, so they follow
-  -- the keys' order
-  pfn changes_of(w : Strata.World.World, keys : List(Strata.Coord.Key), chs : List((Strata.Coord.Key, Strata.Chunk.Chunk)), qs : List((Strata.Coord.Key, List(Strata.World.Op))), acc : List(SvChange)) : List(SvChange) do
+  -- qs are `Strata.World.region_raw` of the same keys, so they follow the
+  -- keys' order. Nothing is hashed or compacted here: a loaded chunk goes
+  -- to the worker as it is.
+  pfn changes_of(w : Strata.World.World, keys : List(Strata.Coord.Key), chs : List((Strata.Coord.Key, Strata.Chunk.Chunk, Int)), qs : List((Strata.Coord.Key, List(Strata.World.Op))), acc : List(SvChange)) : List(SvChange) do
     match keys do
       Nil -> List.reverse(acc)
       Cons(k, t) ->
@@ -776,17 +790,17 @@ mod Strata.Save do
         end
         match chs do
           Nil -> changes_of(w, t, chs, qs2, Cons(change_without(w, k, mem), acc))
-          Cons((ck, c), ct) ->
-            if Kv.key_eq(ck, k) do changes_of(w, t, ct, qs2, Cons(SvChange(k, 1, c, true, mem), acc))
+          Cons((ck, c, gen), ct) ->
+            if Kv.key_eq(ck, k) do changes_of(w, t, ct, qs2, Cons(SvChange(k, if gen < 0 do 1 else 3 end, c, true, mem, gen), acc))
             else changes_of(w, t, chs, qs2, Cons(change_without(w, k, mem), acc)) end
         end
     end
   end
-  -- a changed key the world gives no chunk for: loaded, it was edited back
-  -- to its generation (drop the saved copy); away, its chunk is on disk
-  -- and only there (keep it; the saved queue is followed by the world's)
+  -- a changed key the world gives no chunk for: loaded, it was never
+  -- touched (drop any saved copy); away, its chunk is on disk and only
+  -- there (keep it; the saved queue is followed by the world's)
   pfn change_without(w : Strata.World.World, k : Strata.Coord.Key, mem : List(Strata.World.Op)) : SvChange do
-    if Wv.is_loaded(w, k) do SvChange(k, 2, Ckv.uniform(0), true, mem) else SvChange(k, 0, Ckv.uniform(0), false, mem) end
+    if Wv.is_loaded(w, k) do SvChange(k, 2, Ckv.uniform(0), true, mem, -1) else SvChange(k, 0, Ckv.uniform(0), false, mem, -1) end
   end
 
   pfn spawn_region(path : String, old : Strata.Savefile.Region, changes : List(SvChange), sections : List((String, Bytes)), generator : Int, counter : Int) : Task(SvWrote) do
@@ -800,7 +814,7 @@ mod Strata.Save do
       SvDirty(_, ks, secs) ->
         let (s1, old) = region_now(s, rk)
         let keys = Sto.keys(ks)
-        let (chs, qs) = Wv.region_values(w, keys)
+        let (chs, qs) = Wv.region_raw(w, keys)
         let task = spawn_region(Rgn.path(s1.sv_dir, rk), old, changes_of(w, keys, chs, qs, Nil), secs, s1.sv_generator, s1.sv_header.sh_counter)
         { s1 with sv_dirty: Sto.remove(s1.sv_dirty, rk), sv_writes: Cons(SvWrite(rk, d, task), s1.sv_writes) }
     end

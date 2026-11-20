@@ -204,6 +204,55 @@ water. A cave flooded through its roof keeps some air under the roof.
 ![A breached lake draining](docs/fluid-lake.png)
 ![The same breach from below](docs/fluid-waterfall.png)
 
+## Saving
+
+A game keeps its world in a folder, a **store**, and the world saves as it
+is played: there is no moment the player waits for. Every chunk that
+differs from what its generator makes, and every edit queued for a chunk
+that is not loaded, reaches a region file (8 x 8 x 8 chunks) a couple of
+seconds after it last changed, encoded and written on a worker. Once
+written, an edited chunk that is not loaded leaves memory; a coarse copy a
+seventh of its size stays so the far field still shows it. Loading is the
+stream doing what it always does: its generation workers read the saved
+regions and a saved chunk takes the generated one's place. The store also
+carries the game's own bytes at three levels (the world, a region, a
+player) and the entity snapshot, and never reads them. Design:
+`docs/2026-11-12-save-design.md`.
+
+| Call | Does |
+|---|---|
+| `Strata.Save.identity(dir)` | the seed, voxel scale and generator version in a store's header, before a generator that needs the seed is built |
+| `Strata.Save.open(dir, world, generator_version)` | the store and the world with its change log on, or a refusal with its reason; a missing or empty folder becomes a new store. `open_forcing` takes over the lock a crashed game left |
+| `Strata.Stream.with_store(stream, Strata.Save.region_source(store))` | generation consults the saved regions; once, right after `open` and before the stream's first tick |
+| `Strata.Save.tick(store, stream, dt)` | once a frame after `Strata.Stream.tick`: marks changed regions dirty, starts at most one region write (after 2 s of quiet), the header and changed player records every 5 s, folds in finished writes. It never waits for a write |
+| `Strata.Save.set_section(store, name, bytes)`, `section` | the game's data for the whole world, in the header |
+| `Strata.Save.set_region_section(store, region, name, bytes)`, `region_section`, `region_of(x, y, z, scale)` | the game's data for one region, saved with that region's chunks |
+| `Strata.Save.set_player(store, id, bytes)`, `player`, `players` | one record a player |
+| `Strata.Save.set_entities(store, arrays)`, `entities` | the entity snapshot (`Strata.Entities.snapshot_arrays`, `snapshot_of`), in the header |
+| `Strata.Save.set_generator_version(store, v)` | after `Strata.World.regenerate` |
+| `Strata.Save.edited_keys(store)`, `wake_outcome(store, world)` | the chunks the store holds; `Strata.Fluid.wake(fluid, world, wake_outcome(store, world))` after the surroundings have loaded sets disturbed water moving again |
+| `Strata.Save.flush(store, stream, physics, snapshot, held_bodies)` | loose bodies written into the world as blocks, everything dirty written now, every write waited for |
+| `Strata.Save.close(store, stream, physics, snapshot, held_bodies)` | `flush`, then the lock released. `close_unflushed(store)` for a store that never streamed |
+| `Strata.Save.stats(store)`, `reason(store)` | dirty regions, writes in flight, writes failed, files set aside; the last refusal or failure |
+
+A store made with another generator still loads, with **seams**: chunks
+the player edited keep their saved content, everything never touched comes
+from the new generator, and each region file keeps the generator version it
+was first written with, so a game can find where the two meet. What `open`
+refuses, each with its reason: a store from another block registry (its
+fingerprint covers every field that changes what a block is, not its
+textures), another seed or voxel scale, a newer format, a damaged header
+(set aside as `store.bin.bad`), and a folder another game holds (a lock
+file). A damaged region or player file costs that region or that player,
+not the world: it is renamed `.bad`, counted, and its chunks generate.
+Every file is written whole to `<name>.tmp` and renamed, so a crash of the
+game leaves each file old or new, never half. Power loss is not covered:
+March cannot force a file's data to disk (GAPS S49).
+
+In the viewer, `STRATA_STORE=<dir>` keeps the walked world in that folder:
+carve, quit, start again with the same folder and the craters are there,
+the walker where it stood. Costs are in `RESULTS.md`.
+
 ## Sound
 
 `Strata.Sound` is what a game hears, as a value: it plays, moves, retunes
@@ -992,6 +1041,9 @@ boundary over the ground; their numbers are in `RESULTS.md`.
 | `Strata.World` | loaded chunks, the edited-chunk cache, queued edits |
 | `Strata.Edit` | single, list, box and sphere edits; blasts; `unsupported`: what an edit left hanging (plants over dug ground) |
 | `Strata.Stream` | loading around focus points; task-built chunks and meshes |
+| `Strata.Save` | a world kept in a folder as it is played: dirty regions written by workers, the header, player records, the game's sections; loading, flush and close |
+| `Strata.Savefile` | the encoding of every save file: framed, checksummed, decoded without a panic |
+| `Strata.Regions` | a store's region files as the stream's generation workers read them |
 | `Strata.Query` | raycast and swept box collision |
 | `Strata.Nav` | where a walker stands; A* paths over the voxels, nearest-by-test, straight lines, corners |
 | `Strata.Steer` | directions over the ground for a mover: seek, flee, arrive, keep apart, blend, turn |
@@ -1013,8 +1065,17 @@ boundary over the ground; their numbers are in `RESULTS.md`.
 
 ## Known limits
 
-- No save format: edited chunks stay in memory. A save would have to keep
-  the fluid's active cells too.
+- A saved world is the world at rest: the fluid's active cells, bodies in
+  flight and what an entity was seeing are not kept. On loading, a game
+  wakes the fluid in the chunks that were edited (`wake_outcome`), and
+  `flush` writes loose bodies into the world as blocks.
+- A store survives the game crashing, not the machine losing power: March
+  has no way to force a file's data to disk (GAPS S49), so after a power
+  cut a region can fail its checksum; it is then set aside and its edits
+  regenerate away.
+- A freshly loaded store shows a saved edit on the horizon only once its
+  chunks have loaded: the coarse copies the far field uses are made as
+  chunks leave memory and are not saved.
 - Water has no pressure: it does not rise in a pipe or push uphill behind a
   dam. It leaves a lake only over the lip of its outlet, so a big lake
   takes minutes to drain, and a wet bed keeps a film of an eighth or two.
@@ -1061,4 +1122,8 @@ boundary over the ground; their numbers are in `RESULTS.md`.
     scripts/verify.sh
 
 runs `forge check`, `forge build --release`, `forge lint --strict` and
-`forge test` in the library and in each app, and prints PASS.
+`forge test` in the library and in each app, and prints PASS. The save's
+part of it: `scripts/save_times.sh` (savecheck: the store timed against its
+budget, headless) and, with a GPU, `scripts/save_check.sh` (the viewer
+carves with `STRATA_STORE` set, quits, and a second run must load the same
+world).

@@ -49,6 +49,8 @@
 -- STRATA_FALLS=0|1  spray where a river's surface steps down (default: on when playing, off in scripted runs)
 -- Key P            when playing: a picture of the view, saved as screenshots/strata-<process>-<frame>.png
 -- STRATA_DIG=1      blast once at frame 10, as a left click would (for scripts)
+-- STRATA_STORE=dir  keep the world in that folder (Strata.Save): saved as it plays, loaded at the next start,
+--                   the walker back where it stood; STRATA_STORE_FORCE=1 takes over a crashed run's lock
 -- STRATA_SCENE=n    start from fixed camera pose n (see `pose`); with STRATA_FRAMES the run is deterministic
 -- STRATA_VSYNC=0    present immediately, for timing
 -- STRATA_SIZE=WxH   window size in points (default 1280x800)
@@ -2628,7 +2630,101 @@ mod StrataViewer do
     r
   end
 
-  pfn frame_loop(s : Strata.Stream.Stream, fl : Strata.Fluid.Fluid, job : Option(Strata.Fluid.Job), sl : Strata.Render.Render, reg : Strata.Blocks.Registry, cx : Ctx, cam : Cam, rig : PhysRig, frame : Int, frames : Int, script : Int, hole : (Int, Int, Int), tl : (Int, Int, Int, Int, Int, Int, Int), worst : Float, total : Float, fworst : Float, t_prev : Float, t_mark : Float, vp : NativeF32Arr, snd : Strata.Sound.Sound, aworst : Float, cr : StrataViewer.Figures.Crowd, mt : StrataViewer.Match.MtMatch, falls : Strata.Falls.FlFalls, fxr : StrataViewer.Fx.FxRun) : Unit do
+  -- ── The store (STRATA_STORE) ─────────────────────────────────────────────
+  -- STRATA_STORE=<dir> keeps the walked world in that folder (Strata.Save):
+  -- opened at the start, ticked every frame, closed on quit with the
+  -- walker's pose as player 0, which the next start with the same folder
+  -- takes up. STRATA_STORE_FORCE=1 takes over a lock a crashed run left.
+  pfn store_open(w : Strata.World.World) : (Option(Strata.Save.SaveStore), Strata.World.World) do
+    let d = Authority.must(Env.get("STRATA_STORE", ""))
+    if d == "" do (None, w)
+    else
+      let opened = if Authority.must(Env.get_int("STRATA_STORE_FORCE", 0)) == 1 do Strata.Save.open_forcing(d, w, 1) else Strata.Save.open(d, w, 1) end
+      match opened do
+        Ok((st, w2)) ->
+          Authority.must(println("save: store " ++ d ++ " open; " ++ int_to_string(List.length(Strata.Save.edited_keys(st))) ++ " edited chunks on disk"))
+          (Some(st), w2)
+        Err(e) ->
+          Authority.must(println("save: store " ++ d ++ " refused (" ++ e ++ "); running without a store"))
+          (None, w)
+      end
+    end
+  end
+  pfn store_stream(sv : Option(Strata.Save.SaveStore), s : Strata.Stream.Stream) : Strata.Stream.Stream do
+    match sv do
+      Some(st) -> Strata.Stream.with_store(s, Strata.Save.region_source(st))
+      None -> s
+    end
+  end
+  -- the fluid in the chunks the store says were edited is awake again
+  pfn store_wake(sv : Option(Strata.Save.SaveStore), fl : Strata.Fluid.Fluid, w : Strata.World.World) : Strata.Fluid.Fluid do
+    match sv do
+      Some(st) -> Strata.Fluid.wake(fl, w, Strata.Save.wake_outcome(st, w))
+      None -> fl
+    end
+  end
+  pfn pose_magic() : Int do 1163087702 end
+  pfn pose_bytes(x : Float, y : Float, z : Float, yaw : Float, pitch : Float) : Bytes do
+    Strata.Savefile.finish(Strata.Savefile.put_f64(Strata.Savefile.put_f64(Strata.Savefile.put_f64(Strata.Savefile.put_f64(Strata.Savefile.put_f64(Strata.Savefile.writer(), x), y), z), yaw), pitch), pose_magic())
+  end
+  pfn pose_floats(r : Strata.Savefile.SaveReader, n : Int, acc : List(Float)) : List(Float) do
+    if n <= 0 do List.reverse(acc)
+    else
+      match Strata.Savefile.get_f64(r) do
+        Ok((r2, v)) -> pose_floats(r2, n - 1, Cons(v, acc))
+        Err(_) -> Nil
+      end
+    end
+  end
+  -- where the walker starts: player 0's record, if the store has one that reads; else [start]
+  pfn store_pose(sv : Option(Strata.Save.SaveStore), start : (Float, Float, Float, Float, Float)) : (Float, Float, Float, Float, Float) do
+    match sv do
+      None -> start
+      Some(st) ->
+        match Strata.Save.player(st, 0) do
+          None -> start
+          Some(b) ->
+            match Strata.Savefile.reader(b, pose_magic()) do
+              Err(_) -> start
+              Ok(r) ->
+                match pose_floats(r, 5, Nil) do
+                  Cons(x, Cons(y, Cons(z, Cons(yaw, Cons(pitch, Nil))))) ->
+                    Authority.must(println("save: the walker is back at " ++ float_to_string(Math.round(x)) ++ ", " ++ float_to_string(Math.round(y)) ++ ", " ++ float_to_string(Math.round(z))))
+                    (x, y, z, yaw, pitch)
+                  _ -> start
+                end
+            end
+        end
+    end
+  end
+  pfn store_tick(sv : Option(Strata.Save.SaveStore), s : Strata.Stream.Stream, dt : Float) : (Option(Strata.Save.SaveStore), Strata.Stream.Stream) do
+    match sv do
+      None -> (None, s)
+      Some(st) ->
+        let (st2, s2) = Strata.Save.tick(st, s, dt)
+        (Some(st2), s2)
+    end
+  end
+  -- on quit: the walker's pose as player 0, loose bodies settled into the world, everything written and waited for, the lock released
+  pfn store_close(sv : Option(Strata.Save.SaveStore), s : Strata.Stream.Stream, rig : PhysRig, cam : Cam) : Strata.Stream.Stream do
+    match sv do
+      None -> s
+      Some(st) ->
+        match cam do
+          Cam(x, y, z, yaw, pitch, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _) ->
+            match rig do
+              PhysRig(p, _, me, _, _, _) ->
+                let (st2, s2, _) = Strata.Save.flush(Strata.Save.set_player(st, 0, pose_bytes(x, y, z, yaw, pitch)), s, p, None, Cons(me, Nil))
+                let (dirty, _, failed, aside) = Strata.Save.stats(st2)
+                Authority.must(println("save: world hash " ++ int_to_string(Strata.Stream.world_hash(s2)) ++ "; " ++ int_to_string(List.length(Strata.Save.edited_keys(st2))) ++ " edited chunks on disk; " ++ int_to_string(Strata.Save.reads(st2)) ++ " region files read; still dirty " ++ int_to_string(dirty) ++ ", writes failed " ++ int_to_string(failed) ++ ", files set aside " ++ int_to_string(aside) ++ (if Strata.Save.reason(st2) == "" do "" else " (" ++ Strata.Save.reason(st2) ++ ")" end)))
+                let (s3, _) = Strata.Save.close(st2, s2, p, None, Cons(me, Nil))
+                s3
+            end
+        end
+    end
+  end
+
+  pfn frame_loop(s : Strata.Stream.Stream, fl : Strata.Fluid.Fluid, job : Option(Strata.Fluid.Job), sl : Strata.Render.Render, reg : Strata.Blocks.Registry, cx : Ctx, cam : Cam, rig : PhysRig, frame : Int, frames : Int, script : Int, hole : (Int, Int, Int), tl : (Int, Int, Int, Int, Int, Int, Int), worst : Float, total : Float, fworst : Float, t_prev : Float, t_mark : Float, vp : NativeF32Arr, snd : Strata.Sound.Sound, aworst : Float, cr : StrataViewer.Figures.Crowd, mt : StrataViewer.Match.MtMatch, falls : Strata.Falls.FlFalls, fxr : StrataViewer.Fx.FxRun, sv : Option(Strata.Save.SaveStore)) : Unit do
     Strata.Ffi.Vk.poll()
     if Strata.Ffi.Vk.should_close() || Strata.Ffi.Vk.key(256) || (frames > 0 && frame >= frames) || (frames > 0 && StrataViewer.Match.won(mt) && Authority.must(Env.get_int("STRATA_COMBAT_HOLD", 0)) == 0) do
       match Strata.Render.light_pages() do (pu, pn, pr) -> Authority.must(println("strata_viewer: light pages " ++ int_to_string(pu) ++ " of " ++ int_to_string(pn) ++ " in use (" ++ int_to_string(pn / 32) ++ " MB), " ++ int_to_string(pr) ++ " chunks found none")) end
@@ -2646,7 +2742,7 @@ mod StrataViewer do
         Authority.must(println("soak: frames=" ++ int_to_string(frame) ++ " worst_ms=" ++ ms2(worst *. 1000.0) ++ " mean_ms=" ++ ms2(total *. 1000.0 /. int_to_float(if frame > 10 do frame - 10 else 1 end)) ++ " refused=" ++ int_to_string(Strata.Ffi.Vk.refused()) ++ " waiting=" ++ int_to_string(Strata.Render.waiting(sl)) ++ " slots=" ++ int_to_string(Strata.Render.used(sl)) ++ " live_quads=" ++ int_to_string(Strata.Ffi.Vk.live_quads()) ++ " leaked=" ++ int_to_string(float_to_int(Strata.Ffi.Vk.stat(7))) ++ " loaded=" ++ int_to_string(Strata.Stream.loaded_count(s)) ++ " levels=" ++ int_to_string(Strata.Stream.top_level(s)) ++ " retained=" ++ int_to_string(Strata.Render.retained(sl)) ++ " fluid_worst_ms=" ++ ms2(fworst) ++ " fluid_active=" ++ int_to_string(Strata.Fluid.active_count(fl)) ++ " fluid_waiting=" ++ int_to_string(Strata.Fluid.waiting_count(fl)) ++ " ui_dropped=" ++ int_to_string(Strata.Render.ui_dropped()) ++ " text_waiting=" ++ int_to_string(Strata.Text.waited_last_frame()) ++ " atlas_bytes=" ++ int_to_string(Strata.Text.atlas_bytes()) ++ " fig_prep_us=" ++ float_to_string(Strata.Ffi.Vk.stat(20)) ++ " fig_shadow_ms=" ++ float_to_string(Strata.Ffi.Vk.stat(21)) ++ " fig_updates=" ++ int_to_string(float_to_int(Strata.Ffi.Anim.timing(3))) ++ audio_summary(s, reg, cam, aworst)))
         match cx do Ctx(_, _, bs, starts, _) -> lake_lines(0, starts, lake_amounts(Strata.Stream.world(s), reg, bs)) end
       else () end
-      Strata.Stream.stop(s)
+      Strata.Stream.stop(store_close(sv, s, rig, cam))
       Strata.Ffi.Audio.close()
     else
       match cam do
@@ -2916,6 +3012,8 @@ mod StrataViewer do
               let worst2 = if frame >= 10 && spent > worst do spent else worst end
               let fworst2 = if fluid_ms > fworst do fluid_ms else fworst end
               let total2 = if frame >= 10 do total +. spent else total end
+              -- STRATA_STORE: the store takes the world's changes and starts its writes; it never waits
+              let (sv2, s4) = store_tick(sv, s3, dt)
               let cam2 = Cam(x2, y2, z2, yaw2, pitch2, kx, ky, kz, lb, rb, fly, StrataViewer.Walker.speed_y(moved), StrataViewer.Walker.grounded(moved), fkey, sun, mode, lkey, keys + figbits, stride, slot, rkey)
               if next != frame && frame % 240 == 239 do
                 Authority.must(println("  " ++ float_to_string(Math.round(240.0 /. (now -. t_mark))) ++ " fps; march " ++ ms2(march_ms) ++ " ms, shim " ++ ms2(Strata.Ffi.Vk.stat(0)) ++ " ms, waiting " ++ ms2(Strata.Ffi.Vk.stat(1)) ++ " ms, gpu " ++ ms2(Strata.Ffi.Vk.stat(3)) ++ " ms; " ++ int_to_string(float_to_int(Strata.Ffi.Vk.stat(2))) ++ " draw calls, " ++ int_to_string(float_to_int(Strata.Ffi.Vk.stat(4))) ++ " see-through chunks ordered in " ++ int_to_string(float_to_int(Strata.Ffi.Vk.stat(5))) ++ " us, " ++ int_to_string(Strata.Ffi.Vk.drawn_chunks()) ++ " chunks, " ++ int_to_string(Strata.Ffi.Vk.drawn_quads()) ++ " quads; " ++ int_to_string(Strata.Stream.loaded_count(s3)) ++ " chunks loaded"))
@@ -2927,8 +3025,8 @@ mod StrataViewer do
                 if StrataViewer.Figures.walking(cr2) > 0 || Strata.Render.figure_rigs(sl3) > 0 do Authority.must(println("  figures: " ++ int_to_string(float_to_int(Strata.Ffi.Vk.stat(10))) ++ " parts drawn in " ++ int_to_string(float_to_int(Strata.Ffi.Vk.stat(11))) ++ " draws; " ++ int_to_string(float_to_int(Strata.Ffi.Vk.stat(12))) ++ " us preparing them, " ++ int_to_string(float_to_int(Strata.Ffi.Vk.stat(13))) ++ " us of it the draw list; update " ++ ms2(Strata.Ffi.Anim.timing(0) *. 1000.0) ++ " ms; shadow map " ++ int_to_string(float_to_int(Strata.Ffi.Vk.stat(15))) ++ " parts in " ++ int_to_string(float_to_int(Strata.Ffi.Vk.stat(16))) ++ " draws, gpu " ++ ms2(Strata.Ffi.Vk.stat(14)) ++ " ms; traced " ++ int_to_string(float_to_int(Strata.Ffi.Vk.stat(17))) ++ " figures, " ++ int_to_string(float_to_int(Strata.Ffi.Vk.stat(18))) ++ " parts")) else () end
                 if Strata.Ffi.Vk.stat(8) > 0.0 do Authority.must(println("  particles: " ++ int_to_string(float_to_int(Strata.Ffi.Vk.stat(8))) ++ " live, " ++ int_to_string(Strata.Particles.live_emitters(StrataViewer.Fx.particles(fxr2))) ++ " emitters; stepped and handed over in " ++ int_to_string(float_to_int(fx_us)) ++ " us")) else () end
                 if Strata.Fluid.active_count(fl2) + Strata.Fluid.dormant_count(fl2) > 0 do Authority.must(println("  fluid: active " ++ int_to_string(Strata.Fluid.active_count(fl2)) ++ ", waiting " ++ int_to_string(Strata.Fluid.waiting_count(fl2)) ++ ", dormant " ++ int_to_string(Strata.Fluid.dormant_count(fl2)) ++ "; last step " ++ ms2(fluid_ms) ++ " ms")) else () end
-                frame_loop(s3, fl2, job2, sl4, reg, cx, cam2, rig2, next, frames, script, hole, tl, worst2, total2, fworst2, now, now, vp2, snd2, aworst2, cr2, mt2, falls2, fxr2)
-              else frame_loop(s3, fl2, job2, sl4, reg, cx, cam2, rig2, next, frames, script, hole, tl, worst2, total2, fworst2, now, t_mark, vp2, snd2, aworst2, cr2, mt2, falls2, fxr2) end
+                frame_loop(s4, fl2, job2, sl4, reg, cx, cam2, rig2, next, frames, script, hole, tl, worst2, total2, fworst2, now, now, vp2, snd2, aworst2, cr2, mt2, falls2, fxr2, sv2)
+              else frame_loop(s4, fl2, job2, sl4, reg, cx, cam2, rig2, next, frames, script, hole, tl, worst2, total2, fworst2, now, t_mark, vp2, snd2, aworst2, cr2, mt2, falls2, fxr2, sv2) end
           end
       end
     end
@@ -3693,16 +3791,14 @@ mod StrataViewer do
       if Strata.Render.ui_atlas(StrataViewer.Hud.atlas_w(), StrataViewer.Hud.atlas_h(), StrataViewer.Hud.atlas()) do () else Authority.must(println("strata_viewer: could not upload the interface atlas")) end
       if Strata.Render.light_overflow(reg) > 0 do Authority.must(println("strata_viewer: " ++ int_to_string(Strata.Render.light_overflow(reg)) ++ " blocks share another block's light class")) else () end
       sun_at(int_to_float(Authority.must(Env.get_int("STRATA_SUN", 55))))
-      let ex = match start do (x, _, _, _, _) -> x end
-      let ey = match start do (_, y, _, _, _) -> y end
-      let ez = match start do (_, _, z, _, _) -> z end
-      let yaw0 = match start do (_, _, _, a3, _) -> a3 end
-      let pitch0 = match start do (_, _, _, _, a4) -> a4 end
       let wgen = if fine do Strata.Terrain.gen(fn (k, sd) -> StrataViewer.Fine.terrain(Strata.Coord.kx(k), Strata.Coord.ky(k), Strata.Coord.kz(k), sd)) else gen end
-      let world = Strata.World.new(reg, wgen, seed, if fine do sc else scale end)
+      let world_new = Strata.World.new(reg, wgen, seed, if fine do sc else scale end)
+      -- STRATA_STORE=<dir>: the world is kept in that folder; the walker starts where it stood when the store was closed
+      let (store0, world) = store_open(world_new)
+      let (ex, ey, ez, yaw0, pitch0) = store_pose(store0, start)
       let t0 = Strata.Ffi.Vk.time()
       -- the stream's focus and the camera are in metres
-      let (s0, ticks) = settle_counted(Strata.Stream.set_focus(stream_start(world, r, levels), Cons((ex, ey, ez), Nil)), 0)
+      let (s0, ticks) = settle_counted(Strata.Stream.set_focus(store_stream(store0, stream_start(world, r, levels)), Cons((ex, ey, ez), Nil)), 0)
       let t1 = Strata.Ffi.Vk.time()
       let top = Strata.Stream.top_level(s0)
       if top > 0 do Authority.must(println("strata_viewer: far field: " ++ int_to_string(top) ++ " levels, " ++ int_to_string(Strata.Stream.loaded_count(s0)) ++ " chunks (" ++ per_level(Strata.Stream.world(s0), top) ++ ") settled after " ++ int_to_string(ticks) ++ " ticks in " ++ float_to_string(Math.round((t1 -. t0) *. 1000.0)) ++ " ms")) else ()
@@ -3785,7 +3881,7 @@ mod StrataViewer do
           let mt0 = if Authority.must(Env.get_int("STRATA_COMBAT", 0)) == 1 && !fine do StrataViewer.Match.with_nav(StrataViewer.Match.start(seed, Strata.Stream.world(s1), ex, ey, ez, r, Authority.must(Env.get_int("STRATA_COMBAT_PLAYER", 1)) == 1, combat_scene(Authority.must(Env.get("STRATA_COMBAT_SCENE", ""))), combat_script(Authority.must(Env.get("STRATA_COMBAT_SCRIPT", ""))), Authority.must(Env.get_int("STRATA_COMBAT_WIN", 30)), Authority.must(Env.get_int("STRATA_COMBAT_REPEAT", 0)), Authority.must(Env.get_int("STRATA_COMBAT_ARENA", 1)) == 1, Authority.must(Env.get_int("STRATA_COMBAT_TEAMS", 1)) == 1, if Authority.must(Env.get_int("STRATA_COMBAT_TREES", 1)) == 1 do barrier_id() else if Authority.must(Env.get_int("STRATA_COMBAT_TREES", 1)) == 2 do barrier_id() + 1000 else 0 end end), Authority.must(Env.get_int("STRATA_COMBAT_NAV", 1)) == 1) else StrataViewer.Match.off() end
           let sl_f = if StrataViewer.Match.is_on(mt0) do Strata.Render.figures(sl, StrataViewer.Match.anim(mt0), StrataViewer.Match.rigs(mt0))
             else if StrataViewer.Figures.any(crowd) do Strata.Render.figures(sl, StrataViewer.Figures.anim(crowd), StrataViewer.Figures.rigs(crowd)) else sl end end
-          frame_loop(s1, new_fluid(reg, g, scale), None, sl_f, reg, cx, cam, rig, 0, frames, if soak > 0 do 2 else if scene == 11 && frames > 0 do 1 else if scene == 4 && frames > 0 do 3 else if scene == 134 && frames > 0 do 4 else 0 end end end end, hole, tl, 0.0, 0.0, 0.0, Strata.Ffi.Vk.time(), Strata.Ffi.Vk.time(), NativeArray.make_f32(16, 0.0), audio_start(frames), 0.0, crowd, mt0, Strata.Falls.none(), fx_start(seed))
+          frame_loop(s1, store_wake(store0, new_fluid(reg, g, scale), Strata.Stream.world(s1)), None, sl_f, reg, cx, cam, rig, 0, frames, if soak > 0 do 2 else if scene == 11 && frames > 0 do 1 else if scene == 4 && frames > 0 do 3 else if scene == 134 && frames > 0 do 4 else 0 end end end end, hole, tl, 0.0, 0.0, 0.0, Strata.Ffi.Vk.time(), Strata.Ffi.Vk.time(), NativeArray.make_f32(16, 0.0), audio_start(frames), 0.0, crowd, mt0, Strata.Falls.none(), fx_start(seed), store0)
       end
       Strata.Ffi.Vk.close()
     end

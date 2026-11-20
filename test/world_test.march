@@ -528,4 +528,54 @@ mod Strata.Test.World do
       Test.assert_eq_int(List.length(Ed.changes(o)), 4, "four changes: the cell that was set and cleared counts twice")
     end
   end
+
+  describe "World and a store's workers" do
+    test "region_raw gives a touched loaded chunk with its generation hash, a cached chunk with -1, nothing for an untouched one" do
+      let w = Wd.log_changes(load(load(load(fresh(), 0, -1, 0), 1, -1, 0), 2, -1, 0), true)
+      -- (0, -1, 0) edited; (1, -1, 0) edited and unloaded; (2, -1, 0) edited back; (3, -1, 0) not loaded, one edit queued
+      let e = Ed.world(Ed.set_block(Ed.world(Ed.set_block(Ed.world(Ed.set_block(Ed.world(Ed.set_block(Ed.world(Ed.set_block(w, 5, -5, 5, 0)), 37, -5, 5, 0)), 69, -5, 5, 0)), 69, -5, 5, 1)), 100, -5, 5, 0))
+      let v = Wd.unload(e, Cd.key(1, -1, 0))
+      let gen = C.hash(Strata.Terrain.run(Wd.terrain(v), Cd.key(0, -1, 0), Wd.seed(v)))
+      match Wd.region_raw(v, Cons(Cd.key(0, -1, 0), Cons(Cd.key(1, -1, 0), Cons(Cd.key(2, -1, 0), Cons(Cd.key(3, -1, 0), Nil))))) do
+        (cs, qs) ->
+          Test.assert_eq_int(List.length(cs), 3, "three chunks: the worker judges the one edited back")
+          match cs do
+            Cons((k0, c0, h0), Cons((k1, _, h1), Cons((k2, c2, h2), Nil))) ->
+              Test.assert_true(Cd.key_eq(k0, Cd.key(0, -1, 0)), "in the keys' order")
+              Test.assert_eq_int(h0, gen, "the loaded chunk with the hash it generated to")
+              Test.assert_true(C.hash(c0) != h0, "from which it differs")
+              Test.assert_true(Cd.key_eq(k1, Cd.key(1, -1, 0)), "then the cached one")
+              Test.assert_eq_int(h1, -1, "a cached chunk says -1")
+              Test.assert_true(Cd.key_eq(k2, Cd.key(2, -1, 0)), "then the one edited back")
+              Test.assert_eq_int(C.hash(c2), h2, "which hashes to its generation")
+            _ -> Test.fail("the three chunks")
+          end
+          Test.assert_eq_int(List.length(qs), 1, "one queue")
+      end
+    end
+    test "insert_saved puts a store's chunk in the generated one's place: edited, recognised when edited back, under a newer cached chunk" do
+      let k = Cd.key(0, -1, 0)
+      let gen = Strata.Terrain.run(Wd.terrain(fresh()), k, 7)
+      let saved = C.set(gen, 5, 27, 5, 0)
+      let w = Wd.insert_saved(Wd.log_changes(fresh(), true), k, saved, C.hash(gen))
+      Test.assert_eq_int(Wd.get_block(w, 5, -5, 5), 0, "the saved chunk is loaded")
+      Test.assert_true(Wd.is_edited(w, k), "and counts as edited")
+      match Wd.take_changes(w) do
+        (_, ks) -> Test.assert_eq_int(List.length(ks), 0, "loading it is not a change")
+      end
+      Test.assert_eq_int(Wd.cache_size(Wd.unload(w, k)), 1, "unloaded, it goes to the cache")
+      let back = Ed.world(Ed.set_block(w, 5, -5, 5, 1))
+      Test.assert_false(Wd.is_edited(back, k), "edited back to its generation, it is recognised")
+      Test.assert_eq_int(Wd.cache_size(Wd.unload(back, k)), 0, "and dropped at unload")
+      -- a chunk still in the cache is newer than the store's
+      let newer = Wd.unload(Ed.world(Ed.set_block(load(Wd.log_changes(fresh(), true), 0, -1, 0), 9, -5, 9, 0)), k)
+      let both = Wd.insert_saved(newer, k, saved, C.hash(gen))
+      Test.assert_eq_int(Wd.get_block(both, 9, -5, 9), 0, "the cached edit is there")
+      Test.assert_eq_int(Wd.get_block(both, 5, -5, 5), 1, "and the store's older chunk is not")
+      -- an edit queued here is applied over the saved chunk
+      let queued = Wd.insert_saved(Ed.world(Ed.set_block(Wd.log_changes(fresh(), true), 7, -5, 7, 0)), k, saved, C.hash(gen))
+      Test.assert_eq_int(Wd.get_block(queued, 7, -5, 7), 0, "the queued edit")
+      Test.assert_eq_int(Wd.get_block(queued, 5, -5, 5), 0, "over the saved chunk")
+    end
+  end
 end
