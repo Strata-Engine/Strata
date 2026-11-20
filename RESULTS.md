@@ -1082,7 +1082,8 @@ a live one: the ring never filled.
 
 Misses and what is not known:
 
-- Particles meet nothing: sparks fall through the ground.
+- Particles met nothing when this was written: sparks fell through the
+  ground. Since 19 November an effect may ask to meet the world (below).
 - Shaded particles are drawn in birth order, not by depth: two smoke cubes
   may blend in the wrong order (soft and grey, it does not show).
 - The effect table is written in place while frames may be in flight; the
@@ -1091,6 +1092,83 @@ Misses and what is not known:
 - Glowing particles light nothing; the light about a fire comes from the
   embers blocks.
 - Nothing here was played by hand yet.
+
+## Particles that meet the world (19 November)
+
+The design's addendum of 19 November. An effect asks with
+`Strata.Particles.dies_on_solid`, `rests_on_solid` or `bounces`; a compute
+pass (`native/shaders/collide.comp`) walks each new particle's flight once,
+in the frame it is born, through the light volume, and the vertex shader
+flies it by what the pass wrote. A frame that bore no such particle runs no
+pass.
+
+Measured with the viewer's `STRATA_FX=2` scene (drips that die at the
+ground, a fountain and a jet of cinders that rest, a fountain of grit that
+bounces: 470 particles a second, lives of 3 to 3.5 s) against `STRATA_FX=3`,
+the same emitters with the setting off, and `STRATA_FX_TIMES=20` for twenty
+times the rate. Release build, March main, hidden and offscreen, 1280 x 800,
+light mode 4, the island's shore start, an Apple M3 Max; the mean of frames
+310 to 600 of the viewer's `STRATA_BENCH=1` lines, two runs each (the two
+agree to 0.01 ms). The load average was 12 to 18 from other work: the
+differences between rows are the finding, not the totals.
+
+| | born a frame | GPU, whole frame | before the geometry (uploads, cull, the collision pass) | after the light (water, composite, particles, interface) |
+|---|---|---|---|---|
+| no particles | 0 | 0.72 ms | 0.023 to 0.025 ms | 0.147 ms |
+| flying free | 8 | 0.75 to 0.76 ms | 0.021 ms | 0.157 ms |
+| meeting the world | 8 | 0.82 ms | 0.067 to 0.069 ms | 0.168 to 0.169 ms |
+| flying free, x 20 | 157 | 1.65 ms | 0.024 to 0.026 ms | 0.93 ms |
+| meeting the world, x 20 | 157 | 2.59 to 2.60 ms | 0.079 ms | 1.81 ms |
+
+- **The pass itself costs about 0.05 ms of GPU in a frame that runs it**,
+  and nearly the same for 8 new particles as for 157: it is the cost of a
+  dispatch more than of the rays. Each particle's flight is 32 chords,
+  traced once in its life.
+- **An effect that does not ask pays nothing for the pass**: the rows
+  "flying free" show the time before the geometry at what it is with no
+  particles at all. In the vertex shader it pays one comparison on a table
+  row it already read; the 60 goldens that were stored before this change,
+  spray and the match's fire among them, compare as they did.
+- **The larger difference is drawing, not colliding.** With the setting on,
+  particles lie on the ground for the rest of their lives where before
+  they fell out of sight under it, so more of them cover pixels: 0.01 ms
+  more at 470 a second, 0.9 ms more at 9 400 a second (some 30 000 lying
+  in view, the shaded ones lit once each). A shorter life or `dies_on_solid`
+  is the remedy.
+- The March side is unchanged: the setting is one float of an effect's 44.
+
+What is checked: the setting's table floats, its clamps, that it changes
+nothing else an effect holds nor what a burst queues (`test/particles_test.march`,
+5 tests more); the pieces of the flight the vertex shader draws from what
+the pass wrote (die, rest, the bounce's second leg, velocity as the
+flight's slope: `native/tests/particles_test.c`); the golden `fx-meeting`
+(frame 147 of the scene: piles on the sand, cinders stopped at the foot of
+the bank's face), which must also say `fx: particles meet the world`.
+
+Limits that remain:
+
+- The world is looked at once, as it is when the particle is born. A block
+  placed in a flight's way afterwards is flown through; one dug out still
+  stops the particle, and a particle lying on it hangs there until its
+  life ends.
+- Only loaded chunks are seen: a flight that leaves them meets nothing
+  from there on, and chunks that arrive later are not looked at.
+- Water, glass and thin blocks (tall grass) stop nothing; nor do physics
+  bodies or figures. Cutout blocks (leaves) stop a particle where their
+  texture is opaque.
+- A particle meets the world as a point at its middle, so a large one
+  (smoke at 0.7 m) sinks half its size into a wall before it stops; a
+  resting one is lifted half its size off the face it met.
+- One bounce, then rest. No rolling or sliding; a particle that comes to
+  rest on a slope of steps stays on the step.
+- The flight is walked as 32 chords: a corner thinner than a chord's sag
+  (about a centimetre for a one-second life, more for longer ones) can be
+  stepped over.
+- Spray (`Strata.Render.spray`, effect 0) and the match's seven effects are
+  as they were and meet nothing; only the `STRATA_FX=2` scene's three ask.
+- A game that bore more than 65 536 colliding particles between two frames
+  would have the oldest of them overwritten before they were looked at
+  (the ring's own limit).
 
 ## Path finding (Strata.Nav), measured in the match
 

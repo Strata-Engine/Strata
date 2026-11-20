@@ -11,7 +11,7 @@
 layout(location = 0) in vec4 a_start;      // xyz start (metres), w birth time (seconds)
 layout(location = 1) in vec4 a_vel;        // xyz velocity (m/s), w life (seconds)
 layout(location = 2) in vec4 a_misc;       // x effect, y size scale, z seed 0..1, w rotation at birth
-layout(location = 3) in vec4 a_more;       // x texture layer override (-1: the effect's)
+layout(location = 3) in vec4 a_more;       // x texture layer override (-1: the effect's); y z w what collide.comp found: the first meeting's age, the faces met, the second's age
 
 layout(push_constant) uniform PC { uint pass; } pc;
 
@@ -32,8 +32,6 @@ const float CTT[6] = float[6](0.0, 0.0, 1.0, 0.0, 1.0, 1.0);
 
 // v turned by [a] radians about the unit axis k
 vec3 turn_about(vec3 v, vec3 k, float a) { return v * cos(a) + cross(k, v) * sin(a) + k * dot(k, v) * (1.0 - cos(a)); }
-
-vec4 fxv(int e, int k) { return fx.v[e * 11 + k]; }
 
 // the colour ramp: up to four keys (rgb, opacity) at ages
 vec4 colour_at(int e, float age) {
@@ -65,20 +63,39 @@ void main() {
     vec4 dyn = fxv(e, 8);      // size keys, drag, wobble metres, wobble Hz
     vec4 acc = fxv(e, 9);      // ax, ay, az, spin
     float k = dyn.y;
+    vec4 shp = fxv(e, 10);     // cube, what meeting a solid does (0 nothing, 1 die, 2 rest, 3 bounce), restitution, the share of the rest kept
     vec3 pos;
-    if (k > 1.0e-6) pos = a_start.xyz + (a_vel.xyz - acc.xyz / k) * (1.0 - exp(-k * t)) / k + (acc.xyz / k) * t;
-    else pos = a_start.xyz + a_vel.xyz * t + (0.5 * acc.xyz) * t * t;
-    if (dyn.z > 0.0) {
-        float ph = 6.2831853 * (dyn.w * t + a_misc.z);
-        pos += vec3(sin(ph), 0.0, sin(ph + 1.7)) * dyn.z;
+    float tf = t;              // the age its tumble is taken at: the age it came to rest, once it has
+    float rest_since = -1.0;
+    int rest_face = 0;
+    if (shp.y > 0.5 && a_more.y >= 0.0 && t >= a_more.y) {
+        // an effect that meets the world, past its first meeting (collide.comp found when, once, at its birth)
+        if (shp.y < 1.5) { off(); return; }
+        float t1 = a_more.y;
+        int faces = int(a_more.z);
+        vec3 p1 = pt_fly(a_start.xyz, a_vel.xyz, acc.xyz, k, t1);
+        if (dyn.z > 0.0) p1 += pt_sway(dyn.z, dyn.w, a_misc.z, t1);
+        if (shp.y < 2.5) { pos = p1; tf = t1; rest_since = t1; rest_face = min(faces & 7, 5); }
+        else {
+            // one bounce: a second flight from the meeting, to rest at the next
+            vec3 v1 = pt_bounced(pt_vel(a_vel.xyz, acc.xyz, k, t1), PT_FACE[min(faces & 7, 5)], shp.z, shp.w);
+            float t2 = a_more.w;
+            pos = pt_fly(p1, v1, acc.xyz, k, min(t, t2) - t1);
+            if (t >= t2) { tf = t2; rest_since = t2; rest_face = min((faces >> 3) & 7, 5); }
+        }
+    } else {
+        pos = pt_fly(a_start.xyz, a_vel.xyz, acc.xyz, k, t);
+        if (dyn.z > 0.0) pos += pt_sway(dyn.z, dyn.w, a_misc.z, t);
     }
     float age = t / max(a_vel.w, 1.0e-3);
     float size = size_at(e, age) * a_misc.y;
-    float turn = a_misc.w + acc.w * t;
+    float turn = a_misc.w + acc.w * tf;
+    // at rest its middle is lifted half its size off the face it met, eased in, so it sits on the ground and not in it
+    if (rest_since >= 0.0) pos += PT_FACE[rest_face] * (0.5 * size * clamp((t - rest_since) * 10.0, 0.0, 1.0));
     int vi = gl_VertexIndex;
     vec4 clip;
     vec3 at_vertex = pos;
-    if (fxv(e, 10).x > 0.5) {
+    if (shp.x > 0.5) {
         // a cube: face vi / 6, tumbling about an axis the particle's seed picks
         int f = vi / 6, c = vi % 6;
         vec3 n = CN[f];

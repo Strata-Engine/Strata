@@ -948,7 +948,8 @@ about. Every mistake is an `Err("line N: ...")`, the first in file order.
 Design: `docs/2026-11-12-particles-design.md`. A game describes an effect
 as data and emits it; the GPU flies every particle on a closed form from a
 64-byte record written once at its birth, so a particle costs the CPU
-nothing after it is born. Particles meet nothing.
+nothing after it is born. Particles meet nothing unless their effect asks
+(below).
 
 ```march
 alias Strata.Particles as Pt
@@ -981,8 +982,29 @@ shaded effect is lit once a particle unless `Pt.lit_per_pixel` asks for
 spray's per-pixel lighting. `Strata.Render.spray` is the built-in effect 0:
 tumbling cubes in the texture of the block they were thrown from.
 
+An effect may ask for its particles to meet the solid voxels of the world:
+
+```march
+let spark = Pt.effect() |> Pt.glowing() |> Pt.accel(0.0, 0.0 -. 9.8, 0.0)
+  |> Pt.bounces(0.45, 0.3)      -- once: restitution, friction; then it rests where it lands
+-- or Pt.rests_on_solid() (lies where it lands), Pt.dies_on_solid() (gone there),
+-- Pt.meets_nothing() (the default)
+```
+
+The renderer looks once, in the frame a particle is born: a compute pass
+walks its whole flight through the voxels the lighting already keeps on the
+GPU and writes when and on which face it meets one into the particle's
+record, so it still costs the CPU nothing and the GPU nothing more per
+frame after that. A frame that bears no such particle runs no pass (about
+0.05 ms of GPU in one that does), and an effect that does not ask is drawn
+exactly as before. Because the world is looked at at birth, blocks placed
+or dug during a flight are not seen, nor chunks not yet loaded; water,
+glass, tall grass, bodies and figures stop nothing.
+
 In the viewer, `STRATA_FX=1` shows the six effects side by side at frame
-10. In a match (`STRATA_COMBAT=1`) a fireball trails flame, smoke and
+10, and `STRATA_FX=2` three that meet the world: drips gone at the ground,
+cinders lying where they land and at the foot of a bank, grit that
+bounces (`STRATA_FX=3`: the same flying free, to compare). In a match (`STRATA_COMBAT=1`) a fireball trails flame, smoke and
 embers and bursts in sparks; what it reaches catches over half a second
 and burns for seconds (grass 1 to 2, leaves 2 to 3, wood 4 to 6) as glowing
 embers blocks that light the ground, before it is gone. Cost: `RESULTS.md`,
@@ -1082,6 +1104,11 @@ boundary over the ground; their numbers are in `RESULTS.md`.
 - Water moves only in loaded chunks; at the edge of the loaded world it
   waits.
 - Spray is a picture: it meets nothing and carries no water.
+- Particles meet the world only if their effect asks, and then as it was
+  when they were born: a block placed or dug mid-flight is not seen, nor a
+  chunk not yet loaded. They bounce once at most, and water, glass, thin
+  blocks, bodies and figures stop nothing (`RESULTS.md`, Particles that
+  meet the world).
 - Lighting reaches as far as the stream does and no further: nothing outside
   the loaded chunks casts a shadow or is reflected.
 - One bounce of light. No light shafts, no refraction, no coloured shadows

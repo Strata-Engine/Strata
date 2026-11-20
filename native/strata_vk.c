@@ -27,7 +27,7 @@
 /* Rewritten by build_shaders.sh whenever the shaders change: forge decides
  * whether to recompile this file from its text alone, not from the headers
  * it includes (GAPS S14). */
-#define STRATA_SHADERS_STAMP "a9df06663ffb1b49"
+#define STRATA_SHADERS_STAMP "6a39703ffa161498"
 #include "strata_shaders.h"
 #include "strata_particles.h"
 #include "strata_alloc.h"
@@ -227,7 +227,7 @@ static struct {
      * image, to the offscreen target); the two final passes are compatible */
     VkRenderPass pass_g, pass_t, pass_l, pass, pass_off;
     VkPipelineLayout layout;
-    VkPipeline pipe_opaque, pipe_batch, pipe_blend, pipe_cross, pipe_loose, pipe_cull, pipe_gather, pipe_light, pipe_composite, pipe_spray, pipe_glow;
+    VkPipeline pipe_opaque, pipe_batch, pipe_blend, pipe_cross, pipe_loose, pipe_cull, pipe_gather, pipe_light, pipe_composite, pipe_spray, pipe_glow, pipe_collide;
     /* Particles: a ring of records in a mapped buffer (strata_particles.h),
      * drawn twice, shaded (pipe_spray) then glowing (pipe_glow); and the
      * effect table they read, PT_EFFECTS effects of PT_EFFECT_FLOATS, effect
@@ -235,6 +235,10 @@ static struct {
     VkBuffer spray; VkDeviceMemory spray_mem; float *spray_map;
     VkBuffer fx; VkDeviceMemory fx_mem; float *fx_map; uint8_t fx_set[PT_EFFECTS]; double glow_until;   /* when the last glowing particle born so far dies */
     SprayRing ring; float *spray_births;
+    /* Particles of an effect that meets the world (its table float 41 not 0) are born with record float 13 at -1;
+     * the next frame runs collide.comp over the ring from the first such birth (a count of pushes, as ring.head) to the newest.
+     * [meet_last]: how many particles that frame's pass was given; [meet_total]: colliding particles born since the start. */
+    int meet_pending; uint64_t meet_first; uint32_t meet_last; uint64_t meet_total;
     /* The 2D layer: the quads the game last handed over, drawn last. Each
      * Frame copies them when it is recorded. */
     VkPipeline pipe_ui;
@@ -2098,7 +2102,7 @@ int64_t sv_open_slots(int64_t w, int64_t h, int64_t capture_mouse, int64_t quad_
     g.swap_ok = 1;
 
     /* one set layout for every pipeline: 0 uniforms, 1 chunk table, 2 indirect commands, 3 cull statistics, 4 command -> slot */
-    VkDescriptorSetLayoutBinding dslb[37] = {
+    VkDescriptorSetLayoutBinding dslb[38] = {
         { .binding = 0, .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, .descriptorCount = 1,
           .stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT },
         { .binding = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1,
@@ -2109,33 +2113,34 @@ int64_t sv_open_slots(int64_t w, int64_t h, int64_t capture_mouse, int64_t quad_
           .stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_COMPUTE_BIT },
         /* 5 the block table, 6 the texture array */
         { .binding = 5, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_VERTEX_BIT },
-        { .binding = 6, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT },
+        { .binding = 6, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT },
         /* the frame's own images: 7 colour, 8 normal and material, 9 depth, 10 the lit image */
         { .binding = 7, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT },
         { .binding = 8, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT },
         { .binding = 9, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT },
         { .binding = 10, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT },
         /* the light volume: 11 classes, 12 the coarse copy, 13 cell owners; 14 the class table
-         * (these, the bodies and the palette are seen by vertex shaders too: particles lit once each trace there) */
-        { .binding = 11, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_VERTEX_BIT },
-        { .binding = 12, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_VERTEX_BIT },
-        { .binding = 13, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_VERTEX_BIT },
-        { .binding = 14, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_VERTEX_BIT },
+         * (these, the bodies and the palette are seen by vertex shaders too: particles lit once each trace there;
+         * and, with the tiles and the effect table, by the compute stage: collide.comp walks particles' flights through them) */
+        { .binding = 11, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_COMPUTE_BIT },
+        { .binding = 12, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_COMPUTE_BIT },
+        { .binding = 13, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_COMPUTE_BIT },
+        { .binding = 14, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_COMPUTE_BIT },
         /* the light pass's memory of the frame before */
         { .binding = 15, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT },
         { .binding = 16, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT },
         /* bodies, for the rays: table, classes, cell index, cell lists, moving boxes */
-        { .binding = 17, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_VERTEX_BIT },
-        { .binding = 18, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_VERTEX_BIT },
-        { .binding = 19, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_VERTEX_BIT },
-        { .binding = 20, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_VERTEX_BIT },
-        { .binding = 21, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_VERTEX_BIT },
+        { .binding = 17, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_COMPUTE_BIT },
+        { .binding = 18, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_COMPUTE_BIT },
+        { .binding = 19, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_COMPUTE_BIT },
+        { .binding = 20, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_COMPUTE_BIT },
+        { .binding = 21, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_COMPUTE_BIT },
         /* the 2D layer's interface atlas */
         { .binding = 22, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT },
         /* and its glyph atlas */
         { .binding = 23, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT },
         /* figures: 24 the rigs' palettes, 25 this frame's figure parts, 26 the quad buffer read as words */
-        { .binding = 24, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_VERTEX_BIT },
+        { .binding = 24, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_COMPUTE_BIT },
         { .binding = 25, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_VERTEX_BIT },
         { .binding = 26, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_VERTEX_BIT },
         /* 27 the plain figures' sun shadow map, a comparing sampler */
@@ -2149,17 +2154,21 @@ int64_t sv_open_slots(int64_t w, int64_t h, int64_t capture_mouse, int64_t quad_
         { .binding = 32, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT },
         { .binding = 33, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT },
         /* 34 the particles' effect table */
-        { .binding = 34, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT },
+        { .binding = 34, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT },
         /* 35, 36 what this frame's gather pass wrote, for the light pass */
         { .binding = 35, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT },
-        { .binding = 36, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT } };
-    VkDescriptorSetLayoutCreateInfo dsli = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 37, .pBindings = dslb };
+        { .binding = 36, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT },
+        /* 37 the particles' ring, for the pass that looks for what each new particle will meet (collide.comp) */
+        { .binding = 37, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT } };
+    VkDescriptorSetLayoutCreateInfo dsli = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 38, .pBindings = dslb };
     VKOK(vkCreateDescriptorSetLayout(g.dev, &dsli, NULL, &g.dsl), "descriptor set layout");
     /* where the call's range starts in draw_slot, and per-call flags (bit 0: cutout, bit 1: a figure);
      * a figure piece's draw adds eight words more (fig_record) */
-    VkPushConstantRange pcr = { .stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, .offset = 0, .size = 40 };
+    /* and, past them, two words for collide.comp: the first ring slot to look at and how many (its own range, so no draw's push need name the compute stage) */
+    VkPushConstantRange pcr[2] = { { .stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, .offset = 0, .size = 40 },
+                                   { .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT, .offset = 40, .size = 8 } };
     VkPipelineLayoutCreateInfo pli = { .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = 1, .pSetLayouts = &g.dsl,
-        .pushConstantRangeCount = 1, .pPushConstantRanges = &pcr };
+        .pushConstantRangeCount = 2, .pPushConstantRanges = pcr };
     VKOK(vkCreatePipelineLayout(g.dev, &pli, NULL, &g.layout), "pipeline layout");
     if (!make_pipeline(0, &g.pipe_opaque)) return 0;
     if (g.batch_shared && !make_pipeline(11, &g.pipe_batch)) return 0;
@@ -2177,7 +2186,7 @@ int64_t sv_open_slots(int64_t w, int64_t h, int64_t capture_mouse, int64_t quad_
     if (!g.ui_cpu) return 0;
     g.ui_n = 0; g.ui_dropped = 0;
     {   void *smap = NULL;
-        if (!make_buffer((VkDeviceSize)SV_SPRAY_CAP * SV_SPRAY_FLOATS * 4, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, &g.spray, &g.spray_mem, &smap)) return 0;
+        if (!make_buffer((VkDeviceSize)SV_SPRAY_CAP * SV_SPRAY_FLOATS * 4, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &g.spray, &g.spray_mem, &smap)) return 0;
         g.spray_map = smap; memset(g.spray_map, 0, (size_t)SV_SPRAY_CAP * SV_SPRAY_FLOATS * 4);
         g.spray_births = calloc(SV_SPRAY_CAP, sizeof(float));
         if (!g.spray_births) return 0;
@@ -2186,6 +2195,7 @@ int64_t sv_open_slots(int64_t w, int64_t h, int64_t capture_mouse, int64_t quad_
         g.fx_map = smap; memset(g.fx_map, 0, (size_t)PT_EFFECTS * PT_EFFECT_FLOATS * 4);
         memset(g.fx_set, 0, sizeof g.fx_set);
         pt_effect_spray(g.fx_map); g.fx_set[0] = 1; g.glow_until = -1.0;
+        g.meet_pending = 0; g.meet_first = 0; g.meet_last = 0; g.meet_total = 0;
     }
 
     void *map = NULL;
@@ -2234,7 +2244,7 @@ int64_t sv_open_slots(int64_t w, int64_t h, int64_t capture_mouse, int64_t quad_
     g.blocks_map = map;
     memset(g.blocks_map, 0, (size_t)SV_MAX_BLOCKS * 32);
     for (uint32_t t = 0; t < 65536; t++) ((uint32_t *)g.blocks_map)[SV_TOP_OF + t] = t;
-    VkDescriptorPoolSize dps[4] = { { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, SV_FRAMES }, { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 17 * SV_FRAMES }, { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 15 * SV_FRAMES },
+    VkDescriptorPoolSize dps[4] = { { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, SV_FRAMES }, { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 18 * SV_FRAMES }, { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 15 * SV_FRAMES },
                                     { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 4 * SV_FRAMES } };
     VkDescriptorPoolCreateInfo dpi = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = SV_FRAMES, .poolSizeCount = 4, .pPoolSizes = dps };
     VKOK(vkCreateDescriptorPool(g.dev, &dpi, NULL, &g.dpool), "descriptor pool");
@@ -2298,6 +2308,10 @@ int64_t sv_open_slots(int64_t w, int64_t h, int64_t capture_mouse, int64_t quad_
             lw2[b] = (VkWriteDescriptorSet){ .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = F->dset, .dstBinding = 32 + b, .descriptorCount = 1,
                 .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &lb2[b] };
         vkUpdateDescriptorSets(g.dev, 3, lw2, 0, NULL);
+        VkDescriptorBufferInfo rb = { g.spray, 0, VK_WHOLE_SIZE };
+        VkWriteDescriptorSet rw = { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = F->dset, .dstBinding = 37, .descriptorCount = 1,
+            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &rb };
+        vkUpdateDescriptorSets(g.dev, 1, &rw, 0, NULL);
     }
     if (!fig_init()) { die("figures", 0); return 0; }
     for (int f = 0; f < SV_FRAMES; f++) {
@@ -2331,6 +2345,12 @@ int64_t sv_open_slots(int64_t w, int64_t h, int64_t capture_mouse, int64_t quad_
         VkResult cr = vkCreateComputePipelines(g.dev, VK_NULL_HANDLE, 1, &ci, NULL, &g.pipe_cull);
         vkDestroyShaderModule(g.dev, cs, NULL);
         if (cr != VK_SUCCESS) { die("vkCreateComputePipelines", (int)cr); return 0; }
+        /* and the particles' collision pipeline */
+        cs = shader(strata_collide_comp, sizeof(strata_collide_comp));
+        ci.stage.module = cs;
+        cr = vkCreateComputePipelines(g.dev, VK_NULL_HANDLE, 1, &ci, NULL, &g.pipe_collide);
+        vkDestroyShaderModule(g.dev, cs, NULL);
+        if (cr != VK_SUCCESS) { die("vkCreateComputePipelines (collide)", (int)cr); return 0; }
     }
 
     VkCommandPoolCreateInfo cpi = { .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, .queueFamilyIndex = g.qfam };
@@ -2373,6 +2393,7 @@ void sv_close(void) {
         if (g.pipe_batch) vkDestroyPipeline(g.dev, g.pipe_batch, NULL);
         if (g.pipe_blend) vkDestroyPipeline(g.dev, g.pipe_blend, NULL);
         if (g.pipe_cull) vkDestroyPipeline(g.dev, g.pipe_cull, NULL);
+        if (g.pipe_collide) vkDestroyPipeline(g.dev, g.pipe_collide, NULL);
         if (g.pipe_cross) vkDestroyPipeline(g.dev, g.pipe_cross, NULL);
         if (g.pipe_loose) vkDestroyPipeline(g.dev, g.pipe_loose, NULL);
         drop_target(&g.vol); drop_target(&g.coarse); drop_target(&g.owner);
@@ -2499,7 +2520,10 @@ void sv_set_vsync(int64_t on) { int off = on ? 0 : 1; if (g.ok && off != g.vsync
  * The light volume: 22 pages in use, 23 chunks that found no page, 24 bytes
  * its pool holds (they were 10 to 12, which the figures' stats already used).
  * 25 particles written over a slot still in the live span, since the start
- * (a full ring). */
+ * (a full ring). 33 ring slots the last frame's collision pass was given (0:
+ * it did not run), 34 particles born of effects that meet the world, since
+ * the start. (26 to 29 are the GPU's milliseconds by pass, 30 to 32 the mesh
+ * batches'.) */
 double sv_stat(int64_t which) {
     if (which == 30) return (double)g.batch_visible_count;
     if (which == 31) return (double)g.batch_draws;
@@ -2525,6 +2549,8 @@ double sv_stat(int64_t which) {
     if (which == 21) return fg.shadow_worst;
     if (which >= 26 && which <= 29) return g.pass_ms[which - 26];
     if (which == 25) return g.spray_births ? (double)g.ring.overwritten : 0.0;
+    if (which == 33) return (double)g.meet_last;
+    if (which == 34) return (double)g.meet_total;
     return (which >= 0 && which < 6) ? g.stat[which] : -1.0;
 }
 int64_t sv_drawn_chunks(void) { return g.drawn_chunks; }
@@ -3372,11 +3398,18 @@ int64_t sv_emit(int64_t effect, int64_t shape, void *f18, int64_t count, int64_t
         double until = g.time_s + (double)f[13] * (1.0 + fabs((double)f[14]));
         if (until > g.glow_until) g.glow_until = until;
     }
+    /* an effect that meets the world: its particles are marked for the next frame's collision pass */
+    int meets = pt_effect_meets(g.fx_map + (size_t)effect * PT_EFFECT_FLOATS);
+    if (n > 0 && meets) {
+        if (!g.meet_pending) { g.meet_pending = 1; g.meet_first = g.ring.head; }
+        g.meet_total += (uint64_t)n;
+    }
     for (int64_t i = 0; i < n; i++) {
         float life = f[13] * (1.0f + fabsf(f[14]));
         uint32_t slot = sp_push(&g.ring, (float)g.time_s, life);
         pt_write(g.spray_map + (size_t)slot * SV_SPRAY_FLOATS, (int)effect, (int)shape, f, f + 6, f + 9, f[12], f[13], f[14], f[15],
                  (uint32_t)seed, (uint32_t)i, (uint32_t)n, (float)g.time_s);
+        if (meets) g.spray_map[(size_t)slot * SV_SPRAY_FLOATS + 13] = PT_MEET_UNKNOWN;
     }
     return n;
 }
@@ -3686,6 +3719,22 @@ int64_t sv_frame(void) {
         vkCmdDispatch(F->cmd, (g.hi_slot + 63) / 64, 1, 1);
         VkMemoryBarrier mb = { .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT, .dstAccessMask = VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_SHADER_READ_BIT };
         vkCmdPipelineBarrier(F->cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_VERTEX_SHADER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
+    }
+    /* particles that meet the world: what each one born since the last frame will meet, found once
+     * (collide.comp), after the light volume has this frame's chunks. Nothing is bound or run in a
+     * frame that bore none. The ring is one buffer for every frame in flight; the pass writes only
+     * the last three floats of records no draw has yet read. */
+    g.meet_last = 0;
+    if (g.meet_pending && g.pipe_collide) {
+        uint64_t born = g.ring.head - g.meet_first;
+        if (born > SV_SPRAY_CAP) { g.meet_first = g.ring.head - SV_SPRAY_CAP; born = SV_SPRAY_CAP; }
+        uint32_t cpc[2] = { (uint32_t)(g.meet_first % SV_SPRAY_CAP), (uint32_t)born };
+        vkCmdBindPipeline(F->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g.pipe_collide);
+        vkCmdPushConstants(F->cmd, g.layout, VK_SHADER_STAGE_COMPUTE_BIT, 40, 8, cpc);
+        vkCmdDispatch(F->cmd, (cpc[1] + 63) / 64, 1, 1);
+        VkMemoryBarrier pb = { .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT, .dstAccessMask = VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT };
+        vkCmdPipelineBarrier(F->cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_VERTEX_INPUT_BIT, 0, 1, &pb, 0, NULL, 0, NULL);
+        g.meet_last = cpc[1]; g.meet_pending = 0;
     }
     VkViewport vpt = { 0, 0, (float)g.extent.width, (float)g.extent.height, 0.0f, 1.0f };
     VkRect2D sc = { { 0, 0 }, g.extent };

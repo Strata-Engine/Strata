@@ -104,3 +104,41 @@ scenes with spray passed unchanged until the cubes and pass with them.
   keeps them, so it falls now, and light mode 4 is still settling about it
   at frame 150. Physics edits the world once in the scene's 150 frames, not
   every step. The golden shows the fixed behaviour.
+
+## Particles that meet the world (19 November)
+
+Branch `claude/recursing-volhard-8b2976`. The design's addendum of the same
+day says what and why; these are the calls made in building it.
+
+- **Looked for at birth, on the GPU, once.** `collide.comp` walks a new
+  particle's flight as 32 chords through `trace.glsl` and writes record
+  floats 13 to 15 (first meeting's age, the faces, second meeting's age);
+  `particle.vert` branches on effect float 41. The shim marks a colliding
+  birth with float 13 at -1 and runs the pass over the ring from the first
+  such birth to the newest in the next frame, after `light_flush`.
+- **The flight's functions moved to `fx.glsl`** (`pt_fly`, `pt_vel`,
+  `pt_sway`, `pt_bounced`), shared by the vertex shader and the pass. The
+  vertex shader's free flight is the same arithmetic as before; the stored
+  pictures did not move.
+- **The walker leaves bodies out by a preprocessor switch**
+  (`STRATA_TRACE_WORLD_ONLY`, set by `build_shaders.sh` for the pass
+  alone), so every other shader's `trace_steps` is the text it was.
+- **The pass's two push-constant words sit at offset 40**, a range of their
+  own for the compute stage, so no draw's push had to name it.
+- **The compute stage now sees bindings 6, 11 to 14, 17 to 21, 24 and 34**,
+  and the ring is binding 37 (a storage buffer as well as a vertex buffer).
+- **Stats 33 and 34**: ring slots the last frame's pass was given, and
+  colliding particles born since the start.
+- **A resting particle is lifted half its size** along the face it met,
+  eased in over a tenth of a second, and its tumble stops at the age it
+  came to rest.
+- **A particle born inside a solid or cutout voxel flies free** until a
+  chord ends in the open (a burst at the point of an impact has half its
+  starts underground).
+- **The match's effects were left alone.** Making its sparks bounce and
+  its embers rest is a one-line change each in `StrataViewer.Fx`, and
+  would re-store `combat-fire` and `combat-burning`; not done here, so that
+  this change moves no stored picture.
+- **The viewer's scene**: `STRATA_FX=2` (`Fx.showcase_meeting`), golden
+  `fx-meeting` at frame 147; `STRATA_FX=3` runs the same emitters with the
+  setting off and `STRATA_FX_TIMES=n` multiplies their rates, for timing.

@@ -15,6 +15,7 @@ build_named() { # generated symbol, file, then shared files
   {
     echo "#version 460"
     if [ "$name" = strata_quad_batch_vert ]; then echo "#define STRATA_BATCHED_QUADS"; fi
+    if [ "$name" = strata_collide_comp ]; then echo "#define STRATA_TRACE_WORLD_ONLY"; fi
     cat shaders/ubo.glsl
     for inc in "$@"; do cat "shaders/$inc"; done
     cat "shaders/$f"
@@ -26,6 +27,7 @@ build() { # file, then the shared files to put in front of it
   build_named "strata_$(echo "$1" | tr '.' '_')" "$@"
 }
 build cull.comp
+build collide.comp fx.glsl tiles.glsl trace.glsl
 build quad.vert
 build_named strata_quad_batch_vert quad.vert
 build cross.vert

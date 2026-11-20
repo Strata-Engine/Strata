@@ -8,7 +8,12 @@
 -- A particle, once born, is the renderer's: it flies on a closed form
 -- (start, velocity, a constant acceleration, linear drag, a sway) and
 -- colours and grows by its effect's ramps over its life
--- (native/strata_particles.h). Particles meet nothing.
+-- (native/strata_particles.h). Particles meet nothing unless their effect
+-- asks: `dies_on_solid`, `rests_on_solid` and `bounces` have the renderer
+-- look, once, in the frame a particle is born, for the solid voxels its
+-- flight will meet (the design's addendum of 19 November), and the particle
+-- dies there, stops there, or bounces once and stops at the next. The world
+-- is looked at as it is at the birth, and only where chunks are loaded.
 --
 -- An emitter owes `rate * dt` particles a step and carries the fraction. A
 -- moving emitter spreads a step's particles along the segment from where it
@@ -22,10 +27,13 @@ mod Strata.Particles do
 
   -- look, layer, lit once a particle, colour keys (age, r, g, b, opacity),
   -- size keys (age, metres), acceleration, drag, sway (metres, Hz), spin,
-  -- drawn as a cube (else a square facing the eye)
+  -- drawn as a cube (else a square facing the eye), what meeting a solid
+  -- voxel does (0 nothing, 1 die, 2 rest, 3 bounce once), a bounce's
+  -- restitution and the share of the speed along the face it keeps
   type PtEffect = { pe_glow : Bool, pe_layer : Int, pe_once : Bool, pe_colour : List((Float, Float, Float, Float, Float)),
                     pe_size : List((Float, Float)), pe_ax : Float, pe_ay : Float, pe_az : Float, pe_drag : Float,
-                    pe_wob : Float, pe_hz : Float, pe_spin : Float, pe_cube : Bool }
+                    pe_wob : Float, pe_hz : Float, pe_spin : Float, pe_cube : Bool,
+                    pe_meet : Int, pe_restitution : Float, pe_keep : Float }
 
   type PtShape = PtPoint(Float, Float, Float) | PtSphere(Float, Float, Float, Float) | PtBox(Float, Float, Float, Float, Float, Float)
 
@@ -64,7 +72,8 @@ mod Strata.Particles do
   doc "An effect to build on: shaded cubes, texture layer 13, white and opaque, 0.2 m across, no acceleration, no drag, lit once a particle."
   fn effect() : PtEffect do
     { pe_glow: false, pe_layer: 13, pe_once: true, pe_colour: [(0.0, 1.0, 1.0, 1.0, 1.0)], pe_size: [(0.0, 0.2)],
-      pe_ax: 0.0, pe_ay: 0.0, pe_az: 0.0, pe_drag: 0.0, pe_wob: 0.0, pe_hz: 0.0, pe_spin: 0.0, pe_cube: true }
+      pe_ax: 0.0, pe_ay: 0.0, pe_az: 0.0, pe_drag: 0.0, pe_wob: 0.0, pe_hz: 0.0, pe_spin: 0.0, pe_cube: true,
+      pe_meet: 0, pe_restitution: 0.0, pe_keep: 1.0 }
   end
   doc "Draw its particles as cubes, each face lit by its own direction and textured with the effect's layer (the default)."
   fn cube(e : PtEffect) : PtEffect do { e with pe_cube: true } end
@@ -97,6 +106,20 @@ mod Strata.Particles do
   doc "How fast a particle turns, radians a second: a cube tumbles, a square turns in the view."
   fn spin(e : PtEffect, rad_per_s : Float) : PtEffect do { e with pe_spin: rad_per_s } end
 
+  pfn unit(x : Float) : Float do if x < 0.0 do 0.0 else if x > 1.0 do 1.0 else x end end end
+  doc "Its particles meet nothing: they fly through the world (the default, and the cheapest: the renderer never looks)."
+  fn meets_nothing(e : PtEffect) : PtEffect do { e with pe_meet: 0 } end
+  doc "Its particles die where their flight first meets a solid voxel (a spark put out by the ground, rain on a roof)."
+  fn dies_on_solid(e : PtEffect) : PtEffect do { e with pe_meet: 1 } end
+  doc "Its particles stop where their flight first meets a solid voxel and lie there, their tumble stilled, for the rest of their life (embers on the ground, snow)."
+  fn rests_on_solid(e : PtEffect) : PtEffect do { e with pe_meet: 2 } end
+  doc "Its particles bounce once off the first solid voxel their flight meets and rest at the next: [restitution] 0..1 is the share of the speed into the face that comes back out, [friction] 0..1 the share of the speed along the face that is lost."
+  fn bounces(e : PtEffect, restitution : Float, friction : Float) : PtEffect do
+    { e with pe_meet: 3, pe_restitution: unit(restitution), pe_keep: 1.0 -. unit(friction) }
+  end
+  doc "Does the effect ask the renderer to look for what its particles meet?"
+  fn meets_world(e : PtEffect) : Bool do e.pe_meet != 0 end
+
   pfn pad(xs : List(Float), n : Int) : List(Float) do List.append(xs, List.repeat(0.0, n - List.length(xs))) end
   pfn b2f(b : Bool) : Float do if b do 1.0 else 0.0 end end
   doc "The effect as the renderer's table holds it: 44 floats, laid out as native/strata_particles.h says."
@@ -110,7 +133,7 @@ mod Strata.Particles do
     let sages = pad(List.map(ss, fn k -> match k do (a, _) -> a end), 4)
     let dyn = [int_to_float(List.length(ss)), e.pe_drag, e.pe_wob, e.pe_hz]
     let acc = [e.pe_ax, e.pe_ay, e.pe_az, e.pe_spin]
-    let shape = [b2f(e.pe_cube), 0.0, 0.0, 0.0]
+    let shape = [b2f(e.pe_cube), int_to_float(e.pe_meet), e.pe_restitution, e.pe_keep]
     List.concat([head, ckeys, cages, sizes, sages, dyn, acc, shape])
   end
 
