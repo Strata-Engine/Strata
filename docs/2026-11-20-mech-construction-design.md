@@ -35,6 +35,9 @@ belong to Steel Rain.
   that brings it; the mech in the middle; weight, power, speed and the
   parts that fit the selected mount on the right.
 - **Movement pieces at launch: two legs, treads, and jet/hover.**
+- **Fallen parts become rubble and cover**: once a broken-off part's
+  pieces settle, they turn into world blocks (the debris blocks), so the
+  tactical grid refreshes and a blown-off arm can be half cover.
 - **Approach: start with authored parts assembled at runtime (A), aiming
   for generated parts (C).**
 
@@ -250,6 +253,11 @@ uses:
   grids in world pose, for `Strata.Physics` as bodies, optionally split by
   `Strata.Fracture` round the final hit. The game decides when a part is
   destroyed.
+- **Settling into rubble**: when a loose piece's body comes to rest, the
+  kit gives the game the voxel edits that stamp it into the world as
+  blocks (at the world's scale) and the body to remove. The game applies
+  them as plugin requests, and the tactics grid refreshes from the edit
+  outcome like any blast.
 
 ### Example
 
