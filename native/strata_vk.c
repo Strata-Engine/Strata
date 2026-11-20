@@ -78,7 +78,7 @@ typedef SaRange Range;
 struct FigInst { float pos[3]; uint32_t flags; float rot[4]; };
 
 typedef struct { float pos[4]; float rot[4]; int32_t dims[4]; float sphere[4]; } BodyRow;    /* std430, 64 bytes: low corner (metres), rotation, size and first word, bounding sphere (voxels) */
-typedef struct { int shaped, placed; float pos[3], rot[4], seen_pos[3], seen_rot[4]; int32_t dims[3]; uint32_t first, nwords; float vs; } BodyRec;   /* vs: metres a voxel, 0 the world's */
+typedef struct { int shaped, placed, shared; float pos[3], rot[4], seen_pos[3], seen_rot[4]; int32_t dims[3]; uint32_t first, nwords; float vs; } BodyRec;   /* vs: metres a voxel, 0 the world's */
 
 /* One entry of the chunk table, as the shaders read it (std430, 96 bytes).
  * The CPU writes entries straight into the mapped buffer. A frame in flight
@@ -2798,9 +2798,21 @@ int64_t sv_body_shape(int64_t handle, void *bytes, int64_t n, int64_t sx, int64_
     BodyRec *b = &g.bodies[handle];
     uint32_t words = 0, first = 0;
     if (!put_shape(narr_data(bytes), sx, sy, sz, &first, &words)) { g.refused++; return 0; }
-    if (b->shaped) sa_release(&g_bbytes, (SaRange){ b->first, b->nwords }, g.frame_no);
+    if (b->shaped && !b->shared) sa_release(&g_bbytes, (SaRange){ b->first, b->nwords }, g.frame_no);
     b->first = first; b->nwords = words; b->dims[0] = (int32_t)sx; b->dims[1] = (int32_t)sy; b->dims[2] = (int32_t)sz;
-    b->shaped = 1;
+    b->shaped = 1; b->shared = 0;
+    return 1;
+}
+/* Give body [handle] the shape body [from] has, without a copy: the class
+ * bytes are [from]'s, which must keep its shape for as long as any body
+ * shares it (Strata.Render shares only prototypes, which it never drops). */
+int64_t sv_body_share(int64_t handle, int64_t from) {
+    if (!g.ok || !g.bodies || handle < 0 || handle >= SV_MAX_BODIES || from < 0 || from >= SV_MAX_BODIES || handle == from) return 0;
+    BodyRec *b = &g.bodies[handle], *src = &g.bodies[from];
+    if (!src->shaped || src->shared) return 0;
+    if (b->shaped && !b->shared) sa_release(&g_bbytes, (SaRange){ b->first, b->nwords }, g.frame_no);
+    b->first = src->first; b->nwords = src->nwords; memcpy(b->dims, src->dims, sizeof b->dims);
+    b->shaped = 1; b->shared = 1;
     return 1;
 }
 /* Where body [handle] is: its grid's low corner in metres and its rotation. */
@@ -2821,7 +2833,7 @@ void sv_body_voxel(int64_t handle, double metres) {
 void sv_body_drop(int64_t handle) {
     if (!g.ok || !g.bodies || handle < 0 || handle >= SV_MAX_BODIES) return;
     BodyRec *b = &g.bodies[handle];
-    if (b->shaped) sa_release(&g_bbytes, (SaRange){ b->first, b->nwords }, g.frame_no);
+    if (b->shaped && !b->shared) sa_release(&g_bbytes, (SaRange){ b->first, b->nwords }, g.frame_no);
     memset(b, 0, sizeof *b);
 }
 
@@ -3273,6 +3285,30 @@ int64_t sv_chunk_instance(int64_t slot, int64_t prototype, double x, double y, d
     track_batch((uint32_t)slot, batched);
     target->first[5] = (uint32_t)prototype;
     target->level_flags = SV_IN_USE | SV_SHARED | hidden | (batched ? SV_BATCHED : 0);
+    if ((uint32_t)slot + 1 > g.hi_slot) g.hi_slot = (uint32_t)slot + 1;
+    touch((uint32_t)slot);
+    return 1;
+}
+
+/* Draw the body part in [slot] from the mesh of the body part in
+ * [prototype]: its own pose and voxel size (sv_slot_pose, sv_slot_voxel) and
+ * no mesh of its own, so a thousand instances of one shape are one mesh. The
+ * prototype's ranges are then fixed until close; hide it (sv_chunk_show) to
+ * keep it undrawn. A prototype with translucent quads is refused: their
+ * ordered lists are a slot's own. */
+int64_t sv_body_instance(int64_t slot, int64_t prototype) {
+    if (!g.ok || slot < 0 || prototype < 0 || slot >= g.slot_cap || prototype >= g.slot_cap || slot == prototype) return 0;
+    ChunkEntry *source = &g.entries[prototype], *target = &g.entries[slot];
+    if (!(source->level_flags & SV_IN_USE) || !(source->level_flags & SV_BODY) || (source->level_flags & SV_SHARED) ||
+        source->count[2] || (target->level_flags & (SV_TEMPLATE | SV_HAS_LIGHT))) return 0;
+    release_mesh(target);
+    if (target->level_flags & SV_BATCHED) track_batch((uint32_t)slot, 0);
+    trans_track((uint32_t)slot, 0);
+    source->level_flags |= SV_TEMPLATE;
+    *target = *source;
+    target->level_flags = SV_IN_USE | SV_BODY | SV_SHARED;
+    target->pos[0] = target->pos[1] = target->pos[2] = target->pos[3] = 0.0f;
+    target->rot[0] = target->rot[1] = target->rot[2] = 0.0f; target->rot[3] = 1.0f;
     if ((uint32_t)slot + 1 > g.hi_slot) g.hi_slot = (uint32_t)slot + 1;
     touch((uint32_t)slot);
     return 1;

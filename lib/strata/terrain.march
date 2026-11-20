@@ -11,6 +11,9 @@
 -- It is not stored; it is asked for when wanted, and a
 -- voxel an edit has since removed is told by comparing with the chunk.
 --
+-- A generator may carry a third pure function, its props: the things a
+-- level-0 chunk holds that are not stamped into its voxels (Strata.Shapes).
+--
 -- A generator declares the highest level of detail it supports
 -- (Strata.Coord: a level-L chunk's voxels are 2^L times the world's scale)
 -- and makes a chunk for any key up to it directly, without the fine chunks
@@ -35,21 +38,35 @@ mod Strata.Terrain do
 
   type Column = Column(List(Strata.Coord.Key) -> Int -> List(Strata.Chunk.Chunk))
 
-  -- the chunk function, the stamps function if any, the highest level, and the column function if any
-  type Gen = Gen(Strata.Coord.Key -> Int -> Strata.Chunk.Chunk, Option(Stamps), Int, Option(Column))
+  -- A thing placed that is not stamped into the chunk: a prototype (an index the game and its Strata.Shapes agree on), the
+  -- instance's hash, and where the prototype's low corner stands in metres
+  type PropAt = TnPropAt(Int, Int, Float, Float, Float)
+
+  doc "A placed prop: prototype [proto] with hash [hash], its grid's low corner at (x, y, z) metres."
+  fn placed(proto : Int, hash : Int, x : Float, y : Float, z : Float) : PropAt do TnPropAt(proto, hash, x, y, z) end
+  fn placed_proto(p : PropAt) : Int do match p do TnPropAt(v, _, _, _, _) -> v end end
+  fn placed_hash(p : PropAt) : Int do match p do TnPropAt(_, v, _, _, _) -> v end end
+  fn placed_x(p : PropAt) : Float do match p do TnPropAt(_, _, v, _, _) -> v end end
+  fn placed_y(p : PropAt) : Float do match p do TnPropAt(_, _, _, v, _) -> v end end
+  fn placed_z(p : PropAt) : Float do match p do TnPropAt(_, _, _, _, v) -> v end end
+
+  type PropsFn = TnProps(Strata.Coord.Key -> Int -> List(PropAt))
+
+  -- the chunk function, the stamps function if any, the highest level, the column function if any, and the props function if any
+  type Gen = Gen(Strata.Coord.Key -> Int -> Strata.Chunk.Chunk, Option(Stamps), Int, Option(Column), Option(PropsFn))
 
   doc "Wrap a generator function: (chunk key, seed) -> chunk. It has no stamps and declares level 0: `gen_levels(f, 0)`."
-  fn gen(f : Strata.Coord.Key -> Int -> Strata.Chunk.Chunk) : Gen do Gen(f, None, 0, None) end
+  fn gen(f : Strata.Coord.Key -> Int -> Strata.Chunk.Chunk) : Gen do Gen(f, None, 0, None, None) end
 
   doc "Wrap a generator function that makes chunks of every level 0..[max_level] (it reads the key's level). It has no stamps."
-  fn gen_levels(f : Strata.Coord.Key -> Int -> Strata.Chunk.Chunk, max_level : Int) : Gen do Gen(f, None, if max_level < 0 do 0 else max_level end, None) end
+  fn gen_levels(f : Strata.Coord.Key -> Int -> Strata.Chunk.Chunk, max_level : Int) : Gen do Gen(f, None, if max_level < 0 do 0 else max_level end, None, None) end
 
   doc "The highest level of detail [g] generates."
-  fn max_level(g : Gen) : Int do match g do Gen(_, _, l, _) -> l end end
+  fn max_level(g : Gen) : Int do match g do Gen(_, _, l, _, _) -> l end end
 
   doc "The generator [g] with the stamps function [s]: (chunk key, seed) -> 32768 values in a chunk's voxel order (x + 32 z + 1024 y), the structure index + 1 a voxel, 0 for none."
   fn with_stamps(g : Gen, s : Stamps) : Gen do
-    match g do Gen(f, _, l, c) -> Gen(f, Some(s), l, c) end
+    match g do Gen(f, _, l, c, p) -> Gen(f, Some(s), l, c, p) end
   end
 
   doc "Strata's own generation version: 1, raised whenever a generator built into Strata changes its output. A save store combines it with the game's own version (`Strata.Save`)."
@@ -58,7 +75,7 @@ mod Strata.Terrain do
   doc "Generate the chunk at [k] for [seed]: air for a key above the generator's level (or below 0)."
   fn run(g : Gen, k : Strata.Coord.Key, seed : Int) : Strata.Chunk.Chunk do
     match g do
-      Gen(f, _, l, _) ->
+      Gen(f, _, l, _, _) ->
         let kl = Strata.Coord.level(k)
         if kl > l || kl < 0 do Strata.Chunk.uniform(0) else f(k, seed) end
     end
@@ -69,14 +86,30 @@ mod Strata.Terrain do
     if Strata.Coord.level(k) != 0 do NativeArray.make_i32(32768, 0)
     else
       match g do
-        Gen(_, Some(Stamps(s)), _, _) -> s(k, seed)
-        Gen(_, None, _, _) -> NativeArray.make_i32(32768, 0)
+        Gen(_, Some(Stamps(s)), _, _, _) -> s(k, seed)
+        Gen(_, None, _, _, _) -> NativeArray.make_i32(32768, 0)
       end
     end
   end
+  doc "The generator [g] with the props function [p]: (chunk key, seed) -> the props whose root is in that level-0 chunk, pure like the chunk function. They are what the chunk holds that is not stamped into it: Strata.Shapes stands them as shapes."
+  fn with_props(g : Gen, p : PropsFn) : Gen do
+    match g do Gen(f, s, l, c, _) -> Gen(f, s, l, c, Some(p)) end
+  end
+
+  doc "The props of the chunk at [k] for [seed]: none for a generator without a props function or a key above level 0."
+  fn props(g : Gen, k : Strata.Coord.Key, seed : Int) : List(PropAt) do
+    if Strata.Coord.level(k) != 0 do Nil
+    else
+      match g do
+        Gen(_, _, _, _, Some(TnProps(p))) -> p(k, seed)
+        Gen(_, _, _, _, None) -> Nil
+      end
+    end
+  end
+
   doc "The generator [g] with the column function [c]: keys of one chunk column and level -> their chunks in the same order, equal to `run` key for key."
   fn with_column(g : Gen, c : Column) : Gen do
-    match g do Gen(f, s, l, _) -> Gen(f, s, l, Some(c)) end
+    match g do Gen(f, s, l, _, p) -> Gen(f, s, l, Some(c), p) end
   end
 
   doc "Whether two keys are of one chunk column: the same x, z and level."
@@ -118,8 +151,8 @@ mod Strata.Terrain do
       Nil -> Nil
       Cons(first, _) ->
         match g do
-          Gen(_, _, _, None) -> singly(g, ks, seed)
-          Gen(_, _, l, Some(Column(c))) ->
+          Gen(_, _, _, None, _) -> singly(g, ks, seed)
+          Gen(_, _, l, Some(Column(c)), _) ->
             if !one_column(first, ks) do singly(g, ks, seed)
             else
               -- one column is one level: its keys are all inside the generator's levels or all outside

@@ -1,0 +1,239 @@
+-- Shape: one voxel object's grid, voxel size and pose; a ray through it, a
+-- sphere carved out of it, what the ground still holds of it, and its bytes.
+-- Block ids: 1 stone, 2 a plant that does not collide.
+mod Strata.Test.Shape do
+
+  needs IO.Clock      -- charged to every test module once any uses Check.all (GAPS S3)
+  needs IO.Process
+  import Test
+  alias Strata.Shape as Shp
+  alias Strata.Body as Bg
+  alias Strata.Blocks as B
+  alias Strata.World as Wd
+  alias Strata.Coord as Cd
+  alias Strata.Chunk as C
+  alias Strata.Template as Tp
+  alias Strata.Math.Quat as Qt
+  alias Strata.Query as Qy
+
+  pfn reg() : Strata.Blocks.Registry do
+    match B.register(B.empty(), B.def()) do
+      Ok((r1, _)) ->
+        match B.register(r1, B.with_style(B.with_opacity(B.with_collide(B.def(), false), Strata.Blocks.Clear), Strata.Blocks.Cross)) do
+          Ok((r2, _)) -> r2
+          Err(_) -> r1
+        end
+      Err(_) -> B.empty()
+    end
+  end
+
+  pfn near(a : Float, b : Float, tol : Float) : Bool do
+    let d = a -. b
+    (if d < 0.0 do 0.0 -. d else d end) <= tol
+  end
+
+  pfn flat() : Strata.Terrain.Gen do
+    Strata.Terrain.gen(fn (k, seed) -> if Cd.ky(k) < 0 do C.uniform(1) else C.uniform(0) end)
+  end
+  -- stone below y = 0, air above, round the origin
+  pfn ground() : Strata.World.World do
+    Wd.insert(Wd.insert(Wd.new(reg(), flat(), 7, 1.0), Cd.key(0, 0, 0), C.uniform(0)), Cd.key(0, -1, 0), C.uniform(1))
+  end
+
+  pfn filled(g : Strata.Body.Grid, sx : Int, sy : Int, sz : Int, i : Int) : Strata.Body.Grid do
+    if i >= sx * sy * sz do g
+    else filled(Bg.grid_set(g, i % sx, (i / sx) % sy, i / (sx * sy), 1), sx, sy, sz, i + 1) end
+  end
+  pfn solid(sx : Int, sy : Int, sz : Int) : Strata.Body.Grid do filled(Bg.grid(sx, sy, sz), sx, sy, sz, 0) end
+  pfn any(id : Int) : Bool do id != 0 end
+
+  -- a 3 x 2 x 4 template, voxel i holding i + 1
+  pfn numbered() : Strata.Template.Template do
+    Tp.make(3, 2, 4, List.fold_left(List.range(0, 24), NativeArray.make_i32(24, 0), fn (a, i) -> NativeArray.set_i32(a, i, i + 1)), 0.25)
+  end
+  -- every voxel of g equals the chunk the template was blitted into at the origin
+  pfn same_as_blit(g : Strata.Body.Grid, c : Strata.Chunk.Chunk, i : Int, n : Int) : Bool do
+    if i >= n do true
+    else
+      let x = i % Bg.size_x(g)
+      let y = (i / Bg.size_x(g)) % Bg.size_y(g)
+      let z = i / (Bg.size_x(g) * Bg.size_y(g))
+      if Bg.grid_get(g, x, y, z) != C.get_or(c, x, y, z, -1) do false else same_as_blit(g, c, i + 1, n) end
+    end
+  end
+
+  -- how many voxels of s have their centre within r of (x, y, z), by `point`
+  pfn brute_within(s : Strata.Shape.Shape, x : Float, y : Float, z : Float, r : Float) : Int do
+    let g = Shp.grid(s)
+    List.fold_left(List.range(0, Bg.size_x(g) * Bg.size_y(g) * Bg.size_z(g)), 0, fn (acc, i) ->
+      let vx = i % Bg.size_x(g)
+      let vy = (i / Bg.size_x(g)) % Bg.size_y(g)
+      let vz = i / (Bg.size_x(g) * Bg.size_y(g))
+      match Shp.point(s, int_to_float(vx) +. 0.5, int_to_float(vy) +. 0.5, int_to_float(vz) +. 0.5) do
+        (px, py, pz) ->
+          let d2 = (px -. x) *. (px -. x) +. (py -. y) *. (py -. y) +. (pz -. z) *. (pz -. z)
+          if Bg.grid_get(g, vx, vy, vz) != 0 && d2 <= r *. r do acc + 1 else acc end
+      end)
+  end
+
+  pfn same_grid(a : Strata.Body.Grid, b : Strata.Body.Grid) : Bool do
+    if Bg.size_x(a) != Bg.size_x(b) || Bg.size_y(a) != Bg.size_y(b) || Bg.size_z(a) != Bg.size_z(b) do false
+    else List.all(List.range(0, Bg.size_x(a) * Bg.size_y(a) * Bg.size_z(a)), fn i -> NativeArray.get_i32(Bg.ids(a), i) == NativeArray.get_i32(Bg.ids(b), i)) end
+  end
+
+  pfn prefix(b : NativeU8Arr, n : Int) : NativeU8Arr do
+    List.fold_left(List.range(0, n), NativeArray.make_u8(Strata.Size.of(n), 0), fn (a, i) -> NativeArray.set_u8(a, i, NativeArray.get_u8(b, i)))
+  end
+
+  describe "Shape.grid_of" do
+    test "a template turned as blit turns it, all four ways" do
+      let t = numbered()
+      List.fold_left(List.range(0, 4), (), fn (_, rot) ->
+        match Shp.grid_of(t, rot) do
+          Some(g) ->
+            let c = Tp.blit(C.uniform(0), Cd.key(0, 0, 0), t, 0, 0, 0, rot, 5)
+            Test.assert_eq_int(Bg.size_x(g) * 100 + Bg.size_y(g) * 10 + Bg.size_z(g), if rot == 1 || rot == 3 do 423 else 324 end, "sizes")
+            Test.assert_true(same_as_blit(g, c, 0, 24), "turn " ++ int_to_string(rot))
+          None -> Test.assert_true(false, "a grid")
+        end)
+    end
+    test "a template wider than a grid can be is refused" do
+      Test.assert_true(Option.is_none(Shp.grid_of(Tp.make(129, 1, 1, NativeArray.make_i32(129, 1), 0.25), 0)), "129 wide")
+    end
+  end
+
+  describe "Shape.ray" do
+    test "along x into one voxel of an upright shape" do
+      let s = Shp.make(Bg.grid_set(Bg.grid(4, 4, 4), 1, 2, 3, 1), 0.25, 10.0, 20.0, 30.0, Qt.identity(), Shp.fixed())
+      let h = Shp.ray(s, 8.375, 20.625, 30.875, 1.0, 0.0, 0.0, 100.0, fn id -> any(id))
+      Test.assert_true(Qy.is_hit(h), "hit")
+      Test.assert_eq_int(Qy.hit_x(h) * 100 + Qy.hit_y(h) * 10 + Qy.hit_z(h), 123, "voxel")
+      Test.assert_eq_int(Qy.hit_face(h), 3, "through its -x face")
+      Test.assert_true(near(Qy.hit_dist(h), 1.875, 0.0001), "distance")
+      Test.assert_true(!Qy.is_hit(Shp.ray(s, 8.375, 20.625, 30.875, 1.0, 0.0, 0.0, 1.8, fn id -> any(id))), "too short a ray")
+      Test.assert_true(!Qy.is_hit(Shp.ray(s, 8.375, 20.625, 30.875, 1.0, 0.0, 0.0, 100.0, fn _ -> false)), "nothing stops it")
+      Test.assert_true(!Qy.is_hit(Shp.ray(s, 8.375, 20.375, 30.875, 1.0, 0.0, 0.0, 100.0, fn id -> any(id))), "a row lower: air")
+      let d = Shp.ray(s, 10.375, 25.0, 30.875, 0.0, -2.0, 0.0, 100.0, fn id -> any(id))
+      Test.assert_eq_int(Qy.hit_face(d), 0, "from above, through its +y face")
+      Test.assert_true(near(Qy.hit_dist(d), 25.0 -. 20.75, 0.0001), "distance in metres whatever the direction's length")
+    end
+    test "a turned shape: a ray at a voxel's centre finds that voxel" do
+      let q = Qt.mul(Qt.from_axis_angle(0.0, 1.0, 0.0, 0.7), Qt.from_axis_angle(1.0, 0.0, 0.0, 0.4))
+      let s = Shp.make(Bg.grid_set(Bg.grid(5, 6, 7), 3, 4, 2, 1), 0.25, -3.0, 8.0, 2.0, q, Shp.dynamic())
+      match Shp.point(s, 3.5, 4.5, 2.5) do
+        (cx, cy, cz) ->
+          let h = Shp.ray(s, cx +. 3.0, cy +. 4.0, cz -. 2.0, -3.0, -4.0, 2.0, 50.0, fn id -> any(id))
+          Test.assert_true(Qy.is_hit(h), "hit")
+          Test.assert_eq_int(Qy.hit_x(h) * 100 + Qy.hit_y(h) * 10 + Qy.hit_z(h), 342, "voxel")
+          let whole = Math.sqrt(29.0)
+          Test.assert_true(Qy.hit_dist(h) < whole && Qy.hit_dist(h) > whole -. 0.25, "it stops within half a diagonal of the centre")
+      end
+    end
+  end
+
+  describe "Shape.carve_sphere" do
+    test "takes exactly the voxels within the sphere, and leaves the grid it was given" do
+      let q = Qt.from_axis_angle(0.0, 1.0, 0.0, 0.5)
+      let g = solid(8, 8, 8)
+      let s = Shp.make(g, 0.25, 1.0, 2.0, 3.0, q, Shp.fixed())
+      let want = brute_within(s, 1.6, 2.9, 3.4, 0.6)
+      match Shp.carve_sphere(s, 1.6, 2.9, 3.4, 0.6) do
+        (s2, taken) ->
+          Test.assert_true(want > 20, "the sphere holds something (" ++ int_to_string(want) ++ ")")
+          Test.assert_eq_int(taken, want, "taken")
+          Test.assert_eq_int(Shp.voxel_count(Shp.grid(s2)), 512 - want, "left")
+          Test.assert_eq_int(brute_within(s2, 1.6, 2.9, 3.4, 0.6), 0, "none left inside")
+          Test.assert_eq_int(Shp.voxel_count(g), 512, "the first grid is whole")
+      end
+      match Shp.carve_sphere(s, 40.0, 2.0, 3.0, 0.6) do
+        (_, taken) -> Test.assert_eq_int(taken, 0, "a sphere elsewhere takes nothing")
+      end
+    end
+    test "a box takes the voxels whose centres it holds" do
+      let s = Shp.make(solid(4, 4, 4), 0.5, 0.0, 0.0, 0.0, Qt.identity(), Shp.fixed())
+      match Shp.carve_box(s, 0.0, 1.0, 0.0, 2.0, 2.0, 2.0) do
+        (s2, taken) ->
+          Test.assert_eq_int(taken, 32, "two rows")
+          Test.assert_eq_int(Bg.grid_get(Shp.grid(s2), 0, 2, 0), 0, "a voxel of them")
+          Test.assert_eq_int(Bg.grid_get(Shp.grid(s2), 0, 1, 0), 1, "the row under")
+      end
+    end
+  end
+
+  describe "Shape.held and parts" do
+    test "a post on the ground is held; lifted, it is not" do
+      let w = ground()
+      Test.assert_true(Shp.held(reg(), w, Shp.make(solid(2, 8, 2), 0.25, 4.0, 0.0, 4.0, Qt.identity(), Shp.fixed()), 1.0), "on the ground")
+      Test.assert_true(!Shp.held(reg(), w, Shp.make(solid(2, 8, 2), 0.25, 4.0, 1.0, 4.0, Qt.identity(), Shp.fixed()), 1.0), "a metre up")
+    end
+    test "a post cut through: the foot stands, the top is loose where it was" do
+      let w = ground()
+      let s = Shp.make(solid(2, 16, 2), 0.25, 4.0, 0.0, 4.0, Qt.identity(), Shp.fixed())
+      match Shp.carve_box(s, 0.0, 1.0, 0.0, 10.0, 1.5, 10.0) do
+        (cut, taken) ->
+          Test.assert_eq_int(taken, 8, "two rows cut")
+          let p = Shp.parts(reg(), w, cut, 1.0)
+          match Shp.standing(p) do
+            Some(st) ->
+              Test.assert_eq_int(Shp.voxel_count(Shp.grid(st)), 16, "the foot: four rows")
+              Test.assert_eq_int(Bg.size_y(Shp.grid(st)), 16, "in a grid of the first size")
+              Test.assert_true(Shp.held(reg(), w, st, 1.0), "held")
+            None -> Test.assert_true(false, "something stands")
+          end
+          match Shp.loose(p) do
+            Cons(top, Nil) ->
+              Test.assert_eq_int(Shp.voxel_count(Shp.grid(top)), 40, "the top: ten rows")
+              Test.assert_eq_int(Bg.size_y(Shp.grid(top)), 10, "in its own box")
+              Test.assert_true(near(Shp.corner_y(top), 1.5, 0.000001) && near(Shp.corner_x(top), 4.0, 0.000001), "where it was")
+              Test.assert_eq_int(Shp.mode(top), Shp.dynamic(), "dynamic")
+            _ -> Test.assert_true(false, "one loose part")
+          end
+          Test.assert_eq_int(Shp.crumbs(p), 0, "no crumbs")
+      end
+    end
+    test "a whole held shape comes back with the grid it had; a crumb is dropped" do
+      let w = ground()
+      let s = Shp.make(solid(2, 4, 2), 0.25, 4.0, 0.0, 4.0, Qt.identity(), Shp.fixed())
+      Test.assert_true(Option.is_some(Shp.standing(Shp.parts(reg(), w, s, 1.0))) && List.is_empty(Shp.loose(Shp.parts(reg(), w, s, 1.0))), "whole")
+      -- a post and one voxel floating beside it
+      let g = Bg.grid_set(filled(Bg.grid(4, 4, 2), 2, 4, 2, 0), 3, 3, 0, 1)
+      let p = Shp.parts(reg(), w, Shp.make(g, 0.25, 4.0, 0.0, 4.0, Qt.identity(), Shp.fixed()), 1.0)
+      Test.assert_eq_int(Shp.crumbs(p), 1, "one crumb")
+      Test.assert_true(List.is_empty(Shp.loose(p)), "and no loose part")
+    end
+  end
+
+  describe "Shape bytes" do
+    test "a grid's palette, and its bytes read back" do
+      let g = Bg.grid_set(Bg.grid_set(solid(5, 3, 4), 1, 1, 1, 2), 4, 2, 3, 0)
+      match Shp.palette(g) do
+        (pal, n) ->
+          Test.assert_eq_int(n, 3, "air, stone, plant")
+          Test.assert_eq_int(NativeArray.get_i32(pal, 0) * 100 + NativeArray.get_i32(pal, 1) * 10 + NativeArray.get_i32(pal, 2), 12, "in the order met, air first")
+      end
+      let b = Shp.encode(g)
+      Test.assert_true(NativeArray.length_u8(b) < 40, "run-length: " ++ int_to_string(NativeArray.length_u8(b)) ++ " bytes for 60 voxels")
+      match Shp.decode(b, 0) do
+        Ok((g2, p)) ->
+          Test.assert_true(same_grid(g, g2), "the same grid")
+          Test.assert_eq_int(p, NativeArray.length_u8(b), "read to the end")
+        Err(e) -> Test.assert_true(false, e)
+      end
+    end
+    test "every cut-short copy of the bytes is refused, none panics" do
+      let b = Shp.encode(Bg.grid_set(solid(5, 3, 4), 1, 1, 1, 2))
+      let bad = List.filter(List.range(0, NativeArray.length_u8(b)), fn n -> Result.is_ok(Shp.decode(prefix(b, n), 0)))
+      Test.assert_eq_int(List.length(bad), 0, "prefixes that decoded")
+      Test.assert_true(Result.is_err(Shp.decode(NativeArray.make_u8(64, 255), 0)), "bytes of 255")
+      Test.assert_true(Result.is_err(Shp.decode(NativeArray.make_u8(64, 0), 0)), "bytes of 0")
+    end
+    test "a grid of 300 kinds of block keeps them" do
+      let g = List.fold_left(List.range(0, 300), Bg.grid(10, 10, 3), fn (acc, i) -> Bg.grid_set(acc, i % 10, (i / 10) % 10, i / 100, i + 1))
+      match Shp.palette(g) do (_, n) -> Test.assert_eq_int(n, 257, "no palette") end
+      match Shp.decode(Shp.encode(g), 0) do
+        Ok((g2, _)) -> Test.assert_true(same_grid(g, g2), "the same grid")
+        Err(e) -> Test.assert_true(false, e)
+      end
+    end
+  end
+end

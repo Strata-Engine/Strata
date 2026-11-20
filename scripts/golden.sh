@@ -43,7 +43,17 @@ $DIFF "$OUT/a.ppm" "$OUT/a.ppm" 4 0.05 > /dev/null; [ $? -eq 0 ] || { echo "FAIL
 
 (cd viewer && forge build --release > "$OUT/build.log" 2>&1) || { echo "FAIL: viewer build"; tail -20 "$OUT/build.log"; exit 1; }
 
+# The props scenes run with STRATA_PROPS=1: the forest's trees stand as shapes
+# of 0.25 m voxels on the 1 m island (docs/2026-11-19-shapes-design.md), drawn
+# and traced as bodies are. props-tree-cut is scene 130's tree 20 frames after
+# a scripted cut through its trunk (the crown a falling body, the stump
+# standing); props-tree-fallen is the same run at 5 s, the crown come to rest
+# down the slope.
 SCENES='
+props-tree:STRATA_SCENE=130 STRATA_LIGHT=4 STRATA_PROPS=1 STRATA_FRAMES=120
+props-forest:STRATA_SCENE=3 STRATA_LIGHT=4 STRATA_PROPS=1 STRATA_FRAMES=120
+props-tree-cut:STRATA_SCENE=130 STRATA_LIGHT=4 STRATA_PROPS=1 STRATA_FRAMES=80 STRATA_CUT_AT=60 STRATA_CUT_DROP=110 STRATA_CUT_SIDE=50
+props-tree-fallen:STRATA_SCENE=130 STRATA_LIGHT=4 STRATA_PROPS=1 STRATA_FRAMES=300 STRATA_CUT_AT=60 STRATA_CUT_DROP=110 STRATA_CUT_SIDE=50
 overview:STRATA_SCENE=1
 shore:STRATA_SCENE=2
 forest:STRATA_SCENE=3

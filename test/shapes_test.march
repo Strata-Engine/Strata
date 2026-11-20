@@ -1,0 +1,273 @@
+-- Shapes: the standing shapes of a world. Props stood from prototypes,
+-- found by rays, carved, remembered, handed to physics when loose.
+-- Block ids: 1 stone.
+mod Strata.Test.Shapes do
+
+  needs IO.Clock      -- charged to every test module once any uses Check.all (GAPS S3)
+  needs IO.Process
+  needs IO.Spawn
+  import Test
+  alias Strata.Shapes as Shs
+  alias Strata.Shape as Shp
+  alias Strata.Body as Bg
+  alias Strata.Blocks as B
+  alias Strata.World as Wd
+  alias Strata.Coord as Cd
+  alias Strata.Chunk as C
+  alias Strata.Edit as Ed
+  alias Strata.Query as Qy
+  alias Strata.Physics as Ph
+  alias Strata.Terrain as Tn
+
+  pfn reg() : Strata.Blocks.Registry do
+    match B.register(B.empty(), B.def()) do
+      Ok((r1, _)) -> r1
+      Err(_) -> B.empty()
+    end
+  end
+  pfn near(a : Float, b : Float, tol : Float) : Bool do
+    let d = a -. b
+    (if d < 0.0 do 0.0 -. d else d end) <= tol
+  end
+  pfn any(id : Int) : Bool do id != 0 end
+
+  -- the props of chunk (0, 0, 0): two posts of prototype 0
+  pfn two_posts() : List(Strata.Terrain.PropAt) do [Tn.placed(0, 111, 4.0, 0.0, 4.0), Tn.placed(0, 222, 10.0, 0.0, 4.0)] end
+  pfn gen() : Strata.Terrain.Gen do
+    Tn.with_props(Tn.gen(fn (k, seed) -> if Cd.ky(k) < 0 do C.uniform(1) else C.uniform(0) end),
+      Strata.Terrain.TnProps(fn (k, seed) -> if Cd.kx(k) == 0 && Cd.ky(k) == 0 && Cd.kz(k) == 0 do two_posts() else Nil end))
+  end
+  -- stone below y = 0, air above, round the origin
+  pfn ground() : Strata.World.World do
+    Wd.insert(Wd.insert(Wd.new(reg(), gen(), 7, 1.0), Cd.key(0, 0, 0), C.uniform(0)), Cd.key(0, -1, 0), C.uniform(1))
+  end
+  pfn filled(g : Strata.Body.Grid, sx : Int, sy : Int, sz : Int, i : Int) : Strata.Body.Grid do
+    if i >= sx * sy * sz do g
+    else filled(Bg.grid_set(g, i % sx, (i / sx) % sy, i / (sx * sy), 1), sx, sy, sz, i + 1) end
+  end
+  -- shapes with one prototype: a post 2 x 16 x 2 at 0.25 m (half a metre square, 4 m tall)
+  pfn fresh() : Strata.Shapes.Shapes do
+    match Shs.add_proto(Shs.new(reg(), 1.0), filled(Bg.grid(2, 16, 2), 2, 16, 2, 0), 0.25) do (s, _) -> s end
+  end
+  pfn stood() : Strata.Shapes.Shapes do Shs.add_chunk(fresh(), Cd.key(0, 0, 0), two_posts()) end
+  pfn count_of(s : Strata.Shapes.Shapes, id : Int) : Int do
+    match Shs.shape(s, id) do
+      Some(sp) -> Shp.voxel_count(Shp.grid(sp))
+      None -> -1
+    end
+  end
+  pfn first_id(s : Strata.Shapes.Shapes) : Int do
+    match Shs.ids_in(s, Cd.key(0, 0, 0)) do
+      Cons(i, _) -> i
+      Nil -> -1
+    end
+  end
+  -- the first post cut through a little over a metre up
+  pfn cut(s : Strata.Shapes.Shapes) : (Strata.Shapes.Shapes, List(Strata.Shape.Shape), Int, Int) do Shs.carve_sphere(s, ground(), 4.25, 1.25, 4.25, 0.3) end
+  pfn settle(s : Strata.Shapes.Shapes, w : Strata.World.World, n : Int) : Strata.Shapes.Shapes do
+    if n <= 0 || Shs.pending(s) == 0 do s else settle(Shs.changed(s, w, Nil, Nil), w, n - 1) end
+  end
+
+  describe "Shapes stood from props" do
+    test "each prop is an instance of its prototype and holds no grid of its own" do
+      let s = stood()
+      Test.assert_eq_int(Shs.count(s), 2, "two stand")
+      Test.assert_eq_int(List.length(Shs.ids_in(s, Cd.key(0, 0, 0))), 2, "in their chunk")
+      let id = first_id(s)
+      Test.assert_eq_int(Shs.proto_of(s, id), 0, "an instance of prototype 0")
+      Test.assert_eq_int(count_of(s, id), 64, "the post's voxels")
+      match Shs.shape(s, id) do
+        Some(sp) -> Test.assert_true(near(Shp.corner_x(sp), 4.0, 0.000001) && Shp.voxel(sp) == 0.25 && Shp.mode(sp) == Shp.fixed(), "where its prop says, fixed")
+        None -> Test.assert_true(false, "a shape")
+      end
+      match Shs.take_drawn(s) do
+        (s2, appeared, left) ->
+          Test.assert_eq_int(List.length(appeared) * 10 + List.length(left), 20, "both listed for the renderer")
+          match Shs.take_drawn(s2) do (_, a2, l2) -> Test.assert_eq_int(List.length(a2) + List.length(l2), 0, "once") end
+      end
+      let d = Shs.drop_chunk(s, Cd.key(0, 0, 0))
+      Test.assert_eq_int(Shs.count(d), 0, "dropped with the chunk")
+      Test.assert_true(Option.is_none(Shs.shape(d, id)), "its id is gone")
+    end
+    test "a prop stands centred on its column, on a whole voxel of its own, above the top" do
+      let p = Shs.stand(fresh(), 0, 9, 4.3, -2.6, 11)
+      Test.assert_true(near(Tn.placed_x(p), 4.25, 0.000001) && near(Tn.placed_z(p), -2.75, 0.000001) && near(Tn.placed_y(p), 12.0, 0.000001), "centred on column (4, -3), bottom at 12 m")
+      Test.assert_eq_int(Tn.placed_hash(p) * 10 + Tn.placed_proto(p), 90, "hash and prototype kept")
+    end
+    test "a template set is four prototypes a variant, turned" do
+      let t = Strata.Template.make(3, 2, 5, NativeArray.make_i32(30, 1), 0.25)
+      match Shs.add_set(fresh(), [t, t]) do
+        (s, base) ->
+          Test.assert_eq_int(base, 1, "after the one already there")
+          Test.assert_eq_int(Shs.proto_count(s), 9, "eight more")
+          Test.assert_eq_int(Bg.size_x(Shp.grid(Shs.proto(s, Shs.proto_index(base, 1, 1)))), 5, "variant 1 turned once is 5 wide")
+          Test.assert_eq_int(Bg.size_x(Shp.grid(Shs.proto(s, Shs.proto_index(base, 1, 2)))), 3, "turned twice 3")
+      end
+    end
+  end
+
+  describe "Shapes found by rays" do
+    test "the nearest post along a ray, and nothing past its length" do
+      let s = stood()
+      match Shs.raycast(s, 0.0, 1.1, 4.25, 1.0, 0.0, 0.0, 50.0, fn id -> any(id)) do
+        (h, id) ->
+          Test.assert_eq_int(id, first_id(s), "the first post")
+          Test.assert_true(near(Qy.hit_dist(h), 4.0, 0.0001), "at its face")
+          Test.assert_eq_int(Qy.hit_y(h), 4, "the voxel a little over a metre up")
+      end
+      match Shs.raycast(s, 20.0, 1.1, 4.25, -1.0, 0.0, 0.0, 50.0, fn id -> any(id)) do
+        (h, id) -> Test.assert_true(id != first_id(s) && id >= 0 && near(Qy.hit_dist(h), 9.5, 0.0001), "from the other side, the second post")
+      end
+      match Shs.raycast(s, 0.0, 1.1, 4.25, 1.0, 0.0, 0.0, 3.5, fn id -> any(id)) do
+        (h, id) -> Test.assert_true(id == -1 && !Qy.is_hit(h), "too short a ray")
+      end
+      match Shs.raycast_all(s, Ph.new(reg(), Ph.config()), ground(), 0.0, 1.1, 4.25, 1.0, 0.0, 0.0, 50.0, fn id -> any(id)) do
+        (_, kind, id) -> Test.assert_true(kind == 2 && id == first_id(s), "with the world and bodies: a shape")
+      end
+      match Shs.raycast_all(s, Ph.new(reg(), Ph.config()), ground(), 4.25, 9.0, 8.5, 0.0, -1.0, 0.0, 50.0, fn id -> any(id)) do
+        (h, kind, _) -> Test.assert_true(kind == 0 && near(Qy.hit_dist(h), 9.0, 0.0001), "beside the posts: the ground")
+      end
+    end
+  end
+
+  describe "Shapes found by rays far from the origin" do
+    test "a tree-sized prop in a chunk of negative coordinates, a long ray" do
+      -- a trunk 4 x 48 x 4 in the middle of a 40 x 48 x 40 grid at 0.25 m
+      let g = List.fold_left(List.range(0, 4 * 48 * 4), Bg.grid(40, 48, 40), fn (acc, i) -> Bg.grid_set(acc, 18 + i % 4, (i / 4) % 48, 18 + i / 192, 1))
+      match Shs.add_proto(Shs.new(reg(), 1.0), g, 0.25) do
+        (s0, pi) ->
+          let pr = Shs.stand(s0, pi, 5, -1.5, -10.5, 96)
+          let s = Shs.add_chunk(Shs.add_chunk(s0, Cd.key(-1, 3, -1), [pr]), Cd.key(0, 3, 0), Nil)
+          Test.assert_true(near(Tn.placed_x(pr), -6.5, 0.000001) && near(Tn.placed_y(pr), 97.0, 0.000001) && near(Tn.placed_z(pr), -15.5, 0.000001), "its corner")
+          match Shs.raycast(s, -6.5, 100.0, 0.5, 0.38136154971, -0.00862118681293, -0.920688229901, 250.0, fn id -> any(id)) do
+            (h, id) ->
+              Test.assert_true(id >= 0, "the trunk is met")
+              Test.assert_true(near(Qy.hit_dist(h), 11.76, 0.05), "about 11.76 m away (" ++ float_to_string(Qy.hit_dist(h)) ++ ")")
+          end
+          match Shs.raycast(s, -6.5, 100.0, 0.5, 0.38136154971, -0.00862118681293, -0.920688229901, 20.0, fn id -> any(id)) do
+            (_, id) -> Test.assert_true(id >= 0, "and by a short ray")
+          end
+      end
+    end
+  end
+
+  describe "Shapes carved" do
+    test "a post cut through stands as its foot; the top is loose and falls as a body of the same voxels" do
+      let s = stood()
+      let id = first_id(s)
+      match cut(s) do
+        (s2, loose_, taken, crumbs_) ->
+          Test.assert_eq_int(taken, 8, "two rows taken")
+          Test.assert_eq_int(crumbs_, 0, "no crumbs")
+          Test.assert_eq_int(count_of(s2, id), 16, "the foot stands under the same id")
+          Test.assert_eq_int(Shs.proto_of(s2, id), -1, "with a grid of its own")
+          Test.assert_eq_int(count_of(s2, id + 1), 64, "the other post is whole")
+          Test.assert_eq_int(Shp.voxel_count(Shp.grid(Shs.proto(s2, 0))), 64, "and so is the prototype")
+          Test.assert_eq_int(Shs.remembered(s2), 1, "one prop remembered")
+          match loose_ do
+            Cons(top, Nil) ->
+              Test.assert_eq_int(Shp.voxel_count(Shp.grid(top)), 40, "the top: ten rows")
+              Test.assert_true(near(Shp.corner_y(top), 1.5, 0.000001), "where it was")
+              match Ph.add_shape(Ph.new(reg(), Ph.config()), top, Ph.dynamic()) do
+                (p, body) ->
+                  Test.assert_true(body > 0, "physics takes it")
+                  Test.assert_eq_int(Ph.voxel_count(p, body), 40, "the same voxels")
+                  Test.assert_true(Ph.voxel_size(p, body) == 0.25, "at its own voxel size")
+                  match Ph.shape_of(p, body) do
+                    Some(back) -> Test.assert_true(near(Shp.corner_y(back), 1.5, 0.000001) && near(Shp.corner_x(back), 4.0, 0.000001) && Bg.size_y(Shp.grid(back)) == 10, "and gives it back as a shape where it is")
+                    None -> Test.assert_true(false, "a shape of the body")
+                  end
+              end
+            _ -> Test.assert_true(false, "one loose part")
+          end
+          -- the chunk leaves and returns: the carved post is the carved post
+          let back = Shs.add_chunk(Shs.drop_chunk(s2, Cd.key(0, 0, 0)), Cd.key(0, 0, 0), two_posts())
+          Test.assert_eq_int(Shs.count(back), 2, "two stand again")
+          Test.assert_eq_int(count_of(back, first_id(back)), 16, "the first still its foot")
+          Test.assert_eq_int(Shs.proto_of(back, first_id(back)), -1, "its own grid")
+      end
+    end
+    test "a sphere that reaches nothing changes nothing" do
+      match Shs.carve_sphere(stood(), ground(), 7.0, 2.0, 4.0, 0.5) do
+        (s2, loose_, taken, _) -> Test.assert_true(taken == 0 && List.is_empty(loose_) && Shs.remembered(s2) == 0 && Shs.proto_of(s2, first_id(s2)) == 0, "between the posts")
+      end
+    end
+    test "a physics shape of a voxel physics cannot take is refused" do
+      match Ph.add_shape(Ph.new(reg(), Ph.config()), Shp.make(Bg.grid(2, 2, 2), 0.3, 0.0, 0.0, 0.0, Strata.Math.Quat.identity(), Shp.dynamic()), Ph.dynamic()) do
+        (_, id) -> Test.assert_eq_int(id, -1, "0.3 m in a 1 m world")
+      end
+    end
+    test "a post whose ground is dug away is loose whole, and does not come back" do
+      let s = stood()
+      let o = Ed.set_block(ground(), 4, -1, 4, 0)
+      match Shs.unrooted(s, Ed.world(o), o) do
+        (s2, loose_) ->
+          Test.assert_eq_int(List.length(loose_), 1, "one loose")
+          Test.assert_eq_int(Shs.count(s2), 1, "one stands")
+          match loose_ do
+            Cons(sp, _) -> Test.assert_true(Shp.voxel_count(Shp.grid(sp)) == 64 && Shp.mode(sp) == Shp.dynamic() && near(Shp.corner_x(sp), 4.0, 0.000001), "the whole post, dynamic, where it stood")
+            Nil -> Test.assert_true(false, "a shape")
+          end
+          let back = Shs.add_chunk(Shs.drop_chunk(s2, Cd.key(0, 0, 0)), Cd.key(0, 0, 0), two_posts())
+          Test.assert_eq_int(Shs.count(back), 1, "the chunk returns without it")
+      end
+      let far = Ed.set_block(ground(), 20, -1, 20, 0)
+      match Shs.unrooted(s, Ed.world(far), far) do
+        (s3, l3) -> Test.assert_true(List.is_empty(l3) && Shs.count(s3) == 2, "an edit elsewhere looses nothing")
+      end
+    end
+  end
+
+  describe "Shapes remembered" do
+    test "the memory's bytes, taken in by fresh shapes, stand the same shapes" do
+      match cut(stood()) do
+        (s2, _, _, _) ->
+          let o = Ed.set_block(ground(), 10, -1, 4, 0)
+          match Shs.unrooted(s2, Ed.world(o), o) do
+            (s3, _) ->
+              match Shs.take_dirty(s3) do
+                (s4, regions) ->
+                  Test.assert_eq_int(List.length(regions), 1, "one region changed")
+                  match Shs.take_dirty(s4) do (_, again) -> Test.assert_eq_int(List.length(again), 0, "once") end
+                  match regions do
+                    Cons((rg, bytes), _) ->
+                      Test.assert_true(match rg do (x, y, z) -> x == 0 && y == 0 && z == 0 end, "region 0")
+                      match Shs.adopt(fresh(), bytes) do
+                        Ok(f) ->
+                          let back = Shs.add_chunk(f, Cd.key(0, 0, 0), two_posts())
+                          Test.assert_eq_int(Shs.count(back), 1, "the dug-out post is gone")
+                          Test.assert_eq_int(count_of(back, first_id(back)), 16, "the cut post is its foot")
+                          -- taken in after the chunk stood: the chunk is stood again by it
+                          match Shs.adopt(stood(), bytes) do
+                            Ok(late) -> Test.assert_true(Shs.count(late) == 1 && count_of(late, first_id(late)) == 16, "the same when the props stood first")
+                            Err(e) -> Test.assert_true(false, e)
+                          end
+                        Err(e) -> Test.assert_true(false, e)
+                      end
+                      let short = List.fold_left(List.range(0, NativeArray.length_u8(bytes) - 3), NativeArray.make_u8(Strata.Size.of(NativeArray.length_u8(bytes) - 3), 0), fn (a, i) -> NativeArray.set_u8(a, i, NativeArray.get_u8(bytes, i)))
+                      Test.assert_true(Result.is_err(Shs.adopt(fresh(), short)), "cut short: refused")
+                      Test.assert_eq_int(Shs.refused(Shs.adopt_or_count(fresh(), short)), 1, "and counted")
+                    Nil -> Test.assert_true(false, "a region")
+                  end
+              end
+          end
+      end
+    end
+  end
+
+  describe "Shapes in step with chunks" do
+    test "a loaded chunk's props are listed by the generator and stood; an unloaded chunk's leave" do
+      let w = ground()
+      let s1 = Shs.changed(fresh(), w, [Cd.key(0, 0, 0), Cd.key(0, -1, 0), Cd.key_at(0, 0, 0, 1)], Nil)
+      let s2 = settle(s1, w, 100000000)
+      Test.assert_eq_int(Shs.pending(s2), 0, "the listings finished")
+      Test.assert_eq_int(Shs.count(s2), 2, "the chunk's two posts stand")
+      match Shs.take_regions(s2) do (_, rs) -> Test.assert_eq_int(List.length(rs), 2, "two regions met (y 0 and y -1)") end
+      let s3 = settle(Shs.changed(s2, w, [Cd.key(0, 0, 0)], Nil), w, 100000000)
+      Test.assert_eq_int(Shs.count(s3), 2, "listed again as edited: not stood twice")
+      let s4 = Shs.changed(s3, w, Nil, [Cd.key(0, 0, 0)])
+      Test.assert_eq_int(Shs.count(s4), 0, "gone with the chunk")
+      Test.assert_eq_int(Shs.count(settle(Shs.changed(s4, w, [Cd.key(0, 0, 0)], Nil), w, 100000000)), 2, "and back with it")
+    end
+  end
+end

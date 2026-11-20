@@ -39,8 +39,9 @@ mod Strata.Population do
   opaque type PopLayerDecl = PdLayerCover(String, String, PopRule, Int) | PdLayerScatter(String, String, PopRule, Float, Float, Int) | PdLayerSite(String, String, List(PopSite), Float, Int)
 
   -- each list newest first; freeze reverses them
+  -- pp_props: (layer, shape set) from props
   -- pp_seen: (layer, level) from seen_to; pp_ranks: (shape set, rank) from ranks; pp_on: (layer, block ids) from cover_on; pp_between: (layer, lo, hi) from cover_between
-  ptype PopData = { pp_fields : List(PopFieldDecl), pp_zones : List(PopZoneDecl), pp_shapes : List(PopShapesDecl), pp_weights : List(PopWeightsDecl), pp_layers : List(PopLayerDecl), pp_seen : List((String, Int)), pp_ranks : List((String, NativeIntArr)), pp_on : List((String, List(Int))), pp_between : List((String, Float, Float)) }
+  ptype PopData = { pp_fields : List(PopFieldDecl), pp_zones : List(PopZoneDecl), pp_shapes : List(PopShapesDecl), pp_weights : List(PopWeightsDecl), pp_layers : List(PopLayerDecl), pp_seen : List((String, Int)), pp_ranks : List((String, NativeIntArr)), pp_on : List((String, List(Int))), pp_between : List((String, Float, Float)), pp_props : List((String, String)) }
   opaque type Pop = Pop(PopData)
   pfn popd(p : Pop) : PopData do match p do Pop(d) -> d end end
 
@@ -56,7 +57,7 @@ mod Strata.Population do
   opaque type PopLayer = PfLayerCover(Int, PopFrozenRule, Int) | PfLayerScatter(Int, PopFrozenRule, Float, Float, Int) | PfLayerSite(Int, List(PopSite), Float, Int)
 
   -- fz_seen: each layer's declared seen_to level (run order), -1 for the default; fz_ranks: each shape set's rank array, empty for the default; fz_on: each layer's cover_on block ids (run order), empty for any block; fz_between: each layer's cover_between heights, (-inf, inf) for any
-  ptype FrozenData = { fz_field_names : List(String), fz_fields : List(PopField), fz_zone_names : List(String), fz_zones : List(PopZone), fz_shape_names : List(String), fz_shapes : List(PopShapes), fz_layer_names : List(String), fz_layers : List(PopLayer), fz_ground : List(Int), fz_seen : List(Int), fz_ranks : List(NativeIntArr), fz_on : List(List(Int)), fz_between : List((Float, Float)) }
+  ptype FrozenData = { fz_field_names : List(String), fz_fields : List(PopField), fz_zone_names : List(String), fz_zones : List(PopZone), fz_shape_names : List(String), fz_shapes : List(PopShapes), fz_layer_names : List(String), fz_layers : List(PopLayer), fz_ground : List(Int), fz_seen : List(Int), fz_ranks : List(NativeIntArr), fz_on : List(List(Int)), fz_between : List((Float, Float)), fz_props : List(Int) }
   opaque type Frozen = Frozen(FrozenData)
   pfn fd(f : Frozen) : FrozenData do match f do Frozen(d) -> d end end
   pfn fz_field_names_of(f : Frozen) : List(String) do
@@ -111,11 +112,15 @@ mod Strata.Population do
     let d = fd(f)
     d.fz_between
   end
+  pfn fz_props_of(f : Frozen) : List(Int) do
+    let d = fd(f)
+    d.fz_props
+  end
 
   -- Building
 
   doc "A population with nothing declared."
-  fn new() : Pop do Pop({ pp_fields: Nil, pp_zones: Nil, pp_shapes: Nil, pp_weights: Nil, pp_layers: Nil, pp_seen: Nil, pp_ranks: Nil, pp_on: Nil, pp_between: Nil }) end
+  fn new() : Pop do Pop({ pp_fields: Nil, pp_zones: Nil, pp_shapes: Nil, pp_weights: Nil, pp_layers: Nil, pp_seen: Nil, pp_ranks: Nil, pp_on: Nil, pp_between: Nil, pp_props: Nil }) end
 
   pfn add_field(p : Pop, d : PopFieldDecl) : Pop do
     let q = popd(p)
@@ -239,6 +244,12 @@ mod Strata.Population do
   fn cover_between(p : Pop, layer : String, lo : Float, hi : Float) : Pop do
     let q = popd(p)
     Pop({ q with pp_between: Cons((layer, lo, hi), q.pp_between) })
+  end
+
+  doc "Make the scatter layer named layer a prop layer: in a world whose voxels are larger than those of the shape set named shapes, its instances are not stamped into level-0 chunks but listed as props (Strata.Populate.props_with), each a fine grid of that set's variant standing where the stamp would (docs/2026-11-19-shapes-design.md). shapes is the layer's own variants over again at the detail scale: a set of templates, as many as the layer's own set, all of one voxel size, none over 128 voxels on a side. Above level 0, and in a world at the detail scale or finer, the layer stamps its own set as before. At most one per layer."
+  fn props(p : Pop, layer : String, shapes : String) : Pop do
+    let q = popd(p)
+    Pop({ q with pp_props: Cons((layer, shapes), q.pp_props) })
   end
 
   -- Names and lookups
@@ -508,6 +519,45 @@ mod Strata.Population do
           Some(d) ->
             first_of([fail_if(if lvl < 0 do true else lvl > 16 end, about1("seen_to", n), who ++ " is level " ++ int_to_string(lvl) ++ "; it must be within 0..16"),
                       fail_if(if lvl > 0 do block_layer(ss, d) else false end, about1("seen_to", n), who ++ " is level " ++ int_to_string(lvl) ++ ", but it places blocks of shape set " ++ q(layer_shapes(d)) ++ ", which are placed at level 0 only")])
+        end
+    end
+  end
+  pfn props_name(e : (String, String)) : String do match e do (n, _) -> n end end
+  pfn one_size(ts : List(Strata.Template.Template)) : Bool do
+    match ts do
+      Nil -> false
+      Cons(t, rest) -> Strata.Template.t_voxel_size(t) > 0.0 && List.all(rest, fn u -> Strata.Template.t_voxel_size(u) == Strata.Template.t_voxel_size(t))
+    end
+  end
+  pfn too_wide(t : Strata.Template.Template) : Bool do
+    Strata.Template.t_sx(t) > 128 || Strata.Template.t_sy(t) > 128 || Strata.Template.t_sz(t) > 128
+  end
+  pfn check_props(ls : List(PopLayerDecl), ss : List(PopShapesDecl), e : (String, String)) : Option(String) do
+    match e do
+      (n, sn) ->
+        let who = "props of layer " ++ q(n)
+        match find_layer(ls, n) do
+          None -> fail(about1("props", n), "props names undeclared layer " ++ q(n))
+          Some(d) ->
+            let scatter = match d do
+                PdLayerScatter(_, _, _, _, _, _) -> true
+                _ -> false
+              end
+            if !scatter do fail(about1("props", n), who ++ ": only a scatter layer can be a prop layer")
+            else
+              match List.find(ss, fn x -> shapes_name(x) == sn) do
+                None -> fail(about1("props", n), who ++ " names undeclared shape set " ++ q(sn))
+                Some(PdBlocks(_, _)) -> fail(about1("props", n), who ++ " names shape set " ++ q(sn) ++ ", which holds blocks; a prop is a template's grid")
+                Some(PdTemplates(_, ts)) ->
+                  let own = match List.find(ss, fn x -> shapes_name(x) == layer_shapes(d)) do
+                      Some(x) -> variant_count(x)
+                      None -> -1
+                    end
+                  first_of([fail_if(List.length(ts) != own, about1("props", n), who ++ ": shape set " ++ q(sn) ++ " has " ++ int_to_string(List.length(ts)) ++ " variants and the layer's own set " ++ q(layer_shapes(d)) ++ " has " ++ int_to_string(own) ++ "; they must be the same variants at two scales"),
+                            fail_if(!one_size(ts), about1("props", n), who ++ ": the templates of shape set " ++ q(sn) ++ " must all have one voxel size, above 0"),
+                            fail_if(List.any(ts, too_wide), about1("props", n), who ++ ": a template of shape set " ++ q(sn) ++ " is over 128 voxels on a side")])
+              end
+            end
         end
     end
   end
@@ -804,12 +854,18 @@ mod Strata.Population do
     let znames = List.map(zs, zone_name)
     let snames = List.map(ss, shapes_name)
     let layers = List.filter_map(lorder, fn n -> find_layer(ls, n))
-    { fz_field_names: fnames, fz_fields: List.map(fs, fn d -> compile_field(fnames, lorder, d)), fz_zone_names: znames, fz_zones: List.map(zs, fn d -> compile_zone(fnames, znames, d)), fz_shape_names: snames, fz_shapes: List.map(ss, fn d -> compile_shapes(znames, ws, d)), fz_layer_names: lorder, fz_layers: List.map(layers, fn d -> compile_layer(fnames, znames, snames, d)), fz_ground: ground_used(fs, zs, ls), fz_seen: Nil, fz_ranks: Nil, fz_on: Nil, fz_between: Nil }
+    { fz_field_names: fnames, fz_fields: List.map(fs, fn d -> compile_field(fnames, lorder, d)), fz_zone_names: znames, fz_zones: List.map(zs, fn d -> compile_zone(fnames, znames, d)), fz_shape_names: snames, fz_shapes: List.map(ss, fn d -> compile_shapes(znames, ws, d)), fz_layer_names: lorder, fz_layers: List.map(layers, fn d -> compile_layer(fnames, znames, snames, d)), fz_ground: ground_used(fs, zs, ls), fz_seen: Nil, fz_ranks: Nil, fz_on: Nil, fz_between: Nil, fz_props: Nil }
   end
 
   pfn seen_of(seens : List((String, Int)), n : String) : Int do
     match List.find(seens, fn e -> seen_name(e) == n) do
       Some((_, v)) -> v
+      None -> -1
+    end
+  end
+  pfn props_of(prs : List((String, String)), snames : List(String), n : String) : Int do
+    match List.find(prs, fn e -> props_name(e) == n) do
+      Some((_, sn)) -> index_of(snames, sn)
       None -> -1
     end
   end
@@ -836,6 +892,7 @@ mod Strata.Population do
     let rks = List.reverse(q.pp_ranks)
     let ons = List.reverse(q.pp_on)
     let bets = List.reverse(q.pp_between)
+    let prs = List.reverse(q.pp_props)
     let mistake = first_of([
       duplicate("field", "field", fnames), duplicate("zone", "zone", znames), duplicate("shape set", "shapes", snames), duplicate("layer", "layer", lnames),
       first_some(fs, fn d -> check_field(fnames, lnames, d)),
@@ -853,6 +910,8 @@ mod Strata.Population do
       first_some(ons, fn e -> check_on(ls, e)),
       duplicate("cover_between of a layer", "cover_between", List.map(bets, between_name)),
       first_some(bets, fn e -> check_between(ls, e)),
+      duplicate("props of a layer", "props", List.map(prs, props_name)),
+      first_some(prs, fn e -> check_props(ls, ss, e)),
       first_some(fnames, fn n -> field_loop(fs, n, Nil)),
       first_some(znames, fn n -> zone_loop(zs, n, Nil))])
     match mistake do
@@ -862,7 +921,7 @@ mod Strata.Population do
           Err(e) -> Err(e)
           Ok(lorder) ->
             let f = compile(fs, zs, ss, ws, ls, lorder)
-            Ok(Frozen({ f with fz_seen: List.map(lorder, fn n -> seen_of(seens, n)), fz_ranks: List.map(ss, fn d -> rank_of_set(rks, shapes_name(d))), fz_on: List.map(lorder, fn n -> on_of(ons, n)), fz_between: List.map(lorder, fn n -> between_of(bets, n)) }))
+            Ok(Frozen({ f with fz_seen: List.map(lorder, fn n -> seen_of(seens, n)), fz_ranks: List.map(ss, fn d -> rank_of_set(rks, shapes_name(d))), fz_on: List.map(lorder, fn n -> on_of(ons, n)), fz_between: List.map(lorder, fn n -> between_of(bets, n)), fz_props: List.map(lorder, fn n -> props_of(prs, snames, n)) }))
         end
     end
   end
@@ -1250,6 +1309,25 @@ mod Strata.Population do
       None -> (float_neg_infinity(), float_infinity())
     end
   end
+  doc "The shape set layer i's props are made of (props), as an index, or -1 when the layer is not a prop layer or there is no such layer."
+  fn layer_props(f : Frozen, i : Int) : Int do
+    match nth_of(fz_props_of(f), i) do
+      Some(v) -> v
+      None -> -1
+    end
+  end
+  doc "Layer i's detail scale: the voxel size in metres of its props' templates, or 0 when it is not a prop layer."
+  fn layer_detail(f : Frozen, i : Int) : Float do
+    match shape_set_templates(f, layer_props(f, i)) do
+      Cons(t, _) -> Strata.Template.t_voxel_size(t)
+      Nil -> 0.0
+    end
+  end
+  doc "Does layer i place props in a world of scale metres a voxel: it is a prop layer whose detail scale is finer than the world's."
+  fn layer_is_prop(f : Frozen, i : Int, scale : Float) : Bool do
+    let d = layer_detail(f, i)
+    d > 0.0 && d < scale *. 0.999999
+  end
   doc "Shape set i's rank array (ranks); empty when none was declared (every id ranked by itself) or for no such set."
   fn shape_set_ranks(f : Frozen, i : Int) : NativeIntArr do
     match nth_of(fz_ranks_of(f), i) do
@@ -1314,7 +1392,7 @@ mod Strata.Population do
         end
     end
   end
-  pfn fit_sets(names : List(String), sets : List(PopShapes), scale : Float) : Result(List(PopShapes), String) do
+  pfn fit_sets(names : List(String), sets : List(PopShapes), scale : Float, i : Int, fine : List(Int)) : Result(List(PopShapes), String) do
     match sets do
       Nil -> Ok(Nil)
       Cons(s, rest) ->
@@ -1322,18 +1400,19 @@ mod Strata.Population do
           Cons(n, _) -> n
           Nil -> ""
         end
-        let fitted = match s do
+        -- a set props are made of stays at its own voxel size
+        let fitted = if List.any(fine, fn x -> x == i) do Some(s) else match s do
           PfBlocks(_, _) -> Some(s)
           PfTemplates(ts, ws) ->
             match fit_templates(ts, scale) do
               Some(ts2) -> Some(PfTemplates(ts2, ws))
               None -> None
             end
-        end
+        end end
         match fitted do
           None -> Err("population: shape set " ++ q(name) ++ " holds a template that cannot be fitted to a world of " ++ float_to_string(scale) ++ " m a voxel: its voxel size must be a whole number of the world's" ++ about1("shapes", name))
           Some(s2) ->
-            match fit_sets(List.drop(names, 1), rest, scale) do
+            match fit_sets(List.drop(names, 1), rest, scale, i + 1, fine) do
               Err(e) -> Err(e)
               Ok(rest2) -> Ok(Cons(s2, rest2))
             end
@@ -1368,15 +1447,32 @@ mod Strata.Population do
     end
   end
 
+  -- a prop layer's detail scale must be the world's voxel divided by 2, 4 or 8 (what Strata.Physics takes for a fine body) wherever it is finer than the world's
+  pfn detail_fits(f : Frozen, l : Int, scale : Float) : Option(String) do
+    if !layer_is_prop(f, l, scale) do None
+    else
+      let d = layer_detail(f, l)
+      let k = float_to_int(Math.floor(scale /. d +. 0.5))
+      let whole = Math.abs(int_to_float(k) *. d -. scale) <= 0.000001 *. scale
+      if whole && (k == 2 || k == 4 || k == 8) do None
+      else fail(about1("props", name_at(fz_layer_names_of(f), l)), "props of layer " ++ q(name_at(fz_layer_names_of(f), l)) ++ " have voxels of " ++ float_to_string(d) ++ " m in a world of " ++ float_to_string(scale) ++ " m a voxel: the world's voxel must be 2, 4 or 8 of them") end
+    end
+  end
+
   doc "f with every template of every shape set put through Strata.Template.fit at a world of `scale` metres a voxel, so each is as many metres across as it was authored; or Err naming the first shape set holding a template that cannot be fitted (a voxel size that is not a whole number of the world's, or a world coarser than the template). Block sets pass through. Also Err naming the first scatter layer whose candidate walk for one chunk at its seen level (seen_level_at at this scale) is more than 2048 cells a side (walk_side). Strata.Populate.place refuses a population whose scatter or site templates are not at its Ground's voxel size: fit it first."
   fn fit_all(f : Frozen, scale : Float) : Result(Frozen, String) do
-    match fit_sets(fz_shape_names_of(f), fz_shapes_of(f), scale) do
+    let fine = List.filter(fz_props_of(f), fn x -> x >= 0)
+    match fit_sets(fz_shape_names_of(f), fz_shapes_of(f), scale, 0, fine) do
       Ok(sets) ->
         let d = fd(f)
         let f2 = Frozen({ d with fz_shapes: sets })
-        match walks_go(f2, scale, 0) do
+        match first_some(List.range(0, layer_count(f2)), fn l -> detail_fits(f2, l, scale)) do
           Some(e) -> Err(e)
-          None -> Ok(f2)
+          None ->
+            match walks_go(f2, scale, 0) do
+              Some(e) -> Err(e)
+              None -> Ok(f2)
+            end
         end
       Err(e) -> Err(e)
     end
