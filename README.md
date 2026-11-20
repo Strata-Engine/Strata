@@ -1286,6 +1286,39 @@ In the viewer the far field is on: four levels, to 5.1 km at 1 m a voxel
 field alone. Scene 135 is the island from its highest hill, 136 a ring
 boundary over the ground; their numbers are in `RESULTS.md`.
 
+## Devtools: an agent drives the viewer
+
+Design: `docs/2026-11-20-devtools-design.md`. `tools/strata-mcp/server.mjs` is
+an MCP server (Node, no dependencies) that launches the viewer, hidden by
+default, and drives it while it runs: an agent can look, move, ask, edit and
+hold time without relaunching for every look. The repository's `.mcp.json`
+registers it as `strata` for Claude Code sessions opened here.
+
+| Tool | Does |
+|---|---|
+| `launch`, `quit` | start the viewer (building it if needed) with a scene, size, radius, levels, scale or any `STRATA_*` switch; stop it |
+| `screenshot` | the next frame as a PNG (optionally saved) |
+| `status`, `camera_get`, `camera_set`, `look_at`, `scene` | the frame and camera; move and turn it (metres, radians); the golden scenes' poses |
+| `block_at`, `raycast` | the block at a point; the first block along a ray, or along the camera's view |
+| `edit` | set, box, sphere or blast (voxels), through the viewer's own edit path, so fluid, physics and the save store hear of it |
+| `light`, `regenerate` | light mode and sun height; reread the island's settings, as R does |
+| `pause`, `resume`, `step` | hold the world still (drawing goes on), or advance exactly n frames |
+| `stats`, `log` | the last frame's times and counts; the viewer's output since a line |
+
+The viewer side is `StrataViewer.Devtools` (`viewer/lib/devtools.march`), on
+only with `STRATA_DEVTOOLS=<folder>`: once a frame it takes one-line requests
+from `<folder>/in`, applies them at one point in the frame loop, writes JSON
+replies to `<folder>/out` and logs each request with its frame in
+`<folder>/commands.log`. A folder rather than a port: March's listener binds
+every address, and a viewer that edits the world should not be on the
+network. Pause holds the walker, physics, fluid and the match; particles
+already flying keep flying. `scripts/devtools_check.sh` (in the gate) drives a
+hidden viewer through every tool.
+
+Planned: player input through `Strata.Input`, debug overlays, and a fixed
+time step under which `step` gives the same frames every time and a
+session's `commands.log` replays as a stored test.
+
 ## Modules
 
 | Module | Holds |

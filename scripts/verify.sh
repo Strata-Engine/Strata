@@ -48,6 +48,10 @@ fi
 if [ "${STRATA_NO_GPU:-0}" != "1" ]; then
   if ! scripts/combat_check.sh > .verify.log 2>&1; then echo "FAIL: scripts/combat_check.sh"; tail -20 .verify.log; exit 1; fi
 fi
+# the devtools relay: an MCP client drives a hidden viewer through every tool (needs a GPU)
+if [ "${STRATA_NO_GPU:-0}" != "1" ]; then
+  if ! scripts/devtools_check.sh > .verify.log 2>&1; then echo "FAIL: scripts/devtools_check.sh"; tail -20 .verify.log; exit 1; fi
+fi
 # the audio goldens: rendered in game time, no device opened, nothing played aloud
 if ! scripts/audio_golden.sh > .verify.log 2>&1; then echo "FAIL: scripts/audio_golden.sh"; tail -20 .verify.log; exit 1; fi
 if [ "${STRATA_NO_GPU:-0}" != "1" ]; then

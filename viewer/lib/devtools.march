@@ -1,0 +1,241 @@
+-- Devtools: an agent drives the running viewer through a folder
+-- (docs/2026-11-20-devtools-design.md). On only with STRATA_DEVTOOLS=<dir>.
+--
+-- A request is a file `<dir>/in/<id>.req` holding one line of words, the
+-- first the command and the rest `key=value`: `camera_set x=12.5 yaw=1.57`.
+-- The viewer takes the requests once a frame, at one point in its frame loop,
+-- and writes each reply to `<dir>/out/<id>.json` (written under another name
+-- and renamed, so a reader never sees half of one), then removes the request.
+-- Every request taken is appended to `<dir>/commands.log` with its frame, for
+-- a replay later. `tools/strata-mcp/server.mjs` is the other end.
+--
+-- This module holds what does not need the viewer's own types: the folder,
+-- the words of a request, the replies, the replies that wait (a screenshot,
+-- a step), and the clock that pause and step hold. The viewer applies the
+-- commands themselves (StrataViewer.dev_apply in strata_viewer.march).
+mod StrataViewer.Devtools do
+  needs IO.FileSystem
+  needs IO.Process
+  needs IO.Console
+
+  -- a request: its id, its command, its key=value words
+  type DReq = DReq(String, String, List((String, String)))
+
+  -- a reply that waits: a screenshot (id, its file, frames waited), a step (id, frames left)
+  type DWait = WaitShot(String, String, Int) | WaitStep(String, Int)
+
+  -- the folder ("" off); paused; frames a step still advances; seconds held by pause;
+  -- replies that wait; regenerate this frame; edits taken this frame for the viewer to apply;
+  -- the last frame's numbers (JSON fields); the fixed poses by scene number
+  type Dev = { dv_dir : String, dv_paused : Bool, dv_step : Int, dv_held : Float, dv_waits : List(DWait), dv_regen : Bool, dv_edits : List(DReq), dv_stats : String, dv_pose : Int -> (Float, Float, Float, Float, Float) }
+
+  doc "The devtools of this run: on when STRATA_DEVTOOLS names a folder, which is made with `in` and `out` inside it."
+  fn start() : Dev do
+    let d = Authority.must(Env.get("STRATA_DEVTOOLS", ""))
+    if d != "" do
+      let _ = Authority.must(Dir.mkdir_p(d ++ "/in"))
+      let _ = Authority.must(Dir.mkdir_p(d ++ "/out"))
+      Authority.must(println("devtools: taking requests in " ++ d ++ "/in"))
+    else () end
+    { dv_dir: d, dv_paused: false, dv_step: 0, dv_held: 0.0, dv_waits: Nil, dv_regen: false, dv_edits: Nil, dv_stats: "", dv_pose: fn _ -> (0.0, 0.0, 0.0, 0.0, 0.0) }
+  end
+
+  doc "The same, with the fixed poses (scene number to x, y, z, yaw, pitch) that `scene` jumps to."
+  fn with_poses(dv : Dev, f : Int -> (Float, Float, Float, Float, Float)) : Dev do { dv with dv_pose: f } end
+
+  fn is_on(dv : Dev) : Bool do dv.dv_dir != "" end
+  fn pose_of(dv : Dev, n : Int) : (Float, Float, Float, Float, Float) do (dv.dv_pose)(n) end
+
+  -- ── Requests ──────────────────────────────────────────────────────────
+
+  pfn word_pair(w : String) : (String, String) do
+    match String.split(w, "=") do
+      Cons(k, Cons(v, Nil)) -> (k, v)
+      Cons(k, Nil) -> (k, "")
+      Cons(k, rest) -> (k, String.join(rest, "="))
+      Nil -> ("", "")
+    end
+  end
+
+  pfn non_empty(ws : List(String), acc : List(String)) : List(String) do
+    match ws do
+      Nil -> List.reverse(acc)
+      Cons(w, t) -> if w == "" do non_empty(t, acc) else non_empty(t, Cons(w, acc)) end
+    end
+  end
+
+  doc "A request read from its line: the first word is the command, the rest `key=value`."
+  fn parse(id : String, line : String) : DReq do
+    match non_empty(String.split(String.trim(line), " "), Nil) do
+      Nil -> DReq(id, "", Nil)
+      Cons(c, rest) -> DReq(id, c, List.map(rest, word_pair))
+    end
+  end
+
+  fn req_id(r : DReq) : String do match r do DReq(i, _, _) -> i end end
+  fn req_cmd(r : DReq) : String do match r do DReq(_, c, _) -> c end end
+
+  pfn lookup(kvs : List((String, String)), k : String) : Option(String) do
+    match kvs do
+      Nil -> None
+      Cons((a, v), t) -> if a == k do Some(v) else lookup(t, k) end
+    end
+  end
+
+  doc "Does the request carry [k]?"
+  fn has(r : DReq, k : String) : Bool do match r do DReq(_, _, kvs) -> Option.is_some(lookup(kvs, k)) end end
+  doc "The word [k] of the request, or [d]."
+  fn word(r : DReq, k : String, d : String) : String do
+    match r do
+      DReq(_, _, kvs) ->
+        match lookup(kvs, k) do
+          Some(v) -> v
+          None -> d
+        end
+    end
+  end
+  doc "The number [k] of the request, or [d] when it is missing or not a number."
+  fn num(r : DReq, k : String, d : Float) : Float do
+    match String.to_float(word(r, k, "")) do
+      Ok(v) -> v
+      Err(_) -> d
+    end
+  end
+  doc "The whole number [k] of the request (a number rounded down), or [d]."
+  fn int(r : DReq, k : String, d : Int) : Int do
+    if has(r, k) do float_to_int(Math.floor(num(r, k, int_to_float(d)))) else d end
+  end
+
+  pfn read_all(dv : Dev, frame : Int, names : List(String), acc : List(DReq)) : List(DReq) do
+    match names do
+      Nil -> List.reverse(acc)
+      Cons(n, t) ->
+        if !String.ends_with(n, ".req") do read_all(dv, frame, t, acc)
+        else
+          let path = dv.dv_dir ++ "/in/" ++ n
+          let line = match Authority.must(File.read(path)) do
+              Ok(s) -> s
+              Err(_) -> ""
+            end
+          let _ = Authority.must(File.delete(path))
+          let line1 = String.trim(line)
+          let _ = Authority.must(File.append(dv.dv_dir ++ "/commands.log", int_to_string(frame) ++ " " ++ line1 ++ "\n"))
+          read_all(dv, frame, t, Cons(parse(String.slice(n, 0, String.byte_size(n) - 4), line1), acc))
+        end
+    end
+  end
+
+  doc "This frame's requests, in the order the folder lists them, each removed and logged; the frame's regenerate flag and edits cleared."
+  fn take(dv0 : Dev, frame : Int) : (Dev, List(DReq)) do
+    let dv = { dv0 with dv_regen: false, dv_edits: Nil }
+    if !is_on(dv) do (dv, Nil)
+    else
+      match Authority.must(Dir.list(dv.dv_dir ++ "/in")) do
+        Ok(names) -> (dv, read_all(dv, frame, names, Nil))
+        Err(_) -> (dv, Nil)
+      end
+    end
+  end
+
+  -- ── Replies ───────────────────────────────────────────────────────────
+
+  doc "A string as a JSON string literal."
+  fn jstr(s : String) : String do
+    "\"" ++ String.replace_all(String.replace_all(String.replace_all(s, "\\", "\\\\"), "\"", "\\\""), "\n", "\\n") ++ "\""
+  end
+  doc "A JSON field holding a number."
+  fn fnum(k : String, v : Float) : String do
+    let t = float_to_string(v)
+    -- a JSON number may not end in a dot (March writes 1. for 1.0)
+    jstr(k) ++ ":" ++ (if String.ends_with(t, ".") do t ++ "0" else t end)
+  end
+  fn fint(k : String, v : Int) : String do jstr(k) ++ ":" ++ int_to_string(v) end
+  fn fbool(k : String, v : Bool) : String do jstr(k) ++ ":" ++ (if v do "true" else "false" end) end
+  fn fstr(k : String, v : String) : String do jstr(k) ++ ":" ++ jstr(v) end
+  doc "Fields joined into one object's inside."
+  fn fields(fs : List(String)) : String do String.join(fs, ",") end
+
+  pfn write_reply(dv : Dev, id : String, body : String) : Unit do
+    if is_on(dv) do
+      let path = dv.dv_dir ++ "/out/" ++ id ++ ".json"
+      let _ = Authority.must(File.write(path ++ ".part", body ++ "\n"))
+      let _ = Authority.must(File.rename(path ++ ".part", path))
+      ()
+    else () end
+  end
+
+  doc "Reply that request [id] was done, with these fields (from `fields`; may be empty)."
+  fn ok(dv : Dev, id : String, fs : String) : Unit do
+    write_reply(dv, id, "{" ++ fstr("id", id) ++ "," ++ fbool("ok", true) ++ (if fs == "" do "" else "," ++ fs end) ++ "}")
+  end
+  doc "Reply that request [id] could not be done, and why."
+  fn fail(dv : Dev, id : String, why : String) : Unit do
+    write_reply(dv, id, "{" ++ fstr("id", id) ++ "," ++ fbool("ok", false) ++ "," ++ fstr("error", why) ++ "}")
+  end
+
+  -- ── What waits, and the clock ─────────────────────────────────────────
+
+  fn pause(dv : Dev) : Dev do { dv with dv_paused: true, dv_step: 0 } end
+  fn resume(dv : Dev) : Dev do { dv with dv_paused: false, dv_step: 0 } end
+  fn paused(dv : Dev) : Bool do dv.dv_paused end
+  doc "Advance [n] frames from a pause, and reply to [id] when they are done (the world pauses first if it was running)."
+  fn step(dv : Dev, id : String, n : Int) : Dev do
+    { dv with dv_paused: true, dv_step: dv.dv_step + n, dv_waits: Cons(WaitStep(id, n), dv.dv_waits) }
+  end
+  fn regenerate(dv : Dev) : Dev do { dv with dv_regen: true } end
+  fn regen(dv : Dev) : Bool do dv.dv_regen end
+  fn add_edit(dv : Dev, r : DReq) : Dev do { dv with dv_edits: Cons(r, dv.dv_edits) } end
+  doc "The edits taken this frame, in the order they came."
+  fn edits(dv : Dev) : List(DReq) do List.reverse(dv.dv_edits) end
+  fn stats(dv : Dev) : String do dv.dv_stats end
+
+  doc "Ask the renderer for the next frame drawn, written where the relay will find it, and reply to [id] once it is there."
+  fn shoot(dv : Dev, id : String) : Dev do
+    let path = dv.dv_dir ++ "/out/" ++ id ++ ".ppm"
+    let _ = Authority.must(Process.set_env("STRATA_SHOT", path))
+    Strata.Ffi.Vk.request_shot()
+    { dv with dv_waits: Cons(WaitShot(id, path, 0), dv.dv_waits) }
+  end
+
+  doc "Does the world move this frame? Not while paused, unless a step still has frames."
+  fn advancing(dv : Dev) : Bool do !dv.dv_paused || dv.dv_step > 0 end
+
+  doc "The frame's time step: [raw] while the world moves, 0 while it is held."
+  fn dt(dv : Dev, raw : Float) : Float do if advancing(dv) do raw else 0.0 end end
+
+  doc "The simulation clock now and a frame ago, from the raw clock's: the seconds held by pause taken off, and both the same while held, so nothing steps. (A fixed step later replaces this.)"
+  fn clocks(dv : Dev, now : Float, prev : Float) : (Float, Float) do
+    if advancing(dv) do (now -. dv.dv_held, prev -. dv.dv_held) else (prev -. dv.dv_held, prev -. dv.dv_held) end
+  end
+
+  pfn settle(dv : Dev, ws : List(DWait), stepped : Bool, keep : List(DWait)) : List(DWait) do
+    match ws do
+      Nil -> List.reverse(keep)
+      Cons(WaitStep(id, n), t) ->
+        let left = if stepped do n - 1 else n end
+        if left <= 0 do
+          ok(dv, id, fields([fbool("paused", true)]))
+          settle(dv, t, stepped, keep)
+        else settle(dv, t, stepped, Cons(WaitStep(id, left), keep)) end
+      Cons(WaitShot(id, path, k), t) ->
+        if k >= 1 && Authority.must(File.exists(path)) do
+          ok(dv, id, fields([fstr("ppm", path)]))
+          settle(dv, t, stepped, keep)
+        else if k > 240 do
+          fail(dv, id, "no frame was written in 240 frames")
+          settle(dv, t, stepped, keep)
+        else settle(dv, t, stepped, Cons(WaitShot(id, path, k + 1), keep)) end end
+    end
+  end
+
+  doc "The frame's end: its numbers kept for `stats`, a held frame's time added to what pause holds, a step's frame counted, and the replies that were waiting on it written."
+  fn end_frame(dv : Dev, stats_fields : String, raw_dt : Float) : Dev do
+    if !is_on(dv) do dv
+    else
+      let stepped = dv.dv_paused && dv.dv_step > 0
+      let held = if advancing(dv) do dv.dv_held else dv.dv_held +. raw_dt end
+      let waits = settle(dv, dv.dv_waits, stepped, Nil)
+      { dv with dv_stats: stats_fields, dv_held: held, dv_step: if stepped do dv.dv_step - 1 else dv.dv_step end, dv_waits: waits }
+    end
+  end
+end
