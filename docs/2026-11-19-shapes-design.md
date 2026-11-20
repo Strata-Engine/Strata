@@ -1,6 +1,11 @@
 # Strata shapes: design (population stage 4, props)
 
-Status: design, being built on branch `claude/hungry-pasteur-784291`.
+Status: built through plan Task 8 on branch `claude/hungry-pasteur-784291`
+(not merged). Built: the shape type, prop layers, the shapes of a world,
+drawing and rays, carving, falling, the memory and the save, the viewer
+under `STRATA_PROPS=1`. Not built (plan Task 9): settled bodies (section
+7), proxy boxes and promotion (section 8), site layers as props (section
+4). Measured against section 10 in `RESULTS.md`, "Props as shapes".
 Date: 2026-11-19
 Follows: `2026-11-12-population-design.md` (sections 6 and 9, and stage 4
 of its order of work) and `2026-11-11-physics-design.md`.
