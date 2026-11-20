@@ -10,3 +10,4 @@
 - Task 9: Ruling: `on` and `within` are reserved words in March (the first is GAPS S4; `within` is new); the reach module's helper is `on_map`. Cost: none.
 - Task 10: Ruling: lines of sight stop only at blocks that collide (Strata.Blocks.collides), not every drawn block, so water does not block sight. Cost if wrong: a game wanting glass to block sight registers it colliding.
 - Task 10: Ruling: the five rays are the centres and the centres moved a quarter tile along each of the four diagonals.
+- Task 11: picking with a cut starts the ray where it crosses the cut height; capsule cuts are not considered for picking.
