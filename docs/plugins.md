@@ -72,4 +72,25 @@ Rules:
 
 ## Wiring example
 
-(Filled in by the `strata_tactics` example game.)
+`plugins/strata_tactics/example/lib/tactics_example.march` is a small game
+on the tactics plugin (`plugins/strata_tactics/example/run.sh`; the picture
+is `docs/tactics-example.png`). The lines it has only because of the plugin
+are marked `-- plugin:` and number twelve:
+
+1. the dependency in `forge.toml`: `strata_tactics = { path = ".." }`;
+2. setup: `StrataTactics.setup(StrataTactics.config(grid_settings), reg, world)`;
+3. merging bindings: `Strata.Input.merge([("game", mine), ("tactics", theirs)])`;
+4. the frame: `Strata.Plugin.frame(world, input, pointer, wheel, dt, w, h, last_vp)`;
+5. update: `StrataTactics.update(state, frame)`;
+6. applying requests: `Strata.Plugin.apply(world, requests)`;
+7. the stream told of the outcomes (`Strata.Stream.apply` for each);
+8. the world changed: `StrataTactics.world_changed(state, world, outcomes)`;
+9. the marks the game shows: `StrataTactics.show(state, items)`;
+10. the overlay: `Strata.Render.overlay(StrataTactics.overlay(state, subject))`;
+11. the camera shown: `StrataTactics.view_proj(state, aspect)` to
+    `Strata.Ffi.Vk.set_camera`, kept for the next frame;
+12. the gui: `StrataTactics.gui(state, label, k)` placed in a `Strata.Gui`
+    layer.
+
+Everything else in the example (units, moving them, blasting, ending turns,
+the clock's advancing) is the game's own.

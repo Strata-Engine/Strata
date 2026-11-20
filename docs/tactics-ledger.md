@@ -21,3 +21,8 @@
 - Task 14: Ruling: a look shot moves the orbit's eye-to-focus offset to the point; shots travel over twice the turn time each way (smoothstep). Cost: feel only.
 - Task 15: March gap met: a lambda inside an arm of another lambda's body, after a `let` chain, is misparsed (its `match x do` read as the condition form `match do`; "I cannot find x"). Workaround: helper functions (`outline_tile`, `side_line`, `tile_quad`, `cover_edge`). To be filed in GAPS.md.
 - Task 15: Ruling: `turn_lines` exposes the gui's text so it can be tested; the gui is a column of labels under "Turn order".
+- Task 16: the grid of 24 x 24 tiles reads in 49 ms in the release build (the 64 x 64 test-build figure of 1.5 s is a debug build; 24 x 24 x 16 columns in 49 ms puts 64 x 64 near 350 ms in release, inside the 1 s budget).
+- Task 16: Ruling: the example's scripted mode uses the viewer's STRATA_FRAMES / STRATA_SHOT / STRATA_OFFSCREEN names, not TACTICS_*: the renderer reads STRATA_SHOT itself. World scale 1 m, units 3 voxels tall (not 8: the example world is 1 m a voxel). Cost: names only.
+- Task 16: Ruling: the example's type is `Squaddie`, not `Unit` — a program type named Unit shadows March's Unit everywhere (every `()` in Strata failed to type). Worth a GAPS entry.
+- Task 16: the wiring is twelve lines (docs/plugins.md).
+- Task 16: not done by me: playing the example windowed for a minute (needs a person at the keyboard). Scripted run checked by picture (docs/tactics-example.png): reach, outline, path and marker, sight line, units, blast, turn order all show.
