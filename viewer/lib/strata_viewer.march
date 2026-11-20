@@ -500,8 +500,13 @@ mod StrataViewer do
   doc "The population of island.pop's [text] at settings g on atlas a's sites, with the tree templates ts and the ruins rs (none: a shape that stamps nothing) of a world of [scale] metres a voxel: read, frozen and fitted, or the first mistake (on its line of the file); a population reading a ground slot the viewer does not supply is a mistake."
   fn pop_of(g : Gp, a : Strata.Atlas.Atlas, ts : List(Strata.Template.Template), rs : List(Strata.Template.Template), scale : Float, text : String) : Result(DecorPop, String) do
     let rs2 = if List.is_empty(rs) do Cons(hole(scale), Nil) else rs end
-    let nm = Strata.PopulationFile.named(Cons(("trees", ts), Cons(("ruins", rs2), Nil)), Cons(("sites", pop_sites(a)), Nil))
-    let body = substitute(text, pop_tokens(g, a))
+    -- templates finer than the world are the forest's props (fine_trees); the rest are its stamps
+    let fine = List.filter(ts, fn t -> Strata.Template.t_voxel_size(t) < scale *. 0.999)
+    let coarse = List.filter(ts, fn t -> Strata.Template.t_voxel_size(t) >= scale *. 0.999)
+    let nm = Strata.PopulationFile.named(Cons(("trees", coarse), Cons(("trees_fine", fine), Cons(("ruins", rs2), Nil))), Cons(("sites", pop_sites(a)), Nil))
+    let propped = if List.is_empty(fine) do Cons(("props_shapes", ""), Cons(("forest_props", ""), Nil))
+      else Cons(("props_shapes", "[shapes trees_fine] kind = templates from = trees_fine"), Cons(("forest_props", "props = trees_fine"), Nil)) end
+    let body = substitute(text, List.append(propped, pop_tokens(g, a)))
     -- read_into, not read: the file declares the ground fields it reads, and no other is evaluated
     match Strata.PopulationFile.read_into(Strata.Population.new(), body, nm) do
       Err(m) -> Err(m)
@@ -540,6 +545,18 @@ mod StrataViewer do
   doc "What stands on atlas a's island in a world of [scale] metres a voxel for [seed], at the default settings: island.pop's population with 12 tree templates and the three ruins (none if their files are not found)."
   fn decor(a : Strata.Atlas.Atlas, scale : Float, seed : Int) : Decor do decor_of(gp_default(), a, scale, seed) end
 
+  doc "The tree templates over again at 0.25 m a voxel, for a world of [scale] metres a voxel run with STRATA_PROPS=1: the forest's props (docs/2026-11-19-shapes-design.md). None without the setting, in a world of 0.25 m or finer, or (said once) when a tree is over 128 voxels on a side."
+  fn fine_trees(scale : Float, seed : Int) : List(Strata.Template.Template) do
+    if Authority.must(Env.get_int("STRATA_PROPS", 0)) != 1 || scale <= 0.2501 do Nil
+    else
+      let ts = trees_go(0.25, seed, 11, Nil)
+      if List.any(ts, fn t -> Strata.Template.t_sx(t) > 128 || Strata.Template.t_sy(t) > 128 || Strata.Template.t_sz(t) > 128) do
+        let _said = say_once("strata_viewer: a tree at 0.25 m is over 128 voxels on a side; the forest is stamped, not props")
+        Nil
+      else ts end
+    end
+  end
+
   doc "As decor, at settings g."
   fn decor_of(g : Gp, a : Strata.Atlas.Atlas, scale : Float, seed : Int) : Decor do
     let ts = trees_go(scale, seed, 11, Nil)
@@ -552,7 +569,8 @@ mod StrataViewer do
       else if List.length(read) < 3 do say_once("strata_viewer: the ruins (wall, tower, arch .vox) were not all found under " ++ String.join(ruin_dirs(), ", ") ++ "; no ruins")
       else say_once("strata_viewer: the ruins " ++ String.join(refused, ", ") ++ " were authored at " ++ float_to_string(ruin_voxel()) ++ " m a voxel, which " ++ float_to_string(scale) ++ " m a voxel does not divide; no ruins") end end end
     let ruins = if List.length(rs) == 3 do rs else Nil end
-    let pop = load_pop(g, a, ts, ruins, scale)
+    -- the trees again at the detail scale ride behind the world's own: pop_of tells them apart by their voxel size
+    let pop = load_pop(g, a, List.append(ts, fine_trees(scale, seed)), ruins, scale)
     let ground = match pop do
         Some(DecorPop(_, p)) -> Some(p)
         None -> beard_plan(g, a)
@@ -1875,6 +1893,91 @@ mod StrataViewer do
       Strata.Terrain.Column(fn (ks, sd) -> island_column_chunks(a, d, scale, ks, sd)))
   end
 
+  doc "The props of island chunk k: the forest's trees whose root is in it, each a prototype of shapes sh (registered from fine_trees: variant v turned r is prototype 4 v + r) standing where its stamp would. None without a population or without prop layers."
+  fn island_props(a : Strata.Atlas.Atlas, d : Decor, scale : Float, sh : Strata.Shapes.Shapes, k : Strata.Coord.Key, seed : Int) : List(Strata.Terrain.PropAt) do
+    match decor_pop(d) do
+      None -> Nil
+      Some(DecorPop(_, p)) ->
+        -- a chunk wholly above or below the land holds no root
+        if island_early_of(decor_gp(d), a, scale, Strata.Coord.kx(k), Strata.Coord.ky(k), Strata.Coord.kz(k)) >= 0 do Nil
+        else
+          match island_shared(a, d, scale, 0, Strata.Coord.kx(k), Strata.Coord.kz(k), seed) do
+            IslandCol(_, _, _, _, _, _, _, ip) ->
+              match ip do
+                None -> Nil
+                Some(IslandPop(gr, t, _)) ->
+                  List.map(Strata.Populate.props_with(p, seed, k, gr, t), fn pr -> Strata.Shapes.stand(sh, Strata.Shapes.proto_index(0, Strata.Populate.pr_variant(pr), Strata.Populate.pr_rot(pr)), Strata.Populate.pr_hash(pr), Strata.Populate.pr_xm(pr), Strata.Populate.pr_zm(pr), Strata.Populate.pr_top(pr)))
+              end
+          end
+        end
+    end
+  end
+
+  doc "island_gen with the island's props listed (island_props) for shapes sh."
+  fn island_gen_props(a : Strata.Atlas.Atlas, d : Decor, scale : Float, sh : Strata.Shapes.Shapes) : Strata.Terrain.Gen do
+    Strata.Terrain.with_props(island_gen(a, d, scale), Strata.Terrain.TnProps(fn (k, sd) -> island_props(a, d, scale, sh, k, sd)))
+  end
+
+  -- ── Shapes in the frame ──────────────────────────────────────────────────
+  -- loose parts handed to physics as falling bodies
+  pfn shapes_fall(m : Sim, loose : List(Strata.Shape.Shape)) : Sim do
+    match m do
+      Sim(s, f, p) -> Sim(s, f, List.fold_left(loose, p, fn (q, sp) -> match Strata.Physics.add_shape(q, sp, Strata.Physics.dynamic()) do (q2, _) -> q2 end))
+    end
+  end
+  -- the nearest standing shape along the camera's ray, if it is nearer than the world: its id and where the ray meets it (metres)
+  pfn shape_ahead(sh : Strata.Shapes.Shapes, m : Sim, reg : Strata.Blocks.Registry, x : Float, y : Float, z : Float, fx : Float, fy : Float, fz : Float) : (Int, Float, Float, Float) do
+    let wh = Strata.Query.raycast(Strata.Stream.world(sim_stream(m)), x, y, z, fx, fy, fz, 250.0, Strata.Query.targetable(reg))
+    let limit = if Strata.Query.is_hit(wh) do Strata.Query.hit_dist(wh) else 250.0 end
+    match Strata.Shapes.raycast(sh, x, y, z, fx, fy, fz, limit, fn id -> id != 0) do
+      (h, id) ->
+        if id < 0 do (-1, 0.0, 0.0, 0.0)
+        else
+          let len = Math.sqrt(fx *. fx +. fy *. fy +. fz *. fz)
+          let t = Strata.Query.hit_dist(h) +. 0.2
+          (id, x +. fx /. len *. t, y +. fy /. len *. t, z +. fz /. len *. t)
+        end
+    end
+  end
+  -- a cut of radius r at (cx, cy, cz): the shapes carved and what is loose falling
+  pfn shapes_cut(sh : Strata.Shapes.Shapes, m : Sim, cx : Float, cy : Float, cz : Float, r : Float) : (Strata.Shapes.Shapes, Sim) do
+    match Strata.Shapes.carve_sphere(sh, Strata.Stream.world(sim_stream(m)), cx, cy, cz, r) do
+      (sh2, loose, taken, crumbs) ->
+        let _said = if Authority.must(Env.get_int("STRATA_SLOW", 0)) == 1 do Authority.must(println("shapes: a cut took " ++ int_to_string(taken) ++ " voxels, " ++ int_to_string(List.length(loose)) ++ " loose parts, " ++ int_to_string(crumbs) ++ " crumbs")) else () end
+        (sh2, shapes_fall(m, loose))
+    end
+  end
+  -- after a blast of the world round voxel (vx, vy, vz): shapes within the crater carved, and those it left without ground loose
+  pfn shapes_blasted(sh : Strata.Shapes.Shapes, m : Sim, scale : Float, vx : Int, vy : Int, vz : Int) : (Strata.Shapes.Shapes, Sim) do
+    match shapes_cut(sh, m, (int_to_float(vx) +. 0.5) *. scale, (int_to_float(vy) +. 0.5) *. scale, (int_to_float(vz) +. 0.5) *. scale, 6.0 *. scale) do
+      (sh2, m2) ->
+        let w = Strata.Stream.world(sim_stream(m2))
+        match Strata.Shapes.unrooted(sh2, w, Strata.Edit.outcome_of(w, Nil, Cons(Strata.Edit.box_change(vx - 7, vy - 7, vz - 7, vx + 7, vy + 7, vz + 7, 0), Nil))) do
+          (sh3, loose) -> (sh3, shapes_fall(m2, loose))
+        end
+    end
+  end
+  -- the shapes' memory and the store: regions met are read in, regions changed are set to be written
+  pfn store_shapes(sv : Option(Strata.Save.SaveStore), sh : Strata.Shapes.Shapes) : (Option(Strata.Save.SaveStore), Strata.Shapes.Shapes) do
+    match sv do
+      None -> (None, sh)
+      Some(st) ->
+        match Strata.Shapes.take_regions(sh) do
+          (sh1, met) ->
+            let sh2 = List.fold_left(met, sh1, fn (acc, rg) -> shapes_read(st, acc, rg))
+            match Strata.Shapes.take_dirty(sh2) do
+              (sh3, changed) -> (Some(List.fold_left(changed, st, fn (acc, e) -> match e do (rg, b) -> Strata.Save.set_region_section(acc, rg, "shapes", Bytes.from_u8_arr(b)) end)), sh3)
+            end
+        end
+    end
+  end
+  pfn shapes_read(st : Strata.Save.SaveStore, sh : Strata.Shapes.Shapes, rg : (Int, Int, Int)) : Strata.Shapes.Shapes do
+    match Strata.Save.region_section(st, rg, "shapes") do
+      Some(b) -> Strata.Shapes.adopt_or_count(sh, Bytes.to_u8_arr(b))
+      None -> sh
+    end
+  end
+
   doc "The ground height in whole metres at a whole-metre column of the viewer's land at the default settings, lakes included (a river column's bed)."
   fn land_height(land : Land, wx : Int, wz : Int, seed : Int) : Int do
     match land do
@@ -2074,7 +2177,7 @@ mod StrataViewer do
 
   -- ── Physics ──────────────────────────────────────────────────────────────
   -- physics, the step in flight, the walker's driven body, C last frame, metres per voxel, the clock's start
-  type PhysRig = PhysRig(Strata.Physics.Physics, Option(Strata.Physics.Stepping), Int, Bool, Float, Float)
+  type PhysRig = PhysRig(Strata.Physics.Physics, Option(Strata.Physics.Stepping), Int, Bool, Float, Float, Strata.Shapes.Shapes)
 
   pfn block_of(n : Int, id : Int, i : Int, g : Strata.Body.Grid) : Strata.Body.Grid do
     if i >= n * n * n do g else block_of(n, id, i + 1, Strata.Body.grid_set(g, i % n, (i / n) % n, i / (n * n), id)) end
@@ -2758,7 +2861,7 @@ mod StrataViewer do
         match cam do
           Cam(x, y, z, yaw, pitch, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _) ->
             match rig do
-              PhysRig(p, _, me, _, _, _) ->
+              PhysRig(p, _, me, _, _, _, _) ->
                 let (st2, s2, _) = Strata.Save.flush(Strata.Save.set_player(st, 0, pose_bytes(x, y, z, yaw, pitch)), s, p, None, Cons(me, Nil))
                 let (dirty, _, failed, aside) = Strata.Save.stats(st2)
                 Authority.must(println("save: world hash " ++ int_to_string(Strata.Stream.world_hash(s2)) ++ "; " ++ int_to_string(List.length(Strata.Save.edited_keys(st2))) ++ " edited chunks on disk; " ++ int_to_string(Strata.Save.reads(st2)) ++ " region files read; still dirty " ++ int_to_string(dirty) ++ ", writes failed " ++ int_to_string(failed) ++ ", files set aside " ++ int_to_string(aside) ++ (if Strata.Save.reason(st2) == "" do "" else " (" ++ Strata.Save.reason(st2) ++ ")" end)))
@@ -2832,7 +2935,7 @@ mod StrataViewer do
           let strafe = if down do 0.0 else live *. Strata.Input.value(inp, "strafe") end
           let space = !scripted && !down && Strata.Input.held(inp, "jump")
           let w0 = Strata.Stream.world(s)
-          let (ph_r, pjob, me, ck0, sc, tz) = match rig do PhysRig(a, b, c, d, e, f) -> (a, b, c, d, e, f) end
+          let (ph_r, pjob, me, ck0, sc, tz, shp0) = match rig do PhysRig(a, b, c, d, e, f, g7) -> (a, b, c, d, e, f, g7) end
           -- set down by a match: the walker's driven body goes there too
           let ph = if placed do Strata.Physics.place_driven(ph_r, me, x, y -. 0.7, z) else ph_r end
           -- flying moves along the view at 40 m/s; walking moves on the ground at 5 m/s under gravity, as physics' driven body
@@ -2894,8 +2997,18 @@ mod StrataViewer do
           -- the match's frame: its fighters decide, move and are placed; what it burns comes back as one edit
           let (mt2, m3m, fxr0) = match_frame(mt, m3c, { mi_x: x2, mi_y: y2, mi_z: z2, mi_yaw: Math.atan2(fx, fz), mi_pitch: Math.asin(clampf(fy, -1.0, 1.0)), mi_shoot: lb || (scripted && Authority.must(Env.get_int("STRATA_HOLD", 0)) == 1), mi_slot: slot, mi_table: !scripted && Strata.Input.held(inp, "table"), mi_again: !scripted && Strata.Input.held(inp, "again"), mi_block: rb, mi_sprint: !scripted && Strata.Input.held(inp, "sprint"), mi_left: !scripted && Strata.Input.held(inp, "dodge_left"), mi_right: !scripted && Strata.Input.held(inp, "dodge_right"), mi_moving: go != 0.0 || strafe != 0.0 }, dt, fxr)
           -- in a match a dig or a build is one block, with the match's own hotbar
-          let m4a = if StrataViewer.Match.is_on(mt2) do match_edit(m3m, x2, y2, z2, fx, fy, fz, dig_now, build_now, StrataViewer.Match.block_for(slot))
-            else act(m3m, reg, seed, x2, y2, z2, fx, fy, fz, dig_now, build_now, StrataViewer.Hud.slot_block(slot)) end
+          -- a dig that meets a standing shape before the world cuts the shape and leaves the world; one that blasts the world carves the shapes in its crater.
+          -- STRATA_CUT_AT=n: at frame n a scripted cut along the view lowered STRATA_CUT_DROP centimetres over 12 m (250: the foot of scene 130's tree)
+          let cut_now = scripted && frame == Authority.must(Env.get_int("STRATA_CUT_AT", -1))
+          let cdrop = if cut_now do int_to_float(Authority.must(Env.get_int("STRATA_CUT_DROP", 250))) /. 1200.0 else 0.0 end
+          let ahead = if (dig_now || cut_now) && !StrataViewer.Match.is_on(mt2) && Strata.Shapes.count(shp0) > 0 do shape_ahead(shp0, m3m, reg, x2, y2, z2, fx, fy -. cdrop, fz) else (-1, 0.0, 0.0, 0.0) end
+          let on_shape = match ahead do (aid, _, _, _) -> aid >= 0 end
+          let dug = if dig_now && !on_shape && !StrataViewer.Match.is_on(mt2) do Strata.Query.raycast(Strata.Stream.world(sim_stream(m3m)), x2, y2, z2, fx, fy, fz, 250.0, Strata.Query.targetable(reg)) else Strata.Query.Miss end
+          let m4w = if StrataViewer.Match.is_on(mt2) do match_edit(m3m, x2, y2, z2, fx, fy, fz, dig_now, build_now, StrataViewer.Match.block_for(slot))
+            else act(m3m, reg, seed, x2, y2, z2, fx, fy, fz, dig_now && !on_shape, build_now, StrataViewer.Hud.slot_block(slot)) end
+          let (shp1, m4a) = if on_shape do (match ahead do (_, ax, ay, az) -> shapes_cut(shp0, m4w, ax, ay, az, int_to_float(Authority.must(Env.get_int("STRATA_CUT_R", 90))) /. 100.0) end)
+            else if Strata.Query.is_hit(dug) && Strata.Shapes.count(shp0) > 0 do shapes_blasted(shp0, m4w, vsz, Strata.Query.hit_x(dug), Strata.Query.hit_y(dug), Strata.Query.hit_z(dug))
+            else (shp0, m4w) end end
           -- sound: the camera is the listener; a carve or a build strikes where it lands
           let sndl = Strata.Sound.listener(snd, x2, y2, z2, fx, fy, fz, 0.0, 1.0, 0.0)
           let snd0 = if dig_now do strike_at(sndl, w0, reg, x2, y2, z2, fx, fy, fz, 0.55, 0.85) else if build_now do strike_at(sndl, w0, reg, x2, y2, z2, fx, fy, fz, 0.95, 0.3) else sndl end end
@@ -2964,12 +3077,15 @@ mod StrataViewer do
           if sf.sf_fluid_due && scripted && frame % 240 == 0 && Strata.Fluid.active_count(fl2) > 0 do Authority.must(println("  fluid step at frame " ++ int_to_string(frame) ++ ": " ++ ms2(fluid_ms) ++ " ms on the main thread for " ++ int_to_string(Strata.Fluid.active_count(fl2)) ++ " active cells")) else () end
           let tick_ms = sf.sf_physics_ms +. sf.sf_fluid_ms +. sf.sf_tick_ms
           match Strata.Render.present(sl, sim1, tphys -. 1.0 /. 60.0, fn () -> Strata.Ffi.Vk.time()) do
-            (sl3, sim2, sync_ms, bodies_ms) ->
-              let s3 = Strata.Sim.stream(sim2)
+            (sl3a, sim2, sync_ms, bodies_ms) ->
+              let (shp2, s3) = Strata.Shapes.sync(shp1, Strata.Sim.stream(sim2))
+              let (svs, shp3) = store_shapes(sv, shp2)
+              let (sl3, shp4) = Strata.Render.shapes(sl3a, shp3)
+              let _props = if scripted && frame == frames - 4 && Strata.Shapes.proto_count(shp4) > 0 do Authority.must(println("shapes: " ++ int_to_string(Strata.Shapes.count(shp4)) ++ " standing, " ++ int_to_string(Strata.Shapes.pending(shp4)) ++ " chunks still listing, " ++ int_to_string(Strata.Shapes.remembered(shp4)) ++ " remembered; renderer slots " ++ int_to_string(Strata.Render.used(sl3)))) else () end
               let pd = Strata.Sim.physics(sim2)
               let job2 = Strata.Sim.fluid_job(sim2)
               let pjob2 = Strata.Sim.physics_job(sim2)
-              let rig2 = PhysRig(pd, pjob2, me, ckey, sc, tz)
+              let rig2 = PhysRig(pd, pjob2, me, ckey, sc, tz, shp4)
               let march_ms = (Strata.Ffi.Vk.time() -. t_march) *. 1000.0
               let aspect = int_to_float(Strata.Ffi.Vk.fb_w()) /. int_to_float(if Strata.Ffi.Vk.fb_h() < 1 do 1 else Strata.Ffi.Vk.fb_h() end)
               let view = M4.look_at(V3.new(x2, y2, z2), V3.new(x2 +. fx, y2 +. fy, z2 +. fz), V3.new(0.0, 1.0, 0.0))
@@ -3062,7 +3178,7 @@ mod StrataViewer do
               let fworst2 = if fluid_ms > fworst do fluid_ms else fworst end
               let total2 = if frame >= 10 do total +. spent else total end
               -- STRATA_STORE: the store takes the world's changes and starts its writes; it never waits
-              let (sv2, s4) = store_tick(sv, s3, dt)
+              let (sv2, s4) = store_tick(svs, s3, dt)
               let cam2 = Cam(x2, y2, z2, yaw2, pitch2, kx, ky, kz, lb, rb, fly, StrataViewer.Walker.speed_y(moved), StrataViewer.Walker.grounded(moved), fkey, sun, mode, lkey, keys + figbits, stride, slot, rkey)
               if next != frame && frame % 240 == 239 do
                 Authority.must(println("  " ++ float_to_string(Math.round(240.0 /. (now -. t_mark))) ++ " fps; march " ++ ms2(march_ms) ++ " ms, shim " ++ ms2(Strata.Ffi.Vk.stat(0)) ++ " ms, waiting " ++ ms2(Strata.Ffi.Vk.stat(1)) ++ " ms, gpu " ++ ms2(Strata.Ffi.Vk.stat(3)) ++ " ms; " ++ int_to_string(float_to_int(Strata.Ffi.Vk.stat(2))) ++ " draw calls, " ++ int_to_string(float_to_int(Strata.Ffi.Vk.stat(4))) ++ " see-through chunks ordered in " ++ int_to_string(float_to_int(Strata.Ffi.Vk.stat(5))) ++ " us, " ++ int_to_string(Strata.Ffi.Vk.drawn_chunks()) ++ " chunks, " ++ int_to_string(Strata.Ffi.Vk.drawn_quads()) ++ " quads; " ++ int_to_string(Strata.Stream.loaded_count(s3)) ++ " chunks loaded"))
@@ -3838,7 +3954,8 @@ mod StrataViewer do
     let td = unix_time_ms()
     let dec = decor_of(g, a, scale, seed)
     Authority.must(println("strata_viewer: " ++ int_to_string(List.length(decor_trees(dec))) ++ " tree templates and " ++ int_to_string(List.length(decor_ruins(dec))) ++ " ruins built in " ++ int_to_string(unix_time_ms() - td) ++ " ms"))
-    let gen = island_gen(a, dec, scale)
+    let shp_start = match Strata.Shapes.add_set(Strata.Shapes.new(registry(), scale), fine_trees(scale, seed)) do (sh0, _) -> sh0 end
+    let gen = if Strata.Shapes.proto_count(shp_start) > 0 do island_gen_props(a, dec, scale, shp_start) else island_gen(a, dec, scale) end
     if Authority.must(Env.get_int("STRATA_CHUNK_TIMES", 0)) == 1 do chunk_times(gen, land, seed, scale) else () end
     let tl = scene_lake(land, seed)
     let (mx, mz) = if on_meadow(scene) do meadow() else if scene == 3 || scene == 32 do forest() else (0, 0) end end
@@ -3942,7 +4059,7 @@ mod StrataViewer do
           let ph1b = if scene == 28 && !fine do shore_crate(ph1, land, ex, ez, yaw0, seed, sc, 4) else ph1 end
           let ph1c = crates_in_view(ph1b, land, ex, ez, yaw0, seed, sc, Authority.must(Env.get_int("STRATA_CRATES", 0)), 0)
           let rig = match StrataViewer.Walker.add_to(ph1c, StrataViewer.Walker.body(ex, ey, ez)) do
-              (p3, me) -> PhysRig(p3, None, me, false, sc, Strata.Ffi.Vk.time())
+              (p3, me) -> PhysRig(p3, None, me, false, sc, Strata.Ffi.Vk.time(), shp_start)
             end
           -- figures: scene 31 the humanoid's seven clips side by side, 32 one walking across the forest floor, STRATA_FIGURES=n a crowd
           let crowd = crowd_for(scene, Authority.must(Env.get_int("STRATA_FIGURES", 0)), Strata.Stream.world(s1), ex, ey, ez, yaw0)
