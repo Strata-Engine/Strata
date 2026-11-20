@@ -1,0 +1,76 @@
+-- The tactics plugin: setup, update, world changes, overlay, gui.
+mod StrataTactics.Test.Plugin do
+
+  needs IO.Clock      -- charged to every test module once any uses Check.all (GAPS S3)
+
+  needs IO.Console
+
+  needs IO.FileRead
+
+  needs IO.FileWrite
+  needs IO.Process
+  import Test
+  alias StrataTactics.Test.Worlds as TacPw
+
+  pfn started() : StrataTactics.TacticsState do
+    let w = TacPw.ground()
+    match StrataTactics.setup(StrataTactics.config(TacPw.settings()), Strata.World.registry(w), w) do (s, _, _) -> s end
+  end
+  pfn input(mouse : List(Int)) : Strata.Input.Input do
+    Strata.Input.step(Strata.Input.start(Strata.Input.new(StrataTactics.Camera.bindings())), Strata.Input.raw(Nil, mouse, Nil, Nil))
+  end
+  pfn frame(ray : Option(((Float, Float, Float), (Float, Float, Float))), mouse : List(Int)) : Strata.Plugin.PluginFrame do
+    { pf_world: TacPw.ground(), pf_input: input(mouse), pf_pointer: Some((400.0, 300.0)), pf_ray: ray, pf_wheel: 0.0, pf_dt: 0.016,
+      pf_width: 800.0, pf_height: 600.0, pf_view_proj: Strata.Math.Mat4.identity() }
+  end
+  pfn down_at(x : Float, z : Float) : Option(((Float, Float, Float), (Float, Float, Float))) do Some(((x, 2.0, z), (0.0, -1.0, 0.0))) end
+  pfn kinds(evs : List(StrataTactics.TacticsEvent)) : List(Int) do List.map(evs, fn e -> StrataTactics.event_index(e)) end
+
+  describe "Tactics plugin" do
+    test "setup returns the camera bindings with tactics. names" do
+      let w = TacPw.ground()
+      match StrataTactics.setup(StrataTactics.config(TacPw.settings()), Strata.World.registry(w), w) do
+        (_, _, b) -> Test.assert_true(!List.is_empty(b) && List.all(b, fn t -> match t do (n, _, _) -> String.starts_with(n, "tactics.") end), "tactics.*")
+      end
+    end
+    test "a frame with the pointer over a tile hovers it once" do
+      match StrataTactics.update(started(), frame(down_at(-14.0, -14.0), Nil)) do
+        (s1, _, evs) ->
+          Test.assert_true(kinds(evs) == [0] && StrataTactics.hovered(s1) == Some((0, 0)), "hovered 0, 0")
+          match StrataTactics.update(s1, frame(down_at(-14.0, -14.0), Nil)) do (_, _, evs2) -> Test.assert_true(List.is_empty(evs2), "not again") end
+      end
+    end
+    test "select over a tile emits Clicked" do
+      match StrataTactics.update(started(), frame(down_at(-14.0, -14.0), [0])) do
+        (_, _, evs) -> Test.assert_true(kinds(evs) == [0, 2], "hovered then clicked")
+      end
+    end
+    test "the pointer over the sky unhovers and leaves the camera's focus where it was" do
+      match StrataTactics.update(started(), frame(down_at(-14.0, -14.0), Nil)) do
+        (s1, _, _) ->
+          let f0 = StrataTactics.Camera.focus(StrataTactics.camera(s1))
+          match StrataTactics.update(s1, frame(Some(((0.0, 2.0, 0.0), (0.0, 1.0, 0.0))), Nil)) do
+            (s2, _, evs) -> Test.assert_true(kinds(evs) == [1] && StrataTactics.Camera.focus(StrataTactics.camera(s2)) == f0, "unhovered, still")
+          end
+      end
+    end
+    test "world_changed after a blast updates standable" do
+      let w0 = TacPw.ground()
+      let s0 = started()
+      match Strata.Plugin.apply(w0, [Strata.Plugin.edit(Strata.World.op_box(-16, 0, -16, -13, 20, -13, 1))]) do
+        (w1, outs, _) ->
+          let s1 = StrataTactics.world_changed(s0, w1, outs)
+          Test.assert_true(StrataTactics.Grid.standable(StrataTactics.grid(s0), (0, 0)) && !StrataTactics.Grid.standable(StrataTactics.grid(s1), (0, 0)), "walled in")
+      end
+    end
+    test "overlay carries the camera's cut" do
+      Test.assert_true(NativeArray.get_f32(Strata.Overlay.cut_floats(Strata.Overlay.cut_of(StrataTactics.overlay(started(), None))), 0) == 1.0, "a height cut")
+    end
+    test "gui lists k turns with the active unit first" do
+      let c0 = StrataTactics.Clock.add(StrataTactics.Clock.add(StrataTactics.Clock.start(StrataTactics.Clock.settings()), 1, 10, 0), 2, 8, 0)
+      let c1 = match StrataTactics.Clock.advance(c0) do (c, _) -> c end
+      let s = StrataTactics.with_clock(started(), c1)
+      Test.assert_true(StrataTactics.turn_lines(s, fn u -> "u" ++ int_to_string(u), 3) == ["u1", "u2", "u1", "u2"], "active, then three")
+    end
+  end
+end

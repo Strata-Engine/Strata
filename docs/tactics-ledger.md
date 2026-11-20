@@ -19,3 +19,5 @@
   - Classic and Enhanced: no source separates them for these rules; both are taken to agree.
 - Task 13: Ruling: yaw 0 puts the eye on the +z side looking toward -z; drag turns 0.3 degrees a pixel; zoom actions move the wanted distance 20 m/s and a wheel notch 2 m, the distance easing to it at 10/s; with tilt off the pitch is pitch_far. The camera starts halfway between near and far. Cost if wrong: feel only, all settings or one-line constants.
 - Task 14: Ruling: a look shot moves the orbit's eye-to-focus offset to the point; shots travel over twice the turn time each way (smoothstep). Cost: feel only.
+- Task 15: March gap met: a lambda inside an arm of another lambda's body, after a `let` chain, is misparsed (its `match x do` read as the condition form `match do`; "I cannot find x"). Workaround: helper functions (`outline_tile`, `side_line`, `tile_quad`, `cover_edge`). To be filed in GAPS.md.
+- Task 15: Ruling: `turn_lines` exposes the gui's text so it can be tested; the gui is a column of labels under "Turn order".
