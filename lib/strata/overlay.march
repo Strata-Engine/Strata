@@ -1,0 +1,142 @@
+-- Overlay — what a game draws over the world this frame, and what it cuts
+-- away, as plain data the renderer reads (Strata.Render.overlay).
+--
+-- Items are translucent quads and lines in metres. A quad's corners are in
+-- strip order, as Strata.Model's are: 0 and 1 along one edge, 2 and 3 along
+-- the opposite one. A line is drawn as a band of the given width facing the
+-- camera. An item marked `through` is also drawn, faintly, where geometry
+-- hides it.
+--
+-- A cut hides world geometry for the frame: everything above a height
+-- inside a box (x0, z0)-(x1, z1), and everything inside up to four capsules
+-- (a segment and a radius), so walls between the camera and a point vanish.
+--
+-- Nothing here names a game concept.
+mod Strata.Overlay do
+
+  -- corners (12 floats as four points) or ends (two points and the width); colour; through
+  type Item = OvQuad(List((Float, Float, Float)), (Float, Float, Float, Float), Bool)
+            | OvLine((Float, Float, Float), (Float, Float, Float), Float, (Float, Float, Float, Float), Bool)
+
+  -- y, x0, z0, x1, z1
+  type CutHeight = CutHeight(Float, Float, Float, Float, Float)
+  -- a, b, radius
+  type CutCapsule = CutCapsule((Float, Float, Float), (Float, Float, Float), Float)
+  type Cut = Cut(Option(CutHeight), List(CutCapsule))
+
+  type Overlay = Overlay(List(Item), Cut)
+
+  pfn minf(a : Float, b : Float) : Float do if a < b do a else b end end
+  pfn maxf(a : Float, b : Float) : Float do if a > b do a else b end end
+
+  doc "A quad of four corners in strip order (metres), a colour (r, g, b, a in 0..1), drawn faintly through geometry when [through]."
+  fn quad(corners : List((Float, Float, Float)), rgba : (Float, Float, Float, Float), through : Bool) : Item do OvQuad(corners, rgba, through) end
+
+  doc "A line from [a] to [b] (metres), [width] metres wide, facing the camera."
+  fn line(a : (Float, Float, Float), b : (Float, Float, Float), width : Float, rgba : (Float, Float, Float, Float), through : Bool) : Item do OvLine(a, b, width, rgba, through) end
+
+  doc "0 for a quad, 1 for a line."
+  fn kind_index(i : Item) : Int do match i do OvQuad(_, _, _) -> 0 | OvLine(_, _, _, _, _) -> 1 end end
+
+  doc "No cut."
+  fn no_cut() : Cut do Cut(None, Nil) end
+
+  doc "Hide everything above [y] metres inside the box (x0, z0)-(x1, z1)."
+  fn cut_above(y : Float, x0 : Float, z0 : Float, x1 : Float, z1 : Float) : Cut do Cut(Some(CutHeight(y, minf(x0, x1), minf(z0, z1), maxf(x0, x1), maxf(z0, z1))), Nil) end
+
+  doc "The cut with a capsule from [a] to [b] of [radius] metres added (at most four are kept, first first)."
+  fn with_capsule(c : Cut, a : (Float, Float, Float), b : (Float, Float, Float), radius : Float) : Cut do
+    match c do Cut(h, cs) -> Cut(h, List.take(List.append(cs, [CutCapsule(a, b, radius)]), 4)) end
+  end
+
+  pfn merge_height(a : Option(CutHeight), b : Option(CutHeight)) : Option(CutHeight) do
+    match a do
+      None -> b
+      Some(CutHeight(ya, ax0, az0, ax1, az1)) ->
+        match b do
+          None -> a
+          Some(CutHeight(yb, bx0, bz0, bx1, bz1)) -> Some(CutHeight(minf(ya, yb), minf(ax0, bx0), minf(az0, bz0), maxf(ax1, bx1), maxf(az1, bz1)))
+        end
+    end
+  end
+
+  doc "Two cuts as one: the lower height over the union of the boxes; the capsules of [a] then [b], at most four."
+  fn merge_cuts(a : Cut, b : Cut) : Cut do
+    match a do Cut(ha, ca) -> match b do Cut(hb, cb) -> Cut(merge_height(ha, hb), List.take(List.append(ca, cb), 4)) end end
+  end
+
+  doc "An overlay with nothing in it and no cut."
+  fn empty() : Overlay do Overlay(Nil, no_cut()) end
+
+  doc "The overlay with [item] added after its items."
+  fn add(o : Overlay, item : Item) : Overlay do match o do Overlay(is, c) -> Overlay(List.append(is, [item]), c) end end
+
+  doc "The overlay with [items] added after its items."
+  fn add_all(o : Overlay, items : List(Item)) : Overlay do match o do Overlay(is, c) -> Overlay(List.append(is, items), c) end end
+
+  doc "The overlay with its cut replaced by [c]."
+  fn with_cut(o : Overlay, c : Cut) : Overlay do match o do Overlay(is, _) -> Overlay(is, c) end end
+
+  doc "The overlay's items."
+  fn items(o : Overlay) : List(Item) do match o do Overlay(is, _) -> is end end
+
+  doc "The overlay's cut."
+  fn cut_of(o : Overlay) : Cut do match o do Overlay(_, c) -> c end end
+
+  doc "Two overlays as one: the items of [a] then [b]; the cuts merged."
+  fn merge(a : Overlay, b : Overlay) : Overlay do
+    match a do Overlay(ia, ca) -> match b do Overlay(ib, cb) -> Overlay(List.append(ia, ib), merge_cuts(ca, cb)) end end
+  end
+
+  pfn put(a : NativeF32Arr, i : Int, v : Float) : NativeF32Arr do NativeArray.set_f32(a, i, v) end
+  pfn put3(a : NativeF32Arr, i : Int, p : (Float, Float, Float)) : NativeF32Arr do
+    match p do (x, y, z) -> put(put(put(a, i, x), i + 1, y), i + 2, z) end
+  end
+  pfn put_head(a : NativeF32Arr, i : Int, kind : Int, through : Bool, rgba : (Float, Float, Float, Float), width : Float) : NativeF32Arr do
+    match rgba do
+      (r, g, b, al) ->
+        let a1 = put(put(a, i, int_to_float(kind)), i + 1, if through do 1.0 else 0.0 end)
+        put(put(put(put(put(a1, i + 2, r), i + 3, g), i + 4, b), i + 5, al), i + 6, width)
+    end
+  end
+  pfn put_corners(a : NativeF32Arr, i : Int, cs : List((Float, Float, Float)), k : Int) : NativeF32Arr do
+    match cs do
+      Nil -> a
+      Cons(p, rest) -> if k >= 4 do a else put_corners(put3(a, i + 3 * k, p), i, rest, k + 1) end
+    end
+  end
+  pfn pack_go(a : NativeF32Arr, is : List(Item), i : Int) : NativeF32Arr do
+    match is do
+      Nil -> a
+      Cons(OvQuad(cs, rgba, th), rest) -> pack_go(put_corners(put_head(a, i * 20, 0, th, rgba, 0.0), i * 20 + 8, cs, 0), rest, i + 1)
+      Cons(OvLine(p, q, w, rgba, th), rest) -> pack_go(put3(put3(put_head(a, i * 20, 1, th, rgba, w), i * 20 + 8, p), i * 20 + 11, q), rest, i + 1)
+    end
+  end
+
+  doc "The items as the renderer reads them, and their count: 20 floats an item, [kind, through, r, g, b, a, width, 0, g0 .. g11]; a quad's g0..g11 are its four corners (x, y, z), a line's g0..g5 its two ends and the rest 0; width is 0 for a quad."
+  fn pack(o : Overlay) : (NativeF32Arr, Int) do
+    let is = items(o)
+    let n = List.length(is)
+    (pack_go(NativeArray.make_f32(n * 20, 0.0), is, 0), n)
+  end
+
+  pfn caps_go(a : NativeF32Arr, cs : List(CutCapsule), k : Int) : NativeF32Arr do
+    match cs do
+      Nil -> a
+      Cons(CutCapsule(p, q, r), rest) -> caps_go(put(put3(put3(a, 8 + 7 * k, p), 11 + 7 * k, q), 14 + 7 * k, r), rest, k + 1)
+    end
+  end
+
+  doc "The cut as the renderer reads it: 36 floats, [has_height, y, x0, z0, x1, z1, capsule count, 0] then four capsules of 7 (a, b, radius), unused ones 0."
+  fn cut_floats(c : Cut) : NativeF32Arr do
+    match c do
+      Cut(h, cs) ->
+        let a0 = NativeArray.make_f32(36, 0.0)
+        let a1 = match h do
+          None -> a0
+          Some(CutHeight(y, x0, z0, x1, z1)) -> put(put(put(put(put(put(a0, 0, 1.0), 1, y), 2, x0), 3, z0), 4, x1), 5, z1)
+        end
+        caps_go(put(a1, 6, int_to_float(List.length(cs))), cs, 0)
+    end
+  end
+end
