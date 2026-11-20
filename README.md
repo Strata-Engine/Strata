@@ -1019,11 +1019,23 @@ to a game's own `Pop` and does not freeze; the game freezes, and
 `locate(text, err)` puts freeze's message on the line of the section it is
 about. Every mistake is an `Err("line N: ...")`, the first in file order.
 
-**Limits (stage 1).**
+**Props.** A scatter layer becomes a prop layer by naming its variants over
+again at a finer voxel size: `Pn.props(p, "forest", "trees_fine")`, or
+`props = trees_fine` on the layer in a file. In a world whose voxels are
+larger than that set's (which must be 2, 4 or 8 of them), `place_with` no
+longer stamps the layer at level 0; `Pq.props_with(plan, seed, key, g, t)`
+lists the chunk's props instead (layer, variant, turn, hash, place and
+top), and they stand as shapes (see Shapes below). Above level 0 the layer
+stamps coarse as before, and in a world at the detail scale or finer it is
+an ordinary stamp layer, so one declaration serves both.
 
-- Blocks and stamps only: no props, no shape generators (templates are the
-  game's own or `.vox` files), no polygon zones, and only the cover,
-  scatter and site placers.
+**Limits (stages 1 and 4).**
+
+- Props are scatter layers only (a site layer cannot be one yet), and a
+  prop draws no template probabilities: every instance of a variant shares
+  one grid.
+- No shape generators (templates are the game's own or `.vox` files), no
+  polygon zones, and only the cover, scatter and site placers.
 - A cover field of a scatter layer counts its instances: one 6 m cover
   field is about 0.1 ms a chunk, the whole budget for fields. Two cover
   layers together are about 0.19 ms against 0.1 ms.
@@ -1102,6 +1114,73 @@ and burns for seconds (grass 1 to 2, leaves 2 to 3, wood 4 to 6) as glowing
 embers blocks that light the ground, before it is gone. Cost: `RESULTS.md`,
 Particles.
 
+## Shapes
+
+Design: `docs/2026-11-19-shapes-design.md`. Plan:
+`docs/2026-11-19-shapes-plan.md`. Rulings: `docs/shapes-ledger.md`.
+
+A shape is one voxel object that is not terrain: a grid of the registry's
+blocks (`Strata.Body.Grid`, up to 128 a side), the size of its voxels in
+metres, a pose and a mode (fixed, kinematic, dynamic). A prop standing on
+the ground and a loose physics body are the same thing in two modes, and a
+prop knocked loose is handed to physics as the grid it already was.
+
+```march
+-- start-up: the prototypes (four a variant, one a quarter turn), and the generator's props
+let (sh0, base) = Strata.Shapes.add_set(Strata.Shapes.new(reg, scale), fine_templates)
+let gen = Strata.Terrain.with_props(g, Strata.Terrain.TnProps(fn (k, seed) ->
+    List.map(Pq.props_with(plan, seed, k, ground, table), fn pr ->
+      Strata.Shapes.stand(sh0, Strata.Shapes.proto_index(base, Pq.pr_variant(pr), Pq.pr_rot(pr)),
+                          Pq.pr_hash(pr), Pq.pr_xm(pr), Pq.pr_zm(pr), Pq.pr_top(pr)))))
+
+-- each frame: props of chunks that loaded are listed on workers and stood; then drawn
+let (sh1, s1) = Strata.Shapes.sync(sh, stream)
+let (r1, sh2) = Strata.Render.shapes(r, sh1)
+
+-- a ray: the world, the bodies and the standing shapes; kind 0 world, 1 body, 2 shape
+let (hit, kind, id) = Strata.Shapes.raycast_all(sh, physics, world, ox, oy, oz, dx, dy, dz, 250.0, stop)
+
+-- a blast or a blade: voxels within r metres go; what the ground no longer holds is loose
+let (sh3, loose, taken, crumbs) = Strata.Shapes.carve_sphere(sh, world, x, y, z, r)
+let p2 = List.fold_left(loose, p, fn (q, sp) -> match Strata.Physics.add_shape(q, sp, Strata.Physics.dynamic()) do (q2, _) -> q2 end)
+-- after an edit of the world: shapes whose ground went
+let (sh4, fallen) = Strata.Shapes.unrooted(sh3, Strata.Edit.world(o), o)
+```
+
+- **Standing costs nothing.** An unedited prop holds its prototype's grid
+  and no other. Nothing steps it; the renderer draws it from the
+  prototype's mesh (one mesh for every instance) and gives the rays the
+  prototype's light classes, so it is shadowed, shades the ground and is
+  reflected as a body is. In light mode 1 (no rays) it casts no shadow.
+- **Carved and remembered.** A carved prop gets a grid of its own: the
+  parts still held by the ground (`Strata.Shape.held`, physics' rule for a
+  pinned body). What happened to a prop is kept by its hash and its chunk,
+  so it survives the chunk unloading. `Strata.Shapes.take_dirty` gives the
+  bytes of each save region whose memory changed and `adopt` takes them
+  back; a game moves them through `Strata.Save.set_region_section` and
+  `region_section` under a name of its choice (the viewer's is `shapes`).
+- **Falling.** A loose part is a `Strata.Physics` body at its own voxel
+  size (the world's divided by 1, 2, 4 or 8), made by `add_shape` of the
+  very grid; `Strata.Fracture` and `Strata.Physics.cut` then apply to it
+  as to any body.
+
+**Limits.**
+
+- Walkers, entities and falling bodies pass through a standing shape:
+  there are no proxy boxes yet, and static shapes are not in physics.
+- A fallen part stays a sleeping fine body. It is not saved, and it counts
+  against physics' caps (256 awake, 4,096 in all).
+- A loose part under 8 colliding voxels is dropped, and voxels that do not
+  collide are dropped when a shape is split.
+- Each instance takes a renderer slot for each 32-cubed part of its
+  prototype that draws, and one row of the rays' table, which holds
+  16,384; a slot numbered above that is drawn but not traced.
+- A prototype is meshed on the main thread the first time one of its
+  instances appears.
+- The viewer places props only with `STRATA_PROPS=1` (the stored goldens
+  show stamped trees), and rereading the settings (`R`) puts the forest
+  back to stamps until the next run.
+
 ## The far field
 
 Past the near chunks the world goes on in rings of coarser chunks (Part F
@@ -1151,7 +1230,7 @@ boundary over the ground; their numbers are in `RESULTS.md`.
 | `Strata.Quad` | the packed 8-byte quad and instance formats |
 | `Strata.Occupancy` | one-bit-per-voxel solid masks |
 | `Strata.Mesh` | the greedy mesher |
-| `Strata.Terrain` | the generator contract; a generator's stamps (its structure layer) |
+| `Strata.Terrain` | the generator contract; a generator's stamps (its structure layer) and its props |
 | `Strata.World` | loaded chunks, the edited-chunk cache, queued edits |
 | `Strata.Edit` | single, list, box and sphere edits; blasts; `unsupported`: what an edit left hanging (plants over dug ground) |
 | `Strata.Stream` | loading around focus points; task-built chunks and meshes |
@@ -1167,6 +1246,9 @@ boundary over the ground; their numbers are in `RESULTS.md`.
 | `Strata.Model` | a model block's drawing geometry |
 | `Strata.Rig`, `Strata.Clip` | a jointed figure's description and part meshes; its animations |
 | `Strata.Anim`, `Strata.Ffi.Anim` | figures posed by the C kernel in `native/strata_anim.h` |
+| `Strata.Shape` | one voxel object that is not terrain: grid, voxel size, pose, mode; a ray through it, a carve, what the ground still holds, its bytes, its meshes |
+| `Strata.Shapes` | the standing shapes of a world: prototypes, each chunk's props stood, rays, carving, the memory of what was carved and its bytes |
+| `Strata.Body`, `Strata.Physics`, `Strata.Fracture`, `Strata.Support`, `Strata.Sim` | a grid of blocks and its mass; rigid bodies (a dynamic shape); breaking; what an edit leaves unsupported; stream, fluid and physics stepped together |
 | `Strata.Feature` | scattering features by hashed cells: the same placements however an area is cut |
 | `Strata.Population` | a population's declarations (fields, zones, shapes, layers), `freeze`, `fit_all`, read accessors |
 | `Strata.Populate` | a frozen population run over a Ground: fields, `adapt`, `place_with`, instances |
@@ -1236,7 +1318,8 @@ boundary over the ground; their numbers are in `RESULTS.md`.
   coarse chunk cost about 11 ms and the far field about 30 s to fill from
   cold when last measured, before the March fix of S44 (load 34). See
   `RESULTS.md`.
-- The population's limits are listed under Population above.
+- The population's limits are listed under Population above, and the
+  shapes' under Shapes.
 - The island's thermal scree and its cave and density sampling are tuned
   at 1 m a voxel: their reach and spacing are counted in voxels, so at a
   finer scale steep slopes relax less and the lattice is finer. The rest of
