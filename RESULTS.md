@@ -1127,8 +1127,11 @@ differences between rows are the finding, not the totals.
 - **An effect that does not ask pays nothing for the pass**: the rows
   "flying free" show the time before the geometry at what it is with no
   particles at all. In the vertex shader it pays one comparison on a table
-  row it already read; the 60 goldens that were stored before this change,
-  spray and the match's fire among them, compare as they did.
+  row it already read; the 93 golden scenes stored before this change
+  render as they did before it. (Three of them, `tilted-slab-lit`,
+  `body-by-lake` and `combat-burning`, already differed from their stored
+  images at the commit this work started from, 13de642; this branch's
+  renders of the three are pixel for pixel that commit's.)
 - **The larger difference is drawing, not colliding.** With the setting on,
   particles lie on the ground for the rest of their lives where before
   they fell out of sight under it, so more of them cover pixels: 0.01 ms
