@@ -1,0 +1,9 @@
+# SDD ledger — plan: docs/2026-11-19-shapes-plan.md
+Spec: docs/2026-11-19-shapes-design.md.
+
+Design: Ruling: a shape's voxels are block ids in memory (`Strata.Body.Grid`, unchanged); the palette is derived (the distinct ids, at most 255) and is what a save writes a byte a voxel against. Physics, fracture, support and the mesher read ids, and a body cut from the world is a piece of the world's ids, so a palette byte in memory would put a translation on every hand-over and change physics while another session repairs it — none.
+Design: Ruling: props are drawn by the body path (a slot at a pose with its own voxel size, its light classes in the rays' table), not the figure path the population design named: the body path did not exist in that form when the population design was written; it draws the game's textured blocks, is traced for sun and sky, and is what a prop becomes when it falls, so nothing changes look mid-fall — supersedes population design section 9 "Drawn and lit" and "Shade" (no leaf occupancy is written into the light volume).
+Design: Ruling: static shapes live in `Strata.Shapes`, outside physics (physics walks a list of at most 4,096 bodies each step); a prop knocked loose is handed to `Strata.Physics.add_shape` as the same grid value — none.
+Design: Ruling: no per-face "disconnected" bit; face connection and the held rule are enough for what is built — the brief made it optional.
+Design: Ruling: a layer is a prop layer only when it says so (`props`); the population design's "detail scale defaults to 0.25 m for every layer" would turn every stamped layer of the island into props and change every stored golden. The viewer places props under `STRATA_PROPS=1` — owner to flip the default when goldens are re-stored.
+Design: Ruling: an edit reaches a prop by region (`carve_sphere`, `carve_box`), not by change records: a prop stands in the world's air, where an edit records no change — none.
