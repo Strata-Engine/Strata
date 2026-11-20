@@ -1,0 +1,180 @@
+-- Camera — an XCOM-style tactical camera, as plain state the game steps.
+--
+-- The camera orbits a focus point on the ground. It turns in steps (45
+-- degrees by default) with a smooth turn, or freely by dragging; pans by
+-- keys, stick and screen edges, relative to where it faces, with the focus
+-- riding the ground's height; zooms smoothly between a near and a far
+-- distance, its pitch following the distance (lower when close, as XCOM's
+-- does); follows a point when asked; and keeps a floor level, the height of
+-- the cutaway the player steps up and down.
+--
+-- Yaw 0 puts the eye on the +z side of the focus, looking toward -z; yaw
+-- grows clockwise seen from above. Pitch is the angle below the horizon.
+-- The camera never sets the renderer's camera: the game takes `view_proj`
+-- (docs/plugins.md).
+mod StrataTactics.Camera do
+
+  alias Strata.Math.Mat4 as CmM
+  alias Strata.Math.Vec3 as CmV
+
+  type CameraSettings = { cm_step_deg : Float, cm_turn_s : Float, cm_near : Float, cm_far : Float, cm_pitch_near_deg : Float, cm_pitch_far_deg : Float,
+                          cm_fov_deg : Float, cm_pan_speed : Float, cm_edge_px : Float, cm_level_m : Float, cm_cut_radius : Float, cm_free : Bool, cm_tilt : Bool }
+
+  doc "XCOM-like defaults: turns of 45 degrees over 0.25 s; 10 to 40 m away, pitched 35 degrees down when near and 60 when far; a 40-degree field of view; panning 15 m/s when near (faster as it zooms out); edge scrolling within 12 px; floor levels 3 m apart; a cut 2.5 m round the line to the subject; stepped turns only; tilt on."
+  fn settings() : CameraSettings do
+    { cm_step_deg: 45.0, cm_turn_s: 0.25, cm_near: 10.0, cm_far: 40.0, cm_pitch_near_deg: 35.0, cm_pitch_far_deg: 60.0, cm_fov_deg: 40.0,
+      cm_pan_speed: 15.0, cm_edge_px: 12.0, cm_level_m: 3.0, cm_cut_radius: 2.5, cm_free: false, cm_tilt: true }
+  end
+
+  doc "The camera's input bindings, every action named tactics.*: pan_x (A/D, stick x), pan_z (W/S, stick y), rotate_left (Q), rotate_right (E), zoom (R in, F out, right stick y), level_up (Page Up), level_down (Page Down), drag (right mouse button), select (left mouse button)."
+  fn bindings() : List((String, Strata.Input.Source, Float)) do
+    [("tactics.pan_x", Strata.Input.Key(68), 1.0), ("tactics.pan_x", Strata.Input.Key(65), -1.0), ("tactics.pan_x", Strata.Input.PadAxis(0), 1.0),
+     ("tactics.pan_z", Strata.Input.Key(87), 1.0), ("tactics.pan_z", Strata.Input.Key(83), -1.0), ("tactics.pan_z", Strata.Input.PadAxis(1), -1.0),
+     ("tactics.rotate_left", Strata.Input.Key(81), 1.0), ("tactics.rotate_right", Strata.Input.Key(69), 1.0),
+     ("tactics.zoom", Strata.Input.Key(82), 1.0), ("tactics.zoom", Strata.Input.Key(70), -1.0), ("tactics.zoom", Strata.Input.PadAxis(3), -1.0),
+     ("tactics.level_up", Strata.Input.Key(266), 1.0), ("tactics.level_down", Strata.Input.Key(267), 1.0),
+     ("tactics.drag", Strata.Input.MouseButton(1), 1.0), ("tactics.select", Strata.Input.MouseButton(0), 1.0)]
+  end
+
+  -- settings; focus; yaw now and wanted; distance now and wanted; floor level; following (from, to, progress 0..1);
+  -- the pointer last frame; the shot (Task 14) as (kind, id, phase, time, a, b, side, hold, eye, look); shots done last step
+  type TacticsCamera = { tc_set : CameraSettings, tc_focus : (Float, Float, Float), tc_yaw : Float, tc_yaw_to : Float,
+                         tc_dist : Float, tc_dist_to : Float, tc_level : Int, tc_follow : Option(((Float, Float, Float), (Float, Float, Float), Float)),
+                         tc_last_pointer : Option((Float, Float)), tc_shot : Option(CameraShot), tc_done : List(Int) }
+
+  -- a camera move the game asked for: its id; where the eye and look point go; how long the travel and hold take;
+  -- the elapsed time; the orbit view to return to (eye, look)
+  type CameraShot = CamShot(Int, (Float, Float, Float), (Float, Float, Float), Float, Float, Float, (Float, Float, Float), (Float, Float, Float))
+
+  doc "A camera looking at [focus] from [yaw_deg], halfway between near and far, floor level 0."
+  fn start(s : CameraSettings, focus : (Float, Float, Float), yaw_deg : Float) : TacticsCamera do
+    let d = (s.cm_near +. s.cm_far) /. 2.0
+    { tc_set: s, tc_focus: focus, tc_yaw: yaw_deg, tc_yaw_to: yaw_deg, tc_dist: d, tc_dist_to: d, tc_level: 0, tc_follow: None, tc_last_pointer: None, tc_shot: None, tc_done: Nil }
+  end
+
+  pfn clampf(v : Float, lo : Float, hi : Float) : Float do if v < lo do lo else if v > hi do hi else v end end end
+  pfn rad(d : Float) : Float do d *. Math.pi() /. 180.0 end
+
+  doc "The focus point (metres)."
+  fn focus(c : TacticsCamera) : (Float, Float, Float) do c.tc_focus end
+  doc "The yaw now, in degrees."
+  fn yaw(c : TacticsCamera) : Float do c.tc_yaw end
+  doc "The distance from the eye to the focus now."
+  fn distance(c : TacticsCamera) : Float do c.tc_dist end
+
+  doc "The pitch below the horizon now, in degrees: from pitch_near at the near distance to pitch_far at the far one when tilt is on; pitch_far always when it is off."
+  fn pitch(c : TacticsCamera) : Float do
+    let s = c.tc_set
+    if !s.cm_tilt do s.cm_pitch_far_deg
+    else
+      let k = clampf((c.tc_dist -. s.cm_near) /. (s.cm_far -. s.cm_near), 0.0, 1.0)
+      s.cm_pitch_near_deg +. (s.cm_pitch_far_deg -. s.cm_pitch_near_deg) *. k
+    end
+  end
+
+  pfn orbit_eye(c : TacticsCamera) : (Float, Float, Float) do
+    let y = rad(c.tc_yaw)
+    let p = rad(pitch(c))
+    match c.tc_focus do (fx, fy, fz) -> (fx +. c.tc_dist *. Math.sin(y) *. Math.cos(p), fy +. c.tc_dist *. Math.sin(p), fz +. c.tc_dist *. Math.cos(y) *. Math.cos(p)) end
+  end
+
+  pfn lerp3(a : (Float, Float, Float), b : (Float, Float, Float), k : Float) : (Float, Float, Float) do
+    match (a, b) do ((ax, ay, az), (bx, by0, bz)) -> (ax +. (bx -. ax) *. k, ay +. (by0 -. ay) *. k, az +. (bz -. az) *. k) end
+  end
+  pfn smooth(k : Float) : Float do let t = clampf(k, 0.0, 1.0)
+    t *. t *. (3.0 -. 2.0 *. t) end
+
+  -- (eye, look) now: the orbit view, or the shot's
+  pfn view(c : TacticsCamera) : ((Float, Float, Float), (Float, Float, Float)) do
+    match c.tc_shot do
+      None -> (orbit_eye(c), c.tc_focus)
+      Some(CamShot(_, eye, look, travel, hold, t, oeye, olook)) ->
+        let k = if t < travel do smooth(t /. travel) else if t < travel +. hold do 1.0 else 1.0 -. smooth((t -. travel -. hold) /. travel) end end
+        (lerp3(oeye, eye, k), lerp3(olook, look, k))
+    end
+  end
+
+  doc "Where the eye is (metres)."
+  fn eye(c : TacticsCamera) : (Float, Float, Float) do match view(c) do (e, _) -> e end end
+
+  doc "The view-projection matrix for a window of [aspect] (width over height): what the game hands the renderer."
+  fn view_proj(c : TacticsCamera, aspect : Float) : NativeFloatArr do
+    match view(c) do
+      ((ex, ey, ez), (lx, ly, lz)) ->
+        CmM.mul(CmM.perspective(rad(c.tc_set.cm_fov_deg), aspect, 0.1, 1000.0), CmM.look_at(CmV.new(ex, ey, ez), CmV.new(lx, ly, lz), CmV.new(0.0, 1.0, 0.0)))
+    end
+  end
+
+  doc "Ease the focus to [target] over the turn time."
+  fn follow(c : TacticsCamera, target : (Float, Float, Float)) : TacticsCamera do { c with tc_follow: Some((c.tc_focus, target, 0.0)) } end
+
+  doc "The floor level (0 .. 8)."
+  fn level(c : TacticsCamera) : Int do c.tc_level end
+  doc "The camera at floor level [n], kept within 0 .. 8."
+  fn set_level(c : TacticsCamera, n : Int) : TacticsCamera do { c with tc_level: if n < 0 do 0 else if n > 8 do 8 else n end end } end
+
+  doc "The height (metres) the cutaway hides everything above: one level's height over the focus's floor at level 0, a level more for each level up."
+  fn cut_height(c : TacticsCamera) : Float do match c.tc_focus do (_, fy, _) -> fy +. int_to_float(c.tc_level + 1) *. c.tc_set.cm_level_m end end
+
+  doc "The camera's cutaway: everything above `cut_height` inside [box] (x0, z0, x1, z1 metres: the grid's extent), and a capsule from the eye to [subject] (the focus when None) of the cut radius."
+  fn cut(c : TacticsCamera, subject : Option((Float, Float, Float)), box : (Float, Float, Float, Float)) : Strata.Overlay.Cut do
+    match box do
+      (x0, z0, x1, z1) ->
+        let target = match subject do Some(p) -> p | None -> c.tc_focus end
+        Strata.Overlay.with_capsule(Strata.Overlay.cut_above(cut_height(c), x0, z0, x1, z1), eye(c), target, c.tc_set.cm_cut_radius)
+    end
+  end
+
+  -- one frame of the orbit: turning, dragging, panning, zooming, levels, following
+  pfn orbit_step(c : TacticsCamera, i : Strata.Input.Input, pointer : Option((Float, Float)), wheel : Float, width : Float, height : Float, dt : Float, ground : Float -> Float -> Float) : TacticsCamera do
+    let s = c.tc_set
+    -- stepped turns queue on the wanted yaw
+    let to1 = c.tc_yaw_to +. (if Strata.Input.pressed(i, "tactics.rotate_right") do s.cm_step_deg else 0.0 end) -. (if Strata.Input.pressed(i, "tactics.rotate_left") do s.cm_step_deg else 0.0 end)
+    let dragging = s.cm_free || Strata.Input.held(i, "tactics.drag")
+    let drag_deg = match (pointer, c.tc_last_pointer) do
+      (Some((px, _)), Some((lx, _))) -> if dragging do (px -. lx) *. 0.3 else 0.0 end
+      _ -> 0.0
+    end
+    let rate = s.cm_step_deg /. (if s.cm_turn_s > 0.0 do s.cm_turn_s else 0.0001 end) *. dt
+    let gap = to1 -. c.tc_yaw
+    let turned = if Math.abs(gap) <= rate do to1 else if gap > 0.0 do c.tc_yaw +. rate else c.tc_yaw -. rate end end
+    let yaw2 = turned +. drag_deg
+    let to2 = if drag_deg != 0.0 do yaw2 else to1 end
+    -- zoom: actions and the wheel move the wanted distance; the distance eases to it
+    let dist_to = clampf(c.tc_dist_to -. Strata.Input.value(i, "tactics.zoom") *. 20.0 *. dt -. wheel *. 2.0, s.cm_near, s.cm_far)
+    let dist = c.tc_dist +. (dist_to -. c.tc_dist) *. clampf(dt *. 10.0, 0.0, 1.0)
+    -- pan relative to the yaw; the screen edges pan too
+    let edge_x = match pointer do Some((px, _)) -> if px <= s.cm_edge_px do -1.0 else if px >= width -. s.cm_edge_px do 1.0 else 0.0 end end | None -> 0.0 end
+    let edge_z = match pointer do Some((_, py)) -> if py <= s.cm_edge_px do 1.0 else if py >= height -. s.cm_edge_px do -1.0 else 0.0 end end | None -> 0.0 end
+    let px_in = clampf(Strata.Input.value(i, "tactics.pan_x") +. edge_x, -1.0, 1.0)
+    let pz_in = clampf(Strata.Input.value(i, "tactics.pan_z") +. edge_z, -1.0, 1.0)
+    let y = rad(yaw2)
+    let speed = s.cm_pan_speed *. dist /. s.cm_near *. dt
+    let rx = Math.cos(y)
+    let rz = 0.0 -. Math.sin(y)
+    let fwx = 0.0 -. Math.sin(y)
+    let fwz = 0.0 -. Math.cos(y)
+    let panning = px_in != 0.0 || pz_in != 0.0
+    let (fx, _, fz) = c.tc_focus
+    let moved_x = fx +. (rx *. px_in +. fwx *. pz_in) *. speed
+    let moved_z = fz +. (rz *. px_in +. fwz *. pz_in) *. speed
+    -- following eases the focus unless the player pans
+    let (focus2, follow2) = match c.tc_follow do
+      Some((from, to, k)) ->
+        if panning do ((moved_x, ground(moved_x, moved_z), moved_z), None)
+        else
+          let k2 = k +. dt /. (if s.cm_turn_s > 0.0 do s.cm_turn_s else 0.0001 end)
+          let p = lerp3(from, to, smooth(k2))
+          match p do (qx, _, qz) -> ((qx, ground(qx, qz), qz), if k2 >= 1.0 do None else Some((from, to, k2)) end) end
+        end
+      None -> ((moved_x, ground(moved_x, moved_z), moved_z), None)
+    end
+    let lv = c.tc_level + (if Strata.Input.pressed(i, "tactics.level_up") do 1 else 0 end) - (if Strata.Input.pressed(i, "tactics.level_down") do 1 else 0 end)
+    set_level({ c with tc_focus: focus2, tc_yaw: yaw2, tc_yaw_to: to2, tc_dist: dist, tc_dist_to: dist_to, tc_follow: follow2, tc_last_pointer: pointer }, lv)
+  end
+
+  doc "One frame of the camera from the frame's input ([i], the pointer in window points, the wheel), the window's size, the time step and the ground's height (metres) under a point (the grid's floor)."
+  fn step(c : TacticsCamera, i : Strata.Input.Input, pointer : Option((Float, Float)), wheel : Float, width : Float, height : Float, dt : Float, ground : Float -> Float -> Float) : TacticsCamera do
+    orbit_step({ c with tc_done: Nil }, i, pointer, wheel, width, height, dt, ground)
+  end
+end
