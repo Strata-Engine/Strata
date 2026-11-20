@@ -1346,3 +1346,67 @@ same figures within a tenth.
 - `set_section` with a 4 MB value costs what it costs with 10 bytes: 20000
   calls in 5.5 ms either way (printed by the library's test, not judged).
 
+
+# Translucent order inside a chunk
+
+The addendum of 2026-11-19 to `docs/2026-11-10-renderer-design.md`: a chunk
+whose translucent quads can cover one another carries eight sorted lists of
+them, one for each way a ray can run, and each list is drawn only where the
+eye's rays run its way. Measured 2026-11-19 on the development machine with
+other sessions building beside it (load average 9 to 16), so instructions
+are the figure to trust for the mesher and the medians for the frames.
+"Before" is 13de642 with only the new viewer scenes added.
+
+## Frames
+
+`scripts/bench.sh` (offscreen, 1280 x 800 at the display's scale, light
+mode 4), the match as it stands and then three fixed scenes with
+`STRATA_COMBAT=0 STRATA_SHORE=0 STRATA_SCENE=n STRATA_FRAMES=1500`. Times
+in ms, median / 99th percentile; "after" is the pass that holds the
+translucent quads (water, composite, translucent, particles, interface).
+
+| run | frame before | frame after | GPU before | GPU after | last pass before | last pass after |
+|---|---|---|---|---|---|---|
+| the match, run 1 | 4.06 / 5.43 | 4.04 / 5.54 | 4.06 / 4.65 | 4.04 / 4.56 | 1.31 / 1.67 | 1.32 / 1.43 |
+| the match, run 2 | 4.07 / 5.42 | 4.03 / 5.21 | 4.07 / 4.53 | 4.04 / 4.51 | 1.32 / 1.47 | 1.32 / 1.45 |
+| scene 23, the island's lake | 3.42 / 3.90 | 3.44 / 3.83 | 3.48 / 3.76 | 3.49 / 3.78 | 0.99 / 1.19 | 0.99 / 1.19 |
+| scene 142, the panes from above | 6.09 / 6.72 | 5.68 / 6.23 | 6.08 / 6.67 | 5.67 / 6.21 | 3.19 / 3.67 | 2.78 / 3.24 |
+| scene 145, between two panes | 17.60 / 18.94 | 15.71 / 17.10 | 17.61 / 18.86 | 15.70 / 16.98 | 15.24 / 16.56 | 13.35 / 14.74 |
+
+The match and the lake are unchanged: nearly all their translucent chunks
+are a water surface in one plane, which carries no lists and is drawn as
+before. The pane scenes are cheaper, not dearer, although a chunk with
+lists is drawn with up to eight commands: a pane's far faces are no longer
+shaded, and every water pixel traces rays. Scene 145 fills the screen with
+see-through surfaces several deep and was over 8.33 ms before and after.
+Ordering the translucent commands on the CPU stays in the microseconds
+(`sv_stat(5)`); the number of indirect draw calls is unchanged.
+
+## Meshing
+
+`bench/mesh_translucent/run.sh`: one `Strata.Mesh.build` of a chunk alone
+in air, a 200-build run minus a 0-build run, instructions retired a build.
+Bytes are the chunk's mesh.
+
+| chunk | translucent quads | before | after | bytes before | bytes after |
+|---|---|---|---|---|---|
+| a pond in stone (tops in one plane: no lists) | 1 | 48.10 M | 48.05 M | 344 | 344 |
+| the pane scene (pool, three panes, wall, shelf) | 76 | 43.86 M | 45.31 M | 608 | 4 704 |
+| glass scattered through a 10-voxel cube | 334 | 38.42 M | 45.68 M | 2 672 | 13 360 |
+| the same through a 12-voxel cube (over 512: listed, not sorted) | 703 | 40.05 M | 41.94 M | 5 624 | 28 120 |
+| the same through a 16-voxel cube | 1 704 | 43.63 M | 48.47 M | 13 632 | 68 160 |
+| stone only, the pane scene's shapes | 0 | 43.69 M | 43.77 M | 1 824 | 1 824 |
+
+A build is about 2 ms of CPU here either way; the timer's 50 us steps do
+not resolve the differences, the instruction counts do. The order costs
+3% on the pane scene and 19% at 334 scattered quads; the sort compares
+every pair of an octant's quads, so the bound of 512 keeps the worst chunk
+to roughly a build and a half. A chunk with lists holds each quad once
+more for every list it is in: five times the bytes for glass (four lists
+and the quads themselves, which the renderer does not keep), nine for a
+block seen from both sides. The pool in the pane scene is such a block,
+hence its factor of 7.7.
+
+Not measured: a world with many glass-heavy chunks (the viewer has one
+see-through block that collides), and flowing water in a chunk that also
+needs lists, which is re-meshed as it moves.

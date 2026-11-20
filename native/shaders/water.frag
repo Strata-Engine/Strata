@@ -6,6 +6,7 @@ layout(location = 2) flat in uint v_w1;
 layout(location = 3) flat in uint v_face;
 layout(location = 4) in vec2 v_tex;
 layout(location = 5) flat in vec4 v_rot;
+layout(location = 6) in vec3 v_keep;
 
 
 layout(location = 0) out vec4 o_color;
@@ -20,6 +21,8 @@ layout(set = 0, binding = 31, r32f) uniform writeonly image2D wd_now;
 layout(std430, set = 0, binding = 21) readonly buffer Movers { vec4 boxes[]; } movers;
 
 void main() {
+    // an ordered list is drawn only where the eye's rays run its way (quad.vert)
+    if (any(lessThan(v_keep, vec3(0.0)))) discard;
     uint face = v_face & 7u;
     bool far = v_face >= 8u;    // a chunk above level 0: lit by the sun and sky, mirroring the sky, without rays
     uint tex = v_w1 & 65535u;

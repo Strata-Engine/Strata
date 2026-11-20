@@ -27,7 +27,7 @@
 /* Rewritten by build_shaders.sh whenever the shaders change: forge decides
  * whether to recompile this file from its text alone, not from the headers
  * it includes (GAPS S14). */
-#define STRATA_SHADERS_STAMP "6a39703ffa161498"
+#define STRATA_SHADERS_STAMP "fcca6d4a2395215a"
 #include "strata_shaders.h"
 #include "strata_particles.h"
 #include "strata_alloc.h"
@@ -258,6 +258,7 @@ static struct {
     /* slots that hold translucent quads: the list the CPU orders each frame */
     uint32_t *trans; uint32_t ntrans; int32_t *trans_at;                 /* trans_at[slot] = index in trans, or -1 */
     struct TransKey { float dist; uint32_t slot; } *trans_keys;
+    uint16_t *trans_ord;                                                 /* trans_ord[slot * 8 + o]: quads in the slot's ordered list for octant o; all 0: one unordered list */
     uint32_t submit[SV_RANGES];    /* commands the next indirect call of each range will submit */
     VkBuffer blocks; VkDeviceMemory blocks_mem; int32_t *blocks_map;     /* the block table: 8 words a block id */
     uint32_t nblocks;
@@ -283,7 +284,7 @@ static struct {
     double pass_ms[4];             /* last frame's GPU ms by pass: before the geometry, geometry, light, after the light */
     double stat[6];                /* last frame: CPU ms, ms waiting, draw calls, GPU ms, translucent chunks drawn, microseconds ordering them */
     /* a chunk being assembled by sv_chunk_begin .. sv_chunk_commit */
-    struct { int64_t slot; int32_t origin[3]; uint32_t *part[4]; uint32_t n[4], cap[4]; int open; int body; int fig; int32_t rp; int level; } stage;
+    struct { int64_t slot; int32_t origin[3]; uint32_t *part[4]; uint32_t n[4], cap[4], ord[8]; int open; int body; int fig; int32_t rp; int level; } stage;
     VkQueryPool qpool; int have_ts; float ts_period;   /* four timestamps a Frame: the frame's start and end, the figure shadow pass's */
     VkDeviceSize max_ssbo;         /* the most of a buffer one storage descriptor may reach */
     int64_t refused;               /* uploads turned away because the buffer was full */
@@ -1428,6 +1429,7 @@ int64_t sv_rig_part_begin(int64_t rig, int64_t part, int64_t ox, int64_t oy, int
     g.stage.open = 0;
     if (!g.ok || !fg.pieces || rig < 0 || rig >= SV_FIG_RIGS || part < 0 || part >= SV_FIG_PARTS) return 0;
     for (int i = 0; i < 4; i++) g.stage.n[i] = 0;
+    memset(g.stage.ord, 0, sizeof g.stage.ord);
     g.stage.origin[0] = (int32_t)ox; g.stage.origin[1] = (int32_t)oy; g.stage.origin[2] = (int32_t)oz;
     g.stage.rp = (int32_t)(rig * SV_FIG_PARTS + part);
     g.stage.open = 1; g.stage.body = 0; g.stage.fig = 1;
@@ -2237,7 +2239,8 @@ int64_t sv_open_slots(int64_t w, int64_t h, int64_t capture_mouse, int64_t quad_
     g.trans = calloc(g.slot_cap, sizeof *g.trans);
     g.trans_at = malloc(g.slot_cap * sizeof *g.trans_at);
     g.trans_keys = calloc(g.slot_cap, sizeof *g.trans_keys);
-    if (!g.trans || !g.trans_at || !g.trans_keys) { die("translucent list", 0); return 0; }
+    g.trans_ord = calloc((size_t)g.slot_cap * 8, sizeof *g.trans_ord);
+    if (!g.trans || !g.trans_at || !g.trans_keys || !g.trans_ord) { die("translucent list", 0); return 0; }
     for (int i = 0; i < g.slot_cap; i++) g.trans_at[i] = -1;
 
     if (!make_buffer((VkDeviceSize)SV_MAX_BLOCKS * 32 + 65536 * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &g.blocks, &g.blocks_mem, &map)) return 0;
@@ -2472,7 +2475,7 @@ void sv_close(void) {
     if (g.inst) vkDestroyInstance(g.inst, NULL);
     if (g.win) glfwDestroyWindow(g.win);
     glfwTerminate();
-    free(g.trans); free(g.trans_at); free(g.trans_keys);
+    free(g.trans); free(g.trans_at); free(g.trans_keys); free(g.trans_ord);
     free(g.batch_slots); free(g.batch_at); free(g.batch_visible); free(g.batch_keys); free(g.batches);
     free(g.spray_births); g.spray_births = NULL;
     free(g.ui_cpu); g.ui_cpu = NULL; g.ui_n = 0;
@@ -2657,12 +2660,46 @@ static uint32_t order_translucent(uint32_t region) {
     qsort(g.trans_keys, n, sizeof *g.trans_keys, far_first);
     uint32_t *cmd = g.cmds_map + (size_t)region * SV_CMD_STRIDE * 4;
     uint32_t *ds = g.dslot_map + (size_t)region * SV_CMD_STRIDE;
-    for (uint32_t i = 0; i < n; i++) {
-        const ChunkEntry *e = &g.entries[g.trans_keys[i].slot];
-        cmd[i * 4 + 0] = 4; cmd[i * 4 + 1] = e->count[2]; cmd[i * 4 + 2] = 0; cmd[i * 4 + 3] = e->first[2];
-        ds[i] = g.trans_keys[i].slot;
-        g.drawn_quads += e->count[2];
+    uint32_t nc = 0, room = (uint32_t)g.slot_cap;
+    for (uint32_t i = 0; i < n && nc < room; i++) {
+        uint32_t slot = g.trans_keys[i].slot;
+        const ChunkEntry *e = &g.entries[slot];
+        const uint16_t *ord = g.trans_ord + (size_t)slot * 8;
+        if (!(ord[0] | ord[1] | ord[2] | ord[3] | ord[4] | ord[5] | ord[6] | ord[7])) {
+            /* quads that cannot cover one another: one list, in any order */
+            cmd[nc * 4 + 0] = 4; cmd[nc * 4 + 1] = e->count[2]; cmd[nc * 4 + 2] = 0; cmd[nc * 4 + 3] = e->first[2];
+            ds[nc++] = slot;
+            g.drawn_quads += e->count[2];
+            continue;
+        }
+        /* The chunk carries eight lists, one for each way a ray can run
+         * (octant o: down x with bit 0 set, down y with bit 1, down z with
+         * bit 2), each sorted far to near for such rays. A list is drawn
+         * where rays from the eye run its way, which the shaders clip to;
+         * it is left out when no such ray meets the chunk's box. The eye is
+         * put in the chunk's own voxels for that. */
+        float le[3], box = 32.0f;
+        if (e->level_flags & SV_BODY) {
+            float d[3] = { eye[0] - e->pos[0], eye[1] - e->pos[1], eye[2] - e->pos[2] }, inv[4] = { -e->rot[0], -e->rot[1], -e->rot[2], e->rot[3] };
+            float vs = e->pos[3] > 0.0f ? e->pos[3] : scale;
+            qrot3(inv, d, le);
+            le[0] /= vs; le[1] /= vs; le[2] /= vs;
+        } else {
+            float lod = (float)(1 << (e->level_flags & 255));
+            for (int k = 0; k < 3; k++) le[k] = (eye[k] / scale - (float)e->origin[k]) / lod;
+        }
+        uint32_t first = e->first[2];
+        for (uint32_t o = 0; o < 8; first += ord[o], o++) {
+            if (!ord[o] || nc >= room) continue;
+            int meets = 1;
+            for (int k = 0; k < 3; k++) if ((o >> k) & 1 ? le[k] <= 0.0f : le[k] >= box) meets = 0;
+            if (!meets) continue;
+            cmd[nc * 4 + 0] = 4; cmd[nc * 4 + 1] = ord[o]; cmd[nc * 4 + 2] = 0; cmd[nc * 4 + 3] = first;
+            ds[nc++] = slot | ((8u | o) << 28);
+            g.drawn_quads += ord[o];
+        }
     }
+    n = nc;
     g.stat[4] = (double)n;
     g.stat[5] = (glfwGetTime() - t0) * 1.0e6;
     return n;
@@ -2705,6 +2742,7 @@ int64_t sv_chunk_begin(int64_t slot, double ox, double oy, double oz, int64_t le
     g.stage.slot = slot;
     g.stage.origin[0] = (int32_t)ox; g.stage.origin[1] = (int32_t)oy; g.stage.origin[2] = (int32_t)oz;
     for (int i = 0; i < 4; i++) g.stage.n[i] = 0;
+    memset(g.stage.ord, 0, sizeof g.stage.ord);
     g.stage.open = 1;
     g.stage.body = 0;
     g.stage.fig = 0;
@@ -3109,6 +3147,17 @@ int64_t sv_chunk_part(int64_t part, void *words, int64_t n) {
     return 1;
 }
 
+/* The translucent part of the chunk being assembled ends in eight lists of
+ * its own quads, one for each way a ray can run (Strata.Mesh.order_count),
+ * of these lengths; what comes before the lists is not drawn. Without this
+ * call the part is one list, drawn in any order. */
+int64_t sv_chunk_orders(int64_t a, int64_t b, int64_t c, int64_t d, int64_t e, int64_t f, int64_t g7, int64_t h) {
+    int64_t v[8] = { a, b, c, d, e, f, g7, h };
+    if (!g.stage.open) return 0;
+    for (int i = 0; i < 8; i++) { if (v[i] < 0 || v[i] > 65535) { g.stage.open = 0; return 0; } g.stage.ord[i] = (uint32_t)v[i]; }
+    return 1;
+}
+
 static uint32_t fixed16(float v, float offset) {
     float f = (v + offset) * 256.0f;
     return f <= 0.0f ? 0u : (f >= 65535.0f ? 65535u : (uint32_t)(f + 0.5f));
@@ -3204,7 +3253,11 @@ int64_t sv_chunk_commit(void) {
         if (m1 == 0) ncross++;
         else if (m1 - 1 < SV_MAX_MODELS) nloose += g.model_quads[m1 - 1];
     }
-    uint32_t counts[4] = { g.stage.n[0], g.stage.n[1], g.stage.n[2], ncross }, firsts[4] = { 0, 0, 0, 0 }, lfirst = 0;
+    /* a translucent part that ends in ordered lists: only the lists are kept */
+    uint32_t lists = 0;
+    for (int i = 0; i < 8; i++) lists += g.stage.ord[i];
+    if (lists > g.stage.n[2]) lists = 0;
+    uint32_t counts[4] = { g.stage.n[0], g.stage.n[1], lists ? lists : g.stage.n[2], ncross }, firsts[4] = { 0, 0, 0, 0 }, lfirst = 0;
     if (!sa_alloc_many(&g_quads, counts, 4, firsts)) { g.refused++; return 0; }
     if (!sa_alloc(&g_loose, nloose, &lfirst)) {
         for (int i = 0; i < 4; i++) sa_cancel(&g_quads, (Range){ firsts[i], counts[i] });
@@ -3212,7 +3265,8 @@ int64_t sv_chunk_commit(void) {
     }
     /* the new ranges have been idle for two frames or were never used: no frame in flight reads them */
     for (int l = 0; l < 3; l++)
-        if (counts[l]) memcpy(g.giga_map + (size_t)firsts[l] * 2, g.stage.part[l], (size_t)counts[l] * 8);
+        if (counts[l]) memcpy(g.giga_map + (size_t)firsts[l] * 2, g.stage.part[l] + (l == 2 ? (size_t)(g.stage.n[2] - counts[2]) * 2 : 0), (size_t)counts[l] * 8);
+    for (int i = 0; i < 8; i++) g.trans_ord[(size_t)slot * 8 + i] = lists ? (uint16_t)g.stage.ord[i] : 0;
     uint32_t *cdst = g.giga_map + (size_t)firsts[3] * 2;
     uint32_t *ldst = g.loose_map + (size_t)lfirst * 16;
     for (uint32_t i = 0; i < g.stage.n[3]; i++) {
@@ -3835,7 +3889,7 @@ int64_t sv_frame(void) {
     if (ntrans > 0) {
         vkCmdBindVertexBuffers(F->cmd, 0, 1, &g.giga, &zero);
         uint32_t base = trans_region * SV_CMD_STRIDE;
-        uint32_t pc[2] = { base, 0u };
+        uint32_t pc[2] = { base, 4u };                        /* 4: the translucent pass (quad.vert) */
         vkCmdBindPipeline(F->cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g.pipe_blend);
         vkCmdPushConstants(F->cmd, g.layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, 8, pc);
         vkCmdDrawIndirect(F->cmd, g.cmds, (VkDeviceSize)base * 16, ntrans, 16); draws++;

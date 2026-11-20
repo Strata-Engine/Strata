@@ -103,42 +103,56 @@ mod Strata.Mesh do
 
   -- opaque, cutout, translucent quads; instances; the centre's occupancy;
   -- its light classes (32768 bytes by flat index, or 1 when it is one class
-  -- throughout); the level of detail of its key
-  type Meshed = Meshed(QBuf, QBuf, QBuf, QBuf, NativeU8Arr, NativeU8Arr, Int)
+  -- throughout); the level of detail of its key; the lengths of the eight
+  -- ordered lists that follow the translucent quads in their buffer, twelve
+  -- bits each, octants 0..3 and 4..7 (0: no lists)
+  type Meshed = Meshed(QBuf, QBuf, QBuf, QBuf, NativeU8Arr, NativeU8Arr, Int, Int, Int)
 
   pfn layer_buf(m : Meshed, l : Int) : QBuf do
     match m do
-      Meshed(q0, q1, q2, _, _, _, _) -> if l == 1 do q1 else if l == 2 do q2 else q0 end end
+      Meshed(q0, q1, q2, _, _, _, _, _, _) -> if l == 1 do q1 else if l == 2 do q2 else q0 end end
     end
   end
 
   doc "The quads of layer [l] (0 opaque, 1 cutout, 2 translucent): two words a quad. The array may be longer than the quads in it; read `quad_count_at`."
   fn quads_at(m : Meshed, l : Int) : NativeI32Arr do qb_arr(layer_buf(m, l)) end
-  doc "How many quads layer [l] holds."
-  fn quad_count_at(m : Meshed, l : Int) : Int do qb_len(layer_buf(m, l)) / 2 end
+  doc "How many quads layer [l] holds. The translucent layer's array holds more after them: see `order_count`."
+  fn quad_count_at(m : Meshed, l : Int) : Int do qb_len(layer_buf(m, l)) / 2 - (if l == 2 do order_total(m) else 0 end) end
+  doc "Translucent quads must be drawn far to near. Where a chunk's can cover one another, `quads_at(m, 2)` carries, after its `quad_count_at(m, 2)` quads, eight lists of the same quads, one for each way a ray can run: octant [o] (0..7) is for rays that run down x (bit 0 set), down y (bit 1), down z (bit 2), and up where the bit is clear. A list holds the quads such rays can meet from the front, and from either side those of a block the eye can be inside (a fluid, or one that does not collide), sorted so that none is before one it covers. A quad in no list of an octant is not drawn for its rays: this is how a pane's far face is left out. This is list [o]'s length; all eight are 0 where every quad is seen from both sides and lies in one plane, and then the quads are drawn as they are, from both sides. A chunk with more than 512 translucent quads has its lists unsorted, in mesh order; one with more than 4095 has none."
+  fn order_count(m : Meshed, o : Int) : Int do
+    match m do Meshed(_, _, _, _, _, _, _, lo, hi) -> if o < 4 do int_and(int_shr(lo, 12 * o), 4095) else int_and(int_shr(hi, 12 * (o - 4)), 4095) end end
+  end
+  doc "Where list [o] starts in `quads_at(m, 2)`, in quads."
+  fn order_first(m : Meshed, o : Int) : Int do
+    if o <= 0 do quad_count_at(m, 2) else order_first(m, o - 1) + order_count(m, o - 1) end
+  end
+  doc "How many quads the eight lists hold together."
+  fn order_total(m : Meshed) : Int do
+    order_count(m, 0) + order_count(m, 1) + order_count(m, 2) + order_count(m, 3) + order_count(m, 4) + order_count(m, 5) + order_count(m, 6) + order_count(m, 7)
+  end
   fn quads(m : Meshed, l : Strata.Blocks.Layer) : NativeI32Arr do quads_at(m, B.layer_number(l)) end
   fn quad_count(m : Meshed, l : Strata.Blocks.Layer) : Int do quad_count_at(m, B.layer_number(l)) end
   doc "The cross and model instances: two words each. Read `instance_count`."
-  fn instances(m : Meshed) : NativeI32Arr do match m do Meshed(_, _, _, qi, _, _, _) -> qb_arr(qi) end end
-  fn instance_count(m : Meshed) : Int do match m do Meshed(_, _, _, qi, _, _, _) -> qb_len(qi) / 2 end end
+  fn instances(m : Meshed) : NativeI32Arr do match m do Meshed(_, _, _, qi, _, _, _, _, _) -> qb_arr(qi) end end
+  fn instance_count(m : Meshed) : Int do match m do Meshed(_, _, _, qi, _, _, _, _, _) -> qb_len(qi) / 2 end end
   doc "The centre chunk's occupancy mask (Strata.Occupancy)."
-  fn occupancy(m : Meshed) : NativeU8Arr do match m do Meshed(_, _, _, _, o, _, _) -> o end end
+  fn occupancy(m : Meshed) : NativeU8Arr do match m do Meshed(_, _, _, _, o, _, _, _, _) -> o end end
   doc "The centre chunk's light classes for the renderer's light volume: 32768 bytes by flat index, or a single byte when every voxel has the same class."
-  fn light_bytes(m : Meshed) : NativeU8Arr do match m do Meshed(_, _, _, _, _, lb, _) -> lb end end
+  fn light_bytes(m : Meshed) : NativeU8Arr do match m do Meshed(_, _, _, _, _, lb, _, _, _) -> lb end end
   doc "The level of detail of the chunk the mesh was built for (`build` makes level 0; the stream sets its key's level)."
   fn level(m : Meshed) : Int do
-    match m do Meshed(_, _, _, _, _, _, l) -> l end
+    match m do Meshed(_, _, _, _, _, _, l, _, _) -> l end
   end
   doc "The mesh [m] marked as built for a chunk of level [l]."
   fn with_level(m : Meshed, l : Int) : Meshed do
-    match m do Meshed(q0, q1, q2, qi, o, lb, _) -> Meshed(q0, q1, q2, qi, o, lb, l) end
+    match m do Meshed(q0, q1, q2, qi, o, lb, _, u, v) -> Meshed(q0, q1, q2, qi, o, lb, l, u, v) end
   end
   doc "Bytes of mesh: eight per quad and per instance."
   fn bytes(m : Meshed) : Int do
-    (quad_count_at(m, 0) + quad_count_at(m, 1) + quad_count_at(m, 2) + instance_count(m)) * 8
+    (quad_count_at(m, 0) + quad_count_at(m, 1) + quad_count_at(m, 2) + order_total(m) + instance_count(m)) * 8
   end
 
-  pfn no_mesh(occ : NativeU8Arr, lb : NativeU8Arr) : Meshed do Meshed(qb_new(), qb_new(), qb_new(), qb_new(), occ, lb, 0) end
+  pfn no_mesh(occ : NativeU8Arr, lb : NativeU8Arr) : Meshed do Meshed(qb_new(), qb_new(), qb_new(), qb_new(), occ, lb, 0, 0, 0) end
 
   pfn light_go(lb : NativeU8Arr, r : Strata.Blocks.Registry, c : Strata.Chunk.Chunk, i : Int) : NativeU8Arr do
     if i < 0 || i >= 32768 do lb else light_go(NativeArray.set_u8(lb, i, B.light_class(r, C.get_idx(c, i))), r, c, i + 1) end
@@ -345,7 +359,9 @@ mod Strata.Mesh do
     if b >= b1 do mask else clear_box(clear_row(mask, a, a1, b), a, a1, b + 1, b1) end
   end
 
-  type Bufs = Bufs(QBuf, QBuf, QBuf)
+  -- opaque, cutout, translucent quads; and for each translucent quad a pair whose first word is 1 when it is
+  -- seen from both sides: a fluid's, or a block's the eye can be inside (one that does not collide)
+  type Bufs = Bufs(QBuf, QBuf, QBuf, QBuf)
 
   pfn emit(bufs : Bufs, r : Strata.Blocks.Registry, f : Int, n : Int, a : Int, b : Int, w : Int, h : Int, key : Int) : Bufs do
     let id = int_and(key - 1, 65535)
@@ -359,10 +375,10 @@ mod Strata.Mesh do
     let w1 = Q.pack1(B.face_tex(r, id, f), ao, B.light_class(r, id))
     let l = B.layer_index(r, id)
     match bufs do
-      Bufs(q0, q1, q2) ->
-        if l == 1 do Bufs(q0, qb_push2(q1, w0, w1), q2)
-        else if l == 2 do Bufs(q0, q1, qb_push2(q2, w0, w1))
-        else Bufs(qb_push2(q0, w0, w1), q1, q2) end end
+      Bufs(q0, q1, q2, qs) ->
+        if l == 1 do Bufs(q0, qb_push2(q1, w0, w1), q2, qs)
+        else if l == 2 do Bufs(q0, q1, qb_push2(q2, w0, w1), qb_push2(qs, if Q.is_fluid(w0) || !B.collides(r, id) do 1 else 0 end, 0))
+        else Bufs(qb_push2(q0, w0, w1), q1, q2, qs) end end
     end
   end
 
@@ -429,11 +445,182 @@ mod Strata.Mesh do
     u >= 0 && B.is_solid_opaque(r, u)
   end
 
+  -- ── The translucent layer's order ────────────────────────────────────────
+  -- Translucent quads blend, so what is behind must be drawn first. A ray
+  -- from the eye runs one way along each axis, and the eight ways (octants)
+  -- each see their own quads: those facing against the ray, and from either
+  -- side those of a block the eye can be inside (a fluid, or one that does
+  -- not collide). Within one octant, quad B can come between the eye and
+  -- quad A only if some point of A is farther along all three axes than some
+  -- point of B; that is `before`, and it does not depend on where the eye
+  -- is. It cannot hold both ways unless the quads cut each other, which
+  -- voxel faces never do. So each octant gets its quads once, sorted so that
+  -- every A is ahead of its B, and the renderer draws an octant's list
+  -- clipped to that octant about the eye
+  -- (docs/2026-11-10-renderer-design.md, the addendum).
+  --
+  -- A quad is nine numbers here: 0..5 low and high along x, y, z in voxels
+  -- (both its plane along its normal), 6 its normal's axis (0 x, 1 y, 2 z),
+  -- 7 the way it faces along it (1 or 0), 8 1 when it is seen from both sides.
+  pfn order_max() : Int do 512 end         -- more quads than this are listed but not sorted: the sort compares every pair
+  pfn list_max() : Int do 4095 end         -- more than this carry no lists (a length is twelve bits)
+
+  @[no_alloc]
+  pfn og(g : NativeIntArr, i : Int, k : Int) : Int do NativeArray.get_int(g, 9 * i + k) end
+
+  pfn o_set3(g : NativeIntArr, at : Int, a : Int, b : Int, c : Int) : NativeIntArr do
+    NativeArray.set_int(NativeArray.set_int(NativeArray.set_int(g, at, a), at + 1, b), at + 2, c)
+  end
+  pfn o_put(g : NativeIntArr, i : Int, w0 : Int, both : Int) : NativeIntArr do
+    let f = Q.face_of(w0)
+    let ax = if f < 2 do 1 else if f < 4 do 0 else 2 end end
+    let up = if f == 0 || f == 2 || f == 4 do 1 else 0 end
+    let w = Q.w_of(w0)
+    let h = Q.h_of(w0)
+    let lox = Q.x_of(w0) + (if ax == 0 do up else 0 end)
+    let loy = Q.y_of(w0) + (if ax == 1 do up else 0 end)
+    let loz = Q.z_of(w0) + (if ax == 2 do up else 0 end)
+    let hix = if ax == 0 do lox else lox + w end
+    let hiy = if ax == 1 do loy else loy + h end
+    let hiz = if ax == 2 do loz else if ax == 1 do loz + h else loz + w end end
+    o_set3(o_set3(o_set3(g, 9 * i, lox, hix, loy), 9 * i + 3, hiy, loz, hiz), 9 * i + 6, ax, up, both)
+  end
+  pfn o_read(g : NativeIntArr, arr : NativeI32Arr, sides : NativeI32Arr, n : Int, i : Int) : NativeIntArr do
+    if i >= n do g else o_read(o_put(g, i, NativeArray.get_i32(arr, 2 * i), NativeArray.get_i32(sides, 2 * i)), arr, sides, n, i + 1) end
+  end
+
+  -- are the quads from i on all seen from both sides and in quad 0's plane? Then none can cover another, and none has a side to hide.
+  pfn one_plane(g : NativeIntArr, n : Int, i : Int) : Bool do
+    if i >= n do true
+    else if og(g, i, 8) != 1 || og(g, i, 6) != og(g, 0, 6) || og(g, i, 2 * og(g, i, 6)) != og(g, 0, 2 * og(g, 0, 6)) do false
+    else one_plane(g, n, i + 1) end end
+  end
+
+  -- Octant o is for rays that run down x (bit 0 set), down y (bit 1), down
+  -- z (bit 2); with a bit clear, up. Is quad i seen along such rays?
+  @[no_alloc]
+  pfn in_octant(g : NativeIntArr, i : Int, o : Int) : Bool do
+    og(g, i, 8) == 1 || int_and(o / (if og(g, i, 6) == 0 do 1 else if og(g, i, 6) == 1 do 2 else 4 end end), 1) == og(g, i, 7)
+  end
+  -- the quads of octant o into mem; how many
+  type Members = Members(NativeIntArr, Int)
+  pfn members(g : NativeIntArr, mem : NativeIntArr, n : Int, o : Int, i : Int, k : Int) : Members do
+    if i >= n do Members(mem, k)
+    else if in_octant(g, i, o) do members(g, NativeArray.set_int(mem, k, i), n, o, i + 1, k + 1)
+    else members(g, mem, n, o, i + 1, k) end end
+  end
+
+  -- Member k's box turned to the octant, six numbers at 6 * k: its near
+  -- corner's far side, then its far corner's (low and high where the rays
+  -- run down the axis; minus high and minus low where they run up). Then
+  -- member a must be drawn before member b when each of a's first three is
+  -- less than the matching one of b's last three.
+  pfn turned(lh : NativeIntArr, g : NativeIntArr, mem : NativeIntArr, m : Int, o : Int, k : Int) : NativeIntArr do
+    if k >= m do lh
+    else
+      let i = NativeArray.get_int(mem, k)
+      let dx = int_and(o, 1) == 1
+      let dy = int_and(o, 2) == 2
+      let dz = int_and(o, 4) == 4
+      let l1 = o_set3(lh, 6 * k, if dx do og(g, i, 0) else 0 - og(g, i, 1) end, if dy do og(g, i, 2) else 0 - og(g, i, 3) end, if dz do og(g, i, 4) else 0 - og(g, i, 5) end)
+      turned(o_set3(l1, 6 * k + 3, if dx do og(g, i, 1) else 0 - og(g, i, 0) end, if dy do og(g, i, 3) else 0 - og(g, i, 2) end, if dz do og(g, i, 5) else 0 - og(g, i, 4) end), g, mem, m, o, k + 1)
+    end
+  end
+
+  -- each member's state (0 not reached, 1 being placed, 2 placed), the buffer the order goes to
+  type Topo = Topo(NativeU8Arr, QBuf)
+  -- Place member b after everything that must come before it. A member met
+  -- again while it is being placed closes a ring of quads covering each
+  -- other; the ring is broken there.
+  pfn place(lh : NativeIntArr, arr : NativeI32Arr, mem : NativeIntArr, m : Int, st : NativeU8Arr, q : QBuf, b : Int) : Topo do
+    if NativeArray.get_u8(st, b) != 0 do Topo(st, q)
+    else
+      match firsts(lh, m, arr, mem, NativeArray.set_u8(st, b, 1), q, NativeArray.get_int(lh, 6 * b + 3), NativeArray.get_int(lh, 6 * b + 4), NativeArray.get_int(lh, 6 * b + 5), 0) do
+        Topo(st2, q2) ->
+          let i = NativeArray.get_int(mem, b)
+          Topo(NativeArray.set_u8(st2, b, 2), qb_push2(q2, NativeArray.get_i32(arr, 2 * i), NativeArray.get_i32(arr, 2 * i + 1)))
+      end
+    end
+  end
+  -- every member still to be placed that must come before the one whose far corner is (hx, hy, hz)
+  pfn firsts(lh : NativeIntArr, m : Int, arr : NativeI32Arr, mem : NativeIntArr, st : NativeU8Arr, q : QBuf, hx : Int, hy : Int, hz : Int, a : Int) : Topo do
+    if a >= m do Topo(st, q)
+    else if NativeArray.get_u8(st, a) == 0 && NativeArray.get_int(lh, 6 * a) < hx && NativeArray.get_int(lh, 6 * a + 1) < hy && NativeArray.get_int(lh, 6 * a + 2) < hz do
+      match place(lh, arr, mem, m, st, q, a) do
+        Topo(st2, q2) -> firsts(lh, m, arr, mem, st2, q2, hx, hy, hz, a + 1)
+      end
+    else firsts(lh, m, arr, mem, st, q, hx, hy, hz, a + 1) end end
+  end
+  pfn place_all(lh : NativeIntArr, arr : NativeI32Arr, mem : NativeIntArr, m : Int, st : NativeU8Arr, q : QBuf, k : Int) : Topo do
+    if k >= m do Topo(st, q)
+    else
+      match place(lh, arr, mem, m, st, q, k) do
+        Topo(st2, q2) -> place_all(lh, arr, mem, m, st2, q2, k + 1)
+      end
+    end
+  end
+  -- the members as they come, unsorted: for a chunk with too many to sort
+  pfn as_meshed(q : QBuf, arr : NativeI32Arr, mem : NativeIntArr, m : Int, k : Int) : QBuf do
+    if k >= m do q
+    else
+      let i = NativeArray.get_int(mem, k)
+      as_meshed(qb_push2(q, NativeArray.get_i32(arr, 2 * i), NativeArray.get_i32(arr, 2 * i + 1)), arr, mem, m, k + 1)
+    end
+  end
+  pfn zero_u8(st : NativeU8Arr, m : Int, k : Int) : NativeU8Arr do
+    if k >= m do st else zero_u8(NativeArray.set_u8(st, k, 0), m, k + 1) end
+  end
+
+  -- the translucent buffer, and the eight lists' lengths, twelve bits each, octants 0..3 and 4..7
+  type Sorted = Sorted(QBuf, Int, Int)
+  -- the working arrays: the turned boxes, the members, their states
+  type Work = Work(NativeIntArr, NativeIntArr, NativeU8Arr)
+  pfn octants_go(g : NativeIntArr, arr : NativeI32Arr, wk : Work, n : Int, sort : Bool, o : Int, q : QBuf, lo : Int, hi : Int) : Sorted do
+    if o >= 8 do Sorted(q, lo, hi)
+    else
+      match wk do
+        Work(lh, mem, st) ->
+          match members(g, mem, n, o, 0, 0) do
+            Members(mem2, m) ->
+              let lo2 = if o < 4 do lo + m * int_shl(1, 12 * o) else lo end
+              let hi2 = if o < 4 do hi else hi + m * int_shl(1, 12 * (o - 4)) end
+              if !sort do octants_go(g, arr, Work(lh, mem2, st), n, sort, o + 1, as_meshed(q, arr, mem2, m, 0), lo2, hi2)
+              else
+                let lh2 = turned(lh, g, mem2, m, o, 0)
+                match place_all(lh2, arr, mem2, m, zero_u8(st, m, 0), q, 0) do
+                  Topo(st2, q2) -> octants_go(g, arr, Work(lh2, mem2, st2), n, sort, o + 1, q2, lo2, hi2)
+                end
+              end
+          end
+      end
+    end
+  end
+  pfn o_plain(q : QBuf, arr : NativeI32Arr, n : Int, i : Int) : QBuf do
+    if i >= n do q else o_plain(qb_push2(q, NativeArray.get_i32(arr, 2 * i), NativeArray.get_i32(arr, 2 * i + 1)), arr, n, i + 1) end
+  end
+  pfn sort_trans(q2 : QBuf, sides : NativeI32Arr) : Sorted do
+    let n = qb_len(q2) / 2
+    if n < 1 || n > list_max() do Sorted(q2, 0, 0)
+    else
+      let arr = qb_arr(q2)
+      let g = o_read(NativeArray.make_int(Strata.Size.of(9 * n), 0), arr, sides, n, 0)
+      if one_plane(g, n, 0) do Sorted(q2, 0, 0)
+      else
+        let wk = Work(NativeArray.make_int(Strata.Size.of(6 * n), 0), NativeArray.make_int(Strata.Size.of(n), 0), NativeArray.make_u8(Strata.Size.of(n), 0))
+        -- the lists go to a buffer of their own, after a copy of the quads: [arr] is read throughout
+        octants_go(g, arr, wk, n, n <= order_max(), 0, o_plain(qb_new(), arr, n, 0), 0, 0)
+      end
+    end
+  end
+
   pfn mesh_padded(r : Strata.Blocks.Registry, ids : NativeIntArr, occ : NativeU8Arr, lb : NativeU8Arr) : Meshed do
       match kind_go(NativeArray.make_u8(Strata.Size.of(pvol()), 0), NativeArray.make_int(204, 0), NativeArray.make_int(Strata.Size.of(pvol() + 1156), 0), ids, r, 0) do
         Kinds(kind, tally, fam) ->
-          match faces(Bufs(qb_new(), qb_new(), qb_new()), NativeArray.make_int(1024, 0), ids, kind, fam, tally, r, 0) do
-            Bufs(q0, q1, q2) -> Meshed(q0, q1, q2, instances_go(qb_new(), ids, kind, r, 0), occ, lb, 0)
+          match faces(Bufs(qb_new(), qb_new(), qb_new(), qb_new()), NativeArray.make_int(1024, 0), ids, kind, fam, tally, r, 0) do
+            Bufs(q0, q1, q2, qs) ->
+              match sort_trans(q2, qb_arr(qs)) do
+                Sorted(q2s, olo, ohi) -> Meshed(q0, q1, q2s, instances_go(qb_new(), ids, kind, r, 0), occ, lb, 0, olo, ohi)
+              end
           end
       end
   end
