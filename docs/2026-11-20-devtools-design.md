@@ -1,4 +1,4 @@
-# Strata devtools: an agent drives a running viewer
+# Strata devtools: an agent drives a running Strata app
 
 ## Intent
 
@@ -8,24 +8,31 @@ builds, see warnings as they happen. Today the viewer is driven only by about
 70 `STRATA_*` switches read at start, and a scripted run is "pose N, draw N
 frames, write a PPM, exit".
 
-It is a development tool. `lib/strata` gains nothing for it, and games built
-on Strata do not carry it. Anti-goal: a change to the library made only for
-this tool.
+It is a development tool. It started in the viewer; since 2026-11-20 its
+protocol lives in the library (`lib/strata/devtools.march`, `Strata.Devtools`)
+so a game built on Strata (Ur first) can be driven and measured the same way.
+What a game carries is inert unless `STRATA_DEVTOOLS` is set: each call is a
+string comparison, `record` keeps nothing, and no folder is touched. The
+library holds only the protocol and the commands every app shares; an app's
+own commands (the viewer's camera and edits) stay in the app.
 
 ## Shape
 
 Two parts, joined by a folder:
 
-- **The viewer** (`viewer/lib/devtools.march`, `StrataViewer.Devtools`), on
-  only when `STRATA_DEVTOOLS=<dir>` is set. Once a frame it lists
+- **The app** (`Strata.Devtools` in `lib/strata/devtools.march`, called from
+  the app's frame loop: the viewer's `dev_one`, Ur's `run_frames`), on only
+  when `STRATA_DEVTOOLS=<dir>` is set. Once a frame it lists
   `<dir>/in/`, takes each request file in name order, applies it at one point
   in the frame loop, writes the reply to `<dir>/out/<id>.json` (written to a
   temporary name and renamed, so a reader never sees half a reply) and
   removes the request. Off, it costs one string comparison a frame.
 - **The relay** (`tools/strata-mcp/server.mjs`), an MCP server over stdio in
-  Node with no dependencies. It launches the viewer as its child (so it owns
-  the viewer's output for `log`), turns each MCP tool call into a request
-  file, waits for the reply, and encodes screenshots as PNG (Node's own zlib).
+  Node with no dependencies. It launches the app as its child (the viewer, an
+  app given to `launch`, or the project's default: `STRATA_MCP_APP_BIN` and
+  `STRATA_MCP_APP_CWD`, which Ur's `.mcp.json` sets), so it owns the app's
+  output for `log`; turns each MCP tool call into a request file, waits for
+  the reply, and encodes screenshots as PNG (Node's own zlib).
 
 ### Approaches considered
 
@@ -70,6 +77,48 @@ Replies are JSON objects written by the viewer: `{"id":…,"ok":true,…}` or
 
 Relay-only tools: `launch` (scene, size, extra switches; hidden or shown),
 `quit`, `log` (the viewer's output since a cursor).
+
+Shared commands, answered by `Strata.Devtools.handle` for any app (the viewer
+answers its own versions of the first five): `status` (for an app with none),
+`pause`, `resume`, `step n`, `screenshot`, `stats`, and the measuring ones
+below.
+
+## Measuring (added 2026-11-20)
+
+From the hand benchmarking and profiling that took Ur's metro demo (100,000
+citizens) from about 28 to about 200 frames a second, turned into tools.
+
+In the app (`Strata.Devtools`):
+
+| Command | Does |
+|---|---|
+| `perf_mark` | starts a window: `perf_report since=mark` covers frames after it |
+| `perf_report frames=n since=mark from to` | for every recorded field: median, p90, mean of the slowest tenth, max; then findings |
+| `perf_values field=k …` | one field's raw values over a window, oldest first |
+
+Each frame the app calls `record(dev, nums)` (or `record_timed(dev, nums, dt)`,
+which also keeps `game_s`, the game clock summed from the frame's `dt`) with
+its own numbers (`frame_ms`, Ur's `sim_ms`, …); the library adds the
+renderer's: `renderer_ms`, `waiting_ms`, `draw_calls`, `gpu_ms`,
+`batch_instances`, and the churn between the last two frames from
+`Vk.stat` 35..38: `instances` (`chunk_instance` calls), `motions`
+(`chunk_motion` calls), `commits` (mesh uploads), `synced` (chunk-table
+entries). It keeps the last 1,200 advancing frames; a paused frame is not
+recorded. `from`/`to` select frames by `game_s`, so a faster build and a
+slower one are compared over the same stretch of game time, not the same
+frame numbers (a start-up that follows the clock lands on different frames).
+
+Findings, in words: frames over twice the median and the fields that rose
+most in them; slots placed again every frame (`instances`), meshes rebuilt
+every frame (`commits`), heavy chunk-table churn (`synced`); GPU-bound.
+
+In the relay:
+
+| Tool | Does |
+|---|---|
+| `bench_compare a b rounds frames window/from_s,to_s fields` | alternating runs (A B B A …) of two builds, each launched hidden, paused before it is read; pooled median, p90, slowest-10% mean and max per field, per-run medians, and the difference |
+| `profile seconds thread` | macOS `sample` on the app: where the work goes, waits left out, every thread together by default (a simulation on a worker counts); runtime functions (allocation, `memmove`, array sets, refcounting, drops) charged to the March functions that called them |
+| `screenshot_diff a b take threshold save_diff` | pixels that differ, their box and the largest difference, a diff image; for proving a render change moved nothing else, and that a deliberate break shows |
 
 Phase 2: player input through `Strata.Input`, and debug overlays.
 
