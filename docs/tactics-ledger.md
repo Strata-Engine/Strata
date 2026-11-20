@@ -6,3 +6,7 @@
 - Task 5: known limitation: cut terrain shows the sky through its open interior (solid ground has no inner faces); a dark cap on cut solids is a follow-up. Cost: cut views of hillsides look hollow.
 - Task 6: Ruling: the frame type is `Strata.Plugin.PluginFrame`, not `Frame` — March has one global type namespace and `Frame` was taken. The tactics grid's types are `TileGrid` and `GridSettings` (Strata.Body.Grid exists). Cost if wrong: names only.
 - Tasks 4–5: Ruling: committed as one change — the overlay and cutaway edits interleave in strata_vk.c, ubo.glsl and the shader header (one generated file), so separate commits would not each build. Cost: one review range for both.
+- Task 7: the grid's full build of 64 x 64 tiles (tile 4, scan 24 cells) takes 1510 ms in the test build against a 1000 ms budget (asserted at 4x). Reach 2 ms (budget 2), refresh after a radius-6 blast 13 ms (budget 16). To re-measure in release (Task 16); if still over, the cost is World.get_block per cell and the fix belongs in March/Strata (a column read).
+- Task 9: Ruling: `on` and `within` are reserved words in March (the first is GAPS S4; `within` is new); the reach module's helper is `on_map`. Cost: none.
+- Task 10: Ruling: lines of sight stop only at blocks that collide (Strata.Blocks.collides), not every drawn block, so water does not block sight. Cost if wrong: a game wanting glass to block sight registers it colliding.
+- Task 10: Ruling: the five rays are the centres and the centres moved a quarter tile along each of the four diagonals.
