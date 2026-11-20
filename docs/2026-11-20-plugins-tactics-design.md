@@ -46,7 +46,11 @@ a dozen lines, and has a working tactical layer over any Strata world; and
 - **Grid, turns and camera are one element**, packaged together.
 - **Turns work exactly like Final Fantasy Tactics**: charge time (CT)
   raised by speed each clock tick, active turn (AT) at 100, charged actions
-  with their own speed (details below).
+  with their own speed (details below). **The reference is the 2025 remake,
+  Final Fantasy Tactics: The Ivalice Chronicles**, in its Enhanced mode
+  (the mode is the designer's call; the remake also ships a Classic mode
+  following the older War of the Lions rules). Where sources disagree,
+  the remake's behaviour wins, and the clock's tests are worked from it.
 - **The camera is versatile, like the recent XCOM games**, not FFT's fixed
   isometric view.
 - Engine rule carried over: Strata core names no game concept.
@@ -248,8 +252,9 @@ The game adds and removes units and changes their speed.
   whether it acted; the unit's CT falls by the base cost plus the move cost
   and the act cost: by default 60, +20, +20, so 100 for both. FFT then caps
   the unit's remaining CT; whether and where is version-dependent in the
-  sources and **must be checked against an authoritative FFT mechanics
-  reference before it is built**. Every number here is a setting with FFT's
+  sources and **must be checked against The Ivalice Chronicles (Enhanced)
+  before it is built**, as must the tie-break and the order charged actions
+  resolve in. Every number here is a setting with FFT's
   value as the default.
 - **Charging units** are flagged, so the game can apply its own rules
   (FFT makes them easier to hit); a charged action can be cancelled.
