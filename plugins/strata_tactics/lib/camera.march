@@ -173,8 +173,84 @@ mod StrataTactics.Camera do
     set_level({ c with tc_focus: focus2, tc_yaw: yaw2, tc_yaw_to: to2, tc_dist: dist, tc_dist_to: dist_to, tc_follow: follow2, tc_last_pointer: pointer }, lv)
   end
 
+  -- ── Shots ────────────────────────────────────────────────────────────────
+
+  doc "Is a shot playing? While one plays, `step` ignores turning, panning and zoom."
+  fn in_shot(c : TacticsCamera) : Bool do Option.is_some(c.tc_shot) end
+
+  doc "The ids of the shots that finished on the last `step` (each once)."
+  fn shot_done(c : TacticsCamera) : List(Int) do c.tc_done end
+
+  pfn begin_shot(c : TacticsCamera, id : Int, eye_to : (Float, Float, Float), look_to : (Float, Float, Float), hold_s : Float) : TacticsCamera do
+    match view(c) do
+      (e, l) -> { c with tc_shot: Some(CamShot(id, eye_to, look_to, 2.0 *. c.tc_set.cm_turn_s, hold_s, 0.0, e, l)) }
+    end
+  end
+
+  doc "A shot [id]: travel to frame [at] as the orbit frames its focus (over twice the turn time), hold [hold_s] seconds, and travel back to the orbit view."
+  fn look(c : TacticsCamera, id : Int, at : (Float, Float, Float), hold_s : Float) : TacticsCamera do
+    match (orbit_eye(c), c.tc_focus, at) do
+      ((ex, ey, ez), (fx, fy, fz), (ax, ay, az)) -> begin_shot(c, id, (ax +. ex -. fx, ay +. ey -. fy, az +. ez -. fz), at, hold_s)
+    end
+  end
+
+  pfn solid_at(w : Strata.World.World, p : (Float, Float, Float)) : Bool do
+    let sc = Strata.World.scale(w)
+    match p do
+      (x, y, z) -> Strata.Blocks.collides(Strata.World.registry(w), Strata.World.get_block(w, float_to_int(Math.floor(x /. sc)), float_to_int(Math.floor(y /. sc)), float_to_int(Math.floor(z /. sc))))
+    end
+  end
+
+  -- does a ray from p reach q (within half a metre) without meeting a colliding block?
+  pfn sees(w : Strata.World.World, p : (Float, Float, Float), q : (Float, Float, Float)) : Bool do
+    match (p, q) do
+      ((px, py, pz), (qx, qy, qz)) ->
+        let dx = qx -. px
+        let dy = qy -. py
+        let dz = qz -. pz
+        let d = Math.sqrt(dx *. dx +. dy *. dy +. dz *. dz)
+        if d < 0.5 do true
+        else
+          let r = Strata.World.registry(w)
+          let h = Strata.Query.raycast(w, px, py, pz, dx, dy, dz, d, fn id -> Strata.Blocks.collides(r, id))
+          !Strata.Query.is_hit(h) || Strata.Query.hit_dist(h) >= d -. 0.5
+        end
+    end
+  end
+
+  doc "A shot [id] framing two points, [a] (the shooter) and [b] (the target): over a's shoulder toward b (1.5 m behind and 0.8 m right of a, 1.8 m up, looking at b), or from the side when [side] (square to a-b at its middle, back far enough to frame both). If the shot's eye is inside a block or cannot see a and b, it becomes a `look` at the middle instead. It holds [hold_s] seconds."
+  fn frame_two(c : TacticsCamera, id : Int, a : (Float, Float, Float), b : (Float, Float, Float), side : Bool, hold_s : Float, w : Strata.World.World) : TacticsCamera do
+    match (a, b) do
+      ((ax, ay, az), (bx, by0, bz)) ->
+        let hx = bx -. ax
+        let hz = bz -. az
+        let hl = Math.sqrt(hx *. hx +. hz *. hz)
+        let (fx, fz) = if hl < 0.0001 do (0.0, -1.0) else (hx /. hl, hz /. hl) end
+        let rx = 0.0 -. fz
+        let rz = fx
+        let mid = ((ax +. bx) /. 2.0, (ay +. by0) /. 2.0, (az +. bz) /. 2.0)
+        let (eye_to, look_to) = if side do
+            let back = (hl /. 2.0) /. Math.tan(rad(c.tc_set.cm_fov_deg) /. 2.0) *. 1.3 +. 2.0
+            match mid do (mx, my, mz) -> ((mx +. rx *. back, my +. 1.5, mz +. rz *. back), mid) end
+          else ((ax -. fx *. 1.5 +. rx *. 0.8, ay +. 1.8, az -. fz *. 1.5 +. rz *. 0.8), b) end
+        if solid_at(w, eye_to) || !sees(w, eye_to, a) || !sees(w, eye_to, b) do look(c, id, mid, hold_s)
+        else begin_shot(c, id, eye_to, look_to, hold_s) end
+    end
+  end
+
+  pfn shot_step(c : TacticsCamera, pointer : Option((Float, Float)), dt : Float) : TacticsCamera do
+    match c.tc_shot do
+      None -> c
+      Some(CamShot(id, e, l, travel, hold, t, oe, ol)) ->
+        let t2 = t +. dt
+        if t2 >= 2.0 *. travel +. hold do { c with tc_shot: None, tc_done: [id], tc_last_pointer: pointer }
+        else { c with tc_shot: Some(CamShot(id, e, l, travel, hold, t2, oe, ol)), tc_last_pointer: pointer } end
+    end
+  end
+
   doc "One frame of the camera from the frame's input ([i], the pointer in window points, the wheel), the window's size, the time step and the ground's height (metres) under a point (the grid's floor)."
   fn step(c : TacticsCamera, i : Strata.Input.Input, pointer : Option((Float, Float)), wheel : Float, width : Float, height : Float, dt : Float, ground : Float -> Float -> Float) : TacticsCamera do
-    orbit_step({ c with tc_done: Nil }, i, pointer, wheel, width, height, dt, ground)
+    if in_shot(c) do shot_step({ c with tc_done: Nil }, pointer, dt)
+    else orbit_step({ c with tc_done: Nil }, i, pointer, wheel, width, height, dt, ground) end
   end
 end
