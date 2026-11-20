@@ -27,7 +27,7 @@
 /* Rewritten by build_shaders.sh whenever the shaders change: forge decides
  * whether to recompile this file from its text alone, not from the headers
  * it includes (GAPS S14). */
-#define STRATA_SHADERS_STAMP "585f8322f8fbc9d5"
+#define STRATA_SHADERS_STAMP "a80d1c93ee360292"
 #include "strata_shaders.h"
 #include "strata_particles.h"
 #include "strata_alloc.h"
@@ -46,6 +46,8 @@ static inline void   *narr_data(void *a) { return (char *)a + NARR_HDR; }
 #define SV_SPRAY_FLOATS PT_FLOATS     /* floats a particle's record */
 #define SV_UI_QUADS 16384      /* quads the 2D layer holds a frame */
 #define SV_UI_FLOATS 16        /* floats a quad (Strata.Ui) */
+#define SV_OVL_ITEMS 4096      /* items the overlay holds a frame */
+#define SV_OVL_FLOATS 20       /* floats an item (Strata.Overlay.pack) */
 #define SV_GLYPH_STAGE ST_UPLOAD_BYTES   /* bytes of new glyph pixels a frame carries to the atlas: all strata_text makes in a frame */
 #define SV_GLYPH_RECTS ST_UPLOAD_RECTS
 #define SV_LIGHT_PER_FRAME 128 /* chunks whose light bytes one frame may copy into the volume */
@@ -135,6 +137,7 @@ typedef struct {
     VkBuffer lstage; VkDeviceMemory lstage_mem; unsigned char *lstage_map;   /* this frame's light-volume writes, before they are copied in */
     VkBuffer stats; VkDeviceMemory stats_mem; uint32_t *stats_map;   /* written by the cull pass: commands per range [6], chunks, quads */
     VkBuffer ui; VkDeviceMemory ui_mem; float *ui_map;   /* this frame's 2D layer */
+    VkBuffer ovl; VkDeviceMemory ovl_mem; float *ovl_map;   /* this frame's overlay */
     VkBuffer gstage; VkDeviceMemory gstage_mem; unsigned char *gstage_map;   /* this frame's new glyph pixels, before they are copied in */
     VkBuffer finst; VkDeviceMemory finst_mem; struct FigInst *finst_map;   /* this frame's figure parts: where each is drawn */
     uint32_t batch_instances, batch_quads;
@@ -251,9 +254,10 @@ static struct {
     int meet_pending; uint64_t meet_first; uint32_t meet_last; uint64_t meet_total;
     /* The 2D layer: the quads the game last handed over, drawn last. Each
      * Frame copies them when it is recorded. */
-    VkPipeline pipe_ui;
+    VkPipeline pipe_ui, pipe_ovl, pipe_ovl_thru;
     VkPipeline pipe_fig;           /* figure parts: shared piece meshes, instanced at their poses */
     float *ui_cpu; uint32_t ui_n; uint64_t ui_dropped;
+    float *ovl_cpu; uint32_t ovl_n; uint64_t ovl_dropped;   /* the overlay (Strata.Overlay) */
     Target glyphs; VkSampler glyph_sampler; uint32_t glyph_px, glyph_pages;   /* the glyph atlas: strata_text's pages, one layer each */
     Target ui_art; VkSampler ui_sampler;   /* the interface atlas: one image of a game's own interface art */
     VkBuffer loose; VkDeviceMemory loose_mem; uint32_t *loose_map;       /* model geometry, expanded per instance: 16 words a quad */
@@ -318,7 +322,8 @@ static struct {
 /* The uniform block, in floats (native/shaders/ubo.glsl): vp 0, sun 16,
  * sky 20, fog 24, eye 28, misc 32 (ints), inv_vp 36, prev_vp 52, light 68,
  * sun colour 72, light volume size 76 (ints). */
-#define UBO_FLOATS 124
+#define UBO_FLOATS 160
+#define UBO_CUT 124           /* 9 vec4: the cutaway (Strata.Overlay.cut_floats) */
 #define UBO_TRACE 120         /* vec4: x screen pixels along each side of one the gather pass traces for */
 #define UBO_SUN_VP 100         /* mat4: world to the figure shadow map's clip space */
 #define UBO_FSHADOW 116        /* vec4: x the map holds figures this frame, y a texel in its 0..1 coordinates, z its depth per metre */
@@ -655,20 +660,24 @@ static int make_render_pass(VkImageLayout final, VkRenderPass *out) {
  * 9: glowing particles (final pass, added, after the shaded ones of kind 6).
  * 10: the gather pass (the light pass's rays, at the trace scale);
  * 11: shared mesh batches (geometry pass, voxel textures).
+ * 12: the overlay where it is seen (final pass, blended, depth tested, before the 2D layer);
+ * 13: the overlay drawn faintly through what hides it (depth test inverted).
  * Kinds 0, 2, 3, 8 and 11 belong to the geometry pass, 4 to the light pass, 10 to
  * the trace pass, 1 and 5 to the final pass. */
 static int make_pipeline(int kind, VkPipeline *out) {
     int glow = kind == 9, batch = kind == 11;
-    int spray = kind == 6 || glow, ui = kind == 7, fig = kind == 8;
-    int blend = kind == 1 || spray || ui, cross = kind == 2, loose = kind == 3, full = kind == 4 || kind == 5 || kind == 10, geom = kind == 0 || cross || loose || fig || batch;
+    int spray = kind == 6 || glow, ui = kind == 7, fig = kind == 8, ovl = kind == 12 || kind == 13;
+    int blend = kind == 1 || spray || ui || ovl, cross = kind == 2, loose = kind == 3, full = kind == 4 || kind == 5 || kind == 10, geom = kind == 0 || cross || loose || fig || batch;
     VkShaderModule vs = batch ? shader(strata_quad_batch_vert, sizeof(strata_quad_batch_vert))
                       : fig ? shader(strata_figure_vert, sizeof(strata_figure_vert))
                       : ui ? shader(strata_ui_vert, sizeof(strata_ui_vert))
+                      : ovl ? shader(strata_overlay_vert, sizeof(strata_overlay_vert))
                       : spray ? shader(strata_particle_vert, sizeof(strata_particle_vert))
                       : cross ? shader(strata_cross_vert, sizeof(strata_cross_vert))
                       : loose ? shader(strata_loose_vert, sizeof(strata_loose_vert))
                       : full  ? shader(strata_fullscreen_vert, sizeof(strata_fullscreen_vert)) : shader(strata_quad_vert, sizeof(strata_quad_vert));
     VkShaderModule fs = ui ? shader(strata_ui_frag, sizeof(strata_ui_frag))
+                      : ovl ? shader(strata_overlay_frag, sizeof(strata_overlay_frag))
                       : spray ? shader(strata_particle_frag, sizeof(strata_particle_frag))
                       : kind == 4 ? shader(strata_light_frag, sizeof(strata_light_frag))
                       : kind == 10 ? shader(strata_gather_frag, sizeof(strata_gather_frag))
@@ -703,9 +712,13 @@ static int make_pipeline(int kind, VkPipeline *out) {
         { .location = 1, .binding = 0, .format = VK_FORMAT_R32G32B32A32_SFLOAT, .offset = 16 },
         { .location = 2, .binding = 0, .format = VK_FORMAT_R32G32B32A32_SFLOAT, .offset = 32 },
         { .location = 3, .binding = 0, .format = VK_FORMAT_R32G32B32A32_SFLOAT, .offset = 48 } };
+    /* an overlay item is twenty floats */
+    VkVertexInputBindingDescription obind = { .binding = 0, .stride = SV_OVL_FLOATS * 4, .inputRate = VK_VERTEX_INPUT_RATE_INSTANCE };
+    VkVertexInputAttributeDescription oattrs[5];
+    for (uint32_t i = 0; i < 5; i++) oattrs[i] = (VkVertexInputAttributeDescription){ .location = i, .binding = 0, .format = VK_FORMAT_R32G32B32A32_SFLOAT, .offset = 16 * i };
     VkPipelineVertexInputStateCreateInfo vin = { .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
-        .vertexBindingDescriptionCount = (full || fig || batch) ? 0 : 1, .pVertexBindingDescriptions = ui ? &ubind : spray ? &sbind : (loose ? &lbind : &bind),
-        .vertexAttributeDescriptionCount = (full || fig || batch) ? 0 : (ui ? 4 : spray ? 4 : (loose ? 4 : 2)), .pVertexAttributeDescriptions = ui ? uattrs : spray ? sattrs : (loose ? lattrs : attrs) };
+        .vertexBindingDescriptionCount = (full || fig || batch) ? 0 : 1, .pVertexBindingDescriptions = ovl ? &obind : ui ? &ubind : spray ? &sbind : (loose ? &lbind : &bind),
+        .vertexAttributeDescriptionCount = (full || fig || batch) ? 0 : (ovl ? 5 : ui ? 4 : spray ? 4 : (loose ? 4 : 2)), .pVertexAttributeDescriptions = ovl ? oattrs : ui ? uattrs : spray ? sattrs : (loose ? lattrs : attrs) };
     VkPipelineInputAssemblyStateCreateInfo ia = { .sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
         .topology = (cross || full || spray) ? VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST : VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP };
     VkPipelineViewportStateCreateInfo vp = { .sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO, .viewportCount = 1, .scissorCount = 1 };
@@ -715,7 +728,7 @@ static int make_pipeline(int kind, VkPipeline *out) {
     VkPipelineMultisampleStateCreateInfo ms = { .sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO, .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT };
     /* only the geometry pass writes depth; translucent quads test against it; full-screen passes ignore it */
     VkPipelineDepthStencilStateCreateInfo ds = { .sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO, .depthTestEnable = (full || ui) ? VK_FALSE : VK_TRUE,
-        .depthWriteEnable = geom ? VK_TRUE : VK_FALSE, .depthCompareOp = VK_COMPARE_OP_LESS };
+        .depthWriteEnable = geom ? VK_TRUE : VK_FALSE, .depthCompareOp = kind == 12 ? VK_COMPARE_OP_LESS_OR_EQUAL : kind == 13 ? VK_COMPARE_OP_GREATER : VK_COMPARE_OP_LESS };
     VkPipelineColorBlendAttachmentState cba[3];
     cba[0] = (VkPipelineColorBlendAttachmentState){ .blendEnable = blend ? VK_TRUE : VK_FALSE,
         .srcColorBlendFactor = glow ? VK_BLEND_FACTOR_ONE : VK_BLEND_FACTOR_SRC_ALPHA, .dstColorBlendFactor = glow ? VK_BLEND_FACTOR_ONE : VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA, .colorBlendOp = VK_BLEND_OP_ADD,
@@ -869,6 +882,31 @@ int64_t sv_ui_set(void *floats, int64_t nquads) {
     memcpy(g.ui_cpu, narr_data(floats), (size_t)n * SV_UI_FLOATS * sizeof(float));
     g.ui_n = (uint32_t)n;
     return n;
+}
+
+/* The overlay for the frames from now on: [nitems] items of 20 floats
+ * (Strata.Overlay.pack), drawn over the world after the translucent
+ * surfaces and before the 2D layer. They stay until the next call. Returns
+ * how many were taken; items past the capacity are dropped from the end and
+ * sv_stat(35) is how many the last call dropped. */
+int64_t sv_overlay_set(void *floats, int64_t nitems) {
+    g.ovl_dropped = 0;
+    if (!g.ok || !g.ovl_cpu || nitems <= 0 || !floats) { g.ovl_n = 0; return 0; }
+    int64_t have = narr_len(floats) / SV_OVL_FLOATS;
+    int64_t n = nitems < have ? nitems : have;
+    if (n > SV_OVL_ITEMS) { g.ovl_dropped = (uint64_t)(n - SV_OVL_ITEMS); n = SV_OVL_ITEMS; }
+    memcpy(g.ovl_cpu, narr_data(floats), (size_t)n * SV_OVL_FLOATS * sizeof(float));
+    g.ovl_n = (uint32_t)n;
+    return n;
+}
+
+/* The cutaway for the frames from now on: 36 floats (Strata.Overlay.cut_floats).
+ * Surfaces the cut hides are not drawn; light and shadow, which read the
+ * voxels, are unchanged. All zero (the start) cuts nothing. */
+int64_t sv_set_cut(void *floats) {
+    if (!g.ubo_map || !floats || narr_len(floats) < 36) return 0;
+    memcpy(g.ubo_map + UBO_CUT, narr_data(floats), 36 * sizeof(float));
+    return 1;
 }
 
 /* The window's size in points: what an interface is laid out on. */
@@ -2219,10 +2257,15 @@ int64_t sv_open_slots(int64_t w, int64_t h, int64_t capture_mouse, int64_t quad_
     if (!make_pipeline(6, &g.pipe_spray)) return 0;
     if (!make_pipeline(9, &g.pipe_glow)) return 0;
     if (!make_pipeline(7, &g.pipe_ui)) return 0;
+    if (!make_pipeline(12, &g.pipe_ovl)) return 0;
+    if (!make_pipeline(13, &g.pipe_ovl_thru)) return 0;
     if (!make_pipeline(8, &g.pipe_fig)) return 0;
     g.ui_cpu = calloc((size_t)SV_UI_QUADS * SV_UI_FLOATS, sizeof(float));
     if (!g.ui_cpu) return 0;
     g.ui_n = 0; g.ui_dropped = 0;
+    g.ovl_cpu = calloc((size_t)SV_OVL_ITEMS * SV_OVL_FLOATS, sizeof(float));
+    if (!g.ovl_cpu) return 0;
+    g.ovl_n = 0; g.ovl_dropped = 0;
     {   void *smap = NULL;
         if (!make_buffer((VkDeviceSize)SV_SPRAY_CAP * SV_SPRAY_FLOATS * 4, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &g.spray, &g.spray_mem, &smap)) return 0;
         g.spray_map = smap; memset(g.spray_map, 0, (size_t)SV_SPRAY_CAP * SV_SPRAY_FLOATS * 4);
@@ -2295,6 +2338,8 @@ int64_t sv_open_slots(int64_t w, int64_t h, int64_t capture_mouse, int64_t quad_
         F->stats_map = map; memset(F->stats_map, 0, 32);
         if (!make_buffer((VkDeviceSize)SV_UI_QUADS * SV_UI_FLOATS * 4, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, &F->ui, &F->ui_mem, &map)) return 0;
         F->ui_map = map;
+        if (!make_buffer((VkDeviceSize)2 * SV_OVL_ITEMS * SV_OVL_FLOATS * 4, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, &F->ovl, &F->ovl_mem, &map)) return 0;
+        F->ovl_map = map;
         if (!make_buffer(SV_GLYPH_STAGE, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, &F->gstage, &F->gstage_mem, &map)) return 0;
         F->gstage_map = map;
         /* the parts drawn, then (from SV_FIG_INST) the parts in the shadow map */
@@ -2454,6 +2499,8 @@ void sv_close(void) {
         if (g.pipe_gather) vkDestroyPipeline(g.dev, g.pipe_gather, NULL);
         if (g.pipe_composite) vkDestroyPipeline(g.dev, g.pipe_composite, NULL);
         if (g.pipe_ui) vkDestroyPipeline(g.dev, g.pipe_ui, NULL);
+        if (g.pipe_ovl) vkDestroyPipeline(g.dev, g.pipe_ovl, NULL);
+        if (g.pipe_ovl_thru) vkDestroyPipeline(g.dev, g.pipe_ovl_thru, NULL);
         if (g.pipe_fig) vkDestroyPipeline(g.dev, g.pipe_fig, NULL);
         fig_free();
         for (int f = 0; f < SV_FRAMES; f++) {
@@ -2461,6 +2508,8 @@ void sv_close(void) {
             if (g.frames[f].finst_mem) vkFreeMemory(g.dev, g.frames[f].finst_mem, NULL);
             if (g.frames[f].ui) vkDestroyBuffer(g.dev, g.frames[f].ui, NULL);
             if (g.frames[f].ui_mem) vkFreeMemory(g.dev, g.frames[f].ui_mem, NULL);
+            if (g.frames[f].ovl) vkDestroyBuffer(g.dev, g.frames[f].ovl, NULL);
+            if (g.frames[f].ovl_mem) vkFreeMemory(g.dev, g.frames[f].ovl_mem, NULL);
             if (g.frames[f].gstage) vkDestroyBuffer(g.dev, g.frames[f].gstage, NULL);
             if (g.frames[f].gstage_mem) vkFreeMemory(g.dev, g.frames[f].gstage_mem, NULL);
         }
@@ -2525,6 +2574,7 @@ void sv_close(void) {
     free(g.batch_slots); free(g.batch_at); free(g.motion); free(g.motion_box); g.motion = NULL; g.motion_box = NULL; free(g.batch_visible); free(g.batch_keys); free(g.batches);
     free(g.spray_births); g.spray_births = NULL;
     free(g.ui_cpu); g.ui_cpu = NULL; g.ui_n = 0;
+    free(g.ovl_cpu); g.ovl_cpu = NULL; g.ovl_n = 0;
     free(g.ubo_map); free(g.entries); if (g.cells) for (int i = 0; i < g.vn_old_cells; i++) free(g.cells[i].lamps); free(g.cells); g.vn_old_cells = 0; free(g.cell_page); free(g.free_pages); free(g.stage_light);
     for (uint32_t i = 0; i < g.nlq; i++) free(g.lq[i].bytes);
     free(g.lq);
@@ -2616,6 +2666,7 @@ double sv_stat(int64_t which) {
     if (which == 25) return g.spray_births ? (double)g.ring.overwritten : 0.0;
     if (which == 33) return (double)g.meet_last;
     if (which == 34) return (double)g.meet_total;
+    if (which == 35) return (double)g.ovl_dropped;
     return (which >= 0 && which < 6) ? g.stat[which] : -1.0;
 }
 int64_t sv_drawn_chunks(void) { return g.drawn_chunks; }
@@ -4071,6 +4122,24 @@ int64_t sv_frame(void) {
             vkCmdPushConstants(F->cmd, g.layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, 8, ppc);
             vkCmdDraw(F->cmd, 36, run, 0, first); draws++;      /* a cube's 36 vertices, or a square's 12 (strata_particles.h) */
             if (run < n) { vkCmdDraw(F->cmd, 36, n - run, 0, 0); draws++; }
+        }
+    }
+    /* the overlay: seen where nothing hides it, then faintly through what does (the items marked so) */
+    if (g.ovl_n > 0 && F->ovl_map) {
+        memcpy(F->ovl_map, g.ovl_cpu, (size_t)g.ovl_n * SV_OVL_FLOATS * 4);
+        vkCmdBindVertexBuffers(F->cmd, 0, 1, &F->ovl, &zero);
+        float seen[2] = { 1.0f, 0.0f }, thru[2] = { 0.35f, 0.0f };
+        vkCmdBindPipeline(F->cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g.pipe_ovl);
+        vkCmdPushConstants(F->cmd, g.layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, 8, seen);
+        vkCmdDraw(F->cmd, 4, g.ovl_n, 0, 0); draws++;
+        /* the items marked through, copied after the rest, drawn again from there */
+        uint32_t m = 0;
+        for (uint32_t i = 0; i < g.ovl_n; i++)
+            if (g.ovl_cpu[i * SV_OVL_FLOATS + 1] > 0.5f) { memcpy(F->ovl_map + (size_t)(g.ovl_n + m) * SV_OVL_FLOATS, g.ovl_cpu + (size_t)i * SV_OVL_FLOATS, SV_OVL_FLOATS * 4); m++; }
+        if (m > 0) {
+            vkCmdBindPipeline(F->cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g.pipe_ovl_thru);
+            vkCmdPushConstants(F->cmd, g.layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, 8, thru);
+            vkCmdDraw(F->cmd, 4, m, 0, g.ovl_n); draws++;
         }
     }
     /* the 2D layer over everything: this Frame's own copy of the quads, one draw */

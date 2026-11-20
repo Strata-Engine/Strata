@@ -44,6 +44,8 @@ build particle.vert fx.glsl tiles.glsl trace.glsl sky.glsl
 build particle.frag fx.glsl tiles.glsl trace.glsl sky.glsl
 build ui.vert
 build ui.frag tiles.glsl
+build overlay.vert
+build overlay.frag
 cp "$OUT" strata_shaders.h
 # strata_vk.c carries a stamp of the header, so a shader-only change still
 # changes the C source forge looks at

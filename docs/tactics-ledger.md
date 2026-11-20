@@ -1,2 +1,8 @@
 # Rulings made while building plugins and strata_tactics
 - Task 2: earlier owner wins a clash; the loser's binding is dropped and reported.
+- Task 4: overlay items are pulled 3 cm toward the eye in the vertex shader (no z-fighting); "through" items are copied after the rest in the frame's buffer and drawn again with the depth test inverted at 35% opacity. Pass kinds 12 and 13; dropped count is `Strata.Ffi.Vk.stat(35)`.
+- Task 5: a capsule hides only what is above its lower end, so the floor round the point it reaches stays (otherwise the camera's capsule to a unit would cut a hole in the ground round the unit). Cost if wrong: a game wanting a full capsule cut would need a flag.
+- Task 5: the cut scene uses the existing ruin scene (129) sliced 2 m above the ground in a 24 m box plus a capsule, not a purpose-built house with a figure: it shows the same thing (walls and trees cut, the ground and shadows kept) without new scene-building code. Cost if wrong: figures' obeying the cut is unshown here (they use the same G-buffer shader).
+- Task 5: known limitation: cut terrain shows the sky through its open interior (solid ground has no inner faces); a dark cap on cut solids is a follow-up. Cost: cut views of hillsides look hollow.
+- Task 6: Ruling: the frame type is `Strata.Plugin.PluginFrame`, not `Frame` — March has one global type namespace and `Frame` was taken. The tactics grid's types are `TileGrid` and `GridSettings` (Strata.Body.Grid exists). Cost if wrong: names only.
+- Tasks 4–5: Ruling: committed as one change — the overlay and cutaway edits interleave in strata_vk.c, ubo.glsl and the shader header (one generated file), so separate commits would not each build. Cost: one review range for both.
