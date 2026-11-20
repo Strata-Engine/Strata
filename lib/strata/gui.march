@@ -359,7 +359,7 @@ mod Strata.Gui do
       GLabel(s, _, _) -> (text_w(t, s), maxf(line, text_h(t, s)))
       GButton(_, s, _, _) -> (maxf(t.gt_min_w, text_w(t, s) +. 2.0 *. t.gt_pad), line)
       GToggle(_, s, _, _, _) -> (line *. 0.6 +. t.gt_gap +. text_w(t, s), line)
-      GSlider(_, s, _, _, hi, st, _, _) -> (body_x(t, s) +. 2.0 *. t.gt_min_w +. t.gt_gap +. text_w(t, format_value(hi, st)), line)
+      GSlider(_, s, _, _, hi, st, _, _) -> (body_x(t, s) +. 2.0 *. t.gt_min_w +. t.gt_gap +. value_w(t, hi, st), line)
       GField(_, s, _, _, _, _) -> (body_x(t, s) +. 2.0 *. t.gt_min_w, line)
       GChoice(_, s, os, _, _, _) -> (body_x(t, s) +. maxf(t.gt_min_w, widest(os, t, 0.0) +. 2.0 *. t.gt_pad +. line *. 0.5), line)
       GSpace(_, _) -> (0.0, 0.0)
@@ -612,12 +612,27 @@ mod Strata.Gui do
     clampf(stepped, a, b)
   end
 
+  -- the room a slider's value takes: its widest value, and at least five digits, so sliders in a column line up
+  pfn value_w(t : GTheme, hi : Float, st : Float) : Float do maxf(text_w(t, format_value(hi, st)), text_w(t, "00000")) end
+
+  -- the end of [s] from byte [k] on that fits in [room]: (the byte it starts at); a character is never cut
+  pfn fit_from(t : GTheme, s : String, k : Int, room : Float) : Int do
+    let n = string_byte_length(s)
+    if k >= n || text_w(t, string_slice(s, k, n - k)) <= room do k
+    else fit_from(t, s, next_char(s, k + 1), room) end
+  end
+
+  pfn next_char(s : String, k : Int) : Int do
+    if k >= string_byte_length(s) do k
+    else if int_and(char_to_int(head(string_chars(string_slice(s, k, 1)))), 192) == 128 do next_char(s, k + 1) else k end end
+  end
+
   -- a slider's track (x, width) in its rectangle
   pfn track_of(t : GTheme, n : GNode, r : (Float, Float, Float, Float)) : (Float, Float) do
     match (n, r) do
       (GSlider(_, s, _, _, hi, st, _, _), (x, _, w, _)) ->
         let x0 = x +. body_x(t, s) +. t.gt_line *. 0.2
-        let vw = text_w(t, format_value(hi, st)) +. t.gt_gap
+        let vw = value_w(t, hi, st) +. t.gt_gap
         (x0, maxf(1.0, w -. body_x(t, s) -. vw -. t.gt_line *. 0.4))
       _ -> (0.0, 1.0)
     end
@@ -863,14 +878,14 @@ mod Strata.Gui do
 
   pfn maxi(a : Int, b : Int) : Int do if a > b do a else b end end
 
-  -- move a region so the focused control is inside its viewport
-  pfn keep_seen(g : GStep, items : List(GItem), regions : List(GRegion)) : GStep do
+  -- move a region so the focused control is inside its viewport, clear of its edges by the padding
+  pfn keep_seen(t : GTheme, g : GStep, items : List(GItem), regions : List(GRegion)) : GStep do
     let s = state_of(g)
     match find_item(items, s.gs_focus) do
       Some(GItem(_, _, (_, y, _, h), _, sid)) ->
         match find_region(regions, sid) do
           Some(GRegion(rid, (_, vy, _, vh), tall, off, _, _)) ->
-            let pad = 4.0
+            let pad = t.gt_pad
             let top = vy +. pad
             let bottom = vy +. vh -. pad
             let off2 = if y < top do off -. (top -. y) else if y +. h > bottom do off +. (y +. h -. bottom) else off end end
@@ -958,9 +973,15 @@ mod Strata.Gui do
             let bx0 = x +. body_x(t, txt)
             let fr = (bx0, y, maxf(0.0, w -. body_x(t, txt)), h)
             let d = box(lab(ds, txt), fr, clip, t.gt_field)
-            let d2 = words_in(t, d, bx0 +. t.gt_pad, fr, clip, t.gt_text, now)
-            let caret = if s.gs_caret_of == id do s.gs_caret else string_byte_length(now) end
-            let cx = bx0 +. t.gt_pad +. text_w(t, string_slice(now, 0, clampi(caret, 0, string_byte_length(now))))
+            let caret = clampi(if s.gs_caret_of == id do s.gs_caret else string_byte_length(now) end, 0, string_byte_length(now))
+            -- a text wider than the field shows its end (the part up to the caret when focused)
+            let room = maxf(0.0, w -. body_x(t, txt) -. 2.0 *. t.gt_pad)
+            let upto = if id == s.gs_focus do caret else string_byte_length(now) end
+            let k = fit_from(t, string_slice(now, 0, upto), 0, room)
+            let shown0 = string_slice(now, k, string_byte_length(now) - k)
+            let shown = string_slice(shown0, 0, fit_len(t, shown0, string_byte_length(shown0), room))
+            let d2 = words_in(t, d, bx0 +. t.gt_pad, fr, clip, t.gt_text, shown)
+            let cx = bx0 +. t.gt_pad +. text_w(t, string_slice(now, k, caret - k))
             let d3 = if id == s.gs_focus do box(d2, (cx, y +. h *. 0.2, 2.0, h *. 0.6), clip, t.gt_accent) else d2 end
             if ringed do ring(t, d3, fr, clip) else d3 end
           GChoice(_, txt, os, c, _, _) ->
@@ -978,6 +999,17 @@ mod Strata.Gui do
           _ -> d1
         end
     end
+  end
+
+  -- the longest start of [s] that fits in [room], in bytes, on a character boundary
+  pfn fit_len(t : GTheme, s : String, n : Int, room : Float) : Int do
+    if n <= 0 || text_w(t, string_slice(s, 0, n)) <= room do (if n < 0 do 0 else n end)
+    else fit_len(t, s, back_char(s, n - 1), room) end
+  end
+
+  pfn back_char(s : String, k : Int) : Int do
+    if k <= 0 do 0
+    else if int_and(char_to_int(head(string_chars(string_slice(s, k, 1)))), 192) == 128 do back_char(s, k - 1) else k end end
   end
 
   pfn clampi(v : Int, lo : Int, hi : Int) : Int do if v < lo do lo else if v > hi do hi else v end end end
@@ -1045,7 +1077,7 @@ mod Strata.Gui do
     let g1 = pointer_step(t, g0, f, items0, regions0, sh)
     let keyed = pressed(f, "ui_next") || pressed(f, "ui_prev") || aimed(f, "ui_up") || aimed(f, "ui_down") || aimed(f, "ui_left") || aimed(f, "ui_right")
     let g2 = key_step(t, g1, f, items0)
-    let g3 = if keyed do keep_seen(g2, items0, regions0) else g2 end
+    let g3 = if keyed do keep_seen(t, g2, items0, regions0) else g2 end
     let s3 = state_of(g3)
     -- a moved pointer hides the ring a key showed
     let moved = match (f.gf_pointer, st.gs_last) do (Some((ax, ay)), Some((bx, stp))) -> Math.abs(ax -. bx) +. Math.abs(ay -. stp) > 2.0 | _ -> false end

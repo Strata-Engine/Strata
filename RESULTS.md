@@ -1413,3 +1413,21 @@ hence its factor of 7.7.
 Not measured: a world with many glass-heavy chunks (the viewer has one
 see-through block that collides), and flowing water in a chunk that also
 needs lists, which is re-meshed as it moves.
+
+## Interface toolkit (Strata.Gui): a typical screen's cost per frame
+
+The viewer's settings screen (`STRATA_SETTINGS=1 STRATA_GUI_TIMES=1`, scene 1,
+1280 x 800, M3 Max, load average about 10 after a stretch near 370): a panel,
+a scroll region of eleven rows (five sliders, a field, a choice list, a
+toggle, three labels), two buttons, and the choice list open — 225 quads.
+Each line is one frame in sixty, two runs of 300 frames.
+
+| | microseconds a frame |
+|---|---|
+| `tick`: read the actions, lay out, interact, build the draw list (`Strata.Gui.run`, text measured through `Strata.Text`) | 55 to 79 |
+| `paint`: the draw list into `Strata.Ui` and `Strata.Text` | 17 to 30 |
+| together | 72 to 109 |
+
+Under the design's goal of well under 0.2 ms. The layout measures text
+through C several times a control (fit, track, draw); if a larger screen
+needs it, the measures are the first thing to cache.
