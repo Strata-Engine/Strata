@@ -1,0 +1,134 @@
+-- Regions — a store's region files as a generation worker reads them.
+--
+-- Strata.Save owns a store; Strata.Stream's generation tasks read its
+-- regions. This module is what the two share, so neither names the other:
+-- where a region's file is, how it is read, and the RegionSource a task is
+-- handed (the folder, which regions have a file, and a snapshot of the
+-- regions already decoded).
+--
+-- A region is 8 x 8 x 8 level-0 chunks. It is named by a Strata.Coord.Key
+-- holding the region's coordinates (level 0), so regions key a
+-- Strata.Store as chunks do.
+mod Strata.Regions do
+
+  needs IO.FileSystem
+
+  alias Strata.Savefile as Rsv
+  alias Strata.Store as Rst
+  alias Strata.Coord as Rk
+
+  -- floor(v / 8) for any sign
+  pfn floor8(v : Int) : Int do if v >= 0 do v / 8 else 0 - ((7 - v) / 8) end end
+
+  doc "The region ([x], [y], [z]) as a key."
+  fn key_of(x : Int, y : Int, z : Int) : Strata.Coord.Key do Rk.key_at(x, y, z, 0) end
+
+  doc "The key of the region holding the chunk at [k]: its coordinates floor-divided by 8. Meant for level-0 keys; a coarser key answers the region of its first level-0 chunk."
+  fn of_chunk(k : Strata.Coord.Key) : Strata.Coord.Key do
+    let l = Rk.level(k)
+    let up = if l <= 0 do 0 else if l > 24 do 24 else l end end
+    key_of(floor8(int_shl(Rk.kx(k), up)), floor8(int_shl(Rk.ky(k), up)), floor8(int_shl(Rk.kz(k), up)))
+  end
+
+  doc "The file of region [rk] in the store folder [dir]: regions/r.<x>.<y>.<z>.bin."
+  fn path(dir : String, rk : Strata.Coord.Key) : String do
+    dir ++ "/regions/r." ++ int_to_string(Rk.kx(rk)) ++ "." ++ int_to_string(Rk.ky(rk)) ++ "." ++ int_to_string(Rk.kz(rk)) ++ ".bin"
+  end
+
+  doc "\"12\" or \"-12\" as an Int; None for anything else."
+  fn parse_int(s : String) : Option(Int) do
+    if string_starts_with(s, "-") do
+      match string_to_int(string_slice(s, 1, string_byte_length(s) - 1)) do
+        Some(v) -> Some(0 - v)
+        None -> None
+      end
+    else string_to_int(s) end
+  end
+
+  doc "The region a file name in regions/ names (\"r.<x>.<y>.<z>.bin\"), or None for any other name."
+  fn of_name(name : String) : Option(Strata.Coord.Key) do
+    match string_split(name, ".") do
+      Cons(r, Cons(xs, Cons(ys, Cons(zs, Cons(ext, Nil))))) ->
+        if r != "r" do None
+        else if ext != "bin" do None
+        else
+          match parse_int(xs) do
+            None -> None
+            Some(x) ->
+              match parse_int(ys) do
+                None -> None
+                Some(y) ->
+                  match parse_int(zs) do
+                    None -> None
+                    Some(z) -> Some(key_of(x, y, z))
+                  end
+              end
+          end
+        end end
+      _ -> None
+    end
+  end
+
+  -- What reading a region's file gave: no file, a file that does not
+  -- decode, or the region.
+  type RegionRead = RrAbsent | RrDamaged | RrGot(Strata.Savefile.Region)
+
+  doc "Read and decode the file of region [rk] in [dir]. Never panics: a missing or unreadable file is RrAbsent, one that does not decode RrDamaged."
+  fn read(dir : String, rk : Strata.Coord.Key) : RegionRead do
+    match Authority.must(File.read(path(dir, rk))) do
+      Err(_) -> RrAbsent
+      Ok(s) ->
+        match Rsv.decode_region(Bytes.from_string(s)) do
+          Ok(g) -> RrGot(g)
+          Err(_) -> RrDamaged
+        end
+    end
+  end
+
+  -- What a generation task is handed: the store's folder, the regions that
+  -- have a file, and the regions already decoded (a value: the task shares
+  -- nothing with the store).
+  type RegionSource = { rs_dir : String, rs_present : Strata.Store.Store(Bool), rs_cache : Strata.Store.Store(Strata.Savefile.Region) }
+
+  doc "An empty region, as a store's fill value."
+  fn no_region() : Strata.Savefile.Region do
+    { sr_generator: 0, sr_counter: 0, sr_chunks: Nil, sr_ops: Nil, sr_sections: Nil }
+  end
+
+  doc "A source over the folder [dir]: [present] the regions with a file, [cache] those already decoded."
+  fn source(dir : String, present : Strata.Store.Store(Bool), cache : Strata.Store.Store(Strata.Savefile.Region)) : RegionSource do
+    { rs_dir: dir, rs_present: present, rs_cache: cache }
+  end
+
+  doc "Does region [rk] have a file, as far as [src] knows?"
+  fn present(src : RegionSource, rk : Strata.Coord.Key) : Bool do Rst.has(src.rs_present, rk) end
+
+  doc "Is region [rk] already decoded in [src]?"
+  fn decoded(src : RegionSource, rk : Strata.Coord.Key) : Bool do Rst.has(src.rs_cache, rk) end
+
+  doc "The decoded region [rk] of [src], if it is there."
+  fn lookup(src : RegionSource, rk : Strata.Coord.Key) : Option(Strata.Savefile.Region) do
+    if Rst.has(src.rs_cache, rk) do Some(Rst.get(src.rs_cache, rk)) else None end
+  end
+
+  doc "The folder of [src]."
+  fn dir(src : RegionSource) : String do src.rs_dir end
+
+  doc "The saved chunk of [k] in region [g], if it has one."
+  fn chunk_in(g : Strata.Savefile.Region, k : Strata.Coord.Key) : Option(Strata.Chunk.Chunk) do chunk_go(g.sr_chunks, k) end
+  pfn chunk_go(l : List((Strata.Coord.Key, Strata.Chunk.Chunk)), k : Strata.Coord.Key) : Option(Strata.Chunk.Chunk) do
+    match l do
+      Nil -> None
+      Cons((k2, c), t) -> if Rk.key_eq(k2, k) do Some(c) else chunk_go(t, k) end
+    end
+  end
+
+  doc "The edits region [g] holds queued for [k], oldest first; Nil if none."
+  fn ops_in(g : Strata.Savefile.Region, k : Strata.Coord.Key) : List(Strata.World.Op) do ops_go(g.sr_ops, k) end
+  pfn ops_go(l : List((Strata.Coord.Key, List(Strata.World.Op))), k : Strata.Coord.Key) : List(Strata.World.Op) do
+    match l do
+      Nil -> Nil
+      Cons((k2, ops), t) -> if Rk.key_eq(k2, k) do ops else ops_go(t, k) end
+    end
+  end
+end

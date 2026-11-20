@@ -29,15 +29,54 @@ mod Strata.Save do
   needs IO.Clock      -- the lock's token: the clock's microseconds and the process id
   needs IO.Process    -- (IO.Random would be charged to every test module: GAPS S48)
 
-  alias Strata.Savefile as Svf
+  needs IO.Spawn      -- writes run as tasks
 
-  -- the folder; this store's lock token; the header as read or made (its
-  -- generator version is the stored one); the combined generator version
-  -- the game opened with, written at the next header write; dirty regions,
-  -- writes in flight, writes failed, files set aside; the last refusal or
-  -- failure
+  alias Strata.Savefile as Svf
+  alias Strata.Regions as Rgn
+  alias Strata.Store as Sto
+  alias Strata.World as Wv
+  alias Strata.Coord as Kv
+  alias Strata.Chunk as Ckv
+
+  -- A dirty region: the store's time at its last change, the level-0 keys
+  -- changed since its last write, and the region sections set since then.
+  type SvDirty = SvDirty(Float, Strata.Store.Store(Bool), List((String, Bytes)))
+  -- One changed key as a write task takes it: the key; 0 keep the saved
+  -- chunk, 1 put this chunk, 2 drop the saved chunk; the chunk; whether the
+  -- world's queue is the whole truth (the chunk is in memory) or follows
+  -- the saved queue; the world's queue, oldest first.
+  type SvChange = SvChange(Strata.Coord.Key, Int, Strata.Chunk.Chunk, Bool, List(Strata.World.Op))
+  -- What a region write answers: done?, the region now on disk (holding
+  -- nothing: its file is gone), and each chunk put with its content hash.
+  type SvWrote = SvWrote(Bool, Strata.Savefile.Region, List((Strata.Coord.Key, Int)))
+  -- A region write in flight: the region, what it was writing (dirty again
+  -- if it fails), the task.
+  type SvWrite = SvWrite(Strata.Coord.Key, SvDirty, Task(SvWrote))
+  -- A header write in flight: the header being written.
+  type SvHead = SvHead(Strata.Savefile.SaveHeader, Task(Bool))
+  -- A player record: id, the game's bytes, changed since its last write?
+  type SvPlayer = SvPlayer(Int, Bytes, Bool)
+  type SvPlayerWrite = SvPlayerWrite(Int, Task(Bool))
+
+  -- The folder; this store's lock token; the header as last read or
+  -- written (its generator version is the stored one); the combined
+  -- generator version the game runs, written at the next header write;
+  -- writes failed, files set aside, the last refusal or failure.
+  -- Then what saving as it plays keeps: the store's time (the sum of every
+  -- tick's dt); the world sections and entity snapshot as the game last set
+  -- them, whether the header must be written and when the slow pass (header
+  -- and players) last started a write; the player records; the dirty
+  -- regions; the decoded regions (at most `cache_cap`, each with the stamp
+  -- of its last use) and the regions that have a file; the writes in
+  -- flight; written chunks the world has yet to release; region files read.
   type SaveStore = { sv_dir : String, sv_token : String, sv_header : Strata.Savefile.SaveHeader, sv_generator : Int,
-                 sv_dirty : Int, sv_flight : Int, sv_failed : Int, sv_aside : Int, sv_reason : String }
+                 sv_failed : Int, sv_aside : Int, sv_reason : String,
+                 sv_time : Float, sv_sections : List((String, Bytes)), sv_entities : Option((NativeI32Arr, NativeF32Arr, NativeFloatArr)),
+                 sv_head_dirty : Bool, sv_slow_last : Float, sv_players : List(SvPlayer),
+                 sv_dirty : Strata.Store.Store(SvDirty), sv_cache : Strata.Store.Store(Strata.Savefile.Region), sv_used : Strata.Store.Store(Int), sv_clock : Int,
+                 sv_present : Strata.Store.Store(Bool),
+                 sv_writes : List(SvWrite), sv_heads : List(SvHead), sv_player_writes : List(SvPlayerWrite),
+                 sv_owed : List((Strata.Coord.Key, Int)), sv_reads : Int }
 
   pfn header_path(d : String) : String do d ++ "/store.bin" end
   pfn lock_path(d : String) : String do d ++ "/store.lock" end
@@ -253,8 +292,14 @@ mod Strata.Save do
             match take_lock(dir, token) do
               Err(e) -> Err(e)
               Ok(_) ->
+                let (players, bad) = load_players(players_dir(dir), names_in(players_dir(dir)), Nil, 0)
                 Ok(({ sv_dir: dir, sv_token: token, sv_header: h, sv_generator: gv,
-                      sv_dirty: 0, sv_flight: 0, sv_failed: 0, sv_aside: 0, sv_reason: "" }, Strata.World.log_changes(w, true)))
+                      sv_failed: 0, sv_aside: bad, sv_reason: if bad > 0 do "damaged player record" else "" end,
+                      sv_time: 0.0, sv_sections: h.sh_sections, sv_entities: h.sh_entities,
+                      sv_head_dirty: h.sh_generator != gv, sv_slow_last: 0.0, sv_players: players,
+                      sv_dirty: Sto.empty(SvDirty(0.0, Sto.empty(false), Nil)), sv_cache: Sto.empty(Rgn.no_region()), sv_used: Sto.empty(0), sv_clock: 0,
+                      sv_present: present_in(names_in(regions_dir(dir)), Sto.empty(false)),
+                      sv_writes: Nil, sv_heads: Nil, sv_player_writes: Nil, sv_owed: Nil, sv_reads: 0 }, Strata.World.log_changes(w, true)))
             end
           end
       end
@@ -283,8 +328,10 @@ mod Strata.Save do
   doc "The store's folder."
   fn dir(s : SaveStore) : String do s.sv_dir end
 
-  doc "(dirty regions, writes in flight, writes failed, files set aside)."
-  fn stats(s : SaveStore) : (Int, Int, Int, Int) do (s.sv_dirty, s.sv_flight, s.sv_failed, s.sv_aside) end
+  doc "(dirty regions waiting for a write, writes in flight (regions, the header, players), writes failed, files set aside)."
+  fn stats(s : SaveStore) : (Int, Int, Int, Int) do
+    (Sto.size(s.sv_dirty), List.length(s.sv_writes) + List.length(s.sv_heads) + List.length(s.sv_player_writes), s.sv_failed, s.sv_aside)
+  end
 
   doc "The last refusal or failure, \"\" if none."
   fn reason(s : SaveStore) : String do s.sv_reason end
@@ -317,5 +364,642 @@ mod Strata.Save do
     let l = Strata.Coord.level(k)
     let up = if l <= 0 do 0 else if l > 24 do 24 else l end end
     (floor8(int_shl(Strata.Coord.kx(k), up)), floor8(int_shl(Strata.Coord.ky(k), up)), floor8(int_shl(Strata.Coord.kz(k), up)))
+  end
+
+  -- ── What open reads ──────────────────────────────────────────────────────
+
+  -- the regions that have a file, from the names in regions/
+  pfn present_in(ns : List(String), acc : Strata.Store.Store(Bool)) : Strata.Store.Store(Bool) do
+    match ns do
+      Nil -> acc
+      Cons(n, t) ->
+        match Rgn.of_name(n) do
+          Some(rk) -> present_in(t, Sto.put(acc, rk, true))
+          None -> present_in(t, acc)
+        end
+    end
+  end
+
+  pfn player_path(d : String, id : Int) : String do players_dir(d) ++ "/" ++ int_to_string(id) ++ ".bin" end
+
+  -- "<id>.bin" as its id
+  pfn player_id(name : String) : Option(Int) do
+    if !string_ends_with(name, ".bin") do None
+    else Rgn.parse_int(string_slice(name, 0, string_byte_length(name) - 4)) end
+  end
+
+  -- every player record in folder pd (names ns); a file that does not
+  -- decode is set aside as .bad and counted
+  pfn load_players(pd : String, ns : List(String), acc : List(SvPlayer), bad : Int) : (List(SvPlayer), Int) do
+    match ns do
+      Nil -> (List.reverse(acc), bad)
+      Cons(n, t) ->
+        match player_id(n) do
+          None -> load_players(pd, t, acc, bad)
+          Some(id) ->
+            match read_file(pd ++ "/" ++ n) do
+              None -> load_players(pd, t, acc, bad)
+              Some(b) ->
+                match Svf.decode_player(b) do
+                  Ok(rec) -> load_players(pd, t, Cons(SvPlayer(id, rec, false), acc), bad)
+                  Err(_) ->
+                    let _aside = set_aside(pd ++ "/" ++ n)
+                    load_players(pd, t, acc, bad + 1)
+                end
+            end
+        end
+    end
+  end
+
+  -- ── Fixed values ─────────────────────────────────────────────────────────
+  doc "Seconds a region must go unchanged before it is written: 2.0."
+  fn quiet_time() : Float do 2.0 end
+  doc "Seconds between header (and player) writes at the most: 5.0."
+  fn header_interval() : Float do 5.0 end
+  doc "How many decoded regions the store keeps: 16, least recently used out."
+  fn cache_cap() : Int do 16 end
+  -- written chunks the world gives up per tick (each costs a hash and a coarse copy on the caller's thread)
+  pfn release_budget() : Int do 2 end
+
+  -- ── The game's data ──────────────────────────────────────────────────────
+
+  pfn put_named(l : List((String, Bytes)), name : String, b : Bytes) : List((String, Bytes)) do
+    match l do
+      Nil -> Cons((name, b), Nil)
+      Cons((n, v), t) -> if n == name do Cons((name, b), t) else Cons((n, v), put_named(t, name, b)) end
+    end
+  end
+  pfn get_named(l : List((String, Bytes)), name : String) : Option(Bytes) do
+    match l do
+      Nil -> None
+      Cons((n, v), t) -> if n == name do Some(v) else get_named(t, name) end
+    end
+  end
+
+  doc "Set the world section [name] to [b]: the header is written with it on the next header interval, by a worker. Only the value held then is written, so setting a section every frame costs a list update, whatever its size."
+  fn set_section(s : SaveStore, name : String, b : Bytes) : SaveStore do
+    { s with sv_sections: put_named(s.sv_sections, name, b), sv_head_dirty: true }
+  end
+
+  doc "The world section [name] as last set, or as read at `open`."
+  fn section(s : SaveStore, name : String) : Option(Bytes) do get_named(s.sv_sections, name) end
+
+  doc "Hand the store an entity snapshot's three arrays (`Strata.Entities.snapshot_arrays`); the header is written with the latest on the next header interval. The arrays must not be written to afterwards."
+  fn set_entities(s : SaveStore, snap : (NativeI32Arr, NativeF32Arr, NativeFloatArr)) : SaveStore do
+    { s with sv_entities: Some(snap), sv_head_dirty: true }
+  end
+
+  doc "The entity snapshot read at `open` (or last set), for `Strata.Entities.snapshot_of` and `restore`; None for a store without one."
+  fn entities(s : SaveStore) : Option((NativeI32Arr, NativeF32Arr, NativeFloatArr)) do s.sv_entities end
+
+  doc "Record that the game's generator is now at version [v] (after `Strata.World.regenerate`): written at the next header write; regions first written from now on carry it."
+  fn set_generator_version(s : SaveStore, v : Int) : SaveStore do
+    { s with sv_generator: combined(v), sv_head_dirty: true }
+  end
+
+  pfn put_player(l : List(SvPlayer), id : Int, b : Bytes) : List(SvPlayer) do
+    match l do
+      Nil -> Cons(SvPlayer(id, b, true), Nil)
+      Cons(SvPlayer(i, v, d), t) -> if i == id do Cons(SvPlayer(id, b, true), t) else Cons(SvPlayer(i, v, d), put_player(t, id, b)) end
+    end
+  end
+
+  doc "Set player [id]'s record to [b]: written to players/<id>.bin on the next header interval, by a worker."
+  fn set_player(s : SaveStore, id : Int, b : Bytes) : SaveStore do { s with sv_players: put_player(s.sv_players, id, b) } end
+
+  doc "Player [id]'s record as last set or as read at `open`; None when there is none (a damaged file was set aside at `open`)."
+  fn player(s : SaveStore, id : Int) : Option(Bytes) do player_go(s.sv_players, id) end
+  pfn player_go(l : List(SvPlayer), id : Int) : Option(Bytes) do
+    match l do
+      Nil -> None
+      Cons(SvPlayer(i, v, _), t) -> if i == id do Some(v) else player_go(t, id) end
+    end
+  end
+
+  doc "The ids of the players with a record."
+  fn players(s : SaveStore) : List(Int) do List.map(s.sv_players, fn p -> match p do SvPlayer(i, _, _) -> i end) end
+
+  -- ── The decoded regions ──────────────────────────────────────────────────
+
+  -- the least recently used region of the cache
+  pfn oldest(used : Strata.Store.Store(Int)) : Option(Strata.Coord.Key) do
+    let (found, _) = Sto.fold(used, (None, 0), fn (acc, k, v) ->
+      let (best, bv) = acc
+      match best do
+        None -> (Some(k), v)
+        Some(_) -> if v < bv do (Some(k), v) else acc end
+      end)
+    found
+  end
+  pfn trim_cache(s : SaveStore) : SaveStore do
+    if Sto.size(s.sv_cache) <= cache_cap() do s
+    else
+      match oldest(s.sv_used) do
+        None -> s
+        Some(k) -> trim_cache({ s with sv_cache: Sto.remove(s.sv_cache, k), sv_used: Sto.remove(s.sv_used, k) })
+      end
+    end
+  end
+  pfn cache_put(s : SaveStore, rk : Strata.Coord.Key, g : Strata.Savefile.Region) : SaveStore do
+    trim_cache({ s with sv_cache: Sto.put(s.sv_cache, rk, g), sv_used: Sto.put(s.sv_used, rk, s.sv_clock + 1), sv_clock: s.sv_clock + 1 })
+  end
+  pfn cache_drop(s : SaveStore, rk : Strata.Coord.Key) : SaveStore do
+    { s with sv_cache: Sto.remove(s.sv_cache, rk), sv_used: Sto.remove(s.sv_used, rk) }
+  end
+
+  pfn holds_nothing(g : Strata.Savefile.Region) : Bool do
+    match g.sr_chunks do
+      Cons(_, _) -> false
+      Nil ->
+        match g.sr_ops do
+          Cons(_, _) -> false
+          Nil ->
+            match g.sr_sections do
+              Cons(_, _) -> false
+              Nil -> true
+            end
+        end
+    end
+  end
+
+  pfn region_name(rk : Strata.Coord.Key) : String do
+    "r." ++ int_to_string(Kv.kx(rk)) ++ "." ++ int_to_string(Kv.ky(rk)) ++ "." ++ int_to_string(Kv.kz(rk))
+  end
+
+  -- Region rk as the disk holds it, through the cache: read on the caller's
+  -- thread the first time (a region nothing has loaded yet). A file that
+  -- does not decode is set aside and counted, and the region is empty.
+  pfn region_now(s : SaveStore, rk : Strata.Coord.Key) : (SaveStore, Strata.Savefile.Region) do
+    if Sto.has(s.sv_cache, rk) do ({ s with sv_used: Sto.put(s.sv_used, rk, s.sv_clock + 1), sv_clock: s.sv_clock + 1 }, Sto.get(s.sv_cache, rk))
+    else if !Sto.has(s.sv_present, rk) do (s, Rgn.no_region())
+    else
+      match Rgn.read(s.sv_dir, rk) do
+        RrGot(g) -> (cache_put({ s with sv_reads: s.sv_reads + 1 }, rk, g), g)
+        RrAbsent -> ({ s with sv_present: Sto.remove(s.sv_present, rk), sv_reads: s.sv_reads + 1 }, Rgn.no_region())
+        RrDamaged ->
+          let _aside = set_aside(Rgn.path(s.sv_dir, rk))
+          ({ s with sv_present: Sto.remove(s.sv_present, rk), sv_reads: s.sv_reads + 1, sv_aside: s.sv_aside + 1, sv_reason: "damaged region " ++ region_name(rk) }, Rgn.no_region())
+      end
+    end end
+  end
+
+  -- ── Region sections ──────────────────────────────────────────────────────
+
+  pfn dirty_of(s : SaveStore, rk : Strata.Coord.Key) : SvDirty do
+    if Sto.has(s.sv_dirty, rk) do Sto.get(s.sv_dirty, rk) else SvDirty(s.sv_time, Sto.empty(false), Nil) end
+  end
+
+  doc "Set region [region]'s section [name] to [b]: the region is dirty, and is written with it after the quiet time."
+  fn set_region_section(s : SaveStore, region : (Int, Int, Int), name : String, b : Bytes) : SaveStore do
+    let (x, y, z) = region
+    let rk = Rgn.key_of(x, y, z)
+    match dirty_of(s, rk) do
+      SvDirty(_, keys, secs) -> { s with sv_dirty: Sto.put(s.sv_dirty, rk, SvDirty(s.sv_time, keys, put_named(secs, name, b))) }
+    end
+  end
+
+  -- a section set and not yet collected: waiting in the dirty region, or in a write in flight
+  pfn flying_section(ws : List(SvWrite), rk : Strata.Coord.Key, name : String) : Option(Bytes) do
+    match ws do
+      Nil -> None
+      Cons(SvWrite(k, SvDirty(_, _, secs), _), t) ->
+        if Kv.key_eq(k, rk) do
+          match get_named(secs, name) do
+            Some(b) -> Some(b)
+            None -> flying_section(t, rk, name)
+          end
+        else flying_section(t, rk, name) end
+    end
+  end
+
+  doc "Region [region]'s section [name]: as last set, else as its file holds it. A region the store has not decoded yet is read from disk here, on the caller's thread, each time: read a region's sections when the game reaches the region, not every frame."
+  fn region_section(s : SaveStore, region : (Int, Int, Int), name : String) : Option(Bytes) do
+    let (x, y, z) = region
+    let rk = Rgn.key_of(x, y, z)
+    let waiting = match dirty_of(s, rk) do SvDirty(_, _, secs) -> get_named(secs, name) end
+    match waiting do
+      Some(b) -> Some(b)
+      None ->
+        match flying_section(s.sv_writes, rk, name) do
+          Some(b) -> Some(b)
+          None ->
+            let (_, g) = region_now(s, rk)
+            get_named(g.sr_sections, name)
+        end
+    end
+  end
+
+  -- ── The region write, on a worker ────────────────────────────────────────
+
+  pfn ints_eq(a : List(Int), b : List(Int)) : Bool do
+    match a do
+      Nil -> match b do
+          Nil -> true
+          _ -> false
+        end
+      Cons(x, at) ->
+        match b do
+          Nil -> false
+          Cons(y, bt) -> if x != y do false else ints_eq(at, bt) end
+        end
+    end
+  end
+  pfn op_eq(a : Strata.World.Op, b : Strata.World.Op) : Bool do
+    let (ta, fa) = Wv.op_fields(a)
+    let (tb, fb) = Wv.op_fields(b)
+    if ta != tb do false else ints_eq(fa, fb) end
+  end
+  pfn ops_eq(a : List(Strata.World.Op), b : List(Strata.World.Op)) : Bool do
+    match a do
+      Nil -> match b do
+          Nil -> true
+          _ -> false
+        end
+      Cons(x, at) ->
+        match b do
+          Nil -> false
+          Cons(y, bt) -> if !op_eq(x, y) do false else ops_eq(at, bt) end
+        end
+    end
+  end
+
+  -- The saved queue followed by the world's: the world's edits are newer.
+  -- A write that has already put the world's queue after the saved one
+  -- leaves the saved queue ending with it, so the longest start of [mem]
+  -- that [disk] already ends with is not written twice. (Applying a queue's
+  -- tail a second time changes nothing: each edit overwrites.)
+  pfn merge_ops(disk : List(Strata.World.Op), mem : List(Strata.World.Op)) : List(Strata.World.Op) do
+    let nd = List.length(disk)
+    let nm = List.length(mem)
+    merge_go(disk, mem, nd, if nd < nm do nd else nm end)
+  end
+  pfn merge_go(disk : List(Strata.World.Op), mem : List(Strata.World.Op), nd : Int, n : Int) : List(Strata.World.Op) do
+    if n <= 0 do List.append(disk, mem)
+    else if ops_eq(List.drop(disk, nd - n), List.take(mem, n)) do List.append(disk, List.drop(mem, n))
+    else merge_go(disk, mem, nd, n - 1) end end
+  end
+
+  -- what a job has made of its changes so far: the kinds by key, chunks to
+  -- put (newest first), queues to put, hashes, and whether nothing differs
+  -- from the old region
+  type SvFold = SvFold(Strata.Store.Store(Int), List((Strata.Coord.Key, Strata.Chunk.Chunk)), List((Strata.Coord.Key, List(Strata.World.Op))), List((Strata.Coord.Key, Int)), Bool)
+
+  pfn fold_change(old : Strata.Savefile.Region, f : SvFold, c : SvChange) : SvFold do
+    match f do
+      SvFold(kinds, chs, qs, hs, same) ->
+        match c do
+          SvChange(k, kind, chunk, whole, mem) ->
+            let was = Rgn.chunk_in(old, k)
+            let disk_q = Rgn.ops_in(old, k)
+            let q = if whole do mem else merge_ops(disk_q, mem) end
+            let same_q = ops_eq(q, disk_q)
+            let qs2 = match q do
+              Nil -> qs
+              _ -> Cons((k, q), qs)
+            end
+            if kind == 1 do
+              let h = Ckv.hash(chunk)
+              let same_c = match was do
+                Some(o) -> Ckv.hash(o) == h
+                None -> false
+              end
+              SvFold(Sto.put(kinds, k, 1), Cons((k, chunk), chs), qs2, Cons((k, h), hs), if same_c do (if same_q do same else false end) else false end)
+            else if kind == 2 do
+              let gone = match was do
+                Some(_) -> false
+                None -> true
+              end
+              SvFold(Sto.put(kinds, k, 2), chs, qs2, hs, if gone do (if same_q do same else false end) else false end)
+            else
+              match was do
+                Some(o) -> SvFold(Sto.put(kinds, k, 0), Cons((k, o), chs), qs2, hs, if same_q do same else false end)
+                None -> SvFold(Sto.put(kinds, k, 0), chs, qs2, hs, if same_q do same else false end)
+              end
+            end end
+        end
+    end
+  end
+
+  pfn merge_sections(old : List((String, Bytes)), set : List((String, Bytes))) : List((String, Bytes)) do
+    match set do
+      Nil -> old
+      Cons((n, b), t) -> merge_sections(put_named(old, n, b), t)
+    end
+  end
+
+  -- The region to write: [old] with each change folded in. Chunks and
+  -- queues of keys that did not change keep their order; changed ones follow.
+  pfn region_after(old : Strata.Savefile.Region, changes : List(SvChange), sections : List((String, Bytes)), generator : Int, counter : Int) : (Strata.Savefile.Region, List((Strata.Coord.Key, Int)), Bool) do
+    match List.fold_left(changes, SvFold(Sto.empty(-1), Nil, Nil, Nil, true), fn (f, c) -> fold_change(old, f, c)) do
+      SvFold(kinds, chs, qs, hs, same) ->
+        let kept_c = List.filter(old.sr_chunks, fn p -> match p do (k, _) -> !Sto.has(kinds, k) end)
+        let kept_q = List.filter(old.sr_ops, fn p -> match p do (k, _) -> !Sto.has(kinds, k) end)
+        let no_secs = match sections do
+          Nil -> true
+          _ -> false
+        end
+        let gen = if holds_nothing(old) do generator else old.sr_generator end
+        ({ sr_generator: gen, sr_counter: counter, sr_chunks: List.append(kept_c, List.reverse(chs)), sr_ops: List.append(kept_q, List.reverse(qs)),
+           sr_sections: merge_sections(old.sr_sections, sections) }, hs, if no_secs do same else false end)
+    end
+  end
+
+  -- On a worker: make the region and put it on disk. A region that comes
+  -- out as the disk already holds it is not written again; one that holds
+  -- nothing has its file deleted.
+  pfn region_job(path : String, old : Strata.Savefile.Region, changes : List(SvChange), sections : List((String, Bytes)), generator : Int, counter : Int) : SvWrote do
+    let (g, hs, same) = region_after(old, changes, sections, generator, counter)
+    if same do SvWrote(true, old, hs)
+    else if holds_nothing(g) do
+      let _gone = delete_file(path)
+      SvWrote(!exists_at(path), g, hs)
+    else SvWrote(write_atomic(path, Svf.encode_region(g)), g, hs) end end
+  end
+
+  pfn header_job(path : String, h : Strata.Savefile.SaveHeader) : Bool do write_atomic(path, Svf.encode_header(h)) end
+  pfn player_job(path : String, b : Bytes) : Bool do write_atomic(path, Svf.encode_player(b)) end
+
+  -- ── Dirty regions ────────────────────────────────────────────────────────
+
+  -- each changed key's region is dirty, its quiet clock starting again
+  pfn mark_dirty(s : SaveStore, keys : List(Strata.Coord.Key)) : SaveStore do
+    match keys do
+      Nil -> s
+      Cons(k, t) ->
+        let rk = Rgn.of_chunk(k)
+        match dirty_of(s, rk) do
+          SvDirty(_, ks, secs) -> mark_dirty({ s with sv_dirty: Sto.put(s.sv_dirty, rk, SvDirty(s.sv_time, Sto.put(ks, k, true), secs)) }, t)
+        end
+    end
+  end
+
+  pfn writing(ws : List(SvWrite), rk : Strata.Coord.Key) : Bool do
+    match ws do
+      Nil -> false
+      Cons(SvWrite(k, _, _), t) -> if Kv.key_eq(k, rk) do true else writing(t, rk) end
+    end
+  end
+
+  -- the dirty region quiet for [quiet] seconds whose clock ran out longest ago, no write of it in flight
+  pfn next_region(s : SaveStore, quiet : Float) : Option(Strata.Coord.Key) do
+    let ws = s.sv_writes
+    let now = s.sv_time
+    let (found, _) = Sto.fold(s.sv_dirty, (None, 0.0), fn (acc, rk, d) ->
+      let (best, bt) = acc
+      match d do
+        SvDirty(last, _, _) ->
+          if now -. last < quiet do acc
+          else if writing(ws, rk) do acc
+          else
+            match best do
+              None -> (Some(rk), last)
+              Some(_) -> if last < bt do (Some(rk), last) else acc end
+            end
+          end end
+      end)
+    found
+  end
+
+  -- the changes of [keys], each with what the world holds for it: chs and
+  -- qs are `Strata.World.region_values` of the same keys, so they follow
+  -- the keys' order
+  pfn changes_of(w : Strata.World.World, keys : List(Strata.Coord.Key), chs : List((Strata.Coord.Key, Strata.Chunk.Chunk)), qs : List((Strata.Coord.Key, List(Strata.World.Op))), acc : List(SvChange)) : List(SvChange) do
+    match keys do
+      Nil -> List.reverse(acc)
+      Cons(k, t) ->
+        let (mem, qs2) = match qs do
+          Nil -> (Nil, qs)
+          Cons((qk, ops), qt) -> if Kv.key_eq(qk, k) do (ops, qt) else (Nil, qs) end
+        end
+        match chs do
+          Nil -> changes_of(w, t, chs, qs2, Cons(change_without(w, k, mem), acc))
+          Cons((ck, c), ct) ->
+            if Kv.key_eq(ck, k) do changes_of(w, t, ct, qs2, Cons(SvChange(k, 1, c, true, mem), acc))
+            else changes_of(w, t, chs, qs2, Cons(change_without(w, k, mem), acc)) end
+        end
+    end
+  end
+  -- a changed key the world gives no chunk for: loaded, it was edited back
+  -- to its generation (drop the saved copy); away, its chunk is on disk
+  -- and only there (keep it; the saved queue is followed by the world's)
+  pfn change_without(w : Strata.World.World, k : Strata.Coord.Key, mem : List(Strata.World.Op)) : SvChange do
+    if Wv.is_loaded(w, k) do SvChange(k, 2, Ckv.uniform(0), true, mem) else SvChange(k, 0, Ckv.uniform(0), false, mem) end
+  end
+
+  pfn spawn_region(path : String, old : Strata.Savefile.Region, changes : List(SvChange), sections : List((String, Bytes)), generator : Int, counter : Int) : Task(SvWrote) do
+    task_spawn(fn _ -> region_job(path, old, changes, sections, generator, counter))
+  end
+
+  -- start the write of dirty region rk
+  pfn start_region(s : SaveStore, w : Strata.World.World, rk : Strata.Coord.Key) : SaveStore do
+    let d = Sto.get(s.sv_dirty, rk)
+    match d do
+      SvDirty(_, ks, secs) ->
+        let (s1, old) = region_now(s, rk)
+        let keys = Sto.keys(ks)
+        let (chs, qs) = Wv.region_values(w, keys)
+        let task = spawn_region(Rgn.path(s1.sv_dir, rk), old, changes_of(w, keys, chs, qs, Nil), secs, s1.sv_generator, s1.sv_header.sh_counter)
+        { s1 with sv_dirty: Sto.remove(s1.sv_dirty, rk), sv_writes: Cons(SvWrite(rk, d, task), s1.sv_writes) }
+    end
+  end
+
+  -- start region writes: one (a tick), or every dirty region whatever its quiet clock (a flush)
+  pfn start_regions(s : SaveStore, w : Strata.World.World, every : Bool) : SaveStore do
+    match next_region(s, if every do -1.0 else quiet_time() end) do
+      None -> s
+      Some(rk) ->
+        let s2 = start_region(s, w, rk)
+        if every do start_regions(s2, w, every) else s2 end
+    end
+  end
+
+  -- ── Collecting writes ────────────────────────────────────────────────────
+
+  -- a failed write's region is dirty again with what it was writing, under whatever changed meanwhile
+  pfn dirty_again(s : SaveStore, rk : Strata.Coord.Key, d : SvDirty) : SaveStore do
+    match d do
+      SvDirty(_, ks, secs) ->
+        match dirty_of(s, rk) do
+          SvDirty(_, ks2, secs2) ->
+            let keys = List.fold_left(Sto.keys(ks), ks2, fn (acc, k) -> Sto.put(acc, k, true))
+            { s with sv_dirty: Sto.put(s.sv_dirty, rk, SvDirty(s.sv_time, keys, merge_sections(secs, secs2))) }
+        end
+    end
+  end
+
+  pfn region_done(s : SaveStore, rk : Strata.Coord.Key, d : SvDirty, r : Result(SvWrote, String)) : SaveStore do
+    let failed = { s with sv_failed: s.sv_failed + 1, sv_reason: "cannot write region " ++ region_name(rk) }
+    match r do
+      Err(_) -> dirty_again(failed, rk, d)
+      Ok(SvWrote(ok, g, hs)) ->
+        if !ok do dirty_again(failed, rk, d)
+        else
+          let owed = List.append(hs, s.sv_owed)
+          if holds_nothing(g) do cache_drop({ s with sv_present: Sto.remove(s.sv_present, rk), sv_owed: owed }, rk)
+          else cache_put({ s with sv_present: Sto.put(s.sv_present, rk, true), sv_owed: owed }, rk, g) end
+        end
+    end
+  end
+
+  -- fold in the region writes that have finished (all of them, waiting, when [wait])
+  pfn collect_regions(s : SaveStore, ws : List(SvWrite), wait : Bool, still : List(SvWrite)) : SaveStore do
+    match ws do
+      Nil -> { s with sv_writes: List.append(List.reverse(still), s.sv_writes) }
+      Cons(SvWrite(rk, d, t), rest) ->
+        if wait do collect_regions(region_done(s, rk, d, task_await(t)), rest, wait, still)
+        else
+          match task_poll(t) do
+            None -> collect_regions(s, rest, wait, Cons(SvWrite(rk, d, t), still))
+            Some(r) -> collect_regions(region_done(s, rk, d, r), rest, wait, still)
+          end
+        end
+    end
+  end
+
+  pfn written(r : Result(Bool, String)) : Bool do
+    match r do
+      Ok(b) -> b
+      Err(_) -> false
+    end
+  end
+  pfn head_done(s : SaveStore, h : Strata.Savefile.SaveHeader, ok : Bool) : SaveStore do
+    if ok do { s with sv_header: h }
+    else { s with sv_head_dirty: true, sv_failed: s.sv_failed + 1, sv_reason: "cannot write the header" } end
+  end
+  pfn collect_heads(s : SaveStore, hs : List(SvHead), wait : Bool, still : List(SvHead)) : SaveStore do
+    match hs do
+      Nil -> { s with sv_heads: List.append(List.reverse(still), s.sv_heads) }
+      Cons(SvHead(h, t), rest) ->
+        if wait do collect_heads(head_done(s, h, written(task_await(t))), rest, wait, still)
+        else
+          match task_poll(t) do
+            None -> collect_heads(s, rest, wait, Cons(SvHead(h, t), still))
+            Some(r) -> collect_heads(head_done(s, h, written(r)), rest, wait, still)
+          end
+        end
+    end
+  end
+
+  pfn player_dirty(l : List(SvPlayer), id : Int) : List(SvPlayer) do
+    match l do
+      Nil -> Nil
+      Cons(SvPlayer(i, v, d), t) -> if i == id do Cons(SvPlayer(i, v, true), t) else Cons(SvPlayer(i, v, d), player_dirty(t, id)) end
+    end
+  end
+  pfn player_done(s : SaveStore, id : Int, ok : Bool) : SaveStore do
+    if ok do s
+    else { s with sv_players: player_dirty(s.sv_players, id), sv_failed: s.sv_failed + 1, sv_reason: "cannot write player " ++ int_to_string(id) } end
+  end
+  pfn collect_players(s : SaveStore, ps : List(SvPlayerWrite), wait : Bool, still : List(SvPlayerWrite)) : SaveStore do
+    match ps do
+      Nil -> { s with sv_player_writes: List.append(List.reverse(still), s.sv_player_writes) }
+      Cons(SvPlayerWrite(id, t), rest) ->
+        if wait do collect_players(player_done(s, id, written(task_await(t))), rest, wait, still)
+        else
+          match task_poll(t) do
+            None -> collect_players(s, rest, wait, Cons(SvPlayerWrite(id, t), still))
+            Some(r) -> collect_players(player_done(s, id, written(r)), rest, wait, still)
+          end
+        end
+    end
+  end
+
+  pfn collect(s : SaveStore, wait : Bool) : SaveStore do
+    let s1 = collect_regions({ s with sv_writes: Nil }, s.sv_writes, wait, Nil)
+    let s2 = collect_heads({ s1 with sv_heads: Nil }, s1.sv_heads, wait, Nil)
+    collect_players({ s2 with sv_player_writes: Nil }, s2.sv_player_writes, wait, Nil)
+  end
+
+  -- ── Giving up written chunks ─────────────────────────────────────────────
+
+  -- Up to n of the written chunks owed are released from the world's cache
+  -- (`Strata.World.release_written`). One the stream is generating now is
+  -- left for a later tick: its task may have read the region before the
+  -- write, and the world's cached copy is what makes its result right.
+  pfn release(s : SaveStore, w : Strata.World.World, st : Strata.Stream.Stream, n : Int) : (SaveStore, Strata.World.World) do
+    match s.sv_owed do
+      Nil -> (s, w)
+      owed ->
+        let (now, later) = release_split(owed, st, n, Nil, Nil)
+        ({ s with sv_owed: later }, Wv.release_written(w, now))
+    end
+  end
+  pfn release_split(owed : List((Strata.Coord.Key, Int)), st : Strata.Stream.Stream, n : Int, now : List((Strata.Coord.Key, Int)), later : List((Strata.Coord.Key, Int))) : (List((Strata.Coord.Key, Int)), List((Strata.Coord.Key, Int))) do
+    match owed do
+      Nil -> (now, List.reverse(later))
+      Cons((k, h), t) ->
+        if n <= 0 do (now, List.append(List.reverse(later), owed))
+        else if Strata.Stream.generating(st, k) do release_split(t, st, n, now, Cons((k, h), later))
+        else release_split(t, st, n - 1, Cons((k, h), now), later) end end
+    end
+  end
+
+  -- ── The header and the players ───────────────────────────────────────────
+
+  pfn spawn_header(path : String, h : Strata.Savefile.SaveHeader) : Task(Bool) do task_spawn(fn _ -> header_job(path, h)) end
+  pfn spawn_player(path : String, b : Bytes) : Task(Bool) do task_spawn(fn _ -> player_job(path, b)) end
+
+  pfn player_writing(ps : List(SvPlayerWrite), id : Int) : Bool do
+    match ps do
+      Nil -> false
+      Cons(SvPlayerWrite(i, _), t) -> if i == id do true else player_writing(t, id) end
+    end
+  end
+
+  -- start a write for every changed player record with none in flight
+  pfn start_players(d : String, l : List(SvPlayer), flying : List(SvPlayerWrite), kept : List(SvPlayer), started : List(SvPlayerWrite)) : (List(SvPlayer), List(SvPlayerWrite)) do
+    match l do
+      Nil -> (List.reverse(kept), started)
+      Cons(SvPlayer(id, b, dirty), t) ->
+        if !dirty do start_players(d, t, flying, Cons(SvPlayer(id, b, dirty), kept), started)
+        else if player_writing(flying, id) do start_players(d, t, flying, Cons(SvPlayer(id, b, dirty), kept), started)
+        else start_players(d, t, flying, Cons(SvPlayer(id, b, false), kept), Cons(SvPlayerWrite(id, spawn_player(player_path(d, id), b)), started)) end end
+    end
+  end
+
+  -- The slow pass: when the header interval has passed since the last one
+  -- that wrote anything (or [force]), write the header if it changed and
+  -- every changed player record, each on a worker.
+  pfn slow_pass(s : SaveStore, force : Bool) : SaveStore do
+    let due = if force do true else s.sv_time -. s.sv_slow_last >= header_interval() end
+    if !due do s
+    else
+      let head_free = match s.sv_heads do
+        Nil -> true
+        _ -> false
+      end
+      let s1 = if !s.sv_head_dirty do s
+        else if !head_free do s
+        else
+          let h = { s.sv_header with sh_generator: s.sv_generator, sh_counter: int_wrapping_add(s.sv_header.sh_counter, 1), sh_sections: s.sv_sections, sh_entities: s.sv_entities }
+          { s with sv_head_dirty: false, sv_heads: Cons(SvHead(h, spawn_header(header_path(s.sv_dir), h)), Nil) }
+        end end
+      let (ps, started) = start_players(s1.sv_dir, s1.sv_players, s1.sv_player_writes, Nil, Nil)
+      let head_started = if s.sv_head_dirty do head_free else false end
+      let any = match started do
+        Nil -> head_started
+        _ -> true
+      end
+      { s1 with sv_players: ps, sv_player_writes: List.append(started, s1.sv_player_writes), sv_slow_last: if any do s1.sv_time else s1.sv_slow_last end }
+    end
+  end
+
+  -- ── The tick ─────────────────────────────────────────────────────────────
+
+  doc "Once a frame, after `Strata.Stream.tick`; [dt] is the frame's seconds (the store's only clock). Takes the world's changes and marks their regions dirty, each with a quiet clock every new change starts again; folds in the writes that have finished (it never waits for one) and lets the world give up chunks now on disk, a few a tick; starts at most one region write, the dirty region whose quiet time (2 s) ran out longest ago, on a worker, which encodes and writes the file, or deletes it when the region holds nothing; and on the header interval (5 s) writes the header, if a section, the entity snapshot or the generator version changed, and each changed player record, on workers too. A region's file is read on this thread before its first write if nothing has loaded it yet. A failed write is counted (`stats`), named (`reason`) and tried again after another quiet time; its chunks stay in the world."
+  fn tick(s : SaveStore, st : Strata.Stream.Stream, dt : Float) : (SaveStore, Strata.Stream.Stream) do
+    let step = if dt > 0.0 do dt else 0.0 end
+    let (w1, keys) = Wv.take_changes(Strata.Stream.world(st))
+    let s1 = collect(mark_dirty({ s with sv_time: s.sv_time +. step }, keys), false)
+    let (s2, w2) = release(s1, w1, st, release_budget())
+    let s3 = slow_pass(start_regions(s2, w2, false), false)
+    (s3, Strata.Stream.put_world(st, w2))
+  end
+
+  doc "Wait for every write in flight and fold it in; the world gives up every chunk now on disk that the stream is not generating. For tests and `flush`: a game's frame calls `tick`, which never waits."
+  fn wait_writes(s : SaveStore, st : Strata.Stream.Stream) : (SaveStore, Strata.Stream.Stream) do
+    let s1 = collect(s, true)
+    let (s2, w2) = release(s1, Strata.Stream.world(st), st, 1000000000)
+    (s2, Strata.Stream.put_world(st, w2))
   end
 end

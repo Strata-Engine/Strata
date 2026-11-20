@@ -8,12 +8,15 @@ mod Strata.Test.Save do
   needs IO.Clock      -- charged to every test module once any uses Check.all (GAPS S3)
   needs IO.Process
   needs IO.FileSystem -- the stores are folders under test/.scratch
+  needs IO.Spawn      -- the stream's workers and the store's writes
+  needs IO.Console
   import Test
   alias Strata.Save as Sv
   alias Strata.Blocks as Bsv
   alias Strata.World as Wsv
   alias Strata.Coord as Ksv
   alias Strata.Chunk as Cksv
+  alias Strata.Stream as Smv
 
   -- ── Helpers ──────────────────────────────────────────────────────────────
 
@@ -97,6 +100,13 @@ mod Strata.Test.Save do
     match Sv.identity(dir) do
       Some((s, sc, g)) -> if s != seed do false else if sc != scale do false else g == gv end end
       None -> false
+    end
+  end
+
+  pfn get_first(l : List((String, Bytes))) : Option(Bytes) do
+    match l do
+      Cons((_, b), _) -> Some(b)
+      Nil -> None
     end
   end
 
@@ -320,6 +330,320 @@ mod Strata.Test.Save do
     end
     test "Strata's own generation version is 1" do
       Test.assert_eq_int(Strata.Terrain.generation_version(), 1, "1")
+    end
+  end
+
+  -- ── Saving as it plays ───────────────────────────────────────────────────
+
+  -- a store on a streamed world: the flat world around chunk (0, 0, 0), settled
+  pfn playing(dir : String, gv : Int) : Option((Strata.Save.SaveStore, Strata.Stream.Stream)) do
+    match Sv.open(dir, world(), gv) do
+      Ok((s, w)) -> Some((s, around(Smv.start(w, Smv.config(2, 1, 64, 4)), 16.0, 16.0, 16.0)))
+      Err(_) -> None
+    end
+  end
+  pfn around(st : Strata.Stream.Stream, x : Float, y : Float, z : Float) : Strata.Stream.Stream do
+    Smv.run_until_settled(Smv.set_focus(st, Cons((x, y, z), Nil)), 20000)
+  end
+  pfn put(st : Strata.Stream.Stream, x : Int, y : Int, z : Int, id : Int) : Strata.Stream.Stream do
+    Smv.apply(st, Strata.Edit.set_block(Smv.world(st), x, y, z, id))
+  end
+  -- n ticks of dt seconds
+  pfn ticks(p : (Strata.Save.SaveStore, Strata.Stream.Stream), n : Int, dt : Float) : (Strata.Save.SaveStore, Strata.Stream.Stream) do
+    if n <= 0 do p
+    else
+      let (s, st) = p
+      ticks(Sv.tick(s, st, dt), n - 1, dt)
+    end
+  end
+  -- six seconds of ticks and every write waited for, twice over: whatever was dirty is on disk and released
+  pfn drained(p : (Strata.Save.SaveStore, Strata.Stream.Stream)) : (Strata.Save.SaveStore, Strata.Stream.Stream) do
+    let (s1, st1) = ticks(p, 12, 0.5)
+    let (s2, st2) = ticks(Sv.wait_writes(s1, st1), 12, 0.5)
+    Sv.wait_writes(s2, st2)
+  end
+  pfn waited(p : (Strata.Save.SaveStore, Strata.Stream.Stream)) : (Strata.Save.SaveStore, Strata.Stream.Stream) do
+    let (s, st) = p
+    Sv.wait_writes(s, st)
+  end
+  pfn region_at(dir : String, x : Int, y : Int, z : Int) : Option(Strata.Savefile.Region) do
+    match Sv.read_file(Strata.Regions.path(dir, Strata.Regions.key_of(x, y, z))) do
+      None -> None
+      Some(b) ->
+        match Strata.Savefile.decode_region(b) do
+          Ok(g) -> Some(g)
+          Err(_) -> None
+        end
+    end
+  end
+  pfn region_file(dir : String, x : Int, y : Int, z : Int) : String do Strata.Regions.path(dir, Strata.Regions.key_of(x, y, z)) end
+  -- how many chunks the region file holds, -1 when there is no file (or it does not decode)
+  pfn chunks_at(dir : String, x : Int, y : Int, z : Int) : Int do
+    match region_at(dir, x, y, z) do
+      Some(g) -> List.length(g.sr_chunks)
+      None -> 0 - 1
+    end
+  end
+  pfn has_chunk(dir : String, x : Int, y : Int, z : Int, k : Strata.Coord.Key) : Bool do
+    match region_at(dir, x, y, z) do
+      Some(g) -> Option.is_some(Strata.Regions.chunk_in(g, k))
+      None -> false
+    end
+  end
+  pfn header_at(dir : String) : Option(Strata.Savefile.SaveHeader) do
+    match Sv.read_file(dir ++ "/store.bin") do
+      None -> None
+      Some(b) ->
+        match Strata.Savefile.decode_header(b) do
+          Ok(h) -> Some(h)
+          Err(_) -> None
+        end
+    end
+  end
+  pfn counter_at(dir : String) : Int do
+    match header_at(dir) do
+      Some(h) -> h.sh_counter
+      None -> 0 - 1
+    end
+  end
+  pfn bytes_are(o : Option(Bytes), b : Bytes) : Bool do
+    match o do
+      Some(v) -> same_bytes(v, b)
+      None -> false
+    end
+  end
+  pfn shut(s : Strata.Save.SaveStore, st : Strata.Stream.Stream) : Unit do
+    let _stopped = Smv.stop(st)
+    Sv.close(s)
+  end
+  -- seconds [n] calls of set_section with [b] take
+  pfn set_time(s : Strata.Save.SaveStore, b : Bytes, n : Int) : Float do
+    let t0 = Authority.must(System.now())
+    let _s = set_many(s, b, n)
+    Authority.must(System.now()) -. t0
+  end
+  pfn set_many(s : Strata.Save.SaveStore, b : Bytes, n : Int) : Strata.Save.SaveStore do
+    if n <= 0 do s else set_many(Sv.set_section(s, "map", b), b, n - 1) end
+  end
+  -- 300 ticks of 1/60 s, the section set before each
+  pfn big_ticks(p : (Strata.Save.SaveStore, Strata.Stream.Stream), b : Bytes, n : Int) : (Strata.Save.SaveStore, Strata.Stream.Stream) do
+    if n <= 0 do p
+    else
+      let (s, st) = p
+      big_ticks(Sv.tick(Sv.set_section(s, "map", b), st, 1.0 /. 60.0), b, n - 1)
+    end
+  end
+  pfn dirty_count(s : Strata.Save.SaveStore) : Int do
+    let (d, _, _, _) = Sv.stats(s)
+    d
+  end
+  pfn failed_count(s : Strata.Save.SaveStore) : Int do
+    let (_, _, x, _) = Sv.stats(s)
+    x
+  end
+
+  describe "Save.tick" do
+    test "edits reach their region files after the quiet time, and not before" do
+      let dir = scratch("tick")
+      match playing(dir, 1) do
+        None -> Test.fail("opened")
+        Some((s, st0)) ->
+          let st = put(put(put(put(st0, 5, 5, 5, 1), 37, 5, 5, 1), 5, 5, 37, 1), -5, 5, 5, 1)
+          let (s1, st1) = ticks((s, st), 4, 0.5)
+          Test.assert_false(there(region_file(dir, 0, 0, 0)), "no region file inside the quiet time")
+          Test.assert_eq_int(dirty_count(s1), 2, "two dirty regions")
+          let (s2, st2) = waited(ticks((s1, st1), 4, 0.5))
+          let (s3, st3) = Sv.wait_writes(s2, st2)
+          Test.assert_eq_int(chunks_at(dir, 0, 0, 0), 3, "region 0 holds exactly the three edited chunks")
+          Test.assert_true(has_chunk(dir, 0, 0, 0, Ksv.key(0, 0, 0)), "chunk 0 0 0")
+          Test.assert_true(has_chunk(dir, 0, 0, 0, Ksv.key(1, 0, 0)), "chunk 1 0 0")
+          Test.assert_true(has_chunk(dir, 0, 0, 0, Ksv.key(0, 0, 1)), "chunk 0 0 1")
+          Test.assert_eq_int(chunks_at(dir, -1, 0, 0), 1, "region -1 holds the fourth")
+          Test.assert_true(has_chunk(dir, -1, 0, 0, Ksv.key(-1, 0, 0)), "chunk -1 0 0")
+          Test.assert_eq_int(dirty_count(s3), 0, "nothing dirty")
+          match region_at(dir, 0, 0, 0) do
+            Some(g) ->
+              match Strata.Regions.chunk_in(g, Ksv.key(0, 0, 0)) do
+                Some(c) -> Test.assert_eq_int(Cksv.hash(c), Cksv.hash(Cksv.compact(Strata.Store.get(Wsv.chunks(Smv.world(st3)), Ksv.key(0, 0, 0)))), "the saved chunk is the edited one")
+                None -> Test.fail("chunk")
+              end
+            None -> Test.fail("region")
+          end
+          -- away: the chunks unload, are found written, and leave memory
+          let (s4, st4) = drained((s3, around(st3, 16.0, 16.0, 4000.0)))
+          Test.assert_eq_int(Wsv.cache_size(Smv.world(st4)), 0, "no edited chunk left in memory")
+          Test.assert_eq_int(Wsv.held_coarsened(Smv.world(st4)), 4, "four coarse copies in their place")
+          Test.assert_eq_int(chunks_at(dir, 0, 0, 0), 3, "still three on disk")
+          shut(s4, st4)
+      end
+      tidy(dir)
+    end
+    test "edited back: the saved copy goes, and a region left with nothing has no file" do
+      let dir = scratch("back")
+      match playing(dir, 1) do
+        None -> Test.fail("opened")
+        Some((s, st0)) ->
+          let (s1, st1) = drained((s, put(put(put(st0, 5, 5, 5, 1), 37, 5, 5, 1), -5, 5, 5, 1)))
+          Test.assert_eq_int(chunks_at(dir, 0, 0, 0), 2, "two chunks written")
+          Test.assert_eq_int(chunks_at(dir, -1, 0, 0), 1, "and one")
+          let (s2, st2) = drained((s1, put(put(st1, 5, 5, 5, 0), -5, 5, 5, 0)))
+          Test.assert_eq_int(chunks_at(dir, 0, 0, 0), 1, "the chunk edited back is gone from its region")
+          Test.assert_false(has_chunk(dir, 0, 0, 0, Ksv.key(0, 0, 0)), "that one")
+          Test.assert_false(there(region_file(dir, -1, 0, 0)), "a region whose only chunk was edited back has no file")
+          Test.assert_eq_int(failed_count(s2), 0, "nothing failed")
+          shut(s2, st2)
+      end
+      tidy(dir)
+    end
+    test "sections, region sections and player records are written on their intervals; only the latest value" do
+      let dir = scratch("sections")
+      match playing(dir, 1) do
+        None -> Test.fail("opened")
+        Some((s, st)) ->
+          let c0 = counter_at(dir)
+          let s1 = Sv.set_player(Sv.set_region_section(Sv.set_section(Sv.set_section(s, "score", ramp(10)), "score", ramp(20)), (3, 0, -2), "zone", ramp(300)), 7, ramp(40))
+          Test.assert_true(bytes_are(Sv.section(s1, "score"), ramp(20)), "section reads back")
+          Test.assert_true(bytes_are(Sv.region_section(s1, (3, 0, -2), "zone"), ramp(300)), "region section reads back before it is written")
+          Test.assert_true(bytes_are(Sv.player(s1, 7), ramp(40)), "player reads back")
+          let (s2, st2) = ticks((s1, st), 9, 0.5)
+          Test.assert_eq_int(counter_at(dir), c0, "no header write inside the interval")
+          let (s3, st3) = waited(ticks((s2, st2), 2, 0.5))
+          Test.assert_eq_int(counter_at(dir), c0 + 1, "one header write")
+          match header_at(dir) do
+            Some(h) ->
+              Test.assert_eq_int(List.length(h.sh_sections), 1, "one section")
+              match h.sh_sections do
+                Cons((n, b), _) ->
+                  Test.assert_eq_str(n, "score", "its name")
+                  Test.assert_true(same_bytes(b, ramp(20)), "the second value")
+                Nil -> Test.fail("section")
+              end
+            None -> Test.fail("header")
+          end
+          match region_at(dir, 3, 0, -2) do
+            Some(g) ->
+              Test.assert_eq_int(List.length(g.sr_chunks), 0, "a region of sections only")
+              match g.sr_sections do
+                Cons((n, b), Nil) ->
+                  Test.assert_eq_str(n, "zone", "its name")
+                  Test.assert_true(same_bytes(b, ramp(300)), "its bytes")
+                _ -> Test.fail("region section")
+              end
+            None -> Test.fail("region file")
+          end
+          match Sv.read_file(dir ++ "/players/7.bin") do
+            Some(b) ->
+              match Strata.Savefile.decode_player(b) do
+                Ok(rec) -> Test.assert_true(same_bytes(rec, ramp(40)), "the player's bytes")
+                Err(e) -> Test.fail(e)
+              end
+            None -> Test.fail("players/7.bin")
+          end
+          Test.assert_true(bytes_are(Sv.region_section(s3, (3, 0, -2), "zone"), ramp(300)), "region section reads back after it is written")
+          Test.assert_eq_int(List.length(Sv.players(s3)), 1, "one player")
+          -- nothing changed: no further header write
+          let (s4, st4) = waited(ticks((s3, st3), 24, 0.5))
+          Test.assert_eq_int(counter_at(dir), c0 + 1, "an unchanged header is not rewritten")
+          shut(s4, st4)
+      end
+      tidy(dir)
+    end
+    test "big section: 4 MB set on 300 ticks is written at most twice, and setting it costs no more than a small one" do
+      let dir = scratch("big")
+      match playing(dir, 1) do
+        None -> Test.fail("opened")
+        Some((s, st)) ->
+          let c0 = counter_at(dir)
+          let big = ramp(4 * 1024 * 1024)
+          let (s1, st1) = waited(big_ticks((s, st), big, 300))
+          let n = counter_at(dir) - c0
+          Test.assert_true(n <= 2, "at most two header writes")
+          let small_t = set_time(s1, ramp(10), 20000)
+          let big_t = set_time(s1, big, 20000)
+          println("save: set_section 20000 times: 4 MB " ++ float_to_string(big_t *. 1000.0) ++ " ms, 10 bytes " ++ float_to_string(small_t *. 1000.0) ++ " ms (reported, not judged)")
+          let (s2, st2) = waited(ticks((s1, st1), 12, 0.5))
+          let on_disk = match header_at(dir) do
+            Some(h) -> get_first(h.sh_sections)
+            None -> None
+          end
+          Test.assert_true(bytes_are(on_disk, big), "the 4 MB section is on disk whole")
+          shut(s2, st2)
+      end
+      tidy(dir)
+    end
+    test "write failure keeps chunks: counted, named, and written once the folder is back" do
+      let dir = scratch("refused")
+      match playing(dir, 1) do
+        None -> Test.fail("opened")
+        Some((s, st0)) ->
+          -- the regions folder becomes a file: nothing can be written under it
+          let _gone = Authority.must(Dir.rm_rf(dir ++ "/regions"))
+          let _file = Authority.must(File.write(dir ++ "/regions", "in the way"))
+          let (s1, st1) = drained((s, around(put(st0, 5, 5, 5, 1), 16.0, 16.0, 4000.0)))
+          Test.assert_true(failed_count(s1) >= 1, "the failed write is counted")
+          Test.assert_eq_str(Sv.reason(s1), "cannot write region r.0.0.0", "and named")
+          Test.assert_eq_int(Wsv.cache_size(Smv.world(st1)), 1, "the chunk is still in the world's cache")
+          Test.assert_eq_int(Wsv.held_coarsened(Smv.world(st1)), 0, "not released")
+          let _back = Authority.must(File.delete(dir ++ "/regions"))
+          let _made = Authority.must(Dir.mkdir_p(dir ++ "/regions"))
+          let (s2, st2) = drained((s1, st1))
+          Test.assert_eq_int(chunks_at(dir, 0, 0, 0), 1, "written once the folder is back")
+          Test.assert_eq_int(Wsv.cache_size(Smv.world(st2)), 0, "and released")
+          Test.assert_eq_int(Wsv.held_coarsened(Smv.world(st2)), 1, "as a coarse copy")
+          shut(s2, st2)
+      end
+      tidy(dir)
+    end
+    test "one region write is started per tick" do
+      let dir = scratch("one-a-tick")
+      match playing(dir, 1) do
+        None -> Test.fail("opened")
+        Some((s, st0)) ->
+          -- edits far from anything loaded are queued for their chunks: five regions
+          let st = put(put(put(put(put(st0, 5000, 5, 5, 1), 6000, 5, 5, 1), 7000, 5, 5, 1), 8000, 5, 5, 1), 9000, 5, 5, 1)
+          let (s1, st1) = Sv.tick(s, st, 0.5)
+          Test.assert_eq_int(dirty_count(s1), 5, "five dirty regions")
+          let (s2, st2) = Sv.tick(s1, st1, 2.0)
+          Test.assert_eq_int(dirty_count(s2), 4, "one started")
+          let (s3, st3) = Sv.tick(s2, st2, 0.0)
+          Test.assert_eq_int(dirty_count(s3), 3, "one more")
+          let (s4, st4) = ticks((s3, st3), 3, 0.0)
+          Test.assert_eq_int(dirty_count(s4), 0, "all five over five ticks")
+          let (s5, st5) = Sv.wait_writes(s4, st4)
+          match region_at(dir, 19, 0, 0) do
+            Some(g) ->
+              Test.assert_eq_int(List.length(g.sr_chunks), 0, "no chunk")
+              Test.assert_eq_int(List.length(g.sr_ops), 1, "one key's queue")
+            None -> Test.fail("the region of voxel 5000")
+          end
+          shut(s5, st5)
+      end
+      tidy(dir)
+    end
+    test "a player file with one flipped byte is set aside at open and reads as none" do
+      let dir = scratch("player-bad")
+      match playing(dir, 1) do
+        None -> Test.fail("opened")
+        Some((s, st)) ->
+          let (s1, st1) = drained((Sv.set_player(Sv.set_player(s, 3, ramp(50)), -4, ramp(60)), st))
+          shut(s1, st1)
+          match Sv.read_file(dir ++ "/players/3.bin") do
+            Some(b) ->
+              Test.assert_true(Sv.write_atomic(dir ++ "/players/3.bin", flipped(b, 20)), "flipped")
+              match Sv.open(dir, world(), 1) do
+                Ok((s2, _)) ->
+                  Test.assert_true(Option.is_none(Sv.player(s2, 3)), "the damaged record reads as none")
+                  Test.assert_true(bytes_are(Sv.player(s2, -4), ramp(60)), "the other is read")
+                  Test.assert_true(there(dir ++ "/players/3.bin.bad"), "set aside")
+                  let (_, _, _, a) = Sv.stats(s2)
+                  Test.assert_eq_int(a, 1, "and counted")
+                  Sv.close(s2)
+                Err(e) -> Test.fail(e)
+              end
+            None -> Test.fail("players/3.bin")
+          end
+      end
+      tidy(dir)
     end
   end
 end
