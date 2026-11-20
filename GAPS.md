@@ -495,3 +495,23 @@ and 29 instructions on March main against C's 0.85 ns and 20 (2.9 times; on
 0.5.0 each is a runtime call). Met in the cover placer's loop, which
 recovers a column's x and z from its index (Task 3). Small; the Strata code
 is left plain.
+
+## S50: a write whose later arguments read the array it writes copies the array
+
+(Numbered S50 because the save-and-load branch takes S48 and S49.) In
+`cset(cset(st, i, cget(st, i) +. a), i + 1, cget(st, i + 1) +. b)` the outer
+`cget` reads the array as it was before the inner write, so value semantics
+keeps the old array alive across that write: March holds a second reference
+(`__march_rc_incrc_local`) and `NativeArray.set_float` copies the whole
+array, every call. Reduced case `bench/march/solver_copy`: about 6 000 copies
+of the state array for 4 096 contacts, and none once every read comes before
+the first write. Not a regression: the same on March 0.5.0, `07b58d065`,
+`6c88ab912` and `f04f0dc0c`. A compiler could hoist the pure reads ahead of
+the write, but March does not. Met 2026-11-19 in `Strata.Contact.apply` and
+`pseudo_apply`, and in `Strata.Physics.integrate`, `tally` and `drag`, which
+copied the state, push-out and tally arrays (32 floats a body) on every
+impulse. With 275 bodies a step took 15 to 20 s. Those functions now bind
+every read before writing, with the same arithmetic in the same order, so
+results are bit for bit as before. The same step now takes about 3 s, which
+is contact generation for that many bodies. Rule for Strata code: read
+first, then write.

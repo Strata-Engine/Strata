@@ -1,0 +1,129 @@
+-- Strata.Contact's solver loop, reduced: a contact pass threads two float
+-- arrays (contacts, body state) through `match f(...) do (a, b) -> ...`, and
+-- each contact writes a body's velocity six times (NativeArray.set_float).
+-- A write is in place only while the array is uniquely held; otherwise the
+-- runtime copies the whole array (native_float_arr_set's copy path), so the
+-- cost of a write grows with the array. SIZE is the state array's length
+-- (32 floats a body): compare SIZE=64 with SIZE=8192.
+--   VARIANT 0: as Strata.Contact.solve_one: a local closure `fric` that
+--              reads and writes the state it is passed
+--   VARIANT 1: the same work with `fric` a named function
+--   VARIANT 2: no friction step at all (the normal impulse only)
+mod SolverCopy do
+  needs IO
+
+  pfn cget(a : NativeFloatArr, i : Int) : Float do NativeArray.get_float(a, i) end
+  pfn cset(a : NativeFloatArr, i : Int, v : Float) : NativeFloatArr do NativeArray.set_float(a, i, v) end
+
+  -- body k's velocity (at 7..9) plus j scaled by its inverse mass (at 13)
+  pfn apply(st : NativeFloatArr, k : Int, jx : Float, jy : Float, jz : Float) : NativeFloatArr do
+    let o = k * 32
+    let im = cget(st, o + 13)
+    cset(cset(cset(st, o + 7, cget(st, o + 7) +. jx *. im), o + 8, cget(st, o + 8) +. jy *. im), o + 9, cget(st, o + 9) +. jz *. im)
+  end
+  -- apply with the inverse mass read by the caller: the callee's first use of st is the write
+  pfn apply_im(st : NativeFloatArr, k : Int, im : Float, jx : Float, jy : Float, jz : Float) : NativeFloatArr do
+    let o = k * 32
+    cset(cset(cset(st, o + 7, cget(st, o + 7) +. jx *. im), o + 8, cget(st, o + 8) +. jy *. im), o + 9, cget(st, o + 9) +. jz *. im)
+  end
+  -- apply with every read before the first write: nothing reads the old array after it is written, so each write is in place
+  pfn apply_read_first(st : NativeFloatArr, k : Int, jx : Float, jy : Float, jz : Float) : NativeFloatArr do
+    let o = k * 32
+    let im = cget(st, o + 13)
+    let vx = cget(st, o + 7) +. jx *. im
+    let vy = cget(st, o + 8) +. jy *. im
+    let vz = cget(st, o + 9) +. jz *. im
+    cset(cset(cset(st, o + 7, vx), o + 8, vy), o + 9, vz)
+  end
+  -- one write of a value that does not read st
+  pfn apply_first(st : NativeFloatArr, k : Int, v : Float) : NativeFloatArr do cset(st, k * 32 + 7, v) end
+  pfn vel(st : NativeFloatArr, k : Int) : (Float, Float, Float) do
+    let o = k * 32
+    (cget(st, o + 7), cget(st, o + 8), cget(st, o + 9))
+  end
+
+  pfn fric_named(cs0 : NativeFloatArr, s0 : NativeFloatArr, o : Int, a : Int, ti : Int) : (NativeFloatArr, NativeFloatArr) do
+    let (ax, ay, az) = vel(s0, a)
+    let vt = ax *. cget(cs0, o + ti) +. ay *. cget(cs0, o + ti + 1) +. az *. cget(cs0, o + ti + 2)
+    let d = 0.0 -. vt *. 0.001
+    (cset(cs0, o + 5, cget(cs0, o + 5) +. d), apply(s0, a, d, 0.0, d))
+  end
+
+  pfn solve_one(cs : NativeFloatArr, st : NativeFloatArr, c : Int, nb : Int, variant : Int) : (NativeFloatArr, NativeFloatArr) do
+    let o = c * 8
+    let a = c % nb
+    let vn = if variant == 3 do cget(st, a * 32 + 7) *. cget(cs, o) +. cget(st, a * 32 + 8) *. cget(cs, o + 1) +. cget(st, a * 32 + 9) *. cget(cs, o + 2)
+      else if variant == 4 do 1.0
+      else match vel(st, a) do (vx, vy, vz) -> vx *. cget(cs, o) +. vy *. cget(cs, o + 1) +. vz *. cget(cs, o + 2) end end end
+    let dl = 0.0 -. vn *. 0.001
+    let s1 = if variant == 5 do
+        let o2 = a * 32
+        let im = cget(st, o2 + 13)
+        cset(cset(cset(st, o2 + 7, cget(st, o2 + 7) +. dl *. im), o2 + 8, cget(st, o2 + 8) +. dl *. im), o2 + 9, cget(st, o2 + 9) +. dl *. im)
+      else if variant == 6 do apply_im(st, a, cget(st, a * 32 + 13), dl, dl, dl)
+      else if variant == 7 do apply_first(st, a, dl)
+      else if variant == 8 do apply_read_first(st, a, dl, dl, dl)
+      else apply(st, a, dl, dl, dl) end end end end
+    let cs1 = cset(cs, o + 4, cget(cs, o + 4) +. dl)
+    if variant == 0 do with_closure(cs1, s1, o, a)
+    else if variant == 1 do with_named(cs1, s1, o, a)
+    else (cs1, s1) end end
+  end
+  pfn with_closure(cs1 : NativeFloatArr, s1 : NativeFloatArr, o : Int, a : Int) : (NativeFloatArr, NativeFloatArr) do
+    let fric = fn (cs0, s0, ti) ->
+      let (ax, ay, az) = vel(s0, a)
+      let vt = ax *. cget(cs0, o + ti) +. ay *. cget(cs0, o + ti + 1) +. az *. cget(cs0, o + ti + 2)
+      let d = 0.0 -. vt *. 0.001
+      (cset(cs0, o + 5, cget(cs0, o + 5) +. d), apply(s0, a, d, 0.0, d))
+    match fric(cs1, s1, 0) do
+      (cs2, s2) -> fric(cs2, s2, 1)
+    end
+  end
+  pfn with_named(cs1 : NativeFloatArr, s1 : NativeFloatArr, o : Int, a : Int) : (NativeFloatArr, NativeFloatArr) do
+    match fric_named(cs1, s1, o, a, 0) do
+      (cs2, s2) -> fric_named(cs2, s2, o, a, 1)
+    end
+  end
+
+  pfn pass(cs : NativeFloatArr, st : NativeFloatArr, c : Int, nc : Int, nb : Int, variant : Int) : (NativeFloatArr, NativeFloatArr) do
+    if c >= nc do (cs, st)
+    else
+      match solve_one(cs, st, c, nb, variant) do
+        (cs2, st2) -> pass(cs2, st2, c + 1, nc, nb, variant)
+      end
+    end
+  end
+
+  pfn bodies(st : NativeFloatArr, k : Int, nb : Int) : NativeFloatArr do
+    if k >= nb do st else bodies(cset(cset(st, k * 32 + 13, 1.0), k * 32 + 8, -1.0), k + 1, nb) end
+  end
+  pfn fill(cs : NativeFloatArr, i : Int, n : Int) : NativeFloatArr do
+    if i >= n do cs else fill(cset(cs, i, if i % 8 == 1 do 1.0 else 0.25 end), i + 1, n) end
+  end
+
+  -- one rep: 512 contacts over the bodies, 8 passes
+  pfn solve(cs : NativeFloatArr, st : NativeFloatArr, nb : Int, variant : Int, iters : Int) : (NativeFloatArr, NativeFloatArr) do
+    if iters <= 0 do (cs, st)
+    else
+      match pass(cs, st, 0, 512, nb, variant) do
+        (cs2, st2) -> solve(cs2, st2, nb, variant, iters - 1)
+      end
+    end
+  end
+
+  pfn rep(size : Int, variant : Int, left : Int, acc : Float) : Float do
+    if left <= 0 do acc
+    else
+      let nb = size / 32
+      match solve(fill(NativeArray.make_float(512 * 8, 0.0), 0, 512 * 8), bodies(NativeArray.make_float(size, 0.0), 0, nb), nb, variant, 8) do
+        (_, st) -> rep(size, variant, left - 1, acc +. cget(st, 8))
+      end
+    end
+  end
+
+  fn main(_cap : Cap(IO)) : Unit do
+    let size = Authority.must(Env.get_int("SIZE", 64))
+    let v = Authority.must(Env.get_int("VARIANT", 0))
+    Authority.must(println(float_to_string(rep(if size < 32 do 32 else size end, v, Authority.must(Env.get_int("REPS", 1)), 0.0))))
+  end
+end
