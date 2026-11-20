@@ -398,6 +398,53 @@ mod Strata.Shape do
     end end
   end
 
+  -- ── For the renderer ─────────────────────────────────────────────────────
+  -- A grid is drawn in 32-cubed parts, as a body's is (Strata.Physics): part k
+  -- is (i, j, l) with k = i + nx (j + ny l), 32 voxels apart.
+  pfn parts_of(g : Strata.Body.Grid) : (Int, Int, Int) do
+    ((Bg.size_x(g) + 31) / 32, (Bg.size_y(g) + 31) / 32, (Bg.size_z(g) + 31) / 32)
+  end
+  doc "Part [k]'s low corner in grid g, voxels."
+  fn part_offset(g : Strata.Body.Grid, k : Int) : (Int, Int, Int) do
+    match parts_of(g) do (nx, ny, _) -> (32 * (k % nx), 32 * ((k / nx) % ny), 32 * (k / (nx * ny))) end
+  end
+  -- one part of a grid as a chunk: index x + 32 (z + 32 y), as Strata.Chunk lays it out
+  pfn part_cells(g : Strata.Body.Grid, ox : Int, oy : Int, oz : Int, a : NativeI32Arr, i : Int) : NativeI32Arr do
+    if i >= 32768 do a
+    else part_cells(g, ox, oy, oz, NativeArray.set_i32(a, i, Bg.grid_get(g, ox + i % 32, oy + i / 1024, oz + (i / 32) % 32)), i + 1) end
+  end
+  pfn part_chunk(g : Strata.Body.Grid, i : Int, j : Int, l : Int) : Strata.Chunk.Chunk do
+    Strata.Chunk.compact(Strata.Chunk.from_flat(part_cells(g, 32 * i, 32 * j, 32 * l, NativeArray.make_i32(32768, 0), 0)))
+  end
+  pfn mesh_part(r : Strata.Blocks.Registry, k : Int, nx : Int, ny : Int, at) : (Int, Strata.Mesh.Meshed) do
+    let i = k % nx
+    let j = (k / nx) % ny
+    let l = k / (nx * ny)
+    (k, Strata.Mesh.build(r, Strata.Mesh.around_from(fn (dx, dy, dz) -> at(i + dx, j + dy, l + dz))))
+  end
+  pfn draws(m : Strata.Mesh.Meshed) : Bool do
+    Strata.Mesh.quad_count_at(m, 0) + Strata.Mesh.quad_count_at(m, 1) + Strata.Mesh.quad_count_at(m, 2) + Strata.Mesh.instance_count(m) > 0
+  end
+
+  doc "Grid g meshed in 32-cubed parts, each with its neighbouring parts for faces and corner shading (air beyond the grid): (part, mesh) for every part that draws something."
+  fn meshes(r : Strata.Blocks.Registry, g : Strata.Body.Grid) : List((Int, Strata.Mesh.Meshed)) do
+    match parts_of(g) do
+      (nx, ny, nz) ->
+        let chunks = Strata.Tree.from_list(List.map(List.range(0, nx * ny * nz), fn k -> part_chunk(g, k % nx, (k / nx) % ny, k / (nx * ny))), Strata.Chunk.uniform(0))
+        let at = fn (i, j, l) -> if i < 0 || j < 0 || l < 0 || i >= nx || j >= ny || l >= nz do Strata.Chunk.uniform(0) else Strata.Tree.get(chunks, i + nx * (j + ny * l)) end
+        List.filter(List.map(List.range(0, nx * ny * nz), fn k -> mesh_part(r, k, nx, ny, at)), fn km -> match km do (_, m) -> draws(m) end)
+    end
+  end
+
+  pfn classes_go(r : Strata.Blocks.Registry, ids : NativeI32Arr, out : NativeU8Arr, i : Int, n : Int) : NativeU8Arr do
+    if i >= n do out else classes_go(r, ids, NativeArray.set_u8(out, i, Strata.Blocks.light_class(r, NativeArray.get_i32(ids, i))), i + 1, n) end
+  end
+  doc "Grid g for the renderer's rays: one light class byte a voxel, in the grid's index order."
+  fn classes(r : Strata.Blocks.Registry, g : Strata.Body.Grid) : NativeU8Arr do
+    let n = Bg.size_x(g) * Bg.size_y(g) * Bg.size_z(g)
+    classes_go(r, Bg.ids(g), NativeArray.make_u8(Strata.Size.of(n), 0), 0, n)
+  end
+
   -- ── Bytes ────────────────────────────────────────────────────────────────
   -- A grid on disk: sizes x y z (a byte each), form (0 palette, 1 ids), then
   --   form 0: the palette's length less one (a byte: entries 1 ..), each

@@ -19,7 +19,10 @@ mod Strata.Render do
   -- with the figure world's generation they were finished in (Strata.Anim.generation: a reopened world starts its rig ids at 0 again),
   -- and the keys of the body parts it has been given (kept here so that `bodies` need not look through every slot each frame: a streamed
   -- world holds thousands, a handful of them bodies')
-  type Render = Render(Strata.Slots.Slots, Strata.Mesh.Meshed, (Int, List(Int)), List(Strata.Coord.Key))
+  -- the standing shapes drawn (Strata.Shapes): by prototype key (prototype, 0, 0, 95) the parts of it that draw, each in the slot of key
+  -- (prototype, part, 0, 95), hidden; by shape key (id, 0, 0, 96) the keys (id, part, 0, 96) of the slots it is drawn from
+  type RnShapes = RnShapes(Strata.Store.Store(List(Int)), Strata.Store.Store(List(Strata.Coord.Key)))
+  type Render = Render(Strata.Slots.Slots, Strata.Mesh.Meshed, (Int, List(Int)), List(Strata.Coord.Key), RnShapes)
 
 
   pfn no_mesh() : Strata.Mesh.Meshed do
@@ -27,15 +30,15 @@ mod Strata.Render do
   end
 
   doc "A renderer-side table of [capacity] chunk slots. The shim holds 16384."
-  fn new(capacity : Int) : Render do Render(Sr2.new(capacity), no_mesh(), (-1, Nil), Nil) end
+  fn new(capacity : Int) : Render do Render(Sr2.new(capacity), no_mesh(), (-1, Nil), Nil, RnShapes(Strata.Store.empty(Nil), Strata.Store.empty(Nil))) end
 
 
   doc "Chunk slots in use."
-  fn used(r : Render) : Int do match r do Render(sl, _, _, _) -> Sr2.used(sl) end end
+  fn used(r : Render) : Int do match r do Render(sl, _, _, _, _) -> Sr2.used(sl) end end
   doc "Meshes waiting for a slot or for room in the quad buffer."
-  fn waiting(r : Render) : Int do match r do Render(sl, _, _, _) -> Sr2.waiting(sl) end end
+  fn waiting(r : Render) : Int do match r do Render(sl, _, _, _, _) -> Sr2.waiting(sl) end end
   doc "The slot a chunk's mesh is in, or -1."
-  fn slot_of(r : Render, k : Strata.Coord.Key) : Int do match r do Render(sl, _, _, _) -> Sr2.slot_of(sl, k) end end
+  fn slot_of(r : Render, k : Strata.Coord.Key) : Int do match r do Render(sl, _, _, _, _) -> Sr2.slot_of(sl, k) end end
 
   doc "How many blocks could not have a light class of their own and share the nearest of their kind: 0 unless the registry holds more than 255 blocks that differ in what they are to light. Such a block is lit and reflected with another block's texture, smoothness or glow."
   fn light_overflow(r : Strata.Blocks.Registry) : Int do Strata.Blocks.light_overflow(r) end
@@ -178,7 +181,7 @@ mod Strata.Render do
           Strata.Ffi.Vk.chunk_show(Sr2.slot(a), Sr2.shown(a))
           perform(sl, t, none)
         else
-          let ok = if Strata.Physics.is_part_key(Sr2.key(a)) do upload_part(Sr2.slot(a), Sr2.mesh_or(a, none)) else upload(Sr2.slot(a), Sr2.key(a), Sr2.mesh_or(a, none)) end
+          let ok = if Strata.Coord.level(Sr2.key(a)) >= 95 do upload_part(Sr2.slot(a), Sr2.mesh_or(a, none)) else upload(Sr2.slot(a), Sr2.key(a), Sr2.mesh_or(a, none)) end
           perform(if ok do sl else Sr2.refused(sl, a) end, t, none)
         end end
     end
@@ -238,7 +241,7 @@ mod Strata.Render do
     match Strata.Physics.take_meshes(p) do
       (p2, made) ->
         match r do
-          Render(sl, none, rg, parts) ->
+          Render(sl, none, rg, parts, rsh) ->
             let gone = List.filter(parts, fn k -> !Strata.Physics.exists(p2, Strata.Coord.kx(k)))
             let keyed = List.map(made, fn m -> keyed_part(m))
             -- a body that is gone leaves the rays before its slots are freed
@@ -249,7 +252,7 @@ mod Strata.Render do
                 give_shapes(sl3, p2, made)
                 let parts2 = with_parts(List.filter(parts, fn k -> Strata.Physics.exists(p2, Strata.Coord.kx(k))), keyed)
                 pose_parts(sl3, p2, t, parts2)
-                (Render(sl3, none, rg, parts2), p2)
+                (Render(sl3, none, rg, parts2, rsh), p2)
             end
         end
     end
@@ -280,6 +283,186 @@ mod Strata.Render do
     match m do (id, k, mesh) -> (Strata.Physics.part_key(id, k), mesh) end
   end
 
+  -- ── Standing shapes ──────────────────────────────────────────────────────
+  pfn proto_key(i : Int, k : Int) : Strata.Coord.Key do Strata.Coord.key_at(i, k, 0, 95) end
+  pfn shape_key(id : Int, k : Int) : Strata.Coord.Key do Strata.Coord.key_at(id, k, 0, 96) end
+
+  -- the slots of shape [id] freed, and the rays told it is gone
+  pfn shape_free(sl : Strata.Slots.Slots, none : Strata.Mesh.Meshed, live : Strata.Store.Store(List(Strata.Coord.Key)), id : Int) : (Strata.Slots.Slots, Strata.Store.Store(List(Strata.Coord.Key))) do
+    let ks = Strata.Store.get(live, shape_key(id, 0))
+    match ks do
+      Nil -> (sl, live)
+      Cons(first, _) ->
+        if Sr2.slot_of(sl, first) >= 0 do Strata.Ffi.Vk.body_drop(Sr2.slot_of(sl, first)) else () end
+        match Sr2.plan(sl, Nil, ks) do
+          (sl2, acts) -> (perform(sl2, acts, none), Strata.Store.remove(live, shape_key(id, 0)))
+        end
+    end
+  end
+
+  pfn proto_keyed(pi : Int, km : (Int, Strata.Mesh.Meshed)) : (Strata.Coord.Key, Strata.Mesh.Meshed) do match km do (k, m) -> (proto_key(pi, k), m) end end
+  pfn shape_keyed(id : Int, km : (Int, Strata.Mesh.Meshed)) : (Strata.Coord.Key, Strata.Mesh.Meshed) do match km do (k, m) -> (shape_key(id, k), m) end end
+  pfn part_of(km : (Int, Strata.Mesh.Meshed)) : Int do match km do (k, _) -> k end end
+  pfn hide_all(sl : Strata.Slots.Slots, pi : Int, ks : List(Int)) : Unit do
+    match ks do
+      Nil -> ()
+      Cons(k, t) ->
+        if Sr2.slot_of(sl, proto_key(pi, k)) >= 0 do Strata.Ffi.Vk.chunk_show(Sr2.slot_of(sl, proto_key(pi, k)), false) else () end
+        hide_all(sl, pi, t)
+    end
+  end
+  pfn first_slot(sl : Strata.Slots.Slots, id : Int, ks : List(Int)) : Int do
+    match ks do
+      Cons(k, _) -> Sr2.slot_of(sl, shape_key(id, k))
+      Nil -> -1
+    end
+  end
+  pfn first_slot_proto(sl : Strata.Slots.Slots, pi : Int, ks : List(Int)) : Int do
+    match ks do
+      Cons(k, _) -> Sr2.slot_of(sl, proto_key(pi, k))
+      Nil -> -1
+    end
+  end
+  -- grid g's classes given to the rays under [slot]
+  pfn give_classes(slot : Int, r : Strata.Blocks.Registry, g : Strata.Body.Grid) : Unit do
+    if slot < 0 do ()
+    else if Strata.Ffi.Vk.body_shape(slot, Strata.Shape.classes(r, g), Strata.Body.size_x(g), Strata.Body.size_y(g), Strata.Body.size_z(g)) do () else () end end
+  end
+
+  -- prototype [pi] uploaded if it is not yet: its parts meshed once into hidden slots, its classes given to the rays under its first part's slot
+  pfn proto_ready(sl : Strata.Slots.Slots, none : Strata.Mesh.Meshed, protos : Strata.Store.Store(List(Int)), sh : Strata.Shapes.Shapes, pi : Int) : (Strata.Slots.Slots, Strata.Store.Store(List(Int))) do
+    if Strata.Store.has(protos, proto_key(pi, 0)) do (sl, protos)
+    else
+      let g = Strata.Shape.grid(Strata.Shapes.proto(sh, pi))
+      let ms = Strata.Shape.meshes(Strata.Shapes.registry(sh), g)
+      let ks = List.map(ms, fn km -> part_of(km))
+      match Sr2.plan(sl, List.map(ms, fn km -> proto_keyed(pi, km)), Nil) do
+        (sl2, acts) ->
+          let sl3 = perform(sl2, acts, none)
+          hide_all(sl3, pi, ks)
+          give_classes(first_slot_proto(sl3, pi, ks), Strata.Shapes.registry(sh), g)
+          with_protos(sl3, Strata.Store.put(protos, proto_key(pi, 0), ks))
+      end
+    end
+  end
+  pfn with_protos(sl : Strata.Slots.Slots, protos : Strata.Store.Store(List(Int))) : (Strata.Slots.Slots, Strata.Store.Store(List(Int))) do (sl, protos) end
+
+  -- an instance's plan performed: an upload for one of the instance's own keys shares the prototype's mesh; anything else is performed as planned
+  pfn instance_acts(sl : Strata.Slots.Slots, none : Strata.Mesh.Meshed, id : Int, pi : Int, acts : List(Strata.Slots.Action)) : Strata.Slots.Slots do
+    match acts do
+      Nil -> sl
+      Cons(a, t) ->
+        let k = Sr2.key(a)
+        let own = if Sr2.is_upload(a) do (if Strata.Coord.level(k) == 96 do Strata.Coord.kx(k) == id else false end) else false end
+        if own do
+          let from = Sr2.slot_of(sl, proto_key(pi, Strata.Coord.ky(k)))
+          let ok = if from >= 0 do Strata.Ffi.Vk.body_instance(Sr2.slot(a), from) else false end
+          instance_acts(if ok do sl else Sr2.refused(sl, a) end, none, id, pi, t)
+        else instance_acts(perform(sl, Cons(a, Nil), none), none, id, pi, t) end
+    end
+  end
+
+  -- every slot of shape [id] posed (each part's low corner at the shape's pose), and the rays given its place under its first part's slot
+  pfn shape_pose(sl : Strata.Slots.Slots, sp : Strata.Shape.Shape, ws : Float, id : Int, ks : List(Int), first : Bool) : Unit do
+    match ks do
+      Nil -> ()
+      Cons(k, t) ->
+        pose_one(Sr2.slot_of(sl, shape_key(id, k)), sp, ws, k, first)
+        shape_pose(sl, sp, ws, id, t, false)
+    end
+  end
+  pfn pose_one(slot : Int, sp : Strata.Shape.Shape, ws : Float, k : Int, first : Bool) : Unit do
+    if slot < 0 do ()
+    else
+      let q = Strata.Shape.rotation(sp)
+      let vs = Strata.Shape.voxel(sp)
+      let fine = if vs > 0.0 && vs < ws do vs else 0.0 end
+      let (ox, oy, oz) = Strata.Shape.part_offset(Strata.Shape.grid(sp), k)
+      let (x, y, z) = Strata.Shape.point(sp, int_to_float(ox), int_to_float(oy), int_to_float(oz))
+      Strata.Ffi.Vk.slot_pose(slot, x, y, z, Strata.Math.Quat.x(q), Strata.Math.Quat.y(q), Strata.Math.Quat.z(q), Strata.Math.Quat.w(q))
+      Strata.Ffi.Vk.slot_voxel(slot, fine)
+      if first do
+        Strata.Ffi.Vk.body_place(slot, Strata.Shape.corner_x(sp), Strata.Shape.corner_y(sp), Strata.Shape.corner_z(sp), Strata.Math.Quat.x(q), Strata.Math.Quat.y(q), Strata.Math.Quat.z(q), Strata.Math.Quat.w(q))
+        Strata.Ffi.Vk.body_voxel(slot, fine)
+      else () end
+    end
+  end
+
+  pfn drawn_as(sl : Strata.Slots.Slots, protos : Strata.Store.Store(List(Int)), live : Strata.Store.Store(List(Strata.Coord.Key)), id : Int, ks : List(Int)) : (Strata.Slots.Slots, RnShapes) do
+    (sl, RnShapes(protos, Strata.Store.put(live, shape_key(id, 0), List.map(ks, fn k -> shape_key(id, k)))))
+  end
+  -- shape sp of id [id] as an instance of prototype [pi]
+  pfn draw_instance(sl1 : Strata.Slots.Slots, none : Strata.Mesh.Meshed, protos0 : Strata.Store.Store(List(Int)), live1 : Strata.Store.Store(List(Strata.Coord.Key)), sh : Strata.Shapes.Shapes, id : Int, pi : Int, sp : Strata.Shape.Shape) : (Strata.Slots.Slots, RnShapes) do
+    match proto_ready(sl1, none, protos0, sh, pi) do
+      (sl2, protos1) ->
+        let ks = Strata.Store.get(protos1, proto_key(pi, 0))
+        match Sr2.plan(sl2, List.map(ks, fn k -> (shape_key(id, k), none)), Nil) do
+          (sl3, acts) ->
+            let sl4 = instance_acts(sl3, none, id, pi, acts)
+            let h = first_slot(sl4, id, ks)
+            let from = first_slot_proto(sl4, pi, ks)
+            let _shared = if h >= 0 do (if from >= 0 do Strata.Ffi.Vk.body_share(h, from) else false end) else false end
+            shape_pose(sl4, sp, Strata.Shapes.world_scale(sh), id, ks, true)
+            drawn_as(sl4, protos1, live1, id, ks)
+        end
+    end
+  end
+  -- shape sp of id [id] from a mesh of its own grid
+  pfn draw_own(sl1 : Strata.Slots.Slots, none : Strata.Mesh.Meshed, protos0 : Strata.Store.Store(List(Int)), live1 : Strata.Store.Store(List(Strata.Coord.Key)), sh : Strata.Shapes.Shapes, id : Int, sp : Strata.Shape.Shape) : (Strata.Slots.Slots, RnShapes) do
+    let g = Strata.Shape.grid(sp)
+    let ms = Strata.Shape.meshes(Strata.Shapes.registry(sh), g)
+    let ks = List.map(ms, fn km -> part_of(km))
+    match Sr2.plan(sl1, List.map(ms, fn km -> shape_keyed(id, km)), Nil) do
+      (sl3, acts) ->
+        let sl4 = perform(sl3, acts, none)
+        give_classes(first_slot(sl4, id, ks), Strata.Shapes.registry(sh), g)
+        shape_pose(sl4, sp, Strata.Shapes.world_scale(sh), id, ks, true)
+        drawn_as(sl4, protos0, live1, id, ks)
+    end
+  end
+
+  -- shape [id] drawn anew: as an instance of its prototype, or from a mesh of its own grid; freed if it has left
+  pfn shape_draw(acc : (Strata.Slots.Slots, RnShapes), none : Strata.Mesh.Meshed, sh : Strata.Shapes.Shapes, id : Int) : (Strata.Slots.Slots, RnShapes) do
+    match acc do
+      (sl0, RnShapes(protos0, live0)) ->
+        match shape_free(sl0, none, live0, id) do
+          (sl1, live1) ->
+            match Strata.Shapes.shape(sh, id) do
+              None -> (sl1, RnShapes(protos0, live1))
+              Some(sp) ->
+                let pi = Strata.Shapes.proto_of(sh, id)
+                if pi >= 0 do draw_instance(sl1, none, protos0, live1, sh, id, pi, sp) else draw_own(sl1, none, protos0, live1, sh, id, sp) end
+            end
+        end
+    end
+  end
+  pfn shape_gone(acc : (Strata.Slots.Slots, RnShapes), none : Strata.Mesh.Meshed, id : Int) : (Strata.Slots.Slots, RnShapes) do
+    match acc do
+      (sl, RnShapes(protos, live)) -> match shape_free(sl, none, live, id) do (sl2, live2) -> (sl2, RnShapes(protos, live2)) end
+    end
+  end
+
+  doc "Keep the renderer in step with the standing shapes (Strata.Shapes): each shape that appeared or changed since the last call is drawn, an unedited one from its prototype's mesh (meshed once, the first time an instance of it appears) and a carved one from a mesh of its own, and given to the rays; each that left is freed. A standing shape costs nothing here while nothing changes."
+  fn shapes(r : Render, sh : Strata.Shapes.Shapes) : (Render, Strata.Shapes.Shapes) do
+    match Strata.Shapes.take_drawn(sh) do
+      (sh2, fresh, gone) ->
+        if List.is_empty(fresh) && List.is_empty(gone) do (r, sh2)
+        else
+          match r do
+            Render(sl, none, rg, parts, rsh) ->
+              let a1 = List.fold_left(gone, (sl, rsh), fn (acc, id) -> shape_gone(acc, none, id))
+              match List.fold_left(fresh, a1, fn (acc, id) -> shape_draw(acc, none, sh2, id)) do
+                (sl2, rsh2) -> (Render(sl2, none, rg, parts, rsh2), sh2)
+              end
+          end
+        end
+    end
+  end
+  doc "How many standing shapes the renderer draws, and how many prototypes it holds meshes of."
+  fn shape_counts(r : Render) : (Int, Int) do
+    match r do Render(_, _, _, _, RnShapes(protos, live)) -> (Strata.Store.size(live), Strata.Store.size(protos)) end
+  end
+
   doc "Bring the renderer up to date with the stream: upload its finished meshes, free its unloaded chunks, retry anything refused earlier. With levels (Strata.Stream.config_levels) it also applies Part F's which-chunk-draws rule (Strata.Slots): each region is drawn by one level, a coarse chunk's mesh is kept undrawn while its eight children draw, and an unloaded chunk keeps its slot, drawn, until the chunk above it holds a mesh, when its slot is freed."
   fn sync(r : Render, s : Strata.Stream.Stream) : (Render, Strata.Stream.Stream) do
     match Strata.Stream.take_meshes(s) do
@@ -287,14 +470,14 @@ mod Strata.Render do
         match Strata.Stream.take_unloads(s2) do
           (s3, gone) ->
             match r do
-              Render(sl, none, rg, parts) ->
+              Render(sl, none, rg, parts, rsh) ->
                 let top = Strata.Stream.top_level(s3)
                 let sl1 = if Sr2.levels(sl) == top do sl else match Sr2.with_levels(sl, top) do (sl0, acts0) -> perform(sl0, acts0, none) end end
                 -- uploads first; a refused one is reported before the draw rule settles, so it frees nothing
                 match Sr2.place(sl1, meshes, gone) do
                   (sl2, acts) ->
                     match Sr2.settle(perform(sl2, acts, none)) do
-                      (sl3, acts2) -> (Render(perform(sl3, acts2, none), none, rg, parts), s3)
+                      (sl3, acts2) -> (Render(perform(sl3, acts2, none), none, rg, parts, rsh), s3)
                     end
                 end
             end
@@ -303,9 +486,9 @@ mod Strata.Render do
   end
 
   doc "Chunks unloaded by the stream whose slots are kept, and drawn, until the chunk above each holds a mesh."
-  fn retained(r : Render) : Int do match r do Render(sl, _, _, _) -> Sr2.retained(sl) end end
+  fn retained(r : Render) : Int do match r do Render(sl, _, _, _, _) -> Sr2.retained(sl) end end
   doc "Is [k]'s mesh held and drawn (not kept undrawn by the which-chunk-draws rule)?"
-  fn drawn(r : Render, k : Strata.Coord.Key) : Bool do match r do Render(sl, _, _, _) -> Sr2.drawn(sl, k) end end
+  fn drawn(r : Render, k : Strata.Coord.Key) : Bool do match r do Render(sl, _, _, _, _) -> Sr2.drawn(sl, k) end end
   -- ── Figures ────────────────────────────────────────────────────────────────
   -- a rig's palette as the renderer takes it: 256 x (red, green, blue, roughness, emission)
   pfn palette_go(out : NativeF32Arr, cs : List((Int, Float, Float, Float, Float, Float))) : NativeF32Arr do
@@ -376,7 +559,7 @@ mod Strata.Render do
   doc "Give the renderer the meshes, ray shapes and palettes of these rigs, each finished in [a] (Strata.Anim.finish_rig): uploaded once per rig, shared by every figure made from it; a rig already held, or not finished in [a], is passed over. A rig the renderer had no room for is tried again at the next call. From then on every figure of those rigs that the animation lists is drawn at each frame, at its pose: a game calls nothing per figure. After `Strata.Anim.open` makes a new world, the rigs held from the old one are forgotten and these are uploaded anew, over the old meshes under the same ids."
   fn figures(r : Render, a : Strata.Anim.Anim, rigs : List(Strata.Rig.Rig)) : Render do
     let gen = Strata.Anim.generation(a)
-    match r do Render(sl, none, held, parts) -> Render(sl, none, (gen, figures_go(a, rigs, held_for(held, gen))), parts) end
+    match r do Render(sl, none, held, parts, rsh) -> Render(sl, none, (gen, figures_go(a, rigs, held_for(held, gen))), parts, rsh) end
   end
 
   doc "Rigs whose meshes the renderer holds for the figure world opened last."
