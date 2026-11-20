@@ -1082,7 +1082,8 @@ a live one: the ring never filled.
 
 Misses and what is not known:
 
-- Particles meet nothing: sparks fall through the ground.
+- Particles met nothing when this was written: sparks fell through the
+  ground. Since 19 November an effect may ask to meet the world (below).
 - Shaded particles are drawn in birth order, not by depth: two smoke cubes
   may blend in the wrong order (soft and grey, it does not show).
 - The effect table is written in place while frames may be in flight; the
@@ -1091,6 +1092,86 @@ Misses and what is not known:
 - Glowing particles light nothing; the light about a fire comes from the
   embers blocks.
 - Nothing here was played by hand yet.
+
+## Particles that meet the world (19 November)
+
+The design's addendum of 19 November. An effect asks with
+`Strata.Particles.dies_on_solid`, `rests_on_solid` or `bounces`; a compute
+pass (`native/shaders/collide.comp`) walks each new particle's flight once,
+in the frame it is born, through the light volume, and the vertex shader
+flies it by what the pass wrote. A frame that bore no such particle runs no
+pass.
+
+Measured with the viewer's `STRATA_FX=2` scene (drips that die at the
+ground, a fountain and a jet of cinders that rest, a fountain of grit that
+bounces: 470 particles a second, lives of 3 to 3.5 s) against `STRATA_FX=3`,
+the same emitters with the setting off, and `STRATA_FX_TIMES=20` for twenty
+times the rate. Release build, March main, hidden and offscreen, 1280 x 800,
+light mode 4, the island's shore start, an Apple M3 Max; the mean of frames
+310 to 600 of the viewer's `STRATA_BENCH=1` lines, two runs each (the two
+agree to 0.01 ms). The load average was 12 to 18 from other work: the
+differences between rows are the finding, not the totals.
+
+| | born a frame | GPU, whole frame | before the geometry (uploads, cull, the collision pass) | after the light (water, composite, particles, interface) |
+|---|---|---|---|---|
+| no particles | 0 | 0.72 ms | 0.023 to 0.025 ms | 0.147 ms |
+| flying free | 8 | 0.75 to 0.76 ms | 0.021 ms | 0.157 ms |
+| meeting the world | 8 | 0.82 ms | 0.067 to 0.069 ms | 0.168 to 0.169 ms |
+| flying free, x 20 | 157 | 1.65 ms | 0.024 to 0.026 ms | 0.93 ms |
+| meeting the world, x 20 | 157 | 2.59 to 2.60 ms | 0.079 ms | 1.81 ms |
+
+- **The pass itself costs about 0.05 ms of GPU in a frame that runs it**,
+  and nearly the same for 8 new particles as for 157: it is the cost of a
+  dispatch more than of the rays. Each particle's flight is 32 chords,
+  traced once in its life.
+- **An effect that does not ask pays nothing for the pass**: the rows
+  "flying free" show the time before the geometry at what it is with no
+  particles at all. In the vertex shader it pays one comparison on a table
+  row it already read; the 93 golden scenes stored before this change
+  render as they did before it. (Three of them, `tilted-slab-lit`,
+  `body-by-lake` and `combat-burning`, already differed from their stored
+  images at the commit this work started from, 13de642; this branch's
+  renders of the three are pixel for pixel that commit's.)
+- **The larger difference is drawing, not colliding.** With the setting on,
+  particles lie on the ground for the rest of their lives where before
+  they fell out of sight under it, so more of them cover pixels: 0.01 ms
+  more at 470 a second, 0.9 ms more at 9 400 a second (some 30 000 lying
+  in view, the shaded ones lit once each). A shorter life or `dies_on_solid`
+  is the remedy.
+- The March side is unchanged: the setting is one float of an effect's 44.
+
+What is checked: the setting's table floats, its clamps, that it changes
+nothing else an effect holds nor what a burst queues (`test/particles_test.march`,
+5 tests more); the pieces of the flight the vertex shader draws from what
+the pass wrote (die, rest, the bounce's second leg, velocity as the
+flight's slope: `native/tests/particles_test.c`); the golden `fx-meeting`
+(frame 147 of the scene: piles on the sand, cinders stopped at the foot of
+the bank's face), which must also say `fx: particles meet the world`.
+
+Limits that remain:
+
+- The world is looked at once, as it is when the particle is born. A block
+  placed in a flight's way afterwards is flown through; one dug out still
+  stops the particle, and a particle lying on it hangs there until its
+  life ends.
+- Only loaded chunks are seen: a flight that leaves them meets nothing
+  from there on, and chunks that arrive later are not looked at.
+- Water, glass and thin blocks (tall grass) stop nothing; nor do physics
+  bodies or figures. Cutout blocks (leaves) stop a particle where their
+  texture is opaque.
+- A particle meets the world as a point at its middle, so a large one
+  (smoke at 0.7 m) sinks half its size into a wall before it stops; a
+  resting one is lifted half its size off the face it met.
+- One bounce, then rest. No rolling or sliding; a particle that comes to
+  rest on a slope of steps stays on the step.
+- The flight is walked as 32 chords: a corner thinner than a chord's sag
+  (about a centimetre for a one-second life, more for longer ones) can be
+  stepped over.
+- Spray (`Strata.Render.spray`, effect 0) and the match's seven effects are
+  as they were and meet nothing; only the `STRATA_FX=2` scene's three ask.
+- A game that bore more than 65 536 colliding particles between two frames
+  would have the oldest of them overwritten before they were looked at
+  (the ring's own limit).
 
 ## Path finding (Strata.Nav), measured in the match
 
@@ -1233,3 +1314,102 @@ Not targets, recorded with them:
   island 19 of 20 trees in the level-1 forest chunk are level 0's. Open.
 - **The March share.** Every per-column cost above is plain March code. Its
   gaps have reduced cases: GAPS S43 to S47.
+
+## Save and load (Strata.Save), measured against the design's budget
+
+`scripts/save_times.sh` builds `savecheck` and prints these rows; release
+build, a flat world of two blocks at 1 m, a stream of radius 2 x 1 (75
+chunks over 8 regions). Judged on 2026-11-19 at a load average of 7.5 (the
+rule: only under 8); two runs before it, at loads 8.4 and 8.6, gave the
+same figures within a tenth.
+
+| What | Target | Measured | |
+|---|---|---|---|
+| `Strata.Save.tick` on the frame, nothing to write | under 0.05 ms | 0.001 ms (mean of 2000 ticks) | met |
+| `Strata.Save.tick` on the frame, starting a region write | under 0.5 ms | 0.012 ms mean, 0.016 ms worst (7 ticks, each starting a region of about 9 edited chunks) | met |
+| A region of 512 edited paletted chunks, encoded and written on a worker | under 50 ms | 183 ms: 169 ms encoding 16.4 MB, 14 ms writing (the write was 2.3 to 2.6 ms in the other runs) | missed |
+| First frame of a loaded world, compared with a new one | no slower than one extra region read per wanted region | 8.3 ms slower (12.5 ms against 4.3 ms to settle the 75 chunks); 8 region files read, one read and decode 4.0 ms, so the allowance was 32 ms | met |
+| `flush` with 100 dirty regions | under 2 s | 164 ms (100 regions of one edited chunk each) | met |
+
+- **The miss.** Encoding is one March loop over each chunk's 32768 voxels
+  (the palette rebuilt from content, Task 1's ruling) and CRC-32 over the
+  file, about 10 ns a voxel in all; Task 1 measured the same encode at 266
+  ms under load 71. This is GAPS S45 (a loop pays per turn for array calls,
+  a scheduler poll and a stack save), not something the store can order
+  differently: the Strata code is left plain. It runs on a worker, so the
+  frame does not see it; what it bounds is how soon a heavily edited region
+  is on disk. The design's lever if it matters first is the region's size.
+- **Starting a write** was 2.2 ms mean and 3.1 ms worst when the frame
+  compacted each loaded chunk and hashed it to see whether it still
+  differed from its generation. The worker does both now
+  (`Strata.World.region_raw` hands chunks over as they are).
+- **Not measured here:** `release_written` costs a hash and a coarse copy
+  (five passes over a chunk) on the frame for each written chunk the world
+  gives up; `tick` gives up at most 2 a frame.
+- `set_section` with a 4 MB value costs what it costs with 10 bytes: 20000
+  calls in 5.5 ms either way (printed by the library's test, not judged).
+
+
+# Translucent order inside a chunk
+
+The addendum of 2026-11-19 to `docs/2026-11-10-renderer-design.md`: a chunk
+whose translucent quads can cover one another carries eight sorted lists of
+them, one for each way a ray can run, and each list is drawn only where the
+eye's rays run its way. Measured 2026-11-19 on the development machine with
+other sessions building beside it (load average 9 to 16), so instructions
+are the figure to trust for the mesher and the medians for the frames.
+"Before" is 13de642 with only the new viewer scenes added.
+
+## Frames
+
+`scripts/bench.sh` (offscreen, 1280 x 800 at the display's scale, light
+mode 4), the match as it stands and then three fixed scenes with
+`STRATA_COMBAT=0 STRATA_SHORE=0 STRATA_SCENE=n STRATA_FRAMES=1500`. Times
+in ms, median / 99th percentile; "after" is the pass that holds the
+translucent quads (water, composite, translucent, particles, interface).
+
+| run | frame before | frame after | GPU before | GPU after | last pass before | last pass after |
+|---|---|---|---|---|---|---|
+| the match, run 1 | 4.06 / 5.43 | 4.04 / 5.54 | 4.06 / 4.65 | 4.04 / 4.56 | 1.31 / 1.67 | 1.32 / 1.43 |
+| the match, run 2 | 4.07 / 5.42 | 4.03 / 5.21 | 4.07 / 4.53 | 4.04 / 4.51 | 1.32 / 1.47 | 1.32 / 1.45 |
+| scene 23, the island's lake | 3.42 / 3.90 | 3.44 / 3.83 | 3.48 / 3.76 | 3.49 / 3.78 | 0.99 / 1.19 | 0.99 / 1.19 |
+| scene 142, the panes from above | 6.09 / 6.72 | 5.68 / 6.23 | 6.08 / 6.67 | 5.67 / 6.21 | 3.19 / 3.67 | 2.78 / 3.24 |
+| scene 145, between two panes | 17.60 / 18.94 | 15.71 / 17.10 | 17.61 / 18.86 | 15.70 / 16.98 | 15.24 / 16.56 | 13.35 / 14.74 |
+
+The match and the lake are unchanged: nearly all their translucent chunks
+are a water surface in one plane, which carries no lists and is drawn as
+before. The pane scenes are cheaper, not dearer, although a chunk with
+lists is drawn with up to eight commands: a pane's far faces are no longer
+shaded, and every water pixel traces rays. Scene 145 fills the screen with
+see-through surfaces several deep and was over 8.33 ms before and after.
+Ordering the translucent commands on the CPU stays in the microseconds
+(`sv_stat(5)`); the number of indirect draw calls is unchanged.
+
+## Meshing
+
+`bench/mesh_translucent/run.sh`: one `Strata.Mesh.build` of a chunk alone
+in air, a 200-build run minus a 0-build run, instructions retired a build.
+Bytes are the chunk's mesh.
+
+| chunk | translucent quads | before | after | bytes before | bytes after |
+|---|---|---|---|---|---|
+| a pond in stone (tops in one plane: no lists) | 1 | 48.10 M | 48.05 M | 344 | 344 |
+| the pane scene (pool, three panes, wall, shelf) | 76 | 43.86 M | 45.31 M | 608 | 4 704 |
+| glass scattered through a 10-voxel cube | 334 | 38.42 M | 45.68 M | 2 672 | 13 360 |
+| the same through a 12-voxel cube (over 512: listed, not sorted) | 703 | 40.05 M | 41.94 M | 5 624 | 28 120 |
+| the same through a 16-voxel cube | 1 704 | 43.63 M | 48.47 M | 13 632 | 68 160 |
+| stone only, the pane scene's shapes | 0 | 43.69 M | 43.77 M | 1 824 | 1 824 |
+
+A build is about 2 ms of CPU here either way; the timer's 50 us steps do
+not resolve the differences, the instruction counts do. The order costs
+3% on the pane scene and 19% at 334 scattered quads; the sort compares
+every pair of an octant's quads, so the bound of 512 keeps the worst chunk
+to roughly a build and a half. A chunk with lists holds each quad once
+more for every list it is in: five times the bytes for glass (four lists
+and the quads themselves, which the renderer does not keep), nine for a
+block seen from both sides. The pool in the pane scene is such a block,
+hence its factor of 7.7.
+
+Not measured: a world with many glass-heavy chunks (the viewer has one
+see-through block that collides), and flowing water in a chunk that also
+needs lists, which is re-meshed as it moves.

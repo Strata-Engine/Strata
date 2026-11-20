@@ -12,6 +12,10 @@
 # otherwise: the stored images predate it. The far-field scenes run with the
 # viewer's four levels, settled before the first frame, and are shot at
 # frame 120.
+# The panes scenes (140..145) are for the order of see-through quads inside
+# one chunk: a pool, three glass panes standing through it, a wall of water
+# and a glass shelf, seen from six places (one of them between two panes,
+# where the chunk is drawn from four of its eight ordered lists).
 # Every scene but fine-overview (the 10 cm world) is on the island, its atlas cached in .march/atlas, generated
 # from viewer/assets/island.gen.
 cd "$(dirname "$0")/.." || exit 1
@@ -49,6 +53,13 @@ bad-ids:STRATA_SCENE=5
 glass-front:STRATA_SCENE=6
 glass-back:STRATA_SCENE=7
 underwater:STRATA_SCENE=8
+panes-front:STRATA_SCENE=140
+panes-back:STRATA_SCENE=141
+panes-above:STRATA_SCENE=142
+panes-below:STRATA_SCENE=143
+panes-side:STRATA_SCENE=144
+panes-between:STRATA_SCENE=145
+panes-lit:STRATA_SCENE=142 STRATA_LIGHT=4
 meadow:STRATA_SCENE=9
 post:STRATA_SCENE=10
 walk:STRATA_SCENE=11 STRATA_FRAMES=200
@@ -130,6 +141,7 @@ forest-border:STRATA_SCENE=128 STRATA_LIGHT=4
 ruin-slope:STRATA_SCENE=129 STRATA_LIGHT=4
 crater-ruin:STRATA_SCENE=134 STRATA_LIGHT=4 STRATA_FRAMES=120
 fx-showcase:STRATA_ISLAND=1 STRATA_SHORE=1 STRATA_LIGHT=4 STRATA_FX=1 DRAWS=7 SAYS=fx:_7_effects_defined
+fx-meeting:STRATA_ISLAND=1 STRATA_SHORE=1 STRATA_LIGHT=4 STRATA_FX=2 STRATA_FRAMES=150 DRAWS=7 SAYS=fx:_particles_meet_the_world
 overview-regenerated:STRATA_SCENE=1 STRATA_REGEN=1 GOLDEN_AS=overview
 far-island-from-hill:STRATA_SCENE=135 STRATA_LEVELS=4 STRATA_LIGHT=4 STRATA_FRAMES=123
 far-ring-boundary:STRATA_SCENE=136 STRATA_LEVELS=4 STRATA_RADIUS=4 STRATA_LIGHT=4 STRATA_FRAMES=123

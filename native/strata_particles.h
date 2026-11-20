@@ -51,15 +51,32 @@ static inline uint32_t sp_first(const SprayRing *r) { return (uint32_t)(r->tail 
 /* A particle's record, 16 floats, written once at its birth:
  * [0..2] start (m) [3] birth (s) [4..6] velocity (m/s) [7] life (s)
  * [8] effect [9] size scale [10] seed 0..1 [11] rotation at birth (rad)
- * [12] texture layer override (-1: the effect's own) [13..15] 0 */
+ * [12] texture layer override (-1: the effect's own)
+ * [13..15] 0 for an effect that meets nothing. For one that meets the world
+ * (PT_MEET_*), written by the renderer's collision pass (collide.comp) in
+ * the frame after the birth: [13] the age (s) of its first meeting with a
+ * solid voxel, PT_MEET_NEVER for none, PT_MEET_UNKNOWN until the pass has
+ * run; [14] the face met first + 8 x the face met second (0 +y, 1 -y, 2 +x,
+ * 3 -x, 4 +z, 5 -z); [15] the age of the second meeting, after a bounce. */
 #define PT_FLOATS 16
-/* An effect in the table, 10 vec4s (std140):
+#define PT_MEET_UNKNOWN (-1.0f)
+#define PT_MEET_NEVER 1.0e9f
+/* What an effect's particles do on meeting a solid voxel (effect float 41). */
+#define PT_MEET_NOTHING 0
+#define PT_MEET_DIE 1
+#define PT_MEET_REST 2
+#define PT_MEET_BOUNCE 3
+/* An effect in the table, 11 vec4s (std430):
  * [0..3]   look (0 shaded, 1 glowing), layer, lit (0 per pixel, 1 per particle), colour keys used (1..4)
  * [4..19]  four colour keys (r, g, b, opacity)    [20..23] their ages (0..1)
  * [24..27] four sizes (m)                         [28..31] their ages (0..1)
  * [32..35] size keys used (1..4), drag k, wobble metres, wobble Hz
  * [36..39] ax, ay, az (m/s2), spin (rad/s)
- * [40..43] shape (0 a square facing the eye, 1 a cube), three unused */
+ * [40] shape (0 a square facing the eye, 1 a cube)
+ * [41] on meeting a solid voxel: PT_MEET_NOTHING, _DIE, _REST (stop there
+ *      and live out its life) or _BOUNCE (once, then rest at the next)
+ * [42] a bounce's restitution: the share of the speed into the face that
+ *      comes back out   [43] the share of the speed along the face kept */
 #define PT_EFFECT_FLOATS 44
 #define PT_EFFECTS 64
 
@@ -74,6 +91,52 @@ static inline void pt_effect_spray(float *e) {
     e[24] = 1.0f; e[32] = 1.0f;
     e[37] = -9.8f; e[39] = 4.0f;                       /* falling, tumbling */
     e[40] = 1.0f;
+}
+
+/* Does effect [e] (its PT_EFFECT_FLOATS floats) ask to meet the world? */
+static inline int pt_effect_meets(const float *e) { return e[41] > 0.5f; }
+
+/* How fast a particle is going at age [t], sway aside: the derivative of
+ * pt_position's closed form. */
+static inline void pt_velocity(const float *rec, const float *e, float t, float out[3]) {
+    float k = e[33];
+    for (int i = 0; i < 3; i++) {
+        float v0 = rec[4 + i], a = e[36 + i];
+        out[i] = k > 1e-6f ? a / k + (v0 - a / k) * expf(-k * t) : v0 + a * t;
+    }
+}
+
+/* A velocity after a bounce off face [face] (0 +y, 1 -y, 2 +x, 3 -x, 4 +z,
+ * 5 -z): the part along the face's normal turned back and scaled by
+ * [restitution], the rest scaled by [keep]. */
+static inline void pt_bounced(const float v[3], int face, float restitution, float keep, float out[3]) {
+    int axis = face < 2 ? 1 : (face < 4 ? 0 : 2);
+    for (int i = 0; i < 3; i++) out[i] = v[i] * (i == axis ? -restitution : keep);
+}
+
+/* Where a particle of an effect that meets the world is at age [t], as
+ * particle.vert draws it (the half-size lift of a resting particle aside):
+ * its free flight before the first meeting rec[13]; then nothing (answers
+ * 0: it has died), the meeting point, or a second flight from there to the
+ * second meeting rec[15]. Answers 1 while the particle is drawn. */
+static inline void pt_position(const float *rec, const float *e, float t, float out[3]);
+static inline int pt_position_met(const float *rec, const float *e, float t, float out[3]) {
+    int mode = (int)(e[41] + 0.5f);
+    float t1 = rec[13];
+    if (mode == PT_MEET_NOTHING || t1 < 0.0f || t < t1) { pt_position(rec, e, t, out); return 1; }
+    if (mode == PT_MEET_DIE) return 0;
+    pt_position(rec, e, t1, out);
+    if (mode == PT_MEET_REST) return 1;
+    float v1[3], leg[16], still[PT_EFFECT_FLOATS];
+    pt_velocity(rec, e, t1, v1);
+    for (int i = 0; i < 16; i++) leg[i] = rec[i];
+    for (int i = 0; i < PT_EFFECT_FLOATS; i++) still[i] = e[i];
+    still[34] = 0.0f;                                   /* the second leg does not sway */
+    pt_bounced(v1, (int)rec[14] & 7, e[42], e[43], leg + 4);
+    for (int i = 0; i < 3; i++) leg[i] = out[i];
+    float t2 = rec[15];
+    pt_position(leg, still, (t < t2 ? t : t2) - t1, out);
+    return 1;
 }
 
 /* Corner [v] (0..35) of the unit cube a particle is drawn as, about its

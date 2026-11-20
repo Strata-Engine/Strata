@@ -58,6 +58,7 @@ mod Strata.Stream do
   alias Strata.World as Wo
   alias Strata.Store as So
   alias Strata.Coord as Ko
+  alias Strata.Regions as Rs
 
   -- radius_h, radius_v (chunks), apply_budget (generated chunks per tick),
   -- workers, far_h, far_v (each coarse level's radii in its own chunks), levels
@@ -102,11 +103,16 @@ mod Strata.Stream do
 
   -- ── Work in flight ───────────────────────────────────────────────────────
   -- a generated chunk and its content hash, which the worker computes
-  type Made = Made(Strata.Chunk.Chunk, Int)
+  -- (MadeSaved: a level-0 chunk a store holds, saved edits applied, and the
+  -- hash of what the generator made for its key)
+  type Made = Made(Strata.Chunk.Chunk, Int) | MadeSaved(Strata.Chunk.Chunk, Int)
+  -- what a generation task answers: its chunks in order, and the region files it read
+  type Batch = Batch(List(Made), List(Strata.Regions.Loaded))
   -- a key, the stale stamp it was asked with (0: a wanted chunk), its result
   type GenRes = GenRes(Strata.Coord.Key, Int, Made)
-  -- the keys of one batch, each with its stamp, and the task making them in that order
-  type GenTask = GenTask(List((Strata.Coord.Key, Int)), Task(List(Made)))
+  -- the keys of one batch, each with its stamp, the task making them in that
+  -- order, and the regions whose files the task reads
+  type GenTask = GenTask(List((Strata.Coord.Key, Int)), Task(Batch), List(Strata.Coord.Key))
   -- stale coarse keys to generate again, each with the stamp of its newest
   -- request, and the last stamp issued
   type Redo = Redo(Strata.Store.Store(Int), Int)
@@ -129,11 +135,17 @@ mod Strata.Stream do
   -- other way about. They are kept only once `take_changed` has been called
   -- (sl_on), so a stream nobody takes from (the viewer's) holds nothing in
   -- them. (Fields carry `sl_` so no other record shares them, GAPS S18, S19.)
-  type ChunkLog = { sl_unloads : List(Strata.Coord.Key), sl_on : Bool, sl_changed : Strata.Store.Store(Bool), sl_dropped : Strata.Store.Store(Bool) }
+  --
+  -- The record also carries what a store (Strata.Save) gives and takes:
+  -- the saved regions generation consults (sl_source; None, as a stream
+  -- starts, and nothing is read), and the region files generation tasks
+  -- have read, kept until the store takes them (`take_regions`).
+  type ChunkLog = { sl_unloads : List(Strata.Coord.Key), sl_on : Bool, sl_changed : Strata.Store.Store(Bool), sl_dropped : Strata.Store.Store(Bool),
+                    sl_source : Option(Strata.Regions.RegionSource), sl_regions : List(Strata.Regions.Loaded) }
 
-  pfn no_log() : ChunkLog do { sl_unloads: Nil, sl_on: false, sl_changed: So.empty(false), sl_dropped: So.empty(false) } end
+  pfn no_log() : ChunkLog do { sl_unloads: Nil, sl_on: false, sl_changed: So.empty(false), sl_dropped: So.empty(false), sl_source: None, sl_regions: Nil } end
   pfn log_unload(lg : ChunkLog, k : Strata.Coord.Key) : ChunkLog do
-    if lg.sl_on do { sl_unloads: Cons(k, lg.sl_unloads), sl_on: true, sl_changed: So.remove(lg.sl_changed, k), sl_dropped: So.put(lg.sl_dropped, k, true) }
+    if lg.sl_on do { lg with sl_unloads: Cons(k, lg.sl_unloads), sl_changed: So.remove(lg.sl_changed, k), sl_dropped: So.put(lg.sl_dropped, k, true) }
     else { lg with sl_unloads: Cons(k, lg.sl_unloads) } end
   end
   pfn log_loaded(lg : ChunkLog, k : Strata.Coord.Key) : ChunkLog do
@@ -164,7 +176,7 @@ mod Strata.Stream do
   end
 
   -- ── Collecting tasks ─────────────────────────────────────────────────────
-  type Got = Got(List(GenRes), List(Strata.Coord.Key))     -- finished, failed
+  type Got = Got(List(GenRes), List(Strata.Coord.Key), List(Strata.Regions.Loaded))     -- finished, failed, region files read
 
   -- a finished batch as one result a key, in order; a batch that answers another number of chunks has failed
   pfn results(ks : List((Strata.Coord.Key, Int)), ms : List(Made), ok : List(GenRes)) : Option(List(GenRes)) do
@@ -190,32 +202,31 @@ mod Strata.Stream do
   pfn await_gens(ts : List(GenTask), g : Got) : Got do
     match ts do
       Nil -> g
-      Cons(GenTask(ks, t), rest) ->
-        match g do
-          Got(ok, bad) ->
-            await_gens(rest, gen_done(ks, task_await(t), ok, bad))
-        end
+      Cons(GenTask(ks, t, _), rest) -> await_gens(rest, gen_done(ks, task_await(t), g))
     end
   end
   -- a generation task's result folded in: its chunks, or its keys to try again
-  pfn gen_done(ks : List((Strata.Coord.Key, Int)), r : Result(List(Made), String), ok : List(GenRes), bad : List(Strata.Coord.Key)) : Got do
-    match r do
-      Ok(ms) ->
-        match results(ks, ms, ok) do
-          Some(ok2) -> Got(ok2, bad)
-          None -> Got(ok, keys_onto(ks, bad))
+  pfn gen_done(ks : List((Strata.Coord.Key, Int)), r : Result(Batch, String), g : Got) : Got do
+    match g do
+      Got(ok, bad, reads) ->
+        match r do
+          Ok(Batch(ms, rr)) ->
+            match results(ks, ms, ok) do
+              Some(ok2) -> Got(ok2, bad, List.append(rr, reads))
+              None -> Got(ok, keys_onto(ks, bad), List.append(rr, reads))
+            end
+          Err(_) -> Got(ok, keys_onto(ks, bad), reads)
         end
-      Err(_) -> Got(ok, keys_onto(ks, bad))
     end
   end
   -- the finished tasks folded in, the rest answered (in order) to be kept for a later tick
   pfn poll_gens(ts : List(GenTask), g : Got, still : List(GenTask)) : (Got, List(GenTask)) do
     match ts do
       Nil -> (g, List.reverse(still))
-      Cons(GenTask(ks, t), rest) ->
+      Cons(GenTask(ks, t, rr), rest) ->
         match task_poll(t) do
-          None -> poll_gens(rest, g, Cons(GenTask(ks, t), still))
-          Some(r) -> match g do Got(ok, bad) -> poll_gens(rest, gen_done(ks, r, ok, bad), still) end
+          None -> poll_gens(rest, g, Cons(GenTask(ks, t, rr), still))
+          Some(r) -> poll_gens(rest, gen_done(ks, r, g), still)
         end
     end
   end
@@ -255,8 +266,8 @@ mod Strata.Stream do
   fn stop(s : Stream) : Unit do
     match s do
       Stream(_, _, _, _, _, gts, mts, m, _, gts2, mts2, _) ->
-        match await_gens(gts2, await_gens(gts, Got(Nil, Nil))) do
-          Got(_, _) ->
+        match await_gens(gts2, await_gens(gts, Got(Nil, Nil, Nil))) do
+          Got(_, _, _) ->
             match await_meshes(mts2, await_meshes(mts, m)) do
               Meshing(_, _, _, _, _) -> ()
             end
@@ -269,6 +280,19 @@ mod Strata.Stream do
 
   fn world(s : Stream) : Strata.World.World do match s do Stream(w, _, _, _, _, _, _, _, _, _, _, _) -> w end end
   fn loaded_count(s : Stream) : Int do Wo.loaded_count(world(s)) end
+
+  doc "The stream with world [w] in place of its own: for a caller that took something out of the world (`Strata.World.take_changes`, `release_written`) and puts it back. The loaded chunks must be the ones the stream's world held; to put an edited world, use `apply`."
+  fn put_world(s : Stream, w : Strata.World.World) : Stream do
+    match s do Stream(_, c, fs, q, got, gts, mts, m, gone, gts2, mts2, rd) -> Stream(w, c, fs, q, got, gts, mts, m, gone, gts2, mts2, rd) end
+  end
+
+  doc "Is a generation of [k] under way: its task running, or its chunk made and waiting to be applied?"
+  fn generating(s : Stream, k : Strata.Coord.Key) : Bool do
+    match s do
+      Stream(_, _, _, _, got, gts, _, _, _, gts2, _, _) ->
+        if waiting_has(got, k) do true else if running(gts, k) do true else running(gts2, k) end end
+    end
+  end
 
   -- ── The wanted set ───────────────────────────────────────────────────────
   pfn absv(v : Int) : Int do if v < 0 do 0 - v else v end end
@@ -649,19 +673,31 @@ mod Strata.Stream do
             else if cur == 0 && Wo.is_loaded(w, k) do apply_gens(a, t, n, c, fs)
             else if n <= 0 do apply_gens(Applied(w, m, Cons(GenRes(k, st, ch), rest), rd, again, lg), t, n, c, fs)
             else
-              match ch do
-                Made(cc, h) ->
-                  if Wo.is_loaded(w, k) do
-                    let changed = Wo.gen_hash(w, k) != h
-                    let w2 = Wo.insert_hashed(w, k, cc, h)
-                    apply_gens(Applied(w2, if changed do stale(m, w2, add_todo(Nil, w2, k, 0)) else m end, rest, So.remove(rd, k), again, if changed do log_loaded(lg, k) else lg end), t, n - 1, c, fs)
-                  else
-                    let w2 = Wo.insert_hashed(w, k, cc, h)
-                    apply_gens(Applied(w2, arrived(m, w2, k), rest, So.remove(rd, k), again, log_loaded(lg, k)), t, n - 1, c, fs)
-                  end
+              let h = made_hash(ch)
+              if Wo.is_loaded(w, k) do
+                let changed = Wo.gen_hash(w, k) != h
+                let w2 = put_made(w, k, ch)
+                apply_gens(Applied(w2, if changed do stale(m, w2, add_todo(Nil, w2, k, 0)) else m end, rest, So.remove(rd, k), again, if changed do log_loaded(lg, k) else lg end), t, n - 1, c, fs)
+              else
+                let w2 = put_made(w, k, ch)
+                apply_gens(Applied(w2, arrived(m, w2, k), rest, So.remove(rd, k), again, log_loaded(lg, k)), t, n - 1, c, fs)
               end
             end end end end
         end
+    end
+  end
+
+  pfn made_hash(ch : Made) : Int do
+    match ch do
+      Made(_, h) -> h
+      MadeSaved(_, h) -> h
+    end
+  end
+  -- a made chunk into the world: a generated one as generated, a saved one in the generated one's place
+  pfn put_made(w : Strata.World.World, k : Strata.Coord.Key, ch : Made) : Strata.World.World do
+    match ch do
+      Made(cc, h) -> Wo.insert_hashed(w, k, cc, h)
+      MadeSaved(cc, h) -> Wo.insert_saved(w, k, cc, h)
     end
   end
 
@@ -675,37 +711,132 @@ mod Strata.Stream do
   type Handed = Handed(List(Strata.Coord.Key), List(GenTask))
 
   -- On the worker: generate the batch's keys (one chunk column and level:
-  -- Strata.Terrain.run_column), then coarsen each coarse key's captured fine chunks over its chunk.
-  pfn finish_made(r : Strata.Blocks.Registry, items : List((Strata.Coord.Key, Int, List(Strata.World.Fine))), cs : List(Strata.Chunk.Chunk), acc : List(Made)) : List(Made) do
+  -- Strata.Terrain.run_column), then coarsen each coarse key's captured fine
+  -- chunks over its chunk. With a store's regions ([src]), a level-0 key
+  -- whose region has a file gets what the region holds for it: the saved
+  -- chunk in the generated one's place, and the saved queue of edits
+  -- applied, oldest first. A region not decoded yet is read here, once a
+  -- task ([reads] remembers it), and answered with the chunks.
+  pfn finish_made(r : Strata.Blocks.Registry, items : List((Strata.Coord.Key, Int, List(Strata.World.Fine))), cs : List(Strata.Chunk.Chunk), acc : List(Made), src : Option(Strata.Regions.RegionSource), reads : List(Strata.Regions.Loaded)) : Batch do
     match items do
-      Nil -> List.reverse(acc)
+      Nil -> Batch(List.reverse(acc), reads)
       Cons((k, _, fines), it) ->
         match cs do
-          Nil -> List.reverse(acc)
+          Nil -> Batch(List.reverse(acc), reads)
           Cons(c0, ct) ->
-            let c = if Ko.level(k) > 0 do Wo.coarsen_over(r, k, c0, fines) else c0 end
-            finish_made(r, it, ct, Cons(Made(c, Strata.Chunk.hash(c)), acc))
+            if Ko.level(k) > 0 do
+              let c = Wo.coarsen_over(r, k, c0, fines)
+              finish_made(r, it, ct, Cons(Made(c, Strata.Chunk.hash(c)), acc), src, reads)
+            else
+              let (m, reads2) = saved_or(k, c0, src, reads)
+              finish_made(r, it, ct, Cons(m, acc), src, reads2)
+            end
         end
     end
   end
-  pfn make(g : Strata.Terrain.Gen, r : Strata.Blocks.Registry, items : List((Strata.Coord.Key, Int, List(Strata.World.Fine))), seed : Int) : List(Made) do
-    finish_made(r, items, Strata.Terrain.run_column(g, List.map(items, fn i -> match i do (k, _, _) -> k end), seed), Nil)
+  -- the level-0 chunk of k: generated chunk c0, or what the store's region holds for k
+  pfn saved_or(k : Strata.Coord.Key, c0 : Strata.Chunk.Chunk, src : Option(Strata.Regions.RegionSource), reads : List(Strata.Regions.Loaded)) : (Made, List(Strata.Regions.Loaded)) do
+    match src do
+      None -> (Made(c0, Strata.Chunk.hash(c0)), reads)
+      Some(sr) ->
+        let rk = Rs.of_chunk(k)
+        if !Rs.present(sr, rk) do (Made(c0, Strata.Chunk.hash(c0)), reads)
+        else
+          match Rs.lookup(sr, rk) do
+            Some(g) -> (from_region(k, c0, g), reads)
+            None ->
+              match Rs.loaded_in(reads, rk) do
+                Some(rd) -> (from_read(k, c0, rd), reads)
+                None ->
+                  let rd = Rs.read(Rs.dir(sr), rk)
+                  (from_read(k, c0, rd), Cons(Rs.loaded(rk, Rs.epoch(sr), rd), reads))
+              end
+          end
+        end
+    end
+  end
+  pfn from_read(k : Strata.Coord.Key, c0 : Strata.Chunk.Chunk, rd : Strata.Regions.RegionRead) : Made do
+    match rd do
+      RrGot(g) -> from_region(k, c0, g)
+      _ -> Made(c0, Strata.Chunk.hash(c0))
+    end
+  end
+  pfn from_region(k : Strata.Coord.Key, c0 : Strata.Chunk.Chunk, g : Strata.Savefile.Region) : Made do
+    let ops = Rs.ops_in(g, k)
+    match Rs.chunk_in(g, k) do
+      Some(c) -> MadeSaved(List.fold_left(ops, c, fn (acc, op) -> Wo.apply_op(acc, k, op)), Strata.Chunk.hash(c0))
+      None ->
+        match ops do
+          Nil -> Made(c0, Strata.Chunk.hash(c0))
+          _ -> MadeSaved(List.fold_left(ops, c0, fn (acc, op) -> Wo.apply_op(acc, k, op)), Strata.Chunk.hash(c0))
+        end
+    end
+  end
+  pfn make(g : Strata.Terrain.Gen, r : Strata.Blocks.Registry, items : List((Strata.Coord.Key, Int, List(Strata.World.Fine))), seed : Int, src : Option(Strata.Regions.RegionSource)) : Batch do
+    finish_made(r, items, Strata.Terrain.run_column(g, List.map(items, fn i -> match i do (k, _, _) -> k end), seed), Nil, src, Nil)
   end
 
-  pfn gen_task(g : Strata.Terrain.Gen, r : Strata.Blocks.Registry, items : List((Strata.Coord.Key, Int, List(Strata.World.Fine))), seed : Int) : Task(List(Made)) do
-    task_spawn(fn _ -> make(g, r, items, seed))
+  pfn gen_task(g : Strata.Terrain.Gen, r : Strata.Blocks.Registry, items : List((Strata.Coord.Key, Int, List(Strata.World.Fine))), seed : Int, src : Option(Strata.Regions.RegionSource)) : Task(Batch) do
+    task_spawn(fn _ -> make(g, r, items, seed, src))
+  end
+
+  -- ── A store's regions ────────────────────────────────────────────────────
+  -- The region whose file a task for level-0 key k would have to read: it
+  -- has a file and is not decoded yet. None for any other key.
+  pfn to_read(src : Option(Strata.Regions.RegionSource), k : Strata.Coord.Key) : Option(Strata.Coord.Key) do
+    match src do
+      None -> None
+      Some(sr) ->
+        if Ko.level(k) != 0 do None
+        else
+          let rk = Rs.of_chunk(k)
+          if !Rs.present(sr, rk) do None else if Rs.decoded(sr, rk) do None else Some(rk) end end
+        end
+    end
+  end
+  pfn reading(ts : List(GenTask), rk : Strata.Coord.Key) : Bool do
+    match ts do
+      Nil -> false
+      Cons(GenTask(_, _, rr), t) -> if has_key(rr, rk) do true else reading(t, rk) end
+    end
+  end
+  -- the regions a batch's task will read, each once
+  pfn reads_of(items : List((Strata.Coord.Key, Int, List(Strata.World.Fine))), src : Option(Strata.Regions.RegionSource), acc : List(Strata.Coord.Key)) : List(Strata.Coord.Key) do
+    match items do
+      Nil -> acc
+      Cons((k, _, _), t) ->
+        match to_read(src, k) do
+          None -> reads_of(t, src, acc)
+          Some(rk) -> reads_of(t, src, if has_key(acc, rk) do acc else Cons(rk, acc) end)
+        end
+    end
   end
 
   -- Whether key k may be started now: its stamp (0 for a key not loaded, the
   -- stale stamp for a loaded stale one), or -1: loaded and not stale, not
   -- wanted, already waiting to be applied, or already started.
-  pfn startable(k : Strata.Coord.Key, out : List(GenTask), w : Strata.World.World, c : Config, fs : List(Strata.Coord.Key), waiting : List(GenRes), rd : Strata.Store.Store(Int)) : Int do
+  -- Nor (-2: it keeps its place in the queue) may a key whose region's file another task is reading (one started
+  -- in this dispatch, [out], or still in flight, [fly]): one task reads a
+  -- region's file, and its other keys wait for a later dispatch, when the
+  -- region is decoded.
+  pfn startable(k : Strata.Coord.Key, out : List(GenTask), w : Strata.World.World, c : Config, fs : List(Strata.Coord.Key), waiting : List(GenRes), rd : Strata.Store.Store(Int), ld : Loading) : Int do
     let st = So.get(rd, k)
     let skip = if st == 0 do Wo.is_loaded(w, k) else false end
     if skip do 0 - 1
     else
       let want = if st == 0 do in_box(c, top(c, w), fs, k, 0) else stale_wanted(c, top(c, w), fs, w, k) end
-      if !want do 0 - 1 else if waiting_has(waiting, k) do 0 - 1 else if running(out, k) do 0 - 1 else st end end end
+      if !want do 0 - 1 else if waiting_has(waiting, k) do 0 - 1 else if running(out, k) do 0 - 1 else if region_busy(k, out, ld) do 0 - 2 else st end end end end
+    end
+  end
+  -- the store's regions as a dispatch sees them, and the tasks in flight
+  type Loading = Loading(Option(Strata.Regions.RegionSource), List(GenTask))
+  pfn region_busy(k : Strata.Coord.Key, out : List(GenTask), ld : Loading) : Bool do
+    match ld do
+      Loading(src, fly) ->
+        match to_read(src, k) do
+          None -> false
+          Some(rk) -> if reading(out, rk) do true else reading(fly, rk) end
+        end
     end
   end
 
@@ -720,7 +851,7 @@ mod Strata.Stream do
   -- queue that may be started, at most [left] of them: (the batch's items in
   -- queue order after [items], the queue without them). A key that may not
   -- be started stays in the queue, as send_gens leaves it there.
-  pfn mates(first : Strata.Coord.Key, q : List(Strata.Coord.Key), left : Int, look : Int, out : List(GenTask), w : Strata.World.World, c : Config, fs : List(Strata.Coord.Key), waiting : List(GenRes), rd : Strata.Store.Store(Int), items : List((Strata.Coord.Key, Int, List(Strata.World.Fine))), kept : List(Strata.Coord.Key)) : (List((Strata.Coord.Key, Int, List(Strata.World.Fine))), List(Strata.Coord.Key)) do
+  pfn mates(first : Strata.Coord.Key, q : List(Strata.Coord.Key), left : Int, look : Int, out : List(GenTask), w : Strata.World.World, c : Config, fs : List(Strata.Coord.Key), waiting : List(GenRes), rd : Strata.Store.Store(Int), ld : Loading, items : List((Strata.Coord.Key, Int, List(Strata.World.Fine))), kept : List(Strata.Coord.Key)) : (List((Strata.Coord.Key, Int, List(Strata.World.Fine))), List(Strata.Coord.Key)) do
     -- kept is newest first and prepend puts its first key deepest, so the queue keeps its order
     if left <= 0 do (List.reverse(items), prepend(kept, q))
     else if look <= 0 do (List.reverse(items), prepend(kept, q))
@@ -728,13 +859,13 @@ mod Strata.Stream do
       match q do
         Nil -> (List.reverse(items), List.reverse(kept))
         Cons(k, t) ->
-          if !Strata.Terrain.same_column(first, k) do mates(first, t, left, look - 1, out, w, c, fs, waiting, rd, items, Cons(k, kept))
+          if !Strata.Terrain.same_column(first, k) do mates(first, t, left, look - 1, out, w, c, fs, waiting, rd, ld, items, Cons(k, kept))
           -- the queue can hold a key twice (asked for again after a failure): once in a batch is enough
-          else if has_item(items, k) do mates(first, t, left, look - 1, out, w, c, fs, waiting, rd, items, kept)
+          else if has_item(items, k) do mates(first, t, left, look - 1, out, w, c, fs, waiting, rd, ld, items, kept)
           else
-            let st = startable(k, out, w, c, fs, waiting, rd)
-            if st < 0 do mates(first, t, left, look - 1, out, w, c, fs, waiting, rd, items, Cons(k, kept))
-            else mates(first, t, left - 1, look - 1, out, w, c, fs, waiting, rd, Cons(item_of(k, st, w), items), kept) end
+            let st = startable(k, out, w, c, fs, waiting, rd, ld)
+            if st < 0 do mates(first, t, left, look - 1, out, w, c, fs, waiting, rd, ld, items, Cons(k, kept))
+            else mates(first, t, left - 1, look - 1, out, w, c, fs, waiting, rd, ld, Cons(item_of(k, st, w), items), kept) end
           end end
       end
     end end
@@ -755,25 +886,28 @@ mod Strata.Stream do
   -- or started, and wanted. With a batch cap over 1 the other startable keys
   -- of its chunk column go into the same task, up to the cap and the room.
   -- A coarse key carries the fine chunks to coarsen.
-  pfn send_gens(q : List(Strata.Coord.Key), out : List(GenTask), w : Strata.World.World, c : Config, fs : List(Strata.Coord.Key), waiting : List(GenRes), room : Int, rd : Strata.Store.Store(Int)) : Handed do
+  pfn send_gens(q : List(Strata.Coord.Key), out : List(GenTask), w : Strata.World.World, c : Config, fs : List(Strata.Coord.Key), waiting : List(GenRes), room : Int, rd : Strata.Store.Store(Int), ld : Loading, held : List(Strata.Coord.Key)) : Handed do
     match q do
-      Nil -> Handed(Nil, out)
+      Nil -> Handed(List.reverse(held), out)
       Cons(k, t) ->
-        let st = startable(k, out, w, c, fs, waiting, rd)
-        if st < 0 do send_gens(t, out, w, c, fs, waiting, room, rd)
-        else if room <= 0 do Handed(q, out)
+        let st = startable(k, out, w, c, fs, waiting, rd, ld)
+        if st == 0 - 2 do send_gens(t, out, w, c, fs, waiting, room, rd, ld, Cons(k, held))
+        else if st < 0 do send_gens(t, out, w, c, fs, waiting, room, rd, ld, held)
+        else if room <= 0 do Handed(prepend(held, q), out)
         else
           let more = if batch(c) < room do batch(c) - 1 else room - 1 end
-          match mates(k, t, more, mate_reach(), out, w, c, fs, waiting, rd, Cons(item_of(k, st, w), Nil), Nil) do
+          match mates(k, t, more, mate_reach(), out, w, c, fs, waiting, rd, ld, Cons(item_of(k, st, w), Nil), Nil) do
             (items, t2) ->
               -- everything this thread needs of the items is taken before the task starts: the task
               -- gets the list as its last use here, so the two threads never hold it together
               let ks = stamped(items)
               let n = List.length(items)
-              let task = gen_task(Wo.terrain(w), Wo.registry(w), items, Wo.seed(w))
-              send_gens(t2, Cons(GenTask(ks, task), out), w, c, fs, waiting, room - n, rd)
+              let src = match ld do Loading(sr, _) -> sr end
+              let rr = reads_of(items, src, Nil)
+              let task = gen_task(Wo.terrain(w), Wo.registry(w), items, Wo.seed(w), src)
+              send_gens(t2, Cons(GenTask(ks, task, rr), out), w, c, fs, waiting, room - n, rd, ld, held)
           end
-        end end
+        end end end
     end
   end
 
@@ -842,13 +976,13 @@ mod Strata.Stream do
   pfn running_keys(ts : List(GenTask), acc : Strata.Store.Store(Bool)) : Strata.Store.Store(Bool) do
     match ts do
       Nil -> acc
-      Cons(GenTask(ks, _), t) -> running_keys(t, List.fold_left(ks, acc, fn (a, kv) -> match kv do (k, _) -> So.put(a, k, true) end))
+      Cons(GenTask(ks, _, _), t) -> running_keys(t, List.fold_left(ks, acc, fn (a, kv) -> match kv do (k, _) -> So.put(a, k, true) end))
     end
   end
   pfn running(ts : List(GenTask), k : Strata.Coord.Key) : Bool do
     match ts do
       Nil -> false
-      Cons(GenTask(ks, _), t) -> if in_batch(ks, k) do true else running(t, k) end
+      Cons(GenTask(ks, _, _), t) -> if in_batch(ks, k) do true else running(t, k) end
     end
   end
   pfn in_batch(ks : List((Strata.Coord.Key, Int)), k : Strata.Coord.Key) : Bool do
@@ -866,21 +1000,48 @@ mod Strata.Stream do
     end
   end
 
+  -- the region files tasks read, kept for the store to take, and decoded
+  -- regions put where the next dispatch finds them
+  pfn with_reads(lg : ChunkLog, reads : List(Strata.Regions.Loaded)) : ChunkLog do
+    match reads do
+      Nil -> lg
+      _ ->
+        match lg.sl_source do
+          None -> lg
+          Some(sr) -> { lg with sl_source: Some(List.fold_left(reads, sr, fn (acc, rd) -> Rs.with_loaded(acc, rd))), sl_regions: List.append(reads, lg.sl_regions) }
+        end
+    end
+  end
+
+  doc "The stream with a store's saved regions for its generation to consult (`Strata.Save.region_source`): a level-0 chunk the store holds takes the generated one's place, and saved queued edits are applied, on the workers. A region not yet decoded is read by the one task that first needs it; other keys of that region wait for a later dispatch. Give it right after `Strata.Save.open`, before the first `tick`; `Strata.Save.tick` renews it each frame. A stream never given one reads no file and behaves as it always did."
+  fn with_store(s : Stream, regions : Strata.Regions.RegionSource) : Stream do
+    match s do
+      Stream(w, c, fs, q, got, gts, mts, m, gone, gts2, mts2, rd) -> Stream(w, c, fs, q, got, gts, mts, m, { gone with sl_source: Some(regions) }, gts2, mts2, rd)
+    end
+  end
+
+  doc "The region files generation tasks have read since the last take (decoded, damaged or missing), for `Strata.Save.adopt_regions`."
+  fn take_regions(s : Stream) : (Stream, List(Strata.Regions.Loaded)) do
+    match s do
+      Stream(w, c, fs, q, got, gts, mts, m, gone, gts2, mts2, rd) -> (Stream(w, c, fs, q, got, gts, mts, m, { gone with sl_regions: Nil }, gts2, mts2, rd), gone.sl_regions)
+    end
+  end
+
   doc "One step: collect the work started two ticks ago, apply generated chunks within the budget (stale coarse chunks among them), start the next batch of generation and meshing."
   fn tick(s : Stream) : Stream do
     match s do
       Stream(w, c, fs, q, got, gts, mts, m, gone, gts_new, mts_new, Redo(rst, rn)) ->
         -- polling, the work not yet done is kept (still_g, still_m) and counts against this tick's workers; waiting, there is none
-        let (gotten, still_g) = if polls(c) do poll_gens(gts, Got(Nil, Nil), Nil) else (await_gens(gts, Got(Nil, Nil)), Nil) end
+        let (gotten, still_g) = if polls(c) do poll_gens(gts, Got(Nil, Nil, Nil), Nil) else (await_gens(gts, Got(Nil, Nil, Nil)), Nil) end
         match gotten do
-          Got(gens, failed) ->
+          Got(gens, failed, reads) ->
             let (m1, still_m) = if polls(c) do poll_meshes(mts, m, Nil) else (await_meshes(mts, m), Nil) end
-            match apply_gens(Applied(w, m1, Nil, rst, Nil, gone), append(got, gens), budget(c), c, fs) do
+            match apply_gens(Applied(w, m1, Nil, rst, Nil, with_reads(gone, reads)), append(got, gens), budget(c), c, fs) do
               Applied(w1, m2, waiting, rst2, again, gone2) ->
                 match start_stale(w1, c, fs, Redo(rst2, rn), prepend(again, prepend(failed, q))) do
                   (w2, rd2, q1) ->
                     let rs2 = match rd2 do Redo(st, _) -> st end
-                    match send_gens(skip_running(q1, List.append(still_g, gts_new)), Nil, w2, c, fs, waiting, nonneg(nworkers(c) - List.length(still_g)), rs2) do
+                    match send_gens(skip_running(q1, List.append(still_g, gts_new)), Nil, w2, c, fs, waiting, nonneg(nworkers(c) - List.length(still_g)), rs2, Loading(gone2.sl_source, List.append(still_g, gts_new)), Nil) do
                       Handed(q2, gts2) ->
                         match take_todo(m2) do
                           (m3, todo) ->

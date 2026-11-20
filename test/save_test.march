@@ -1,0 +1,940 @@
+-- Save: the store's folder on disk — atomic writes, opening and its
+-- refusals, the lock two games meet, regions, the registry's fingerprint.
+--
+-- Each test works in a fresh folder of its own under test/.scratch (made
+-- here, removed at the end of the test; test/.scratch is ignored by git).
+mod Strata.Test.Save do
+
+  needs IO.Clock      -- charged to every test module once any uses Check.all (GAPS S3)
+  needs IO.Process
+  needs IO.FileSystem -- the stores are folders under test/.scratch
+  needs IO.Spawn      -- the stream's workers and the store's writes
+  needs IO.Console
+  import Test
+  alias Strata.Save as Sv
+  alias Strata.Blocks as Bsv
+  alias Strata.World as Wsv
+  alias Strata.Coord as Ksv
+  alias Strata.Chunk as Cksv
+  alias Strata.Stream as Smv
+
+  -- ── Helpers ──────────────────────────────────────────────────────────────
+
+  -- a fresh, empty folder path for one test: test/.scratch/<name>-<pid>-<ms>
+  pfn scratch(name : String) : String do
+    let base = "test/.scratch"
+    let _made = Authority.must(Dir.mkdir_p(base))
+    let tag = int_to_string(Authority.must(Process.pid())) ++ "-" ++ int_to_string(Authority.must(System.now_ms()))
+    let dir = base ++ "/" ++ name ++ "-" ++ tag
+    let _clean = Authority.must(Dir.rm_rf(dir))
+    dir
+  end
+  pfn tidy(dir : String) : Unit do
+    let _gone = Authority.must(Dir.rm_rf(dir))
+    ()
+  end
+  pfn names(d : String) : List(String) do
+    match Authority.must(Dir.list(d)) do
+      Ok(ns) -> ns
+      Err(_) -> Nil
+    end
+  end
+  pfn there(path : String) : Bool do Authority.must(File.exists(path)) end
+
+  pfn reg_with(r : Strata.Blocks.Registry, d : Strata.Blocks.Def) : Strata.Blocks.Registry do
+    match Bsv.register(r, d) do
+      Ok((r2, _)) -> r2
+      Err(_) -> r
+    end
+  end
+  -- air and one stone
+  pfn reg() : Strata.Blocks.Registry do reg_with(Bsv.empty(), Bsv.def()) end
+  pfn flat() : Strata.Terrain.Gen do
+    Strata.Terrain.gen(fn (k, seed) -> if Ksv.ky(k) < 0 do Cksv.uniform(1) else Cksv.uniform(0) end)
+  end
+  pfn world_of(r : Strata.Blocks.Registry, seed : Int, scale : Float) : Strata.World.World do Wsv.new(r, flat(), seed, scale) end
+  pfn world() : Strata.World.World do world_of(reg(), 7, 1.0) end
+
+  pfn opened(r : Result((Strata.Save.SaveStore, Strata.World.World), String)) : Option(Strata.Save.SaveStore) do
+    match r do
+      Ok((s, _)) -> Some(s)
+      Err(_) -> None
+    end
+  end
+  pfn refusal(r : Result((Strata.Save.SaveStore, Strata.World.World), String)) : String do
+    match r do
+      Ok((s, _)) ->
+        let _shut = Sv.close_unflushed(s)
+        "opened"
+      Err(e) -> e
+    end
+  end
+  -- open a new store in dir with the default world and close it at once
+  pfn made(dir : String, gv : Int) : Bool do
+    match opened(Sv.open(dir, world(), gv)) do
+      Some(s) ->
+        let _shut = Sv.close_unflushed(s)
+        true
+      None -> false
+    end
+  end
+
+  -- bytes 0, 1, ..., 255, 0, 1, ... (n of them)
+  pfn ramp(n : Int) : Bytes do
+    Bytes.from_u8_arr(ramp_go(NativeArray.make_u8(Strata.Size.of(n), 0), 0, n))
+  end
+  pfn ramp_go(a : NativeU8Arr, i : Int, n : Int) : NativeU8Arr do
+    if i >= n do a else ramp_go(NativeArray.set_u8(a, i, i % 256), i + 1, n) end
+  end
+  pfn same_bytes(a : Bytes, b : Bytes) : Bool do
+    let x = Bytes.to_u8_arr(a)
+    let y = Bytes.to_u8_arr(b)
+    if NativeArray.length_u8(x) != NativeArray.length_u8(y) do false else same_go(x, y, 0, NativeArray.length_u8(x)) end
+  end
+  pfn same_go(x : NativeU8Arr, y : NativeU8Arr, i : Int, n : Int) : Bool do
+    if i >= n do true
+    else if NativeArray.get_u8(x, i) != NativeArray.get_u8(y, i) do false
+    else same_go(x, y, i + 1, n) end end
+  end
+  pfn flipped(b : Bytes, i : Int) : Bytes do
+    let a = Bytes.to_u8_arr(b)
+    Bytes.from_u8_arr(NativeArray.set_u8(a, i, int_xor(NativeArray.get_u8(a, i), 255)))
+  end
+
+  -- does the store in dir name this seed, scale and generator version?
+  pfn ident_is(dir : String, seed : Int, scale : Float, gv : Int) : Bool do
+    match Sv.identity(dir) do
+      Some((s, sc, g)) -> if s != seed do false else if sc != scale do false else g == gv end end
+      None -> false
+    end
+  end
+
+  pfn get_first(l : List((String, Bytes))) : Option(Bytes) do
+    match l do
+      Cons((_, b), _) -> Some(b)
+      Nil -> None
+    end
+  end
+
+  pfn region_is(k : Strata.Coord.Key, x : Int, y : Int, z : Int) : Bool do
+    let (rx, ry, rz) = Sv.region_of_key(k)
+    if rx != x do false else if ry != y do false else rz == z end end
+  end
+
+  -- ── Files ────────────────────────────────────────────────────────────────
+
+  describe "Save files" do
+    test "write_atomic then read_file gives the same bytes, and leaves no .tmp" do
+      let dir = scratch("atomic")
+      let _made = Authority.must(Dir.mkdir_p(dir))
+      let path = dir ++ "/f.bin"
+      let b = ramp(1000)
+      Test.assert_true(Sv.write_atomic(path, b), "written")
+      Test.assert_false(there(path ++ ".tmp"), "no .tmp left")
+      Test.assert_true(match Sv.read_file(path) do
+          Some(back) -> same_bytes(back, b)
+          None -> false
+        end, "the same 1000 bytes, zeros and 255s included")
+      Test.assert_true(Sv.write_atomic(path, ramp(3)), "rewritten")
+      Test.assert_true(match Sv.read_file(path) do
+          Some(back) -> same_bytes(back, ramp(3))
+          None -> false
+        end, "the new bytes replace the old")
+      Test.assert_true(Option.is_none(Sv.read_file(dir ++ "/missing.bin")), "a missing file reads as None")
+      Test.assert_false(Sv.write_atomic(dir ++ "/no/such/folder/f.bin", b), "a write into a missing folder answers false")
+      Sv.set_aside(path)
+      Test.assert_true(there(path ++ ".bad"), "set_aside renames to .bad")
+      Test.assert_false(there(path), "and the file is gone")
+      tidy(dir)
+    end
+    test "a .tmp left beside a store is gone after open" do
+      let dir = scratch("leftover")
+      Test.assert_true(made(dir, 1), "a store")
+      let _a = Sv.write_atomic(dir ++ "/store.bin.tmp", ramp(10))
+      let _b = Authority.must(File.write(dir ++ "/regions/r.0.0.0.bin.tmp", "half a region"))
+      let _c = Authority.must(File.write(dir ++ "/players/p1.bin.tmp", "half a player"))
+      Test.assert_true(there(dir ++ "/store.bin.tmp"), "the leftover is there")
+      match opened(Sv.open(dir, world(), 1)) do
+        Some(s) ->
+          Test.assert_false(there(dir ++ "/store.bin.tmp"), "the store's leftover is gone")
+          Test.assert_false(there(dir ++ "/regions/r.0.0.0.bin.tmp"), "a region's leftover is gone")
+          Test.assert_false(there(dir ++ "/players/p1.bin.tmp"), "a player's leftover is gone")
+          Sv.close_unflushed(s)
+        None -> Test.fail("reopened")
+      end
+      tidy(dir)
+    end
+  end
+
+  -- ── Opening ──────────────────────────────────────────────────────────────
+
+  describe "Save.open" do
+    test "a new store: open on a missing folder makes store.bin and store.lock; close removes the lock" do
+      let dir = scratch("new")
+      Test.assert_true(Option.is_none(Sv.identity(dir)), "no identity before")
+      match opened(Sv.open(dir, world(), 3)) do
+        Some(s) ->
+          Test.assert_true(there(dir ++ "/store.bin"), "store.bin")
+          Test.assert_true(there(dir ++ "/store.lock"), "store.lock")
+          Test.assert_true(Authority.must(Dir.exists(dir ++ "/regions")), "regions/")
+          Test.assert_true(Authority.must(Dir.exists(dir ++ "/players")), "players/")
+          Test.assert_eq_str(Sv.dir(s), dir, "dir")
+          Test.assert_eq_str(Sv.reason(s), "", "no reason")
+          let (d, f, x, a) = Sv.stats(s)
+          Test.assert_eq_int(d + f + x + a, 0, "stats all zero")
+          Test.assert_true(ident_is(dir, 7, 1.0, 3 * 65536 + Strata.Terrain.generation_version()), "identity: the world's seed, scale and the combined version")
+          Sv.close_unflushed(s)
+          Test.assert_false(there(dir ++ "/store.lock"), "close removes the lock")
+          Test.assert_true(there(dir ++ "/store.bin"), "and keeps the header")
+        None -> Test.fail("opened")
+      end
+      tidy(dir)
+    end
+    test "open hands back the world with its change log on" do
+      let dir = scratch("same-world")
+      match Sv.open(dir, world(), 1) do
+        Ok((s, w)) ->
+          Test.assert_eq_int(Wsv.seed(w), 7, "seed")
+          Test.assert_eq_int(Bsv.count(Wsv.registry(w)), 2, "registry")
+          match Wsv.take_changes(Wsv.enqueue(w, Ksv.key(0, -1, 0), Wsv.op_cell(5, -5, 5, 0))) do
+            (_, ks) -> Test.assert_eq_int(List.length(ks), 1, "an edit is recorded: the log is on")
+          end
+          match Sv.open_forcing(dir, world(), 1) do
+            Ok((s2, w2)) ->
+              match Wsv.take_changes(Wsv.enqueue(w2, Ksv.key(0, -1, 0), Wsv.op_cell(5, -5, 5, 0))) do
+                (_, ks) -> Test.assert_eq_int(List.length(ks), 1, "open_forcing turns it on too")
+              end
+              Sv.close_unflushed(s2)
+            Err(e) -> Test.fail("open_forcing: " ++ e)
+          end
+          Sv.close_unflushed(s)
+        Err(e) -> Test.fail("opened: " ++ e)
+      end
+      tidy(dir)
+    end
+    test "refusals: another registry, seed or voxel scale" do
+      let dir = scratch("refusals")
+      Test.assert_true(made(dir, 1), "a store")
+      let more = reg_with(reg(), Bsv.with_collide(Bsv.def(), false))
+      Test.assert_eq_str(refusal(Sv.open(dir, world_of(more, 7, 1.0), 1)), "different block registry", "one more block")
+      Test.assert_eq_str(refusal(Sv.open(dir, world_of(reg(), 8, 1.0), 1)), "different seed", "seed + 1")
+      Test.assert_eq_str(refusal(Sv.open(dir, world_of(reg(), 7, 0.1), 1)), "different voxel scale", "scale 0.1")
+      Test.assert_false(there(dir ++ "/store.lock"), "a refusal leaves no lock")
+      Test.assert_true(Option.is_some(opened(Sv.open(dir, world(), 1))), "the right world still opens")
+      tidy(dir)
+    end
+    test "a store.bin with one flipped byte refuses as a damaged header and is set aside" do
+      let dir = scratch("damaged")
+      Test.assert_true(made(dir, 1), "a store")
+      let path = dir ++ "/store.bin"
+      match Sv.read_file(path) do
+        Some(b) ->
+          Test.assert_true(Sv.write_atomic(path, flipped(b, 20)), "one byte flipped")
+          Test.assert_eq_str(refusal(Sv.open(dir, world(), 1)), "damaged header", "refused")
+          Test.assert_true(there(path ++ ".bad"), "store.bin.bad")
+          Test.assert_false(there(dir ++ "/store.lock"), "no lock")
+          Test.assert_true(Option.is_none(Sv.identity(dir)), "no identity")
+          Test.assert_false(Option.is_some(opened(Sv.open(dir, world(), 1))), "a folder with a set-aside header is not taken for a new store")
+        None -> Test.fail("store.bin read")
+      end
+      tidy(dir)
+    end
+    test "a folder of other files is not a store: refused as no header, and left untouched" do
+      let dir = scratch("not-a-store")
+      let _made = Authority.must(Dir.mkdir_p(dir))
+      let _notes = Authority.must(File.write(dir ++ "/notes.txt", "mine"))
+      let _half = Authority.must(File.write(dir ++ "/draft.tmp", "mine too"))
+      Test.assert_eq_str(refusal(Sv.open(dir, world(), 1)), "no header", "refused")
+      Test.assert_false(Authority.must(Dir.exists(dir ++ "/regions")), "no regions/ made")
+      Test.assert_true(there(dir ++ "/draft.tmp"), "its .tmp file kept")
+      Test.assert_false(there(dir ++ "/store.lock"), "no lock")
+      tidy(dir)
+    end
+    test "seams: a different generator version opens, and is recorded at the next header write" do
+      let dir = scratch("seams")
+      Test.assert_true(made(dir, 1), "a store at version 1")
+      match opened(Sv.open(dir, world(), 2)) do
+        Some(s) ->
+          Test.assert_true(ident_is(dir, 7, 1.0, 65536 + Strata.Terrain.generation_version()), "the stored version is kept while open")
+          Sv.close_unflushed(s)
+          Test.assert_true(ident_is(dir, 7, 1.0, 2 * 65536 + Strata.Terrain.generation_version()), "and the new one is written at close")
+        None -> Test.fail("version 2 opens")
+      end
+      tidy(dir)
+    end
+  end
+
+  -- ── The lock (Review Focus 3) ────────────────────────────────────────────
+
+  describe "Save lock" do
+    test "a second open refuses while the first holds the folder; open_forcing takes over; the first close leaves the second's lock" do
+      let dir = scratch("lock")
+      match opened(Sv.open(dir, world(), 1)) do
+        Some(first) ->
+          Test.assert_eq_str(refusal(Sv.open(dir, world(), 1)), "open in another game", "the second open refuses")
+          Test.assert_true(there(dir ++ "/store.lock"), "the first's lock is untouched")
+          match opened(Sv.open_forcing(dir, world(), 1)) do
+            Some(second) ->
+              Sv.close_unflushed(first)
+              Test.assert_true(there(dir ++ "/store.lock"), "the first's close leaves the second's lock")
+              Test.assert_eq_str(refusal(Sv.open(dir, world(), 1)), "open in another game", "still held, by the second")
+              Sv.close_unflushed(second)
+              Test.assert_false(there(dir ++ "/store.lock"), "the second's close removes it")
+              Test.assert_true(Option.is_some(opened(Sv.open(dir, world(), 1))), "and the folder opens again")
+            None -> Test.fail("open_forcing")
+          end
+        None -> Test.fail("first open")
+      end
+      tidy(dir)
+    end
+    test "a stale lock (a crashed game) refuses open and is taken over by open_forcing" do
+      let dir = scratch("stale")
+      Test.assert_true(made(dir, 1), "a store")
+      let _crashed = Authority.must(File.write(dir ++ "/store.lock", "a token from a game that crashed"))
+      Test.assert_eq_str(refusal(Sv.open(dir, world(), 1)), "open in another game", "refused")
+      match opened(Sv.open_forcing(dir, world(), 1)) do
+        Some(s) ->
+          Sv.close_unflushed(s)
+          Test.assert_false(there(dir ++ "/store.lock"), "the taken-over lock is this store's, and close removes it")
+        None -> Test.fail("open_forcing")
+      end
+      tidy(dir)
+    end
+  end
+
+  -- ── Regions ──────────────────────────────────────────────────────────────
+
+  describe "Save regions" do
+    test "region_of_key floor-divides level-0 keys by 8, negative keys included" do
+      Test.assert_true(region_is(Ksv.key(0, 0, 0), 0, 0, 0), "(0,0,0)")
+      Test.assert_true(region_is(Ksv.key(7, 7, 7), 0, 0, 0), "(7,7,7)")
+      Test.assert_true(region_is(Ksv.key(8, 0, 0), 1, 0, 0), "(8,0,0)")
+      Test.assert_true(region_is(Ksv.key(-1, 0, 0), -1, 0, 0), "(-1,0,0)")
+      Test.assert_true(region_is(Ksv.key(-8, 0, 0), -1, 0, 0), "(-8,0,0)")
+      Test.assert_true(region_is(Ksv.key(-9, 0, 0), -2, 0, 0), "(-9,0,0)")
+      Test.assert_true(region_is(Ksv.key(3, -9, 16), 0, -2, 2), "each axis")
+    end
+    test "region_of takes metres and the voxel scale: 256 voxels a side" do
+      let (a, b, c) = Sv.region_of(255.9, -0.1, 256.0, 1.0)
+      Test.assert_true(if a != 0 do false else if b != -1 do false else c == 1 end end, "at 1 m voxels")
+      let (d, e, f) = Sv.region_of(25.7, 0.0, -25.7, 0.1)
+      Test.assert_true(if d != 1 do false else if e != 0 do false else f == -2 end end, "at 10 cm voxels")
+      let (g, h, i) = Sv.region_of(float_nan(), float_infinity(), 1.0, 0.0)
+      Test.assert_true(if g != 0 do false else if h != 0 do false else i == 0 end end, "no panic on NaN, infinity or a zero scale")
+    end
+  end
+
+  -- ── Fingerprint and versions ─────────────────────────────────────────────
+
+  describe "Save identity values" do
+    test "fingerprint changes with a block's flags, not with its textures" do
+      let base = Bsv.fingerprint(reg())
+      Test.assert_true(Bsv.fingerprint(reg()) == base, "the same registry, the same fingerprint")
+      Test.assert_true(Bsv.fingerprint(reg_with(Bsv.empty(), Bsv.with_collide(Bsv.def(), false))) != base, "flags changed")
+      Test.assert_true(Bsv.fingerprint(reg_with(Bsv.empty(), Bsv.with_faces(Bsv.def(), 3, 4, 5))) == base, "only textures changed")
+      Test.assert_true(Bsv.fingerprint(reg_with(reg(), Bsv.def())) != base, "one more block")
+    end
+    test "Strata's own generation version is 1" do
+      Test.assert_eq_int(Strata.Terrain.generation_version(), 1, "1")
+    end
+  end
+
+  -- ── Saving as it plays ───────────────────────────────────────────────────
+
+  -- a store on a streamed world: the flat world around chunk (0, 0, 0), settled
+  pfn playing(dir : String, gv : Int) : Option((Strata.Save.SaveStore, Strata.Stream.Stream)) do
+    match Sv.open(dir, world(), gv) do
+      Ok((s, w)) -> Some((s, around(Smv.start(w, Smv.config(2, 1, 64, 4)), 16.0, 16.0, 16.0)))
+      Err(_) -> None
+    end
+  end
+  pfn around(st : Strata.Stream.Stream, x : Float, y : Float, z : Float) : Strata.Stream.Stream do
+    Smv.run_until_settled(Smv.set_focus(st, Cons((x, y, z), Nil)), 20000)
+  end
+  pfn put(st : Strata.Stream.Stream, x : Int, y : Int, z : Int, id : Int) : Strata.Stream.Stream do
+    Smv.apply(st, Strata.Edit.set_block(Smv.world(st), x, y, z, id))
+  end
+  -- n ticks of dt seconds
+  pfn ticks(p : (Strata.Save.SaveStore, Strata.Stream.Stream), n : Int, dt : Float) : (Strata.Save.SaveStore, Strata.Stream.Stream) do
+    if n <= 0 do p
+    else
+      let (s, st) = p
+      ticks(Sv.tick(s, st, dt), n - 1, dt)
+    end
+  end
+  -- six seconds of ticks and every write waited for, twice over: whatever was dirty is on disk and released
+  pfn drained(p : (Strata.Save.SaveStore, Strata.Stream.Stream)) : (Strata.Save.SaveStore, Strata.Stream.Stream) do
+    let (s1, st1) = ticks(p, 12, 0.5)
+    let (s2, st2) = ticks(Sv.wait_writes(s1, st1), 12, 0.5)
+    Sv.wait_writes(s2, st2)
+  end
+  pfn waited(p : (Strata.Save.SaveStore, Strata.Stream.Stream)) : (Strata.Save.SaveStore, Strata.Stream.Stream) do
+    let (s, st) = p
+    Sv.wait_writes(s, st)
+  end
+  pfn region_at(dir : String, x : Int, y : Int, z : Int) : Option(Strata.Savefile.Region) do
+    match Sv.read_file(Strata.Regions.path(dir, Strata.Regions.key_of(x, y, z))) do
+      None -> None
+      Some(b) ->
+        match Strata.Savefile.decode_region(b) do
+          Ok(g) -> Some(g)
+          Err(_) -> None
+        end
+    end
+  end
+  pfn region_file(dir : String, x : Int, y : Int, z : Int) : String do Strata.Regions.path(dir, Strata.Regions.key_of(x, y, z)) end
+  -- how many chunks the region file holds, -1 when there is no file (or it does not decode)
+  pfn chunks_at(dir : String, x : Int, y : Int, z : Int) : Int do
+    match region_at(dir, x, y, z) do
+      Some(g) -> List.length(g.sr_chunks)
+      None -> 0 - 1
+    end
+  end
+  pfn has_chunk(dir : String, x : Int, y : Int, z : Int, k : Strata.Coord.Key) : Bool do
+    match region_at(dir, x, y, z) do
+      Some(g) -> Option.is_some(Strata.Regions.chunk_in(g, k))
+      None -> false
+    end
+  end
+  pfn header_at(dir : String) : Option(Strata.Savefile.SaveHeader) do
+    match Sv.read_file(dir ++ "/store.bin") do
+      None -> None
+      Some(b) ->
+        match Strata.Savefile.decode_header(b) do
+          Ok(h) -> Some(h)
+          Err(_) -> None
+        end
+    end
+  end
+  pfn counter_at(dir : String) : Int do
+    match header_at(dir) do
+      Some(h) -> h.sh_counter
+      None -> 0 - 1
+    end
+  end
+  pfn bytes_are(o : Option(Bytes), b : Bytes) : Bool do
+    match o do
+      Some(v) -> same_bytes(v, b)
+      None -> false
+    end
+  end
+  pfn shut(s : Strata.Save.SaveStore, st : Strata.Stream.Stream) : Unit do
+    let _stopped = Smv.stop(st)
+    Sv.close_unflushed(s)
+  end
+  -- seconds [n] calls of set_section with [b] take
+  pfn set_time(s : Strata.Save.SaveStore, b : Bytes, n : Int) : Float do
+    let t0 = Authority.must(System.now())
+    let _s = set_many(s, b, n)
+    Authority.must(System.now()) -. t0
+  end
+  pfn set_many(s : Strata.Save.SaveStore, b : Bytes, n : Int) : Strata.Save.SaveStore do
+    if n <= 0 do s else set_many(Sv.set_section(s, "map", b), b, n - 1) end
+  end
+  -- 300 ticks of 1/60 s, the section set before each
+  pfn big_ticks(p : (Strata.Save.SaveStore, Strata.Stream.Stream), b : Bytes, n : Int) : (Strata.Save.SaveStore, Strata.Stream.Stream) do
+    if n <= 0 do p
+    else
+      let (s, st) = p
+      big_ticks(Sv.tick(Sv.set_section(s, "map", b), st, 1.0 /. 60.0), b, n - 1)
+    end
+  end
+  pfn dirty_count(s : Strata.Save.SaveStore) : Int do
+    let (d, _, _, _) = Sv.stats(s)
+    d
+  end
+  pfn failed_count(s : Strata.Save.SaveStore) : Int do
+    let (_, _, x, _) = Sv.stats(s)
+    x
+  end
+
+  describe "Save.tick" do
+    test "edits reach their region files after the quiet time, and not before" do
+      let dir = scratch("tick")
+      match playing(dir, 1) do
+        None -> Test.fail("opened")
+        Some((s, st0)) ->
+          let st = put(put(put(put(st0, 5, 5, 5, 1), 37, 5, 5, 1), 5, 5, 37, 1), -5, 5, 5, 1)
+          let (s1, st1) = ticks((s, st), 4, 0.5)
+          Test.assert_false(there(region_file(dir, 0, 0, 0)), "no region file inside the quiet time")
+          Test.assert_eq_int(dirty_count(s1), 2, "two dirty regions")
+          let (s2, st2) = waited(ticks((s1, st1), 4, 0.5))
+          let (s3, st3) = Sv.wait_writes(s2, st2)
+          Test.assert_eq_int(chunks_at(dir, 0, 0, 0), 3, "region 0 holds exactly the three edited chunks")
+          Test.assert_true(has_chunk(dir, 0, 0, 0, Ksv.key(0, 0, 0)), "chunk 0 0 0")
+          Test.assert_true(has_chunk(dir, 0, 0, 0, Ksv.key(1, 0, 0)), "chunk 1 0 0")
+          Test.assert_true(has_chunk(dir, 0, 0, 0, Ksv.key(0, 0, 1)), "chunk 0 0 1")
+          Test.assert_eq_int(chunks_at(dir, -1, 0, 0), 1, "region -1 holds the fourth")
+          Test.assert_true(has_chunk(dir, -1, 0, 0, Ksv.key(-1, 0, 0)), "chunk -1 0 0")
+          Test.assert_eq_int(dirty_count(s3), 0, "nothing dirty")
+          match region_at(dir, 0, 0, 0) do
+            Some(g) ->
+              match Strata.Regions.chunk_in(g, Ksv.key(0, 0, 0)) do
+                Some(c) -> Test.assert_eq_int(Cksv.hash(c), Cksv.hash(Cksv.compact(Strata.Store.get(Wsv.chunks(Smv.world(st3)), Ksv.key(0, 0, 0)))), "the saved chunk is the edited one")
+                None -> Test.fail("chunk")
+              end
+            None -> Test.fail("region")
+          end
+          -- away: the chunks unload, are found written, and leave memory
+          let (s4, st4) = drained((s3, around(st3, 16.0, 16.0, 4000.0)))
+          Test.assert_eq_int(Wsv.cache_size(Smv.world(st4)), 0, "no edited chunk left in memory")
+          Test.assert_eq_int(Wsv.held_coarsened(Smv.world(st4)), 4, "four coarse copies in their place")
+          Test.assert_eq_int(chunks_at(dir, 0, 0, 0), 3, "still three on disk")
+          shut(s4, st4)
+      end
+      tidy(dir)
+    end
+    test "edited back: the saved copy goes, and a region left with nothing has no file" do
+      let dir = scratch("back")
+      match playing(dir, 1) do
+        None -> Test.fail("opened")
+        Some((s, st0)) ->
+          let (s1, st1) = drained((s, put(put(put(st0, 5, 5, 5, 1), 37, 5, 5, 1), -5, 5, 5, 1)))
+          Test.assert_eq_int(chunks_at(dir, 0, 0, 0), 2, "two chunks written")
+          Test.assert_eq_int(chunks_at(dir, -1, 0, 0), 1, "and one")
+          let (s2, st2) = drained((s1, put(put(st1, 5, 5, 5, 0), -5, 5, 5, 0)))
+          Test.assert_eq_int(chunks_at(dir, 0, 0, 0), 1, "the chunk edited back is gone from its region")
+          Test.assert_false(has_chunk(dir, 0, 0, 0, Ksv.key(0, 0, 0)), "that one")
+          Test.assert_false(there(region_file(dir, -1, 0, 0)), "a region whose only chunk was edited back has no file")
+          Test.assert_eq_int(failed_count(s2), 0, "nothing failed")
+          shut(s2, st2)
+      end
+      tidy(dir)
+    end
+    test "edited back and unloaded before the write: the saved copy still goes, and coming back finds the generated chunk" do
+      let dir = scratch("back-away")
+      match loading(dir, world(), 1, 2, 1) do
+        None -> Test.fail("opened")
+        Some((s, st0)) ->
+          let (s1, st1) = drained((s, put(st0, 5, 5, 5, 1)))
+          Test.assert_eq_int(chunks_at(dir, 0, 0, 0), 1, "the edit is saved")
+          -- edited back, and away at once: the chunk unloads equal to its generation before any write
+          let (s2, st2) = drained((s1, around(put(st1, 5, 5, 5, 0), 16.0, 16.0, 4000.0)))
+          Test.assert_false(there(region_file(dir, 0, 0, 0)), "the saved copy is gone, and the region's file with it")
+          Test.assert_eq_int(Wsv.cache_size(Smv.world(st2)), 0, "the world has forgotten the reverted chunk")
+          Test.assert_eq_int(Wsv.held_coarsened(Smv.world(st2)), 0, "and keeps no coarse copy of it")
+          let st3 = around(st2, 16.0, 16.0, 16.0)
+          Test.assert_eq_int(chunk_hash(st3, 0, 0, 0), Cksv.hash(Cksv.uniform(0)), "back, the chunk is the generated one")
+          closed(s2, st3)
+          match loading(dir, world(), 1, 2, 1) do
+            None -> Test.fail("opened again")
+            Some((s4, st4)) ->
+              Test.assert_eq_int(chunk_hash(st4, 0, 0, 0), Cksv.hash(Cksv.uniform(0)), "and after a reopen the edit is not resurrected")
+              closed(s4, st4)
+          end
+      end
+      tidy(dir)
+    end
+    test "sections, region sections and player records are written on their intervals; only the latest value" do
+      let dir = scratch("sections")
+      match playing(dir, 1) do
+        None -> Test.fail("opened")
+        Some((s, st)) ->
+          let c0 = counter_at(dir)
+          let s1 = Sv.set_player(Sv.set_region_section(Sv.set_section(Sv.set_section(s, "score", ramp(10)), "score", ramp(20)), (3, 0, -2), "zone", ramp(300)), 7, ramp(40))
+          Test.assert_true(bytes_are(Sv.section(s1, "score"), ramp(20)), "section reads back")
+          Test.assert_true(bytes_are(Sv.region_section(s1, (3, 0, -2), "zone"), ramp(300)), "region section reads back before it is written")
+          Test.assert_true(bytes_are(Sv.player(s1, 7), ramp(40)), "player reads back")
+          let (s2, st2) = ticks((s1, st), 9, 0.5)
+          Test.assert_eq_int(counter_at(dir), c0, "no header write inside the interval")
+          let (s3, st3) = waited(ticks((s2, st2), 2, 0.5))
+          Test.assert_eq_int(counter_at(dir), c0 + 1, "one header write")
+          match header_at(dir) do
+            Some(h) ->
+              Test.assert_eq_int(List.length(h.sh_sections), 1, "one section")
+              match h.sh_sections do
+                Cons((n, b), _) ->
+                  Test.assert_eq_str(n, "score", "its name")
+                  Test.assert_true(same_bytes(b, ramp(20)), "the second value")
+                Nil -> Test.fail("section")
+              end
+            None -> Test.fail("header")
+          end
+          match region_at(dir, 3, 0, -2) do
+            Some(g) ->
+              Test.assert_eq_int(List.length(g.sr_chunks), 0, "a region of sections only")
+              match g.sr_sections do
+                Cons((n, b), Nil) ->
+                  Test.assert_eq_str(n, "zone", "its name")
+                  Test.assert_true(same_bytes(b, ramp(300)), "its bytes")
+                _ -> Test.fail("region section")
+              end
+            None -> Test.fail("region file")
+          end
+          match Sv.read_file(dir ++ "/players/7.bin") do
+            Some(b) ->
+              match Strata.Savefile.decode_player(b) do
+                Ok(rec) -> Test.assert_true(same_bytes(rec, ramp(40)), "the player's bytes")
+                Err(e) -> Test.fail(e)
+              end
+            None -> Test.fail("players/7.bin")
+          end
+          Test.assert_true(bytes_are(Sv.region_section(s3, (3, 0, -2), "zone"), ramp(300)), "region section reads back after it is written")
+          Test.assert_eq_int(List.length(Sv.players(s3)), 1, "one player")
+          -- nothing changed: no further header write
+          let (s4, st4) = waited(ticks((s3, st3), 24, 0.5))
+          Test.assert_eq_int(counter_at(dir), c0 + 1, "an unchanged header is not rewritten")
+          shut(s4, st4)
+      end
+      tidy(dir)
+    end
+    test "big section: 4 MB set on 300 ticks is written at most twice, and setting it costs no more than a small one" do
+      let dir = scratch("big")
+      match playing(dir, 1) do
+        None -> Test.fail("opened")
+        Some((s, st)) ->
+          let c0 = counter_at(dir)
+          let big = ramp(4 * 1024 * 1024)
+          let (s1, st1) = waited(big_ticks((s, st), big, 300))
+          let n = counter_at(dir) - c0
+          Test.assert_true(n <= 2, "at most two header writes")
+          let small_t = set_time(s1, ramp(10), 20000)
+          let big_t = set_time(s1, big, 20000)
+          println("save: set_section 20000 times: 4 MB " ++ float_to_string(big_t *. 1000.0) ++ " ms, 10 bytes " ++ float_to_string(small_t *. 1000.0) ++ " ms (reported, not judged)")
+          let (s2, st2) = waited(ticks((s1, st1), 12, 0.5))
+          let on_disk = match header_at(dir) do
+            Some(h) -> get_first(h.sh_sections)
+            None -> None
+          end
+          Test.assert_true(bytes_are(on_disk, big), "the 4 MB section is on disk whole")
+          shut(s2, st2)
+      end
+      tidy(dir)
+    end
+    test "write failure keeps chunks: counted, named, and written once the folder is back" do
+      let dir = scratch("refused")
+      match playing(dir, 1) do
+        None -> Test.fail("opened")
+        Some((s, st0)) ->
+          -- the regions folder becomes a file: nothing can be written under it
+          let _gone = Authority.must(Dir.rm_rf(dir ++ "/regions"))
+          let _file = Authority.must(File.write(dir ++ "/regions", "in the way"))
+          let (s1, st1) = drained((s, around(put(st0, 5, 5, 5, 1), 16.0, 16.0, 4000.0)))
+          Test.assert_true(failed_count(s1) >= 1, "the failed write is counted")
+          Test.assert_eq_str(Sv.reason(s1), "cannot write region r.0.0.0", "and named")
+          Test.assert_eq_int(Wsv.cache_size(Smv.world(st1)), 1, "the chunk is still in the world's cache")
+          Test.assert_eq_int(Wsv.held_coarsened(Smv.world(st1)), 0, "not released")
+          let _back = Authority.must(File.delete(dir ++ "/regions"))
+          let _made = Authority.must(Dir.mkdir_p(dir ++ "/regions"))
+          let (s2, st2) = drained((s1, st1))
+          Test.assert_eq_int(chunks_at(dir, 0, 0, 0), 1, "written once the folder is back")
+          Test.assert_eq_int(Wsv.cache_size(Smv.world(st2)), 0, "and released")
+          Test.assert_eq_int(Wsv.held_coarsened(Smv.world(st2)), 1, "as a coarse copy")
+          shut(s2, st2)
+      end
+      tidy(dir)
+    end
+    test "one region write is started per tick" do
+      let dir = scratch("one-a-tick")
+      match playing(dir, 1) do
+        None -> Test.fail("opened")
+        Some((s, st0)) ->
+          -- edits far from anything loaded are queued for their chunks: five regions
+          let st = put(put(put(put(put(st0, 5000, 5, 5, 1), 6000, 5, 5, 1), 7000, 5, 5, 1), 8000, 5, 5, 1), 9000, 5, 5, 1)
+          let (s1, st1) = Sv.tick(s, st, 0.5)
+          Test.assert_eq_int(dirty_count(s1), 5, "five dirty regions")
+          let (s2, st2) = Sv.tick(s1, st1, 2.0)
+          Test.assert_eq_int(dirty_count(s2), 4, "one started")
+          let (s3, st3) = Sv.tick(s2, st2, 0.0)
+          Test.assert_eq_int(dirty_count(s3), 3, "one more")
+          let (s4, st4) = ticks((s3, st3), 3, 0.0)
+          Test.assert_eq_int(dirty_count(s4), 0, "all five over five ticks")
+          let (s5, st5) = Sv.wait_writes(s4, st4)
+          match region_at(dir, 19, 0, 0) do
+            Some(g) ->
+              Test.assert_eq_int(List.length(g.sr_chunks), 0, "no chunk")
+              Test.assert_eq_int(List.length(g.sr_ops), 1, "one key's queue")
+            None -> Test.fail("the region of voxel 5000")
+          end
+          shut(s5, st5)
+      end
+      tidy(dir)
+    end
+    test "a player file with one flipped byte is set aside at open and reads as none" do
+      let dir = scratch("player-bad")
+      match playing(dir, 1) do
+        None -> Test.fail("opened")
+        Some((s, st)) ->
+          let (s1, st1) = drained((Sv.set_player(Sv.set_player(s, 3, ramp(50)), -4, ramp(60)), st))
+          shut(s1, st1)
+          match Sv.read_file(dir ++ "/players/3.bin") do
+            Some(b) ->
+              Test.assert_true(Sv.write_atomic(dir ++ "/players/3.bin", flipped(b, 20)), "flipped")
+              match Sv.open(dir, world(), 1) do
+                Ok((s2, _)) ->
+                  Test.assert_true(Option.is_none(Sv.player(s2, 3)), "the damaged record reads as none")
+                  Test.assert_true(bytes_are(Sv.player(s2, -4), ramp(60)), "the other is read")
+                  Test.assert_true(there(dir ++ "/players/3.bin.bad"), "set aside")
+                  let (_, _, _, a) = Sv.stats(s2)
+                  Test.assert_eq_int(a, 1, "and counted")
+                  Sv.close_unflushed(s2)
+                Err(e) -> Test.fail(e)
+              end
+            None -> Test.fail("players/3.bin")
+          end
+      end
+      tidy(dir)
+    end
+  end
+
+  -- ── Loading through the stream; flush and close ──────────────────────────
+
+  pfn phys() : Strata.Physics.Physics do Strata.Physics.new(reg(), Strata.Physics.config()) end
+  -- flush, release the lock, stop the stream
+  pfn closed(s : Strata.Save.SaveStore, st : Strata.Stream.Stream) : Unit do
+    let (st2, _) = Sv.close(s, st, phys(), None, Nil)
+    Smv.stop(st2)
+  end
+  -- a store opened on world w, its stream given the store's regions, settled around (16, 16, 16) with radii rh, rv
+  pfn loading(dir : String, w : Strata.World.World, gv : Int, rh : Int, rv : Int) : Option((Strata.Save.SaveStore, Strata.Stream.Stream)) do
+    match Sv.open(dir, w, gv) do
+      Ok((s, w2)) -> Some((s, around(Smv.with_store(Smv.start(w2, Smv.config(rh, rv, 64, 4)), Sv.region_source(s)), 16.0, 16.0, 16.0)))
+      Err(_) -> None
+    end
+  end
+  -- one block changed in each of the first n loaded chunks of ks: stone to air below ground, air to stone above
+  pfn edit_each(st : Strata.Stream.Stream, ks : List(Strata.Coord.Key), n : Int) : Strata.Stream.Stream do
+    if n <= 0 do st
+    else
+      match ks do
+        Nil -> st
+        Cons(k, t) ->
+          if Ksv.level(k) != 0 do edit_each(st, t, n)
+          else edit_each(put(st, 32 * Ksv.kx(k) + 5, 32 * Ksv.ky(k) + 5, 32 * Ksv.kz(k) + 5, if Ksv.ky(k) < 0 do 0 else 1 end), t, n - 1) end
+      end
+    end
+  end
+  pfn region_files(dir : String) : Int do
+    match Authority.must(Dir.list(dir ++ "/regions")) do
+      Ok(ns) -> List.length(List.filter(ns, fn n -> string_ends_with(n, ".bin")))
+      Err(_) -> 0
+    end
+  end
+  pfn chunk_hash(st : Strata.Stream.Stream, x : Int, y : Int, z : Int) : Int do
+    Cksv.hash(Cksv.compact(Strata.Store.get(Wsv.chunks(Smv.world(st)), Ksv.key(x, y, z))))
+  end
+  -- stone below chunk row 1 (the flat world's ground one chunk higher)
+  pfn raised() : Strata.Terrain.Gen do
+    Strata.Terrain.gen(fn (k, seed) -> if Ksv.ky(k) < 1 do Cksv.uniform(1) else Cksv.uniform(0) end)
+  end
+  pfn air() : Strata.Terrain.Gen do Strata.Terrain.gen(fn (k, seed) -> Cksv.uniform(0)) end
+  pfn keys_same(a : List(Strata.Coord.Key), b : List(Strata.Coord.Key)) : Bool do
+    if List.length(a) != List.length(b) do false
+    else List.all(a, fn k -> List.any(b, fn k2 -> Ksv.key_eq(k, k2))) end
+  end
+  pfn full_grid(g : Strata.Body.Grid, i : Int) : Strata.Body.Grid do
+    if i >= 8 do g else full_grid(Strata.Body.grid_set(g, i % 2, (i / 2) % 2, i / 4, 1), i + 1) end
+  end
+  pfn i32s(n : Int, i : Int, a : NativeI32Arr) : NativeI32Arr do
+    if i >= n do a else i32s(n, i + 1, NativeArray.set_i32(a, i, i * 7 - 300)) end
+  end
+  pfn i32s_same(a : NativeI32Arr, b : NativeI32Arr, i : Int) : Bool do
+    if NativeArray.length_i32(a) != NativeArray.length_i32(b) do false
+    else if i >= NativeArray.length_i32(a) do true
+    else if NativeArray.get_i32(a, i) != NativeArray.get_i32(b, i) do false
+    else i32s_same(a, b, i + 1) end end end
+  end
+
+  describe "Save loading" do
+    test "world through a store: 40 edited chunks in several regions come back, hash for hash" do
+      let dir = scratch("through")
+      match loading(dir, world(), 1, 2, 1) do
+        None -> Test.fail("opened")
+        Some((s, st0)) ->
+          let st1 = Smv.run_until_settled(edit_each(st0, Strata.Store.keys(Wsv.chunks(Smv.world(st0))), 40), 20000)
+          let before = Smv.world_hash(st1)
+          let loaded = Smv.loaded_count(st1)
+          -- away, so everything unloads; then every write waited for, and close
+          let (s2, st2) = drained((s, around(st1, 16.0, 16.0, 4000.0)))
+          Test.assert_eq_int(Wsv.cache_size(Smv.world(st2)), 0, "nothing edited left in memory")
+          Test.assert_true(region_files(dir) >= 6, "at least six region files")
+          closed(s2, st2)
+          Test.assert_false(there(dir ++ "/store.lock"), "close leaves no lock")
+          match loading(dir, world(), 1, 2, 1) do
+            None -> Test.fail("opened again")
+            Some((s3, st3)) ->
+              Test.assert_eq_int(Smv.loaded_count(st3), loaded, "the same chunks loaded")
+              Test.assert_eq_int(Smv.world_hash(st3), before, "the world hash is the original's")
+              Test.assert_eq_int(List.length(Sv.edited_keys(s3)), 40, "the store lists the 40 edited chunks")
+              closed(s3, st3)
+          end
+      end
+      tidy(dir)
+    end
+    test "the same session: chunks written, released and reloaded come back as edited" do
+      let dir = scratch("reload")
+      match loading(dir, world(), 1, 2, 1) do
+        None -> Test.fail("opened")
+        Some((s, st0)) ->
+          let st1 = Smv.run_until_settled(edit_each(st0, Strata.Store.keys(Wsv.chunks(Smv.world(st0))), 20), 20000)
+          let before = Smv.world_hash(st1)
+          let (s2, st2) = drained((s, around(st1, 16.0, 16.0, 4000.0)))
+          Test.assert_eq_int(Wsv.held_coarsened(Smv.world(st2)), 20, "twenty released")
+          let (s3, st3) = drained((s2, around(st2, 16.0, 16.0, 16.0)))
+          Test.assert_eq_int(Smv.world_hash(st3), before, "back, and the same")
+          Test.assert_eq_int(Wsv.held_coarsened(Smv.world(st3)), 0, "the coarse copies are dropped as their chunks load")
+          closed(s3, st3)
+      end
+      tidy(dir)
+    end
+    test "seams: another generator and version loads; edited chunks keep their saved content, the rest is the new generator's" do
+      let dir = scratch("seams")
+      match loading(dir, world(), 1, 2, 1) do
+        None -> Test.fail("opened")
+        Some((s, st0)) ->
+          let st1 = put(st0, 5, 5, 5, 1)
+          let edited = chunk_hash(st1, 0, 0, 0)
+          let (s2, st2) = drained((s, st1))
+          closed(s2, st2)
+          match loading(dir, Wsv.new(reg(), raised(), 7, 1.0), 2, 2, 1) do
+            None -> Test.fail("opened with generator version 2")
+            Some((s3, st3)) ->
+              Test.assert_eq_int(chunk_hash(st3, 0, 0, 0), edited, "the edited chunk is the first generator's, edited")
+              Test.assert_eq_int(chunk_hash(st3, 1, 0, 0), Cksv.hash(Cksv.uniform(1)), "an untouched chunk is the new generator's")
+              match region_at(dir, 0, 0, 0) do
+                Some(g) -> Test.assert_eq_int(g.sr_generator, 65536 + Strata.Terrain.generation_version(), "the region reports the generator version that wrote it")
+                None -> Test.fail("region file")
+              end
+              closed(s3, st3)
+              Test.assert_true(ident_is(dir, 7, 1.0, 2 * 65536 + Strata.Terrain.generation_version()), "the header records the new version")
+              match region_at(dir, 0, 0, 0) do
+                Some(g) -> Test.assert_eq_int(g.sr_generator, 65536 + Strata.Terrain.generation_version(), "and the region keeps the version it was first written with")
+                None -> Test.fail("region file after close")
+              end
+          end
+      end
+      tidy(dir)
+    end
+    test "a damaged region is set aside, counted, and its chunks generate" do
+      let dir = scratch("damaged")
+      match loading(dir, world(), 1, 2, 1) do
+        None -> Test.fail("opened")
+        Some((s, st0)) ->
+          let (s2, st2) = drained((s, put(put(st0, 5, 5, 5, 1), -5, 5, 5, 1)))
+          closed(s2, st2)
+          match Sv.read_file(region_file(dir, 0, 0, 0)) do
+            None -> Test.fail("region file")
+            Some(b) ->
+              Test.assert_true(Sv.write_atomic(region_file(dir, 0, 0, 0), flipped(b, 40)), "flipped")
+              match loading(dir, world(), 1, 2, 1) do
+                None -> Test.fail("opened again")
+                Some((s3, st3)) ->
+                  let (s4, st4) = Sv.tick(s3, st3, 0.1)
+                  Test.assert_true(there(region_file(dir, 0, 0, 0) ++ ".bad"), "set aside as .bad")
+                  Test.assert_false(there(region_file(dir, 0, 0, 0)), "and gone")
+                  let (_, _, _, a) = Sv.stats(s4)
+                  Test.assert_eq_int(a, 1, "counted")
+                  Test.assert_eq_int(chunk_hash(st4, 0, 0, 0), Cksv.hash(Cksv.uniform(0)), "its chunk generated")
+                  Test.assert_true(chunk_hash(st4, -1, 0, 0) != Cksv.hash(Cksv.uniform(0)), "the other region's chunk is the saved one")
+                  closed(s4, st4)
+              end
+          end
+      end
+      tidy(dir)
+    end
+    test "one file read per region: 605 chunks over two saved regions read each file once" do
+      let dir = scratch("reads")
+      match loading(dir, world(), 1, 2, 1) do
+        None -> Test.fail("opened")
+        Some((s, st0)) ->
+          let (s2, st2) = drained((s, put(put(st0, 5, 5, 5, 1), -5, 5, 5, 1)))
+          closed(s2, st2)
+          match loading(dir, world(), 1, 5, 2) do
+            None -> Test.fail("opened again")
+            Some((s3, st3)) ->
+              Test.assert_eq_int(Smv.loaded_count(st3), 605, "605 chunks")
+              let (s4, st4) = Sv.wait_writes(s3, st3)
+              Test.assert_eq_int(Sv.reads(s4), 2, "two region files, each read once")
+              Test.assert_true(chunk_hash(st4, 0, 0, 0) != Cksv.hash(Cksv.uniform(0)), "and used")
+              closed(s4, st4)
+          end
+      end
+      tidy(dir)
+    end
+  end
+
+  describe "Save.flush and close" do
+    test "settling: a loose body in mid-air is written into the world and its region" do
+      let dir = scratch("settle")
+      match loading(dir, world(), 1, 2, 1) do
+        None -> Test.fail("opened")
+        Some((s, st)) ->
+          let (p, id) = Strata.Physics.add(phys(), full_grid(Strata.Body.grid(2, 2, 2), 0), 8.0, 20.0, 8.0, Strata.Math.Quat.identity(), Strata.Physics.dynamic())
+          Test.assert_true(Strata.Physics.exists(p, id), "a body")
+          let (s2, st2, p2) = Sv.flush(s, st, p, None, Nil)
+          Test.assert_eq_int(Strata.Physics.count(p2), 0, "the body is gone from physics")
+          Test.assert_true(chunk_hash(st2, 0, 0, 0) != Cksv.hash(Cksv.uniform(0)), "its blocks are in the world")
+          Test.assert_true(has_chunk(dir, 0, 0, 0, Ksv.key(0, 0, 0)), "and in the saved region")
+          let (dty, fly, _, _) = Sv.stats(s2)
+          Test.assert_eq_int(dty + fly, 0, "nothing dirty or in flight after a flush")
+          -- a body an entity holds is left alone
+          let (p3, id3) = Strata.Physics.add(phys(), full_grid(Strata.Body.grid(2, 2, 2), 0), 8.0, 20.0, 8.0, Strata.Math.Quat.identity(), Strata.Physics.dynamic())
+          let (s4, st4, p4) = Sv.flush(s2, st2, p3, None, Cons(id3, Nil))
+          Test.assert_eq_int(Strata.Physics.count(p4), 1, "a held body stays")
+          closed(s4, st4)
+      end
+      tidy(dir)
+    end
+    test "a world with no generated terrain: a structure built by edits over three chunks comes back block for block" do
+      let dir = scratch("built")
+      match loading(dir, Wsv.new(reg(), air(), 7, 1.0), 1, 2, 1) do
+        None -> Test.fail("opened")
+        Some((s, st0)) ->
+          let st1 = Smv.run_until_settled(Smv.apply(st0, Strata.Edit.fill_box(Smv.world(st0), 20, 4, 4, 75, 9, 9, 1)), 20000)
+          let before = Smv.world_hash(st1)
+          let a = chunk_hash(st1, 0, 0, 0)
+          let b = chunk_hash(st1, 1, 0, 0)
+          let c = chunk_hash(st1, 2, 0, 0)
+          closed(s, st1)
+          Test.assert_false(there(dir ++ "/store.lock"), "close leaves no lock")
+          Test.assert_eq_int(List.length(List.filter(names(dir), fn n -> string_ends_with(n, ".tmp"))) + List.length(List.filter(names(dir ++ "/regions"), fn n -> string_ends_with(n, ".tmp"))), 0, "and no .tmp")
+          match loading(dir, Wsv.new(reg(), air(), 7, 1.0), 1, 2, 1) do
+            None -> Test.fail("opened again")
+            Some((s2, st2)) ->
+              Test.assert_eq_int(chunk_hash(st2, 0, 0, 0), a, "chunk 0")
+              Test.assert_eq_int(chunk_hash(st2, 1, 0, 0), b, "chunk 1")
+              Test.assert_eq_int(chunk_hash(st2, 2, 0, 0), c, "chunk 2")
+              Test.assert_true(a != Cksv.hash(Cksv.uniform(0)), "which is not air")
+              Test.assert_eq_int(Smv.world_hash(st2), before, "the whole world as it was")
+              Test.assert_eq_int(Wsv.get_block(Smv.world(st2), 75, 9, 9), 1, "its far corner")
+              Test.assert_eq_int(Wsv.get_block(Smv.world(st2), 76, 9, 9), 0, "and no further")
+              -- wake_outcome covers exactly the chunks of edited_keys
+              let keys = Sv.edited_keys(s2)
+              let o = Sv.wake_outcome(s2, Smv.world(st2))
+              Test.assert_eq_int(List.length(keys), 3, "three edited chunks")
+              Test.assert_true(keys_same(Strata.Edit.dirty(o), keys), "wake_outcome's chunks are edited_keys")
+              Test.assert_eq_int(List.length(Strata.Edit.changes(o)), 24, "eight boxes a chunk")
+              closed(s2, st2)
+          end
+      end
+      tidy(dir)
+    end
+    test "an entity snapshot's arrays and the game's sections ride the header through close and open" do
+      let dir = scratch("snapshot")
+      match loading(dir, world(), 1, 2, 1) do
+        None -> Test.fail("opened")
+        Some((s, st)) ->
+          Test.assert_true(Option.is_none(Sv.entities(s)), "a new store has no snapshot")
+          let ints = i32s(200, 0, NativeArray.make_i32(200, 0))
+          let (st2, _) = Sv.close(Sv.set_player(Sv.set_section(s, "quest", ramp(77)), 0, ramp(24)), st, phys(), Some((ints, NativeArray.make_f32(50, 1.5), NativeArray.make_float(10, 2.25))), Nil)
+          Smv.stop(st2)
+          match Sv.open(dir, world(), 1) do
+            Err(e) -> Test.fail(e)
+            Ok((s2, _)) ->
+              match Sv.entities(s2) do
+                None -> Test.fail("no snapshot read")
+                Some((i, f, d)) ->
+                  Test.assert_true(i32s_same(i, ints, 0), "the int array")
+                  Test.assert_eq_int(NativeArray.length_f32(f), 50, "the float32 array")
+                  Test.assert_eq_int(NativeArray.length_float(d), 10, "the double array")
+                  Test.assert_true(NativeArray.get_float(d, 9) == 2.25, "its values")
+              end
+              Test.assert_true(bytes_are(Sv.section(s2, "quest"), ramp(77)), "the section")
+              Test.assert_true(bytes_are(Sv.player(s2, 0), ramp(24)), "the player record")
+              Sv.close_unflushed(s2)
+          end
+      end
+      tidy(dir)
+    end
+  end
+end

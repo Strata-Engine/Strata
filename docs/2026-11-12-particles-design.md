@@ -310,3 +310,82 @@ Settled without the owner, after a reviewer's read; each can be overruled:
   looking.
 - Whether glowing particles also feed the light pass's emission (they do
   not in this design).
+
+## Addendum, 19 November: particles that meet the world
+
+The non-goal above ("particles that collide with blocks") is lifted for
+blocks, as an option an effect asks for. Bodies and figures stay out.
+
+### The problem
+
+A particle is a closed form of the clock; it has no state to stop. A
+collision must therefore be a fact about the whole flight, known once, that
+the closed form can branch on.
+
+### Considered
+
+- **In the vertex stage, every frame.** Walk the flight from birth to now
+  against the light volume for each of a particle's 36 vertices. Sees edits
+  made mid-flight, but pays tens of rays a vertex a frame for as long as the
+  particle lives: the opposite of "written once".
+- **At birth, on the CPU.** The shim would need the voxels (it keeps no copy
+  of the light volume's pages) and a second ray walker in C beside the
+  shader's; work moved into C that the GPU already knows how to do.
+- **At birth, on the GPU (chosen).** A compute pass, run only in a frame
+  that bore particles of an effect that asks, walks each new particle's
+  whole flight once against the light volume (`trace.glsl`, the walker the
+  lighting uses) and writes what it finds into the record's three spare
+  floats. From then on the particle is a closed form again, in two or three
+  pieces.
+
+### The design
+
+- **The effect** says what its particles do on meeting a solid voxel
+  (table floats 41 to 43, unused until now): 0 nothing (the default, and
+  spray), 1 **die**, 2 **rest** (stop there, keep ageing through its ramps,
+  its tumble frozen), 3 **bounce** once (velocity mirrored about the face
+  met, the normal part times a restitution, the rest times what friction
+  leaves) and rest at the next meeting. `Pt.dies_on_solid`,
+  `Pt.rests_on_solid`, `Pt.bounces(restitution, friction)`,
+  `Pt.meets_nothing`.
+- **The record's spares**: [13] the age in seconds of the first meeting, or
+  a number past any life for none; [14] the faces met, first + 8 x second
+  (0 +y, 1 -y, 2 +x, 3 -x, 4 +z, 5 -z); [15] the age of the second meeting
+  (bounce only). The shim writes [13] = -1, "not yet looked for", into a
+  particle of an effect that asks; the pass replaces it in the same frame,
+  before the particle is first drawn.
+- **The pass** (`collide.comp`): one invocation a particle born since the
+  last frame. The flight (drag, acceleration and sway included) is cut into
+  32 chords of equal time over the particle's life and each chord traced;
+  the meeting's age is the chord's start plus its share of the chord. On a
+  bounce the second leg starts from the meeting and takes what chords are
+  left. A particle born inside a solid voxel (a burst at the point of an
+  impact) flies free until a chord's end is in the open. Solid voxels stop
+  a particle, and cutout ones where their texture is opaque; water, glass
+  and thin blocks do not. Bodies and figures are not looked at (a
+  preprocessor switch leaves them out of the walker): a particle resting
+  where a body was would hang in the air when it moved.
+- **The vertex shader** branches once on the effect's mode. Mode 0 runs the
+  code it ran before. Otherwise, past the first meeting: die sends the
+  particle off screen; rest evaluates the flight at the meeting's age;
+  bounce flies a second closed form from there (no sway) until the second
+  meeting. A resting particle is lifted half its size along the face it
+  met, eased in over a tenth of a second, so a cube sits on the ground
+  rather than in it.
+- **Cost for effects that do not ask**: no dispatch (the shim counts
+  colliding births; a frame with none binds nothing), and one comparison in
+  the vertex shader on a table row it already reads.
+
+### Limits, by construction
+
+- The world is looked at once, at birth. A block placed in a flight's way
+  afterwards is flown through; one removed still stops the particle, and a
+  particle resting on it stays in the air until its life ends.
+- A flight that leaves the loaded chunks meets nothing from there on, and
+  chunks loaded after the birth are not seen.
+- A particle is a point: its middle meets the voxel, and a large one
+  overlaps a wall by half its size before it stops.
+- One bounce. A chord can step over a corner thinner than its sag (a
+  centimetre or so for a one-second life).
+- Water, glass, thin blocks, bodies and figures stop nothing.
+- Spray (effect 0) is unchanged and meets nothing.

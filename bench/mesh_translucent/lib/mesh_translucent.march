@@ -1,0 +1,74 @@
+-- mesh_translucent: Strata.Mesh.build on one chunk, repeated.
+--
+-- What the translucent layer's order costs a mesh (Strata.Mesh, "The
+-- translucent layer's order"). A run with REPS=0 is the preparation alone,
+-- so (REPS=n run) - (REPS=0 run), over n, is one build; run.sh takes the
+-- difference of CPU time and of instructions retired.
+--
+--   MODE=1   a pond in stone: translucent tops in one plane (no lists)
+--   MODE=2   the viewer's pane scene: a pool, three panes through it, a wall, a shelf
+--   MODE=3   glass scattered one voxel in twelve through a 12-voxel cube: listed, too many to sort
+--   MODE=4   the same through a 16-voxel cube
+--   MODE=5   stone only, as much surface as mode 2: nothing translucent
+--   MODE=6   glass scattered through a 10-voxel cube: just under the most quads that are sorted
+--   REPS=n   builds (default 200)
+mod MeshTranslucent do
+
+  needs IO
+  needs IO.Process
+
+  alias Strata.Chunk as C
+  alias Strata.Blocks as B
+  alias Strata.Mesh as Ms
+
+  pfn add(r : Strata.Blocks.Registry, d : Strata.Blocks.Def) : Strata.Blocks.Registry do
+    match B.register(r, d) do
+      Ok((r2, _)) -> r2
+      Err(_) -> r
+    end
+  end
+  -- 1 stone, 2 water (see-through, translucent, does not collide), 3 glass (see-through, translucent)
+  pfn reg() : Strata.Blocks.Registry do
+    let stone = B.with_faces(B.def(), 1, 1, 1)
+    let water = B.with_faces(B.with_collide(B.with_layer(B.with_opacity(B.def(), Strata.Blocks.SeeThrough), Strata.Blocks.Translucent), false), 2, 2, 2)
+    let glass = B.with_faces(B.with_layer(B.with_opacity(B.def(), Strata.Blocks.SeeThrough), Strata.Blocks.Translucent), 3, 3, 3)
+    add(add(add(B.empty(), stone), water), glass)
+  end
+
+  pfn lcg(s : Int) : Int do int_and(s * 1103515245 + 12345, 2147483647) end
+  pfn scatter(c : Strata.Chunk.Chunk, side : Int, i : Int, s : Int) : Strata.Chunk.Chunk do
+    if i >= side * side * side do c
+    else if (s / 65536) % 12 == 0 do scatter(C.set(c, C.coord(8 + i % side), C.coord(8 + (i / side) % side), C.coord(8 + i / (side * side)), 3), side, i + 1, lcg(s))
+    else scatter(c, side, i + 1, lcg(s)) end end
+  end
+  pfn panes(pool_id : Int, pane_id : Int) : Strata.Chunk.Chunk do
+    let pool = C.fill_box(C.uniform(0), 4, 15, 4, 27, 16, 27, pool_id)
+    let p1 = C.fill_box(pool, 10, 10, 10, 21, 24, 10, pane_id)
+    let p2 = C.fill_box(p1, 10, 10, 15, 21, 24, 15, pane_id)
+    let p3 = C.fill_box(p2, 10, 10, 20, 21, 24, 20, pane_id)
+    let wall = C.fill_box(p3, 24, 10, 6, 24, 24, 25, pool_id)
+    C.fill_box(wall, 6, 11, 22, 25, 11, 26, pane_id)
+  end
+  pfn chunk_of(mode : Int) : Strata.Chunk.Chunk do
+    if mode == 1 do C.fill_box(C.fill_box(C.uniform(0), 0, 0, 0, 31, 15, 31, 1), 8, 14, 8, 20, 15, 20, 2)
+    else if mode == 2 do panes(2, 3)
+    else if mode == 3 do scatter(C.uniform(0), 12, 0, lcg(77))
+    else if mode == 4 do scatter(C.uniform(0), 16, 0, lcg(77))
+    else if mode == 6 do scatter(C.uniform(0), 10, 0, lcg(77))
+    else panes(1, 1) end end end end end
+  end
+
+  pfn rep(left : Int, r : Strata.Blocks.Registry, a : Strata.Mesh.Around, acc : Int) : Int do
+    if left <= 0 do acc else rep(left - 1, r, a, acc + Ms.bytes(Ms.build(r, a))) end
+  end
+
+  fn main(_cap : Cap(IO)) : Unit do
+    let mode = Authority.must(Env.get_int("MODE", 2))
+    let reps = Authority.must(Env.get_int("REPS", 200))
+    let c = chunk_of(mode)
+    let a = Ms.around_from(fn (dx, dy, dz) -> if dx == 0 && dy == 0 && dz == 0 do c else C.uniform(0) end)
+    let m = Ms.build(reg(), a)
+    let total = rep(reps, reg(), a, 0)
+    Authority.must(println("mesh_translucent: mode " ++ int_to_string(mode) ++ ", " ++ int_to_string(Ms.quad_count_at(m, 0)) ++ " opaque and " ++ int_to_string(Ms.quad_count_at(m, 2)) ++ " translucent quads, " ++ int_to_string(Ms.bytes(m)) ++ " bytes of mesh; " ++ int_to_string(reps) ++ " builds (" ++ int_to_string(total) ++ ")"))
+  end
+end

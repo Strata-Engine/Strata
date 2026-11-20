@@ -1,0 +1,84 @@
+// Particles that meet the world (docs/2026-11-12-particles-design.md, the
+// addendum). One invocation per particle born since the last frame; it does
+// nothing for a particle whose effect does not ask, or one already looked
+// at. The particle's whole flight is cut into CHORDS chords of equal time
+// and each traced through the light volume; what is found goes into the
+// record's last three floats, and particle.vert flies the particle by them
+// from then on:
+//   [13] the age (seconds) of the first meeting, 1e9 for none (-1: not yet looked for)
+//   [14] the face met first + 8 x the face met second (trace.glsl's numbering)
+//   [15] the age of the second meeting, after a bounce; 1e9 for none
+// Solid voxels stop a particle, and cutout ones where their texture is
+// opaque; water, glass and thin blocks do not, and bodies and figures are not
+// looked at (STRATA_TRACE_WORLD_ONLY). A particle born inside a solid or
+// cutout voxel flies free until a chord ends in the open.
+layout(local_size_x = 64) in;
+
+layout(push_constant) uniform PC { layout(offset = 40) uint first; uint count; } pc;
+layout(std430, set = 0, binding = 37) buffer Ring { vec4 r[]; } ring;
+
+const uint CAP = 65536u;      // strata_vk.c SV_SPRAY_CAP
+const int CHORDS = 32;
+const float NONE = 1.0e9;
+
+// is the point (metres) inside a voxel that would stop a particle at once?
+bool blocked(vec3 p) {
+    uint c = class_at(p / u.eye.w);
+    if (c == 0u) return false;
+    int kind = class_kind(c);
+    return kind == 1 || kind == 2;
+}
+
+void main() {
+    uint gi = gl_GlobalInvocationID.x;
+    if (gi >= pc.count) return;
+    uint s = ((pc.first + gi) % CAP) * 4u;
+    vec4 more = ring.r[s + 3u];
+    if (more.y >= 0.0) return;
+    vec4 start = ring.r[s], vel = ring.r[s + 1u], misc = ring.r[s + 2u];
+    int e = clamp(int(misc.x), 0, 63);
+    vec4 shp = fxv(e, 10);     // cube, what meeting a solid does (1 die, 2 rest, 3 bounce), restitution, the share of the rest kept
+    float t1 = NONE, t2 = NONE;
+    int f1 = 0, f2 = 0;
+    if (shp.y > 0.5) {
+        vec4 dyn = fxv(e, 8), acc = fxv(e, 9);
+        float k = dyn.y;
+        float dt = vel.w / float(CHORDS);
+        vec3 org = start.xyz, v = vel.xyz;     // the leg being flown: where and how fast it began, and when
+        float t0 = 0.0;
+        bool leg2 = false;
+        vec3 a = org;
+        if (dyn.z > 0.0) a += pt_sway(dyn.z, dyn.w, misc.z, 0.0);
+        float ta = 0.0;
+        bool inside = blocked(a);
+        int i = 1;
+        // one pass a chord, and one more for the chord a bounce cuts in two
+        for (int n = 0; n < CHORDS + 1 && i <= CHORDS; n++) {
+            float tb = float(i) * dt;
+            vec3 b = pt_fly(org, v, acc.xyz, k, tb - t0);
+            if (!leg2 && dyn.z > 0.0) b += pt_sway(dyn.z, dyn.w, misc.z, tb);
+            if (inside) { inside = blocked(b); a = b; ta = tb; i++; continue; }
+            vec3 d = (b - a) / u.eye.w;
+            float len = length(d);
+            Hit h;
+            if (len > 1.0e-4 && trace_steps(a / u.eye.w, d / len, len, false, 96, 1.0e9, -1000000, h)) {
+                float share = clamp(h.t / len, 0.0, 1.0);
+                float th = ta + (tb - ta) * share;
+                if (leg2) { t2 = th; f2 = clamp(h.face, 0, 5); break; }
+                t1 = th; f1 = clamp(h.face, 0, 5);
+                if (shp.y < 2.5) break;
+                // the second leg, from where the closed form is at the meeting (as particle.vert has it)
+                vec3 p1 = pt_fly(org, v, acc.xyz, k, th);
+                if (dyn.z > 0.0) p1 += pt_sway(dyn.z, dyn.w, misc.z, th);
+                v = pt_bounced(pt_vel(v, acc.xyz, k, th), PT_FACE[f1], shp.z, shp.w);
+                org = p1; t0 = th; leg2 = true;
+                // ... traced from the chord's own meeting point, a little off the face it met
+                a = a + (b - a) * share + PT_FACE[f1] * (0.02 * u.eye.w);
+                ta = th;
+                continue;
+            }
+            a = b; ta = tb; i++;
+        }
+    }
+    ring.r[s + 3u] = vec4(more.x, t1, float(f1 + 8 * f2), t2);
+}

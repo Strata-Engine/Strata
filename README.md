@@ -40,6 +40,7 @@ click blasts a crater (with a spray in the colour of what it threw up),
 right click builds a sphere, escape quits. Blast the rim of a lake in the
 hills and it drains. `L` steps through the light modes, `[` and `]` lower
 and raise the sun, and `R` rereads the island's settings and regenerates.
+A gamepad works beside them: the sticks walk and look (see Input).
 
 ## The island
 
@@ -203,6 +204,55 @@ water. A cave flooded through its roof keeps some air under the roof.
 ![A hole dug in the sea closes](docs/fluid-sea-closes.png)
 ![A breached lake draining](docs/fluid-lake.png)
 ![The same breach from below](docs/fluid-waterfall.png)
+
+## Saving
+
+A game keeps its world in a folder, a **store**, and the world saves as it
+is played: there is no moment the player waits for. Every chunk that
+differs from what its generator makes, and every edit queued for a chunk
+that is not loaded, reaches a region file (8 x 8 x 8 chunks) a couple of
+seconds after it last changed, encoded and written on a worker. Once
+written, an edited chunk that is not loaded leaves memory; a coarse copy a
+seventh of its size stays so the far field still shows it. Loading is the
+stream doing what it always does: its generation workers read the saved
+regions and a saved chunk takes the generated one's place. The store also
+carries the game's own bytes at three levels (the world, a region, a
+player) and the entity snapshot, and never reads them. Design:
+`docs/2026-11-12-save-design.md`.
+
+| Call | Does |
+|---|---|
+| `Strata.Save.identity(dir)` | the seed, voxel scale and generator version in a store's header, before a generator that needs the seed is built |
+| `Strata.Save.open(dir, world, generator_version)` | the store and the world with its change log on, or a refusal with its reason; a missing or empty folder becomes a new store. `open_forcing` takes over the lock a crashed game left |
+| `Strata.Stream.with_store(stream, Strata.Save.region_source(store))` | generation consults the saved regions; once, right after `open` and before the stream's first tick |
+| `Strata.Save.tick(store, stream, dt)` | once a frame after `Strata.Stream.tick`: marks changed regions dirty, starts at most one region write (after 2 s of quiet), the header and changed player records every 5 s, folds in finished writes. It never waits for a write |
+| `Strata.Save.set_section(store, name, bytes)`, `section` | the game's data for the whole world, in the header |
+| `Strata.Save.set_region_section(store, region, name, bytes)`, `region_section`, `region_of(x, y, z, scale)` | the game's data for one region, saved with that region's chunks |
+| `Strata.Save.set_player(store, id, bytes)`, `player`, `players` | one record a player |
+| `Strata.Save.set_entities(store, arrays)`, `entities` | the entity snapshot (`Strata.Entities.snapshot_arrays`, `snapshot_of`), in the header |
+| `Strata.Save.set_generator_version(store, v)` | after `Strata.World.regenerate` |
+| `Strata.Save.edited_keys(store)`, `wake_outcome(store, world)` | the chunks the store holds; `Strata.Fluid.wake(fluid, world, wake_outcome(store, world))` after the surroundings have loaded sets disturbed water moving again |
+| `Strata.Save.flush(store, stream, physics, snapshot, held_bodies)` | loose bodies written into the world as blocks, everything dirty written now, every write waited for |
+| `Strata.Save.close(store, stream, physics, snapshot, held_bodies)` | `flush`, then the lock released. `close_unflushed(store)` for a store that never streamed |
+| `Strata.Save.stats(store)`, `reason(store)` | dirty regions, writes in flight, writes failed, files set aside; the last refusal or failure |
+
+A store made with another generator still loads, with **seams**: chunks
+the player edited keep their saved content, everything never touched comes
+from the new generator, and each region file keeps the generator version it
+was first written with, so a game can find where the two meet. What `open`
+refuses, each with its reason: a store from another block registry (its
+fingerprint covers every field that changes what a block is, not its
+textures), another seed or voxel scale, a newer format, a damaged header
+(set aside as `store.bin.bad`), and a folder another game holds (a lock
+file). A damaged region or player file costs that region or that player,
+not the world: it is renamed `.bad`, counted, and its chunks generate.
+Every file is written whole to `<name>.tmp` and renamed, so a crash of the
+game leaves each file old or new, never half. Power loss is not covered:
+March cannot force a file's data to disk (GAPS S49).
+
+In the viewer, `STRATA_STORE=<dir>` keeps the walked world in that folder:
+carve, quit, start again with the same folder and the craters are there,
+the walker where it stood. Costs are in `RESULTS.md`.
 
 ## Sound
 
@@ -384,7 +434,8 @@ Strata.Render.draw_ui(u4)                                  -- one draw call, in 
 
 Limits:
 
-- No widgets: nothing a pointer acts on, no text entry, no layout engine.
+- Few widgets: a slider and a one-line text field (`Strata.Controls`; typing
+  is under Input below); no layout engine.
 - The whole display is rebuilt each frame. The layer holds 16 384 quads;
   more are dropped from the end and `Strata.Render.ui_dropped` says how many.
 - Lines break at spaces and between Chinese, Japanese and Korean
@@ -407,6 +458,96 @@ Limits:
 ![Text from 8 to 200 pixels](docs/ui-text-sheet.png)
 ![Wrapping, alignment, outline, shadow, mixed runs](docs/ui-text-styles.png)
 ![Six scripts, mixed direction, kerning and ligatures](docs/ui-text-scripts.png)
+## Input
+
+`Strata.Ffi.Vk` reads the window raw: is a key held, is a mouse button
+held, where the pointer is. `Strata.Input` puts a game's own names over
+that. A game lists bindings, each an action, a source and a weight, and
+asks each frame about its actions, not about keys:
+
+```
+let map = Strata.Input.new([
+    ("ahead", Strata.Input.Key(87), 1.0),          -- W
+    ("ahead", Strata.Input.Key(83), -1.0),         -- S
+    ("ahead", Strata.Input.PadAxis(1), -1.0),      -- left stick; up is negative
+    ("jump", Strata.Input.Key(32), 1.0),
+    ("jump", Strata.Input.PadButton(0), 1.0),      -- south
+    ("fire", Strata.Input.MouseButton(0), 1.0),
+    ("fire", Strata.Input.PadAxis(5), 1.0)])       -- right trigger
+let input0 = Strata.Input.start(map)
+-- each frame, after Strata.Ffi.Vk.poll()
+let input = Strata.Input.step(input0, Strata.Render.input(input0, Strata.Ffi.Vk.first_pad()))
+Strata.Input.value(input, "ahead")      -- -1 .. 1
+Strata.Input.held(input, "fire")
+Strata.Input.pressed(input, "jump")     -- true on the frame it went down
+Strata.Input.released(input, "jump")    -- and on the frame it came up
+```
+
+- **Actions are the game's.** The names are strings of its choosing and the
+  bindings are a list it could as well read from a file. The library knows
+  no action and ships no default map.
+- **Sources.** `Key` and `MouseButton` take GLFW's codes. `PadButton` takes
+  GLFW's gamepad buttons, Xbox layout: 0 south, 1 east, 2 west, 3 north,
+  4 and 5 the bumpers, 6 back, 7 start, 8 guide, 9 and 10 the stick clicks,
+  11 to 14 the d-pad up, right, down, left. `PadAxis` 0 and 1 are the left
+  stick's x and y, 2 and 3 the right stick's, -1 to 1 with y positive
+  downward; 4 and 5 are the left and right triggers, 0 at rest to 1.
+- **Value.** A held key or button adds its weight; an axis adds its reading
+  times its weight; the sum is clamped to -1..1. Opposite keys cancel, and a
+  key with the stick is still 1.
+- **Held, pressed, released.** An action is held while any key or button of
+  it is down or an axis of it is at least half way out (`with_press_point`),
+  so a trigger works as a button. `pressed` and `released` are the frames
+  on which that changed; `step` keeps the frame before to tell.
+- **Dead zone.** 0.15 of an axis's throw unless `with_dead_zone` says
+  otherwise. Inside it an axis reads exactly 0, and from its edge it rises
+  evenly from 0 to 1. A stick's two axes share one round zone (`stick`), so
+  a diagonal push keeps its direction; a trigger has its own (`dead_zone`).
+- **Headless.** `Strata.Input` is pure: `step` takes a raw state that is
+  plain data (`Strata.Input.raw(keys, mouse_buttons, pad_buttons, pad_axes)`),
+  so a test or a replay feeds it without a window. `Strata.Render.input`
+  fills one from the window, asking only about the keys the map binds.
+- **Pads.** `Strata.Ffi.Vk.pad_connected`, `pad_button`, `pad_axis` and
+  `first_pad` read up to 16 pads as of the last `poll`. A game with several
+  players steps one `Input` a pad.
+- **Typing.** `Strata.Ffi.Vk.typed()` is what was typed since the last
+  `poll`, in order: Unicode code points, and the keys that type nothing
+  (Backspace, Delete, the arrows, Home, End, Enter) as negative key codes,
+  repeated as the system repeats them. `Strata.Controls.text_edit(text,
+  caret, events, limit)` applies that list to a string and its caret and
+  answers the new pair; `Strata.Controls.text_field_at` draws the field
+  with the caret where it is. Enter and Escape are left in the list for
+  the game.
+
+```
+let (name, caret) = Strata.Controls.text_edit(name0, caret0, Strata.Ffi.Vk.typed(), 24)
+let u1 = Strata.Controls.text_field_at(u0, 20.0, 20.0, 240.0, 32.0, name, caret, true, back, fore, 16.0)
+```
+
+The viewer's controls are one such list (`controls()` in
+`viewer/lib/strata_viewer.march`). On a gamepad: left stick walks, right
+stick looks, south jumps (rises when flying, east sinks), the right trigger
+digs and the left builds, the bumpers step through the hotbar, north
+switches flying, the left stick's click sprints. A scripted run reads
+Escape and nothing else, so a pad left plugged in cannot change a picture.
+
+Limits:
+
+- A pad is one GLFW has a mapping for; any other joystick is not seen.
+  There is no rumble and no gyro.
+- Pointer motion and scroll are not bindable: they are per-frame deltas and
+  are read from `Strata.Ffi.Vk` as before.
+- No chords, double taps or hold timers, and no rebinding screen.
+- Typing takes at most 64 events a frame and drops the rest. There is no
+  input method support (composed Chinese or Japanese), no selection and no
+  clipboard; a field is one line.
+- `text_field_at` shows the caret as a bar character put into the text, so
+  in right-to-left or shaped text it can part joined letters.
+- The gamepad and typing paths in the C shim were built without a physical
+  pad and without typing into a window: the mapping, edges, dead zones and
+  text editing are covered by tests on raw states, the shim's reading of
+  GLFW is not.
+
 ## Animation
 
 Jointed voxel figures (people, creatures, vehicles) built and animated in
@@ -899,7 +1040,8 @@ about. Every mistake is an `Err("line N: ...")`, the first in file order.
 Design: `docs/2026-11-12-particles-design.md`. A game describes an effect
 as data and emits it; the GPU flies every particle on a closed form from a
 64-byte record written once at its birth, so a particle costs the CPU
-nothing after it is born. Particles meet nothing.
+nothing after it is born. Particles meet nothing unless their effect asks
+(below).
 
 ```march
 alias Strata.Particles as Pt
@@ -932,8 +1074,29 @@ shaded effect is lit once a particle unless `Pt.lit_per_pixel` asks for
 spray's per-pixel lighting. `Strata.Render.spray` is the built-in effect 0:
 tumbling cubes in the texture of the block they were thrown from.
 
+An effect may ask for its particles to meet the solid voxels of the world:
+
+```march
+let spark = Pt.effect() |> Pt.glowing() |> Pt.accel(0.0, 0.0 -. 9.8, 0.0)
+  |> Pt.bounces(0.45, 0.3)      -- once: restitution, friction; then it rests where it lands
+-- or Pt.rests_on_solid() (lies where it lands), Pt.dies_on_solid() (gone there),
+-- Pt.meets_nothing() (the default)
+```
+
+The renderer looks once, in the frame a particle is born: a compute pass
+walks its whole flight through the voxels the lighting already keeps on the
+GPU and writes when and on which face it meets one into the particle's
+record, so it still costs the CPU nothing and the GPU nothing more per
+frame after that. A frame that bears no such particle runs no pass (about
+0.05 ms of GPU in one that does), and an effect that does not ask is drawn
+exactly as before. Because the world is looked at at birth, blocks placed
+or dug during a flight are not seen, nor chunks not yet loaded; water,
+glass, tall grass, bodies and figures stop nothing.
+
 In the viewer, `STRATA_FX=1` shows the six effects side by side at frame
-10. In a match (`STRATA_COMBAT=1`) a fireball trails flame, smoke and
+10, and `STRATA_FX=2` three that meet the world: drips gone at the ground,
+cinders lying where they land and at the foot of a bank, grit that
+bounces (`STRATA_FX=3`: the same flying free, to compare). In a match (`STRATA_COMBAT=1`) a fireball trails flame, smoke and
 embers and bursts in sparks; what it reaches catches over half a second
 and burns for seconds (grass 1 to 2, leaves 2 to 3, wood 4 to 6) as glowing
 embers blocks that light the ground, before it is gone. Cost: `RESULTS.md`,
@@ -992,6 +1155,9 @@ boundary over the ground; their numbers are in `RESULTS.md`.
 | `Strata.World` | loaded chunks, the edited-chunk cache, queued edits |
 | `Strata.Edit` | single, list, box and sphere edits; blasts; `unsupported`: what an edit left hanging (plants over dug ground) |
 | `Strata.Stream` | loading around focus points; task-built chunks and meshes |
+| `Strata.Save` | a world kept in a folder as it is played: dirty regions written by workers, the header, player records, the game's sections; loading, flush and close |
+| `Strata.Savefile` | the encoding of every save file: framed, checksummed, decoded without a panic |
+| `Strata.Regions` | a store's region files as the stream's generation workers read them |
 | `Strata.Query` | raycast and swept box collision |
 | `Strata.Nav` | where a walker stands; A* paths over the voxels, nearest-by-test, straight lines, corners |
 | `Strata.Steer` | directions over the ground for a mover: seek, flee, arrive, keep apart, blend, turn |
@@ -1007,20 +1173,36 @@ boundary over the ground; their numbers are in `RESULTS.md`.
 | `Strata.PopulationFile` | a population read from a text file |
 | `Strata.Template`, `Strata.Ffi.Vox` | voxel templates (holes, probabilities, turns) blitted into chunks; MagicaVoxel `.vox` import (`native/strata_vox.cpp`, link with `-fno-exceptions`) |
 | `Strata.Entities`, `Strata.Ffi.Ent` | entity kinds, and entities kept as rows by the C kernel in `native/strata_ent.h` |
+| `Strata.Input` | a game's named actions bound as data to keys, mouse buttons and a gamepad: held, pressed, released, value; dead zones |
+| `Strata.Controls` | immediate-mode controls: a slider, a text field, and typed input applied to a string |
 | `Strata.Particles` | particle effects as data, emitters, the bursts a frame hands the renderer |
-| `Strata.Ffi.Vk` | window, input and the Vulkan renderer |
+| `Strata.Ffi.Vk` | window, raw input (keys, mouse, gamepads, typed characters) and the Vulkan renderer |
 | `Strata.Math.*`, `Strata.Noise`, `Strata.Tree` | vectors, matrices, noise, a persistent tree |
 
 ## Known limits
 
-- No save format: edited chunks stay in memory. A save would have to keep
-  the fluid's active cells too.
+- A saved world is the world at rest: the fluid's active cells, bodies in
+  flight and what an entity was seeing are not kept. On loading, a game
+  wakes the fluid in the chunks that were edited (`wake_outcome`), and
+  `flush` writes loose bodies into the world as blocks.
+- A store survives the game crashing, not the machine losing power: March
+  has no way to force a file's data to disk (GAPS S49), so after a power
+  cut a region can fail its checksum; it is then set aside and its edits
+  regenerate away.
+- A freshly loaded store shows a saved edit on the horizon only once its
+  chunks have loaded: the coarse copies the far field uses are made as
+  chunks leave memory and are not saved.
 - Water has no pressure: it does not rise in a pipe or push uphill behind a
   dam. It leaves a lake only over the lip of its outlet, so a big lake
   takes minutes to drain, and a wet bed keeps a film of an eighth or two.
 - Water moves only in loaded chunks; at the edge of the loaded world it
   waits.
 - Spray is a picture: it meets nothing and carries no water.
+- Particles meet the world only if their effect asks, and then as it was
+  when they were born: a block placed or dug mid-flight is not seen, nor a
+  chunk not yet loaded. They bounce once at most, and water, glass, thin
+  blocks, bodies and figures stop nothing (`RESULTS.md`, Particles that
+  meet the world).
 - Lighting reaches as far as the stream does and no further: nothing outside
   the loaded chunks casts a shadow or is reflected.
 - One bounce of light. No light shafts, no refraction, no coloured shadows
@@ -1035,8 +1217,13 @@ boundary over the ground; their numbers are in `RESULTS.md`.
 - The far field is lit without rays: no shadows, sky light or reflections
   past the near chunks. Where two levels meet the ground can step by one
   coarse voxel; the levels meet on whole coarse chunks.
-- Translucent quads are ordered by chunk, not within one, and draw from
-  both sides, so a one-block pane blends twice.
+- Translucent quads are in the right order inside a chunk, and a pane
+  blends once, but chunks are still ordered among themselves by the
+  distance of their centres: a long quad in one chunk and a pane just
+  across the border can blend in the wrong order. A chunk with more than
+  512 translucent quads is drawn in mesh order. Crosses, models and
+  particles are not sorted against translucent quads, and the browser
+  preview does not sort at all.
 - Model faces light as the nearest of the six axis directions.
 - On MoltenVK presentation paces to the display even with vsync off;
   uncapped timing uses `STRATA_OFFSCREEN=1`.
@@ -1061,4 +1248,8 @@ boundary over the ground; their numbers are in `RESULTS.md`.
     scripts/verify.sh
 
 runs `forge check`, `forge build --release`, `forge lint --strict` and
-`forge test` in the library and in each app, and prints PASS.
+`forge test` in the library and in each app, and prints PASS. The save's
+part of it: `scripts/save_times.sh` (savecheck: the store timed against its
+budget, headless) and, with a GPU, `scripts/save_check.sh` (the viewer
+carves with `STRATA_STORE` set, quits, and a second run must load the same
+world).

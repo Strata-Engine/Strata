@@ -35,6 +35,7 @@ layout(location = 1) out vec3 v_world;        // metres
 layout(location = 2) flat out uint v_w1;
 layout(location = 3) flat out uint v_face;        // 0..5; plus 8 for a chunk above level 0, lit without rays
 layout(location = 5) flat out vec4 v_rot;        // the rotation of the body drawn; identity for the world
+layout(location = 6) out vec3 v_keep;            // the translucent pass: a fragment with a negative component is not drawn
 
 void main() {
 #ifdef STRATA_BATCHED_QUADS
@@ -46,6 +47,9 @@ void main() {
 #else
     uint slot = draw_slot.slot[pc.base + uint(gl_DrawID)];
 #endif
+    // The translucent pass (flag 4) puts a list's octant in the slot's top bits: 8 + o, or 0 for a chunk with one unordered list.
+    uint octant = (pc.flags & 4u) != 0u ? slot >> 28 : 0u;
+    if ((pc.flags & 4u) != 0u) slot &= 0x0FFFFFFFu;
     uint face = (w0 >> 25) & 7u;
     vec3 p = vec3(float(w0 & 31u), float((w0 >> 5) & 31u), float((w0 >> 10) & 31u));
     float w = float(((w0 >> 15) & 31u) + 1u);
@@ -88,4 +92,13 @@ void main() {
     v_w1 = fluid ? (w1t | (255u << 16)) : w1t;           // a fluid is not corner-shaded
     v_face = face | ((ol.w & 255) > 0 ? 8u : 0u);
     gl_Position = to_clip(u.vp * vec4(world, 1.0));
+    v_keep = vec3(1.0);
+    if ((pc.flags & 4u) != 0u) {
+        // from this corner to the eye, in the chunk's own voxels
+        vec3 d = (body ? qrot(vec4(-ch.rot.xyz, ch.rot.w), u.eye.xyz - ch.pos.xyz) / (ch.pos.w > 0.0 ? ch.pos.w : u.eye.w) : (u.eye.xyz / u.eye.w - vec3(ol.xyz)) / lod) - q;
+        // An ordered list is for rays that run one way along each axis (bit set: down it). It is drawn only where the
+        // eye's rays run that way, which also keeps a quad to the side it is seen from: the fragments decide.
+        // A chunk with one unordered list is drawn whole, from both sides.
+        if (octant >= 8u) v_keep = d * vec3((octant & 1u) != 0u ? 1.0 : -1.0, (octant & 2u) != 0u ? 1.0 : -1.0, (octant & 4u) != 0u ? 1.0 : -1.0);
+    }
 }

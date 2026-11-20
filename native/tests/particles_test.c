@@ -133,6 +133,48 @@ int main(void) {
         CHECK(memcmp(recs, again, 64 * PT_FLOATS * sizeof(float)) != 0, "another seed writes others");
     }
 
+    {   /* particles that meet the world: the pieces of the flight particle.vert draws from what collide.comp wrote */
+        float fx[PT_EFFECT_FLOATS], rec[PT_FLOATS] = { 0 }, p[3], q[3], v[3];
+        pt_effect_spray(fx);
+        CHECK(!pt_effect_meets(fx), "spray meets nothing");
+        rec[1] = 10.0f; rec[4] = 2.0f; rec[5] = 0.0f; rec[7] = 4.0f;              /* from (0, 10, 0) at 2 m/s along x, falling */
+        rec[13] = 1.0f; rec[14] = 0.0f + 8.0f * 2.0f; rec[15] = 1.5f;              /* meets a floor (+y) at 1 s, then a wall (+x) at 1.5 s */
+        CHECK(pt_position_met(rec, fx, 2.0f, p) == 1 && fabsf(p[1] - (10.0f - 4.9f * 4.0f)) < 1e-4f, "an effect that meets nothing ignores what the record says");
+        fx[41] = PT_MEET_DIE;
+        CHECK(pt_effect_meets(fx), "an effect with float 41 set meets the world");
+        pt_position(rec, fx, 0.5f, q);
+        CHECK(pt_position_met(rec, fx, 0.5f, p) == 1 && memcmp(p, q, sizeof p) == 0, "before the meeting it is the free flight exactly");
+        CHECK(pt_position_met(rec, fx, 1.0f, p) == 0 && pt_position_met(rec, fx, 3.0f, p) == 0, "die: gone from the meeting on");
+        rec[13] = PT_MEET_UNKNOWN;
+        CHECK(pt_position_met(rec, fx, 3.0f, p) == 1, "a particle not yet looked at flies free");
+        rec[13] = PT_MEET_NEVER;
+        CHECK(pt_position_met(rec, fx, 3.0f, p) == 1, "and one that meets nothing lives its life");
+        rec[13] = 1.0f;
+        fx[41] = PT_MEET_REST;
+        pt_position(rec, fx, 1.0f, q);
+        CHECK(pt_position_met(rec, fx, 1.0f, p) == 1 && memcmp(p, q, sizeof p) == 0, "rest: at the meeting it is where the flight is");
+        CHECK(pt_position_met(rec, fx, 3.5f, p) == 1 && memcmp(p, q, sizeof p) == 0, "and stays there");
+        fx[41] = PT_MEET_BOUNCE; fx[42] = 0.5f; fx[43] = 0.8f;
+        pt_velocity(rec, fx, 1.0f, v);
+        CHECK(fabsf(v[0] - 2.0f) < 1e-5f && fabsf(v[1] + 9.8f) < 1e-4f, "velocity at 1 s: 2 along, 9.8 down");
+        float b[3];
+        pt_bounced(v, 0, 0.5f, 0.8f, b);
+        CHECK(fabsf(b[0] - 1.6f) < 1e-5f && fabsf(b[1] - 4.9f) < 1e-4f && b[2] == 0.0f, "off a floor: half the fall comes back up, four fifths of the rest is kept");
+        pt_bounced(v, 3, 0.5f, 0.8f, b);
+        CHECK(fabsf(b[0] + 1.0f) < 1e-5f && fabsf(b[1] + 7.84f) < 1e-4f, "off a wall: x turned back, y kept by friction's share");
+        CHECK(pt_position_met(rec, fx, 1.0f, p) == 1 && fabsf(p[0] - q[0]) < 1e-5f && fabsf(p[1] - q[1]) < 1e-5f, "bounce: unbroken at the meeting");
+        /* 0.2 s into the second leg: from (2, 5.1) at (1.6, 4.9) under gravity */
+        CHECK(pt_position_met(rec, fx, 1.2f, p) == 1 && fabsf(p[0] - (2.0f + 0.32f)) < 1e-4f && fabsf(p[1] - (5.1f + 0.98f - 0.196f)) < 1e-4f, "the second leg flies from the meeting at the bounced velocity");
+        float at2[3];
+        pt_position_met(rec, fx, 1.5f, at2);
+        CHECK(pt_position_met(rec, fx, 3.9f, p) == 1 && memcmp(p, at2, sizeof p) == 0, "and rests at the second meeting");
+        /* with drag: the velocity is the flight's slope */
+        fx[33] = 0.7f;
+        float lo[3], hi[3];
+        pt_position(rec, fx, 0.8f - 1e-3f, lo); pt_position(rec, fx, 0.8f + 1e-3f, hi); pt_velocity(rec, fx, 0.8f, v);
+        CHECK(fabsf((hi[0] - lo[0]) / 2e-3f - v[0]) < 2e-2f && fabsf((hi[1] - lo[1]) / 2e-3f - v[1]) < 2e-2f, "with drag, pt_velocity is the slope of pt_position");
+    }
+
     if (fails == 0) printf("particles_test: ok\n");
     return fails == 0 ? 0 : 1;
 }

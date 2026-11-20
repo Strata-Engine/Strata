@@ -496,10 +496,31 @@ and 29 instructions on March main against C's 0.85 ns and 20 (2.9 times; on
 recovers a column's x and z from its index (Task 3). Small; the Strata code
 is left plain.
 
+## S48: `IO.Random` in a library module is charged to every test module
+
+Met writing `Strata.Save`'s lock (save Task 2): a module declaring `needs
+IO.Random` and calling `Crypto.random_hex` built alone, but the test build
+then stopped at an unrelated test module: "Module `AcousticsTest` uses
+`IO.Random` but does not declare `needs IO.Random`" (the S3 charge, for
+another capability). Workaround: the lock's token is the process id and the
+clock's microseconds (`IO.Process` and `IO.Clock`, which every test module
+declares already for S3), not random bytes.
+
+## S49: no way to force a file's data to disk
+
+March's standard library has `File.write` and `File.rename` and nothing
+that waits for the data to reach the disk (no fsync, on a file or on its
+folder). `Strata.Save` writes every file to `<name>.tmp` and renames it,
+which is safe against the game crashing: a reader sees the old file or the
+new. After a power cut or an operating-system crash the rename can have
+reached the disk before the data it names, and the file is then short or
+garbage. Workaround: none; every save file carries a checksum, so such a
+file is set aside as `.bad` and counted, and a region's edits regenerate
+away. Wanted from March: `File.sync` (and a way to sync a folder).
+
 ## S50: a write whose later arguments read the array it writes copies the array
 
-(Numbered S50 because the save-and-load branch takes S48 and S49.) In
-`cset(cset(st, i, cget(st, i) +. a), i + 1, cget(st, i + 1) +. b)` the outer
+In `cset(cset(st, i, cget(st, i) +. a), i + 1, cget(st, i + 1) +. b)` the outer
 `cget` reads the array as it was before the inner write, so value semantics
 keeps the old array alive across that write: March holds a second reference
 (`__march_rc_incrc_local`) and `NativeArray.set_float` copies the whole
