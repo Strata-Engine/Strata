@@ -479,7 +479,28 @@ mod Strata.World do
         if !Sr.has(cs, k) do w
         else if differs(cs, gh, tc, k) do
           World(r, g, sd, sc, Sr.remove(cs, k), Sr.remove(gh, k), Sr.remove(tc, k), Sr.put(ca, k, Ck.compact(Sr.get(cs, k))), pe, st, note(lg, k), sm)
-        else World(r, g, sd, sc, Sr.remove(cs, k), Sr.remove(gh, k), Sr.remove(tc, k), ca, pe, st, lg, sm) end end
+        else if reverted(lg, tc, k) do
+          World(r, g, sd, sc, Sr.remove(cs, k), Sr.remove(gh, k), Sr.remove(tc, k), Sr.put(ca, k, Ck.compact(Sr.get(cs, k))), pe, st, note_reverted(lg, k), sm)
+        else World(r, g, sd, sc, Sr.remove(cs, k), Sr.remove(gh, k), Sr.remove(tc, k), ca, pe, st, lg, sm) end end end
+    end
+  end
+
+  -- While a store is listening (the log is on), a level-0 chunk touched
+  -- since it loaded and now equal to its generation is not simply dropped
+  -- at unload: the store may hold an older saved copy of it, which a
+  -- reload would bring back. It waits in the cache, as an edited chunk
+  -- does, and is logged as reverted; the store drops its saved copy and
+  -- then has the world forget the chunk (`forget_reverted`).
+  pfn reverted(lg : Option(Strata.Store.Store(Bool)), tc : Strata.Store.Store(Bool), k : Strata.Coord.Key) : Bool do
+    match lg do
+      None -> false
+      Some(_) -> if Kd.level(k) != 0 do false else Sr.get(tc, k) end
+    end
+  end
+  pfn note_reverted(lg : Option(Strata.Store.Store(Bool)), k : Strata.Coord.Key) : Option(Strata.Store.Store(Bool)) do
+    match lg do
+      None -> lg
+      Some(s) -> Some(Sr.put(s, k, false))
     end
   end
 
@@ -549,6 +570,39 @@ mod Strata.World do
         match lg do
           None -> (w, Nil)
           Some(log) -> (World(r, g, sd, sc, cs, gh, tc, ca, pe, st, Some(Sr.empty(false)), sm), Sr.keys(log))
+        end
+    end
+  end
+
+  doc "As `take_changes`, in two lists: the keys changed, and the keys of chunks that were unloaded equal to their generation after being touched (edited back, or loaded from a store and unchanged from what the generator now makes). Each of the second kind waits in the cache; a store drops any saved copy of it and then calls `forget_reverted`."
+  fn take_changes_marked(w : World) : (World, List(Strata.Coord.Key), List(Strata.Coord.Key)) do
+    match w do
+      World(r, g, sd, sc, cs, gh, tc, ca, pe, st, lg, sm) ->
+        match lg do
+          None -> (w, Nil, Nil)
+          Some(log) ->
+            let (changed, back) = Sr.fold(log, (Nil, Nil), fn (acc, k, v) ->
+              let (a, b) = acc
+              if v do (Cons(k, a), b) else (a, Cons(k, b)) end)
+            (World(r, g, sd, sc, cs, gh, tc, ca, pe, st, Some(Sr.empty(false)), sm), changed, back)
+        end
+    end
+  end
+
+  doc "The world after a store has dropped the saved copies of [dropped], (key, `Strata.Chunk.hash` of the reverted chunk) pairs from `take_changes_marked`'s second list: each key still cached (not loaded) with that hash leaves the cache, and nothing is kept in its place: it generates again. A key loaded or edited since is left."
+  fn forget_reverted(w : World, dropped : List((Strata.Coord.Key, Int))) : World do
+    match dropped do
+      Nil -> w
+      _ ->
+        match w do
+          World(r, g, sd, sc, cs, gh, tc, ca, pe, st, lg, sm) ->
+            let ca2 = List.fold_left(dropped, ca, fn (acc, p) ->
+              let (k, h) = p
+              if Sr.has(cs, k) do acc
+              else if !Sr.has(acc, k) do acc
+              else if Ck.hash(Sr.get(acc, k)) != h do acc
+              else Sr.remove(acc, k) end end end)
+            World(r, g, sd, sc, cs, gh, tc, ca2, pe, st, lg, sm)
         end
     end
   end

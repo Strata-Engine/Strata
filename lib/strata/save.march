@@ -44,14 +44,17 @@ mod Strata.Save do
   -- One changed key as a write task takes it: the key; 0 keep the saved
   -- chunk, 1 put this chunk, 2 drop the saved chunk, 3 a loaded chunk as it
   -- is, for the worker to judge (put it compacted if it differs from the
-  -- hash it generated to, else drop the saved chunk); the chunk; whether
+  -- hash it generated to, else drop the saved chunk), 4 a chunk unloaded
+  -- equal to its generation (drop the saved chunk, and answer its hash so
+  -- the world can forget it); the chunk; whether
   -- the world's queue is the whole truth (the chunk is in memory) or
   -- follows the saved queue; the world's queue, oldest first; the hash the
   -- chunk generated to (kind 3).
   type SvChange = SvChange(Strata.Coord.Key, Int, Strata.Chunk.Chunk, Bool, List(Strata.World.Op), Int)
   -- What a region write answers: done?, the region now on disk (holding
   -- nothing: its file is gone), and each chunk put with its content hash.
-  type SvWrote = SvWrote(Bool, Strata.Savefile.Region, List((Strata.Coord.Key, Int)))
+  -- (and each reverted chunk whose saved copy was dropped, with its hash)
+  type SvWrote = SvWrote(Bool, Strata.Savefile.Region, List((Strata.Coord.Key, Int)), List((Strata.Coord.Key, Int)))
   -- A region write in flight: the region, what it was writing (dirty again
   -- if it fails), the task.
   type SvWrite = SvWrite(Strata.Coord.Key, SvDirty, Task(SvWrote))
@@ -71,7 +74,8 @@ mod Strata.Save do
   -- and players) last started a write; the player records; the dirty
   -- regions; the decoded regions (at most `cache_cap`, each with the stamp
   -- of its last use) and the regions that have a file; the writes in
-  -- flight; written chunks the world has yet to release; region files read;
+  -- flight; written chunks the world has yet to release and reverted chunks
+  -- it has yet to forget; region files read;
   -- how many region writes have been folded in (the epoch) and, for each
   -- region written, the epoch of its last write (Strata.Regions).
   type SaveStore = { sv_dir : String, sv_token : String, sv_header : Strata.Savefile.SaveHeader, sv_generator : Int,
@@ -81,7 +85,7 @@ mod Strata.Save do
                  sv_dirty : Strata.Store.Store(SvDirty), sv_cache : Strata.Store.Store(Strata.Savefile.Region), sv_used : Strata.Store.Store(Int), sv_clock : Int,
                  sv_present : Strata.Store.Store(Bool),
                  sv_writes : List(SvWrite), sv_heads : List(SvHead), sv_player_writes : List(SvPlayerWrite),
-                 sv_owed : List((Strata.Coord.Key, Int)), sv_reads : Int,
+                 sv_owed : List((Strata.Coord.Key, Int)), sv_forget : List((Strata.Coord.Key, Int)), sv_reads : Int,
                  sv_epoch : Int, sv_epochs : Strata.Store.Store(Int) }
 
   pfn header_path(d : String) : String do d ++ "/store.bin" end
@@ -305,7 +309,7 @@ mod Strata.Save do
                       sv_head_dirty: h.sh_generator != gv, sv_slow_last: 0.0, sv_players: players,
                       sv_dirty: Sto.empty(SvDirty(0.0, Sto.empty(false), Nil)), sv_cache: Sto.empty(Rgn.no_region()), sv_used: Sto.empty(0), sv_clock: 0,
                       sv_present: present_in(names_in(regions_dir(dir)), Sto.empty(false)),
-                      sv_writes: Nil, sv_heads: Nil, sv_player_writes: Nil, sv_owed: Nil, sv_reads: 0, sv_epoch: 0, sv_epochs: Sto.empty(0) }, Strata.World.log_changes(w, true)))
+                      sv_writes: Nil, sv_heads: Nil, sv_player_writes: Nil, sv_owed: Nil, sv_forget: Nil, sv_reads: 0, sv_epoch: 0, sv_epochs: Sto.empty(0) }, Strata.World.log_changes(w, true)))
             end
           end
       end
@@ -648,21 +652,23 @@ mod Strata.Save do
   -- what a job has made of its changes so far: the kinds by key, chunks to
   -- put (newest first), queues to put, hashes, and whether nothing differs
   -- from the old region
-  type SvFold = SvFold(Strata.Store.Store(Int), List((Strata.Coord.Key, Strata.Chunk.Chunk)), List((Strata.Coord.Key, List(Strata.World.Op))), List((Strata.Coord.Key, Int)), Bool)
+  type SvFold = SvFold(Strata.Store.Store(Int), List((Strata.Coord.Key, Strata.Chunk.Chunk)), List((Strata.Coord.Key, List(Strata.World.Op))), List((Strata.Coord.Key, Int)), Bool, List((Strata.Coord.Key, Int)))
 
   -- a loaded chunk judged: put, compacted, if it differs from its generation, else dropped
   pfn judged(c : SvChange) : SvChange do
     match c do
       SvChange(k, kind, chunk, whole, mem, gen) ->
-        if kind != 3 do c
+        if kind == 4 do SvChange(k, 2, Ckv.uniform(0), whole, mem, gen)
+        else if kind != 3 do c
         else if Ckv.hash(chunk) == gen do SvChange(k, 2, Ckv.uniform(0), whole, mem, gen)
-        else SvChange(k, 1, Ckv.compact(chunk), whole, mem, gen) end end
+        else SvChange(k, 1, Ckv.compact(chunk), whole, mem, gen) end end end
     end
   end
 
   pfn fold_change(old : Strata.Savefile.Region, f : SvFold, c : SvChange) : SvFold do
     match f do
-      SvFold(kinds, chs, qs, hs, same) ->
+      SvFold(kinds, chs, qs, hs, same, gone0) ->
+        let gone = match c do SvChange(gk, gkind, gchunk, _, _, _) -> if gkind == 4 do Cons((gk, Ckv.hash(gchunk)), gone0) else gone0 end end
         match judged(c) do
           SvChange(k, kind, chunk, whole, mem, _) ->
             let was = Rgn.chunk_in(old, k)
@@ -679,17 +685,17 @@ mod Strata.Save do
                 Some(o) -> Ckv.hash(o) == h
                 None -> false
               end
-              SvFold(Sto.put(kinds, k, 1), Cons((k, chunk), chs), qs2, Cons((k, h), hs), if same_c do (if same_q do same else false end) else false end)
+              SvFold(Sto.put(kinds, k, 1), Cons((k, chunk), chs), qs2, Cons((k, h), hs), if same_c do (if same_q do same else false end) else false end, gone)
             else if kind == 2 do
-              let gone = match was do
+              let absent = match was do
                 Some(_) -> false
                 None -> true
               end
-              SvFold(Sto.put(kinds, k, 2), chs, qs2, hs, if gone do (if same_q do same else false end) else false end)
+              SvFold(Sto.put(kinds, k, 2), chs, qs2, hs, if absent do (if same_q do same else false end) else false end, gone)
             else
               match was do
-                Some(o) -> SvFold(Sto.put(kinds, k, 0), Cons((k, o), chs), qs2, hs, if same_q do same else false end)
-                None -> SvFold(Sto.put(kinds, k, 0), chs, qs2, hs, if same_q do same else false end)
+                Some(o) -> SvFold(Sto.put(kinds, k, 0), Cons((k, o), chs), qs2, hs, if same_q do same else false end, gone)
+                None -> SvFold(Sto.put(kinds, k, 0), chs, qs2, hs, if same_q do same else false end, gone)
               end
             end end
         end
@@ -705,9 +711,9 @@ mod Strata.Save do
 
   -- The region to write: [old] with each change folded in. Chunks and
   -- queues of keys that did not change keep their order; changed ones follow.
-  pfn region_after(old : Strata.Savefile.Region, changes : List(SvChange), sections : List((String, Bytes)), generator : Int, counter : Int) : (Strata.Savefile.Region, List((Strata.Coord.Key, Int)), Bool) do
-    match List.fold_left(changes, SvFold(Sto.empty(-1), Nil, Nil, Nil, true), fn (f, c) -> fold_change(old, f, c)) do
-      SvFold(kinds, chs, qs, hs, same) ->
+  pfn region_after(old : Strata.Savefile.Region, changes : List(SvChange), sections : List((String, Bytes)), generator : Int, counter : Int) : (Strata.Savefile.Region, List((Strata.Coord.Key, Int)), Bool, List((Strata.Coord.Key, Int))) do
+    match List.fold_left(changes, SvFold(Sto.empty(-1), Nil, Nil, Nil, true, Nil), fn (f, c) -> fold_change(old, f, c)) do
+      SvFold(kinds, chs, qs, hs, same, gone) ->
         let kept_c = List.filter(old.sr_chunks, fn p -> match p do (k, _) -> !Sto.has(kinds, k) end)
         let kept_q = List.filter(old.sr_ops, fn p -> match p do (k, _) -> !Sto.has(kinds, k) end)
         let no_secs = match sections do
@@ -716,7 +722,7 @@ mod Strata.Save do
         end
         let gen = if holds_nothing(old) do generator else old.sr_generator end
         ({ sr_generator: gen, sr_counter: counter, sr_chunks: List.append(kept_c, List.reverse(chs)), sr_ops: List.append(kept_q, List.reverse(qs)),
-           sr_sections: merge_sections(old.sr_sections, sections) }, hs, if no_secs do same else false end)
+           sr_sections: merge_sections(old.sr_sections, sections) }, hs, if no_secs do same else false end, gone)
     end
   end
 
@@ -724,12 +730,12 @@ mod Strata.Save do
   -- out as the disk already holds it is not written again; one that holds
   -- nothing has its file deleted.
   pfn region_job(path : String, old : Strata.Savefile.Region, changes : List(SvChange), sections : List((String, Bytes)), generator : Int, counter : Int) : SvWrote do
-    let (g, hs, same) = region_after(old, changes, sections, generator, counter)
-    if same do SvWrote(true, old, hs)
+    let (g, hs, same, gone) = region_after(old, changes, sections, generator, counter)
+    if same do SvWrote(true, old, hs, gone)
     else if holds_nothing(g) do
       let _gone = delete_file(path)
-      SvWrote(!exists_at(path), g, hs)
-    else SvWrote(write_atomic(path, Svf.encode_region(g)), g, hs) end end
+      SvWrote(!exists_at(path), g, hs, gone)
+    else SvWrote(write_atomic(path, Svf.encode_region(g)), g, hs, gone) end end
   end
 
   pfn header_job(path : String, h : Strata.Savefile.SaveHeader) : Bool do write_atomic(path, Svf.encode_header(h)) end
@@ -738,13 +744,16 @@ mod Strata.Save do
   -- ── Dirty regions ────────────────────────────────────────────────────────
 
   -- each changed key's region is dirty, its quiet clock starting again
-  pfn mark_dirty(s : SaveStore, keys : List(Strata.Coord.Key)) : SaveStore do
+  -- ([changed]: true for a key that changed, false for one unloaded equal
+  -- to its generation, `Strata.World.take_changes_marked`; the latest word
+  -- on a key stands)
+  pfn mark_dirty(s : SaveStore, keys : List(Strata.Coord.Key), changed : Bool) : SaveStore do
     match keys do
       Nil -> s
       Cons(k, t) ->
         let rk = Rgn.of_chunk(k)
         match dirty_of(s, rk) do
-          SvDirty(_, ks, secs) -> mark_dirty({ s with sv_dirty: Sto.put(s.sv_dirty, rk, SvDirty(s.sv_time, Sto.put(ks, k, true), secs)) }, t)
+          SvDirty(_, ks, secs) -> mark_dirty({ s with sv_dirty: Sto.put(s.sv_dirty, rk, SvDirty(s.sv_time, Sto.put(ks, k, changed), secs)) }, t, changed)
         end
     end
   end
@@ -779,8 +788,9 @@ mod Strata.Save do
   -- the changes of [keys], each with what the world holds for it: chs and
   -- qs are `Strata.World.region_raw` of the same keys, so they follow the
   -- keys' order. Nothing is hashed or compacted here: a loaded chunk goes
-  -- to the worker as it is.
-  pfn changes_of(w : Strata.World.World, keys : List(Strata.Coord.Key), chs : List((Strata.Coord.Key, Strata.Chunk.Chunk, Int)), qs : List((Strata.Coord.Key, List(Strata.World.Op))), acc : List(SvChange)) : List(SvChange) do
+  -- to the worker as it is. A cached chunk marked reverted ([marks] false)
+  -- is one unloaded equal to its generation: its saved copy is dropped.
+  pfn changes_of(w : Strata.World.World, marks : Strata.Store.Store(Bool), keys : List(Strata.Coord.Key), chs : List((Strata.Coord.Key, Strata.Chunk.Chunk, Int)), qs : List((Strata.Coord.Key, List(Strata.World.Op))), acc : List(SvChange)) : List(SvChange) do
     match keys do
       Nil -> List.reverse(acc)
       Cons(k, t) ->
@@ -789,10 +799,10 @@ mod Strata.Save do
           Cons((qk, ops), qt) -> if Kv.key_eq(qk, k) do (ops, qt) else (Nil, qs) end
         end
         match chs do
-          Nil -> changes_of(w, t, chs, qs2, Cons(change_without(w, k, mem), acc))
+          Nil -> changes_of(w, marks, t, chs, qs2, Cons(change_without(w, k, mem), acc))
           Cons((ck, c, gen), ct) ->
-            if Kv.key_eq(ck, k) do changes_of(w, t, ct, qs2, Cons(SvChange(k, if gen < 0 do 1 else 3 end, c, true, mem, gen), acc))
-            else changes_of(w, t, chs, qs2, Cons(change_without(w, k, mem), acc)) end
+            if Kv.key_eq(ck, k) do changes_of(w, marks, t, ct, qs2, Cons(SvChange(k, if gen < 0 do (if Sto.get(marks, k) do 1 else 4 end) else 3 end, c, true, mem, gen), acc))
+            else changes_of(w, marks, t, chs, qs2, Cons(change_without(w, k, mem), acc)) end
         end
     end
   end
@@ -815,7 +825,7 @@ mod Strata.Save do
         let (s1, old) = region_now(s, rk)
         let keys = Sto.keys(ks)
         let (chs, qs) = Wv.region_raw(w, keys)
-        let task = spawn_region(Rgn.path(s1.sv_dir, rk), old, changes_of(w, keys, chs, qs, Nil), secs, s1.sv_generator, s1.sv_header.sh_counter)
+        let task = spawn_region(Rgn.path(s1.sv_dir, rk), old, changes_of(w, ks, keys, chs, qs, Nil), secs, s1.sv_generator, s1.sv_header.sh_counter)
         { s1 with sv_dirty: Sto.remove(s1.sv_dirty, rk), sv_writes: Cons(SvWrite(rk, d, task), s1.sv_writes) }
     end
   end
@@ -838,7 +848,7 @@ mod Strata.Save do
       SvDirty(_, ks, secs) ->
         match dirty_of(s, rk) do
           SvDirty(_, ks2, secs2) ->
-            let keys = List.fold_left(Sto.keys(ks), ks2, fn (acc, k) -> Sto.put(acc, k, true))
+            let keys = Sto.fold(ks, ks2, fn (acc, k, v) -> if Sto.has(acc, k) do acc else Sto.put(acc, k, v) end)
             { s with sv_dirty: Sto.put(s.sv_dirty, rk, SvDirty(s.sv_time, keys, merge_sections(secs, secs2))) }
         end
     end
@@ -848,14 +858,15 @@ mod Strata.Save do
     let failed = { s with sv_failed: s.sv_failed + 1, sv_reason: "cannot write region " ++ region_name(rk) }
     match r do
       Err(_) -> dirty_again(failed, rk, d)
-      Ok(SvWrote(ok, g, hs)) ->
+      Ok(SvWrote(ok, g, hs, gone)) ->
         if !ok do dirty_again(failed, rk, d)
         else
           let owed = List.append(hs, s.sv_owed)
-          let e = s.sv_epoch + 1
-          let ep = Sto.put(s.sv_epochs, rk, e)
-          if holds_nothing(g) do cache_drop({ s with sv_present: Sto.remove(s.sv_present, rk), sv_owed: owed, sv_epoch: e, sv_epochs: ep }, rk)
-          else cache_put({ s with sv_present: Sto.put(s.sv_present, rk, true), sv_owed: owed, sv_epoch: e, sv_epochs: ep }, rk, g) end
+          let sf = { s with sv_forget: List.append(gone, s.sv_forget) }
+          let e = sf.sv_epoch + 1
+          let ep = Sto.put(sf.sv_epochs, rk, e)
+          if holds_nothing(g) do cache_drop({ sf with sv_present: Sto.remove(sf.sv_present, rk), sv_owed: owed, sv_epoch: e, sv_epochs: ep }, rk)
+          else cache_put({ sf with sv_present: Sto.put(sf.sv_present, rk, true), sv_owed: owed, sv_epoch: e, sv_epochs: ep }, rk, g) end
         end
     end
   end
@@ -936,11 +947,17 @@ mod Strata.Save do
   -- left for a later tick: its task may have read the region before the
   -- write, and the world's cached copy is what makes its result right.
   pfn release(s : SaveStore, w : Strata.World.World, st : Strata.Stream.Stream, n : Int) : (SaveStore, Strata.World.World) do
-    match s.sv_owed do
+    let (s1, w1) = match s.sv_forget do
       Nil -> (s, w)
+      gone ->
+        let (now, later) = release_split(gone, st, n, Nil, Nil)
+        ({ s with sv_forget: later }, Wv.forget_reverted(w, now))
+    end
+    match s1.sv_owed do
+      Nil -> (s1, w1)
       owed ->
         let (now, later) = release_split(owed, st, n, Nil, Nil)
-        ({ s with sv_owed: later }, Wv.release_written(w, now))
+        ({ s1 with sv_owed: later }, Wv.release_written(w1, now))
     end
   end
   pfn release_split(owed : List((Strata.Coord.Key, Int)), st : Strata.Stream.Stream, n : Int, now : List((Strata.Coord.Key, Int)), later : List((Strata.Coord.Key, Int))) : (List((Strata.Coord.Key, Int)), List((Strata.Coord.Key, Int))) do
@@ -1009,8 +1026,8 @@ mod Strata.Save do
   fn tick(s : SaveStore, st : Strata.Stream.Stream, dt : Float) : (SaveStore, Strata.Stream.Stream) do
     let step = if dt > 0.0 do dt else 0.0 end
     let (st0, got) = Strata.Stream.take_regions(st)
-    let (w1, keys) = Wv.take_changes(Strata.Stream.world(st0))
-    let s1 = collect(mark_dirty(adopt_regions({ s with sv_time: s.sv_time +. step }, got), keys), false)
+    let (w1, keys, back) = Wv.take_changes_marked(Strata.Stream.world(st0))
+    let s1 = collect(mark_dirty(mark_dirty(adopt_regions({ s with sv_time: s.sv_time +. step }, got), keys, true), back, false), false)
     let (s2, w2) = release(s1, w1, st0, release_budget())
     let s3 = slow_pass(start_regions(s2, w2, false), false)
     (s3, Strata.Stream.with_store(Strata.Stream.put_world(st0, w2), region_source(s3)))
@@ -1134,9 +1151,9 @@ mod Strata.Save do
       None -> s
     end
     let (st2, got) = Strata.Stream.take_regions(st1)
-    let (w1, keys) = Wv.take_changes(Strata.Stream.world(st2))
+    let (w1, keys, back) = Wv.take_changes_marked(Strata.Stream.world(st2))
     -- writes in flight first, so every dirty region may start; then the header and the players
-    let s1 = collect(mark_dirty(adopt_regions(s0, got), keys), true)
+    let s1 = collect(mark_dirty(mark_dirty(adopt_regions(s0, got), keys, true), back, false), true)
     let s2 = collect(slow_pass(start_regions(s1, w1, true), true), true)
     let (s3, w2) = release(s2, w1, st2, 1000000000)
     (s3, Strata.Stream.with_store(Strata.Stream.put_world(st2, w2), region_source(s3)), p1)
