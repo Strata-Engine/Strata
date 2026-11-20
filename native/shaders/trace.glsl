@@ -217,7 +217,11 @@ bool trace_steps(vec3 ro, vec3 rd, float tmax, bool stop_glass, int steps, float
     float fine = fine_until;
     // the nearest body voxel found so far, from the bodies listed in the chunks the ray has entered
     float bt = 1.0e30; uint bcls = 0u; int bface = 0;
+#ifdef STRATA_TRACE_WORLD_ONLY
+    const bool any_bodies = false;                // the blocks alone: collide.comp's particles meet no body or figure
+#else
     bool any_bodies = u.bodies.y > 0;
+#endif
     for (int i = 0; i < steps; i++) {
         if (t >= tmax || t >= bt) break;
         vec3 p = ro + d * t;
