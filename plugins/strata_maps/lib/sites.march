@@ -8,7 +8,11 @@
 -- at least so many tiles (the larger of the x and z distances) from every
 -- tile of the named sites, in the highest fifth of the candidates, inside
 -- the settled disc, or under open sky (24 voxels of room over the floor).
--- Rules go in order, each choosing by a hash among the tiles that meet it; a
+-- Every site stands on the mainland: of the groups of tiles joined by a
+-- mech's steps (12 voxels of room, 2 voxels of fluid at most, floors at most
+-- 2 height steps apart), the one with the most tiles on the thinner of its
+-- north and south edge rows, then the largest, so sites can reach each other. Rules go in order,
+-- each choosing by a hash among the tiles that meet it; a
 -- zone grows from its first tile through candidates. A rule that cannot be
 -- met is a report line, not a site. Tiles are the grid's (tx, tz).
 mod StrataMaps.Sites do
@@ -42,11 +46,73 @@ mod StrataMaps.Sites do
     match (d.md_settled, mid(g, t)) do ((cx, cz, r), (x, z)) -> r > 0 && (x - cx) * (x - cx) + (z - cz) * (z - cz) <= r * r end
   end
 
+  -- ── The ground a mech can cover ──
+  -- tiles joined by a mech's steps: standable with 12 voxels of room, at most 2 voxels of fluid, a floor at most 2 height steps up or down
+  pfn step_ok(g : StrataTactics.Grid.TileGrid, a : (Int, Int), b : (Int, Int)) : Bool do
+    match b do
+      (bx, bz) -> bx >= 0 && bz >= 0 && bx < StG.width(g) && bz < StG.depth(g) && StG.fits(g, b, 12) && StG.fluid(g, b) <= 2
+        && int_abs(StG.floor(g, b) - StG.floor(g, a)) <= 2 * (StG.settings_of(g)).gs_step
+    end
+  end
+  -- the largest group of joined tiles, as a mask (1 in it)
+  pfn mainland(d : StrataMaps.Data.MapData, g : StrataTactics.Grid.TileGrid) : NativeIntArr do
+    let w = StG.width(g)
+    let n = w * StG.depth(g)
+    match List.fold_left(List.range(0, n), (NativeArray.make_int(Math.max_int(1, n), 0), 0, (0, 0)), fn (st, i) -> label(d, g, w, st, i)) do
+      (labels, count, _) ->
+        -- per group: its size, its tiles on the north rows, on the south rows
+        let dp = StG.depth(g)
+        let size = List.fold_left(List.range(0, n), NativeArray.make_int(count + 1, 0), fn (a, i) -> bump(a, NativeArray.get_int(labels, i)))
+        let north = List.fold_left(List.range(0, n), NativeArray.make_int(count + 1, 0), fn (a, i) -> if i / w <= 1 do bump(a, NativeArray.get_int(labels, i)) else a end)
+        let south = List.fold_left(List.range(0, n), NativeArray.make_int(count + 1, 0), fn (a, i) -> if i / w >= dp - 2 do bump(a, NativeArray.get_int(labels, i)) else a end)
+        -- the best: reaching both edges first, then the largest
+        let best = List.fold_left(List.range(1, count + 1), 0, fn (b, id) -> if b == 0 || score(size, north, south, id) > score(size, north, south, b) do id else b end)
+        List.fold_left(List.range(0, n), NativeArray.make_int(Math.max_int(1, n), 0), fn (a, i) -> if best > 0 && NativeArray.get_int(labels, i) == best do NativeArray.set_int(a, i, 1) else a end)
+    end
+  end
+  -- labels, the next label, (the largest group's label, its size)
+  pfn label(d : StrataMaps.Data.MapData, g : StrataTactics.Grid.TileGrid, w : Int, st : (NativeIntArr, Int, (Int, Int)), i : Int) : (NativeIntArr, Int, (Int, Int)) do
+    match st do
+      (labels, next, (best, size)) ->
+        let t = (i % w, i / w)
+        -- grouped by where a mech can move (fords and shallows included), not by where a site may stand
+        if NativeArray.get_int(labels, i) != 0 || !StG.fits(g, t, 12) || StG.fluid(g, t) > 2 do st
+        else
+          let id = next + 1
+          match spread(g, w, id, [t], NativeArray.set_int(labels, i, id), 1) do
+            (l2, count) -> (l2, id, if count > size do (id, count) else (best, size) end)
+          end
+        end
+    end
+  end
+  -- most room on its thinner edge first, then the largest
+  pfn score(size : NativeIntArr, north : NativeIntArr, south : NativeIntArr, id : Int) : Int do
+    Math.min_int(NativeArray.get_int(north, id), NativeArray.get_int(south, id)) * 100000 + NativeArray.get_int(size, id)
+  end
+  pfn bump(a : NativeIntArr, id : Int) : NativeIntArr do if id <= 0 do a else NativeArray.set_int(a, id, NativeArray.get_int(a, id) + 1) end end
+  pfn spread(g : StrataTactics.Grid.TileGrid, w : Int, id : Int, now : List((Int, Int)), labels : NativeIntArr, count : Int) : (NativeIntArr, Int) do
+    match now do
+      Nil -> (labels, count)
+      Cons(t, rest) ->
+        match List.fold_left(List.range(0, 4), (labels, rest, count), fn (acc, k) -> grow_to(g, w, id, t, k, acc)) do
+          (l2, r2, c2) -> spread(g, w, id, r2, l2, c2)
+        end
+    end
+  end
+  pfn grow_to(g : StrataTactics.Grid.TileGrid, w : Int, id : Int, t : (Int, Int), k : Int, acc : (NativeIntArr, List((Int, Int)), Int)) : (NativeIntArr, List((Int, Int)), Int) do
+    match (acc, t) do
+      ((labels, rest, count), (tx, tz)) ->
+        let u = if k == 0 do (tx + 1, tz) else if k == 1 do (tx - 1, tz) else if k == 2 do (tx, tz + 1) else (tx, tz - 1) end end end
+        match u do (ux, uz) -> if step_ok(g, t, u) && NativeArray.get_int(labels, uz * w + ux) == 0 do (NativeArray.set_int(labels, uz * w + ux, id), Cons(u, rest), count + 1) else acc end end
+    end
+  end
+  pfn on_land(land : NativeIntArr, w : Int, t : (Int, Int)) : Bool do match t do (x, z) -> NativeArray.get_int(land, z * w + x) == 1 end end
+
   -- the tiles meeting a rule (all but the high band and the zone's growth)
-  pfn candidates(d : StrataMaps.Data.MapData, g : StrataTactics.Grid.TileGrid, sites : List(StrataMaps.Data.MapSite), r : SiteRule) : List((Int, Int)) do
+  pfn candidates(d : StrataMaps.Data.MapData, g : StrataTactics.Grid.TileGrid, sites : List(StrataMaps.Data.MapSite), r : SiteRule, land : NativeIntArr) : List((Int, Int)) do
     let w = StG.width(g)
     let all = List.map(List.range(0, w * StG.depth(g)), fn i -> (i % w, i / w))
-    let ok = List.filter(all, fn t -> sound(d, g, t) && edge_ok(g, r.sr_edge, t) && far_ok(sites, r.sr_far_from, t)
+    let ok = List.filter(all, fn t -> on_land(land, w, t) && sound(d, g, t) && edge_ok(g, r.sr_edge, t) && far_ok(sites, r.sr_far_from, t)
       && (!r.sr_in_settlement || settled_ok(d, g, t)) && (!r.sr_open_sky || StG.clearance(g, t) >= 24))
     if !r.sr_high do ok
     else
@@ -73,10 +139,10 @@ mod StrataMaps.Sites do
   end
 
   -- one site for rule r (the k-th of its count)
-  pfn one(d : StrataMaps.Data.MapData, g : StrataTactics.Grid.TileGrid, sites : List(StrataMaps.Data.MapSite), r : SiteRule, h : Int) : Option(StrataMaps.Data.MapSite) do
+  pfn one(d : StrataMaps.Data.MapData, g : StrataTactics.Grid.TileGrid, sites : List(StrataMaps.Data.MapSite), r : SiteRule, h : Int, land : NativeIntArr) : Option(StrataMaps.Data.MapSite) do
     if r.sr_kind == 2 do building(d, g, sites, r, h)
     else
-      let cs = candidates(d, g, sites, r)
+      let cs = candidates(d, g, sites, r, land)
       let n = List.length(cs)
       if n == 0 do None
       else if r.sr_kind == 1 do Some({ st_name: r.sr_name, st_tiles: [List.nth(cs, int_mod_euclid(h, n))] })
@@ -117,11 +183,12 @@ mod StrataMaps.Sites do
 
   doc "The sites of [rules], in order, on [grid] (read from a world of this map): each a zone, point or building meeting its rule, chosen by a hash; a rule that cannot be met is a report line."
   fn place(d : StrataMaps.Data.MapData, grid : StrataTactics.Grid.TileGrid, rules : List(SiteRule)) : StrataMaps.Data.MapData do
-    List.fold_left(List.range(0, List.length(rules)), d, fn (acc, ri) -> rule_sites(acc, grid, ri, List.nth(rules, ri)))
+    let land = mainland(d, grid)
+    List.fold_left(List.range(0, List.length(rules)), d, fn (acc, ri) -> rule_sites(acc, grid, ri, List.nth(rules, ri), land))
   end
-  pfn rule_sites(d : StrataMaps.Data.MapData, g : StrataTactics.Grid.TileGrid, ri : Int, r : SiteRule) : StrataMaps.Data.MapData do
+  pfn rule_sites(d : StrataMaps.Data.MapData, g : StrataTactics.Grid.TileGrid, ri : Int, r : SiteRule, land : NativeIntArr) : StrataMaps.Data.MapData do
     List.fold_left(List.range(0, Math.max_int(1, r.sr_count)), d, fn (acc, k) ->
-      match one(acc, g, acc.md_sites, r, Strata.Seed.mix(acc.md_settings.ms_seed, 8800 + ri * 17 + k)) do
+      match one(acc, g, acc.md_sites, r, Strata.Seed.mix(acc.md_settings.ms_seed, 8800 + ri * 17 + k), land) do
         Some(s) -> { acc with md_sites: List.append(acc.md_sites, [s]) }
         None -> StD.report(acc, "sites: could not place " ++ r.sr_name)
       end)
