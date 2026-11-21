@@ -1,0 +1,156 @@
+-- Check — is a map playable? (The slice's check: routes across the river.)
+--
+-- Over the playable square, a tile graph from the height field: a tile's
+-- height is its centre column's, its water depth the level less that height;
+-- a tile can be entered when its water is at most [wade] voxels deep, from a
+-- neighbour whose height is within [jump] voxels. The routes are the most
+-- tile-disjoint paths (no two share a tile) from the north edge to the south
+-- edge, counted up to 3 by augmenting paths over the tiles split in two
+-- (max-flow with a capacity of one a tile). A map passes with two routes.
+mod StrataMaps.Check do
+
+  alias StrataMaps.Settings as CkS
+  alias StrataMaps.Data as CkD
+  alias Strata.Heights as CkH
+
+  type CheckReport = { cr_ok : Bool, cr_routes : Int, cr_attempts : Int, cr_why : List(String) }
+
+  pfn tiles(d : StrataMaps.Data.MapData) : Int do d.md_settings.ms_tiles end
+  pfn centre(d : StrataMaps.Data.MapData, t : Int) : (Int, Int) do
+    let lo = CkD.corner(d.md_settings) + CkS.ring_voxels()
+    let n = tiles(d)
+    (lo + (t % n) * 8 + 4, lo + (t / n) * 8 + 4)
+  end
+  pfn height(d : StrataMaps.Data.MapData, t : Int) : Int do match centre(d, t) do (x, z) -> CkH.get(d.md_heights, x, z) end end
+  pfn open_tile(d : StrataMaps.Data.MapData, t : Int, wade : Int) : Bool do
+    match centre(d, t) do (x, z) -> let lv = CkD.water_at(d, x, z)
+      lv < 0 || lv - CkH.get(d.md_heights, x, z) <= wade end
+  end
+  -- the neighbour of tile t in direction k (0 +x, 1 -x, 2 +z, 3 -z), or -1
+  pfn nb(n : Int, t : Int, k : Int) : Int do
+    let x = t % n
+    let z = t / n
+    if k == 0 do (if x + 1 < n do t + 1 else -1 end) else if k == 1 do (if x > 0 do t - 1 else -1 end)
+    else if k == 2 do (if z + 1 < n do t + n else -1 end) else (if z > 0 do t - n else -1 end) end end end
+  end
+  pfn step_ok(d : StrataMaps.Data.MapData, a : Int, b : Int, jump : Int, wade : Int) : Bool do
+    b >= 0 && open_tile(d, b, wade) && int_abs(height(d, a) - height(d, b)) <= jump
+  end
+
+  -- flows: tile in->out (n2), out(t)->in(nb) by direction (4 n2), source->in (n2), out->sink (n2)
+  type CkFlow = CkFlow(NativeIntArr, NativeIntArr, NativeIntArr, NativeIntArr)
+
+  -- a BFS over residual states: state 2t (in) / 2t+1 (out), 2 n2 the source, 2 n2 + 1 the sink;
+  -- parent state and the move taken: 0 source->in, 1 in->out, 2 out->in back, 3 out->in(nb) by dir, 4 in(nb)->out back by dir, 5 out->sink
+  pfn bfs(d : StrataMaps.Data.MapData, fl : CkFlow, n : Int, jump : Int, wade : Int) : Option((NativeIntArr, NativeIntArr)) do
+    let n2 = n * n
+    let src = 2 * n2
+    let snk = 2 * n2 + 1
+    let par = NativeArray.make_int(2 * n2 + 2, -1)
+    let mv = NativeArray.make_int(2 * n2 + 2, -1)
+    let starts = List.filter(List.range(0, n), fn t -> open_tile(d, t, wade) && src_free(fl, t))
+    let par1 = List.fold_left(starts, par, fn (p, t) -> NativeArray.set_int(p, 2 * t, src))
+    let mv1 = List.fold_left(starts, mv, fn (m, t) -> NativeArray.set_int(m, 2 * t, 0))
+    match search(d, fl, n, jump, wade, List.map(starts, fn t -> 2 * t), Nil, par1, mv1) do
+      (p2, m2) -> if NativeArray.get_int(p2, snk) >= 0 do Some((p2, m2)) else None end
+    end
+  end
+
+  pfn src_free(fl : CkFlow, t : Int) : Bool do match fl do CkFlow(_, _, s, _) -> NativeArray.get_int(s, t) == 0 end end
+
+  pfn seen(par : NativeIntArr, s : Int) : Bool do NativeArray.get_int(par, s) != -1 end
+
+  pfn search(d : StrataMaps.Data.MapData, fl : CkFlow, n : Int, jump : Int, wade : Int, now : List(Int), next : List(Int), par : NativeIntArr, mv : NativeIntArr) : (NativeIntArr, NativeIntArr) do
+    match now do
+      Nil -> match next do Nil -> (par, mv) | _ -> search(d, fl, n, jump, wade, List.reverse(next), Nil, par, mv) end
+      Cons(s, rest) ->
+        if seen(par, 2 * n * n + 1) do (par, mv)
+        else
+          match expand(d, fl, n, jump, wade, s, par, mv) do
+            (p2, m2, found) -> search(d, fl, n, jump, wade, rest, List.append(found, next), p2, m2)
+          end
+        end
+    end
+  end
+
+  -- the residual moves from state s
+  pfn expand(d : StrataMaps.Data.MapData, fl : CkFlow, n : Int, jump : Int, wade : Int, s : Int, par : NativeIntArr, mv : NativeIntArr) : (NativeIntArr, NativeIntArr, List(Int)) do
+    match fl do
+      CkFlow(io, dir, _, sk) ->
+        let n2 = n * n
+        let t = s / 2
+        let cands = if s % 2 == 0 do
+            -- in(t): to out(t) if unused; back to out(prev) along a used edge into t
+            let fwd = if NativeArray.get_int(io, t) == 0 do [(2 * t + 1, 1)] else Nil end
+            let back = List.filter_map(List.range(0, 4), fn k -> back_move(n, dir, t, k))
+            List.append(fwd, back)
+          else
+            -- out(t): back to in(t) if used; to in(nb) along unused edges; to the sink from the south edge
+            let back = if NativeArray.get_int(io, t) == 1 do [(2 * t, 2)] else Nil end
+            let fwd = List.filter_map(List.range(0, 4), fn k -> fwd_move(d, n, dir, t, k, jump, wade))
+            let sink = if t / n == n - 1 && NativeArray.get_int(sk, t) == 0 do [(2 * n2 + 1, 5)] else Nil end
+            List.append(back, List.append(fwd, sink))
+          end
+        List.fold_left(cands, (par, mv, Nil), fn (acc, c) -> visit(acc, s, c))
+    end
+  end
+  pfn visit(acc : (NativeIntArr, NativeIntArr, List(Int)), from : Int, c : (Int, Int)) : (NativeIntArr, NativeIntArr, List(Int)) do
+    match (acc, c) do
+      ((p, m, found), (to, how)) -> if seen(p, to) do acc else (NativeArray.set_int(p, to, from), NativeArray.set_int(m, to, how), Cons(to, found)) end
+    end
+  end
+  pfn fwd_move(d : StrataMaps.Data.MapData, n : Int, dir : NativeIntArr, t : Int, k : Int, jump : Int, wade : Int) : Option((Int, Int)) do
+    let w = nb(n, t, k)
+    if w >= 0 && NativeArray.get_int(dir, t * 4 + k) == 0 && step_ok(d, t, w, jump, wade) do Some((2 * w, 10 + k)) else None end
+  end
+  -- into in(t) came an edge out(u) -> in(t) with u = nb(t, k), stored at u's direction toward t
+  pfn back_move(n : Int, dir : NativeIntArr, t : Int, k : Int) : Option((Int, Int)) do
+    let u = nb(n, t, k)
+    let kk = if k == 0 do 1 else if k == 1 do 0 else if k == 2 do 3 else 2 end end end
+    if u >= 0 && NativeArray.get_int(dir, u * 4 + kk) == 1 do Some((2 * u + 1, 20 + kk)) else None end
+  end
+
+  -- push one unit along the path found
+  pfn augment(fl : CkFlow, n : Int, par : NativeIntArr, mv : NativeIntArr, s : Int) : CkFlow do
+    let src = 2 * n * n
+    if s == src do fl
+    else
+      let p = NativeArray.get_int(par, s)
+      let how = NativeArray.get_int(mv, s)
+      match fl do
+        CkFlow(io, dir, sr, sk) ->
+          let fl2 = if how == 0 do CkFlow(io, dir, NativeArray.set_int(sr, s / 2, 1), sk)
+            else if how == 1 do CkFlow(NativeArray.set_int(io, s / 2, 1), dir, sr, sk)
+            else if how == 2 do CkFlow(NativeArray.set_int(io, s / 2, 0), dir, sr, sk)
+            else if how == 5 do CkFlow(io, dir, sr, NativeArray.set_int(sk, p / 2, 1))
+            else if how >= 20 do CkFlow(io, NativeArray.set_int(dir, (s / 2) * 4 + (how - 20), 0), sr, sk)
+            else CkFlow(io, NativeArray.set_int(dir, (p / 2) * 4 + (how - 10), 1), sr, sk) end end end end end
+          augment(fl2, n, par, mv, p)
+      end
+    end
+  end
+
+  pfn flow_go(d : StrataMaps.Data.MapData, fl : CkFlow, n : Int, jump : Int, wade : Int, k : Int) : Int do
+    if k >= 3 do k
+    else
+      match bfs(d, fl, n, jump, wade) do
+        None -> k
+        Some((par, mv)) -> flow_go(d, augment(fl, n, par, mv, 2 * n * n + 1), n, jump, wade, k + 1)
+      end
+    end
+  end
+
+  doc "The most tile-disjoint routes (up to 3) from the playable square's north edge to its south edge for a mover that climbs or drops [jump] voxels a tile and wades [wade] voxels of water."
+  fn routes(d : StrataMaps.Data.MapData, jump : Int, wade : Int) : Int do
+    let n = tiles(d)
+    let n2 = n * n
+    flow_go(d, CkFlow(NativeArray.make_int(n2, 0), NativeArray.make_int(4 * n2, 0), NativeArray.make_int(n2, 0), NativeArray.make_int(n2, 0)), n, jump, wade, 0)
+  end
+
+  doc "The check: passing with at least two routes."
+  fn run(d : StrataMaps.Data.MapData, jump : Int, wade : Int, attempts : Int) : CheckReport do
+    let r = routes(d, jump, wade)
+    let why = if r >= 2 do Nil else ["only " ++ int_to_string(r) ++ " separate route(s) between the north and south edges (2 needed)"] end
+    { cr_ok: r >= 2, cr_routes: r, cr_attempts: attempts, cr_why: why }
+  end
+end
