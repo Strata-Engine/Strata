@@ -11,3 +11,4 @@
 - Task 1: Strata.Trees in the library; build(species, seed, voxel, wood, leaves) draws in ids 1 and 2 and remaps at the end; base_offset is half. Golden images unchanged.
 - Task 2: Strata.Edit.stamp blits into a scratch chunk of a sentinel id (65535) per touched chunk and passes the written cells to set_many.
 - Task 4: Ruling: Roads.at answers (segment, metres along); the surface comes from segments. Ruling: adapt and chunk_paint take no water: a road column more than 2 voxels above its ground is a gap adapt leaves and chunk_paint decks (a dry gully gets a viaduct); bridges reports water crossings with the banks' height. Node heights are eased over 16 passes so no segment exceeds the grade.
+- Task 5: Ruling: Lots.blocks covers free land with greedy rectangles (a run in x grown in z), not maximal rectangles; a lot faces the side with the most road beside it.
