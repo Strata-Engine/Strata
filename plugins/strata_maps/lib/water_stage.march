@@ -1,0 +1,136 @@
+-- WaterStage — a river across the map, in level stretches.
+--
+-- For water above 0 the river runs from the west edge to the east edge of
+-- the whole square, following low ground: from the lowest column of the
+-- west edge's middle half it steps east, moving its centre at most one
+-- voxel north or south a step toward the lower side, then the line is
+-- smoothed. Its width is 6 + 56 x water voxels. Downstream (east) the water
+-- level only falls: the level at a column is the lower of the level before
+-- and the lower bank less 2. A stretch keeps one level until the level
+-- below it has fallen more than 2 voxels; there a weir (a wall one voxel
+-- thick across the river, up to the upper level) starts the next stretch.
+-- The bed is 4 + 6 x water voxels under the level, and the banks are eased
+-- down to the water. The river's last column (the east edge of the ring)
+-- holds sinks that take water leaving the map. Lakes come later.
+mod StrataMaps.WaterStage do
+
+  alias StrataMaps.Settings as WsS
+  alias StrataMaps.Data as WsD
+  alias Strata.Heights as WsH
+
+  -- the river's centre line, one z a column, west to east
+  pfn path(d : StrataMaps.Data.MapData, c : Int, n : Int) : NativeIntArr do
+    let g = d.md_heights
+    let mids = List.range(c + n / 4, c + 3 * n / 4)
+    let start = List.fold_left(mids, c + n / 2, fn (best, z) -> if WsH.get(g, c, z) < WsH.get(g, c, best) do z else best end)
+    let raw = List.fold_left(List.range(1, n), NativeArray.set_int(NativeArray.make_int(n, 0), 0, start), fn (a, i) -> step_path(a, g, c, n, i, d.md_settings.ms_seed))
+    smooth_path(raw, n, 15)
+  end
+  pfn step_path(a : NativeIntArr, g : Strata.Heights.HeightGrid, c : Int, n : Int, i : Int, seed : Int) : NativeIntArr do
+    let z = NativeArray.get_int(a, i - 1)
+    let x = c + i
+    let up = WsH.get(g, x, z - 1)
+    let here = WsH.get(g, x, z)
+    let down = WsH.get(g, x, z + 1)
+    let wander = int_mod_euclid(Strata.Seed.cell(seed, 31, i / 24, 0, 0), 3) - 1
+    let dz = if up < here && up <= down do -1 else if down < here do 1 else wander end end
+    let nz = Math.max_int(c + n / 8, Math.min_int(c + 7 * n / 8, z + dz))
+    NativeArray.set_int(a, i, nz)
+  end
+  pfn smooth_path(a : NativeIntArr, n : Int, r : Int) : NativeIntArr do
+    List.fold_left(List.range(0, n), NativeArray.make_int(n, 0), fn (out, i) ->
+      let lo = Math.max_int(0, i - r)
+      let hi = Math.min_int(n - 1, i + r)
+      let sum = List.fold_left(List.range(lo, hi + 1), 0, fn (s, k) -> s + NativeArray.get_int(a, k))
+      NativeArray.set_int(out, i, sum / (hi - lo + 1)))
+  end
+
+  -- the lower bank's height at column x: the lowest ground just outside the river
+  pfn bank(g : Strata.Heights.HeightGrid, x : Int, zc : Int, half : Int) : Int do
+    List.fold_left(List.range(half + 1, half + 4), 1000000, fn (m, k) -> Math.min_int(m, Math.min_int(WsH.get(g, x, zc - k), WsH.get(g, x, zc + k))))
+  end
+
+  doc "The river for the data's water knob: water levels, carved bed and banks, weirs and sinks; water 0 changes nothing."
+  fn run(d : StrataMaps.Data.MapData) : StrataMaps.Data.MapData do
+    let s = d.md_settings
+    let w = s.ms_knobs.mk_water
+    if w <= 0.0 do d
+    else
+      let c = WsD.corner(s)
+      let n = WsS.side_voxels(s)
+      let p = path(d, c, n)
+      let width = float_to_int(Math.round(6.0 +. 56.0 *. w))
+      let half = width / 2
+      let depth = float_to_int(Math.round(4.0 +. 6.0 *. w))
+      -- levels west to east, stretched, and where the weirs go
+      let (levels, weirs_at) = levels_of(d.md_heights, p, c, n, half)
+      let d1 = List.fold_left(List.range(0, n), d, fn (acc, i) -> carve(acc, c + i, NativeArray.get_int(p, i), half, NativeArray.get_int(levels, i), depth))
+      let weirs = List.flat_map(weirs_at, fn i -> List.map(List.range(0 - half, half + 1), fn k -> (c + i, NativeArray.get_int(p, i) + k)))
+      let sinks = List.map(List.range(0 - half, half + 1), fn k -> (c + n - 1, NativeArray.get_int(p, n - 1) + k))
+      { d1 with md_weirs: weirs, md_sinks: sinks }
+    end
+  end
+
+  -- each column's stretch level, and the columns where a weir starts a stretch
+  pfn levels_of(g : Strata.Heights.HeightGrid, p : NativeIntArr, c : Int, n : Int, half : Int) : (NativeIntArr, List(Int)) do
+    let first = bank(g, c, NativeArray.get_int(p, 0), half) - 2
+    let seed_acc = (NativeArray.set_int(NativeArray.make_int(n, 0), 0, first), first, first, Nil)
+    let walked = List.fold_left(List.range(1, n), seed_acc, fn (acc, i) -> level_step(acc, g, p, c, half, i))
+    match walked do
+      (lv, _, _, ws) -> (lv, List.reverse(ws))
+    end
+  end
+  pfn level_step(acc : (NativeIntArr, Int, Int, List(Int)), g : Strata.Heights.HeightGrid, p : NativeIntArr, c : Int, half : Int, i : Int) : (NativeIntArr, Int, Int, List(Int)) do
+    match acc do
+      (lv, running, stretch, ws) ->
+        let r2 = Math.min_int(running, bank(g, c + i, NativeArray.get_int(p, i), half) - 2)
+        if r2 < stretch - 2 do (NativeArray.set_int(lv, i, r2), r2, r2, Cons(i, ws))
+        else (NativeArray.set_int(lv, i, stretch), r2, stretch, ws) end
+    end
+  end
+
+  -- one column of river: water at the level, the bed under it, the banks eased down to it
+  pfn carve(d : StrataMaps.Data.MapData, x : Int, zc : Int, half : Int, level : Int, depth : Int) : StrataMaps.Data.MapData do
+    let wet = List.fold_left(List.range(0 - half, half + 1), d, fn (acc, k) ->
+      let g = WsH.set(acc.md_heights, x, zc + k, Math.min_int(WsH.get(acc.md_heights, x, zc + k), level - depth))
+      WsD.with_water({ acc with md_heights: g }, x, zc + k, level))
+    List.fold_left(List.range(1, 4), wet, fn (acc, k) -> ease_bank(acc, x, zc, half, k, level))
+  end
+  pfn ease_bank(d : StrataMaps.Data.MapData, x : Int, zc : Int, half : Int, k : Int, level : Int) : StrataMaps.Data.MapData do
+    let cap = level + k
+    let g1 = WsH.set(d.md_heights, x, zc - half - k, Math.min_int(WsH.get(d.md_heights, x, zc - half - k), Math.max_int(cap, level)))
+    let g2 = WsH.set(g1, x, zc + half + k, Math.min_int(WsH.get(g1, x, zc + half + k), Math.max_int(cap, level)))
+    { d with md_heights: g2 }
+  end
+
+  doc "For tests: at column x every water column's level is at or under the ground just outside the river and above its own bed."
+  fn banks_ok(d : StrataMaps.Data.MapData, x : Int) : Bool do
+    let c = WsD.corner(d.md_settings)
+    let n = WsS.side_voxels(d.md_settings)
+    let wet = List.filter(List.range(c, c + n), fn z -> WsD.water_at(d, x, z) >= 0)
+    match wet do
+      Nil -> true
+      _ ->
+        let lv = WsD.water_at(d, x, List.head(wet))
+        let zlo = List.head(wet) - 1
+        let zhi = List.last(wet) + 1
+        List.all(wet, fn z -> WsD.water_at(d, x, z) == lv && WsH.get(d.md_heights, x, z) < lv)
+          && WsH.get(d.md_heights, x, zlo) >= lv && WsH.get(d.md_heights, x, zhi) >= lv
+    end
+  end
+
+  doc "For tests: wherever the level changes from one column to the next, a weir stands at the second."
+  fn weirs_ok(d : StrataMaps.Data.MapData) : Bool do
+    let c = WsD.corner(d.md_settings)
+    let n = WsS.side_voxels(d.md_settings)
+    List.all(List.range(1, n), fn i -> weir_ok(d, c + i, c, n))
+  end
+  pfn weir_ok(d : StrataMaps.Data.MapData, x : Int, c : Int, n : Int) : Bool do
+    let here = List.filter(List.range(c, c + n), fn z -> WsD.water_at(d, x, z) >= 0)
+    let before = List.filter(List.range(c, c + n), fn z -> WsD.water_at(d, x - 1, z) >= 0)
+    match (here, before) do
+      (Cons(z1, _), Cons(z0, _)) -> WsD.water_at(d, x, z1) == WsD.water_at(d, x - 1, z0) || List.any(d.md_weirs, fn w -> match w do (wx, _) -> wx == x end)
+      _ -> true
+    end
+  end
+end
