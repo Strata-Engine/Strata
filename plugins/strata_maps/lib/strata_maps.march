@@ -1,28 +1,155 @@
 -- StrataMaps — bounded tactical maps from layered settings, as a plugin
 -- (docs/plugins.md, docs/2026-11-20-map-generation-design.md): a seed and
--- knobs become a height field, water, and (later) settlements, vegetation,
--- hazards and ruin; the result is a Strata.Terrain.Gen the stream builds,
--- checked for play with strata_tactics.
+-- knobs become a height field, water, a settlement of roads, lots and
+-- buildings, lava, set pieces, trees and ruin; the result is a
+-- Strata.Terrain.Gen the stream builds, requests the game applies once it
+-- has (the ruin), objective sites, and a check for play with
+-- strata_tactics.
 mod StrataMaps do
 
   doc "The plugin's version."
-  fn version() : String do "0.1.0" end
+  fn version() : String do "0.2.0" end
 
-  pfn attempt(s : StrataMaps.Settings.MapSettings, b : StrataMaps.Settings.MapBlocks, seed : Int) : StrataMaps.Data.MapData do
+  -- ── The ground only (terrain and water) ─────────────────────────────────
+  pfn ground_attempt(s : StrataMaps.Settings.MapSettings, b : StrataMaps.Settings.MapBlocks, seed : Int) : StrataMaps.Data.MapData do
     StrataMaps.WaterStage.run(StrataMaps.TerrainStage.run(StrataMaps.Data.empty({ s with ms_seed: seed }, b)))
   end
-
-  pfn try_go(s : StrataMaps.Settings.MapSettings, b : StrataMaps.Settings.MapBlocks, jump : Int, wade : Int, k : Int, best : Option((StrataMaps.Data.MapData, StrataMaps.Check.CheckReport))) : (StrataMaps.Data.MapData, StrataMaps.Check.CheckReport) do
-    let d = attempt(s, b, s.ms_seed + k)
-    let r = StrataMaps.Check.run(d, jump, wade, k + 1)
-    let better = match best do None -> Some((d, r)) | Some((bd, br)) -> if r.cr_routes > br.cr_routes do Some((d, r)) else best end end
+  pfn ground_go(s : StrataMaps.Settings.MapSettings, b : StrataMaps.Settings.MapBlocks, jump : Int, wade : Int, k : Int, best : Option((StrataMaps.Data.MapData, StrataMaps.Check.CheckReport))) : (StrataMaps.Data.MapData, StrataMaps.Check.CheckReport) do
+    let d = ground_attempt(s, b, s.ms_seed + k)
+    let r = StrataMaps.Check.ground(d, jump, wade, k + 1)
+    let better = match best do None -> Some((d, r)) | Some((_, br)) -> if r.cr_routes > br.cr_routes do Some((d, r)) else best end end
     if r.cr_ok do (d, r)
     else if k + 1 >= 8 do match better do Some((bd, br)) -> (bd, { br with cr_attempts: 8 }) | None -> (d, r) end
-    else try_go(s, b, jump, wade, k + 1, better) end end
+    else ground_go(s, b, jump, wade, k + 1, better) end end
   end
 
-  doc "A map from [s] with the game's blocks [b], checked for a mover that climbs [jump] voxels a tile and wades [wade]: the terrain generator for the stream, the map data, and the check's report. Up to 8 attempts from the seed, the seed + 1, ...; the first that passes, else the one with the most routes, reported as failing with its reasons. (The slice: terrain and water.)"
-  fn generate(s : StrataMaps.Settings.MapSettings, b : StrataMaps.Settings.MapBlocks, jump : Int, wade : Int) : (Strata.Terrain.Gen, StrataMaps.Data.MapData, StrataMaps.Check.CheckReport) do
-    match try_go(s, b, jump, wade, 0, None) do (d, r) -> (StrataMaps.WorldGen.gen(d), d, r) end
+  doc "The ground alone (terrain and water) from [s] with the game's blocks [b], checked for a mover that climbs [jump] voxels a tile and wades [wade]: the generator, the data, the report. Up to 8 attempts; the first that passes, else the one with the most routes."
+  fn generate_ground(s : StrataMaps.Settings.MapSettings, b : StrataMaps.Settings.MapBlocks, jump : Int, wade : Int) : (Strata.Terrain.Gen, StrataMaps.Data.MapData, StrataMaps.Check.CheckReport) do
+    match ground_go(s, b, jump, wade, 0, None) do (d, r) -> (StrataMaps.WorldGen.gen(d), d, r) end
+  end
+
+  -- ── The whole map ────────────────────────────────────────────────────────
+  doc "The tactical grid over the playable square of a world [w] built from [d]: tiles of 8 voxels, the map's height step, columns scanned from under the lowest ground to over the highest roof, units of 8 voxels at least, the kind of a tile the block id under it."
+  fn grid(d : StrataMaps.Data.MapData, w : Strata.World.World) : StrataTactics.Grid.TileGrid do
+    match (StrataMaps.Data.playable(d), StrataMaps.WorldGen.bounds(d)) do
+      ((px, pz, n), (lo, hi)) ->
+        let top = List.fold_left(d.md_buildings, hi, fn (m, b) -> match b.mbd_origin do (_, y, _) -> Math.max_int(m, y + Strata.Template.t_sy(b.mbd_template)) end)
+        StrataTactics.Grid.build(w, StrataTactics.Grid.settings(px, pz, n / 8, n / 8, 8, d.md_settings.ms_step, lo - 8, top + 24, 8, fn id -> id))
+    end
+  end
+
+  -- the stages up to the generator: terrain, water, roads and lots, buildings, lava, set pieces, trees
+  pfn stages(s : StrataMaps.Settings.MapSettings, b : StrataMaps.Settings.MapBlocks, styles : List(Strata.Building.BldStyle), pieces : List(StrataMaps.PieceStage.MapPiece), trees : List(Strata.Template.Template)) : StrataMaps.Data.MapData do
+    let d1 = StrataMaps.SettleStage.run(StrataMaps.WaterStage.run(StrataMaps.TerrainStage.run(StrataMaps.Data.empty(s, b))))
+    StrataMaps.GreenStage.run(StrataMaps.PieceStage.run(StrataMaps.HazardStage.run(StrataMaps.BuildStage.run(d1, styles)), pieces), trees)
+  end
+
+  -- one attempt: the generator, the ruin's requests, the data with its sites, the report
+  pfn attempt(s : StrataMaps.Settings.MapSettings, b : StrataMaps.Settings.MapBlocks, reg : Strata.Blocks.Registry, styles : List(Strata.Building.BldStyle), pieces : List(StrataMaps.PieceStage.MapPiece), trees : List(Strata.Template.Template), rules : List(StrataMaps.Sites.SiteRule), mover : StrataTactics.Reach.Mover, k : Int) : (Strata.Terrain.Gen, List(Strata.Plugin.Request), StrataMaps.Data.MapData, StrataMaps.Check.CheckReport) do
+    let d = stages({ s with ms_seed: s.ms_seed + k }, b, styles, pieces, trees)
+    let gen = StrataMaps.WorldGen.gen(d)
+    if !StrataMaps.Check.early(d, mover) do
+      (gen, Nil, d, { cr_ok: false, cr_routes: 0, cr_unreached: Nil, cr_cover: 0.0, cr_sight: 0, cr_attempts: k + 1, cr_why: ["no route across the ground before buildings (early check)"] })
+    else
+      let w0 = StrataMaps.RuinStage.scratch(d, reg)
+      match StrataMaps.RuinStage.run(d, w0) do
+        (reqs, d2) -> match Strata.Plugin.apply(w0, reqs) do
+          (w, _, _) ->
+            let g = grid(d2, w)
+            let d3 = StrataMaps.Sites.place(d2, g, rules)
+            (gen, reqs, d3, { StrataMaps.Check.run(w, g, d3, mover) with cr_attempts: k + 1 })
+        end
+      end
+    end
+  end
+  -- which report is better: passing, then more routes, then fewer unreached
+  pfn better(a : StrataMaps.Check.CheckReport, b : StrataMaps.Check.CheckReport) : Bool do
+    (a.cr_ok && !b.cr_ok) || a.cr_routes > b.cr_routes || (a.cr_routes == b.cr_routes && List.length(a.cr_unreached) < List.length(b.cr_unreached))
+  end
+  pfn gen_go(s : StrataMaps.Settings.MapSettings, b : StrataMaps.Settings.MapBlocks, reg : Strata.Blocks.Registry, styles : List(Strata.Building.BldStyle), pieces : List(StrataMaps.PieceStage.MapPiece), trees : List(Strata.Template.Template), rules : List(StrataMaps.Sites.SiteRule), mover : StrataTactics.Reach.Mover, k : Int, best : Option((Strata.Terrain.Gen, List(Strata.Plugin.Request), StrataMaps.Data.MapData, StrataMaps.Check.CheckReport))) : (Strata.Terrain.Gen, List(Strata.Plugin.Request), StrataMaps.Data.MapData, StrataMaps.Check.CheckReport) do
+    let here = attempt(s, b, reg, styles, pieces, trees, rules, mover, k)
+    match here do
+      (_, _, _, r) ->
+        let kept = match best do None -> here | Some(bt) -> match bt do (_, _, _, br) -> if better(r, br) do here else bt end end end
+        if r.cr_ok do here
+        else if k + 1 >= 8 do match kept do (g, q, d, kr) -> (g, q, d, { kr with cr_attempts: 8 }) end
+        else gen_go(s, b, reg, styles, pieces, trees, rules, mover, k + 1, Some(kept)) end end
+    end
+  end
+
+  doc "A map from [s] with the game's blocks [b] and registry [reg], its building styles, set pieces, tree templates and site rules, checked for [mover]: the generator for the stream, the ruin's requests (to apply once the stream has built the world), the data, and the check's report. Up to 8 attempts (the seed, the seed + 1, ...), each: the stages, an early check over the ground, the generator, a scratch world, the ruin, the grid, the sites, the check; the first that passes, else the best (most routes, then fewest unreached) with its reasons."
+  fn generate(s : StrataMaps.Settings.MapSettings, b : StrataMaps.Settings.MapBlocks, reg : Strata.Blocks.Registry, styles : List(Strata.Building.BldStyle), pieces : List(StrataMaps.PieceStage.MapPiece), trees : List(Strata.Template.Template), rules : List(StrataMaps.Sites.SiteRule), mover : StrataTactics.Reach.Mover) : (Strata.Terrain.Gen, List(Strata.Plugin.Request), StrataMaps.Data.MapData, StrataMaps.Check.CheckReport) do
+    gen_go(s, b, reg, styles, pieces, trees, rules, mover, 0, None)
+  end
+
+  -- ── Archetypes from text ─────────────────────────────────────────────────
+  -- a section being read: name, base, style, pattern (-1 unset), knob ranges
+  type MapArch = MapArch(String, Int, Int, Int, List((String, Float, Float)))
+
+  pfn named(v : String, names : List(String)) : Option(Int) do
+    match List.find_index(names, fn n -> n == v) do
+      Some(i) -> Some(i)
+      None -> match String.to_int(v) do Ok(i) -> Some(i) | Err(_) -> None end
+    end
+  end
+  pfn knob_names() : List(String) do ["relief", "water", "settlement", "density", "vegetation", "hazard", "ruin"] end
+  pfn to_arch(a : MapArch) : StrataMaps.Settings.Archetype do
+    match a do
+      MapArch(name, base, style, pattern, ranges) ->
+        { ar_name: name, ar_ranges: ranges, ar_fixed: fn s -> fixed(s, base, style, pattern) }
+    end
+  end
+  pfn fixed(s : StrataMaps.Settings.MapSettings, base : Int, style : Int, pattern : Int) : StrataMaps.Settings.MapSettings do
+    let s1 = if base >= 0 do { s with ms_base: base } else s end
+    let s2 = if style >= 0 do { s1 with ms_style: style } else s1 end
+    if pattern >= 0 do { s2 with ms_pattern: pattern } else s2 end
+  end
+  -- one line into the state (done archetypes, the section being read), or why not
+  pfn line(st : (List(MapArch), Option(MapArch)), no : Int, raw : String) : Result((List(MapArch), Option(MapArch)), String) do
+    let t = String.trim(raw)
+    match st do
+      (done, cur) ->
+        if String.is_empty(t) || String.starts_with(t, "#") do Ok(st)
+        else if String.starts_with(t, "[") && String.ends_with(t, "]") do
+          let name = String.trim(String.slice_bytes(t, 1, String.byte_size(t) - 2))
+          Ok((match cur do Some(a) -> List.append(done, [a]) | None -> done end, Some(MapArch(name, -1, -1, -1, Nil))))
+        else
+          match (cur, String.split_first(t, "=")) do
+            (None, _) -> Err("line " ++ int_to_string(no) ++ ": a setting before any [archetype] heading")
+            (_, None) -> Err("line " ++ int_to_string(no) ++ ": expected key = value")
+            (Some(MapArch(name, base, style, pattern, ranges)), Some((k0, v0))) ->
+              let k = String.trim(k0)
+              let v = String.trim(v0)
+              if k == "base" do match named(v, ["plains", "rolling", "highlands", "canyon", "plateau"]) do
+                Some(i) -> Ok((done, Some(MapArch(name, i, style, pattern, ranges))))
+                None -> Err("line " ++ int_to_string(no) ++ ": unknown base " ++ v) end
+              else if k == "style" do match String.to_int(v) do
+                Ok(i) -> Ok((done, Some(MapArch(name, base, i, pattern, ranges))))
+                Err(_) -> Err("line " ++ int_to_string(no) ++ ": style wants a number") end
+              else if k == "pattern" do match named(v, ["grid", "arterial", "broken"]) do
+                Some(i) -> Ok((done, Some(MapArch(name, base, style, i, ranges))))
+                None -> Err("line " ++ int_to_string(no) ++ ": unknown pattern " ++ v) end
+              else if List.member(knob_names(), k) do match range(v) do
+                Some((lo, hi)) -> Ok((done, Some(MapArch(name, base, style, pattern, List.append(ranges, [(k, lo, hi)])))))
+                None -> Err("line " ++ int_to_string(no) ++ ": " ++ k ++ " wants two numbers, lo hi") end
+              else Err("line " ++ int_to_string(no) ++ ": unknown setting " ++ k) end end end end
+          end
+        end end
+    end
+  end
+  pfn range(v : String) : Option((Float, Float)) do
+    match List.filter(String.split(v, " "), fn p -> !String.is_empty(p)) do
+      Cons(a, Cons(b, Nil)) -> match (String.to_float(a), String.to_float(b)) do (Ok(lo), Ok(hi)) -> Some((lo, hi)) | _ -> None end
+      _ -> None
+    end
+  end
+
+  doc "Archetypes from text: `[name]` headings, then lines of `knob = lo hi` (relief, water, settlement, density, vegetation, hazard, ruin), `base =` (plains, rolling, highlands, canyon, plateau, or a number), `style =` (a number, the game's style index) and `pattern =` (grid, arterial, broken, or a number); blank lines and lines starting # are skipped. A bad line is an error naming it."
+  fn load_archetypes(text : String) : Result(List(StrataMaps.Settings.Archetype), String) do
+    let lines = String.split(text, "\n")
+    match List.fold_left(List.range(0, List.length(lines)), Ok((Nil, None)), fn (acc, i) -> match acc do Ok(st) -> line(st, i + 1, List.nth(lines, i)) | Err(e) -> Err(e) end) do
+      Ok((done, cur)) -> Ok(List.map(match cur do Some(a) -> List.append(done, [a]) | None -> done end, fn a -> to_arch(a)))
+      Err(e) -> Err(e)
+    end
   end
 end

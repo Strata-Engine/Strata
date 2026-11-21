@@ -13,7 +13,7 @@ mod StrataMaps.Check do
   alias StrataMaps.Data as CkD
   alias Strata.Heights as CkH
 
-  type CheckReport = { cr_ok : Bool, cr_routes : Int, cr_attempts : Int, cr_why : List(String) }
+  type CheckReport = { cr_ok : Bool, cr_routes : Int, cr_unreached : List(String), cr_cover : Float, cr_sight : Int, cr_attempts : Int, cr_why : List(String) }
 
   pfn tiles(d : StrataMaps.Data.MapData) : Int do d.md_settings.ms_tiles end
   pfn centre(d : StrataMaps.Data.MapData, t : Int) : (Int, Int) do
@@ -147,10 +147,145 @@ mod StrataMaps.Check do
     flow_go(d, CkFlow(NativeArray.make_int(n2, 0), NativeArray.make_int(4 * n2, 0), NativeArray.make_int(n2, 0), NativeArray.make_int(n2, 0)), n, jump, wade, 0)
   end
 
-  doc "The check: passing with at least two routes."
-  fn run(d : StrataMaps.Data.MapData, jump : Int, wade : Int, attempts : Int) : CheckReport do
+  doc "The ground check (terrain and water only): passing with at least two routes between the north and south edges."
+  fn ground(d : StrataMaps.Data.MapData, jump : Int, wade : Int, attempts : Int) : CheckReport do
     let r = routes(d, jump, wade)
     let why = if r >= 2 do Nil else ["only " ++ int_to_string(r) ++ " separate route(s) between the north and south edges (2 needed)"] end
-    { cr_ok: r >= 2, cr_routes: r, cr_attempts: attempts, cr_why: why }
+    { cr_ok: r >= 2, cr_routes: r, cr_unreached: Nil, cr_cover: 0.0, cr_sight: 0, cr_attempts: attempts, cr_why: why }
+  end
+
+  doc "The early check, before buildings: the north and south edges joined over the height field for the mover (its climb and drop in height steps), wading 2 voxels."
+  fn early(d : StrataMaps.Data.MapData, mover : StrataTactics.Reach.Mover) : Bool do
+    routes(d, Math.min_int(mover.mv_jump, mover.mv_drop) * d.md_settings.ms_step, 2) >= 1
+  end
+
+  -- ── The tactical check on the built world ──────────────────────────────
+  -- A mover steps to a neighbouring tile that is standable, has room for its
+  -- height, holds at most 2 voxels of fluid (it wades that much), and whose
+  -- floor rises at most its climb or falls at most its drop (height steps).
+
+  pfn ok_step(g : StrataTactics.Grid.TileGrid, m : StrataTactics.Reach.Mover, a : (Int, Int), b : (Int, Int)) : Bool do
+    let st = (StrataTactics.Grid.settings_of(g)).gs_step
+    match b do
+      (bx, bz) ->
+        if bx < 0 || bz < 0 || bx >= StrataTactics.Grid.width(g) || bz >= StrataTactics.Grid.depth(g) do false
+        else
+          let dh = StrataTactics.Grid.floor(g, b) - StrataTactics.Grid.floor(g, a)
+          StrataTactics.Grid.fits(g, b, m.mv_height) && StrataTactics.Grid.fluid(g, b) <= 2 && dh <= m.mv_jump * st && 0 - dh <= m.mv_drop * st
+        end
+    end
+  end
+  pfn step_to(t : (Int, Int), k : Int) : (Int, Int) do match t do (x, z) -> if k == 0 do (x + 1, z) else if k == 1 do (x - 1, z) else if k == 2 do (x, z + 1) else (x, z - 1) end end end end end
+  pfn back(k : Int) : Int do if k == 0 do 1 else if k == 1 do 0 else if k == 2 do 3 else 2 end end end end
+
+  -- tiles reached from [from] by steps
+  pfn reach(g : StrataTactics.Grid.TileGrid, m : StrataTactics.Reach.Mover, from : List((Int, Int))) : NativeIntArr do
+    let w = StrataTactics.Grid.width(g)
+    let seen = List.fold_left(from, NativeArray.make_int(Math.max_int(1, w * StrataTactics.Grid.depth(g)), 0), fn (a, t) -> match t do (x, z) -> NativeArray.set_int(a, z * w + x, 1) end)
+    flood(g, m, w, from, Nil, seen)
+  end
+  pfn flood(g : StrataTactics.Grid.TileGrid, m : StrataTactics.Reach.Mover, w : Int, now : List((Int, Int)), next : List((Int, Int)), seen : NativeIntArr) : NativeIntArr do
+    match now do
+      Nil -> match next do Nil -> seen | _ -> flood(g, m, w, next, Nil, seen) end
+      Cons(t, rest) ->
+        match List.fold_left(List.range(0, 4), (seen, next), fn (acc, k) -> visit_tile(g, m, w, t, k, acc)) do
+          (s2, n2) -> flood(g, m, w, rest, n2, s2)
+        end
+    end
+  end
+  pfn visit_tile(g : StrataTactics.Grid.TileGrid, m : StrataTactics.Reach.Mover, w : Int, t : (Int, Int), k : Int, acc : (NativeIntArr, List((Int, Int)))) : (NativeIntArr, List((Int, Int))) do
+    match acc do
+      (seen, next) ->
+        let u = step_to(t, k)
+        match u do (ux, uz) -> if ok_step(g, m, t, u) && NativeArray.get_int(seen, uz * w + ux) == 0 do (NativeArray.set_int(seen, uz * w + ux, 1), Cons(u, next)) else acc end end
+    end
+  end
+
+  -- edge-disjoint paths from [a] to [b] (up to 3), by augmenting paths over the tile graph; flow per arc (tile, direction) 0 or 1
+  pfn paths(g : StrataTactics.Grid.TileGrid, m : StrataTactics.Reach.Mover, a : List((Int, Int)), b : List((Int, Int))) : Int do
+    let w = StrataTactics.Grid.width(g)
+    let n = w * StrataTactics.Grid.depth(g)
+    let goal = List.fold_left(b, NativeArray.make_int(Math.max_int(1, n), 0), fn (arr, t) -> match t do (x, z) -> NativeArray.set_int(arr, z * w + x, 1) end)
+    paths_go(g, m, a, goal, w, n, NativeArray.make_int(Math.max_int(1, n * 4), 0), 0)
+  end
+  pfn paths_go(g : StrataTactics.Grid.TileGrid, m : StrataTactics.Reach.Mover, a : List((Int, Int)), goal : NativeIntArr, w : Int, n : Int, flow : NativeIntArr, k : Int) : Int do
+    if k >= 3 do k
+    else
+      -- parent tile index and the direction stepped, per tile; -1 unseen, -2 a start
+      let par0 = List.fold_left(a, NativeArray.make_int(Math.max_int(1, n), -1), fn (arr, t) -> match t do (x, z) -> NativeArray.set_int(arr, z * w + x, -2) end)
+      match augment_search(g, m, goal, w, flow, a, Nil, par0, NativeArray.make_int(Math.max_int(1, n), 0)) do
+        None -> k
+        Some((end_t, par, dirs)) -> paths_go(g, m, a, goal, w, n, push_flow(flow, par, dirs, w, end_t), k + 1)
+      end
+    end
+  end
+  pfn augment_search(g : StrataTactics.Grid.TileGrid, m : StrataTactics.Reach.Mover, goal : NativeIntArr, w : Int, flow : NativeIntArr, now : List((Int, Int)), next : List((Int, Int)), par : NativeIntArr, dirs : NativeIntArr) : Option(((Int, Int), NativeIntArr, NativeIntArr)) do
+    match now do
+      Nil -> match next do Nil -> None | _ -> augment_search(g, m, goal, w, flow, next, Nil, par, dirs) end
+      Cons(t, rest) ->
+        match t do
+          (tx, tz) ->
+            if NativeArray.get_int(goal, tz * w + tx) == 1 do Some((t, par, dirs))
+            else
+              match List.fold_left(List.range(0, 4), (par, dirs, next), fn (acc, k) -> arc(g, m, w, flow, t, k, acc)) do
+                (p2, d2, n2) -> augment_search(g, m, goal, w, flow, rest, n2, p2, d2)
+              end
+            end
+        end
+    end
+  end
+  -- the arc from t in direction k, if the residual graph has it: cancelling flow coming back, or a step with no flow yet
+  pfn arc(g : StrataTactics.Grid.TileGrid, m : StrataTactics.Reach.Mover, w : Int, flow : NativeIntArr, t : (Int, Int), k : Int, acc : (NativeIntArr, NativeIntArr, List((Int, Int)))) : (NativeIntArr, NativeIntArr, List((Int, Int))) do
+    match (acc, t, step_to(t, k)) do
+      ((par, dirs, next), (tx, tz), (ux, uz)) ->
+        if ux < 0 || uz < 0 || ux >= StrataTactics.Grid.width(g) || uz >= StrataTactics.Grid.depth(g) do acc
+        else
+          let ti = tz * w + tx
+          let ui = uz * w + ux
+          let cancel = NativeArray.get_int(flow, ui * 4 + back(k)) == 1
+          let fresh = NativeArray.get_int(flow, ti * 4 + k) == 0 && ok_step(g, m, t, (ux, uz))
+          if NativeArray.get_int(par, ui) == -1 && (cancel || fresh) do (NativeArray.set_int(par, ui, ti), NativeArray.set_int(dirs, ui, k), Cons((ux, uz), next)) else acc end
+        end
+    end
+  end
+  pfn push_flow(flow : NativeIntArr, par : NativeIntArr, dirs : NativeIntArr, w : Int, t : (Int, Int)) : NativeIntArr do
+    match t do
+      (tx, tz) ->
+        let ui = tz * w + tx
+        let pi = NativeArray.get_int(par, ui)
+        if pi < 0 do flow
+        else
+          let k = NativeArray.get_int(dirs, ui)
+          let f2 = if NativeArray.get_int(flow, ui * 4 + back(k)) == 1 do NativeArray.set_int(flow, ui * 4 + back(k), 0) else NativeArray.set_int(flow, pi * 4 + k, 1) end
+          push_flow(f2, par, dirs, w, (pi % w, pi / w))
+        end
+    end
+  end
+
+  doc "The tactical check of a built world [w] (after the ruin pass) on its grid: routes are edge-disjoint tile paths (up to 3) between the first two sites (the north and south rows when there are fewer); every site must be reached from both of those; cover is the share of standable tiles with half or full cover on some edge for a unit the mover's height; sight counts clear lines between up to 4 tiles of each of the two. Passing: 2 routes or more, nothing unreached, cover between 0.08 and 0.6 (sight is reported, not required)."
+  fn run(w : Strata.World.World, g : StrataTactics.Grid.TileGrid, d : StrataMaps.Data.MapData, mover : StrataTactics.Reach.Mover) : CheckReport do
+    let gw = StrataTactics.Grid.width(g)
+    let gd = StrataTactics.Grid.depth(g)
+    let all = List.map(List.range(0, gw * gd), fn i -> (i % gw, i / gw))
+    let (na, a, nb, b) = match d.md_sites do
+      Cons(s1, Cons(s2, _)) -> (s1.st_name, s1.st_tiles, s2.st_name, s2.st_tiles)
+      _ -> ("the north edge", List.filter(all, fn t -> match t do (_, z) -> z == 0 && StrataTactics.Grid.standable(g, t) end), "the south edge", List.filter(all, fn t -> match t do (_, z) -> z == gd - 1 && StrataTactics.Grid.standable(g, t) end))
+    end
+    let r = if List.is_empty(a) || List.is_empty(b) do 0 else paths(g, mover, a, b) end
+    let from_a = reach(g, mover, a)
+    let from_b = reach(g, mover, b)
+    let reached = fn ts -> List.any(ts, fn t -> match t do (x, z) -> NativeArray.get_int(from_a, z * gw + x) == 1 end) && List.any(ts, fn t -> match t do (x, z) -> NativeArray.get_int(from_b, z * gw + x) == 1 end)
+    let unreached = List.filter_map(d.md_sites, fn s -> if reached(s.st_tiles) do None else Some(s.st_name) end)
+    let standing = List.filter(all, fn t -> StrataTactics.Grid.standable(g, t))
+    let covered = List.filter(standing, fn t -> List.any(List.range(0, 4), fn k -> StrataTactics.Sight.edge(w, g, t, k, mover.mv_height, StrataTactics.Sight.cover_settings()) >= StrataTactics.Sight.half()))
+    let cover = if List.is_empty(standing) do 0.0 else int_to_float(List.length(covered)) /. int_to_float(List.length(standing)) end
+    let eye = mover.mv_height * 3 / 4
+    let pairs = List.flat_map(List.take(a, 4), fn ta -> List.map(List.take(b, 4), fn tb -> (ta, tb)))
+    let sight = List.length(List.filter(pairs, fn p -> match p do (ta, tb) -> StrataTactics.Sight.line(w, g, ta, eye, tb, eye) == StrataTactics.Sight.clear() end))
+    let why0 = if r >= 2 do Nil else ["only " ++ int_to_string(r) ++ " separate route(s) between " ++ na ++ " and " ++ nb ++ " (2 needed)"] end
+    let why1 = if List.is_empty(unreached) do why0 else List.append(why0, [String.join(unreached, ", ") ++ " not reached from both " ++ na ++ " and " ++ nb]) end
+    let why2 = if cover >= 0.08 && cover <= 0.6 do why1 else List.append(why1, ["cover on " ++ int_to_string(float_to_int(cover *. 100.0)) ++ "% of standable tiles (8% to 60% wanted)"]) end
+    let why3 = if sight >= 1 do why2 else List.append(why2, ["no clear line between " ++ na ++ " and " ++ nb]) end
+    { cr_ok: r >= 2 && List.is_empty(unreached) && cover >= 0.08 && cover <= 0.6, cr_routes: r, cr_unreached: unreached, cr_cover: cover, cr_sight: sight, cr_attempts: 1, cr_why: why3 }
   end
 end
