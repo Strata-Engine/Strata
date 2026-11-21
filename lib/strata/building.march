@@ -6,7 +6,8 @@
 -- ground floor and the upper storeys (kinds with weights: 0 wall, 1 window,
 -- 2 shopfront, 3 door, 4 loading door), block ids, a roof kind (0 flat with
 -- a parapet, 1 pitched, 2 saw-tooth), whether it builds halls, roof
--- clutter, and the voxel size its templates stand for.
+-- clutter, the voxel size its templates stand for, and whether a hollow
+-- building keeps glass in its windows.
 --
 -- The plan, in lot-local voxels (x across the lot, z along it, (0, 0) the
 -- lot's low corner): the footprint is the lot less the setback on the
@@ -27,19 +28,27 @@
 -- a trim band at each floor and up each corner, and the roof: a slab and a
 -- parapet with clutter on it, a pitched roof along the longer side, or
 -- saw-tooth rows with glass on their steep faces.
+--
+-- Level 2 (`hollow`): the same outside, walls two voxels thick (the wall
+-- block outside, the trim inside), floors at each storey, openings cut
+-- through both layers (air, or glass where the style is glazed; doors
+-- always open), and in each volume of two storeys or more a stair core one
+-- bay square in its back corner on the left: a flight of steps up the
+-- core's edge from each floor, one voxel a step, the floor above open over
+-- the flight and whole where the flight arrives.
 mod Strata.Building do
 
   type BldStyle = { bs_storeys : (Int, Int), bs_storey : Int, bs_coverage : Float, bs_setback : Int, bs_volumes : Int, bs_bay : Int,
                     bs_ground : List((Int, Float)), bs_upper : List((Int, Float)),
                     bs_wall : Int, bs_trim : Int, bs_glass : Int, bs_floor : Int, bs_roof : Int, bs_door : Int,
-                    bs_roof_kind : Int, bs_hall : Bool, bs_clutter : List(Strata.Template.Template), bs_voxel : Float }
+                    bs_roof_kind : Int, bs_hall : Bool, bs_clutter : List(Strata.Template.Template), bs_voxel : Float, bs_glazed : Bool }
 
-  doc "A style of the given blocks (wall, trim, glass, floor, roof; doors in the trim) with defaults: 2 to 4 storeys of 8 voxels, coverage 0.7, setback 2, up to 2 volumes, bays of 4; ground floors half windows, a fifth doors, the rest shopfronts; upper storeys four fifths windows; flat roofs; no halls, no clutter; 0.4 m voxels."
+  doc "A style of the given blocks (wall, trim, glass, floor, roof; doors in the trim) with defaults: 2 to 4 storeys of 8 voxels, coverage 0.7, setback 2, up to 2 volumes, bays of 4; ground floors half windows, a fifth doors, the rest shopfronts; upper storeys four fifths windows; flat roofs; no halls, no clutter; 0.4 m voxels; hollow windows open (not glazed)."
   fn style(wall : Int, trim : Int, glass : Int, floor : Int, roof : Int) : BldStyle do
     { bs_storeys: (2, 4), bs_storey: 8, bs_coverage: 0.7, bs_setback: 2, bs_volumes: 2, bs_bay: 4,
       bs_ground: [(1, 0.5), (3, 0.2), (2, 0.3)], bs_upper: [(1, 0.8), (0, 0.2)],
       bs_wall: wall, bs_trim: trim, bs_glass: glass, bs_floor: floor, bs_roof: roof, bs_door: trim,
-      bs_roof_kind: 0, bs_hall: false, bs_clutter: Nil, bs_voxel: 0.4 }
+      bs_roof_kind: 0, bs_hall: false, bs_clutter: Nil, bs_voxel: 0.4, bs_glazed: false }
   end
 
   -- the lot, its size, volumes (x0, z0, x1, z1, storeys), openings, the roof kind, the storey height, the street side, the bay width
@@ -298,6 +307,107 @@ mod Strata.Building do
     let g1 = List.fold_left(p.bp_volumes, g0, fn (acc, v) -> match v do (x0, z0, x1, z1, n) -> gbox(acc, x0, 0, z0, x1, n * p.bp_storey - 1, z1, s.bs_wall) end)
     let g2 = List.fold_left(p.bp_volumes, g1, fn (acc, v) -> trim(acc, p, s, v))
     let g3 = List.fold_left(p.bp_openings, g2, fn (acc, o) -> draw_opening(acc, p, s, o))
+    let g4 = List.fold_left(List.range(0, List.length(p.bp_volumes)), g3, fn (acc, vi) -> roof(acc, p, s, List.nth(p.bp_volumes, vi), seed, vi))
+    match g4 do BldGrid(w, hh, d, a) -> Strata.Template.make(w, hh, d, a, s.bs_voxel) end
+  end
+
+  -- ── Level 2 ──────────────────────────────────────────────────────────────
+  -- the stair core of a volume, if it has one: its low corner (x, z), one bay square, in the back-left corner inside the walls
+  pfn core(p : BldPlan, v : (Int, Int, Int, Int, Int)) : Option((Int, Int)) do
+    match v do
+      (x0, z0, x1, z1, n) ->
+        let b = p.bp_bay
+        if n < 2 || x1 - x0 + 1 < b + 6 || z1 - z0 + 1 < b + 6 do None
+        else
+          -- back: away from the street; left: the low side across
+          let cx = if p.bp_street == 1 do x1 - 1 - b else x0 + 2 end
+          let cz = if p.bp_street == 2 do z0 + 2 else z1 - 1 - b end
+          Some((cx, cz))
+        end
+    end
+  end
+  -- the core's edge, walked round from its low corner: (x, z) of each cell in order
+  pfn edge(b : Int, cx : Int, cz : Int) : List((Int, Int)) do
+    let side = List.range(0, b - 1)
+    List.append(List.append(List.map(side, fn i -> (cx + i, cz)), List.map(side, fn i -> (cx + b - 1, cz + i))),
+      List.append(List.map(side, fn i -> (cx + b - 1 - i, cz + b - 1)), List.map(side, fn i -> (cx, cz + b - 1 - i))))
+  end
+  -- a volume's steps (x, y, z): from each floor but the top, storey - 1 steps up the core's edge
+  pfn flight(p : BldPlan, v : (Int, Int, Int, Int, Int)) : List((Int, Int, Int)) do
+    match (core(p, v), v) do
+      (Some((cx, cz)), (_, _, _, _, n)) ->
+        let e = edge(p.bp_bay, cx, cz)
+        let steps = Math.min_int(p.bp_storey - 1, List.length(e))
+        List.flat_map(List.range(0, n - 1), fn st -> storey_steps(e, st * p.bp_storey, steps))
+      _ -> Nil
+    end
+  end
+
+  pfn storey_steps(e : List((Int, Int)), base : Int, steps : Int) : List((Int, Int, Int)) do
+    List.map(List.range(0, steps), fn j -> step_at(e, base, j))
+  end
+  pfn step_at(e : List((Int, Int)), base : Int, j : Int) : (Int, Int, Int) do match List.nth(e, j) do (x, z) -> (x, base + 1 + j, z) end end
+
+  doc "The stair cells (x, y, z), lot-local voxels: the steps of every volume's core, for data (the tactical layer, the damage pass)."
+  fn stairs(p : BldPlan) : List((Int, Int, Int)) do List.flat_map(p.bp_volumes, fn v -> flight(p, v)) end
+
+  -- an opening cut through both wall layers: glass where glazed (windows and shopfronts), air otherwise
+  pfn cut_opening(g : BldGrid, p : BldPlan, s : BldStyle, o : (Int, Int, Int, Int, Int)) : BldGrid do
+    match o do
+      (vi, side, b, st, kind) -> match List.nth_opt(p.bp_volumes, vi) do
+        None -> g
+        Some(v) -> match (v, wall_run(v, side)) do
+          ((x0, z0, x1, z1, _), (start, len)) ->
+            let a0 = bay_start(p.bp_bay, start, len, b)
+            let a1 = a0 + p.bp_bay - 1
+            let base = st * p.bp_storey
+            let sh = p.bp_storey
+            let pane = if s.bs_glazed do s.bs_glass else 0 end
+            let (f0, f1, y0, y1, id) = if kind == 1 do (a0 + 1, a1 - 1, base + 2, base + sh - 3, pane)
+              else if kind == 2 do (a0, a1, base + 1, base + sh - 3, pane)
+              else if kind == 3 do (a0 + p.bp_bay / 2 - 1, a0 + p.bp_bay / 2, base + 1, base + Math.min_int(sh - 2, 5), 0)
+              else if kind == 4 do (a0, a1, base + 1, base + sh - 2, 0)
+              else (0, -1, 0, -1, 0) end end end end
+            if side == 0 do gbox(g, x1 - 1, y0, f0, x1, y1, f1, id)
+            else if side == 1 do gbox(g, x0, y0, f0, x0 + 1, y1, f1, id)
+            else if side == 2 do gbox(g, f0, y0, z1 - 1, f1, y1, z1, id)
+            else gbox(g, f0, y0, z0, f1, y1, z0 + 1, id) end end end
+        end
+      end
+    end
+  end
+
+  pfn open_over(g : BldGrid, cells : List((Int, Int)), y : Int) : BldGrid do List.fold_left(cells, g, fn (acc, c) -> match c do (x, z) -> gset(acc, x, y, z, 0) end) end
+
+  pfn lay_steps(g : BldGrid, cells : List((Int, Int, Int)), id : Int) : BldGrid do List.fold_left(cells, g, fn (acc, c) -> match c do (x, y, z) -> gset(acc, x, y, z, id) end) end
+
+  -- a volume's shell: wall outside, trim inside, air within; floors at each storey; the core opened and its steps laid
+  pfn shell(g : BldGrid, p : BldPlan, s : BldStyle, v : (Int, Int, Int, Int, Int)) : BldGrid do
+    match v do
+      (x0, z0, x1, z1, n) ->
+        let top = n * p.bp_storey
+        let g1 = gbox(gbox(gbox(g, x0, 0, z0, x1, top - 1, z1, s.bs_wall), x0 + 1, 0, z0 + 1, x1 - 1, top - 1, z1 - 1, s.bs_trim), x0 + 2, 0, z0 + 2, x1 - 2, top - 1, z1 - 2, 0)
+        let g2 = List.fold_left(List.range(0, n), g1, fn (acc, st) -> gbox(acc, x0 + 2, st * p.bp_storey, z0 + 2, x1 - 2, st * p.bp_storey, z1 - 2, s.bs_floor))
+        match core(p, v) do
+          None -> g2
+          Some((cx, cz)) ->
+            let e = edge(p.bp_bay, cx, cz)
+            let steps = Math.min_int(p.bp_storey - 1, List.length(e))
+            let flight_cells = List.take(e, steps)
+            -- the floor above each flight opened over it
+            let g3 = List.fold_left(List.range(1, n), g2, fn (acc, st) -> open_over(acc, flight_cells, st * p.bp_storey))
+            lay_steps(g3, flight(p, v), s.bs_floor)
+        end
+    end
+  end
+
+  doc "Level 2: the building hollow, a template the size of its lot like `solid`: walls two thick (wall outside, trim inside), floors at every storey, a stair core aligned through each volume of two storeys or more, openings cut through (glass kept only where the style is glazed), the same trim and roofs outside."
+  fn hollow(p : BldPlan, s : BldStyle, seed : Int) : Strata.Template.Template do
+    let h = grid_height(p)
+    let g0 = BldGrid(p.bp_w, h, p.bp_d, NativeArray.make_i32(Math.max_int(1, p.bp_w * h * p.bp_d), 0))
+    let g1 = List.fold_left(p.bp_volumes, g0, fn (acc, v) -> shell(acc, p, s, v))
+    let g2 = List.fold_left(p.bp_volumes, g1, fn (acc, v) -> trim(acc, p, s, v))
+    let g3 = List.fold_left(p.bp_openings, g2, fn (acc, o) -> cut_opening(acc, p, s, o))
     let g4 = List.fold_left(List.range(0, List.length(p.bp_volumes)), g3, fn (acc, vi) -> roof(acc, p, s, List.nth(p.bp_volumes, vi), seed, vi))
     match g4 do BldGrid(w, hh, d, a) -> Strata.Template.make(w, hh, d, a, s.bs_voxel) end
   end
