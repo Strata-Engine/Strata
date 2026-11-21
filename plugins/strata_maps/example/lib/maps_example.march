@@ -1,0 +1,142 @@
+-- The strata_maps example: one generated map, seen through the tactics camera.
+--
+-- The map comes from StrataMaps.generate (the slice: base terrain and a river
+-- in level stretches with weirs, fords and sinks), checked for two routes
+-- between the north and south edges for a mover that climbs 4 voxels a tile
+-- and wades 2. The check's report is printed. The world streams from the
+-- map's generator; the camera is strata_tactics': W A S D pan, Q E turn,
+-- R F zoom, the right mouse button drags it round. Escape quits.
+--
+-- STRATA_MAP_SEED (default 5) and STRATA_MAP_BASE (0 plains, 1 rolling, the
+-- default, 2 highlands, 3 canyon, 4 plateau) pick the map. STRATA_FRAMES=n
+-- runs n frames without input and writes frame n - 3 to STRATA_SHOT.
+mod MapsExample do
+
+  needs IO
+  needs IO.Process
+  needs IO.Spawn
+  needs IO.Foreign
+  needs Audio
+  needs IO.FileSystem
+  needs Anim
+
+  alias Strata.Blocks as MxB
+  alias Strata.Math.Mat4 as MxM
+
+  -- ── Blocks ───────────────────────────────────────────────────────────────
+  pfn plain(tex : Int) : Strata.Blocks.Def do MxB.with_faces(MxB.def(), tex, tex, tex) end
+  pfn add(r : Strata.Blocks.Registry, d : Strata.Blocks.Def) : Strata.Blocks.Registry do
+    match MxB.register(r, d) do Ok((r2, _)) -> r2 | Err(_) -> r end
+  end
+
+  -- ids: 1 stone, 2 dirt, 3 grass (dirt sides), 4 sand, 5 asphalt, 6 concrete, 7 lava, 8 rubble, 9 scorched, 10 deck,
+  -- 11 the sink (looks like water), 12..19 water (a fluid; 19 is a full voxel)
+  pfn registry() : Strata.Blocks.Registry do
+    let water = MxB.with_material(MxB.with_faces(MxB.with_collide(MxB.with_layer(MxB.with_opacity(MxB.def(), Strata.Blocks.SeeThrough), Strata.Blocks.Translucent), false), 11, 11, 11), 10, 0)
+    let r10 = add(add(add(add(add(add(add(add(add(add(MxB.empty(), plain(1)), plain(2)), MxB.with_faces(MxB.def(), 3, 2, 2)), plain(4)), plain(5)), plain(6)), plain(7)), plain(8)), plain(9)), plain(10))
+    let r11 = add(r10, water)
+    match MxB.register_fluid(r11, water) do Ok((r19, _)) -> r19 | Err(_) -> r11 end
+  end
+  pfn blocks() : StrataMaps.Settings.MapBlocks do
+    { mb_stone: 1, mb_dirt: 2, mb_grass: 3, mb_sand: 4, mb_asphalt: 5, mb_concrete: 6, mb_water: 19, mb_sink: 11, mb_weir: 6, mb_lava: 7, mb_rubble: 8, mb_scorched: 9, mb_deck: 10 }
+  end
+
+  -- a 16 x 16 tile of one colour with a little hashed speckle
+  pfn tile_px(a : NativeU8Arr, i : Int, r : Int, g : Int, b : Int) : NativeU8Arr do
+    if i >= 256 do a
+    else
+      let n = ((i * 2654435761) / 65536) % 24 - 12
+      let a1 = NativeArray.set_u8(NativeArray.set_u8(a, i * 4, chan(r + n)), i * 4 + 1, chan(g + n))
+      tile_px(NativeArray.set_u8(NativeArray.set_u8(a1, i * 4 + 2, chan(b + n)), i * 4 + 3, 255), i + 1, r, g, b)
+    end
+  end
+  pfn chan(v : Int) : Int do if v < 0 do 0 else if v > 255 do 255 else v end end end
+  pfn tex(i : Int, r : Int, g : Int, b : Int) : Bool do Strata.Ffi.Vk.texture_set(i, tile_px(NativeArray.make_u8(1024, 0), 0, r, g, b)) end
+  pfn textures(reg : Strata.Blocks.Registry) : Bool do
+    Strata.Ffi.Vk.textures_create(16, 12)
+      && tex(0, 255, 0, 255) && tex(1, 122, 120, 116) && tex(2, 112, 84, 58) && tex(3, 86, 132, 60) && tex(4, 196, 180, 132)
+      && tex(5, 52, 52, 56) && tex(6, 168, 164, 156) && tex(7, 230, 90, 20) && tex(8, 104, 98, 92) && tex(9, 40, 36, 34)
+      && tex(10, 120, 96, 70) && tex(11, 56, 98, 140)
+      && Strata.Ffi.Vk.textures_commit() && Strata.Render.upload_blocks(reg)
+  end
+
+  pfn settle(s : Strata.Stream.Stream, n : Int) : Strata.Stream.Stream do
+    if n >= 100000 do s else let s2 = Strata.Stream.tick(s)
+      if Strata.Stream.settled(s2) do s2 else settle(s2, n + 1) end end
+  end
+
+  -- ── The map ──────────────────────────────────────────────────────────────
+  pfn map_settings(seed : Int, base : Int) : StrataMaps.Settings.MapSettings do
+    let s0 = StrataMaps.Settings.settings(seed, 16)
+    { s0 with ms_base: base, ms_knobs: StrataMaps.Settings.with_knob(StrataMaps.Settings.with_knob(s0.ms_knobs, "relief", 0.4), "water", 0.5) }
+  end
+
+  pfn report(r : StrataMaps.Check.CheckReport) : String do
+    "maps_example: " ++ (if r.cr_ok do "passed" else "failed" end) ++ " with " ++ int_to_string(r.cr_routes) ++ " route(s) after " ++ int_to_string(r.cr_attempts) ++ " attempt(s)"
+      ++ String.join(List.map(r.cr_why, fn w -> "; " ++ w), "")
+  end
+
+  -- ── The frame loop ───────────────────────────────────────────────────────
+  pfn frame_loop(s : Strata.Stream.Stream, sl : Strata.Render.Render, cam : StrataTactics.Camera.TacticsCamera, inp0 : Strata.Input.Input, frame : Int, frames : Int, t_prev : Float, vpbuf : NativeF32Arr) : Unit do
+    Strata.Ffi.Vk.poll()
+    let scripted = frames > 0
+    let now = Strata.Ffi.Vk.time()
+    let dt = if scripted do 1.0 /. 60.0 else (if now -. t_prev > 0.1 do 0.1 else now -. t_prev end) end
+    let raw = if scripted do Strata.Input.idle() else Strata.Render.input(inp0, 0) end
+    let inp = Strata.Input.step(inp0, raw)
+    if Strata.Ffi.Vk.should_close() || Strata.Input.held(inp, "game.quit") || (scripted && frame >= frames) do ()
+    else
+      let ww = int_to_float(Strata.Ffi.Vk.win_w())
+      let wh = int_to_float(Strata.Ffi.Vk.win_h())
+      let pointer = if scripted do None else Some((Strata.Ffi.Vk.mouse_x(), Strata.Ffi.Vk.mouse_y())) end
+      let cam1 = StrataTactics.Camera.step(cam, inp, pointer, if scripted do 0.0 else Strata.Ffi.Vk.scroll_y() end, ww, wh, dt, fn (x, z) -> 0.0)
+      match Strata.Render.sync(sl, Strata.Stream.tick(s)) do
+        (sl2, s2) ->
+          let aspect = if wh > 0.0 do ww /. wh else 1.6 end
+          let vpb = MxM.write_f32(StrataTactics.Camera.view_proj(cam1, aspect), vpbuf)
+          Strata.Ffi.Vk.set_camera(vpb)
+          match StrataTactics.Camera.eye(cam1) do (ex, ey, ez) -> Strata.Ffi.Vk.set_eye(ex, ey, ez, 0.4) end
+          let u0 = Strata.Render.ui_begin(1.0)
+          let u1 = Strata.Text.text(u0, Strata.Ui.bottom_left(), 12.0, 12.0, Strata.Text.default_font(), 14.0, (1.0, 1.0, 1.0, 1.0), "WASD QE RF, right drag: camera   Esc: quit")
+          if Strata.Render.draw_ui(u1) do () else () end
+          Strata.Render.set_time(if scripted do int_to_float(frame) /. 60.0 else now end)
+          if scripted && frame == frames - 3 do Strata.Ffi.Vk.request_shot() else () end
+          let next = if Strata.Render.draw(1.0) do frame + 1 else frame end
+          frame_loop(s2, sl2, cam1, inp, next, frames, now, vpb)
+      end
+    end
+  end
+
+  fn main(_cap : Cap(IO)) : Unit do
+    let frames = Authority.must(Env.get_int("STRATA_FRAMES", 0))
+    let seed = Authority.must(Env.get_int("STRATA_MAP_SEED", 5))
+    let base = Authority.must(Env.get_int("STRATA_MAP_BASE", 1))
+    if !Strata.Ffi.Vk.open(1280, 800, false, 0) do Authority.must(println("maps_example: could not open a Vulkan window"))
+    else
+      Strata.Ffi.Vk.set_offscreen(Authority.must(Env.get_int("STRATA_OFFSCREEN", 0)) == 1)
+      Strata.Ffi.Vk.set_lighting(4)
+      let reg = registry()
+      if Strata.Render.set_light_box(7, 3) do () else Authority.must(println("maps_example: no light volume")) end
+      if textures(reg) do () else Authority.must(println("maps_example: could not upload textures")) end
+      Strata.Render.set_sun(0.45, 0.82, 0.35, 1.0, 0.92, 0.8)
+      Strata.Ffi.Vk.set_fog(160.0, 320.0)
+      let t0 = Strata.Ffi.Vk.time()
+      match StrataMaps.generate(map_settings(seed, base), blocks(), 4, 2) do
+        (gen, d, r) ->
+          Authority.must(println(report(r) ++ " in " ++ int_to_string(float_to_int((Strata.Ffi.Vk.time() -. t0) *. 1000.0)) ++ " ms"))
+          let scale = 0.4
+          let (hi, lo) = StrataMaps.TerrainStage.span(d)
+          let mid_y = int_to_float((hi + lo) / 2) *. scale
+          let w0 = Strata.World.new(reg, gen, d.md_settings.ms_seed, scale)
+          let s0 = settle(Strata.Stream.set_focus(Strata.Stream.start(w0, Strata.Stream.config(7, 3, 64, 8)), [(0.0, mid_y, 0.0)]), 0)
+          let cs = StrataTactics.Camera.settings()
+          let cam = StrataTactics.Camera.start({ cs with cm_near: 60.0, cm_far: 160.0, cm_pitch_near_deg: 40.0, cm_pitch_far_deg: 55.0 }, (0.0, mid_y, 0.0), 45.0)
+          let bindings = List.append([("game.quit", Strata.Input.Key(256), 1.0)], StrataTactics.Camera.bindings())
+          match Strata.Render.sync(Strata.Render.new(16384), s0) do
+            (sl, s1) -> frame_loop(s1, sl, cam, Strata.Input.start(Strata.Input.new(bindings)), 0, frames, Strata.Ffi.Vk.time(), NativeArray.make_f32(16, 0.0))
+          end
+      end
+      Strata.Ffi.Vk.close()
+    end
+  end
+end

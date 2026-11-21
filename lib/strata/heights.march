@@ -1,0 +1,88 @@
+-- Heights — a square grid of column heights in voxels, and the ground
+-- adaptation the urban tools need (levelling under a footprint, easing the
+-- ground round it, quantising to a step).
+--
+-- A grid covers n x n columns from world voxel (x0, z0), index
+-- (z - z0) * n + (x - x0). Reading outside it answers the nearest edge
+-- column, so a stage that looks a little past the grid sees the ground
+-- continue.
+mod Strata.Heights do
+
+  -- origin x, origin z, side, heights
+  type HeightGrid = HeightGrid(Int, Int, Int, NativeIntArr)
+
+  doc "A grid of n x n columns from world voxel (x0, z0), every height [fill]."
+  fn grid(x0 : Int, z0 : Int, n : Int, fill : Int) : HeightGrid do
+    let m = if n < 1 do 1 else n end
+    HeightGrid(x0, z0, m, NativeArray.make_int(m * m, fill))
+  end
+
+  doc "The grid's side in columns."
+  fn size(g : HeightGrid) : Int do match g do HeightGrid(_, _, n, _) -> n end end
+  doc "The grid's low corner, world voxels (x0, z0)."
+  fn origin(g : HeightGrid) : (Int, Int) do match g do HeightGrid(x0, z0, _, _) -> (x0, z0) end end
+
+  pfn clampi(v : Int, lo : Int, hi : Int) : Int do if v < lo do lo else if v > hi do hi else v end end end
+
+  doc "The height at world column (x, z); outside the grid, the nearest edge column's."
+  fn get(g : HeightGrid, x : Int, z : Int) : Int do
+    match g do HeightGrid(x0, z0, n, a) -> NativeArray.get_int(a, clampi(z - z0, 0, n - 1) * n + clampi(x - x0, 0, n - 1)) end
+  end
+
+  doc "The grid with world column (x, z) set to [h]; outside the grid, unchanged."
+  fn set(g : HeightGrid, x : Int, z : Int, h : Int) : HeightGrid do
+    match g do
+      HeightGrid(x0, z0, n, a) ->
+        let i = x - x0
+        let j = z - z0
+        if i < 0 || j < 0 || i >= n || j >= n do g else HeightGrid(x0, z0, n, NativeArray.set_int(a, j * n + i, h)) end
+    end
+  end
+
+  doc "Every height rounded down to a multiple of [step] (a step under 1 leaves the grid as it is)."
+  fn quantise(g : HeightGrid, step : Int) : HeightGrid do
+    if step < 1 do g
+    else
+      match g do
+        HeightGrid(x0, z0, n, a) ->
+          HeightGrid(x0, z0, n, List.fold_left(List.range(0, n * n), a, fn (acc, i) -> NativeArray.set_int(acc, i, int_div_euclid(NativeArray.get_int(acc, i), step) * step)))
+      end
+    end
+  end
+
+  doc "The largest height difference between world column (x, z) and one of its four neighbours."
+  fn slope(g : HeightGrid, x : Int, z : Int) : Int do
+    let h = get(g, x, z)
+    let d = fn (a, b) -> int_abs(get(g, a, b) - h)
+    Math.max_int(Math.max_int(d(x + 1, z), d(x - 1, z)), Math.max_int(d(x, z + 1), d(x, z - 1)))
+  end
+
+  doc "The grid with [cells] (world columns) set to [level], and the ring of [margin] columns round their bounding box eased toward their old heights: a column d columns out stays within [grade] x d of the level (cut and fill)."
+  fn flatten(g : HeightGrid, cells : List((Int, Int)), level : Int, margin : Int, grade : Float) : HeightGrid do
+    match cells do
+      Nil -> g
+      _ ->
+        let bx0 = List.fold_left(cells, 1000000000, fn (m, c) -> match c do (x, _) -> Math.min_int(m, x) end)
+        let bx1 = List.fold_left(cells, -1000000000, fn (m, c) -> match c do (x, _) -> Math.max_int(m, x) end)
+        let bz0 = List.fold_left(cells, 1000000000, fn (m, c) -> match c do (_, z) -> Math.min_int(m, z) end)
+        let bz1 = List.fold_left(cells, -1000000000, fn (m, c) -> match c do (_, z) -> Math.max_int(m, z) end)
+        let g1 = List.fold_left(cells, g, fn (acc, c) -> match c do (x, z) -> set(acc, x, z, level) end)
+        let ring = List.flat_map(List.range(bz0 - margin, bz1 + margin + 1), fn z -> List.map(List.range(bx0 - margin, bx1 + margin + 1), fn x -> (x, z)))
+        List.fold_left(ring, g1, fn (acc, c) -> ease(acc, c, bx0, bz0, bx1, bz1, level, grade))
+    end
+  end
+
+  pfn ease(g : HeightGrid, c : (Int, Int), bx0 : Int, bz0 : Int, bx1 : Int, bz1 : Int, level : Int, grade : Float) : HeightGrid do
+    match c do
+      (x, z) ->
+        let dx = if x < bx0 do bx0 - x else if x > bx1 do x - bx1 else 0 end end
+        let dz = if z < bz0 do bz0 - z else if z > bz1 do z - bz1 else 0 end end
+        let d = Math.max_int(dx, dz)
+        if d == 0 do g
+        else
+          let lim = float_to_int(Math.floor(grade *. int_to_float(d)))
+          set(g, x, z, level + clampi(get(g, x, z) - level, 0 - lim, lim))
+        end
+    end
+  end
+end
