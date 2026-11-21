@@ -3,9 +3,10 @@
 -- On a scratch world built from the map's generator (`scratch`), for ruin
 -- r: each building is ruined with probability r (by a hash), by 1 to 4
 -- blasts (more as r rises) at its main volume's corners on its upper
--- storeys, 3 to 5 voxels across; what the blasts leave without support
--- (Strata.Support.loose, everything at or below the building's floor held)
--- is removed; a cone of rubble the size of what came down is laid on the
+-- storeys, 3 to 5 voxels across; what the blasts leave without support is
+-- removed, checked over a box round the whole building (Strata.Support.loose_box:
+-- a window round the changes alone counts its edge as held, and so can leave
+-- a cell hanging past its span); a cone of rubble the size of what came down is laid on the
 -- ground at the first blast's corner, layer by layer and only on air resting
 -- on something solid (not water or leaves), so it never hangs. Over r = 0.6, craters on open ground
 -- (one more for each tenth over). Everything is answered as requests (the
@@ -53,6 +54,19 @@ mod StrataMaps.RuinStage do
     end
   end
 
+  -- everything without support in the box (a whole building and its blasts, so the box's edge holds nothing up), removed; (state, how many cells came away)
+  pfn drop_in_box(st : RuState, x0 : Int, y0 : Int, z0 : Int, x1 : Int, y1 : Int, z1 : Int, anchor : Int) : (RuState, Int) do
+    match st do
+      RuState(w, rs) ->
+        let cells = List.concat(Strata.Support.pieces(Strata.Support.loose_box(Strata.World.registry(w), w, x0, y0, z0, x1, y1, z1, anchor, StrataMaps.Settings.scale())))
+        if List.is_empty(cells) do (st, 0)
+        else
+          let o = RuE.set_many(w, List.map(cells, fn c -> match c do (x, y, z) -> (x, y, z, 0) end))
+          (RuState(RuE.world(o), List.fold_left(cells, rs, fn (acc, c) -> match c do (x, y, z) -> Cons(Strata.Plugin.edit(Strata.World.op_cell(x, y, z, 0)), acc) end)), List.length(cells))
+        end
+    end
+  end
+
   -- a blast: the world changed, the request kept; the changes
   pfn blast(st : RuState, x : Int, y : Int, z : Int, radius : Int, seed : Int) : (RuState, List(Strata.Edit.Change)) do
     match st do
@@ -88,7 +102,7 @@ mod StrataMaps.RuinStage do
   end
 
   -- one building ruined (or not)
-  pfn ruin_building(d : StrataMaps.Data.MapData, r : Float, st : RuState, bi : Int, b : StrataMaps.Data.MapBuilding) : RuState do
+  pfn ruin_building(d : StrataMaps.Data.MapData, r : Float, anchor : Int, st : RuState, bi : Int, b : StrataMaps.Data.MapBuilding) : RuState do
     let h = Strata.Seed.mix(d.md_settings.ms_seed, 4400 + bi)
     match (List.head_opt(Strata.Building.footprint(b.mbd_plan)), List.head_opt(Strata.Building.volumes(b.mbd_plan)), b.mbd_origin) do
       (Some((fx0, fz0, fx1, fz1)), Some((_, _, _, _, n)), (_, floor, _)) ->
@@ -106,7 +120,7 @@ mod StrataMaps.RuinStage do
               let storey = pick(hj, 3, n / 2, Math.max_int(n / 2, n - 1))
               match blast(s, x, floor + storey * sh + sh / 2, cz, pick(hj, 4, 3, 5), hj) do (s2, c2) -> (s2, List.append(cs, c2)) end
           end) do
-            (s1, cs) -> match drop_loose(s1, cs, floor - 1) do
+            (s1, cs) -> match drop_in_box(s1, fx0 - 8, floor - 8, fz0 - 8, fx1 + 8, floor + Strata.Template.t_sy(b.mbd_template) + 8, fz1 + 8, anchor) do
               (s2, fell) ->
                 let volume = List.length(cs) + fell
                 let hh = Math.max_int(1, Math.min_int(6, float_to_int(Math.pow(int_to_float(volume), 1.0 /. 3.0) /. 2.0 +. 0.5)))
@@ -119,7 +133,7 @@ mod StrataMaps.RuinStage do
   end
 
   -- a crater on open ground (no lot, road or water), tried at up to 20 hashed places
-  pfn crater(d : StrataMaps.Data.MapData, st : RuState, ci : Int) : RuState do
+  pfn crater(d : StrataMaps.Data.MapData, anchor : Int, st : RuState, ci : Int) : RuState do
     match RuD.playable(d) do
       (px, pz, n) ->
         let spots = List.map(List.range(0, 20), fn t -> (px + pick(Strata.Seed.mix(d.md_settings.ms_seed, 6100 + ci * 31 + t), 1, 4, n - 5), pz + pick(Strata.Seed.mix(d.md_settings.ms_seed, 6100 + ci * 31 + t), 2, 4, n - 5)))
@@ -128,7 +142,7 @@ mod StrataMaps.RuinStage do
           Some((x, z)) ->
             let y = Strata.Heights.get(d.md_heights, x, z) - 1
             match blast(st, x, y, z, 3, Strata.Seed.mix(d.md_settings.ms_seed, 6200 + ci)) do
-              (s1, cs) -> match drop_loose(s1, cs, y - 8) do (s2, _) -> s2 end
+              (s1, cs) -> match drop_loose(s1, cs, anchor) do (s2, _) -> s2 end
             end
         end
     end
@@ -143,9 +157,11 @@ mod StrataMaps.RuinStage do
     let r = d.md_settings.ms_knobs.mk_ruin
     if r <= 0.0 do (Nil, d)
     else
-      let st1 = List.fold_left(List.range(0, List.length(d.md_buildings)), RuState(w, Nil), fn (st, bi) -> ruin_building(d, r, st, bi, List.nth(d.md_buildings, bi)))
+      -- one anchor for the whole map, under its lowest ground: a building's own floor would hold up whatever hangs below it (a lower neighbour, earlier rubble)
+      let anchor = match StrataMaps.WorldGen.bounds(d) do (lo, _) -> lo - 2 end
+      let st1 = List.fold_left(List.range(0, List.length(d.md_buildings)), RuState(w, Nil), fn (st, bi) -> ruin_building(d, r, anchor, st, bi, List.nth(d.md_buildings, bi)))
       let craters = if r > 0.6 do float_to_int((r -. 0.6) *. 10.0 +. 0.5) else 0 end
-      match List.fold_left(List.range(0, craters), st1, fn (st, ci) -> crater(d, st, ci)) do
+      match List.fold_left(List.range(0, craters), st1, fn (st, ci) -> crater(d, anchor, st, ci)) do
         RuState(_, rs) -> (List.reverse(rs), d)
       end
     end

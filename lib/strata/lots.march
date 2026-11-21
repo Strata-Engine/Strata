@@ -37,25 +37,76 @@ mod Strata.Lots do
     let road = LoR.mask(roads, x0, z0, n, scale)
     let free = List.fold_left(List.range(0, n * n), NativeArray.make_int(Math.max_int(1, n * n), 0), fn (a, i) ->
       if NativeArray.get_int(road, i) == 0 && buildable(x0 + i % n, z0 + i / n) do NativeArray.set_int(a, i, 1) else a end)
-    List.map(cover(free, n, Nil, 0), fn r -> match r do (a, b, c, e) -> (x0 + a, z0 + b, x0 + c, z0 + e) end)
+    -- each connected piece of free land covered in its own box (a box's histogram passes, not the whole square's)
+    List.flat_map(regions(free, n), fn rg -> cover_region(free, n, rg, x0, z0))
   end
 
-  -- the free columns covered by rectangles, largest first, until what is left is slivers (under 16 columns)
-  pfn cover(free : NativeIntArr, n : Int, acc : List((Int, Int, Int, Int)), guard : Int) : List((Int, Int, Int, Int)) do
-    match largest(free, n) do
+  -- the connected pieces of free land (4-neighbours): each as its cells' box (x0, z0, x1, z1) and its label in [labels]
+  pfn regions(free : NativeIntArr, n : Int) : List((NativeIntArr, Int, (Int, Int, Int, Int))) do
+    match List.fold_left(List.range(0, n * n), (NativeArray.make_int(Math.max_int(1, n * n), 0), 0, Nil), fn (st, i) -> region_at(free, n, st, i)) do
+      (labels, _, found) -> List.map(List.reverse(found), fn f -> match f do (id, bx) -> (labels, id, bx) end)
+    end
+  end
+  pfn region_at(free : NativeIntArr, n : Int, st : (NativeIntArr, Int, List((Int, (Int, Int, Int, Int)))), i : Int) : (NativeIntArr, Int, List((Int, (Int, Int, Int, Int)))) do
+    match st do
+      (labels, next, found) ->
+        if NativeArray.get_int(free, i) == 0 || NativeArray.get_int(labels, i) != 0 do st
+        else
+          let id = next + 1
+          match fill_region(free, n, id, [i], NativeArray.set_int(labels, i, id), (i % n, i / n, i % n, i / n)) do
+            (l2, bx) -> (l2, id, Cons((id, bx), found))
+          end
+        end
+    end
+  end
+  pfn fill_region(free : NativeIntArr, n : Int, id : Int, now : List(Int), labels : NativeIntArr, bx : (Int, Int, Int, Int)) : (NativeIntArr, (Int, Int, Int, Int)) do
+    match now do
+      Nil -> (labels, bx)
+      Cons(i, rest) ->
+        let x = i % n
+        let z = i / n
+        let bx2 = match bx do (a, b, c, e) -> (Math.min_int(a, x), Math.min_int(b, z), Math.max_int(c, x), Math.max_int(e, z)) end
+        let nbs = List.filter([if x + 1 < n do i + 1 else -1 end, if x > 0 do i - 1 else -1 end, if z + 1 < n do i + n else -1 end, if z > 0 do i - n else -1 end], fn j -> j >= 0)
+        match List.fold_left(nbs, (labels, rest), fn (acc, j) -> take_cell(free, id, acc, j)) do
+          (l2, r2) -> fill_region(free, n, id, r2, l2, bx2)
+        end
+    end
+  end
+  pfn take_cell(free : NativeIntArr, id : Int, acc : (NativeIntArr, List(Int)), j : Int) : (NativeIntArr, List(Int)) do
+    match acc do
+      (labels, rest) -> if NativeArray.get_int(free, j) == 1 && NativeArray.get_int(labels, j) == 0 do (NativeArray.set_int(labels, j, id), Cons(j, rest)) else acc end
+    end
+  end
+  pfn sub_grid(labels : NativeIntArr, n : Int, id : Int, bx0 : Int, bz0 : Int, w : Int, h : Int) : NativeIntArr do
+    List.fold_left(List.range(0, w * h), NativeArray.make_int(Math.max_int(1, w * h), 0), fn (a, k) -> if NativeArray.get_int(labels, (bz0 + k / w) * n + bx0 + k % w) == id do NativeArray.set_int(a, k, 1) else a end)
+  end
+  pfn shift(r : (Int, Int, Int, Int), dx : Int, dz : Int) : (Int, Int, Int, Int) do match r do (a, b, c, e) -> (dx + a, dz + b, dx + c, dz + e) end end
+  -- one piece's rectangles, in the whole square's coordinates
+  pfn cover_region(free : NativeIntArr, n : Int, rg : (NativeIntArr, Int, (Int, Int, Int, Int)), x0 : Int, z0 : Int) : List((Int, Int, Int, Int)) do
+    match rg do
+      (labels, id, (bx0, bz0, bx1, bz1)) ->
+        let w = bx1 - bx0 + 1
+        let h = bz1 - bz0 + 1
+        List.map(cover(sub_grid(labels, n, id, bx0, bz0, w, h), w, h, Nil, 0), fn r -> shift(r, x0 + bx0, z0 + bz0))
+    end
+  end
+
+  -- the free cells of a w x h grid covered by rectangles, largest first, until what is left is slivers (under 16 cells)
+  pfn cover(free : NativeIntArr, n : Int, hgt : Int, acc : List((Int, Int, Int, Int)), guard : Int) : List((Int, Int, Int, Int)) do
+    match largest(free, n, hgt) do
       (area, rx0, rz0, rx1, rz1) ->
         if area < 16 || guard > 100000 do List.reverse(acc)
         else
           let w = rx1 - rx0 + 1
           let f2 = List.fold_left(List.range(0, w * (rz1 - rz0 + 1)), free, fn (a, k) -> NativeArray.set_int(a, (rz0 + k / w) * n + rx0 + k % w, 0))
-          cover(f2, n, Cons((rx0, rz0, rx1, rz1), acc), guard + 1)
+          cover(f2, n, hgt, Cons((rx0, rz0, rx1, rz1), acc), guard + 1)
         end
     end
   end
 
   -- the largest rectangle of free columns: (area, x0, z0, x1, z1), by the histogram of free run heights row by row
-  pfn largest(free : NativeIntArr, n : Int) : (Int, Int, Int, Int, Int) do
-    match List.fold_left(List.range(0, n), (NativeArray.make_int(Math.max_int(1, n), 0), (0, 0, 0, 0, 0)), fn (st, z) -> row(st, free, n, z)) do
+  pfn largest(free : NativeIntArr, n : Int, hgt : Int) : (Int, Int, Int, Int, Int) do
+    match List.fold_left(List.range(0, hgt), (NativeArray.make_int(Math.max_int(1, n), 0), (0, 0, 0, 0, 0)), fn (st, z) -> row(st, free, n, z)) do
       (_, best) -> best
     end
   end

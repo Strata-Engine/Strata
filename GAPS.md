@@ -565,3 +565,19 @@ strata_kit's motion tests and example).
 A parameter typed `occupied : (Int, Int, Int) -> Bool` refuses the
 three-argument lambda `fn (x, y, z) -> ...`: the type is a function of one
 tuple. A function of three Ints is `Int -> Int -> Int -> Bool`.
+
+## S55: an array field written through a record update copies the array
+
+`{ d with md_water: NativeArray.set_int(d.md_water, i, v) }` copies the
+whole array on every call: the record `d` still owns the array while it is
+written, because the update itself uses `d`, so the array has two owners and
+`set_int` takes its copy path. A compiler could see that `d` dies in the
+update and move the field out first, but March does not. Reduced case
+`bench/march/record_field`: about 400 000 instructions a write for an array
+of 262 144 ints, against 900 with the bare array threaded through the loop
+(the same with a helper taking the record). Met 2026-11-21 in StrataMaps:
+the water stage wrote the per-column water array and height grid this way
+once per river column, so its cost grew with the cube of the map's side
+(3.9 s for a 768-voxel square, release); the lava stage did the same per
+scorched column (3.7 s). Rule for Strata code: in a loop, thread the bare
+arrays and build the record once.
