@@ -1,0 +1,108 @@
+-- Lots — the buildable land between roads, cut into lots that face a street.
+--
+-- `blocks` finds the buildable columns of an n x n square that no road
+-- covers and covers them with rectangles: a greedy scan takes the first
+-- free column, runs it as far as it goes in x, then grows the run in z
+-- while the whole run stays free; the rectangles never overlap and cover
+-- every free column. `split` cuts one rectangle recursively across its
+-- longer side at a hashed point (40% to 60% along) until neither side is
+-- longer than max_side. A lot's street side is the side whose neighbouring
+-- row of columns holds the most road columns (ties to the lower side
+-- number: 0 +x, 1 -x, 2 +z, 3 -z). A piece with no road on any side is
+-- merged back into the piece it was cut from (the cut is undone there);
+-- pieces with a side under min_side are dropped. All in voxels.
+mod Strata.Lots do
+
+  alias Strata.Roads as LoR
+
+  -- x0, z0, x1, z1 (inclusive), the street side
+  type Lot = Lot(Int, Int, Int, Int, Int)
+
+  doc "The lot's rectangle (x0, z0, x1, z1), inclusive, in voxels."
+  fn lot_box(l : Lot) : (Int, Int, Int, Int) do match l do Lot(x0, z0, x1, z1, _) -> (x0, z0, x1, z1) end end
+  doc "The side facing its street: 0 +x, 1 -x, 2 +z, 3 -z."
+  fn lot_street(l : Lot) : Int do match l do Lot(_, _, _, _, s) -> s end end
+  doc "Its area in columns."
+  fn lot_area(l : Lot) : Int do match l do Lot(x0, z0, x1, z1, _) -> (x1 - x0 + 1) * (z1 - z0 + 1) end end
+  doc "A lot from its rectangle and street side."
+  fn lot(x0 : Int, z0 : Int, x1 : Int, z1 : Int, street : Int) : Lot do Lot(x0, z0, x1, z1, street) end
+
+  pfn road_at(roads : Strata.Roads.RoadGraph, scale : Float, x : Int, z : Int) : Bool do
+    Option.is_some(LoR.at(roads, (int_to_float(x) +. 0.5) *. scale, (int_to_float(z) +. 0.5) *. scale))
+  end
+
+  doc "The buildable land of the n x n columns from (x0, z0) that no road covers, as non-overlapping rectangles (x0, z0, x1, z1) covering all of it. [scale] is metres a voxel."
+  fn blocks(roads : Strata.Roads.RoadGraph, x0 : Int, z0 : Int, n : Int, scale : Float, buildable : Int -> Int -> Bool) : List((Int, Int, Int, Int)) do
+    let free = List.fold_left(List.range(0, n * n), NativeArray.make_int(Math.max_int(1, n * n), 0), fn (a, i) ->
+      let x = x0 + i % n
+      let z = z0 + i / n
+      if buildable(x, z) && !road_at(roads, scale, x, z) do NativeArray.set_int(a, i, 1) else a end)
+    match List.fold_left(List.range(0, n * n), (free, Nil), fn (st, i) -> take(st, n, i)) do
+      (_, rs) -> List.map(List.reverse(rs), fn r -> match r do (a, b, c, d) -> (x0 + a, z0 + b, x0 + c, z0 + d) end)
+    end
+  end
+  -- from free column i: the run in x, grown in z while the run stays free; its columns taken
+  pfn take(st : (NativeIntArr, List((Int, Int, Int, Int))), n : Int, i : Int) : (NativeIntArr, List((Int, Int, Int, Int))) do
+    match st do
+      (free, rs) ->
+        if NativeArray.get_int(free, i) == 0 do st
+        else
+          let x = i % n
+          let z = i / n
+          let x1 = run_x(free, n, x, z)
+          let z1 = grow_z(free, n, x, x1, z)
+          let f2 = List.fold_left(List.range(0, (x1 - x + 1) * (z1 - z + 1)), free, fn (a, k) -> NativeArray.set_int(a, (z + k / (x1 - x + 1)) * n + x + k % (x1 - x + 1), 0))
+          (f2, Cons((x, z, x1, z1), rs))
+        end
+    end
+  end
+  pfn run_x(free : NativeIntArr, n : Int, x : Int, z : Int) : Int do
+    if x + 1 < n && NativeArray.get_int(free, z * n + x + 1) == 1 do run_x(free, n, x + 1, z) else x end
+  end
+  pfn row_free(free : NativeIntArr, n : Int, x0 : Int, x1 : Int, z : Int) : Bool do List.all(List.range(x0, x1 + 1), fn x -> NativeArray.get_int(free, z * n + x) == 1) end
+  pfn grow_z(free : NativeIntArr, n : Int, x0 : Int, x1 : Int, z : Int) : Int do
+    if z + 1 < n && row_free(free, n, x0, x1, z + 1) do grow_z(free, n, x0, x1, z + 1) else z end
+  end
+
+  -- road columns along each side: (side, count)
+  pfn frontage(roads : Strata.Roads.RoadGraph, scale : Float, b : (Int, Int, Int, Int)) : List((Int, Int)) do
+    match b do
+      (x0, z0, x1, z1) ->
+        let count = fn cs -> List.length(List.filter(cs, fn c -> match c do (x, z) -> road_at(roads, scale, x, z) end))
+        [(0, count(List.map(List.range(z0, z1 + 1), fn z -> (x1 + 1, z)))), (1, count(List.map(List.range(z0, z1 + 1), fn z -> (x0 - 1, z)))),
+         (2, count(List.map(List.range(x0, x1 + 1), fn x -> (x, z1 + 1)))), (3, count(List.map(List.range(x0, x1 + 1), fn x -> (x, z0 - 1))))]
+    end
+  end
+  -- the street side, if any side touches a road
+  pfn street(roads : Strata.Roads.RoadGraph, scale : Float, b : (Int, Int, Int, Int)) : Option(Int) do
+    match List.fold_left(frontage(roads, scale, b), (-1, 0), fn (best, f) -> match (best, f) do ((_, bc), (s, c)) -> if c > bc do (s, c) else best end end) do
+      (s, c) -> if c > 0 do Some(s) else None end
+    end
+  end
+
+  doc "Block [b] cut into lots: split across the longer side at a hashed point (40% to 60%) until no side is longer than [max_side]; a piece with no road beside it is merged back into the piece it was cut from; pieces with a side under [min_side] are dropped. The same seed cuts the same way."
+  fn split(b : (Int, Int, Int, Int), roads : Strata.Roads.RoadGraph, scale : Float, min_side : Int, max_side : Int, seed : Int) : List(Lot) do
+    List.filter_map(pieces(b, roads, scale, max_side, seed, 0), fn p -> match p do
+      (x0, z0, x1, z1) -> if x1 - x0 + 1 < min_side || z1 - z0 + 1 < min_side do None
+        else match street(roads, scale, p) do Some(s) -> Some(Lot(x0, z0, x1, z1, s)) | None -> None end end
+    end)
+  end
+  -- the pieces of b: cut while too long, undone where a half would have no road beside it
+  pfn pieces(b : (Int, Int, Int, Int), roads : Strata.Roads.RoadGraph, scale : Float, max_side : Int, seed : Int, depth : Int) : List((Int, Int, Int, Int)) do
+    match b do
+      (x0, z0, x1, z1) ->
+        let w = x1 - x0 + 1
+        let d = z1 - z0 + 1
+        if (w <= max_side && d <= max_side) || depth > 24 do [b]
+        else
+          let along_x = w >= d
+          let len = if along_x do w else d end
+          let u = Strata.Seed.unit(Strata.Seed.mix(Strata.Seed.mix(seed, x0 * 73856093 + z0 * 19349663), x1 * 83492791 + z1 + depth))
+          let cut = Math.max_int(1, Math.min_int(len - 1, float_to_int(int_to_float(len) *. (0.4 +. 0.2 *. u))))
+          let (a, c) = if along_x do ((x0, z0, x0 + cut - 1, z1), (x0 + cut, z0, x1, z1)) else ((x0, z0, x1, z0 + cut - 1), (x0, z0 + cut, x1, z1)) end
+          if Option.is_none(street(roads, scale, a)) || Option.is_none(street(roads, scale, c)) do [b]
+          else List.append(pieces(a, roads, scale, max_side, seed, depth + 1), pieces(c, roads, scale, max_side, seed, depth + 1)) end
+        end
+    end
+  end
+end
