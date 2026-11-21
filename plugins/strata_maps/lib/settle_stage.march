@@ -1,0 +1,162 @@
+-- SettleStage — the settlement: where it is, its roads, its lots.
+--
+-- The settled area is a disc whose area is the settlement knob's share of
+-- the playable square while it fits inside it (shares up to pi / 4); past
+-- that it grows to reach the square's corners at settlement 1. Its centre is
+-- placed by a hash so the disc stays on the square. Ground is buildable where it is dry and level: the tile it lies in
+-- (8 x 8 columns) varies by at most 2 height steps; when under 90% of the disc is
+-- buildable a report line says how much was. Roads follow the pattern:
+-- 0 grid (streets each way, spacing 40 m at density 0 to 24 m at 1), 1
+-- arterial (two main roads crossing at the centre, with spurs off them at
+-- that spacing), 2 broken (the grid with a quarter of its blocks' sides
+-- missing, by a hash). Streets are 6.4 m wide (main roads 8 m, spurs
+-- 4.8 m), asphalt, clipped to the disc and the square. The ground is fitted
+-- to them (grade 1 in 10; gaps over water left for bridges, listed), then
+-- the buildable ground in the disc that no road covers is cut into lots
+-- (8 voxels a side at least, at most 40 at density 0 down to 24 at 1).
+mod StrataMaps.SettleStage do
+
+  alias StrataMaps.Settings as SeS
+  alias StrataMaps.Data as SeD
+  alias Strata.Roads as SeR
+
+  pfn u(seed : Int, k : Int) : Float do Strata.Seed.unit(Strata.Seed.mix(seed, k)) end
+  pfn m(v : Float) : Float do v *. SeS.scale() end
+
+  -- the disc (centre x, z, radius) in world voxels
+  pfn disc(d : StrataMaps.Data.MapData, share : Float) : (Int, Int, Int) do
+    match SeD.playable(d) do
+      (px, pz, n) ->
+        -- a disc of the share's area while it fits in the square (share up to pi / 4), then growing to the square's corners at share 1
+        let fit = Math.pi() /. 4.0
+        let r = if share <= fit do float_to_int(Math.sqrt(share *. int_to_float(n * n) /. Math.pi()))
+          else float_to_int(int_to_float(n) *. (0.5 +. (0.7072 -. 0.5) *. (share -. fit) /. (1.0 -. fit))) end
+        let room = Math.max_int(0, n / 2 - Math.min_int(r, n / 2))
+        let seed = d.md_settings.ms_seed
+        let cx = px + n / 2 + float_to_int((u(seed, 501) *. 2.0 -. 1.0) *. int_to_float(room))
+        let cz = pz + n / 2 + float_to_int((u(seed, 502) *. 2.0 -. 1.0) *. int_to_float(room))
+        (cx, cz, Math.max_int(1, r))
+    end
+  end
+  pfn inside(dk : (Int, Int, Int), x : Int, z : Int) : Bool do match dk do (cx, cz, r) -> (x - cx) * (x - cx) + (z - cz) * (z - cz) <= r * r end end
+  doc "Is world column (x, z) on level ground: does the tile it lies in (8 x 8 columns from the playable square's corner) vary by at most 2 height steps?"
+  fn level(d : StrataMaps.Data.MapData, x : Int, z : Int) : Bool do level_in(d, d.md_heights, x, z) end
+  pfn level_in(d : StrataMaps.Data.MapData, h : Strata.Heights.HeightGrid, x : Int, z : Int) : Bool do
+    match SeD.playable(d) do
+      (px, pz, _) ->
+        let tx = px + int_div_euclid(x - px, 8) * 8
+        let tz = pz + int_div_euclid(z - pz, 8) * 8
+        let hs = List.map(List.range(0, 64), fn i -> Strata.Heights.get(h, tx + i % 8, tz + i / 8))
+        List.fold_left(hs, -1000000, fn (a, v) -> Math.max_int(a, v)) - List.fold_left(hs, 1000000, fn (a, v) -> Math.min_int(a, v)) <= 2 * d.md_settings.ms_step
+    end
+  end
+  -- level for every tile of the playable square, worked out once: index tz * tiles + tx
+  pfn levels(d : StrataMaps.Data.MapData, h : Strata.Heights.HeightGrid) : NativeIntArr do
+    match SeD.playable(d) do
+      (px, pz, n) ->
+        let t = n / 8
+        List.fold_left(List.range(0, t * t), NativeArray.make_int(Math.max_int(1, t * t), 0), fn (a, i) -> if level_in(d, h, px + (i % t) * 8, pz + (i / t) * 8) do NativeArray.set_int(a, i, 1) else a end)
+    end
+  end
+  pfn buildable(d : StrataMaps.Data.MapData, lv : NativeIntArr, x : Int, z : Int) : Bool do
+    match SeD.playable(d) do
+      (px, pz, n) ->
+        let t = n / 8
+        let tx = (x - px) / 8
+        let tz = (z - pz) / 8
+        x >= px && z >= pz && tx < t && tz < t && NativeArray.get_int(lv, tz * t + tx) == 1 && SeD.water_at(d, x, z) < 0 && SeD.lava_at(d, x, z) < 0 && !SeD.on_trail(d, x, z)
+    end
+  end
+
+  -- a road from (ax, az) to (bx, bz) voxels, clipped to the square, [w] metres wide
+  pfn road(g : Strata.Roads.RoadGraph, d : StrataMaps.Data.MapData, ax : Int, az : Int, bx : Int, bz : Int, w : Float, surface : Int) : Strata.Roads.RoadGraph do
+    match SeD.playable(d) do
+      (px, pz, n) ->
+        let cl = fn v -> Math.max_int(px + 2, Math.min_int(px + n - 3, v))
+        let clz = fn v -> Math.max_int(pz + 2, Math.min_int(pz + n - 3, v))
+        let (x0, z0, x1, z1) = (cl(ax), clz(az), cl(bx), clz(bz))
+        if int_abs(x1 - x0) + int_abs(z1 - z0) < 4 do g
+        else match SeR.add_node(g, m(int_to_float(x0)), m(int_to_float(z0))) do
+          (g1, a) -> match SeR.add_node(g1, m(int_to_float(x1)), m(int_to_float(z1))) do (g2, b) -> SeR.add_segment(g2, a, b, w, surface) end
+        end end
+    end
+  end
+  -- half the disc's chord at offset [o] from its centre
+  pfn chord(r : Int, o : Int) : Int do if int_abs(o) >= r do 0 else float_to_int(Math.sqrt(int_to_float(r * r - o * o))) end end
+  pfn offsets(r : Int, sp : Int) : List(Int) do
+    let k = r / Math.max_int(1, sp)
+    List.map(List.range(0 - k, k + 1), fn i -> i * sp)
+  end
+
+  -- the grid: full lines each way
+  pfn grid(d : StrataMaps.Data.MapData, dk : (Int, Int, Int), sp : Int, surface : Int) : Strata.Roads.RoadGraph do
+    match dk do
+      (cx, cz, r) ->
+        let os = offsets(r, sp)
+        let g1 = List.fold_left(os, SeR.graph(), fn (g, o) -> road(g, d, cx + o, cz - chord(r, o), cx + o, cz + chord(r, o), 6.4, surface))
+        List.fold_left(os, g1, fn (g, o) -> road(g, d, cx - chord(r, o), cz + o, cx + chord(r, o), cz + o, 6.4, surface))
+    end
+  end
+  -- the broken grid: each side of each block a segment of its own, a quarter left out by a hash
+  pfn broken(d : StrataMaps.Data.MapData, dk : (Int, Int, Int), sp : Int, surface : Int) : Strata.Roads.RoadGraph do
+    match dk do
+      (cx, cz, r) ->
+        let os = offsets(r, sp)
+        let seed = d.md_settings.ms_seed
+        let pairs = List.flat_map(os, fn a -> List.map(os, fn b -> (a, b)))
+        List.fold_left(pairs, SeR.graph(), fn (g, p) -> broken_cell(g, d, cx, cz, r, sp, seed, surface, p))
+    end
+  end
+  pfn broken_cell(g : Strata.Roads.RoadGraph, d : StrataMaps.Data.MapData, cx : Int, cz : Int, r : Int, sp : Int, seed : Int, surface : Int, p : (Int, Int)) : Strata.Roads.RoadGraph do
+    match p do
+      (a, b) ->
+        let keep = fn k -> u(seed, 7000 + (a + 10000) * 31 + (b + 10000) * 977 + k) >= 0.25
+        let x = cx + a
+        let z = cz + b
+        let g1 = if keep(1) && inside((cx, cz, r), x, z) && inside((cx, cz, r), x + sp, z) do road(g, d, x, z, x + sp, z, 6.4, surface) else g end
+        if keep(2) && inside((cx, cz, r), x, z) && inside((cx, cz, r), x, z + sp) do road(g1, d, x, z, x, z + sp, 6.4, surface) else g1 end
+    end
+  end
+  -- arterial: two main roads crossing at the centre, spurs off them every [sp]
+  pfn arterial(d : StrataMaps.Data.MapData, dk : (Int, Int, Int), sp : Int, surface : Int) : Strata.Roads.RoadGraph do
+    match dk do
+      (cx, cz, r) ->
+        let g1 = road(road(SeR.graph(), d, cx - r, cz, cx + r, cz, 8.0, surface), d, cx, cz - r, cx, cz + r, 8.0, surface)
+        let len = sp * 3 / 4
+        let os = List.filter(offsets(r, sp), fn o -> o != 0)
+        let g2 = List.fold_left(os, g1, fn (g, o) -> road(g, d, cx + o, cz, cx + o, cz + (if (o / Math.max_int(1, sp)) % 2 == 0 do len else 0 - len end), 4.8, surface))
+        List.fold_left(os, g2, fn (g, o) -> road(g, d, cx, cz + o, cx + (if (o / Math.max_int(1, sp)) % 2 == 0 do 0 - len else len end), cz + o, 4.8, surface))
+    end
+  end
+
+  doc "The settlement for the data's settlement knob: the settled disc, its roads (the settings' pattern), the ground fitted to them, bridges, and lots. Settlement 0 changes nothing."
+  fn run(d : StrataMaps.Data.MapData) : StrataMaps.Data.MapData do
+    let s = d.md_settings
+    let share = s.ms_knobs.mk_settlement
+    if share <= 0.0 do d
+    else
+      let dk = disc(d, share)
+      let density = s.ms_knobs.mk_density
+      let sp = float_to_int((40.0 -. 16.0 *. density) /. SeS.scale())
+      let asphalt = d.md_blocks.mb_asphalt
+      let roads = if s.ms_pattern == 1 do arterial(d, dk, sp, asphalt) else if s.ms_pattern == 2 do broken(d, dk, sp, asphalt) else grid(d, dk, sp, asphalt) end end
+      let h = SeR.adapt(roads, d.md_heights, SeS.scale(), 0.1)
+      let bridges = SeR.bridges(roads, h, fn (x, z) -> SeD.water_at(d, x, z) >= 0, SeS.scale())
+      match SeD.playable(d) do
+        (px, pz, n) ->
+          let lv = levels(d, h)
+          let ok = fn (x, z) -> inside(dk, x, z) && buildable(d, lv, x, z)
+          let blocks = Strata.Lots.blocks(roads, px, pz, n, SeS.scale(), ok)
+          let most = Math.max_int(8, float_to_int(40.0 -. 16.0 *. density))
+          let lots = List.flat_map(blocks, fn b -> Strata.Lots.split(b, roads, SeS.scale(), 8, most, s.ms_seed))
+          -- the room the disc had: buildable columns over all its columns, sampled every 4th
+          let cols = List.filter(List.map(List.range(0, (n / 4) * (n / 4)), fn i -> (px + (i % (n / 4)) * 4, pz + (i / (n / 4)) * 4)), fn c -> match c do (x, z) -> inside(dk, x, z) end)
+          let lv0 = levels(d, d.md_heights)
+          let good = List.length(List.filter(cols, fn c -> match c do (x, z) -> buildable(d, lv0, x, z) end))
+          let all = Math.max_int(1, List.length(cols))
+          let d1 = { d with md_heights: h, md_roads: roads, md_bridges: bridges, md_settled: dk, md_lots: lots }
+          if good * 10 < all * 9 do SeD.report(d1, "settlement: room for " ++ int_to_string(good * 100 / all) ++ "% of the settled area; placed " ++ int_to_string(List.length(lots)) ++ " lots") else d1 end
+      end
+    end
+  end
+end

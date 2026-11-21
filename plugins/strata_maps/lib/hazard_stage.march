@@ -1,0 +1,94 @@
+-- HazardStage — lava in the lowest open ground.
+--
+-- For hazard above 0, lava takes up to 15% of the playable square at hazard
+-- 1: the lowest columns of open ground (no water, road, lot or trail within 3
+-- columns, so the scorched ring never reaches them), lowest first, so a
+-- canyon's floor fills before anything else. The pool's surface is level, 2
+-- voxels below the highest ground it takes and no higher than the lowest
+-- ground round it, so it is held in; its bed lies 4 under where the
+-- ground was. Every other column within 3 of lava is scorched. When less
+-- open ground was found than the hazard asked for, a report line says so.
+mod StrataMaps.HazardStage do
+
+  alias StrataMaps.Data as HzD
+
+  -- 1 for each column of the n x n square from (px, pz) with water, a road or a lot, grown by 3 columns
+  pfn blocked(d : StrataMaps.Data.MapData, px : Int, pz : Int, n : Int) : NativeIntArr do
+    let roads = Strata.Roads.mask(d.md_roads, px, pz, n, StrataMaps.Settings.scale())
+    let lots = List.fold_left(d.md_lots, NativeArray.make_int(Math.max_int(1, n * n), 0), fn (a, l) -> mark_lot(a, l, px, pz, n))
+    let hard = List.fold_left(List.range(0, n * n), NativeArray.make_int(Math.max_int(1, n * n), 0), fn (a, i) ->
+      if NativeArray.get_int(roads, i) == 1 || NativeArray.get_int(lots, i) == 1 || HzD.water_at(d, px + i % n, pz + i / n) >= 0 || HzD.on_trail(d, px + i % n, pz + i / n) do NativeArray.set_int(a, i, 1) else a end)
+    grow(hard, n, 3)
+  end
+  pfn mark_lot(a : NativeIntArr, l : Strata.Lots.Lot, px : Int, pz : Int, n : Int) : NativeIntArr do
+    match Strata.Lots.lot_box(l) do
+      (x0, z0, x1, z1) ->
+        let w = x1 - x0 + 1
+        List.fold_left(List.range(0, w * (z1 - z0 + 1)), a, fn (b, k) -> set_in(b, n, x0 + k % w - px, z0 + k / w - pz))
+    end
+  end
+  pfn set_in(a : NativeIntArr, n : Int, i : Int, j : Int) : NativeIntArr do if i < 0 || j < 0 || i >= n || j >= n do a else NativeArray.set_int(a, j * n + i, 1) end end
+  -- the mask grown by r columns (a square around each marked column): a pass along x, then along z
+  pfn grow(a : NativeIntArr, n : Int, r : Int) : NativeIntArr do
+    let along = fn (src, dx, dz) -> List.fold_left(List.range(0, n * n), NativeArray.make_int(Math.max_int(1, n * n), 0), fn (b, i) ->
+      if any_near(src, n, i % n, i / n, dx, dz, r) do NativeArray.set_int(b, i, 1) else b end)
+    along(along(a, 1, 0), 0, 1)
+  end
+  pfn any_near(a : NativeIntArr, n : Int, x : Int, z : Int, dx : Int, dz : Int, r : Int) : Bool do
+    List.any(List.range(0 - r, r + 1), fn k -> near_one(a, n, x + k * dx, z + k * dz))
+  end
+  pfn near_one(a : NativeIntArr, n : Int, x : Int, z : Int) : Bool do x >= 0 && z >= 0 && x < n && z < n && NativeArray.get_int(a, z * n + x) == 1 end
+
+  doc "Lava for the data's hazard knob: pools in the lowest open ground (up to 15% of the playable square at hazard 1), a level surface 2 under the highest ground taken, a scorched ring 3 wide; never on or within 3 of water, roads or lots (a report line when less fitted than asked). Hazard 0 changes nothing."
+  fn run(d : StrataMaps.Data.MapData) : StrataMaps.Data.MapData do
+    let hz = d.md_settings.ms_knobs.mk_hazard
+    if hz <= 0.0 do d
+    else
+      match HzD.playable(d) do
+        (px, pz, n) ->
+          let block = blocked(d, px, pz, n)
+          let ask = float_to_int(0.15 *. hz *. int_to_float(n * n))
+          let cands = List.filter_map(List.range(0, n * n), fn i -> if NativeArray.get_int(block, i) == 1 do None else Some((Strata.Heights.get(d.md_heights, px + i % n, pz + i / n), i)) end)
+          let sorted = List.sort_by(cands, fn (a, b) -> match (a, b) do ((ha, ia), (hb, ib)) -> ha < hb || (ha == hb && ia < ib) end)
+          let chosen = List.take(sorted, ask)
+          let d1 = if List.length(cands) < ask do HzD.report(d, "lava: room for " ++ int_to_string(List.length(cands)) ++ " of " ++ int_to_string(ask) ++ " columns") else d end
+          match chosen do
+            Nil -> d1
+            _ ->
+              let top = List.fold_left(chosen, -1000000, fn (m, c) -> match c do (h, _) -> Math.max_int(m, h) end)
+              -- no higher than the lowest ground round the pools (columns beside a pool that are not lava), so the lava is held in
+              let pool = List.fold_left(chosen, NativeArray.make_int(Math.max_int(1, n * n), 0), fn (a, c) -> match c do (_, i) -> NativeArray.set_int(a, i, 1) end)
+              let rim = List.fold_left(chosen, 1000000, fn (m, c) -> match c do (_, i) -> Math.min_int(m, rim_at(d1, pool, px, pz, n, i)) end)
+              lay(d1, chosen, px, pz, n, Math.min_int(top - 2, rim))
+          end
+      end
+    end
+  end
+
+  -- the lowest ground beside column i that is not in the pool
+  pfn rim_at(d : StrataMaps.Data.MapData, pool : NativeIntArr, px : Int, pz : Int, n : Int, i : Int) : Int do
+    let x = i % n
+    let z = i / n
+    List.fold_left([(x + 1, z), (x - 1, z), (x, z + 1), (x, z - 1)], 1000000, fn (m, c) -> match c do
+      (a, b) -> if a >= 0 && b >= 0 && a < n && b < n && NativeArray.get_int(pool, b * n + a) == 1 do m else Math.min_int(m, Strata.Heights.get(d.md_heights, px + a, pz + b)) end
+    end)
+  end
+  -- the pool at [level] over the chosen columns; their beds lowered; the scorched ring
+  pfn lay(d : StrataMaps.Data.MapData, chosen : List((Int, Int)), px : Int, pz : Int, n : Int, level : Int) : StrataMaps.Data.MapData do
+    let d2 = List.fold_left(chosen, d, fn (acc, c) -> match c do (h, i) -> pool(acc, px + i % n, pz + i / n, h, level) end)
+    let lava = List.fold_left(chosen, NativeArray.make_int(Math.max_int(1, n * n), 0), fn (a, c) -> match c do (_, i) -> NativeArray.set_int(a, i, 1) end)
+    let ring = grow(lava, n, 3)
+    List.fold_left(List.range(0, n * n), d2, fn (acc, i) -> if NativeArray.get_int(ring, i) == 1 && NativeArray.get_int(lava, i) == 0 do scorch(acc, px + i % n, pz + i / n) else acc end)
+  end
+  pfn pool(d : StrataMaps.Data.MapData, x : Int, z : Int, h : Int, level : Int) : StrataMaps.Data.MapData do
+    let n = StrataMaps.Settings.side_voxels(d.md_settings)
+    let c = HzD.corner(d.md_settings)
+    let i = (z - c) * n + (x - c)
+    { d with md_heights: Strata.Heights.set(d.md_heights, x, z, Math.min_int(h, level + 2) - 4), md_lava: NativeArray.set_int(d.md_lava, i, level) }
+  end
+  pfn scorch(d : StrataMaps.Data.MapData, x : Int, z : Int) : StrataMaps.Data.MapData do
+    let n = StrataMaps.Settings.side_voxels(d.md_settings)
+    let c = HzD.corner(d.md_settings)
+    { d with md_scorched: NativeArray.set_int(d.md_scorched, (z - c) * n + (x - c), 1) }
+  end
+end

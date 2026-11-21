@@ -1,0 +1,123 @@
+-- PieceStage — set pieces placed by zone.
+--
+-- A piece is a template the game supplies with a zone (0 a yard: a lot's
+-- ground outside its building; 1 high ground: open ground in the highest
+-- fifth; 2 on a road; 3 open ground: no road, lot, water or lava), how many
+-- a map gets (a range; the count drawn by a hash), and whether it needs
+-- level ground (its footprint varying by at most one height step). Places
+-- are tried every 3 columns over the playable square in an order and with
+-- quarter turns drawn by a hash; a piece goes where its whole footprint is
+-- in its zone, off buildings, water, lava and every piece already placed,
+-- standing on the highest ground under it. A report line names a piece that
+-- got fewer than its least.
+mod StrataMaps.PieceStage do
+
+  alias StrataMaps.Data as PcD
+
+  type MapPiece = { mp_template : Strata.Template.Template, mp_zone : Int, mp_per_map : (Int, Int), mp_needs_flat : Bool }
+
+  -- what a column of the n x n square is: per index, bits 1 road, 2 lot, 4 building, 8 water or lava, 16 taken
+  pfn kinds(d : StrataMaps.Data.MapData, px : Int, pz : Int, n : Int) : NativeIntArr do
+    let roads = Strata.Roads.mask(d.md_roads, px, pz, n, StrataMaps.Settings.scale())
+    let a0 = List.fold_left(List.range(0, n * n), NativeArray.make_int(Math.max_int(1, n * n), 0), fn (a, i) ->
+      let x = px + i % n
+      let z = pz + i / n
+      let v = (if NativeArray.get_int(roads, i) == 1 do 1 else 0 end) + (if PcD.water_at(d, x, z) >= 0 || PcD.lava_at(d, x, z) >= 0 do 8 else 0 end) + (if PcD.on_trail(d, x, z) do 16 else 0 end)
+      if v == 0 do a else NativeArray.set_int(a, i, v) end)
+    let a1 = List.fold_left(d.md_lots, a0, fn (a, l) -> match Strata.Lots.lot_box(l) do (x0, z0, x1, z1) -> mark(a, n, px, pz, x0, z0, x1, z1, 2) end)
+    List.fold_left(d.md_buildings, a1, fn (a, b) -> List.fold_left(Strata.Building.footprint(b.mbd_plan), a, fn (a2, f) -> match f do (x0, z0, x1, z1) -> mark(a2, n, px, pz, x0, z0, x1, z1, 4) end))
+  end
+  pfn mark(a : NativeIntArr, n : Int, px : Int, pz : Int, x0 : Int, z0 : Int, x1 : Int, z1 : Int, bit : Int) : NativeIntArr do
+    let w = x1 - x0 + 1
+    if w <= 0 || z1 < z0 do a
+    else List.fold_left(List.range(0, w * (z1 - z0 + 1)), a, fn (b, k) -> add_bit(b, n, x0 + k % w - px, z0 + k / w - pz, bit)) end
+  end
+  pfn add_bit(a : NativeIntArr, n : Int, i : Int, j : Int, bit : Int) : NativeIntArr do
+    if i < 0 || j < 0 || i >= n || j >= n do a
+    else
+      let v = NativeArray.get_int(a, j * n + i)
+      if (v / bit) % 2 == 1 do a else NativeArray.set_int(a, j * n + i, v + bit) end
+    end
+  end
+  pfn has(v : Int, bit : Int) : Bool do (v / bit) % 2 == 1 end
+
+  -- may a column of kind v be under a piece of [zone]? (high: also at or above [high])
+  pfn zone_ok(zone : Int, v : Int, h : Int, high : Int) : Bool do
+    if has(v, 4) || has(v, 8) || has(v, 16) do false
+    else if zone == 0 do has(v, 2)
+    else if zone == 2 do has(v, 1)
+    else if zone == 1 do !has(v, 1) && !has(v, 2) && h >= high
+    else !has(v, 1) && !has(v, 2) end end end end
+  end
+
+  -- the highest fifth of open ground starts here
+  pfn high_mark(d : StrataMaps.Data.MapData, ks : NativeIntArr, px : Int, pz : Int, n : Int) : Int do
+    let hs = List.filter_map(List.range(0, (n / 4) * (n / 4)), fn k ->
+      let i = ((k / (n / 4)) * 4) * n + (k % (n / 4)) * 4
+      if NativeArray.get_int(ks, i) == 0 do Some(Strata.Heights.get(d.md_heights, px + i % n, pz + i / n)) else None end)
+    let sorted = List.sort_by(hs, fn (a, b) -> a < b)
+    match List.nth_opt(sorted, List.length(sorted) * 4 / 5) do Some(h) -> h | None -> 1000000 end
+  end
+
+  -- try to place piece [p] at column (x, z) turned [rot]: its origin height, if it fits
+  pfn fits(d : StrataMaps.Data.MapData, ks : NativeIntArr, px : Int, pz : Int, n : Int, high : Int, p : MapPiece, x : Int, z : Int, rot : Int) : Option(Int) do
+    match Strata.Template.bounds(p.mp_template, x, 0, z, rot) do
+      (x0, _, z0, x1, _, z1) ->
+        if x0 < px || z0 < pz || x1 >= px + n || z1 >= pz + n do None
+        else
+          let w = x1 - x0 + 1
+          let cols = List.map(List.range(0, w * (z1 - z0 + 1)), fn k -> (x0 + k % w, z0 + k / w))
+          let hs = List.map(cols, fn c -> match c do (cx, cz) -> Strata.Heights.get(d.md_heights, cx, cz) end)
+          let top = List.fold_left(hs, -1000000, fn (m, h) -> Math.max_int(m, h))
+          let low = List.fold_left(hs, 1000000, fn (m, h) -> Math.min_int(m, h))
+          let ok = List.all(cols, fn c -> match c do (cx, cz) -> zone_ok(p.mp_zone, NativeArray.get_int(ks, (cz - pz) * n + (cx - px)), Strata.Heights.get(d.md_heights, cx, cz), high) end)
+          if ok && (!p.mp_needs_flat || top - low <= d.md_settings.ms_step) do Some(top) else None end
+        end
+    end
+  end
+
+  -- piece pi placed up to its count; (kinds, placed, how many)
+  pfn place_piece(d : StrataMaps.Data.MapData, px : Int, pz : Int, n : Int, high : Int, st : (NativeIntArr, List(StrataMaps.Data.MapPlaced), List(String)), pi : Int, p : MapPiece) : (NativeIntArr, List(StrataMaps.Data.MapPlaced), List(String)) do
+    match p.mp_per_map do
+      (lo, hi) ->
+        let seed = Strata.Seed.mix(d.md_settings.ms_seed, 9301 + pi)
+        let want = lo + Math.min_int(Math.max_int(0, hi - lo), float_to_int(Strata.Seed.unit(Strata.Seed.mix(seed, 1)) *. int_to_float(hi - lo + 1)))
+        let spots = List.map(List.range(0, (n / 3) * (n / 3)), fn k -> (px + (k % (n / 3)) * 3, pz + (k / (n / 3)) * 3, Strata.Seed.mix(seed, 100 + k)))
+        let order = List.sort_by(spots, fn (a, b) -> match (a, b) do ((_, _, ha), (_, _, hb)) -> ha < hb end)
+        match List.fold_left(order, (st, 0), fn (acc, s) -> try_spot(d, px, pz, n, high, p, want, acc, s)) do
+          ((ks, placed, reports), got) -> (ks, placed, if got < lo do List.append(reports, ["pieces: placed " ++ int_to_string(got) ++ " of at least " ++ int_to_string(lo) ++ " of piece " ++ int_to_string(pi)]) else reports end)
+        end
+    end
+  end
+  pfn try_spot(d : StrataMaps.Data.MapData, px : Int, pz : Int, n : Int, high : Int, p : MapPiece, want : Int, acc : ((NativeIntArr, List(StrataMaps.Data.MapPlaced), List(String)), Int), s : (Int, Int, Int)) : ((NativeIntArr, List(StrataMaps.Data.MapPlaced), List(String)), Int) do
+    match (acc, s) do
+      (((ks, placed, rs), got), (x, z, h)) ->
+        if got >= want do acc
+        else
+          let rot = int_mod_euclid(h, 4)
+          match fits(d, ks, px, pz, n, high, p, x, z, rot) do
+            None -> acc
+            Some(y) -> match Strata.Template.bounds(p.mp_template, x, 0, z, rot) do
+              (x0, _, z0, x1, _, z1) -> ((mark(ks, n, px, pz, x0, z0, x1, z1, 16), Cons({ mpl_template: p.mp_template, mpl_origin: (x, y, z), mpl_rot: rot, mpl_kind: 0 }, placed), rs), got + 1)
+            end
+          end
+        end
+    end
+  end
+
+  doc "The set pieces placed, each by its zone and count, never on buildings, water, lava or each other (report lines for pieces short of their least)."
+  fn run(d : StrataMaps.Data.MapData, pieces : List(MapPiece)) : StrataMaps.Data.MapData do
+    match pieces do
+      Nil -> d
+      _ ->
+        match PcD.playable(d) do
+          (px, pz, n) ->
+            let ks = kinds(d, px, pz, n)
+            let high = high_mark(d, ks, px, pz, n)
+            match List.fold_left(List.range(0, List.length(pieces)), (ks, Nil, Nil), fn (st, pi) -> place_piece(d, px, pz, n, high, st, pi, List.nth(pieces, pi))) do
+              (_, placed, reports) -> List.fold_left(reports, { d with md_placed: List.append(d.md_placed, List.reverse(placed)) }, fn (acc, r) -> PcD.report(acc, r))
+            end
+        end
+    end
+  end
+end

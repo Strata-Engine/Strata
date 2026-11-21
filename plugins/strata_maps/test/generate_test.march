@@ -1,0 +1,104 @@
+-- The tactical check on the built world, and generate with every stage.
+mod StrataMaps.Test.Generate do
+
+  needs IO.Clock
+  needs IO.Console
+  needs IO.FileRead
+  needs IO.FileWrite
+  needs IO.Process
+  import Test
+  alias StrataMaps.Check as MapGe
+  alias StrataMaps.Test.Blocks as MapGeb
+
+  -- ids 1..6 plain, 7..14 water (a fluid), 15..20 plain
+  pfn plain(r : Strata.Blocks.Registry) : Strata.Blocks.Registry do match Strata.Blocks.register(r, Strata.Blocks.def()) do Ok((r2, _)) -> r2 | Err(_) -> r end end
+  pfn reg() : Strata.Blocks.Registry do
+    let r6 = List.fold_left(List.range(0, 6), Strata.Blocks.empty(), fn (r, _) -> plain(r))
+    let water = Strata.Blocks.with_collide(Strata.Blocks.with_layer(Strata.Blocks.with_opacity(Strata.Blocks.def(), Strata.Blocks.SeeThrough), Strata.Blocks.Translucent), false)
+    let r14 = match Strata.Blocks.register_fluid(r6, water) do Ok((r, _)) -> r | Err(_) -> r6 end
+    List.fold_left(List.range(0, 6), r14, fn (r, _) -> plain(r))
+  end
+  pfn blocks() : StrataMaps.Settings.MapBlocks do { MapGeb.ids() with mb_water: 14 } end
+  pfn mover() : StrataTactics.Reach.Mover do StrataTactics.Reach.mover(8, 2, 3, 10) end
+  pfn zone(name : String, edge : Int) : StrataMaps.Sites.SiteRule do
+    { sr_name: name, sr_kind: 0, sr_tiles: 4, sr_edge: edge, sr_far_from: Nil, sr_high: false, sr_in_settlement: false, sr_open_sky: false, sr_count: 1 }
+  end
+  pfn rules() : List(StrataMaps.Sites.SiteRule) do [zone("north", 3), zone("south", 2)] end
+  pfn crate() : Strata.Template.Template do Strata.Template.make(8, 6, 8, NativeArray.make_i32(384, 18), 0.4) end
+  pfn crates() : List(StrataMaps.PieceStage.MapPiece) do [{ mp_template: crate(), mp_zone: 3, mp_per_map: (12, 16), mp_needs_flat: false }] end
+  -- the check on data: its world, grid, sites
+  pfn checked(d : StrataMaps.Data.MapData) : StrataMaps.Check.CheckReport do
+    let w = StrataMaps.RuinStage.scratch(d, reg())
+    let g = StrataMaps.grid(d, w)
+    MapGe.run(w, g, StrataMaps.Sites.place(d, g, rules()), mover())
+  end
+  -- flat ground at 8 with a river 16 voxels wide (bed 0, water to 6) across the whole square at z -8..7
+  pfn river_map() : StrataMaps.Data.MapData do
+    let d0 = StrataMaps.Data.empty(StrataMaps.Settings.settings(3, 16), blocks())
+    let c = StrataMaps.Data.corner(d0.md_settings)
+    let n = StrataMaps.Settings.side_voxels(d0.md_settings)
+    List.fold_left(List.range(0, n * 16), d0, fn (d, i) ->
+      let x = c + i % n
+      let z = -8 + i / n
+      StrataMaps.Data.with_water({ d with md_heights: Strata.Heights.set(d.md_heights, x, z, 0) }, x, z, 6))
+  end
+
+  describe "Check and generate" do
+    test "a single bridge over a wide river is one route and fails" do
+      let d0 = river_map()
+      -- one road a tile wide (x 0..7), north to south over the river
+      match Strata.Roads.add_node(Strata.Roads.graph(), 1.6, -24.0) do
+        (g1, a) -> match Strata.Roads.add_node(g1, 1.6, 24.0) do
+          (g2, b) ->
+            let roads = Strata.Roads.add_segment(g2, a, b, 3.2, 5)
+            let d = { d0 with md_roads: roads, md_heights: Strata.Roads.adapt(roads, d0.md_heights, 0.4, 0.1) }
+            let r = checked(d)
+            Test.assert_true(r.cr_routes == 1 && !r.cr_ok, "one route, failing")
+            Test.assert_true(List.any(r.cr_why, fn w -> String.contains(w, "route")), "the reason says so")
+        end
+      end
+    end
+    test "an open plain with cover passes" do
+      let d0 = MapGeb.data_for(4, 16, 0, 0.0, 0.0)
+      let d = StrataMaps.PieceStage.run(StrataMaps.TerrainStage.run({ d0 with md_blocks: blocks() }), crates())
+      let r = checked(d)
+      Test.assert_true(r.cr_ok && r.cr_routes >= 2 && List.is_empty(r.cr_unreached), "passes")
+      Test.assert_true(r.cr_cover >= 0.08 && r.cr_cover <= 0.6 && r.cr_sight >= 1, "cover in range, a clear line")
+    end
+    test "generate returns a passing map for an ordinary blend" do
+      let s0 = StrataMaps.Settings.settings(5, 16)
+      let k = List.fold_left([("relief", 0.3), ("water", 0.4), ("settlement", 0.4), ("density", 0.5), ("vegetation", 0.3), ("ruin", 0.3)], s0.ms_knobs, fn (acc, kv) -> match kv do (name, v) -> StrataMaps.Settings.with_knob(acc, name, v) end)
+      let style = { Strata.Building.style(6, 2, 3, 6, 5) with bs_door: 2 }
+      match StrataMaps.generate({ s0 with ms_base: 1, ms_knobs: k }, blocks(), reg(), [style], crates(), Nil, rules(), mover()) do
+        (_, _, d, r) -> Test.assert_true(r.cr_ok && List.length(d.md_sites) == 2, "passes with both zones")
+      end
+    end
+    test "a map that cannot pass returns the best attempt with reasons after 8 tries" do
+      let s0 = StrataMaps.Settings.settings(6, 16)
+      let k = StrataMaps.Settings.with_knob(StrataMaps.Settings.with_knob(s0.ms_knobs, "relief", 1.0), "water", 1.0)
+      match StrataMaps.generate({ s0 with ms_base: 2, ms_knobs: k }, blocks(), reg(), Nil, Nil, Nil, rules(), StrataTactics.Reach.mover(8, 0, 0, 10)) do
+        (_, _, _, r) -> Test.assert_true(!r.cr_ok && r.cr_attempts == 8 && !List.is_empty(r.cr_why), "fails with reasons")
+      end
+    end
+    test "load_archetypes reads a section and reports a bad line" do
+      match StrataMaps.load_archetypes("[River Town]\nbase = rolling\nwater = 0.5 0.7\nsettlement = 0.4 0.6\n") do
+        Ok(Cons(a, Nil)) ->
+          let s = StrataMaps.Settings.apply(a, 3, StrataMaps.Settings.settings(3, 16))
+          Test.assert_true(a.ar_name == "River Town" && s.ms_base == 1 && s.ms_knobs.mk_water >= 0.5 && s.ms_knobs.mk_water <= 0.7, "read")
+        _ -> Test.fail("not one archetype")
+      end
+      match StrataMaps.load_archetypes("[A]\nwater = lots\n") do
+        Err(e) -> Test.assert_true(String.contains(e, "line 2"), "names the line")
+        Ok(_) -> Test.fail("accepted a bad line")
+      end
+    end
+  end
+
+  describe "Generate (review)" do
+    test "an attempt with every site placed beats one missing a site, whatever its routes" do
+      let missing = { cr_ok: false, cr_routes: 3, cr_unreached: Nil, cr_cover: 0.2, cr_sight: 1, cr_attempts: 1, cr_why: ["sites: could not place spawn south"] }
+      let whole = { cr_ok: false, cr_routes: 2, cr_unreached: Nil, cr_cover: 0.62, cr_sight: 1, cr_attempts: 2, cr_why: ["cover on 62% of standable tiles (8% to 60% wanted)"] }
+      Test.assert_true(StrataMaps.better(whole, missing) && !StrataMaps.better(missing, whole), "the whole map wins")
+    end
+  end
+end

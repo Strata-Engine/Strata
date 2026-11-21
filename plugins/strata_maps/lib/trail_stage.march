@@ -1,0 +1,275 @@
+-- TrailStage — passes cut through ground no route crosses.
+--
+-- First the landings: where the two rows along the north or south edge have
+-- no dry 3 x 2 block of tiles (or 6-tile strip along the outer row) within 2
+-- height steps, the most level one is flattened to its mean height, room
+-- for a spawn. Then, when the early check
+-- (StrataMaps.Check.early) finds no route between the north and south edges
+-- for the mover, two trails are cut, from the north landing. Each is the
+-- cheapest path over the playable square's tiles from a tile of the north
+-- edge to the south edge, a step costing 1, plus 6 for each height step of
+-- climb or drop beyond the mover's reach, plus 4 into water deeper than 2
+-- voxels; the second trail costs 12 more on tiles within 2 of the first, so
+-- the two stay apart. Along a trail the tiles' heights are eased (forward
+-- and back, until every step is within reach), then each tile of the trail
+-- is set flat to its height (cut and fill); under deep water the bed is
+-- raised to 2 below the water, a ford. The trails are graded ground, not
+-- roads: the generator draws them as the ground they are. Their tiles are
+-- recorded (md_trails), and lots, lava, set pieces and trees keep off them.
+mod StrataMaps.TrailStage do
+
+  alias StrataMaps.Data as TrD
+
+  pfn reach(d : StrataMaps.Data.MapData, m : StrataTactics.Reach.Mover) : Int do Math.max_int(d.md_settings.ms_step, Math.min_int(m.mv_jump, m.mv_drop) * d.md_settings.ms_step) end
+
+  -- a tile's height (its middle column; deep water counts as a ford's bed) and its water level
+  pfn tile_h(d : StrataMaps.Data.MapData, px : Int, pz : Int, tx : Int, tz : Int) : Int do
+    let x = px + tx * 8 + 4
+    let z = pz + tz * 8 + 4
+    let h = Strata.Heights.get(d.md_heights, x, z)
+    let lv = TrD.water_at(d, x, z)
+    if lv >= 0 && lv - h > 2 do lv - 2 else h end
+  end
+  pfn deep(d : StrataMaps.Data.MapData, px : Int, pz : Int, tx : Int, tz : Int) : Bool do
+    let x = px + tx * 8 + 4
+    let z = pz + tz * 8 + 4
+    let lv = TrD.water_at(d, x, z)
+    lv >= 0 && lv - Strata.Heights.get(d.md_heights, x, z) > 2
+  end
+
+  -- the cheapest path from (sx, 0) to any tile of the last row: tiles in order, by Dijkstra with an open list
+  pfn path(d : StrataMaps.Data.MapData, px : Int, pz : Int, t : Int, sx : Int, reachv : Int, avoid : NativeIntArr, goal : List((Int, Int))) : List((Int, Int)) do
+    let dist = NativeArray.set_int(NativeArray.make_int(t * t, 1000000000), sx, 0)
+    let par = NativeArray.make_int(t * t, -1)
+    match search(d, px, pz, t, reachv, avoid, goal, [(0, sx)], dist, par, NativeArray.make_int(t * t, 0)) do
+      (end_i, par2) -> if end_i < 0 do Nil else List.reverse(back(par2, t, end_i, Nil)) end
+    end
+  end
+  pfn back(par : NativeIntArr, t : Int, i : Int, acc : List((Int, Int))) : List((Int, Int)) do
+    if i < 0 do List.reverse(acc) else back(par, t, NativeArray.get_int(par, i), List.append(acc, [(i % t, i / t)])) end
+  end
+  pfn search(d : StrataMaps.Data.MapData, px : Int, pz : Int, t : Int, reachv : Int, avoid : NativeIntArr, goal : List((Int, Int)), open : List((Int, Int)), dist : NativeIntArr, par : NativeIntArr, done : NativeIntArr) : (Int, NativeIntArr) do
+    match open do
+      Nil -> (-1, par)
+      _ ->
+        let best = List.fold_left(open, (2000000000, -1), fn (b, o) -> match (b, o) do ((bc, _), (c, i)) -> if c < bc do (c, i) else b end end)
+        match best do
+          (c, i) ->
+            let rest = List.filter(open, fn o -> match o do (_, j) -> j != i end)
+            if NativeArray.get_int(done, i) == 1 do search(d, px, pz, t, reachv, avoid, goal, rest, dist, par, done)
+            else if (List.is_empty(goal) && i / t == t - 1) || List.member(goal, (i % t, i / t)) do (i, par)
+            else
+              let done2 = NativeArray.set_int(done, i, 1)
+              match List.fold_left(List.range(0, 4), (rest, dist, par), fn (acc, k) -> relax(d, px, pz, t, reachv, avoid, done2, i, c, k, acc)) do
+                (o2, d2, p2) -> search(d, px, pz, t, reachv, avoid, goal, o2, d2, p2, done2)
+              end
+            end end
+        end
+    end
+  end
+  pfn relax(d : StrataMaps.Data.MapData, px : Int, pz : Int, t : Int, reachv : Int, avoid : NativeIntArr, done : NativeIntArr, i : Int, c : Int, k : Int, acc : (List((Int, Int)), NativeIntArr, NativeIntArr)) : (List((Int, Int)), NativeIntArr, NativeIntArr) do
+    match acc do
+      (open, dist, par) ->
+        let tx = i % t
+        let tz = i / t
+        let (ux, uz) = if k == 0 do (tx + 1, tz) else if k == 1 do (tx - 1, tz) else if k == 2 do (tx, tz + 1) else (tx, tz - 1) end end end
+        if ux < 0 || uz < 0 || ux >= t || uz >= t do acc
+        else
+          let j = uz * t + ux
+          let dh = int_abs(tile_h(d, px, pz, ux, uz) - tile_h(d, px, pz, tx, tz))
+          let step = 1 + 6 * Math.max_int(0, dh - reachv) / Math.max_int(1, d.md_settings.ms_step) + (if deep(d, px, pz, ux, uz) do 4 else 0 end) + NativeArray.get_int(avoid, j)
+          let nc = c + step
+          if NativeArray.get_int(done, j) == 1 || nc >= NativeArray.get_int(dist, j) do acc
+          else (Cons((nc, j), open), NativeArray.set_int(dist, j, nc), NativeArray.set_int(par, j, i)) end
+        end
+    end
+  end
+
+  -- heights eased along a path so every step is within reach: forward and back, sixteen times over; pinned tiles (on landings) stay where they are
+  pfn grade(hs : NativeIntArr, pins : NativeIntArr, n : Int, reachv : Int) : NativeIntArr do
+    List.fold_left(List.range(0, 16), hs, fn (a, _) -> backward(forward(a, pins, n, reachv), pins, n, reachv))
+  end
+  pfn forward(a : NativeIntArr, pins : NativeIntArr, n : Int, r : Int) : NativeIntArr do
+    List.fold_left(List.range(1, Math.max_int(1, n)), a, fn (b, i) -> if NativeArray.get_int(pins, i) == 1 do b else NativeArray.set_int(b, i, clamp(NativeArray.get_int(b, i), NativeArray.get_int(b, i - 1) - r, NativeArray.get_int(b, i - 1) + r)) end)
+  end
+  pfn backward(a : NativeIntArr, pins : NativeIntArr, n : Int, r : Int) : NativeIntArr do
+    List.fold_left(List.range(0, Math.max_int(0, n - 1)), a, fn (b, k) -> let i = n - 2 - k
+      if NativeArray.get_int(pins, i) == 1 do b else NativeArray.set_int(b, i, clamp(NativeArray.get_int(b, i), NativeArray.get_int(b, i + 1) - r, NativeArray.get_int(b, i + 1) + r)) end)
+  end
+  pfn clamp(v : Int, lo : Int, hi : Int) : Int do if v < lo do lo else if v > hi do hi else v end end end
+
+  -- ── Landings ──
+  -- the 3 x 2 block of tiles from column x0 in rows r, r + 1: its tiles
+  pfn block(x0 : Int, r : Int) : List((Int, Int)) do List.map(List.range(0, 6), fn k -> (x0 + k % 3, r + k / 3)) end
+  -- a strip of 6 tiles along one row from column x0
+  pfn strip(x0 : Int, r : Int) : List((Int, Int)) do List.map(List.range(0, 6), fn k -> (x0 + k, r)) end
+  -- the block's spread of heights (its tiles' middles), or none when any of them is under water
+  pfn spread(d : StrataMaps.Data.MapData, px : Int, pz : Int, tiles : List((Int, Int))) : Option(Int) do
+    let cs = List.map(tiles, fn c -> match c do (tx, tz) -> (px + tx * 8 + 4, pz + tz * 8 + 4) end)
+    if List.any(cs, fn c -> match c do (x, z) -> TrD.water_at(d, x, z) >= 0 end) do None
+    else
+      let hs = List.map(cs, fn c -> match c do (x, z) -> Strata.Heights.get(d.md_heights, x, z) end)
+      Some(List.fold_left(hs, -100000, fn (a, v) -> Math.max_int(a, v)) - List.fold_left(hs, 100000, fn (a, v) -> Math.min_int(a, v)))
+    end
+  end
+  -- the most level dry room in rows r, r + 1: a 3 x 2 block there, or a 6-tile strip along the outer row [outer]; (its tiles, its first column, spread)
+  pfn best_block(d : StrataMaps.Data.MapData, px : Int, pz : Int, t : Int, r : Int, outer : Int) : Option((List((Int, Int)), Int, Int)) do
+    let rooms = List.append(List.map(List.range(0, Math.max_int(0, t - 2)), fn x0 -> (block(x0, r), x0)), List.map(List.range(0, Math.max_int(0, t - 5)), fn x0 -> (strip(x0, outer), x0)))
+    List.fold_left(rooms, None, fn (b, rm) -> better_room(d, px, pz, b, rm))
+  end
+  pfn better_room(d : StrataMaps.Data.MapData, px : Int, pz : Int, b : Option((List((Int, Int)), Int, Int)), rm : (List((Int, Int)), Int)) : Option((List((Int, Int)), Int, Int)) do
+    match rm do
+      (tiles, x0) -> match (spread(d, px, pz, tiles), b) do
+        (None, _) -> b
+        (Some(sp), None) -> Some((tiles, x0, sp))
+        (Some(sp), Some((_, _, bs))) -> if sp < bs do Some((tiles, x0, sp)) else b end
+      end
+    end
+  end
+  -- a landing on the edge whose rows start at r: if no dry block there is level (2 steps), the most level is flattened to its mean; its column, if any
+  pfn landing(d : StrataMaps.Data.MapData, r : Int) : (StrataMaps.Data.MapData, Option(Int)) do
+    match TrD.playable(d) do
+      (px, pz, n) ->
+        let t = n / 8
+        match best_block(d, px, pz, t, r, if r == 0 do 0 else t - 1 end) do
+          None -> (d, None)
+          Some((tiles, x0, sp)) ->
+            -- level already: kept as it is, but recorded, so no trail regrades it
+            if sp <= 2 * d.md_settings.ms_step do (record(d, tiles), Some(x0))
+            else
+              let step = Math.max_int(1, d.md_settings.ms_step)
+              let level = int_div_euclid(List.fold_left(tiles, 0, fn (a, c) -> a + mid_height(d, px, pz, c)) / 6, step) * step
+              (record(flatten_tiles(d, tiles, px, pz, level), tiles), Some(x0))
+            end
+        end
+    end
+  end
+  -- tiles kept as the trails' (lots, lava, pieces and trees keep off them; the generator clears the air over them)
+  pfn record(d : StrataMaps.Data.MapData, tiles : List((Int, Int))) : StrataMaps.Data.MapData do
+    match TrD.playable(d) do
+      (px, pz, _) ->
+        let t = d.md_settings.ms_tiles
+        let mask = List.fold_left(tiles, d.md_trail_mask, fn (a, c) -> set_mask(a, t, c))
+        { d with md_trails: List.append(d.md_trails, List.map(tiles, fn c -> corner_of(px, pz, c))), md_trail_mask: mask }
+    end
+  end
+  pfn mid_height(d : StrataMaps.Data.MapData, px : Int, pz : Int, c : (Int, Int)) : Int do match c do (tx, tz) -> Strata.Heights.get(d.md_heights, px + tx * 8 + 4, pz + tz * 8 + 4) end end
+  pfn flatten_tiles(d : StrataMaps.Data.MapData, tiles : List((Int, Int)), px : Int, pz : Int, level : Int) : StrataMaps.Data.MapData do
+    List.fold_left(tiles, d, fn (acc, c) -> lay_one(acc, c, px, pz, level))
+  end
+  pfn set_mask(a : NativeIntArr, t : Int, c : (Int, Int)) : NativeIntArr do match c do (tx, tz) -> NativeArray.set_int(a, tz * t + tx, 1) end end
+  pfn corner_of(px : Int, pz : Int, c : (Int, Int)) : (Int, Int) do match c do (tx, tz) -> (px + tx * 8, pz + tz * 8) end end
+  -- both landings: the data, the north landing's column, the south landing's tiles
+  pfn landed(d : StrataMaps.Data.MapData) : (StrataMaps.Data.MapData, Option(Int), List((Int, Int))) do
+    let t = d.md_settings.ms_tiles
+    let before = List.length(d.md_trails)
+    match landing(d, 0) do
+      (d1, north) ->
+        let mid = List.length(d1.md_trails)
+        match landing(d1, t - 2) do
+          (d2, _) -> (d2, north, List.map(List.drop(d2.md_trails, mid), fn c -> tile_of(d2, c)))
+        end
+    end
+  end
+  pfn tile_of(d : StrataMaps.Data.MapData, c : (Int, Int)) : (Int, Int) do match (TrD.playable(d), c) do ((px, pz, _), (x, z)) -> ((x - px) / 8, (z - pz) / 8) end end
+
+  -- can the mover get from the north landing (column x0, row 0) to any tile of [goal] over tile heights (within reach, wading 2)?
+  pfn joined(d : StrataMaps.Data.MapData, r : Int, x0 : Int, goal : List((Int, Int))) : Bool do
+    match TrD.playable(d) do
+      (px, pz, n) ->
+        let t = n / 8
+        let seen = NativeArray.set_int(NativeArray.make_int(t * t, 0), x0, 1)
+        flood(d, px, pz, t, r, goal, [(x0, 0)], Nil, seen)
+    end
+  end
+  pfn flood(d : StrataMaps.Data.MapData, px : Int, pz : Int, t : Int, r : Int, goal : List((Int, Int)), now : List((Int, Int)), next : List((Int, Int)), seen : NativeIntArr) : Bool do
+    match now do
+      Nil -> match next do Nil -> false | _ -> flood(d, px, pz, t, r, goal, next, Nil, seen) end
+      Cons(c, rest) ->
+        if List.member(goal, c) do true
+        else
+          match List.fold_left(List.range(0, 4), (next, seen), fn (acc, k) -> step_to(d, px, pz, t, r, c, k, acc)) do
+            (n2, s2) -> flood(d, px, pz, t, r, goal, rest, n2, s2)
+          end
+        end
+    end
+  end
+  pfn step_to(d : StrataMaps.Data.MapData, px : Int, pz : Int, t : Int, r : Int, c : (Int, Int), k : Int, acc : (List((Int, Int)), NativeIntArr)) : (List((Int, Int)), NativeIntArr) do
+    match (acc, c) do
+      ((next, seen), (tx, tz)) ->
+        let (ux, uz) = if k == 0 do (tx + 1, tz) else if k == 1 do (tx - 1, tz) else if k == 2 do (tx, tz + 1) else (tx, tz - 1) end end end
+        if ux < 0 || uz < 0 || ux >= t || uz >= t || NativeArray.get_int(seen, uz * t + ux) == 1 do acc
+        else if deep(d, px, pz, ux, uz) || int_abs(Strata.Heights.get(d.md_heights, px + ux * 8 + 4, pz + uz * 8 + 4) - Strata.Heights.get(d.md_heights, px + tx * 8 + 4, pz + tz * 8 + 4)) > r do acc
+        else (Cons((ux, uz), next), NativeArray.set_int(seen, uz * t + ux, 1)) end end
+    end
+  end
+
+  doc "The trails the data would get for [mover] (after its landings): two paths of tiles (the playable square's tile coordinates) from the north edge to the south, or none when a route already crosses the ground."
+  fn paths(d : StrataMaps.Data.MapData, mover : StrataTactics.Reach.Mover) : List(List((Int, Int))) do
+    match landed(d) do (d1, north, south) -> paths_from(d1, mover, north, south) end
+  end
+  pfn paths_from(d : StrataMaps.Data.MapData, mover : StrataTactics.Reach.Mover, north : Option(Int), south : List((Int, Int))) : List(List((Int, Int))) do
+    let r = reach(d, mover)
+    let landings_joined = match north do Some(x0) -> List.is_empty(south) || joined(d, r, x0, south) | None -> true end
+    if StrataMaps.Check.early(d, mover) && landings_joined do Nil
+    else
+      match TrD.playable(d) do
+        (px, pz, n) ->
+          let t = n / 8
+          let h = Strata.Seed.mix(d.md_settings.ms_seed, 7700)
+          -- from the north landing where there is one, else from hashed columns
+          let s1 = match north do Some(x0) -> x0 | None -> t / 4 + int_mod_euclid(h, Math.max_int(1, t / 4)) end
+          let s2 = match north do Some(x0) -> x0 + 2 | None -> t / 2 + int_mod_euclid(h / 7, Math.max_int(1, t / 4)) end
+          let p1 = path(d, px, pz, t, s1, r, NativeArray.make_int(t * t, 0), south)
+          let near = List.fold_left(p1, NativeArray.make_int(t * t, 0), fn (a, c) -> mark_near(a, t, c))
+          let p2 = path(d, px, pz, t, s2, r, near, south)
+          List.filter(List.append([p1], [p2]), fn p -> !List.is_empty(p))
+      end
+    end
+  end
+  pfn mark_near(a : NativeIntArr, t : Int, c : (Int, Int)) : NativeIntArr do
+    match c do (cx, cz) -> List.fold_left(List.range(0, 25), a, fn (b, k) -> near_one(b, t, cx - 2 + k % 5, cz - 2 + k / 5)) end
+  end
+  pfn near_one(a : NativeIntArr, t : Int, x : Int, z : Int) : NativeIntArr do if x < 0 || z < 0 || x >= t || z >= t do a else NativeArray.set_int(a, z * t + x, 12) end end
+
+  -- one trail cut: its tiles set flat to their graded heights
+  pfn cut(d : StrataMaps.Data.MapData, p : List((Int, Int)), r : Int) : StrataMaps.Data.MapData do
+    match TrD.playable(d) do
+      (px, pz, _) ->
+        let n = List.length(p)
+        let t = d.md_settings.ms_tiles
+        let pins = List.fold_left(List.range(0, n), NativeArray.make_int(Math.max_int(1, n), 0), fn (a, i) -> pin(d, t, a, i, List.nth(p, i)))
+        let hs = grade(along(d, px, pz, p, n), pins, n, r)
+        lay(d, p, hs, px, pz, n)
+    end
+  end
+  pfn pin(d : StrataMaps.Data.MapData, t : Int, a : NativeIntArr, i : Int, c : (Int, Int)) : NativeIntArr do match c do (tx, tz) -> if NativeArray.get_int(d.md_trail_mask, tz * t + tx) == 1 do NativeArray.set_int(a, i, 1) else a end end end
+  pfn along(d : StrataMaps.Data.MapData, px : Int, pz : Int, p : List((Int, Int)), n : Int) : NativeIntArr do
+    List.fold_left(List.range(0, n), NativeArray.make_int(Math.max_int(1, n), 0), fn (a, i) -> set_h(d, px, pz, a, i, List.nth(p, i)))
+  end
+  pfn set_h(d : StrataMaps.Data.MapData, px : Int, pz : Int, a : NativeIntArr, i : Int, c : (Int, Int)) : NativeIntArr do match c do (tx, tz) -> NativeArray.set_int(a, i, tile_h(d, px, pz, tx, tz)) end end
+  -- each tile at its graded height as it is: rounding to the height step could put a tile more than the reach from a landing
+  pfn lay(d : StrataMaps.Data.MapData, p : List((Int, Int)), hs : NativeIntArr, px : Int, pz : Int, n : Int) : StrataMaps.Data.MapData do
+    List.fold_left(List.range(0, n), d, fn (acc, i) -> lay_one(acc, List.nth(p, i), px, pz, NativeArray.get_int(hs, i)))
+  end
+  pfn lay_one(d : StrataMaps.Data.MapData, c : (Int, Int), px : Int, pz : Int, h : Int) : StrataMaps.Data.MapData do
+    match c do (tx, tz) -> if NativeArray.get_int(d.md_trail_mask, tz * d.md_settings.ms_tiles + tx) == 1 do d else flat_tile(d, px + tx * 8, pz + tz * 8, h) end end
+  end
+  pfn flat_tile(d : StrataMaps.Data.MapData, x0 : Int, z0 : Int, h : Int) : StrataMaps.Data.MapData do
+    { d with md_heights: List.fold_left(List.range(0, 64), d.md_heights, fn (g, k) -> Strata.Heights.set(g, x0 + k % 8, z0 + k / 8, h)) }
+  end
+
+  doc "The data with a landing on the north and south edges where they have no level dry room for a spawn (a 3 x 2 block of tiles flattened), and two trails cut when no route crosses the ground for [mover] (see `paths`)."
+  fn run(d0 : StrataMaps.Data.MapData, mover : StrataTactics.Reach.Mover) : StrataMaps.Data.MapData do
+    match landed(d0) do (d, north, south) -> cut_all(d, mover, north, south) end
+  end
+  pfn cut_all(d : StrataMaps.Data.MapData, mover : StrataTactics.Reach.Mover, north : Option(Int), south : List((Int, Int))) : StrataMaps.Data.MapData do
+    let r = reach(d, mover)
+    match TrD.playable(d) do
+      (px, pz, _) ->
+        let ps = paths_from(d, mover, north, south)
+        -- each trail cut and recorded before the next, so the next is graded against it (its tiles pinned)
+        List.fold_left(ps, d, fn (acc, p) -> record(cut(acc, p, r), p))
+    end
+  end
+end

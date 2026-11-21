@@ -1,0 +1,99 @@
+-- Objective sites: rules placed on standable tiles, a rule that cannot be met reported.
+mod StrataMaps.Test.Sites do
+
+  needs IO.Clock
+  needs IO.Console
+  needs IO.FileRead
+  needs IO.FileWrite
+  needs IO.Process
+  import Test
+  alias StrataMaps.Sites as MapSi
+  alias StrataMaps.Test.Blocks as MapStb
+
+  pfn reg() : Strata.Blocks.Registry do
+    List.fold_left(List.range(0, 20), Strata.Blocks.empty(), fn (r, i) -> match Strata.Blocks.register(r, Strata.Blocks.with_faces(Strata.Blocks.def(), 1, 1, 1)) do Ok((r2, _)) -> r2 | Err(_) -> r end)
+  end
+  pfn made(seed : Int) : StrataMaps.Data.MapData do StrataMaps.WaterStage.run(StrataMaps.TerrainStage.run(MapStb.data_for(seed, 16, 1, 0.5, 0.5))) end
+  pfn grid_of(d : StrataMaps.Data.MapData) : StrataTactics.Grid.TileGrid do
+    match (StrataMaps.Data.playable(d), StrataMaps.WorldGen.bounds(d)) do
+      ((px, pz, n), (lo, hi)) -> StrataTactics.Grid.build(StrataMaps.RuinStage.scratch(d, reg()), StrataTactics.Grid.settings(px, pz, n / 8, n / 8, 8, 2, lo - 8, hi + 40, 10, fn id -> id))
+    end
+  end
+  pfn rule(name : String, kind : Int, tiles : Int, edge : Int) : StrataMaps.Sites.SiteRule do
+    { sr_name: name, sr_kind: kind, sr_tiles: tiles, sr_edge: edge, sr_far_from: Nil, sr_high: false, sr_in_settlement: false, sr_open_sky: false, sr_count: 1 }
+  end
+  pfn site(d : StrataMaps.Data.MapData, name : String) : List((Int, Int)) do
+    match List.find(d.md_sites, fn s -> s.st_name == name) do Some(s) -> s.st_tiles | None -> Nil end
+  end
+  pfn dist(a : (Int, Int), b : (Int, Int)) : Int do match (a, b) do ((ax, az), (bx, bz)) -> Math.max_int(int_abs(ax - bx), int_abs(az - bz)) end end
+
+  describe "Sites" do
+    test "two spawn zones land on opposite edges" do
+      -- dry rolling ground (a river along an edge can leave it no reachable room: see the mainland tests)
+      let d = StrataMaps.TerrainStage.run(MapStb.data_for(3, 16, 1, 0.5, 0.0))
+      let s = MapSi.place(d, grid_of(d), [rule("north", 0, 4, 3), rule("south", 0, 4, 2)])
+      Test.assert_true(List.length(site(s, "north")) == 4 && List.length(site(s, "south")) == 4, "four tiles each")
+      Test.assert_true(List.all(site(s, "north"), fn t -> match t do (_, tz) -> tz <= 1 end) && List.all(site(s, "south"), fn t -> match t do (_, tz) -> tz >= 14 end), "on the -z and +z edges")
+    end
+    test "far_from keeps the distance" do
+      let d = made(4)
+      let s = MapSi.place(d, grid_of(d), [rule("base", 0, 3, 1), { rule("cache", 1, 1, -1) with sr_far_from: [("base", 8)] }])
+      Test.assert_true(List.all(site(s, "cache"), fn c -> List.all(site(s, "base"), fn b -> dist(c, b) >= 8)) && !List.is_empty(site(s, "cache")), "8 tiles from the base")
+    end
+    test "high picks the highest candidate band" do
+      let d = made(5)
+      let g = grid_of(d)
+      let s = MapSi.place(d, g, [{ rule("hill", 1, 1, -1) with sr_high: true }])
+      let floors = List.sort_by(List.filter_map(List.range(0, 256), fn i -> if StrataTactics.Grid.standable(g, (i % 16, i / 16)) do Some(StrataTactics.Grid.floor(g, (i % 16, i / 16))) else None end), fn (a, b) -> a < b)
+      let band = List.nth(floors, List.length(floors) * 4 / 5)
+      Test.assert_true(List.all(site(s, "hill"), fn t -> StrataTactics.Grid.floor(g, t) >= band) && !List.is_empty(site(s, "hill")), "in the top fifth")
+    end
+    test "no zone on water, lava or rubble" do
+      let d = made(6)
+      let s = MapSi.place(d, grid_of(d), [rule("a", 0, 12, -1), rule("b", 0, 12, -1), rule("c", 0, 12, -1)])
+      match StrataMaps.Data.playable(d) do
+        (px, pz, _) -> Test.assert_true(List.all(List.flat_map(s.md_sites, fn st -> st.st_tiles), fn t -> match t do (tx, tz) -> StrataMaps.Data.water_at(s, px + tx * 8 + 4, pz + tz * 8 + 4) < 0 && StrataMaps.Data.lava_at(s, px + tx * 8 + 4, pz + tz * 8 + 4) < 0 end), "dry and cool")
+      end
+    end
+    test "an impossible rule is reported, not placed" do
+      let d = made(7)
+      let s = MapSi.place(d, grid_of(d), [rule("a", 0, 2, 3), { rule("never", 1, 1, 3) with sr_far_from: [("a", 100)] }])
+      Test.assert_true(List.is_empty(site(s, "never")) && List.any(s.md_reports, fn r -> String.contains(r, "never")), "reported")
+    end
+  end
+
+  pfn joined(d : StrataMaps.Data.MapData, mover : StrataTactics.Reach.Mover) : Bool do
+    let w = StrataMaps.RuinStage.scratch(d, reg())
+    let g = StrataMaps.grid(d, w)
+    let s = MapSi.place(d, g, [rule("north", 0, 4, 3), rule("south", 0, 4, 2)])
+    (StrataMaps.Check.run(w, g, s, mover)).cr_routes >= 1
+  end
+
+  describe "Sites on broken ground" do
+    test "the Highland Pass archetype's zones are joined, forest and all (32 tiles, seed 7)" do
+      let mover = StrataTactics.Reach.mover(6, 2, 3, 12)
+      let s0 = StrataMaps.Settings.settings(7, 32)
+      let k = StrataMaps.Settings.with_knob(StrataMaps.Settings.with_knob(StrataMaps.Settings.with_knob(s0.ms_knobs, "relief", 0.9), "water", 0.25), "vegetation", 0.6)
+      let trees = List.map(List.range(0, 6), fn i -> Strata.Trees.build(i % 3, 1000 + i, 0.4, 16, 17))
+      let d = StrataMaps.GreenStage.run(StrataMaps.TrailStage.run(StrataMaps.WaterStage.run(StrataMaps.TerrainStage.run(StrataMaps.Data.empty({ s0 with ms_base: 2, ms_knobs: k }, MapStb.ids()))), mover), trees)
+      Test.assert_true(joined(d, mover), "a route between the zones")
+    end
+    test "zones land on ground joined to each other" do
+      -- steep highlands with trails cut: both edge zones must stand where a mech can get from one to the other
+      let mover = StrataTactics.Reach.mover(6, 2, 3, 12)
+      let steep = fn sd -> StrataMaps.WaterStage.run(StrataMaps.TerrainStage.run(MapStb.data_for(sd, 16, 2, 0.95, 0.25)))
+      let seeds = List.take(List.filter(List.range(1, 30), fn sd -> !StrataMaps.Check.early(steep(sd), mover)), 5)
+      Test.assert_true(List.length(seeds) >= 3, "steep seeds to try")
+      Test.assert_true(List.all(seeds, fn sd -> joined(StrataMaps.TrailStage.run(steep(sd), mover), mover)), "a route between them on every seed")
+    end
+  end
+
+  describe "Sites and the mainland" do
+    test "a zone is not put on ground cut off from the rest" do
+      -- seed 3's river runs along the north edge, leaving only an island there: the north zone is reported, not placed on it
+      let d = made(3)
+      let s = MapSi.place(d, grid_of(d), [rule("north", 0, 4, 3), rule("south", 0, 4, 2)])
+      Test.assert_true(List.is_empty(site(s, "north")) && List.any(s.md_reports, fn r -> String.contains(r, "north")) && List.length(site(s, "south")) == 4, "north reported, south placed")
+    end
+  end
+end
