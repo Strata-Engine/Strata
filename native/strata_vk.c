@@ -2087,7 +2087,7 @@ static int fig_shadow_record(Frame *F, uint32_t q0) {
 
 int64_t sv_open_slots(int64_t w, int64_t h, int64_t capture_mouse, int64_t quad_capacity, int64_t slots) {
     memset(&g, 0, sizeof g);
-    if (slots < SV_DEFAULT_SLOTS || slots > 262144) return 0;
+    if (slots < SV_DEFAULT_SLOTS || slots > 2097152) return 0;   /* buffers are sized to what is asked: ~1 KB a slot across the frames in flight */
     g.slot_cap = (uint32_t)slots;
     const char *batch = getenv("STRATA_BATCH_SHARED");
     g.batch_shared = !batch || batch[0] != '0';
