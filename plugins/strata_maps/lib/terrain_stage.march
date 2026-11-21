@@ -1,0 +1,106 @@
+-- TerrainStage — the base height field.
+--
+-- The relief knob sets the range R = 6 + 94 x relief voxels (a mech's jump
+-- of gentle steps at 0, 40 m at 1). Recipes, each a noise field shaped:
+--   0 plains     fBm at a quarter of R
+--   1 rolling    fBm at 0.6 R, broad
+--   2 highlands  ridged at the full R
+--   3 canyon     a plateau at R cut by a winding canyon down to the floor
+--   4 plateau    fBm terraced into four levels with sharp edges
+-- Heights start at 8 (ground above the deepest a river carves), are
+-- quantised to the height step, and the ring eases from the playable
+-- square's edge toward the edge's mean height, so the outside is calm.
+mod StrataMaps.TerrainStage do
+
+  alias StrataMaps.Settings as TsS
+  alias StrataMaps.Data as TsD
+  alias Strata.Heights as TsH
+
+  pfn clampf(v : Float, lo : Float, hi : Float) : Float do if v < lo do lo else if v > hi do hi else v end end end
+  pfn smooth(t : Float) : Float do let x = clampf(t, 0.0, 1.0)
+    x *. x *. (3.0 -. 2.0 *. x) end
+
+  -- the noise field over the whole square, [0, 1]
+  pfn field(seed : Int, n : Int, scale : Float, fractal : Int, freq : Float, octaves : Int) : NativeF32Arr do
+    let out = NativeArray.make_f32(n * n, 0.0)
+    let filled = Strata.Noise.field2(Strata.Noise.settings(0, octaves, 2.0, 0.5, fractal, 0.0), seed, freq, 0.0, 0.0, scale, n, n, out)
+    if filled == 0 do out
+    else
+      -- stretched to [0, 1] over the square, so every recipe reaches its range
+      let (lo, hi) = List.fold_left(List.range(0, n * n), (1000.0, -1000.0), fn (acc, i) -> match acc do
+        (a, b) -> let v = NativeArray.get_f32(out, i)
+          (if v < a do v else a end, if v > b do v else b end)
+      end)
+      let w = if hi -. lo < 0.000001 do 1.0 else hi -. lo end
+      List.fold_left(List.range(0, n * n), out, fn (a, i) -> NativeArray.set_f32(a, i, (NativeArray.get_f32(a, i) -. lo) /. w))
+    end
+  end
+
+  -- height above 8 at column (i, j) of the square for the recipe
+  pfn shape(base : Int, r : Float, f : NativeF32Arr, warp : NativeF32Arr, n : Int, i : Int, j : Int) : Float do
+    let v = NativeArray.get_f32(f, j * n + i)
+    if base == 0 do v *. 0.25 *. r
+    else if base == 1 do v *. 0.6 *. r
+    else if base == 2 do v *. r
+    else if base == 3 do
+      -- the canyon winds along x; its centre line moves with the warp field
+      let centre = int_to_float(n) /. 2.0 +. (NativeArray.get_f32(warp, i) -. 0.5) *. int_to_float(n) *. 0.4
+      let half = int_to_float(n) *. 0.08
+      let d = Math.abs(int_to_float(j) -. centre)
+      let cut = 1.0 -. smooth((d -. half) /. (half *. 0.8))
+      r *. (0.85 +. 0.15 *. v) *. (1.0 -. cut)
+    else
+      let levels = 4.0
+      let t = Math.floor(v *. levels *. 0.999) /. (levels -. 1.0)
+      clampf(t, 0.0, 1.0) *. r
+    end end end end
+  end
+
+  doc "The base height field for the data's settings (seed, base, relief, step), over the whole square."
+  fn run(d : StrataMaps.Data.MapData) : StrataMaps.Data.MapData do
+    let s = d.md_settings
+    let n = TsS.side_voxels(s)
+    let r = 6.0 +. 94.0 *. s.ms_knobs.mk_relief
+    let scale = 0.4
+    let freq = if s.ms_base == 1 do 1.0 /. 160.0 else if s.ms_base == 2 do 1.0 /. 110.0 else 1.0 /. 140.0 end end
+    let f = field(Strata.Seed.mix(s.ms_seed, 11), n, scale, if s.ms_base == 2 do 2 else 1 end, freq, if s.ms_base == 2 do 5 else 4 end)
+    let warp = field(Strata.Seed.mix(s.ms_seed, 23), n, scale, 1, 1.0 /. 200.0, 2)
+    let c = TsD.corner(s)
+    let g0 = List.fold_left(List.range(0, n * n), d.md_heights, fn (g, k) -> TsH.set(g, c + k % n, c + k / n, 8 + float_to_int(Math.round(shape(s.ms_base, r, f, warp, n, k % n, k / n)))))
+    let g1 = ease_ring(g0, s, n, c)
+    { d with md_heights: TsH.quantise(g1, s.ms_step) }
+  end
+
+  -- the ring eased from the playable edge toward the edge's mean
+  pfn ease_ring(g : Strata.Heights.HeightGrid, s : StrataMaps.Settings.MapSettings, n : Int, c : Int) : Strata.Heights.HeightGrid do
+    let lo = c + TsS.ring_voxels()
+    let hi = lo + TsS.playable_voxels(s) - 1
+    let edge = List.flat_map(List.range(lo, hi + 1), fn t -> [TsH.get(g, t, lo), TsH.get(g, t, hi), TsH.get(g, lo, t), TsH.get(g, hi, t)])
+    let mean = List.fold_left(edge, 0, fn (a, h) -> a + h) / List.length(edge)
+    List.fold_left(List.range(0, n * n), g, fn (acc, k) -> ease_one(acc, c + k % n, c + k / n, lo, hi, mean))
+  end
+  pfn ease_one(g : Strata.Heights.HeightGrid, x : Int, z : Int, lo : Int, hi : Int, mean : Int) : Strata.Heights.HeightGrid do
+    let dx = if x < lo do lo - x else if x > hi do x - hi else 0 end end
+    let dz = if z < lo do lo - z else if z > hi do z - hi else 0 end end
+    let dd = Math.max_int(dx, dz)
+    if dd == 0 do g
+    else
+      -- the edge column this one continues
+      let ex = if x < lo do lo else if x > hi do hi else x end end
+      let ez = if z < lo do lo else if z > hi do hi else z end end
+      let t = smooth(int_to_float(dd) /. int_to_float(TsS.ring_voxels()))
+      TsH.set(g, x, z, float_to_int(Math.round(int_to_float(TsH.get(g, ex, ez)) *. (1.0 -. t) +. int_to_float(mean) *. t)))
+    end
+  end
+
+  doc "The highest and lowest heights over the playable square."
+  fn span(d : StrataMaps.Data.MapData) : (Int, Int) do
+    let s = d.md_settings
+    let lo = TsD.corner(s) + TsS.ring_voxels()
+    let pv = TsS.playable_voxels(s)
+    List.fold_left(List.range(0, pv * pv), (-1000000, 1000000), fn (acc, k) -> match acc do
+      (mx, mn) -> let h = TsH.get(d.md_heights, lo + k % pv, lo + k / pv)
+        (Math.max_int(mx, h), Math.min_int(mn, h))
+    end)
+  end
+end
