@@ -1,0 +1,85 @@
+-- WorldGen — the map as a terrain generator the stream builds by chunk.
+--
+-- Per column: stone, then dirt three deep, then the surface block (grass
+-- on dry ground, sand under water) up to the height field's top; above it,
+-- water up to the column's level; a weir column holds the weir block up to
+-- the upper stretch's level; a sink column the sink block. Outside the
+-- square the height field reads its nearest edge, so the ground continues
+-- flat at the ring's edge height. Below everything is stone, above the
+-- highest ground and water is air. Buildings, set pieces and trees join as
+-- templates with their tasks.
+mod StrataMaps.WorldGen do
+
+  alias StrataMaps.Settings as WgS
+  alias StrataMaps.Data as WgD
+  alias Strata.Heights as WgH
+
+  -- per column of the square: 0 plain, 1 weir, 2 sink
+  pfn marks(d : StrataMaps.Data.MapData) : NativeIntArr do
+    let n = WgS.side_voxels(d.md_settings)
+    let c = WgD.corner(d.md_settings)
+    let put = fn (a, xz, v) -> match xz do (x, z) -> if x < c || z < c || x >= c + n || z >= c + n do a else NativeArray.set_int(a, (z - c) * n + (x - c), v) end end
+    let a1 = List.fold_left(d.md_weirs, NativeArray.make_int(n * n, 0), fn (a, w) -> put(a, w, 1))
+    List.fold_left(d.md_sinks, a1, fn (a, s) -> put(a, s, 2))
+  end
+
+  pfn mark_at(m : NativeIntArr, n : Int, c : Int, x : Int, z : Int) : Int do
+    if x < c || z < c || x >= c + n || z >= c + n do 0 else NativeArray.get_int(m, (z - c) * n + (x - c)) end
+  end
+
+  -- the block at (y) of a column: top (first air), its water level (or -1), its mark, the upper level for a weir
+  pfn block_at(b : StrataMaps.Settings.MapBlocks, y : Int, top : Int, level : Int, mark : Int, upper : Int) : Int do
+    if y < top - 4 do b.mb_stone
+    else if y < top - 1 do b.mb_dirt
+    else if y < top do (if level >= 0 do b.mb_sand else b.mb_grass end)
+    else if mark == 1 && y < upper do b.mb_weir
+    else if mark == 2 && y < level do b.mb_sink
+    else if level >= 0 && y < level do b.mb_water
+    else 0 end end end end end end
+  end
+
+  pfn column(a : NativeI32Arr, d : StrataMaps.Data.MapData, m : NativeIntArr, n : Int, c : Int, cx : Int, cy : Int, cz : Int, i : Int, k : Int) : NativeI32Arr do
+    let x = cx * 32 + i
+    let z = cz * 32 + k
+    let top = WgH.get(d.md_heights, x, z)
+    let level = WgD.water_at(d, x, z)
+    let mark = mark_at(m, n, c, x, z)
+    let upper = if mark == 1 do Math.max_int(WgD.water_at(d, x - 1, z), level) else level end
+    List.fold_left(List.range(0, 32), a, fn (acc, y) -> NativeArray.set_i32(acc, Strata.Coord.index(i, y, k), block_at(d.md_blocks, cy * 32 + y, top, level, mark, upper)))
+  end
+
+  pfn chunk_of(d : StrataMaps.Data.MapData, m : NativeIntArr, lo : Int, hi : Int, k : Strata.Coord.Key) : Strata.Chunk.Chunk do
+    let cy = Strata.Coord.ky(k)
+    if (cy + 1) * 32 <= lo - 4 do Strata.Chunk.uniform(d.md_blocks.mb_stone)
+    else if cy * 32 >= hi do Strata.Chunk.uniform(0)
+    else
+      let n = WgS.side_voxels(d.md_settings)
+      let c = WgD.corner(d.md_settings)
+      let cx = Strata.Coord.kx(k)
+      let cz = Strata.Coord.kz(k)
+      let a = List.fold_left(List.range(0, 32 * 32), NativeArray.make_i32(32768, 0), fn (acc, j) -> column(acc, d, m, n, c, cx, cy, cz, j % 32, j / 32))
+      Strata.Chunk.from_flat(a)
+    end end
+  end
+
+  doc "The lowest ground and the highest ground or water over the square (voxels)."
+  fn bounds(d : StrataMaps.Data.MapData) : (Int, Int) do
+    let n = WgS.side_voxels(d.md_settings)
+    let c = WgD.corner(d.md_settings)
+    List.fold_left(List.range(0, n * n), (1000000, -1000000), fn (acc, j) -> match acc do
+      (lo, hi) ->
+        let x = c + j % n
+        let z = c + j / n
+        let h = WgH.get(d.md_heights, x, z)
+        (Math.min_int(lo, h), Math.max_int(hi, Math.max_int(h, WgD.water_at(d, x, z))))
+    end)
+  end
+
+  doc "The map as a terrain generator (Strata.Terrain.Gen); the seed it is handed is not used (the map's own seed made the data)."
+  fn gen(d : StrataMaps.Data.MapData) : Strata.Terrain.Gen do
+    let m = marks(d)
+    match bounds(d) do
+      (lo, hi) -> Strata.Terrain.gen(fn (k, seed) -> chunk_of(d, m, lo, hi + 1, k))
+    end
+  end
+end
