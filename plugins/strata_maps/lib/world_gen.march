@@ -1,13 +1,17 @@
 -- WorldGen — the map as a terrain generator the stream builds by chunk.
 --
--- Per column: stone, then dirt three deep, then the surface block (grass
--- on dry ground, sand under water) up to the height field's top; above it,
--- water up to the column's level; a weir column holds the weir block up to
--- the upper stretch's level; a sink column the sink block. Outside the
--- square the height field reads its nearest edge, so the ground continues
--- flat at the ring's edge height. Below everything is stone, above the
--- highest ground and water is air. Buildings, set pieces and trees join as
--- templates with their tasks.
+-- Per column: stone, then dirt three deep, then the surface block (concrete
+-- under a lot, scorched in a scorched ring, sand under water, grass on other
+-- dry ground) up to the height field's top; above it, water up to the
+-- column's level (a weir column holds the weir block up to the upper
+-- stretch's level, a sink column the sink block) or lava up to its level.
+-- Then the roads (Strata.Roads.chunk_paint: surface, decks over gaps, air
+-- above) and every template that reaches the chunk — buildings, set pieces,
+-- trees — blitted in that order, from an index of the chunks each one
+-- touches, built once for the map. Outside the square the height field
+-- reads its nearest edge, so the ground continues flat at the ring's edge
+-- height. Below everything is stone, above the highest ground, water, lava
+-- and template is air.
 mod StrataMaps.WorldGen do
 
   alias StrataMaps.Settings as WgS
@@ -27,28 +31,83 @@ mod StrataMaps.WorldGen do
     if x < c || z < c || x >= c + n || z >= c + n do 0 else NativeArray.get_int(m, (z - c) * n + (x - c)) end
   end
 
-  -- the block at (y) of a column: top (first air), its water level (or -1), its mark, the upper level for a weir
-  pfn block_at(b : StrataMaps.Settings.MapBlocks, y : Int, top : Int, level : Int, mark : Int, upper : Int) : Int do
+  -- the block at (y) of a column: top (first air), its water level (or -1), its mark, the upper level for a weir, its surface (0: by water), its lava level (or -1)
+  pfn block_at(b : StrataMaps.Settings.MapBlocks, y : Int, top : Int, level : Int, mark : Int, upper : Int, surf : Int, lava : Int) : Int do
     if y < top - 4 do b.mb_stone
     else if y < top - 1 do b.mb_dirt
-    else if y < top do (if level >= 0 do b.mb_sand else b.mb_grass end)
+    else if y < top do (if surf != 0 do surf else if level >= 0 do b.mb_sand else b.mb_grass end end)
     else if mark == 1 && y < upper do b.mb_weir
     else if mark == 2 && y < level do b.mb_sink
     else if level >= 0 && y < level do b.mb_water
-    else 0 end end end end end end
+    else if lava >= 0 && y < lava do b.mb_lava
+    else 0 end end end end end end end
   end
 
-  pfn column(a : NativeI32Arr, d : StrataMaps.Data.MapData, m : NativeIntArr, n : Int, c : Int, cx : Int, cy : Int, cz : Int, i : Int, k : Int) : NativeI32Arr do
-    let x = cx * 32 + i
-    let z = cz * 32 + k
-    let top = WgH.get(d.md_heights, x, z)
-    let level = WgD.water_at(d, x, z)
-    let mark = mark_at(m, n, c, x, z)
-    let upper = if mark == 1 do Math.max_int(WgD.water_at(d, x - 1, z), level) else level end
-    List.fold_left(List.range(0, 32), a, fn (acc, y) -> NativeArray.set_i32(acc, Strata.Coord.index(i, y, k), block_at(d.md_blocks, cy * 32 + y, top, level, mark, upper)))
+  -- per column of the square: the surface block under a lot or a scorched ring, else 0
+  pfn surfaces(d : StrataMaps.Data.MapData) : NativeIntArr do
+    let n = WgS.side_voxels(d.md_settings)
+    let c = WgD.corner(d.md_settings)
+    let a0 = List.fold_left(List.range(0, n * n), NativeArray.make_int(n * n, 0), fn (a, j) -> if NativeArray.get_int(d.md_scorched, j) == 1 do NativeArray.set_int(a, j, d.md_blocks.mb_scorched) else a end)
+    List.fold_left(d.md_lots, a0, fn (a, l) -> match Strata.Lots.lot_box(l) do (x0, z0, x1, z1) -> paint_box(a, n, c, x0, z0, x1, z1, d.md_blocks.mb_concrete) end)
+  end
+  pfn paint_box(a : NativeIntArr, n : Int, c : Int, x0 : Int, z0 : Int, x1 : Int, z1 : Int, id : Int) : NativeIntArr do
+    let w = x1 - x0 + 1
+    if w <= 0 || z1 < z0 do a else List.fold_left(List.range(0, w * (z1 - z0 + 1)), a, fn (b, k) -> put_col(b, n, c, x0 + k % w, z0 + k / w, id)) end
+  end
+  pfn put_col(a : NativeIntArr, n : Int, c : Int, x : Int, z : Int, id : Int) : NativeIntArr do if x < c || z < c || x >= c + n || z >= c + n do a else NativeArray.set_int(a, (z - c) * n + (x - c), id) end end
+
+  -- ── Templates ──
+  -- a template placed: template, origin, quarter turns
+  type WgStamp = WgStamp(Strata.Template.Template, Int, Int, Int, Int)
+
+  pfn stamps(d : StrataMaps.Data.MapData) : List(WgStamp) do
+    List.append(List.map(d.md_buildings, fn b -> match b.mbd_origin do (x, y, z) -> WgStamp(b.mbd_template, x, y, z, 0) end),
+      List.map(d.md_placed, fn p -> match p.mpl_origin do (x, y, z) -> WgStamp(p.mpl_template, x, y, z, p.mpl_rot) end))
+  end
+  -- for each chunk column (kx, 0, kz), the stamps that reach it, in order
+  pfn index(ss : List(WgStamp)) : Strata.Store.Store(List(WgStamp)) do
+    List.fold_left(List.reverse(ss), Strata.Store.empty(Nil), fn (st, s) -> file(st, s))
+  end
+  pfn file(st : Strata.Store.Store(List(WgStamp)), s : WgStamp) : Strata.Store.Store(List(WgStamp)) do
+    match s do
+      WgStamp(t, ox, oy, oz, rot) -> match Strata.Template.bounds(t, ox, oy, oz, rot) do
+        (x0, _, z0, x1, _, z1) ->
+          let kx0 = int_div_euclid(x0, 32)
+          let kz0 = int_div_euclid(z0, 32)
+          let nx = int_div_euclid(x1, 32) - kx0 + 1
+          let nz = int_div_euclid(z1, 32) - kz0 + 1
+          List.fold_left(List.range(0, nx * nz), st, fn (acc, i) -> push(acc, Strata.Coord.key(kx0 + i % nx, 0, kz0 + i / nx), s))
+      end
+    end
+  end
+  pfn push(st : Strata.Store.Store(List(WgStamp)), k : Strata.Coord.Key, s : WgStamp) : Strata.Store.Store(List(WgStamp)) do Strata.Store.put(st, k, Cons(s, Strata.Store.get(st, k))) end
+  -- the highest voxel any stamp reaches
+  pfn stamp_top(ss : List(WgStamp)) : Int do
+    List.fold_left(ss, -1000000, fn (m, s) -> match s do WgStamp(t, _, oy, _, _) -> Math.max_int(m, oy + Strata.Template.t_sy(t)) end)
+  end
+  pfn blit_all(c : Strata.Chunk.Chunk, k : Strata.Coord.Key, ix : Strata.Store.Store(List(WgStamp))) : Strata.Chunk.Chunk do
+    List.fold_left(Strata.Store.get(ix, Strata.Coord.key(Strata.Coord.kx(k), 0, Strata.Coord.kz(k))), c, fn (acc, s) -> match s do WgStamp(t, ox, oy, oz, rot) -> Strata.Template.blit(acc, k, t, ox, oy, oz, rot, 0) end)
   end
 
-  pfn chunk_of(d : StrataMaps.Data.MapData, m : NativeIntArr, lo : Int, hi : Int, k : Strata.Coord.Key) : Strata.Chunk.Chunk do
+  -- what a chunk needs beyond the data: weir and sink marks, surfaces, the template index
+  type WgCtx = WgCtx(NativeIntArr, NativeIntArr, Strata.Store.Store(List(WgStamp)))
+
+  pfn column(a : NativeI32Arr, d : StrataMaps.Data.MapData, cx0 : WgCtx, n : Int, c : Int, cx : Int, cy : Int, cz : Int, i : Int, k : Int) : NativeI32Arr do
+    match cx0 do
+      WgCtx(m, sf, _) ->
+        let x = cx * 32 + i
+        let z = cz * 32 + k
+        let top = WgH.get(d.md_heights, x, z)
+        let level = WgD.water_at(d, x, z)
+        let mark = mark_at(m, n, c, x, z)
+        let upper = if mark == 1 do Math.max_int(WgD.water_at(d, x - 1, z), level) else level end
+        let surf = mark_at(sf, n, c, x, z)
+        let lava = WgD.lava_at(d, x, z)
+        List.fold_left(List.range(0, 32), a, fn (acc, y) -> NativeArray.set_i32(acc, Strata.Coord.index(i, y, k), block_at(d.md_blocks, cy * 32 + y, top, level, mark, upper, surf, lava)))
+    end
+  end
+
+  pfn chunk_of(d : StrataMaps.Data.MapData, cx0 : WgCtx, lo : Int, hi : Int, k : Strata.Coord.Key) : Strata.Chunk.Chunk do
     let cy = Strata.Coord.ky(k)
     if (cy + 1) * 32 <= lo - 4 do Strata.Chunk.uniform(d.md_blocks.mb_stone)
     else if cy * 32 >= hi do Strata.Chunk.uniform(0)
@@ -57,12 +116,13 @@ mod StrataMaps.WorldGen do
       let c = WgD.corner(d.md_settings)
       let cx = Strata.Coord.kx(k)
       let cz = Strata.Coord.kz(k)
-      let a = List.fold_left(List.range(0, 32 * 32), NativeArray.make_i32(32768, 0), fn (acc, j) -> column(acc, d, m, n, c, cx, cy, cz, j % 32, j / 32))
-      Strata.Chunk.from_flat(a)
+      let a = List.fold_left(List.range(0, 32 * 32), NativeArray.make_i32(32768, 0), fn (acc, j) -> column(acc, d, cx0, n, c, cx, cy, cz, j % 32, j / 32))
+      let ground = Strata.Roads.chunk_paint(Strata.Chunk.from_flat(a), k, d.md_roads, d.md_heights, WgS.scale(), d.md_blocks.mb_deck)
+      match cx0 do WgCtx(_, _, ix) -> blit_all(ground, k, ix) end
     end end
   end
 
-  doc "The lowest ground and the highest ground or water over the square (voxels)."
+  doc "The lowest ground and the highest ground, water or lava over the square (voxels)."
   fn bounds(d : StrataMaps.Data.MapData) : (Int, Int) do
     let n = WgS.side_voxels(d.md_settings)
     let c = WgD.corner(d.md_settings)
@@ -71,15 +131,17 @@ mod StrataMaps.WorldGen do
         let x = c + j % n
         let z = c + j / n
         let h = WgH.get(d.md_heights, x, z)
-        (Math.min_int(lo, h), Math.max_int(hi, Math.max_int(h, WgD.water_at(d, x, z))))
+        (Math.min_int(lo, h), Math.max_int(hi, Math.max_int(h, Math.max_int(WgD.water_at(d, x, z), WgD.lava_at(d, x, z)))))
     end)
   end
 
   doc "The map as a terrain generator (Strata.Terrain.Gen); the seed it is handed is not used (the map's own seed made the data)."
   fn gen(d : StrataMaps.Data.MapData) : Strata.Terrain.Gen do
-    let m = marks(d)
+    let ss = stamps(d)
+    let cx0 = WgCtx(marks(d), surfaces(d), index(ss))
+    -- roads clear 3 m above themselves (air anyway); templates may stand above the ground
     match bounds(d) do
-      (lo, hi) -> Strata.Terrain.gen(fn (k, seed) -> chunk_of(d, m, lo, hi + 1, k))
+      (lo, hi) -> Strata.Terrain.gen(fn (k, seed) -> chunk_of(d, cx0, lo, Math.max_int(hi + 1, stamp_top(ss)), k))
     end
   end
 end
