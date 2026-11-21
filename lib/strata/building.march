@@ -1,0 +1,304 @@
+-- Building — the building grammar: a lot and a style to a plan, a plan to
+-- voxels.
+--
+-- A style is data the game declares: storeys (a range) and storey height,
+-- coverage and setback, how many volumes, bay width, opening tables for the
+-- ground floor and the upper storeys (kinds with weights: 0 wall, 1 window,
+-- 2 shopfront, 3 door, 4 loading door), block ids, a roof kind (0 flat with
+-- a parapet, 1 pitched, 2 saw-tooth), whether it builds halls, roof
+-- clutter, and the voxel size its templates stand for.
+--
+-- The plan, in lot-local voxels (x across the lot, z along it, (0, 0) the
+-- lot's low corner): the footprint is the lot less the setback on the
+-- street side and, where coverage is under 0.9, a margin on the other
+-- sides; volume 0 (the main block) takes the footprint's full width and,
+-- with more volumes allowed and room enough, its front part, and a wing
+-- (volume 1) takes half the width behind it, a storey lower; a hall is one
+-- volume of the fewest storeys. Each volume side is split into bays
+-- (centred, the bay width each); each bay on each storey gets an opening
+-- from the style's table — the street side's ground floor from the ground
+-- table, always with a door or shopfront somewhere — except where the wall
+-- faces another volume or stands on the lot's edge away from the street,
+-- which stay blank. Openings are (volume, side, bay, storey, kind), sides
+-- 0 +x, 1 -x, 2 +z, 3 -z.
+--
+-- Level 1 (`solid`): each volume a solid mass of wall, the openings drawn in
+-- its outer layer (glass for windows and shopfronts, door blocks for doors),
+-- a trim band at each floor and up each corner, and the roof: a slab and a
+-- parapet with clutter on it, a pitched roof along the longer side, or
+-- saw-tooth rows with glass on their steep faces.
+mod Strata.Building do
+
+  type BldStyle = { bs_storeys : (Int, Int), bs_storey : Int, bs_coverage : Float, bs_setback : Int, bs_volumes : Int, bs_bay : Int,
+                    bs_ground : List((Int, Float)), bs_upper : List((Int, Float)),
+                    bs_wall : Int, bs_trim : Int, bs_glass : Int, bs_floor : Int, bs_roof : Int, bs_door : Int,
+                    bs_roof_kind : Int, bs_hall : Bool, bs_clutter : List(Strata.Template.Template), bs_voxel : Float }
+
+  doc "A style of the given blocks (wall, trim, glass, floor, roof; doors in the trim) with defaults: 2 to 4 storeys of 8 voxels, coverage 0.7, setback 2, up to 2 volumes, bays of 4; ground floors half windows, a fifth doors, the rest shopfronts; upper storeys four fifths windows; flat roofs; no halls, no clutter; 0.4 m voxels."
+  fn style(wall : Int, trim : Int, glass : Int, floor : Int, roof : Int) : BldStyle do
+    { bs_storeys: (2, 4), bs_storey: 8, bs_coverage: 0.7, bs_setback: 2, bs_volumes: 2, bs_bay: 4,
+      bs_ground: [(1, 0.5), (3, 0.2), (2, 0.3)], bs_upper: [(1, 0.8), (0, 0.2)],
+      bs_wall: wall, bs_trim: trim, bs_glass: glass, bs_floor: floor, bs_roof: roof, bs_door: trim,
+      bs_roof_kind: 0, bs_hall: false, bs_clutter: Nil, bs_voxel: 0.4 }
+  end
+
+  -- the lot, its size, volumes (x0, z0, x1, z1, storeys), openings, the roof kind, the storey height, the street side, the bay width
+  type BldPlan = { bp_lot : Strata.Lots.Lot, bp_w : Int, bp_d : Int, bp_volumes : List((Int, Int, Int, Int, Int)), bp_openings : List((Int, Int, Int, Int, Int)),
+                   bp_roof : Int, bp_storey : Int, bp_street : Int, bp_bay : Int }
+
+  doc "The volumes: (x0, z0, x1, z1, storeys), lot-local voxels, volume 0 the main block."
+  fn volumes(p : BldPlan) : List((Int, Int, Int, Int, Int)) do p.bp_volumes end
+  doc "The openings: (volume, side, bay, storey, kind)."
+  fn openings(p : BldPlan) : List((Int, Int, Int, Int, Int)) do p.bp_openings end
+  doc "The height of the tallest volume's walls, voxels (the roof sits on it)."
+  fn height(p : BldPlan) : Int do List.fold_left(p.bp_volumes, 0, fn (m, v) -> match v do (_, _, _, _, n) -> Math.max_int(m, n * p.bp_storey) end) end
+  doc "The volumes' boxes in world voxels (x0, z0, x1, z1)."
+  fn footprint(p : BldPlan) : List((Int, Int, Int, Int)) do
+    match Strata.Lots.lot_box(p.bp_lot) do (lx, lz, _, _) -> List.map(p.bp_volumes, fn v -> match v do (x0, z0, x1, z1, _) -> (lx + x0, lz + z0, lx + x1, lz + z1) end) end
+  end
+
+  pfn u(seed : Int, k : Int) : Float do Strata.Seed.unit(Strata.Seed.mix(seed, k)) end
+  pfn pick_int(seed : Int, k : Int, lo : Int, hi : Int) : Int do if hi <= lo do lo else lo + Math.min_int(hi - lo, float_to_int(u(seed, k) *. int_to_float(hi - lo + 1))) end end
+  -- a kind from a weighted table
+  pfn pick_kind(table : List((Int, Float)), seed : Int, k : Int) : Int do
+    let total = List.fold_left(table, 0.0, fn (s, e) -> match e do (_, w) -> s +. w end)
+    let r = u(seed, k) *. total
+    match List.fold_left(table, (0, 0.0, false), fn (st, e) -> match (st, e) do
+      ((chosen, acc, done), (kind, w)) -> if done do st else if r < acc +. w do (kind, acc +. w, true) else (kind, acc +. w, false) end end
+    end) do (kind, _, _) -> kind end
+  end
+
+  -- the footprint (x0, z0, x1, z1) of a w x d lot facing [street]
+  pfn foot(s : BldStyle, w : Int, d : Int, street : Int) : (Int, Int, Int, Int) do
+    let m = if s.bs_coverage >= 0.9 do 0 else Math.max_int(1, float_to_int((1.0 -. s.bs_coverage) *. int_to_float(Math.min_int(w, d)) /. 2.0)) end
+    let sb = s.bs_setback
+    let x0 = if street == 1 do sb else m end
+    let x1 = w - 1 - (if street == 0 do sb else m end)
+    let z0 = if street == 3 do sb else m end
+    let z1 = d - 1 - (if street == 2 do sb else m end)
+    (x0, z0, Math.max_int(x0, x1), Math.max_int(z0, z1))
+  end
+
+  -- the volumes on the footprint: the main block and perhaps a wing behind it
+  pfn masses(s : BldStyle, f : (Int, Int, Int, Int), street : Int, seed : Int) : List((Int, Int, Int, Int, Int)) do
+    match (f, s.bs_storeys) do
+      ((x0, z0, x1, z1), (lo, hi)) ->
+        if s.bs_hall do [(x0, z0, x1, z1, Math.max_int(1, lo))]
+        else
+          let n = pick_int(seed, 1, Math.max_int(lo, Math.min_int(hi, lo + 1)), hi)
+          -- depth runs away from the street
+          let across_x = street == 2 || street == 3
+          let depth = if across_x do z1 - z0 + 1 else x1 - x0 + 1 end
+          let width = if across_x do x1 - x0 + 1 else z1 - z0 + 1 end
+          if s.bs_volumes < 2 || depth < 14 || width < 10 do [(x0, z0, x1, z1, n)]
+          else
+            let front = Math.max_int(8, float_to_int(int_to_float(depth) *. (0.5 +. 0.2 *. u(seed, 2))))
+            let left = u(seed, 3) < 0.5
+            let half = width / 2
+            let wn = Math.max_int(1, Math.max_int(lo, n - 1))
+            -- main (front) and wing (behind, half the width), by street side
+            if street == 3 do [(x0, z0, x1, z0 + front - 1, n), (if left do x0 else x1 - half + 1 end, z0 + front, if left do x0 + half - 1 else x1 end, z1, wn)]
+            else if street == 2 do [(x0, z1 - front + 1, x1, z1, n), (if left do x0 else x1 - half + 1 end, z0, if left do x0 + half - 1 else x1 end, z1 - front, wn)]
+            else if street == 1 do [(x0, z0, x0 + front - 1, z1, n), (x0 + front, if left do z0 else z1 - half + 1 end, x1, if left do z0 + half - 1 else z1 end, wn)]
+            else [(x1 - front + 1, z0, x1, z1, n), (x0, if left do z0 else z1 - half + 1 end, x1 - front, if left do z0 + half - 1 else z1 end, wn)] end end end
+          end
+        end
+    end
+  end
+
+  -- a wall's run along its side: (start, length) in lot-local voxels
+  pfn wall_run(v : (Int, Int, Int, Int, Int), side : Int) : (Int, Int) do
+    match v do (x0, z0, x1, z1, _) -> if side <= 1 do (z0, z1 - z0 + 1) else (x0, x1 - x0 + 1) end end
+  end
+  pfn bays(bay : Int, len : Int) : Int do if bay <= 0 do 0 else len / bay end end
+  pfn bay_start(bay : Int, start : Int, len : Int, b : Int) : Int do start + (len - bays(bay, len) * bay) / 2 + b * bay end
+
+  doc "The lot-local coordinate along its wall of the middle of bay [b] on side [side] of volume [v]."
+  fn bay_middle(p : BldPlan, v : Int, side : Int, b : Int) : Int do
+    match List.nth_opt(p.bp_volumes, v) do
+      Some(vol) -> match wall_run(vol, side) do (start, len) -> bay_start(p.bp_bay, start, len, b) + p.bp_bay / 2 end
+      None -> 0
+    end
+  end
+
+  -- the column just outside volume v's wall on [side] at [along]
+  pfn beyond(v : (Int, Int, Int, Int, Int), side : Int, along : Int) : (Int, Int) do
+    match v do (x0, z0, x1, z1, _) -> if side == 0 do (x1 + 1, along) else if side == 1 do (x0 - 1, along) else if side == 2 do (along, z1 + 1) else (along, z0 - 1) end end end end
+  end
+  pfn covered(vs : List((Int, Int, Int, Int, Int)), c : (Int, Int)) : Bool do
+    List.any(vs, fn v -> match (v, c) do ((x0, z0, x1, z1, _), (x, z)) -> x >= x0 && x <= x1 && z >= z0 && z <= z1 end)
+  end
+  -- may bay b of side [side] of volume v open? not onto another volume, not onto the lot edge away from the street
+  pfn may_open(vs : List((Int, Int, Int, Int, Int)), v : (Int, Int, Int, Int, Int), side : Int, along : Int, w : Int, d : Int, street : Int) : Bool do
+    match beyond(v, side, along) do
+      (x, z) -> !covered(vs, (x, z)) && (side == street || (x >= 0 && x < w && z >= 0 && z < d))
+    end
+  end
+
+  -- the openings of volume vi
+  pfn volume_openings(s : BldStyle, vs : List((Int, Int, Int, Int, Int)), vi : Int, w : Int, d : Int, street : Int, seed : Int) : List((Int, Int, Int, Int, Int)) do
+    match List.nth_opt(vs, vi) do
+      None -> Nil
+      Some(v) -> List.flat_map(List.range(0, 4), fn side -> side_openings(s, vs, v, vi, side, w, d, street, seed))
+    end
+  end
+  pfn side_openings(s : BldStyle, vs : List((Int, Int, Int, Int, Int)), v : (Int, Int, Int, Int, Int), vi : Int, side : Int, w : Int, d : Int, street : Int, seed : Int) : List((Int, Int, Int, Int, Int)) do
+    match (wall_run(v, side), v) do
+      ((start, len), (_, _, _, _, storeys)) ->
+        let nb = bays(s.bs_bay, len)
+        let open = List.filter(List.range(0, nb), fn b -> may_open(vs, v, side, bay_start(s.bs_bay, start, len, b) + s.bs_bay / 2, w, d, street))
+        let cells = List.flat_map(List.range(0, storeys), fn st -> List.map(open, fn b -> (st, b)))
+        let raw = List.map(cells, fn c -> match c do (st, b) -> (vi, side, b, st, kind_for(s, side == street, st, seed, vi * 100000 + side * 10000 + st * 100 + b)) end)
+        let kept = List.filter(raw, fn o -> match o do (_, _, _, _, k) -> k != 0 end)
+        -- the street side's ground floor always has a way in: the middle open bay becomes a door
+        let ways_in = List.any(kept, fn o -> match o do (_, _, _, st, k) -> st == 0 && (k == 2 || k == 3 || k == 4) end)
+        if side == street && vi == 0 && !ways_in && !List.is_empty(open) do
+          let mid = List.nth(open, List.length(open) / 2)
+          Cons((vi, side, mid, 0, 3), List.filter(kept, fn o -> match o do (_, _, b, st, _) -> !(st == 0 && b == mid) end))
+        else kept end
+    end
+  end
+  pfn kind_for(s : BldStyle, on_street : Bool, storey : Int, seed : Int, k : Int) : Int do
+    if storey == 0 && on_street do pick_kind(s.bs_ground, seed, 7000000 + k) else pick_kind(s.bs_upper, seed, 7000000 + k) end
+  end
+
+  doc "The plan of a building of style [s] on [lot] from [seed]: its volumes and openings (the same seed, the same plan)."
+  fn plan(lot : Strata.Lots.Lot, s : BldStyle, seed : Int) : BldPlan do
+    match Strata.Lots.lot_box(lot) do
+      (lx0, lz0, lx1, lz1) ->
+        let w = lx1 - lx0 + 1
+        let d = lz1 - lz0 + 1
+        let street = Strata.Lots.lot_street(lot)
+        let vs = masses(s, foot(s, w, d, street), street, seed)
+        let ops = List.flat_map(List.range(0, List.length(vs)), fn vi -> volume_openings(s, vs, vi, w, d, street, seed))
+        { bp_lot: lot, bp_w: w, bp_d: d, bp_volumes: vs, bp_openings: ops, bp_roof: s.bs_roof_kind, bp_storey: s.bs_storey, bp_street: street, bp_bay: s.bs_bay }
+    end
+  end
+
+  -- ── Level 1 ──────────────────────────────────────────────────────────────
+  -- the template's grid: w x h x d ids, x + w * (y + h * z)
+  type BldGrid = BldGrid(Int, Int, Int, NativeI32Arr)
+
+  pfn gset(g : BldGrid, x : Int, y : Int, z : Int, id : Int) : BldGrid do
+    match g do BldGrid(w, h, d, a) -> if x < 0 || y < 0 || z < 0 || x >= w || y >= h || z >= d do g else BldGrid(w, h, d, NativeArray.set_i32(a, x + w * (y + h * z), id)) end end
+  end
+  pfn gbox(g : BldGrid, x0 : Int, y0 : Int, z0 : Int, x1 : Int, y1 : Int, z1 : Int, id : Int) : BldGrid do
+    let nx = x1 - x0 + 1
+    let ny = y1 - y0 + 1
+    let nz = z1 - z0 + 1
+    if nx <= 0 || ny <= 0 || nz <= 0 do g
+    else List.fold_left(List.range(0, nx * ny * nz), g, fn (acc, i) -> gset(acc, x0 + i % nx, y0 + (i / nx) % ny, z0 + i / (nx * ny), id)) end
+  end
+
+  -- the roof's height over a volume's walls
+  pfn roof_rise(kind : Int, v : (Int, Int, Int, Int, Int)) : Int do
+    match v do (x0, z0, x1, z1, _) -> if kind == 1 do Math.min_int(x1 - x0 + 1, z1 - z0 + 1) / 2 + 1 else if kind == 2 do 5 else 2 end end end
+  end
+
+  -- an opening drawn in the outer layer of its wall
+  pfn draw_opening(g : BldGrid, p : BldPlan, s : BldStyle, o : (Int, Int, Int, Int, Int)) : BldGrid do
+    match o do
+      (vi, side, b, st, kind) -> match List.nth_opt(p.bp_volumes, vi) do
+        None -> g
+        Some(v) -> match (v, wall_run(v, side)) do
+          ((x0, z0, x1, z1, _), (start, len)) ->
+            let a0 = bay_start(p.bp_bay, start, len, b)
+            let a1 = a0 + p.bp_bay - 1
+            let base = st * p.bp_storey
+            let sh = p.bp_storey
+            -- (along from, along to, y from, y to, block)
+            let (f0, f1, y0, y1, id) = if kind == 1 do (a0 + 1, a1 - 1, base + 2, base + sh - 3, s.bs_glass)
+              else if kind == 2 do (a0, a1, base + 1, base + sh - 3, s.bs_glass)
+              else if kind == 3 do (a0 + p.bp_bay / 2 - 1, a0 + p.bp_bay / 2, base, base + Math.min_int(sh - 2, 5), s.bs_door)
+              else if kind == 4 do (a0, a1, base, base + sh - 2, s.bs_door)
+              else (0, -1, 0, -1, 0) end end end end
+            if side == 0 do gbox(g, x1, y0, f0, x1, y1, f1, id)
+            else if side == 1 do gbox(g, x0, y0, f0, x0, y1, f1, id)
+            else if side == 2 do gbox(g, f0, y0, z1, f1, y1, z1, id)
+            else gbox(g, f0, y0, z0, f1, y1, z0, id) end end end
+        end
+      end
+    end
+  end
+
+  -- trim: a band round the outside at every floor above the ground, and up the corners
+  pfn trim(g : BldGrid, p : BldPlan, s : BldStyle, v : (Int, Int, Int, Int, Int)) : BldGrid do
+    match v do
+      (x0, z0, x1, z1, n) ->
+        let top = n * p.bp_storey
+        let bands = List.fold_left(List.range(1, n), g, fn (acc, st) -> ring(acc, x0, z0, x1, z1, st * p.bp_storey, s.bs_trim))
+        let c1 = gbox(gbox(bands, x0, 0, z0, x0, top - 1, z0, s.bs_trim), x1, 0, z0, x1, top - 1, z0, s.bs_trim)
+        gbox(gbox(c1, x0, 0, z1, x0, top - 1, z1, s.bs_trim), x1, 0, z1, x1, top - 1, z1, s.bs_trim)
+    end
+  end
+  -- the outer ring of a box at height y (only over solid voxels: openings drawn later)
+  pfn ring(g : BldGrid, x0 : Int, z0 : Int, x1 : Int, z1 : Int, y : Int, id : Int) : BldGrid do
+    gbox(gbox(gbox(gbox(g, x0, y, z0, x1, y, z0, id), x0, y, z1, x1, y, z1, id), x0, y, z0, x0, y, z1, id), x1, y, z0, x1, y, z1, id)
+  end
+
+  -- the roof on a volume
+  pfn roof(g : BldGrid, p : BldPlan, s : BldStyle, v : (Int, Int, Int, Int, Int), seed : Int, vi : Int) : BldGrid do
+    match v do
+      (x0, z0, x1, z1, n) ->
+        let top = n * p.bp_storey
+        if p.bp_roof == 1 do pitched(g, s, x0, z0, x1, z1, top)
+        else if p.bp_roof == 2 do sawtooth(g, s, x0, z0, x1, z1, top)
+        else
+          let slab = gbox(g, x0, top, z0, x1, top, z1, s.bs_roof)
+          clutter(ring(slab, x0, z0, x1, z1, top + 1, s.bs_trim), s, x0, z0, x1, z1, top + 1, seed, vi)
+        end end
+    end
+  end
+  -- a pitched roof: layers stepping in from the two long sides
+  pfn pitched(g : BldGrid, s : BldStyle, x0 : Int, z0 : Int, x1 : Int, z1 : Int, top : Int) : BldGrid do
+    let along_x = x1 - x0 >= z1 - z0
+    let span = if along_x do z1 - z0 + 1 else x1 - x0 + 1 end
+    List.fold_left(List.range(0, span / 2 + 1), g, fn (acc, k) ->
+      if along_x do gbox(acc, x0, top + k, z0 + k, x1, top + k, z1 - k, s.bs_roof) else gbox(acc, x0 + k, top + k, z0, x1 - k, top + k, z1, s.bs_roof) end)
+  end
+  -- saw-tooth: rows of teeth 6 voxels long rising 5, glass on their steep faces
+  pfn sawtooth(g : BldGrid, s : BldStyle, x0 : Int, z0 : Int, x1 : Int, z1 : Int, top : Int) : BldGrid do
+    let slab = gbox(g, x0, top, z0, x1, top, z1, s.bs_roof)
+    List.fold_left(List.range(z0, z1 + 1), slab, fn (acc, z) ->
+      let ph = (z - z0) % 6
+      let rise = if ph == 5 do 4 else ph end
+      let face = if ph == 5 do s.bs_glass else s.bs_roof end
+      if rise <= 0 do acc else gbox(gbox(acc, x0, top + 1, z, x1, top + rise - 1, z, s.bs_wall), x0, top + rise, z, x1, top + rise, z, face) end)
+  end
+  -- up to two clutter templates on a flat roof, at hashed places inside the parapet
+  pfn clutter(g : BldGrid, s : BldStyle, x0 : Int, z0 : Int, x1 : Int, z1 : Int, y : Int, seed : Int, vi : Int) : BldGrid do
+    let n = List.length(s.bs_clutter)
+    if n == 0 do g
+    else List.fold_left(List.range(0, 2), g, fn (acc, k) -> place_clutter(acc, s, x0, z0, x1, z1, y, seed, vi * 10 + k)) end
+  end
+  pfn place_clutter(g : BldGrid, s : BldStyle, x0 : Int, z0 : Int, x1 : Int, z1 : Int, y : Int, seed : Int, k : Int) : BldGrid do
+    let t = List.nth(s.bs_clutter, pick_int(seed, 9000 + k, 0, List.length(s.bs_clutter) - 1))
+    let tx = Strata.Template.t_sx(t)
+    let ty = Strata.Template.t_sy(t)
+    let tz = Strata.Template.t_sz(t)
+    if x1 - x0 - 1 < tx || z1 - z0 - 1 < tz do g
+    else
+      let px = pick_int(seed, 9100 + k, x0 + 1, x1 - tx)
+      let pz = pick_int(seed, 9200 + k, z0 + 1, z1 - tz)
+      let ids = Strata.Template.t_ids(t)
+      List.fold_left(List.range(0, tx * ty * tz), g, fn (acc, i) ->
+        let id = NativeArray.get_i32(ids, i)
+        if id == 0 do acc else gset(acc, px + i % tx, y + (i / tx) % ty, pz + i / (tx * ty), id) end)
+    end
+  end
+
+  pfn grid_height(p : BldPlan) : Int do
+    List.fold_left(p.bp_volumes, 1, fn (m, v) -> match v do (_, _, _, _, n) -> Math.max_int(m, n * p.bp_storey + roof_rise(p.bp_roof, v)) end)
+  end
+
+  doc "Level 1: the building as a template the size of its lot (origin at the lot's low corner, y 0 the ground floor): each volume a solid mass of wall, openings drawn in its outer layer (glass windows and shopfronts, door blocks for doors and loading doors), trim at every floor and up the corners, and its roof."
+  fn solid(p : BldPlan, s : BldStyle, seed : Int) : Strata.Template.Template do
+    let h = grid_height(p)
+    let g0 = BldGrid(p.bp_w, h, p.bp_d, NativeArray.make_i32(Math.max_int(1, p.bp_w * h * p.bp_d), 0))
+    let g1 = List.fold_left(p.bp_volumes, g0, fn (acc, v) -> match v do (x0, z0, x1, z1, n) -> gbox(acc, x0, 0, z0, x1, n * p.bp_storey - 1, z1, s.bs_wall) end)
+    let g2 = List.fold_left(p.bp_volumes, g1, fn (acc, v) -> trim(acc, p, s, v))
+    let g3 = List.fold_left(p.bp_openings, g2, fn (acc, o) -> draw_opening(acc, p, s, o))
+    let g4 = List.fold_left(List.range(0, List.length(p.bp_volumes)), g3, fn (acc, vi) -> roof(acc, p, s, List.nth(p.bp_volumes, vi), seed, vi))
+    match g4 do BldGrid(w, hh, d, a) -> Strata.Template.make(w, hh, d, a, s.bs_voxel) end
+  end
+end
