@@ -23,3 +23,4 @@
 - Task 15: set pieces by zone; Ruling: yard = a lot's ground outside its building; high ground = the highest fifth of open ground.
 - Task 16: trees by hashed cells, doubled within 12 m of water; Ruling: street trees where density < 0.5 (an exurb).
 - Task 18 (complete): surfaces (concrete, scorched, sand, grass), lava, roads, and templates by a per-chunk index.
+- Task 19: ruin pass on a scratch world, answered as requests; Ruling: rubble laid on resting air cell by cell (not stamped).
