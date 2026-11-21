@@ -38,6 +38,8 @@ checked for play. The generic parts are Strata tools and a shareable plugin,
   city quarters, medium-density exurbs (up to four storeys, trees).
 - **Approach C**: a layered pipeline, with authored set pieces placed by
   the grammar.
+- **Real flooding:** a blasted riverbank floods the map mid-battle (see
+  Water in battle).
 - Plugin rule carried over: generic parts are shareable, nothing in Strata
   core names a game concept, `strata_maps` uses only public Strata.
 
@@ -67,8 +69,6 @@ checked for play. The generic parts are Strata tools and a shareable plugin,
 - **Lava is static in this project:** a glowing, non-colliding hazard
   block (it lights its surroundings) the tactical layer reads as a terrain
   kind. Flowing lava is a later project.
-- **Rivers are water** in Strata's fluid model, so a breached bank drains
-  as it does on the island.
 - **Trees move into Strata core** as a population generator kind
   (`branching`, as the population design planned), out of the viewer, and
   are **stamped as world voxels** (not props) in this project, so forests
@@ -168,7 +168,8 @@ sites).
 2. **Water.** Rivers as paths from edge to edge (or edge to lake) carved
    into the height field with banks, width from the **water** knob (a
    stream to a big river); lakes in basins (`Strata.Flood`). Water is
-   written as fluid blocks at rest.
+   written at rest as source bodies, one per river stretch and lake, with
+   sinks at the downstream edge (see Water in battle).
 3. **Roads and lots.** A road graph suited to the settlement style (a grid
    for exurbs, arterials and yards for industrial areas, a broken grid for
    city quarters), clipped to buildable ground; bridges where roads cross
@@ -206,6 +207,34 @@ sites).
 
 Each layer may be off. A layer that is on but finds no room (no buildable
 ground for a settlement) reports it in the map's data.
+
+## Water in battle (real flooding)
+
+The owner's call: a breached bank floods. How (designer's calls within it):
+
+- **A river is a chain of stretches**, each a body of water at its own
+  level, stepping down along the river at weirs or small falls (built by
+  the water stage where the bed drops more than a height step). Each
+  stretch is a **source body**: like Strata's sea, it is never used up and
+  tops up water standing against it, so a breach keeps pouring until the
+  ground it floods reaches the stretch's level or drains away. Strata's
+  fluid has one sea level today (`Strata.Fluid.with_sea_top`); it gains
+  **source bodies at several levels** (a Strata core addition, generic:
+  "a body of fluid held at a level").
+- **Sinks at the downstream map edge** (and in the backdrop ring) take
+  water that leaves the map, so floods do not pool at the boundary forever.
+- **The map starts at rest:** stretches are written at their levels with
+  nothing active, so the fluid simulation costs nothing until something
+  breaks a bank.
+- **The fluid steps during battle** (Strata.Fluid on the game's loop, as
+  the viewer runs it), and its outcomes go to `strata_tactics`'
+  `world_changed`, so flooded tiles' fluid depth updates in the grid.
+  What water does to units (slows legs, stops treads, nothing to hover)
+  is Steel Rain's rule through the grid's fluid depth and the reach cost.
+- **The tactical check** at generation sees water as it stands; it does not
+  predict floods. Blasting a bank is a play.
+- Lakes are source bodies too; small ponds may be plain still water that
+  can drain.
 
 ## Layers and knobs
 
