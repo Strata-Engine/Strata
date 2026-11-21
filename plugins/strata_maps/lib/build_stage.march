@@ -1,0 +1,58 @@
+-- BuildStage — a building on every lot.
+--
+-- The settings' style (its index into the styles the game passes; the
+-- first when out of range) with its storeys pinned by density: the style's
+-- lowest at density 0, its highest at 1, rounded between. Each lot gets the
+-- building the grammar plans for it from a hash of the map's seed and the
+-- lot's place, drawn hollow (level 2). The ground under its footprint is
+-- set to the footprint's mean height, rounded down to the height step (no
+-- easing round it, so neighbouring footprints keep their own levels), and
+-- the building stands there, its template's origin at the lot's low corner.
+mod StrataMaps.BuildStage do
+
+  alias StrataMaps.Data as BsD
+
+  pfn pinned(s : Strata.Building.BldStyle, density : Float) : Strata.Building.BldStyle do
+    match s.bs_storeys do
+      (lo, hi) ->
+        let n = lo + float_to_int(Math.floor(density *. int_to_float(hi - lo) +. 0.5))
+        { s with bs_storeys: (n, n) }
+    end
+  end
+  pfn cells(p : Strata.Building.BldPlan) : List((Int, Int)) do
+    List.flat_map(Strata.Building.footprint(p), fn f -> match f do (x0, z0, x1, z1) -> List.map(List.range(0, (x1 - x0 + 1) * (z1 - z0 + 1)), fn i -> (x0 + i % (x1 - x0 + 1), z0 + i / (x1 - x0 + 1))) end)
+  end
+  pfn lot_seed(seed : Int, l : Strata.Lots.Lot) : Int do match Strata.Lots.lot_box(l) do (x0, z0, _, _) -> Strata.Seed.mix(Strata.Seed.mix(seed, 811 + x0), z0) end end
+
+  -- one lot's building, the ground set under it
+  pfn place(acc : (Strata.Heights.HeightGrid, List(StrataMaps.Data.MapBuilding)), s : Strata.Building.BldStyle, seed : Int, step : Int, l : Strata.Lots.Lot) : (Strata.Heights.HeightGrid, List(StrataMaps.Data.MapBuilding)) do
+    match acc do
+      (h, bs) ->
+        let ls = lot_seed(seed, l)
+        let p = Strata.Building.plan(l, s, ls)
+        let cs = cells(p)
+        if List.is_empty(cs) do acc
+        else
+          let mean = List.fold_left(cs, 0, fn (a, c) -> match c do (x, z) -> a + Strata.Heights.get(h, x, z) end) / List.length(cs)
+          let floor = int_div_euclid(mean, Math.max_int(1, step)) * Math.max_int(1, step)
+          let h2 = List.fold_left(cs, h, fn (g, c) -> match c do (x, z) -> Strata.Heights.set(g, x, z, floor) end)
+          match Strata.Lots.lot_box(l) do
+            (x0, z0, _, _) -> (h2, Cons({ mbd_plan: p, mbd_template: Strata.Building.hollow(p, s, ls), mbd_origin: (x0, floor, z0) }, bs))
+          end
+        end
+    end
+  end
+
+  doc "A building of the settings' style on every lot (storeys by density), on ground flattened under its footprint. No styles: no buildings, and a report line."
+  fn run(d : StrataMaps.Data.MapData, styles : List(Strata.Building.BldStyle)) : StrataMaps.Data.MapData do
+    match styles do
+      Nil -> if List.is_empty(d.md_lots) do d else BsD.report(d, "buildings: no styles given") end
+      Cons(first, _) ->
+        let set = d.md_settings
+        let s = pinned(match List.nth_opt(styles, set.ms_style) do Some(st) -> st | None -> first end, set.ms_knobs.mk_density)
+        match List.fold_left(d.md_lots, (d.md_heights, Nil), fn (acc, l) -> place(acc, s, set.ms_seed, set.ms_step, l)) do
+          (h, bs) -> { d with md_heights: h, md_buildings: List.reverse(bs) }
+        end
+    end
+  end
+end
