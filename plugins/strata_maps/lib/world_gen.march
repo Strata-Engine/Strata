@@ -31,18 +31,6 @@ mod StrataMaps.WorldGen do
     if x < c || z < c || x >= c + n || z >= c + n do 0 else NativeArray.get_int(m, (z - c) * n + (x - c)) end
   end
 
-  -- the block at (y) of a column: top (first air), its water level (or -1), its mark, the upper level for a weir, its surface (0: by water), its lava level (or -1)
-  pfn block_at(b : StrataMaps.Settings.MapBlocks, y : Int, top : Int, level : Int, mark : Int, upper : Int, surf : Int, lava : Int) : Int do
-    if y < top - 4 do b.mb_stone
-    else if y < top - 1 do b.mb_dirt
-    else if y < top do (if surf != 0 do surf else if level >= 0 do b.mb_sand else b.mb_grass end end)
-    else if mark == 1 && y < upper do b.mb_weir
-    else if mark == 2 && y < level do b.mb_sink
-    else if level >= 0 && y < level do b.mb_water
-    else if lava >= 0 && y < lava do b.mb_lava
-    else 0 end end end end end end end
-  end
-
   -- per column of the square: the surface block under a lot or a scorched ring, else 0
   pfn surfaces(d : StrataMaps.Data.MapData) : NativeIntArr do
     let n = WgS.side_voxels(d.md_settings)
@@ -103,23 +91,63 @@ mod StrataMaps.WorldGen do
         let upper = if mark == 1 do Math.max_int(WgD.water_at(d, x - 1, z), level) else level end
         let surf = mark_at(sf, n, c, x, z)
         let lava = WgD.lava_at(d, x, z)
-        List.fold_left(List.range(0, 32), a, fn (acc, y) -> NativeArray.set_i32(acc, Strata.Coord.index(i, y, k), block_at(d.md_blocks, cy * 32 + y, top, level, mark, upper, surf, lava)))
+        let b = d.md_blocks
+        let y0 = cy * 32
+        -- the column as runs (what block_at answers voxel by voxel): stone, dirt, the surface, then what stands on it
+        let surface = if surf != 0 do surf else if level >= 0 do b.mb_sand else b.mb_grass end end
+        let (cap, id) = if mark == 1 do (upper, b.mb_weir) else if mark == 2 do (level, b.mb_sink) else if level >= 0 do (level, b.mb_water) else if lava >= 0 do (lava, b.mb_lava) else (top, 0) end end end end
+        let a1 = run_fill(a, i, k, y0, Math.max_int(y0, -1000000), top - 4, b.mb_stone)
+        let a2 = run_fill(a1, i, k, y0, top - 4, top - 1, b.mb_dirt)
+        let a3 = run_fill(a2, i, k, y0, top - 1, top, surface)
+        if id == 0 do a3 else run_fill(a3, i, k, y0, top, cap, id) end
+    end
+  end
+  -- cells [from, to) of column (i, k) set to [id], clipped to the chunk whose lowest row is y0
+  pfn run_fill(a : NativeI32Arr, i : Int, k : Int, y0 : Int, from : Int, to : Int, id : Int) : NativeI32Arr do
+    run_go(a, i, k, y0, Math.max_int(from, y0), Math.min_int(to, y0 + 32), id)
+  end
+  pfn run_go(a : NativeI32Arr, i : Int, k : Int, y0 : Int, y : Int, y1 : Int, id : Int) : NativeI32Arr do
+    if y >= y1 do a else run_go(NativeArray.set_i32(a, Strata.Coord.index(i, y - y0, k), id), i, k, y0, y + 1, y1, id) end
+  end
+
+  -- this chunk column's lowest ground and highest ground, water, lava or template (the stamps that reach it)
+  pfn local_bounds(d : StrataMaps.Data.MapData, cx0 : WgCtx, kx : Int, kz : Int) : (Int, Int) do
+    let base = List.fold_left(List.range(0, 1024), (1000000, -1000000), fn (acc, j) -> col_bounds(d, acc, kx * 32 + j % 32, kz * 32 + j / 32))
+    match (base, cx0) do
+      ((lo, hi), WgCtx(_, _, ix)) -> (lo, Math.max_int(hi + 1, stamp_top(Strata.Store.get(ix, Strata.Coord.key(kx, 0, kz)))))
+    end
+  end
+  pfn col_bounds(d : StrataMaps.Data.MapData, acc : (Int, Int), x : Int, z : Int) : (Int, Int) do
+    match acc do
+      (lo, hi) ->
+        let h = WgH.get(d.md_heights, x, z)
+        (Math.min_int(lo, h), Math.max_int(hi, Math.max_int(h, Math.max_int(WgD.water_at(d, x, z), WgD.lava_at(d, x, z)))))
     end
   end
 
-  pfn chunk_of(d : StrataMaps.Data.MapData, cx0 : WgCtx, lo : Int, hi : Int, k : Strata.Coord.Key) : Strata.Chunk.Chunk do
+  pfn chunk_of(d : StrataMaps.Data.MapData, cx0 : WgCtx, glo : Int, ghi : Int, k : Strata.Coord.Key) : Strata.Chunk.Chunk do
     let cy = Strata.Coord.ky(k)
-    if (cy + 1) * 32 <= lo - 4 do Strata.Chunk.uniform(d.md_blocks.mb_stone)
-    else if cy * 32 >= hi do Strata.Chunk.uniform(0)
+    -- the map-wide bounds first (cheap), then this chunk column's own: most chunks are all stone or all air
+    if (cy + 1) * 32 <= glo - 4 do Strata.Chunk.uniform(d.md_blocks.mb_stone)
+    else if cy * 32 >= ghi do Strata.Chunk.uniform(0)
     else
-      let n = WgS.side_voxels(d.md_settings)
-      let c = WgD.corner(d.md_settings)
-      let cx = Strata.Coord.kx(k)
-      let cz = Strata.Coord.kz(k)
-      let a = List.fold_left(List.range(0, 32 * 32), NativeArray.make_i32(32768, 0), fn (acc, j) -> column(acc, d, cx0, n, c, cx, cy, cz, j % 32, j / 32))
-      let ground = Strata.Roads.chunk_paint(Strata.Chunk.from_flat(a), k, d.md_roads, d.md_heights, WgS.scale(), d.md_blocks.mb_deck)
-      match cx0 do WgCtx(_, _, ix) -> clear_trails(d, blit_all(ground, k, ix), k) end
+      match local_bounds(d, cx0, Strata.Coord.kx(k), Strata.Coord.kz(k)) do
+        (lo, hi) ->
+          if (cy + 1) * 32 <= lo - 4 do Strata.Chunk.uniform(d.md_blocks.mb_stone)
+          else if cy * 32 >= hi do Strata.Chunk.uniform(0)
+          else build_chunk(d, cx0, k, cy)
+          end end
+      end
     end end
+  end
+  pfn build_chunk(d : StrataMaps.Data.MapData, cx0 : WgCtx, k : Strata.Coord.Key, cy : Int) : Strata.Chunk.Chunk do
+    let n = WgS.side_voxels(d.md_settings)
+    let c = WgD.corner(d.md_settings)
+    let cx = Strata.Coord.kx(k)
+    let cz = Strata.Coord.kz(k)
+    let a = List.fold_left(List.range(0, 32 * 32), NativeArray.make_i32(32768, 0), fn (acc, j) -> column(acc, d, cx0, n, c, cx, cy, cz, j % 32, j / 32))
+    let ground = Strata.Roads.chunk_paint(Strata.Chunk.from_flat(a), k, d.md_roads, d.md_heights, WgS.scale(), d.md_blocks.mb_deck)
+    match cx0 do WgCtx(_, _, ix) -> clear_trails(d, blit_all(ground, k, ix), k) end
   end
 
   -- 16 voxels of air over every trail column (canopies and pieces that reach over a trail cut away), as roads keep 3 m

@@ -91,7 +91,9 @@ mod StrataMaps.WaterStage do
       let depth = float_to_int(Math.round(4.0 +. 6.0 *. w))
       -- levels west to east, stretched, and where the weirs go
       let (levels, weirs_at) = levels_of(d.md_heights, p, c, n, half)
-      let d1 = List.fold_left(List.range(0, n), d, fn (acc, i) -> carve(acc, c + i, NativeArray.get_int(p, i), half, NativeArray.get_int(levels, i), if is_ford(i, n) do 2 else depth end))
+      -- the bare grid and water array threaded through the columns, the data rebuilt once (GAPS S55: a record update of an array field copies it)
+      let (g1, wa1) = List.fold_left(List.range(0, n), (d.md_heights, d.md_water), fn (acc, i) -> carve(acc, c, n, c + i, NativeArray.get_int(p, i), half, NativeArray.get_int(levels, i), if is_ford(i, n) do 2 else depth end))
+      let d1 = { d with md_heights: g1, md_water: wa1 }
       let weirs = List.flat_map(weirs_at, fn i -> List.map(List.range(0 - half, half + 1), fn k -> (c + i, NativeArray.get_int(p, i) + k)))
       let sinks = List.map(List.range(0 - half, half + 1), fn k -> (c + n - 1, NativeArray.get_int(p, n - 1) + k))
       { d1 with md_weirs: weirs, md_sinks: sinks }
@@ -116,18 +118,28 @@ mod StrataMaps.WaterStage do
     end
   end
 
-  -- one column of river: water at the level, the bed under it, the banks eased down to it
-  pfn carve(d : StrataMaps.Data.MapData, x : Int, zc : Int, half : Int, level : Int, depth : Int) : StrataMaps.Data.MapData do
-    let wet = List.fold_left(List.range(0 - half, half + 1), d, fn (acc, k) ->
-      let g = WsH.set(acc.md_heights, x, zc + k, Math.min_int(WsH.get(acc.md_heights, x, zc + k), level - depth))
-      WsD.with_water({ acc with md_heights: g }, x, zc + k, level))
+  -- one column of river on the bare grid and water array: water at the level, the bed under it, the banks eased down to it
+  pfn carve(st : (Strata.Heights.HeightGrid, NativeIntArr), c : Int, n : Int, x : Int, zc : Int, half : Int, level : Int, depth : Int) : (Strata.Heights.HeightGrid, NativeIntArr) do
+    let wet = List.fold_left(List.range(0 - half, half + 1), st, fn (acc, k) -> wet_cell(acc, c, n, x, zc + k, level, depth))
     List.fold_left(List.range(1, 4), wet, fn (acc, k) -> ease_bank(acc, x, zc, half, k, level))
   end
-  pfn ease_bank(d : StrataMaps.Data.MapData, x : Int, zc : Int, half : Int, k : Int, level : Int) : StrataMaps.Data.MapData do
-    let cap = level + k
-    let g1 = WsH.set(d.md_heights, x, zc - half - k, Math.min_int(WsH.get(d.md_heights, x, zc - half - k), Math.max_int(cap, level)))
-    let g2 = WsH.set(g1, x, zc + half + k, Math.min_int(WsH.get(g1, x, zc + half + k), Math.max_int(cap, level)))
-    { d with md_heights: g2 }
+  pfn wet_cell(st : (Strata.Heights.HeightGrid, NativeIntArr), c : Int, n : Int, x : Int, z : Int, level : Int, depth : Int) : (Strata.Heights.HeightGrid, NativeIntArr) do
+    match st do
+      (g, wa) ->
+        let h = Math.min_int(WsH.get(g, x, z), level - depth)
+        let wa2 = if x < c || z < c || x >= c + n || z >= c + n do wa else NativeArray.set_int(wa, (z - c) * n + (x - c), level) end
+        (WsH.set(g, x, z, h), wa2)
+    end
+  end
+  pfn ease_bank(st : (Strata.Heights.HeightGrid, NativeIntArr), x : Int, zc : Int, half : Int, k : Int, level : Int) : (Strata.Heights.HeightGrid, NativeIntArr) do
+    match st do
+      (g, wa) ->
+        let cap = Math.max_int(level + k, level)
+        let lo = Math.min_int(WsH.get(g, x, zc - half - k), cap)
+        let g1 = WsH.set(g, x, zc - half - k, lo)
+        let hi = Math.min_int(WsH.get(g1, x, zc + half + k), cap)
+        (WsH.set(g1, x, zc + half + k, hi), wa)
+    end
   end
 
   doc "For tests: at column x every water column's level is at or under the ground just outside the river and above its own bed."

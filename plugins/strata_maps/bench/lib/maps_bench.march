@@ -1,0 +1,82 @@
+-- maps_bench — the generation budget, measured: one attempt of a 64 x 64
+-- map with every layer at 0.5 (rolling ground), each stage timed in
+-- milliseconds. STRATA_TILES and STRATA_MAP_SEED change the map. No window.
+mod MapsBench do
+
+  needs IO
+  needs IO.Process
+  needs IO.Clock
+
+  pfn reg() : Strata.Blocks.Registry do
+    let plain = fn r -> match Strata.Blocks.register(r, Strata.Blocks.def()) do Ok((r2, _)) -> r2 | Err(_) -> r end
+    let r11 = List.fold_left(List.range(0, 11), Strata.Blocks.empty(), fn (r, _) -> plain(r))
+    let water = Strata.Blocks.with_collide(Strata.Blocks.with_layer(Strata.Blocks.with_opacity(Strata.Blocks.def(), Strata.Blocks.SeeThrough), Strata.Blocks.Translucent), false)
+    let r19 = match Strata.Blocks.register_fluid(r11, water) do Ok((r, _)) -> r | Err(_) -> r11 end
+    List.fold_left(List.range(0, 15), r19, fn (r, _) -> plain(r))
+  end
+  pfn blocks() : StrataMaps.Settings.MapBlocks do
+    { mb_stone: 1, mb_dirt: 2, mb_grass: 3, mb_sand: 4, mb_asphalt: 5, mb_concrete: 6, mb_water: 19, mb_sink: 11, mb_weir: 6, mb_lava: 7, mb_rubble: 8, mb_scorched: 9, mb_deck: 10 }
+  end
+  pfn crate() : Strata.Template.Template do Strata.Template.make(8, 6, 8, NativeArray.make_i32(384, 8), 0.4) end
+  pfn tree(i : Int) : Strata.Template.Template do Strata.Trees.build(i % 3, 1000 + i, 0.4, 20, 21) end
+  pfn zone(name : String, edge : Int) : StrataMaps.Sites.SiteRule do
+    { sr_name: name, sr_kind: 0, sr_tiles: 6, sr_edge: edge, sr_far_from: Nil, sr_high: false, sr_in_settlement: false, sr_open_sky: false, sr_count: 1 }
+  end
+  pfn now() : Int do System.monotonic_time() end
+  pfn say(label : String, t0 : Int) : Int do
+    let t = now()
+    let _ = Authority.must(println("maps_bench: " ++ label ++ " " ++ int_to_string(t - t0) ++ " ms"))
+    t
+  end
+
+  fn main(_cap : Cap(IO)) : Unit do
+    let tiles = Authority.must(Env.get_int("STRATA_TILES", 64))
+    let seed = Authority.must(Env.get_int("STRATA_MAP_SEED", 7))
+    let s0 = StrataMaps.Settings.settings(seed, tiles)
+    let k = List.fold_left(["relief", "water", "settlement", "density", "vegetation", "hazard", "ruin"], s0.ms_knobs, fn (acc, nm) -> StrataMaps.Settings.with_knob(acc, nm, 0.5))
+    let s = { s0 with ms_base: 1, ms_knobs: k }
+    let style = { Strata.Building.style(6, 2, 3, 6, 5) with bs_door: 2 }
+    let mover = StrataTactics.Reach.mover(6, 2, 3, 12)
+    let pieces = [{ mp_template: crate(), mp_zone: 3, mp_per_map: (8, 16), mp_needs_flat: false }, { mp_template: crate(), mp_zone: 0, mp_per_map: (0, 6), mp_needs_flat: true }]
+    let trees = List.map(List.range(0, 6), fn i -> tree(i))
+    let r = reg()
+    let start = now()
+    let t0 = now()
+    let d1 = StrataMaps.TerrainStage.run(StrataMaps.Data.empty(s, blocks()))
+    let t1 = say("terrain", t0)
+    let d2 = StrataMaps.WaterStage.run(d1)
+    let t2 = say("water", t1)
+    let d3 = StrataMaps.TrailStage.run(d2, mover)
+    let t3 = say("trails", t2)
+    let d4 = StrataMaps.SettleStage.run(d3)
+    let t4 = say("settle (roads, lots)", t3)
+    let d5 = StrataMaps.BuildStage.run(d4, [style])
+    let t5 = say("buildings", t4)
+    let d6 = StrataMaps.HazardStage.run(d5)
+    let t6 = say("lava", t5)
+    let d7 = StrataMaps.PieceStage.run(d6, pieces)
+    let t7 = say("pieces", t6)
+    let d8 = StrataMaps.GreenStage.run(d7, trees)
+    let t8 = say("trees", t7)
+    let ok = StrataMaps.Check.early(d8, mover)
+    let t9 = say("early check", t8)
+    let w0 = StrataMaps.RuinStage.scratch(d8, r)
+    let t10 = say("scratch world (generator over the playable square)", t9)
+    match StrataMaps.RuinStage.run(d8, w0) do
+      (reqs, d9) ->
+        let t11 = say("ruin", t10)
+        match Strata.Plugin.apply(w0, reqs) do
+          (w, _, _) ->
+            let t12 = say("ruin applied", t11)
+            let g = StrataMaps.grid(d9, w)
+            let t13 = say("grid", t12)
+            let d10 = StrataMaps.Sites.place(d9, g, [zone("north", 3), zone("south", 2)])
+            let t14 = say("sites", t13)
+            let rep = StrataMaps.Check.run(w, g, d10, mover)
+            let t15 = say("check", t14)
+            let _ = Authority.must(println("maps_bench: total " ++ int_to_string(t15 - start) ++ " ms; " ++ int_to_string(tiles) ++ " tiles, " ++ int_to_string(List.length(d10.md_lots)) ++ " lots, " ++ int_to_string(List.length(d10.md_placed)) ++ " pieces and trees, " ++ int_to_string(List.length(reqs)) ++ " ruin edits; early " ++ (if ok do "yes" else "no" end) ++ ", check " ++ (if rep.cr_ok do "passes" else "fails" end)))
+            ()
+        end
+    end
+  end
+end

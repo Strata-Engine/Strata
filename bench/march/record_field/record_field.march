@@ -1,0 +1,45 @@
+-- StrataMaps' per-column stage loops, reduced: a record holding a large int
+-- array is threaded through a loop, each turn writing one element through a
+-- functional record update, `{ r with rf_a: NativeArray.set_int(r.rf_a, i, v) }`.
+-- A write is in place only while the array is uniquely held. Here the record
+-- `r` still holds the array while it is written (r is used again by the
+-- update), so the runtime copies the whole array on every write: the cost of
+-- a write grows with SIZE. Compare SIZE=64 with SIZE=262144.
+--   VARIANT 0: the update written in the loop
+--   VARIANT 1: the update through a helper taking the record (as StrataMaps.Data.with_water)
+--   VARIANT 2: the loop threads the bare array; the record is built once at the end
+mod RecordField do
+  needs IO
+
+  type RfRec = { rf_a : NativeIntArr, rf_n : Int }
+
+  pfn put(r : RfRec, i : Int, v : Int) : RfRec do { r with rf_a: NativeArray.set_int(r.rf_a, i, v) } end
+
+  pfn loop_record(r : RfRec, i : Int, n : Int, size : Int) : RfRec do
+    if i >= n do r else loop_record({ r with rf_a: NativeArray.set_int(r.rf_a, (i * 7919) % size, i) }, i + 1, n, size) end
+  end
+  pfn loop_helper(r : RfRec, i : Int, n : Int, size : Int) : RfRec do
+    if i >= n do r else loop_helper(put(r, (i * 7919) % size, i), i + 1, n, size) end
+  end
+  pfn loop_bare(a : NativeIntArr, i : Int, n : Int, size : Int) : NativeIntArr do
+    if i >= n do a else loop_bare(NativeArray.set_int(a, (i * 7919) % size, i), i + 1, n, size) end
+  end
+
+  -- one rep: 1000 writes
+  pfn one(size : Int, variant : Int) : Int do
+    let r0 = { rf_a: NativeArray.make_int(size, 0), rf_n: size }
+    let r = if variant == 0 do loop_record(r0, 0, 1000, size)
+      else if variant == 1 do loop_helper(r0, 0, 1000, size)
+      else { r0 with rf_a: loop_bare(NativeArray.make_int(size, 0), 0, 1000, size) } end end
+    NativeArray.get_int(r.rf_a, 7919 % size)
+  end
+  pfn rep(size : Int, variant : Int, left : Int, acc : Int) : Int do
+    if left <= 0 do acc else rep(size, variant, left - 1, acc + one(size, variant)) end
+  end
+
+  fn main(_cap : Cap(IO)) : Unit do
+    let size = Authority.must(Env.get_int("SIZE", 64))
+    let v = Authority.must(Env.get_int("VARIANT", 0))
+    Authority.must(println(int_to_string(rep(if size < 8 do 8 else size end, v, Authority.must(Env.get_int("REPS", 1)), 0))))
+  end
+end

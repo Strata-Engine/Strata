@@ -82,23 +82,40 @@ mod StrataTactics.Grid do
   end
 
   -- ── Reading the voxels ──────────────────────────────────────────────────
-  pfn solid(w : Strata.World.World, x : Int, y : Int, z : Int) : Bool do Strata.Blocks.collides(Strata.World.registry(w), Strata.World.get_block(w, x, y, z)) end
-
-  -- are cells y .. y + n - 1 free (none collides)?
-  pfn free_run(w : Strata.World.World, x : Int, y : Int, z : Int, n : Int) : Bool do
-    if n <= 0 do true else if solid(w, x, y, z) do false else free_run(w, x, y + 1, z, n - 1) end end
-  end
 
   -- the column's floor: from y down to ylo + 1, the highest cell with a solid cell under it and room above
-  pfn column_floor(w : Strata.World.World, s : GridSettings, x : Int, y : Int, z : Int) : Option(Int) do
-    if y <= s.gs_ylo do None
-    else if solid(w, x, y - 1, z) && !solid(w, x, y, z) && free_run(w, x, y, z, s.gs_min_height) do Some(y)
-    else column_floor(w, s, x, y - 1, z) end end
+  -- (min_height free cells from it up). One walk down, one read a cell: the free run above is counted as it goes,
+  -- starting min_height over y so a floor near y sees the cells above it as the test always did.
+  -- The walk holds the chunk it is in and fetches the next only when it crosses into it (a World.get_block
+  -- finds the chunk in the store on every call).
+  -- the floor and the free cells from it up (to the scan's top, over y): the tile's clearance needs no second walk
+  pfn column_floor(w : Strata.World.World, s : GridSettings, x : Int, y : Int, z : Int) : Option((Int, Int)) do
+    let top = y + s.gs_min_height
+    let r = Strata.World.registry(w)
+    let c = chunk_at(w, x, top, z)
+    floor_scan(w, r, s, x, top, z, y, solid_in(r, c, x, top, z), 0, c, int_div_euclid(top, 32))
   end
-
-  -- free cells from y up, at most cap
-  pfn free_up(w : Strata.World.World, x : Int, y : Int, z : Int, cap : Int, n : Int) : Int do
-    if n >= cap do cap else if solid(w, x, y + n, z) do n else free_up(w, x, y, z, cap, n + 1) end end
+  pfn chunk_at(w : Strata.World.World, x : Int, y : Int, z : Int) : Strata.Chunk.Chunk do Strata.Store.get(Strata.World.chunks(w), Strata.Coord.key_of_voxel(x, y, z)) end
+  pfn solid_in(r : Strata.Blocks.Registry, c : Strata.Chunk.Chunk, x : Int, y : Int, z : Int) : Bool do
+    Strata.Blocks.collides(r, Strata.Chunk.get_or(c, Strata.Coord.local_of(x), Strata.Coord.local_of(y), Strata.Coord.local_of(z), 0))
+  end
+  -- at cell y: [sy] whether it is solid, [run] the free cells just above it; [c] the chunk holding chunk row [cy]
+  pfn floor_scan(w : Strata.World.World, r : Strata.Blocks.Registry, s : GridSettings, x : Int, y : Int, z : Int, ymax : Int, sy : Bool, run : Int, c : Strata.Chunk.Chunk, cy : Int) : Option((Int, Int)) do
+    let u = Strata.Chunk.uniform_id(c)
+    let bottom = cy * 32
+    if y <= s.gs_ylo do None
+    -- a chunk of one block holds no floor above its bottom row: jump there (all free: the run grows; all solid: no run)
+    else if u >= 0 && y > bottom && bottom > s.gs_ylo do
+      if Strata.Blocks.collides(r, u) do floor_scan(w, r, s, x, bottom, z, ymax, true, 0, c, cy)
+      else floor_scan(w, r, s, x, bottom, z, ymax, false, run + (y - bottom), c, cy) end
+    else
+      let here = if sy do 0 else run + 1 end
+      let by = int_div_euclid(y - 1, 32)
+      let cb = if by == cy do c else chunk_at(w, x, y - 1, z) end
+      let below = solid_in(r, cb, x, y - 1, z)
+      if !sy && below && here >= s.gs_min_height && y <= ymax do Some((y, here))
+      else floor_scan(w, r, s, x, y - 1, z, ymax, below, here, cb, by) end
+    end end
   end
 
   pfn fluid_up(w : Strata.World.World, x : Int, y : Int, z : Int, cap : Int, n : Int) : Int do
@@ -118,20 +135,22 @@ mod StrataTactics.Grid do
   end
 
   -- (floor, clearance, fluid, kind, standable) of one tile
+  pfn floor_of(w : Strata.World.World, s : GridSettings, c : (Int, Int)) : Option((Int, Int, Int, Int)) do
+    match c do (x, z) -> match column_floor(w, s, x, s.gs_yhi, z) do Some((y, run)) -> Some((x, z, y, run)) | None -> None end end
+  end
   pfn read_tile(w : Strata.World.World, s : GridSettings, tx : Int, tz : Int) : (Int, Int, Int, Int, Int) do
     let cs = columns(s, tx, tz)
-    let floors = List.filter_map(cs, fn c -> match c do (x, z) -> match column_floor(w, s, x, s.gs_yhi, z) do Some(y) -> Some((x, z, y)) | None -> None end end)
+    let floors = List.filter_map(cs, fn c -> floor_of(w, s, c))
     match floors do
       Nil -> (0, 0, 0, 0, 0)
       _ ->
-        let f = lower_median(List.map(floors, fn t -> match t do (_, _, y) -> y end))
-        let near = List.filter(floors, fn t -> match t do (_, _, y) -> int_abs(y - f) <= s.gs_step end)
+        let f = lower_median(List.map(floors, fn t -> match t do (_, _, y, _) -> y end))
+        let near = List.filter(floors, fn t -> match t do (_, _, y, _) -> int_abs(y - f) <= s.gs_step end)
         let n = s.gs_tile * s.gs_tile
         let stand = if List.length(near) * 2 >= n do 1 else 0 end
         let cap = s.gs_yhi - f
         -- each column's room from its own floor (a column a step above the median is solid at f)
-        let clear = List.fold_left(near, cap, fn (acc, t) -> match t do (x, z, y) -> let c = free_up(w, x, y, z, s.gs_yhi - y, 0)
-          if c < acc do c else acc end end)
+        let clear = List.fold_left(near, cap, fn (acc, t) -> match t do (_, _, y, run) -> Math.min_int(acc, Math.min_int(run, s.gs_yhi - y)) end)
         let cx = s.gs_x0 + tx * s.gs_tile + s.gs_tile / 2
         let cz = s.gs_z0 + tz * s.gs_tile + s.gs_tile / 2
         let k = s.gs_kind(Strata.World.get_block(w, cx, f - 1, cz))
