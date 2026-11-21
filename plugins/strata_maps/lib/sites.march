@@ -1,0 +1,129 @@
+-- Sites — objective sites on the tactical grid.
+--
+-- A rule asks for a zone (a connected patch of [tiles] tiles), a point (one
+-- tile) or a building (the tiles under one), [count] times, on standable
+-- tiles that are dry, off lava and not rubble (the grid's kind is the block
+-- under a tile, so the game's kind function keeps the rubble block's id),
+-- and, as the rule says, within 2 tiles of an edge (0 +x, 1 -x, 2 +z, 3 -z),
+-- at least so many tiles (the larger of the x and z distances) from every
+-- tile of the named sites, in the highest fifth of the candidates, inside
+-- the settled disc, or under open sky (24 voxels of room over the floor).
+-- Rules go in order, each choosing by a hash among the tiles that meet it; a
+-- zone grows from its first tile through candidates. A rule that cannot be
+-- met is a report line, not a site. Tiles are the grid's (tx, tz).
+mod StrataMaps.Sites do
+
+  alias StrataMaps.Data as StD
+  alias StrataTactics.Grid as StG
+
+  type SiteRule = { sr_name : String, sr_kind : Int, sr_tiles : Int, sr_edge : Int, sr_far_from : List((String, Int)), sr_high : Bool,
+                    sr_in_settlement : Bool, sr_open_sky : Bool, sr_count : Int }
+
+  -- the world column at a tile's middle
+  pfn mid(g : StrataTactics.Grid.TileGrid, t : (Int, Int)) : (Int, Int) do
+    match t do (tx, tz) -> ((StG.settings_of(g)).gs_x0 + tx * (StG.settings_of(g)).gs_tile + (StG.settings_of(g)).gs_tile / 2, (StG.settings_of(g)).gs_z0 + tz * (StG.settings_of(g)).gs_tile + (StG.settings_of(g)).gs_tile / 2) end
+  end
+  pfn dist(a : (Int, Int), b : (Int, Int)) : Int do match (a, b) do ((ax, az), (bx, bz)) -> Math.max_int(int_abs(ax - bx), int_abs(az - bz)) end end
+
+  -- may anything stand here: standable, dry, off lava, not rubble
+  pfn sound(d : StrataMaps.Data.MapData, g : StrataTactics.Grid.TileGrid, t : (Int, Int)) : Bool do
+    match mid(g, t) do
+      (x, z) -> StG.standable(g, t) && StD.water_at(d, x, z) < 0 && StD.lava_at(d, x, z) < 0 && StG.fluid(g, t) == 0
+        && StG.kind(g, t) != d.md_blocks.mb_rubble && StG.kind(g, t) != d.md_blocks.mb_lava
+    end
+  end
+  pfn edge_ok(g : StrataTactics.Grid.TileGrid, edge : Int, t : (Int, Int)) : Bool do
+    match t do (tx, tz) -> if edge == 0 do tx >= StG.width(g) - 2 else if edge == 1 do tx <= 1 else if edge == 2 do tz >= StG.depth(g) - 2 else if edge == 3 do tz <= 1 else true end end end end end
+  end
+  pfn far_ok(sites : List(StrataMaps.Data.MapSite), far : List((String, Int)), t : (Int, Int)) : Bool do
+    List.all(far, fn f -> match f do (name, n) -> List.all(sites, fn s -> s.st_name != name || List.all(s.st_tiles, fn u -> dist(t, u) >= n)) end)
+  end
+  pfn settled_ok(d : StrataMaps.Data.MapData, g : StrataTactics.Grid.TileGrid, t : (Int, Int)) : Bool do
+    match (d.md_settled, mid(g, t)) do ((cx, cz, r), (x, z)) -> r > 0 && (x - cx) * (x - cx) + (z - cz) * (z - cz) <= r * r end
+  end
+
+  -- the tiles meeting a rule (all but the high band and the zone's growth)
+  pfn candidates(d : StrataMaps.Data.MapData, g : StrataTactics.Grid.TileGrid, sites : List(StrataMaps.Data.MapSite), r : SiteRule) : List((Int, Int)) do
+    let w = StG.width(g)
+    let all = List.map(List.range(0, w * StG.depth(g)), fn i -> (i % w, i / w))
+    let ok = List.filter(all, fn t -> sound(d, g, t) && edge_ok(g, r.sr_edge, t) && far_ok(sites, r.sr_far_from, t)
+      && (!r.sr_in_settlement || settled_ok(d, g, t)) && (!r.sr_open_sky || StG.clearance(g, t) >= 24))
+    if !r.sr_high do ok
+    else
+      let floors = List.sort_by(List.map(ok, fn t -> StG.floor(g, t)), fn (a, b) -> a < b)
+      match List.nth_opt(floors, List.length(floors) * 4 / 5) do Some(band) -> List.filter(ok, fn t -> StG.floor(g, t) >= band) | None -> Nil end
+    end
+  end
+
+  -- a zone of n tiles grown from [start] through [cands] (4-neighbours, in a fixed order); none if it cannot reach n
+  pfn grow(cands : List((Int, Int)), start : (Int, Int), n : Int) : Option(List((Int, Int))) do
+    let got = grow_go(cands, [start], [start], n)
+    if List.length(got) >= n do Some(List.take(got, n)) else None end
+  end
+  pfn grow_go(cands : List((Int, Int)), frontier : List((Int, Int)), got : List((Int, Int)), n : Int) : List((Int, Int)) do
+    if List.length(got) >= n do got
+    else
+      match frontier do
+        Nil -> got
+        Cons((tx, tz), rest) ->
+          let next = List.filter([(tx + 1, tz), (tx - 1, tz), (tx, tz + 1), (tx, tz - 1)], fn t -> List.member(cands, t) && !List.member(got, t))
+          grow_go(cands, List.append(rest, next), List.append(got, next), n)
+      end
+    end
+  end
+
+  -- one site for rule r (the k-th of its count)
+  pfn one(d : StrataMaps.Data.MapData, g : StrataTactics.Grid.TileGrid, sites : List(StrataMaps.Data.MapSite), r : SiteRule, h : Int) : Option(StrataMaps.Data.MapSite) do
+    if r.sr_kind == 2 do building(d, g, sites, r, h)
+    else
+      let cs = candidates(d, g, sites, r)
+      let n = List.length(cs)
+      if n == 0 do None
+      else if r.sr_kind == 1 do Some({ st_name: r.sr_name, st_tiles: [List.nth(cs, int_mod_euclid(h, n))] })
+      else
+        -- a zone: from up to 8 hashed starting tiles, the first that grows to size
+        let tries = List.map(List.range(0, 8), fn k -> List.nth(cs, int_mod_euclid(Strata.Seed.mix(h, k), n)))
+        match List.head_opt(List.filter_map(tries, fn s -> grow(cs, s, Math.max_int(1, r.sr_tiles)))) do
+          Some(ts) -> Some({ st_name: r.sr_name, st_tiles: ts })
+          None -> None
+        end
+      end end
+    end
+  end
+  -- a building's tiles: a building (by a hash, of those whose first footprint tile meets the rule) and every tile under its footprint
+  pfn building(d : StrataMaps.Data.MapData, g : StrataTactics.Grid.TileGrid, sites : List(StrataMaps.Data.MapSite), r : SiteRule, h : Int) : Option(StrataMaps.Data.MapSite) do
+    let ok = List.filter(d.md_buildings, fn b -> building_ok(d, g, sites, r, b))
+    match ok do
+      Nil -> None
+      _ -> Some({ st_name: r.sr_name, st_tiles: building_tiles(StG.settings_of(g), List.nth(ok, int_mod_euclid(h, List.length(ok)))) })
+    end
+  end
+  pfn on_grid(st : StrataTactics.Grid.GridSettings, t : (Int, Int)) : Bool do match t do (tx, tz) -> tx >= 0 && tz >= 0 && tx < st.gs_width && tz < st.gs_depth end end
+  pfn building_tiles(st : StrataTactics.Grid.GridSettings, b : StrataMaps.Data.MapBuilding) : List((Int, Int)) do List.flat_map(Strata.Building.footprint(b.mbd_plan), fn f -> foot_tiles(st, f)) end
+  pfn building_ok(d : StrataMaps.Data.MapData, g : StrataTactics.Grid.TileGrid, sites : List(StrataMaps.Data.MapSite), r : SiteRule, b : StrataMaps.Data.MapBuilding) : Bool do
+    match building_tiles(StG.settings_of(g), b) do Cons(t, _) -> far_ok(sites, r.sr_far_from, t) && edge_ok(g, r.sr_edge, t) && (!r.sr_in_settlement || settled_ok(d, g, t)) | Nil -> false end
+  end
+  pfn foot_tiles(st : StrataTactics.Grid.GridSettings, f : (Int, Int, Int, Int)) : List((Int, Int)) do
+    match f do
+      (x0, z0, x1, z1) ->
+        let t0 = int_div_euclid(x0 - st.gs_x0, st.gs_tile)
+        let t1 = int_div_euclid(x1 - st.gs_x0, st.gs_tile)
+        let u0 = int_div_euclid(z0 - st.gs_z0, st.gs_tile)
+        let u1 = int_div_euclid(z1 - st.gs_z0, st.gs_tile)
+        let w = t1 - t0 + 1
+        List.filter(List.map(List.range(0, w * (u1 - u0 + 1)), fn i -> (t0 + i % w, u0 + i / w)), fn t -> on_grid(st, t))
+    end
+  end
+
+  doc "The sites of [rules], in order, on [grid] (read from a world of this map): each a zone, point or building meeting its rule, chosen by a hash; a rule that cannot be met is a report line."
+  fn place(d : StrataMaps.Data.MapData, grid : StrataTactics.Grid.TileGrid, rules : List(SiteRule)) : StrataMaps.Data.MapData do
+    List.fold_left(List.range(0, List.length(rules)), d, fn (acc, ri) -> rule_sites(acc, grid, ri, List.nth(rules, ri)))
+  end
+  pfn rule_sites(d : StrataMaps.Data.MapData, g : StrataTactics.Grid.TileGrid, ri : Int, r : SiteRule) : StrataMaps.Data.MapData do
+    List.fold_left(List.range(0, Math.max_int(1, r.sr_count)), d, fn (acc, k) ->
+      match one(acc, g, acc.md_sites, r, Strata.Seed.mix(acc.md_settings.ms_seed, 8800 + ri * 17 + k)) do
+        Some(s) -> { acc with md_sites: List.append(acc.md_sites, [s]) }
+        None -> StD.report(acc, "sites: could not place " ++ r.sr_name)
+      end)
+  end
+end
