@@ -11,31 +11,67 @@
 -- runs straight between its two nodes' heights. `adapt` first eases the
 -- nodes' heights so that no segment is steeper than the grade (rise over
 -- run), then cuts or fills each road column to the road's height where the
--- ground is no more than 2 voxels below it, and eases a shoulder of 2
--- columns either side; where the ground falls further away (a river
+-- ground is no more than 2 voxels below it (where roads overlap, the first
+-- segment's height, as `at` answers), and eases a shoulder of 2
+-- columns either side (never over another road); where the ground falls further away (a river
 -- channel, a gully) the column is left as it is and the road crosses it on
--- a bridge: `chunk_paint` lays a deck there, and `bridges` reports the
+-- a bridge: `chunk_paint` lays a deck there, level at the higher of the
+-- road's heights on the gap's two banks, and `bridges` reports the
 -- crossings of water with the banks' road height. Everything reads only the
 -- graph and the grid, so chunks painted apart agree at their borders.
 mod Strata.Roads do
 
   alias Strata.Heights as RdH
 
-  -- nodes (x, z metres) and segments (node a, node b, width metres, surface id), in the order added
-  type RoadGraph = { rg_nodes : List((Float, Float)), rg_segs : List((Int, Int, Float, Int)) }
+  -- nodes (x, z metres) and segments (node a, node b, width metres, surface id), in the order added, as lists
+  -- and in arrays (nodes x, z; segments a, b, width, surface, and each road's box x0, z0, x1, z1 in metres)
+  -- so a lookup per column costs a few array reads a segment
+  type RoadGraph = { rg_nodes : List((Float, Float)), rg_segs : List((Int, Int, Float, Int)), rg_nn : Int, rg_ns : Int,
+                     rg_nx : NativeFloatArr, rg_nz : NativeFloatArr, rg_sa : NativeIntArr, rg_sb : NativeIntArr,
+                     rg_sw : NativeFloatArr, rg_ss : NativeIntArr, rg_box : NativeFloatArr }
 
   doc "A graph with no roads."
-  fn graph() : RoadGraph do { rg_nodes: Nil, rg_segs: Nil } end
+  fn graph() : RoadGraph do
+    { rg_nodes: Nil, rg_segs: Nil, rg_nn: 0, rg_ns: 0, rg_nx: NativeArray.make_float(1, 0.0), rg_nz: NativeArray.make_float(1, 0.0),
+      rg_sa: NativeArray.make_int(1, 0), rg_sb: NativeArray.make_int(1, 0), rg_sw: NativeArray.make_float(1, 0.0), rg_ss: NativeArray.make_int(1, 0), rg_box: NativeArray.make_float(4, 0.0) }
+  end
+  -- an array grown by one (copied), [v] at index n
+  pfn push_f(a : NativeFloatArr, n : Int, v : Float) : NativeFloatArr do
+    NativeArray.set_float(List.fold_left(List.range(0, n), NativeArray.make_float(n + 1, 0.0), fn (b, i) -> NativeArray.set_float(b, i, NativeArray.get_float(a, i))), n, v)
+  end
+  pfn push_i(a : NativeIntArr, n : Int, v : Int) : NativeIntArr do
+    NativeArray.set_int(List.fold_left(List.range(0, n), NativeArray.make_int(n + 1, 0), fn (b, i) -> NativeArray.set_int(b, i, NativeArray.get_int(a, i))), n, v)
+  end
   doc "The graph with a node at (x, z) metres, and its index."
-  fn add_node(g : RoadGraph, x : Float, z : Float) : (RoadGraph, Int) do ({ g with rg_nodes: List.append(g.rg_nodes, [(x, z)]) }, List.length(g.rg_nodes)) end
+  fn add_node(g : RoadGraph, x : Float, z : Float) : (RoadGraph, Int) do
+    ({ g with rg_nodes: List.append(g.rg_nodes, [(x, z)]), rg_nn: g.rg_nn + 1, rg_nx: push_f(g.rg_nx, g.rg_nn, x), rg_nz: push_f(g.rg_nz, g.rg_nn, z) }, g.rg_nn)
+  end
   doc "The graph with a segment from node a to node b, [width] metres wide, of block [surface]."
-  fn add_segment(g : RoadGraph, a : Int, b : Int, width : Float, surface : Int) : RoadGraph do { g with rg_segs: List.append(g.rg_segs, [(a, b, width, surface)]) } end
+  fn add_segment(g : RoadGraph, a : Int, b : Int, width : Float, surface : Int) : RoadGraph do
+    match (node_at(g, a), node_at(g, b)) do
+      ((ax, az), (bx, bz)) ->
+        let r = width /. 2.0
+        let n = g.rg_ns
+        let bx0 = push_f(push_f(push_f(push_f(g.rg_box, 4 * n, minf(ax, bx) -. r), 4 * n + 1, minf(az, bz) -. r), 4 * n + 2, maxf(ax, bx) +. r), 4 * n + 3, maxf(az, bz) +. r)
+        { g with rg_segs: List.append(g.rg_segs, [(a, b, width, surface)]), rg_ns: n + 1, rg_sa: push_i(g.rg_sa, n, a), rg_sb: push_i(g.rg_sb, n, b),
+                 rg_sw: push_f(g.rg_sw, n, width), rg_ss: push_i(g.rg_ss, n, surface), rg_box: bx0 }
+    end
+  end
   doc "The segments: (node a, node b, width metres, surface id), in the order added."
   fn segments(g : RoadGraph) : List((Int, Int, Float, Int)) do g.rg_segs end
   doc "Node i's position (x, z metres); the origin for a node that does not exist."
-  fn node_at(g : RoadGraph, i : Int) : (Float, Float) do match List.nth_opt(g.rg_nodes, i) do Some(p) -> p | None -> (0.0, 0.0) end end
+  fn node_at(g : RoadGraph, i : Int) : (Float, Float) do
+    if i < 0 || i >= g.rg_nn do (0.0, 0.0) else (NativeArray.get_float(g.rg_nx, i), NativeArray.get_float(g.rg_nz, i)) end
+  end
 
-  pfn seg(g : RoadGraph, i : Int) : (Int, Int, Float, Int) do match List.nth_opt(g.rg_segs, i) do Some(s) -> s | None -> (0, 0, 0.0, 0) end end
+  pfn seg(g : RoadGraph, i : Int) : (Int, Int, Float, Int) do
+    if i < 0 || i >= g.rg_ns do (0, 0, 0.0, 0) else (NativeArray.get_int(g.rg_sa, i), NativeArray.get_int(g.rg_sb, i), NativeArray.get_float(g.rg_sw, i), NativeArray.get_int(g.rg_ss, i)) end
+  end
+  -- is (x, z) metres inside segment i's box (grown by [pad])?
+  pfn in_box(g : RoadGraph, i : Int, x : Float, z : Float, pad : Float) : Bool do
+    x >= NativeArray.get_float(g.rg_box, 4 * i) -. pad && z >= NativeArray.get_float(g.rg_box, 4 * i + 1) -. pad
+      && x <= NativeArray.get_float(g.rg_box, 4 * i + 2) +. pad && z <= NativeArray.get_float(g.rg_box, 4 * i + 3) +. pad
+  end
   pfn seg_len(g : RoadGraph, i : Int) : Float do
     match seg(g, i) do (a, b, _, _) -> match (node_at(g, a), node_at(g, b)) do ((ax, az), (bx, bz)) -> Math.sqrt((bx -. ax) *. (bx -. ax) +. (bz -. az) *. (bz -. az)) end end
   end
@@ -59,14 +95,40 @@ mod Strata.Roads do
   end
 
   doc "The first segment (in the order added) whose road covers point (x, z) metres, and how far along it the point lies (metres from its node a)."
-  fn at(g : RoadGraph, x : Float, z : Float) : Option((Int, Float)) do at_go(g, x, z, 0, List.length(g.rg_segs)) end
+  fn at(g : RoadGraph, x : Float, z : Float) : Option((Int, Float)) do at_go(g, x, z, 0, g.rg_ns) end
   pfn at_go(g : RoadGraph, x : Float, z : Float, i : Int, n : Int) : Option((Int, Float)) do
     if i >= n do None
-    else
-      match (seg(g, i), project(g, i, x, z)) do
-        ((_, _, w, _), (d, along)) -> if d <= w /. 2.0 do Some((i, along)) else at_go(g, x, z, i + 1, n) end
-      end
+    else match hit(g, i, x, z) do Some(a) -> Some((i, a)) | None -> at_go(g, x, z, i + 1, n) end end
+  end
+  -- metres along segment i if its road covers (x, z)
+  pfn hit(g : RoadGraph, i : Int, x : Float, z : Float) : Option(Float) do
+    if !in_box(g, i, x, z, 0.0) do None
+    else match project(g, i, x, z) do (d, along) -> if d <= NativeArray.get_float(g.rg_sw, i) /. 2.0 do Some(along) else None end end end
+  end
+  -- as `at`, over candidate segments (in order)
+  pfn at_in(g : RoadGraph, cands : List(Int), x : Float, z : Float) : Option((Int, Float)) do
+    match cands do
+      Nil -> None
+      Cons(i, rest) -> match hit(g, i, x, z) do Some(a) -> Some((i, a)) | None -> at_in(g, rest, x, z) end
     end
+  end
+
+  doc "Which of the n x n columns from (x0, z0) a road covers (1) or not (0), index (z - z0) * n + (x - x0): the columns `at` finds, worked out per segment over its box rather than per column over every segment. [scale] is metres a voxel."
+  fn mask(g : RoadGraph, x0 : Int, z0 : Int, n : Int, scale : Float) : NativeIntArr do
+    List.fold_left(List.range(0, g.rg_ns), NativeArray.make_int(Math.max_int(1, n * n), 0), fn (m, i) -> mask_seg(g, m, x0, z0, n, scale, i))
+  end
+  pfn mask_seg(g : RoadGraph, m : NativeIntArr, x0 : Int, z0 : Int, n : Int, scale : Float, i : Int) : NativeIntArr do
+    let cx0 = Math.max_int(x0, vox(NativeArray.get_float(g.rg_box, 4 * i), scale))
+    let cz0 = Math.max_int(z0, vox(NativeArray.get_float(g.rg_box, 4 * i + 1), scale))
+    let cx1 = Math.min_int(x0 + n - 1, vox(NativeArray.get_float(g.rg_box, 4 * i + 2), scale))
+    let cz1 = Math.min_int(z0 + n - 1, vox(NativeArray.get_float(g.rg_box, 4 * i + 3), scale))
+    let nx = cx1 - cx0 + 1
+    let nz = cz1 - cz0 + 1
+    if nx <= 0 || nz <= 0 do m
+    else List.fold_left(List.range(0, nx * nz), m, fn (a, k) -> mark_col(g, a, x0, z0, n, scale, i, cx0 + k % nx, cz0 + k / nx)) end
+  end
+  pfn mark_col(g : RoadGraph, m : NativeIntArr, x0 : Int, z0 : Int, n : Int, scale : Float, i : Int, x : Int, z : Int) : NativeIntArr do
+    if Option.is_some(hit(g, i, mid(x, scale), mid(z, scale))) do NativeArray.set_int(m, (z - z0) * n + (x - x0), 1) else m end
   end
 
   pfn minf(a : Float, b : Float) : Float do if a < b do a else b end end
@@ -90,7 +152,7 @@ mod Strata.Roads do
 
   -- one easing pass: each segment steeper than the grade pulls its nodes' heights together
   pfn ease_pass(g : RoadGraph, nh : NativeIntArr, scale : Float, grade : Float) : NativeIntArr do
-    List.fold_left(List.range(0, List.length(g.rg_segs)), nh, fn (a, i) -> ease_seg(g, a, scale, grade, i))
+    List.fold_left(List.range(0, g.rg_ns), nh, fn (a, i) -> ease_seg(g, a, scale, grade, i))
   end
   pfn ease_seg(g : RoadGraph, nh : NativeIntArr, scale : Float, grade : Float, i : Int) : NativeIntArr do
     match seg(g, i) do
@@ -137,7 +199,8 @@ mod Strata.Roads do
           (x, z) -> match project(g, i, mid(x, scale), mid(z, scale)) do
             (d, along) ->
               let beyond = d -. w /. 2.0
-              if beyond <= 0.0 || beyond > 2.0 *. scale do acc
+              -- never a column another road covers: its own bed decides it
+              if beyond <= 0.0 || beyond > 2.0 *. scale || Option.is_some(at(g, mid(x, scale), mid(z, scale))) do acc
               else
                 let p = profile(g, h0, scale, i, along)
                 let e = float_to_int(Math.ceil(beyond /. scale))
@@ -148,6 +211,9 @@ mod Strata.Roads do
         end)
     end
   end
+  pfn first_here(g : RoadGraph, i : Int, x : Int, z : Int, scale : Float) : Bool do
+    match at(g, mid(x, scale), mid(z, scale)) do Some((j, _)) -> j == i | None -> false end
+  end
   -- the road's own columns cut or filled to its height (not where the ground falls away)
   pfn bed(g : RoadGraph, h0 : Strata.Heights.HeightGrid, h : Strata.Heights.HeightGrid, scale : Float, i : Int) : Strata.Heights.HeightGrid do
     match seg(g, i) do
@@ -155,7 +221,8 @@ mod Strata.Roads do
         List.fold_left(near_cols(g, i, scale, 0), h, fn (acc, c) -> match c do
           (x, z) -> match project(g, i, mid(x, scale), mid(z, scale)) do
             (d, along) ->
-              if d > w /. 2.0 do acc
+              -- only where this segment is the one `at` answers, so the grid and the painted surface agree where roads overlap
+              if d > w /. 2.0 || !first_here(g, i, x, z, scale) do acc
               else
                 let p = profile(g, h0, scale, i, along)
                 if RdH.get(acc, x, z) < p - 2 do acc else RdH.set(acc, x, z, p) end
@@ -167,12 +234,12 @@ mod Strata.Roads do
 
   doc "The grid fitted to the roads: nodes' heights eased so no segment rises more than [grade] (rise over run) between them, each road column cut or filled to the road's height where the ground is at most 2 voxels below it (deeper gaps are left for a bridge), and a shoulder of 2 columns either side eased toward it. [scale] is metres a voxel."
   fn adapt(g : RoadGraph, h : Strata.Heights.HeightGrid, scale : Float, grade : Float) : Strata.Heights.HeightGrid do
-    let n = List.length(g.rg_nodes)
+    let n = g.rg_nn
     let nh0 = List.fold_left(List.range(0, n), NativeArray.make_int(Math.max_int(1, n), 0), fn (a, i) -> NativeArray.set_int(a, i, node_height(g, h, scale, i)))
     let nh = List.fold_left(List.range(0, 16), nh0, fn (a, _) -> ease_pass(g, a, scale, grade))
     -- the nodes' columns carry the eased heights: every profile reads them
     let h0 = List.fold_left(List.range(0, n), h, fn (acc, i) -> match node_at(g, i) do (x, z) -> RdH.set(acc, vox(x, scale), vox(z, scale), NativeArray.get_int(nh, i)) end)
-    let segs = List.range(0, List.length(g.rg_segs))
+    let segs = List.range(0, g.rg_ns)
     let h1 = List.fold_left(segs, h0, fn (acc, i) -> shoulder(g, h0, acc, scale, i))
     let h2 = List.fold_left(segs, h1, fn (acc, i) -> bed(g, h0, acc, scale, i))
     List.fold_left(List.range(0, n), h2, fn (acc, i) -> match node_at(g, i) do (x, z) -> RdH.set(acc, vox(x, scale), vox(z, scale), NativeArray.get_int(nh, i)) end)
@@ -180,7 +247,7 @@ mod Strata.Roads do
 
   doc "For each segment crossing water ([water] of a column x, z), in segment order: the segment, where the crossing starts and ends along it (metres), and the deck's height (voxels: the higher of the road's heights on the two banks). Sampled every voxel along the centre line of an adapted grid."
   fn bridges(g : RoadGraph, h : Strata.Heights.HeightGrid, water : Int -> Int -> Bool, scale : Float) : List((Int, Float, Float, Int)) do
-    List.flat_map(List.range(0, List.length(g.rg_segs)), fn i -> crossings(g, h, water, scale, i))
+    List.flat_map(List.range(0, g.rg_ns), fn i -> crossings(g, h, water, scale, i))
   end
   pfn crossings(g : RoadGraph, h : Strata.Heights.HeightGrid, water : Int -> Int -> Bool, scale : Float, i : Int) : List((Int, Float, Float, Int)) do
     match seg(g, i) do
@@ -218,17 +285,53 @@ mod Strata.Roads do
 
   doc "Chunk [c] at key [k] with the roads painted in: in each column under a road, the road's surface block at its height (height - 1), or a deck of block [deck] where the ground lies more than 2 voxels below the road (a bridge), and air for 3 m above either (cutting through whatever the terrain left there). Reads only the graph and the adapted grid, so neighbouring chunks agree."
   fn chunk_paint(c : Strata.Chunk.Chunk, k : Strata.Coord.Key, g : RoadGraph, h : Strata.Heights.HeightGrid, scale : Float, deck : Int) : Strata.Chunk.Chunk do
-    if List.is_empty(g.rg_segs) do c
-    else List.fold_left(List.range(0, 1024), c, fn (acc, i) -> paint_col(acc, k, g, h, scale, deck, i % 32, i / 32)) end
+    -- the segments whose roads reach the chunk's columns; none: the chunk as it is
+    let mx0 = int_to_float(Strata.Coord.kx(k) * 32) *. scale
+    let mz0 = int_to_float(Strata.Coord.kz(k) * 32) *. scale
+    let side = 32.0 *. scale
+    let cands = List.filter(List.range(0, g.rg_ns), fn i -> box_meets(g, i, mx0, mz0, mx0 +. side, mz0 +. side))
+    if List.is_empty(cands) do c
+    else List.fold_left(List.range(0, 1024), c, fn (acc, i) -> paint_col(acc, k, g, cands, h, scale, deck, i % 32, i / 32)) end
   end
-  pfn paint_col(c : Strata.Chunk.Chunk, k : Strata.Coord.Key, g : RoadGraph, h : Strata.Heights.HeightGrid, scale : Float, deck : Int, lx : Int, lz : Int) : Strata.Chunk.Chunk do
+  pfn box_meets(g : RoadGraph, i : Int, x0 : Float, z0 : Float, x1 : Float, z1 : Float) : Bool do
+    NativeArray.get_float(g.rg_box, 4 * i) <= x1 && NativeArray.get_float(g.rg_box, 4 * i + 2) >= x0
+      && NativeArray.get_float(g.rg_box, 4 * i + 1) <= z1 && NativeArray.get_float(g.rg_box, 4 * i + 3) >= z0
+  end
+  -- is the road at [along] on segment i over a gap (ground more than 2 voxels below it)?
+  pfn gap_at(g : RoadGraph, h : Strata.Heights.HeightGrid, scale : Float, i : Int, along : Float) : Bool do
+    match point_on(g, i, along) do (px, pz) -> RdH.get(h, vox(px, scale), vox(pz, scale)) < profile(g, h, scale, i, along) - 2 end
+  end
+  pfn point_on(g : RoadGraph, i : Int, along : Float) : (Float, Float) do
+    match seg(g, i) do
+      (a, b, _, _) -> match (node_at(g, a), node_at(g, b)) do
+        ((ax, az), (bx, bz)) ->
+          let l = seg_len(g, i)
+          let t = if l < 0.000001 do 0.0 else maxf(0.0, minf(1.0, along /. l)) end
+          (ax +. (bx -. ax) *. t, az +. (bz -. az) *. t)
+      end
+    end
+  end
+  -- the bank beyond a gap along segment i from [along], stepping [dir] voxels (at most 400): its metres along
+  pfn bank(g : RoadGraph, h : Strata.Heights.HeightGrid, scale : Float, i : Int, along : Float, dir : Float, n : Int) : Float do
+    let l = seg_len(g, i)
+    let next = along +. dir *. scale
+    if n <= 0 || next < 0.0 || next > l || !gap_at(g, h, scale, i, next) do maxf(0.0, minf(l, next)) else bank(g, h, scale, i, next, dir, n - 1) end
+  end
+  -- a deck's height over the gap at [along]: the higher of the road's heights on its two banks
+  pfn deck_height(g : RoadGraph, h : Strata.Heights.HeightGrid, scale : Float, i : Int, along : Float) : Int do
+    Math.max_int(profile(g, h, scale, i, bank(g, h, scale, i, along, -1.0, 400)), profile(g, h, scale, i, bank(g, h, scale, i, along, 1.0, 400)))
+  end
+  pfn paint_col(c : Strata.Chunk.Chunk, k : Strata.Coord.Key, g : RoadGraph, cands : List(Int), h : Strata.Heights.HeightGrid, scale : Float, deck : Int, lx : Int, lz : Int) : Strata.Chunk.Chunk do
     let x = Strata.Coord.kx(k) * 32 + lx
     let z = Strata.Coord.kz(k) * 32 + lz
-    match at(g, mid(x, scale), mid(z, scale)) do
+    match at_in(g, cands, mid(x, scale), mid(z, scale)) do
       None -> c
       Some((i, along)) ->
-        let p = profile(g, h, scale, i, along)
-        let block = if RdH.get(h, x, z) < p - 2 do deck else match seg(g, i) do (_, _, _, s) -> s end end
+        let p0 = profile(g, h, scale, i, along)
+        let over_gap = RdH.get(h, x, z) < p0 - 2
+        -- a deck lies level at the height of the gap's banks
+        let p = if over_gap do deck_height(g, h, scale, i, along) else p0 end
+        let block = if over_gap do deck else match seg(g, i) do (_, _, _, s) -> s end end
         let clear = float_to_int(Math.ceil(3.0 /. scale))
         let y0 = Strata.Coord.ky(k) * 32
         List.fold_left(List.range(p - 1, p + clear), c, fn (acc, y) -> put(acc, lx, y - y0, lz, if y == p - 1 do block else 0 end))

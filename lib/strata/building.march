@@ -200,9 +200,11 @@ mod Strata.Building do
   end
 
   -- the roof's height over a volume's walls
-  pfn roof_rise(kind : Int, v : (Int, Int, Int, Int, Int)) : Int do
-    match v do (x0, z0, x1, z1, _) -> if kind == 1 do Math.min_int(x1 - x0 + 1, z1 - z0 + 1) / 2 + 1 else if kind == 2 do 5 else 2 end end end
+  pfn roof_rise(kind : Int, v : (Int, Int, Int, Int, Int), clutter : Int) : Int do
+    match v do (x0, z0, x1, z1, _) -> if kind == 1 do Math.min_int(x1 - x0 + 1, z1 - z0 + 1) / 2 + 1 else if kind == 2 do 5 else 2 + clutter end end end
   end
+  -- the tallest clutter template
+  pfn clutter_height(s : BldStyle) : Int do List.fold_left(s.bs_clutter, 0, fn (m, t) -> Math.max_int(m, Strata.Template.t_sy(t))) end
 
   -- an opening drawn in the outer layer of its wall
   pfn draw_opening(g : BldGrid, p : BldPlan, s : BldStyle, o : (Int, Int, Int, Int, Int)) : BldGrid do
@@ -285,9 +287,13 @@ mod Strata.Building do
     let tx = Strata.Template.t_sx(t)
     let ty = Strata.Template.t_sy(t)
     let tz = Strata.Template.t_sz(t)
-    if x1 - x0 - 1 < tx || z1 - z0 - 1 < tz do g
+    -- the first in the roof's low half across x, the second in the high half, so two never overlap
+    let half = (x0 + x1) / 2
+    let lo = if k % 2 == 0 do x0 + 1 else half + 1 end
+    let hi = if k % 2 == 0 do half - tx else x1 - tx end
+    if hi < lo || z1 - z0 - 1 < tz do g
     else
-      let px = pick_int(seed, 9100 + k, x0 + 1, x1 - tx)
+      let px = pick_int(seed, 9100 + k, lo, hi)
       let pz = pick_int(seed, 9200 + k, z0 + 1, z1 - tz)
       let ids = Strata.Template.t_ids(t)
       List.fold_left(List.range(0, tx * ty * tz), g, fn (acc, i) ->
@@ -296,13 +302,13 @@ mod Strata.Building do
     end
   end
 
-  pfn grid_height(p : BldPlan) : Int do
-    List.fold_left(p.bp_volumes, 1, fn (m, v) -> match v do (_, _, _, _, n) -> Math.max_int(m, n * p.bp_storey + roof_rise(p.bp_roof, v)) end)
+  pfn grid_height(p : BldPlan, s : BldStyle) : Int do
+    List.fold_left(p.bp_volumes, 1, fn (m, v) -> match v do (_, _, _, _, n) -> Math.max_int(m, n * p.bp_storey + roof_rise(p.bp_roof, v, clutter_height(s))) end)
   end
 
   doc "Level 1: the building as a template the size of its lot (origin at the lot's low corner, y 0 the ground floor): each volume a solid mass of wall, openings drawn in its outer layer (glass windows and shopfronts, door blocks for doors and loading doors), trim at every floor and up the corners, and its roof."
   fn solid(p : BldPlan, s : BldStyle, seed : Int) : Strata.Template.Template do
-    let h = grid_height(p)
+    let h = grid_height(p, s)
     let g0 = BldGrid(p.bp_w, h, p.bp_d, NativeArray.make_i32(Math.max_int(1, p.bp_w * h * p.bp_d), 0))
     let g1 = List.fold_left(p.bp_volumes, g0, fn (acc, v) -> match v do (x0, z0, x1, z1, n) -> gbox(acc, x0, 0, z0, x1, n * p.bp_storey - 1, z1, s.bs_wall) end)
     let g2 = List.fold_left(p.bp_volumes, g1, fn (acc, v) -> trim(acc, p, s, v))
@@ -401,11 +407,46 @@ mod Strata.Building do
     end
   end
 
+  -- a doorway through the double wall where volume w stands against volume v, on each storey they share (2 wide, 5 high, in the middle of the shared run)
+  pfn link(g : BldGrid, p : BldPlan, s : BldStyle, v : (Int, Int, Int, Int, Int), w : (Int, Int, Int, Int, Int)) : BldGrid do
+    match (v, w) do
+      ((vx0, vz0, vx1, vz1, vn), (wx0, wz0, wx1, wz1, wn)) ->
+        let shared = Math.min_int(vn, wn)
+        let ox0 = Math.max_int(vx0, wx0)
+        let ox1 = Math.min_int(vx1, wx1)
+        let oz0 = Math.max_int(vz0, wz0)
+        let oz1 = Math.min_int(vz1, wz1)
+        let mx = (ox0 + ox1) / 2
+        let mz = (oz0 + oz1) / 2
+        -- (x0, z0, x1, z1) of the cut through both walls, or none
+        let cut = if wz0 == vz1 + 1 && ox1 - ox0 >= 5 do Some((mx - 1, vz1 - 1, mx, wz0 + 1))
+          else if vz0 == wz1 + 1 && ox1 - ox0 >= 5 do Some((mx - 1, wz1 - 1, mx, vz0 + 1))
+          else if wx0 == vx1 + 1 && oz1 - oz0 >= 5 do Some((vx1 - 1, mz - 1, wx0 + 1, mz))
+          else if vx0 == wx1 + 1 && oz1 - oz0 >= 5 do Some((wx1 - 1, mz - 1, vx0 + 1, mz))
+          else None end end end end
+        match cut do
+          None -> g
+          Some((cx0, cz0, cx1, cz1)) -> List.fold_left(List.range(0, shared), g, fn (acc, st) -> gbox(acc, cx0, st * p.bp_storey + 1, cz0, cx1, st * p.bp_storey + Math.min_int(p.bp_storey - 2, 5), cz1, 0))
+        end
+    end
+  end
+  pfn links(g : BldGrid, p : BldPlan, s : BldStyle) : BldGrid do
+    let n = List.length(p.bp_volumes)
+    List.fold_left(List.range(0, n * n), g, fn (acc, k) -> if k / n < k % n do link(acc, p, s, List.nth(p.bp_volumes, k / n), List.nth(p.bp_volumes, k % n)) else acc end)
+  end
+
+  doc "The boxes to clear before stamping the building at run time, one a volume: (x0, y0, z0, x1, y1, z1) with x and z in world voxels and y from the stamp's origin height (0 the ground floor) to the top of its roof. A template's empty voxels keep what was there, so clear these first (Strata.Edit.fill_box with air) for a hollow building's rooms to be air."
+  fn clearance(p : BldPlan) : List((Int, Int, Int, Int, Int, Int)) do
+    match Strata.Lots.lot_box(p.bp_lot) do
+      (lx, lz, _, _) -> List.map(p.bp_volumes, fn v -> match v do (x0, z0, x1, z1, n) -> (lx + x0, 0, lz + z0, lx + x1, n * p.bp_storey + roof_rise(p.bp_roof, v, 0) - 1, lz + z1) end)
+    end
+  end
+
   doc "Level 2: the building hollow, a template the size of its lot like `solid`: walls two thick (wall outside, trim inside), floors at every storey, a stair core aligned through each volume of two storeys or more, openings cut through (glass kept only where the style is glazed), the same trim and roofs outside."
   fn hollow(p : BldPlan, s : BldStyle, seed : Int) : Strata.Template.Template do
-    let h = grid_height(p)
+    let h = grid_height(p, s)
     let g0 = BldGrid(p.bp_w, h, p.bp_d, NativeArray.make_i32(Math.max_int(1, p.bp_w * h * p.bp_d), 0))
-    let g1 = List.fold_left(p.bp_volumes, g0, fn (acc, v) -> shell(acc, p, s, v))
+    let g1 = links(List.fold_left(p.bp_volumes, g0, fn (acc, v) -> shell(acc, p, s, v)), p, s)
     let g2 = List.fold_left(p.bp_volumes, g1, fn (acc, v) -> trim(acc, p, s, v))
     let g3 = List.fold_left(p.bp_openings, g2, fn (acc, o) -> cut_opening(acc, p, s, o))
     let g4 = List.fold_left(List.range(0, List.length(p.bp_volumes)), g3, fn (acc, vi) -> roof(acc, p, s, List.nth(p.bp_volumes, vi), seed, vi))
