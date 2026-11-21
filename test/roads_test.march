@@ -1,0 +1,77 @@
+-- Roads: a graph of segments, adapted to the ground, bridges, painted into chunks.
+mod Strata.Test.Roads do
+
+  needs IO.Clock      -- charged to every test module once any uses Check.all (GAPS S3)
+  needs IO.Console
+  needs IO.FileRead
+  needs IO.FileWrite
+  needs IO.Process
+  import Test
+  alias Strata.Roads as Rds
+  alias Strata.Heights as RdsH
+
+  -- a road from (0, 8) to (40, 8) metres, 4 m wide, surface 5, at 0.5 m a voxel: voxels (0, 16) to (80, 16), 8 voxels wide
+  pfn east() : Strata.Roads.RoadGraph do
+    match Rds.add_node(Rds.graph(), 0.0, 8.0) do
+      (g1, a) -> match Rds.add_node(g1, 40.0, 8.0) do (g2, b) -> Rds.add_segment(g2, a, b, 4.0, 5) end
+    end
+  end
+  -- ground at 10 with a hill (a cone up to 30) round voxel (40, 16)
+  pfn hill() : Strata.Heights.HeightGrid do
+    List.fold_left(List.range(0, 96 * 96), RdsH.grid(-8, -8, 96, 10), fn (g, i) ->
+      let x = i % 96 - 8
+      let z = i / 96 - 8
+      let d = int_abs(x - 40) + int_abs(z - 16)
+      if d < 20 do RdsH.set(g, x, z, 30 - d) else g end)
+  end
+  -- ground at 20 with a river channel (bed 10) across x 36..44
+  pfn river() : Strata.Heights.HeightGrid do
+    List.fold_left(List.range(0, 96 * 96), RdsH.grid(-8, -8, 96, 20), fn (g, i) ->
+      let x = i % 96 - 8
+      let z = i / 96 - 8
+      if x >= 36 && x <= 44 do RdsH.set(g, x, z, 10) else g end)
+  end
+  pfn wet(x : Int, z : Int) : Bool do x >= 36 && x <= 44 end
+
+  describe "Roads" do
+    test "at finds a point on a road and not one beside it" do
+      let on = Rds.at(east(), 20.0, 9.5)
+      Test.assert_true(match on do Some((s, along)) -> s == 0 && Math.abs(along -. 20.0) < 0.001 | None -> false end, "on, 20 m along")
+      Test.assert_true(Option.is_none(Rds.at(east(), 20.0, 10.5)) && Option.is_none(Rds.at(east(), 45.0, 8.0)), "beside and past the end")
+    end
+    test "adapt keeps a road within its grade over a hill" do
+      let h = Rds.adapt(east(), hill(), 0.5, 0.1)
+      -- along the centre line, over any run of k columns the road rises at most 0.1 k, rounded up
+      Test.assert_true(List.all(List.range(0, 70), fn x -> int_abs(RdsH.get(h, x + 10, 16) - RdsH.get(h, x, 16)) <= 2), "no more than 1 in 10")
+      Test.assert_true(RdsH.get(h, 40, 16) < 15 && RdsH.get(h, 40, 30) == 16, "cut through the hill; the hill beside it kept")
+    end
+    test "a road across a river reports one bridge with the banks' height" do
+      let h = Rds.adapt(east(), river(), 0.5, 0.1)
+      match Rds.bridges(east(), h, wet, 0.5) do
+        Cons((s, a, b, deck), Nil) -> Test.assert_true(s == 0 && a >= 17.5 && a <= 18.5 && b >= 22.0 && b <= 23.0 && deck == 20, "one bridge, 18 m to 22.5 m, deck at 20")
+        _ -> Test.fail("not one bridge")
+      end
+      Test.assert_true(RdsH.get(h, 40, 16) == 10, "the channel is left open under the road")
+    end
+    test "chunk_paint writes the surface and clears above it" do
+      let h = Rds.adapt(east(), hill(), 0.5, 0.1)
+      let k = Strata.Coord.key(0, 0, 0)
+      let c = Rds.chunk_paint(Strata.Chunk.uniform(1), k, east(), h, 0.5, 9)
+      let top = RdsH.get(h, 10, 16)
+      Test.assert_true(Strata.Chunk.get_or(c, 10, top - 1, 16, -1) == 5 && Strata.Chunk.get_or(c, 10, top, 16, -1) == 0 && Strata.Chunk.get_or(c, 10, top + 5, 16, -1) == 0, "surface, air over it")
+      Test.assert_true(Strata.Chunk.get_or(c, 10, top - 2, 16, -1) == 1 && Strata.Chunk.get_or(c, 10, top, 25, -1) == 1, "below and beside untouched")
+    end
+    test "two chunks either side of a road agree at the border" do
+      let h = Rds.adapt(east(), hill(), 0.5, 0.1)
+      let c0 = Rds.chunk_paint(Strata.Chunk.uniform(1), Strata.Coord.key(0, 0, 0), east(), h, 0.5, 9)
+      let c1 = Rds.chunk_paint(Strata.Chunk.uniform(1), Strata.Coord.key(1, 0, 0), east(), h, 0.5, 9)
+      let surf = fn (c, x) -> List.fold_left(List.range(0, 32), -1, fn (m, y) -> if Strata.Chunk.get_or(c, x, y, 16, -1) == 5 do y else m end)
+      Test.assert_true(surf(c0, 31) >= 0 && int_abs(surf(c0, 31) - surf(c1, 0)) <= 1, "the surface steps at most a voxel across the border")
+    end
+    test "a bridge deck spans the channel" do
+      let h = Rds.adapt(east(), river(), 0.5, 0.1)
+      let c = Rds.chunk_paint(Strata.Chunk.uniform(0), Strata.Coord.key(1, 0, 0), east(), h, 0.5, 9)
+      Test.assert_true(Strata.Chunk.get_or(c, 40 - 32, 19, 16, -1) == 9 && Strata.Chunk.get_or(c, 40 - 32, 15, 16, -1) == 0, "a deck at the banks' height, air under it")
+    end
+  end
+end

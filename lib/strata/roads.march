@@ -1,0 +1,240 @@
+-- Roads — a graph of road segments, fitted to the ground, bridged over gaps,
+-- painted into chunks.
+--
+-- Nodes are points (x, z metres); a segment joins two nodes with a width
+-- (metres) and a surface block id. A point is on a segment when it lies
+-- within half the width of the segment's centre line (round at the ends, so
+-- segments meeting at a node join without a notch).
+--
+-- Heights are those of a Strata.Heights grid in voxels, a column's height
+-- being its first air (its surface block at height - 1). A road's height
+-- runs straight between its two nodes' heights. `adapt` first eases the
+-- nodes' heights so that no segment is steeper than the grade (rise over
+-- run), then cuts or fills each road column to the road's height where the
+-- ground is no more than 2 voxels below it, and eases a shoulder of 2
+-- columns either side; where the ground falls further away (a river
+-- channel, a gully) the column is left as it is and the road crosses it on
+-- a bridge: `chunk_paint` lays a deck there, and `bridges` reports the
+-- crossings of water with the banks' road height. Everything reads only the
+-- graph and the grid, so chunks painted apart agree at their borders.
+mod Strata.Roads do
+
+  alias Strata.Heights as RdH
+
+  -- nodes (x, z metres) and segments (node a, node b, width metres, surface id), in the order added
+  type RoadGraph = { rg_nodes : List((Float, Float)), rg_segs : List((Int, Int, Float, Int)) }
+
+  doc "A graph with no roads."
+  fn graph() : RoadGraph do { rg_nodes: Nil, rg_segs: Nil } end
+  doc "The graph with a node at (x, z) metres, and its index."
+  fn add_node(g : RoadGraph, x : Float, z : Float) : (RoadGraph, Int) do ({ g with rg_nodes: List.append(g.rg_nodes, [(x, z)]) }, List.length(g.rg_nodes)) end
+  doc "The graph with a segment from node a to node b, [width] metres wide, of block [surface]."
+  fn add_segment(g : RoadGraph, a : Int, b : Int, width : Float, surface : Int) : RoadGraph do { g with rg_segs: List.append(g.rg_segs, [(a, b, width, surface)]) } end
+  doc "The segments: (node a, node b, width metres, surface id), in the order added."
+  fn segments(g : RoadGraph) : List((Int, Int, Float, Int)) do g.rg_segs end
+  doc "Node i's position (x, z metres); the origin for a node that does not exist."
+  fn node_at(g : RoadGraph, i : Int) : (Float, Float) do match List.nth_opt(g.rg_nodes, i) do Some(p) -> p | None -> (0.0, 0.0) end end
+
+  pfn seg(g : RoadGraph, i : Int) : (Int, Int, Float, Int) do match List.nth_opt(g.rg_segs, i) do Some(s) -> s | None -> (0, 0, 0.0, 0) end end
+  pfn seg_len(g : RoadGraph, i : Int) : Float do
+    match seg(g, i) do (a, b, _, _) -> match (node_at(g, a), node_at(g, b)) do ((ax, az), (bx, bz)) -> Math.sqrt((bx -. ax) *. (bx -. ax) +. (bz -. az) *. (bz -. az)) end end
+  end
+
+  -- (distance to the centre line, metres along it) for point (x, z) and segment i
+  pfn project(g : RoadGraph, i : Int, x : Float, z : Float) : (Float, Float) do
+    match seg(g, i) do
+      (a, b, _, _) ->
+        match (node_at(g, a), node_at(g, b)) do
+          ((ax, az), (bx, bz)) ->
+            let dx = bx -. ax
+            let dz = bz -. az
+            let l2 = dx *. dx +. dz *. dz
+            let t0 = if l2 < 0.000001 do 0.0 else ((x -. ax) *. dx +. (z -. az) *. dz) /. l2 end
+            let t = if t0 < 0.0 do 0.0 else if t0 > 1.0 do 1.0 else t0 end end
+            let qx = ax +. dx *. t
+            let qz = az +. dz *. t
+            (Math.sqrt((x -. qx) *. (x -. qx) +. (z -. qz) *. (z -. qz)), t *. Math.sqrt(l2))
+        end
+    end
+  end
+
+  doc "The first segment (in the order added) whose road covers point (x, z) metres, and how far along it the point lies (metres from its node a)."
+  fn at(g : RoadGraph, x : Float, z : Float) : Option((Int, Float)) do at_go(g, x, z, 0, List.length(g.rg_segs)) end
+  pfn at_go(g : RoadGraph, x : Float, z : Float, i : Int, n : Int) : Option((Int, Float)) do
+    if i >= n do None
+    else
+      match (seg(g, i), project(g, i, x, z)) do
+        ((_, _, w, _), (d, along)) -> if d <= w /. 2.0 do Some((i, along)) else at_go(g, x, z, i + 1, n) end
+      end
+    end
+  end
+
+  pfn minf(a : Float, b : Float) : Float do if a < b do a else b end end
+  pfn maxf(a : Float, b : Float) : Float do if a > b do a else b end end
+  pfn vox(m : Float, scale : Float) : Int do float_to_int(Math.floor(m /. scale)) end
+  pfn round_i(v : Float) : Int do float_to_int(Math.floor(v +. 0.5)) end
+  pfn node_height(g : RoadGraph, h : Strata.Heights.HeightGrid, scale : Float, i : Int) : Int do
+    match node_at(g, i) do (x, z) -> RdH.get(h, vox(x, scale), vox(z, scale)) end
+  end
+
+  -- the road's height (voxels) along segment i at [along] metres: straight between its nodes' heights in the grid
+  pfn profile(g : RoadGraph, h : Strata.Heights.HeightGrid, scale : Float, i : Int, along : Float) : Int do
+    match seg(g, i) do
+      (a, b, _, _) ->
+        let l = seg_len(g, i)
+        let ha = int_to_float(node_height(g, h, scale, a))
+        let hb = int_to_float(node_height(g, h, scale, b))
+        if l < 0.000001 do round_i(ha) else round_i(ha +. (hb -. ha) *. along /. l) end
+    end
+  end
+
+  -- one easing pass: each segment steeper than the grade pulls its nodes' heights together
+  pfn ease_pass(g : RoadGraph, nh : NativeIntArr, scale : Float, grade : Float) : NativeIntArr do
+    List.fold_left(List.range(0, List.length(g.rg_segs)), nh, fn (a, i) -> ease_seg(g, a, scale, grade, i))
+  end
+  pfn ease_seg(g : RoadGraph, nh : NativeIntArr, scale : Float, grade : Float, i : Int) : NativeIntArr do
+    match seg(g, i) do
+      (a, b, _, _) ->
+        let most = float_to_int(Math.floor(grade *. seg_len(g, i) /. scale))
+        let ha = NativeArray.get_int(nh, a)
+        let hb = NativeArray.get_int(nh, b)
+        let over = int_abs(ha - hb) - most
+        if over <= 0 do nh
+        else
+          let down = (over + 1) / 2
+          let up = over - down
+          if ha > hb do NativeArray.set_int(NativeArray.set_int(nh, a, ha - down), b, hb + up)
+          else NativeArray.set_int(NativeArray.set_int(nh, b, hb - down), a, ha + up) end
+        end
+    end
+  end
+
+  -- the columns near segment i (within half its width plus [extra] columns), as (x, z)
+  pfn near_cols(g : RoadGraph, i : Int, scale : Float, extra : Int) : List((Int, Int)) do
+    match seg(g, i) do
+      (a, b, w, _) ->
+        match (node_at(g, a), node_at(g, b)) do
+          ((ax, az), (bx, bz)) ->
+            let r = w /. 2.0 +. int_to_float(extra + 1) *. scale
+            let x0 = vox(minf(ax, bx) -. r, scale)
+            let x1 = vox(maxf(ax, bx) +. r, scale)
+            let z0 = vox(minf(az, bz) -. r, scale)
+            let z1 = vox(maxf(az, bz) +. r, scale)
+            let nx = x1 - x0 + 1
+            List.map(List.range(0, nx * (z1 - z0 + 1)), fn k -> (x0 + k % nx, z0 + k / nx))
+        end
+    end
+  end
+
+  -- a column's centre in metres
+  pfn mid(v : Int, scale : Float) : Float do (int_to_float(v) +. 0.5) *. scale end
+
+  -- the shoulder: columns within 2 of the road's edge eased toward its height (not where the ground falls away)
+  pfn shoulder(g : RoadGraph, h0 : Strata.Heights.HeightGrid, h : Strata.Heights.HeightGrid, scale : Float, i : Int) : Strata.Heights.HeightGrid do
+    match seg(g, i) do
+      (_, _, w, _) ->
+        List.fold_left(near_cols(g, i, scale, 2), h, fn (acc, c) -> match c do
+          (x, z) -> match project(g, i, mid(x, scale), mid(z, scale)) do
+            (d, along) ->
+              let beyond = d -. w /. 2.0
+              if beyond <= 0.0 || beyond > 2.0 *. scale do acc
+              else
+                let p = profile(g, h0, scale, i, along)
+                let e = float_to_int(Math.ceil(beyond /. scale))
+                let ground = RdH.get(acc, x, z)
+                if ground < p - 2 do acc else RdH.set(acc, x, z, p + Math.max_int(0 - e, Math.min_int(e, ground - p))) end
+              end
+          end
+        end)
+    end
+  end
+  -- the road's own columns cut or filled to its height (not where the ground falls away)
+  pfn bed(g : RoadGraph, h0 : Strata.Heights.HeightGrid, h : Strata.Heights.HeightGrid, scale : Float, i : Int) : Strata.Heights.HeightGrid do
+    match seg(g, i) do
+      (_, _, w, _) ->
+        List.fold_left(near_cols(g, i, scale, 0), h, fn (acc, c) -> match c do
+          (x, z) -> match project(g, i, mid(x, scale), mid(z, scale)) do
+            (d, along) ->
+              if d > w /. 2.0 do acc
+              else
+                let p = profile(g, h0, scale, i, along)
+                if RdH.get(acc, x, z) < p - 2 do acc else RdH.set(acc, x, z, p) end
+              end
+          end
+        end)
+    end
+  end
+
+  doc "The grid fitted to the roads: nodes' heights eased so no segment rises more than [grade] (rise over run) between them, each road column cut or filled to the road's height where the ground is at most 2 voxels below it (deeper gaps are left for a bridge), and a shoulder of 2 columns either side eased toward it. [scale] is metres a voxel."
+  fn adapt(g : RoadGraph, h : Strata.Heights.HeightGrid, scale : Float, grade : Float) : Strata.Heights.HeightGrid do
+    let n = List.length(g.rg_nodes)
+    let nh0 = List.fold_left(List.range(0, n), NativeArray.make_int(Math.max_int(1, n), 0), fn (a, i) -> NativeArray.set_int(a, i, node_height(g, h, scale, i)))
+    let nh = List.fold_left(List.range(0, 16), nh0, fn (a, _) -> ease_pass(g, a, scale, grade))
+    -- the nodes' columns carry the eased heights: every profile reads them
+    let h0 = List.fold_left(List.range(0, n), h, fn (acc, i) -> match node_at(g, i) do (x, z) -> RdH.set(acc, vox(x, scale), vox(z, scale), NativeArray.get_int(nh, i)) end)
+    let segs = List.range(0, List.length(g.rg_segs))
+    let h1 = List.fold_left(segs, h0, fn (acc, i) -> shoulder(g, h0, acc, scale, i))
+    let h2 = List.fold_left(segs, h1, fn (acc, i) -> bed(g, h0, acc, scale, i))
+    List.fold_left(List.range(0, n), h2, fn (acc, i) -> match node_at(g, i) do (x, z) -> RdH.set(acc, vox(x, scale), vox(z, scale), NativeArray.get_int(nh, i)) end)
+  end
+
+  doc "For each segment crossing water ([water] of a column x, z), in segment order: the segment, where the crossing starts and ends along it (metres), and the deck's height (voxels: the higher of the road's heights on the two banks). Sampled every voxel along the centre line of an adapted grid."
+  fn bridges(g : RoadGraph, h : Strata.Heights.HeightGrid, water : Int -> Int -> Bool, scale : Float) : List((Int, Float, Float, Int)) do
+    List.flat_map(List.range(0, List.length(g.rg_segs)), fn i -> crossings(g, h, water, scale, i))
+  end
+  pfn crossings(g : RoadGraph, h : Strata.Heights.HeightGrid, water : Int -> Int -> Bool, scale : Float, i : Int) : List((Int, Float, Float, Int)) do
+    match seg(g, i) do
+      (a, b, _, _) ->
+        match (node_at(g, a), node_at(g, b)) do
+          ((ax, az), (bx, bz)) ->
+            let l = seg_len(g, i)
+            let n = float_to_int(Math.ceil(l /. scale))
+            let wet = fn k ->
+              let s = minf(l, int_to_float(k) *. scale)
+              let t = if l < 0.000001 do 0.0 else s /. l end
+              water(vox(ax +. (bx -. ax) *. t, scale), vox(az +. (bz -. az) *. t, scale))
+            let flags = List.map(List.range(0, n + 1), wet)
+            runs(g, h, scale, i, l, flags, 0, -1, Nil)
+        end
+    end
+  end
+  -- runs of wet samples: k the sample, start the run's first sample (or -1)
+  pfn runs(g : RoadGraph, h : Strata.Heights.HeightGrid, scale : Float, i : Int, l : Float, flags : List(Bool), k : Int, start : Int, acc : List((Int, Float, Float, Int))) : List((Int, Float, Float, Int)) do
+    match flags do
+      Nil -> List.reverse(if start >= 0 do Cons(span(g, h, scale, i, l, start, k - 1), acc) else acc end)
+      Cons(f, rest) ->
+        if f && start < 0 do runs(g, h, scale, i, l, rest, k + 1, k, acc)
+        else if !f && start >= 0 do runs(g, h, scale, i, l, rest, k + 1, -1, Cons(span(g, h, scale, i, l, start, k - 1), acc))
+        else runs(g, h, scale, i, l, rest, k + 1, start, acc) end end
+    end
+  end
+  pfn span(g : RoadGraph, h : Strata.Heights.HeightGrid, scale : Float, i : Int, l : Float, k0 : Int, k1 : Int) : (Int, Float, Float, Int) do
+    let s0 = minf(l, int_to_float(k0) *. scale)
+    let s1 = minf(l, int_to_float(k1) *. scale)
+    let before = profile(g, h, scale, i, maxf(0.0, s0 -. scale))
+    let after = profile(g, h, scale, i, minf(l, s1 +. scale))
+    (i, s0, s1, Math.max_int(before, after))
+  end
+
+  doc "Chunk [c] at key [k] with the roads painted in: in each column under a road, the road's surface block at its height (height - 1), or a deck of block [deck] where the ground lies more than 2 voxels below the road (a bridge), and air for 3 m above either (cutting through whatever the terrain left there). Reads only the graph and the adapted grid, so neighbouring chunks agree."
+  fn chunk_paint(c : Strata.Chunk.Chunk, k : Strata.Coord.Key, g : RoadGraph, h : Strata.Heights.HeightGrid, scale : Float, deck : Int) : Strata.Chunk.Chunk do
+    if List.is_empty(g.rg_segs) do c
+    else List.fold_left(List.range(0, 1024), c, fn (acc, i) -> paint_col(acc, k, g, h, scale, deck, i % 32, i / 32)) end
+  end
+  pfn paint_col(c : Strata.Chunk.Chunk, k : Strata.Coord.Key, g : RoadGraph, h : Strata.Heights.HeightGrid, scale : Float, deck : Int, lx : Int, lz : Int) : Strata.Chunk.Chunk do
+    let x = Strata.Coord.kx(k) * 32 + lx
+    let z = Strata.Coord.kz(k) * 32 + lz
+    match at(g, mid(x, scale), mid(z, scale)) do
+      None -> c
+      Some((i, along)) ->
+        let p = profile(g, h, scale, i, along)
+        let block = if RdH.get(h, x, z) < p - 2 do deck else match seg(g, i) do (_, _, _, s) -> s end end
+        let clear = float_to_int(Math.ceil(3.0 /. scale))
+        let y0 = Strata.Coord.ky(k) * 32
+        List.fold_left(List.range(p - 1, p + clear), c, fn (acc, y) -> put(acc, lx, y - y0, lz, if y == p - 1 do block else 0 end))
+    end
+  end
+  pfn put(c : Strata.Chunk.Chunk, lx : Int, ly : Int, lz : Int, id : Int) : Strata.Chunk.Chunk do
+    if ly < 0 || ly > 31 do c else Strata.Chunk.set_idx(c, lx + 32 * (lz + 32 * ly), id) end
+  end
+end
