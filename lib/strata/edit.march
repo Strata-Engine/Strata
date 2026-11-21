@@ -242,6 +242,57 @@ mod Strata.Edit do
     Strata.Store.fold(gather(cells, Strata.Store.empty(Nil)), Outcome(w, Nil, Nil, Nil), fn (o, k, l) -> chunk_cells(o, k, l))
   end
 
+  -- ── Stamps ───────────────────────────────────────────────────────────────
+  -- A template stamped into the world: per chunk it overlaps, Template.blit
+  -- into a scratch chunk of a sentinel id; every cell no longer the sentinel
+  -- is one the template writes there (holes and failed draws are never
+  -- written), and those cells go to set_many, so the world keeps its blocks
+  -- under the holes, every touched chunk is dirty, unloaded ones queue.
+
+  pfn stamp_sentinel() : Int do 65535 end
+
+  pfn floor32(v : Int) : Int do fdiv2(v, 32) end
+
+  -- the cells chunk (cx, cy, cz) gets from the template
+  pfn stamp_cells(t : Strata.Template.Template, ox : Int, oy : Int, oz : Int, rot : Int, stream : Int, b : (Int, Int, Int, Int, Int, Int), acc : List((Int, Int, Int, Int)), ck : (Int, Int, Int)) : List((Int, Int, Int, Int)) do
+    match (b, ck) do
+      ((x0, y0, z0, x1, y1, z1), (cx, cy, cz)) ->
+        let k = Kc.key(cx, cy, cz)
+        let c = Strata.Template.blit(Strata.Chunk.uniform(stamp_sentinel()), k, t, ox, oy, oz, rot, stream)
+        let lx0 = hi(x0, cx * 32)
+        let lx1 = lo(x1, cx * 32 + 31)
+        let ly0 = hi(y0, cy * 32)
+        let ly1 = lo(y1, cy * 32 + 31)
+        let lz0 = hi(z0, cz * 32)
+        let lz1 = lo(z1, cz * 32 + 31)
+        let n = (lx1 - lx0 + 1) * (ly1 - ly0 + 1) * (lz1 - lz0 + 1)
+        if lx1 < lx0 || ly1 < ly0 || lz1 < lz0 do acc
+        else
+          List.fold_left(List.range(0, n), acc, fn (a, i) -> stamp_cell(c, a, lx0 + i % (lx1 - lx0 + 1), ly0 + (i / (lx1 - lx0 + 1)) % (ly1 - ly0 + 1), lz0 + i / ((lx1 - lx0 + 1) * (ly1 - ly0 + 1))))
+        end
+    end
+  end
+  pfn stamp_cell(c : Strata.Chunk.Chunk, acc : List((Int, Int, Int, Int)), x : Int, y : Int, z : Int) : List((Int, Int, Int, Int)) do
+    let id = Strata.Chunk.get_or(c, Kc.local_of(x), Kc.local_of(y), Kc.local_of(z), stamp_sentinel())
+    if id == stamp_sentinel() do acc else Cons((x, y, z, id), acc) end
+  end
+
+  doc "Template [t] written into the world at voxel (ox, oy, oz), turned [rot] quarter turns about y, its probabilities drawn from [stream]: exactly what Template.blit writes into a chunk, written into the world. Holes (and voxels whose draw fails) keep what was there; every touched chunk is dirty; each block that changed (or was queued for an unloaded chunk) is one Cell change."
+  fn stamp(w : Strata.World.World, t : Strata.Template.Template, ox : Int, oy : Int, oz : Int, rot : Int, stream : Int) : Outcome do
+    let b = Strata.Template.bounds(t, ox, oy, oz, rot)
+    match b do
+      (x0, y0, z0, x1, y1, z1) ->
+        let cx0 = floor32(x0)
+        let cy0 = floor32(y0)
+        let cz0 = floor32(z0)
+        let nx = floor32(x1) - cx0 + 1
+        let ny = floor32(y1) - cy0 + 1
+        let nz = floor32(z1) - cz0 + 1
+        let keys = List.map(List.range(0, nx * ny * nz), fn i -> (cx0 + i % nx, cy0 + (i / nx) % ny, cz0 + i / (nx * ny)))
+        set_many(w, List.reverse(List.fold_left(keys, Nil, fn (acc, ck) -> stamp_cells(t, ox, oy, oz, rot, stream, b, acc, ck))))
+    end
+  end
+
   -- ── Blasts ───────────────────────────────────────────────────────────────
   -- A crater is a sphere whose radius varies with direction only: a voxel at
   -- offset (dx, dy, dz) and distance d from the centre is carved when d is

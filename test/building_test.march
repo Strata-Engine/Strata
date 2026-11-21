@@ -1,0 +1,185 @@
+-- The building grammar: mass and facade (level 1), hollow (level 2).
+mod Strata.Test.Building do
+
+  needs IO.Clock      -- charged to every test module once any uses Check.all (GAPS S3)
+  needs IO.Console
+  needs IO.FileRead
+  needs IO.FileWrite
+  needs IO.Process
+  import Test
+  alias Strata.Building as Bdg
+
+  -- blocks: 1 wall, 2 trim, 3 glass, 4 floor, 5 roof, 6 door
+  pfn town() : Strata.Building.BldStyle do { Bdg.style(1, 2, 3, 4, 5) with bs_door: 6, bs_storeys: (2, 4), bs_coverage: 0.8, bs_volumes: 2 } end
+  pfn hall() : Strata.Building.BldStyle do { Bdg.style(1, 2, 3, 4, 5) with bs_door: 6, bs_storeys: (1, 1), bs_hall: true, bs_roof_kind: 2, bs_bay: 6 } end
+  -- a 24 x 30 lot facing -z at (100, 200)
+  pfn lot() : Strata.Lots.Lot do Strata.Lots.lot(100, 200, 123, 229, 3) end
+
+  pfn inside(p : Strata.Building.BldPlan, w : Int, d : Int) : Bool do
+    List.all(Bdg.volumes(p), fn v -> match v do (x0, z0, x1, z1, _) -> x0 >= 0 && z0 >= 0 && x1 < w && z1 < d && x0 <= x1 && z0 <= z1 end)
+  end
+  -- the first seed from [from] whose plan has two volumes
+  pfn two(from : Int) : Strata.Building.BldPlan do
+    let p = Bdg.plan(lot(), town(), from)
+    if List.length(Bdg.volumes(p)) >= 2 || from > 200 do p else two(from + 1) end
+  end
+  -- the lot-local column just outside an opening's wall at its bay's middle
+  pfn outside(p : Strata.Building.BldPlan, o : (Int, Int, Int, Int, Int)) : (Int, Int) do
+    match o do
+      (v, side, bay, _, _) -> match List.nth(Bdg.volumes(p), v) do
+        (x0, z0, x1, z1, _) ->
+          let along = Bdg.bay_middle(p, v, side, bay)
+          if side == 0 do (x1 + 1, along) else if side == 1 do (x0 - 1, along) else if side == 2 do (along, z1 + 1) else (along, z0 - 1) end end end
+      end
+    end
+  end
+  pfn in_volume(p : Strata.Building.BldPlan, c : (Int, Int)) : Bool do
+    List.any(Bdg.volumes(p), fn v -> match (v, c) do ((x0, z0, x1, z1, _), (x, z)) -> x >= x0 && x <= x1 && z >= z0 && z <= z1 end)
+  end
+
+  describe "Building, level 1" do
+    test "a building stays inside its lot" do
+      Test.assert_true(List.all(List.range(0, 20), fn sd -> inside(Bdg.plan(lot(), town(), sd), 24, 30)), "every volume inside")
+      let t = Bdg.solid(Bdg.plan(lot(), town(), 4), town(), 4)
+      Test.assert_true(Strata.Template.t_sx(t) == 24 && Strata.Template.t_sz(t) == 30, "the template is the lot")
+    end
+    test "its storeys are within the style's range" do
+      Test.assert_true(List.all(List.range(0, 20), fn sd -> List.all(Bdg.volumes(Bdg.plan(lot(), town(), sd)), fn v -> match v do (_, _, _, _, n) -> n >= 1 && n <= 4 end)), "1..4")
+      Test.assert_true(List.all(List.range(0, 20), fn sd -> match List.head(Bdg.volumes(Bdg.plan(lot(), town(), sd))) do (_, _, _, _, n) -> n >= 2 end), "the main volume at least 2")
+    end
+    test "the street side's ground floor has a shopfront or door" do
+      Test.assert_true(List.all(List.range(0, 20), fn sd -> List.any(Bdg.openings(Bdg.plan(lot(), town(), sd)), fn o -> match o do (_, side, _, storey, kind) -> side == 3 && storey == 0 && (kind == 2 || kind == 3) end)), "a way in from the street")
+    end
+    test "walls between volumes carry no openings" do
+      let p = two(0)
+      Test.assert_true(List.length(Bdg.volumes(p)) == 2, "a plan with a wing")
+      Test.assert_true(List.all(Bdg.openings(p), fn o -> !in_volume(p, outside(p, o))), "no opening looks into the other volume")
+    end
+    test "no opening is cut into a wall touching the lot edge without a street" do
+      Test.assert_true(List.all(List.range(0, 20), fn sd ->
+        let p = Bdg.plan(lot(), town(), sd)
+        List.all(Bdg.openings(p), fn o -> match outside(p, o) do (x, z) -> match o do (_, side, _, _, _) -> side == 3 || (x >= 0 && x < 24 && z >= 0 && z < 30) end end)), "only the street side opens onto the lot edge")
+    end
+    test "a hall style gives one wide low volume" do
+      let p = Bdg.plan(lot(), hall(), 3)
+      match Bdg.volumes(p) do
+        Cons((x0, z0, x1, z1, n), Nil) -> Test.assert_true(n == 1 && (x1 - x0 + 1) * (z1 - z0 + 1) * 10 >= 24 * 30 * 6, "one storey over at least 60% of the lot")
+        _ -> Test.fail("not one volume")
+      end
+    end
+    test "the same seed plans the same building" do
+      let a = Bdg.plan(lot(), town(), 11)
+      let b = Bdg.plan(lot(), town(), 11)
+      Test.assert_true(Bdg.volumes(a) == Bdg.volumes(b) && Bdg.openings(a) == Bdg.openings(b), "equal")
+    end
+    test "solid draws walls, glass in the windows and a roof" do
+      let p = Bdg.plan(lot(), town(), 4)
+      let t = Bdg.solid(p, town(), 4)
+      let ids = Strata.Template.t_ids(t)
+      let has = fn id -> List.any(List.range(0, NativeArray.length_i32(ids)), fn i -> NativeArray.get_i32(ids, i) == id)
+      Test.assert_true(has(1) && has(3) && has(5) && Bdg.height(p) == Strata.Template.t_sy(t) - 2, "wall, glass, roof; height under the parapet")
+    end
+  end
+
+  -- ── Level 2 ──
+  pfn at(t : Strata.Template.Template, x : Int, y : Int, z : Int) : Int do
+    NativeArray.get_i32(Strata.Template.t_ids(t), x + Strata.Template.t_sx(t) * (y + Strata.Template.t_sy(t) * z))
+  end
+  pfn tall(from : Int) : Strata.Building.BldPlan do
+    let p = Bdg.plan(lot(), town(), from)
+    match List.head(Bdg.volumes(p)) do (_, _, _, _, n) -> if n >= 3 || from > 200 do p else tall(from + 1) end end
+  end
+  pfn is_stair(p : Strata.Building.BldPlan, x : Int, y : Int, z : Int) : Bool do List.any(Bdg.stairs(p), fn c -> c == (x, y, z)) end
+
+  describe "Building, level 2" do
+    test "every storey has a floor" do
+      let p = tall(0)
+      let t = Bdg.hollow(p, town(), 0)
+      match List.head(Bdg.volumes(p)) do
+        (_, _, x1, z1, n) -> Test.assert_true(List.all(List.range(0, n), fn st -> at(t, x1 - 3, st * 8, z1 - 3) == 4), "floor block at each storey")
+      end
+    end
+    test "the stair core is open through every floor and aligned" do
+      let p = tall(0)
+      let t = Bdg.hollow(p, town(), 0)
+      -- the main volume's flight (a wing has a core of its own)
+      let main = List.head(Bdg.volumes(p))
+      let cells = List.filter(Bdg.stairs(p), fn c -> match (c, main) do ((x, _, z), (x0, z0, x1, z1, _)) -> x >= x0 && x <= x1 && z >= z0 && z <= z1 end)
+      let xs = List.map(cells, fn c -> match c do (x, _, _) -> x end)
+      let zs = List.map(cells, fn c -> match c do (_, _, z) -> z end)
+      let spread = fn vs -> List.fold_left(vs, -1000, fn (m, v) -> Math.max_int(m, v)) - List.fold_left(vs, 1000, fn (m, v) -> Math.min_int(m, v))
+      Test.assert_true(!List.is_empty(cells) && spread(xs) < 4 && spread(zs) < 4, "inside one bay square through the whole height")
+      match List.head(Bdg.volumes(p)) do
+        (_, _, _, _, n) -> Test.assert_true(List.all(List.range(1, n), fn st -> List.any(cells, fn c -> match c do (x, _, z) -> at(t, x, st * 8, z) == 0 end)), "an opening in every upper floor over the core")
+      end
+      Test.assert_true(List.all(cells, fn c -> match c do (x, y, z) -> at(t, x, y, z) == 4 end), "the steps are floor blocks")
+    end
+    test "a window is a hole you can see through" do
+      let p = tall(0)
+      let t = Bdg.hollow(p, town(), 0)
+      match List.find(Bdg.openings(p), fn o -> match o do (v, side, _, _, k) -> v == 0 && k == 1 && side == 3 end) do
+        Some((v, side, b, st, _)) ->
+          let x = Bdg.bay_middle(p, v, side, b)
+          match List.nth(Bdg.volumes(p), v) do
+            (_, z0, _, _, _) -> Test.assert_true(at(t, x, st * 8 + 3, z0) == 0 && at(t, x, st * 8 + 3, z0 + 1) == 0 && at(t, x, st * 8 + 3, z0 + 2) == 0, "outer, inner and the room behind are air")
+          end
+        None -> Test.fail("no window on the street side")
+      end
+    end
+    test "the interior is air apart from floors and stairs" do
+      let p = tall(0)
+      let t = Bdg.hollow(p, town(), 0)
+      match List.head(Bdg.volumes(p)) do
+        (x0, z0, x1, z1, n) ->
+          let w = x1 - x0 - 3
+          let d = z1 - z0 - 3
+          Test.assert_true(List.all(List.range(0, n), fn st -> List.all(List.range(0, w * d * 7), fn i ->
+            let x = x0 + 2 + i % w
+            let z = z0 + 2 + (i / w) % d
+            let y = st * 8 + 1 + i / (w * d)
+            at(t, x, y, z) == 0 || is_stair(p, x, y, z))), "air or steps")
+      end
+    end
+    test "walls are two thick with the trim inside" do
+      let p = tall(0)
+      let t = Bdg.hollow(p, town(), 0)
+      match List.head(Bdg.volumes(p)) do (x0, z0, x1, z1, _) -> Test.assert_true(at(t, x0, 1, z1 - 4) == 1 && at(t, x0 + 1, 1, z1 - 4) == 2, "wall outside, trim inside") end
+    end
+  end
+
+  -- a 2 x 3 x 2 tank of block 7
+  pfn tank() : Strata.Template.Template do Strata.Template.make(2, 3, 2, NativeArray.make_i32(12, 7), 0.4) end
+
+  describe "Building (review)" do
+    test "a wing opens into the main block on every storey they share" do
+      let p = two(0)
+      let t = Bdg.hollow(p, town(), 0)
+      match Bdg.volumes(p) do
+        Cons(m, Cons(w, _)) -> match (m, w) do
+          ((_, _, _, mz1, mn), (wx0, wz0, wx1, _, wn)) ->
+            -- the wing stands behind the main block (street -z): its wall meets the main block's back wall at z = mz1 / wz0
+            let mid = (wx0 + wx1) / 2
+            let shared = Math.min_int(mn, wn)
+            Test.assert_true(wz0 == mz1 + 1, "the wing is behind the main block")
+            Test.assert_true(List.all(List.range(0, shared), fn st -> List.all(List.range(mz1 - 1, wz0 + 2), fn z -> List.any(List.range(mid - 1, mid + 2), fn x -> at(t, x, st * 8 + 2, z) == 0))), "a way through on each shared storey")
+        end
+        _ -> Test.fail("no wing")
+      end
+    end
+    test "clearance lists the boxes to clear before stamping, so the interior is air" do
+      let p = tall(0)
+      let cl = Bdg.clearance(p)
+      Test.assert_true(List.length(cl) == List.length(Bdg.volumes(p)), "one box a volume")
+      match (List.head(cl), List.head(Bdg.footprint(p))) do
+        ((x0, y0, z0, x1, y1, z1), (fx0, fz0, fx1, fz1)) -> Test.assert_true(x0 == fx0 && z0 == fz0 && x1 == fx1 && z1 == fz1 && y0 == 0 && y1 >= Bdg.height(p), "the volume's box, ground to roof")
+      end
+    end
+    test "roof clutter stands whole on a flat roof" do
+      let s = { town() with bs_clutter: [tank()], bs_volumes: 1 }
+      let p = Bdg.plan(lot(), s, 2)
+      let t = Bdg.solid(p, s, 2)
+      let ids = Strata.Template.t_ids(t)
+      Test.assert_eq_int(List.length(List.filter(List.range(0, NativeArray.length_i32(ids)), fn i -> NativeArray.get_i32(ids, i) == 7)), 24, "two tanks, all 12 voxels of each")
+    end
+  end
+end
