@@ -25,3 +25,4 @@
 - Task 18 (complete): surfaces (concrete, scorched, sand, grass), lava, roads, and templates by a per-chunk index.
 - Task 19: ruin pass on a scratch world, answered as requests; Ruling: rubble laid on resting air cell by cell (not stamped).
 - Task 20: sites by rule on the grid; Ruling: rubble seen through the grid kind (keep the rubble id in the kind function); high = top fifth of candidates.
+- Task 21: full check and generate; Rulings: generate takes the registry, the slice is generate_ground, sight reported not required, mover wades 2. BUDGET NOT MET: 58 s per 64x64 attempt in the test build (stages 16 s, scratch world 18 s, grid+sites 21 s) against 12 s; needs profiling.
