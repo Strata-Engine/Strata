@@ -1,0 +1,83 @@
+-- Sculpt — shaping a part's voxel grid in code.
+--
+-- A canvas is sx x sy x sz voxels of palette indices (0 empty), stored
+-- x + sx * (y + sy * z) as StrataKit.Part.from_grid reads it. Shapes are
+-- predicates over (x, y, z); fill sets every voxel a shape covers, carve
+-- empties them, paint recolours only filled ones, and surface recolours
+-- filled voxels whose neighbour on one face is empty (face 0 +x, 1 -x, 2 +y,
+-- 3 -y, 4 +z, 5 -z): panel lines, glass, glowing slats on an outer skin.
+-- Everything outside the canvas reads 0 and is never written.
+mod SteelRain.Sculpt do
+
+  type Sculpt = Sculpt(Int, Int, Int, NativeU8Arr)
+
+  doc "An empty canvas."
+  fn canvas(sx : Int, sy : Int, sz : Int) : Sculpt do Sculpt(sx, sy, sz, NativeArray.make_u8(Math.max_int(1, sx * sy * sz), 0)) end
+  doc "Its size."
+  fn size(s : Sculpt) : (Int, Int, Int) do match s do Sculpt(x, y, z, _) -> (x, y, z) end end
+  doc "Its voxels, for StrataKit.Part.from_grid."
+  fn grid(s : Sculpt) : NativeU8Arr do match s do Sculpt(_, _, _, g) -> g end end
+
+  pfn inside(s : Sculpt, x : Int, y : Int, z : Int) : Bool do
+    match s do Sculpt(sx, sy, sz, _) -> x >= 0 && y >= 0 && z >= 0 && x < sx && y < sy && z < sz end
+  end
+  doc "The voxel at (x, y, z); 0 outside."
+  fn get(s : Sculpt, x : Int, y : Int, z : Int) : Int do
+    if !inside(s, x, y, z) do 0 else match s do Sculpt(sx, sy, _, g) -> NativeArray.get_u8(g, x + sx * (y + sy * z)) end end
+  end
+  doc "The canvas with (x, y, z) set to [c]; unchanged outside."
+  fn set(s : Sculpt, x : Int, y : Int, z : Int, c : Int) : Sculpt do
+    if !inside(s, x, y, z) do s else match s do Sculpt(sx, sy, sz, g) -> Sculpt(sx, sy, sz, NativeArray.set_u8(g, x + sx * (y + sy * z), c)) end end
+  end
+
+  -- every voxel through f: the old value and (x, y, z) to the new value
+  pfn each(s : Sculpt, f : Int -> Int -> Int -> Int -> Int) : Sculpt do
+    match s do
+      Sculpt(sx, sy, sz, g) ->
+        Sculpt(sx, sy, sz, List.fold_left(List.range(0, sx * sy * sz), g, fn (a, i) -> NativeArray.set_u8(a, i, f(NativeArray.get_u8(a, i), i % sx, (i / sx) % sy, i / (sx * sy)))))
+    end
+  end
+
+  doc "Every voxel [shape] covers set to [c]."
+  fn fill(s : Sculpt, shape : Int -> Int -> Int -> Bool, c : Int) : Sculpt do each(s, fn (v, x, y, z) -> if shape(x, y, z) do c else v end) end
+  doc "Every voxel [shape] covers emptied."
+  fn carve(s : Sculpt, shape : Int -> Int -> Int -> Bool) : Sculpt do each(s, fn (v, x, y, z) -> if shape(x, y, z) do 0 else v end) end
+  doc "Every filled voxel [shape] covers recoloured [c]."
+  fn paint(s : Sculpt, shape : Int -> Int -> Int -> Bool, c : Int) : Sculpt do each(s, fn (v, x, y, z) -> if v != 0 && shape(x, y, z) do c else v end) end
+
+  pfn open_on(s : Sculpt, x : Int, y : Int, z : Int, face : Int) : Bool do
+    if face == 0 do get(s, x + 1, y, z) == 0 else if face == 1 do get(s, x - 1, y, z) == 0
+    else if face == 2 do get(s, x, y + 1, z) == 0 else if face == 3 do get(s, x, y - 1, z) == 0
+    else if face == 4 do get(s, x, y, z + 1) == 0 else get(s, x, y, z - 1) == 0 end end end end end
+  end
+  doc "Every filled voxel [shape] covers whose neighbour on [face] is empty (or off the canvas) recoloured [c]."
+  fn surface(s : Sculpt, face : Int, shape : Int -> Int -> Int -> Bool, c : Int) : Sculpt do
+    let before = s
+    each(s, fn (v, x, y, z) -> if v != 0 && shape(x, y, z) && open_on(before, x, y, z, face) do c else v end)
+  end
+
+  doc "A box from (x0, y0, z0) to (x1, y1, z1), both included, of [c]."
+  fn box(s : Sculpt, x0 : Int, y0 : Int, z0 : Int, x1 : Int, y1 : Int, z1 : Int, c : Int) : Sculpt do fill(s, in_box(x0, y0, z0, x1, y1, z1), c) end
+  doc "The shape of that box."
+  fn in_box(x0 : Int, y0 : Int, z0 : Int, x1 : Int, y1 : Int, z1 : Int) : Int -> Int -> Int -> Bool do
+    fn (x, y, z) -> x >= x0 && x <= x1 && y >= y0 && y <= y1 && z >= z0 && z <= z1
+  end
+
+  pfn disc(a : Int, b : Int, ca : Float, cb : Float, r : Float) : Bool do
+    let da = int_to_float(a) +. 0.5 -. ca
+    let db = int_to_float(b) +. 0.5 -. cb
+    da *. da +. db *. db <= r *. r
+  end
+  doc "A cylinder along z: centre (cx, cy) in voxel units (voxel 4's middle is 4.5), radius r, z0..z1."
+  fn cyl_z(s : Sculpt, cx : Float, cy : Float, r : Float, z0 : Int, z1 : Int, c : Int) : Sculpt do fill(s, in_cyl_z(cx, cy, r, z0, z1), c) end
+  doc "The shape of a cylinder along z."
+  fn in_cyl_z(cx : Float, cy : Float, r : Float, z0 : Int, z1 : Int) : Int -> Int -> Int -> Bool do fn (x, y, z) -> z >= z0 && z <= z1 && disc(x, y, cx, cy, r) end
+  doc "A cylinder along y: centre (cx, cz), radius r, y0..y1."
+  fn cyl_y(s : Sculpt, cx : Float, cz : Float, r : Float, y0 : Int, y1 : Int, c : Int) : Sculpt do fill(s, in_cyl_y(cx, cz, r, y0, y1), c) end
+  doc "The shape of a cylinder along y."
+  fn in_cyl_y(cx : Float, cz : Float, r : Float, y0 : Int, y1 : Int) : Int -> Int -> Int -> Bool do fn (x, y, z) -> y >= y0 && y <= y1 && disc(x, z, cx, cz, r) end
+  doc "A cylinder along x: centre (cy, cz), radius r, x0..x1."
+  fn cyl_x(s : Sculpt, cy : Float, cz : Float, r : Float, x0 : Int, x1 : Int, c : Int) : Sculpt do fill(s, in_cyl_x(cy, cz, r, x0, x1), c) end
+  doc "The shape of a cylinder along x."
+  fn in_cyl_x(cy : Float, cz : Float, r : Float, x0 : Int, x1 : Int) : Int -> Int -> Int -> Bool do fn (x, y, z) -> x >= x0 && x <= x1 && disc(y, z, cy, cz, r) end
+end
