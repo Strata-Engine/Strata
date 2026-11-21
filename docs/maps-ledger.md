@@ -22,3 +22,4 @@
 - Task 17: lava pools in the lowest open ground, 3 clear of water/roads/lots, level surface, 3-wide scorch, report when short. The settled disc reaches the square's corners at settlement 1.
 - Task 15: set pieces by zone; Ruling: yard = a lot's ground outside its building; high ground = the highest fifth of open ground.
 - Task 16: trees by hashed cells, doubled within 12 m of water; Ruling: street trees where density < 0.5 (an exurb).
+- Task 18 (complete): surfaces (concrete, scorched, sand, grass), lava, roads, and templates by a per-chunk index.
