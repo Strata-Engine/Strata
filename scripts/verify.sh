@@ -9,7 +9,7 @@ run() { # dir, command...
     echo "FAIL: ($d) $*"; tail -40 .verify.log; exit 1
   fi
 }
-for d in . demo viewer soundcheck animcheck entcheck savecheck plugins/strata_tactics plugins/strata_tactics/example plugins/strata_kit plugins/strata_kit/example; do
+for d in . demo viewer soundcheck animcheck entcheck savecheck plugins/strata_tactics plugins/strata_tactics/example plugins/strata_kit plugins/strata_kit/example plugins/strata_maps plugins/strata_maps/example; do
   [ -f "$d/forge.toml" ] || continue
   run "$d" forge check
   run "$d" forge build --release
