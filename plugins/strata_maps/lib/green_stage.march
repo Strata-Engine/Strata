@@ -1,0 +1,126 @@
+-- GreenStage — trees.
+--
+-- For vegetation above 0: one tree a cell of a grid over the playable
+-- square, at a point in the cell drawn by a hash; cells are 14 m across at
+-- vegetation 0 down to 3.2 m (a tile) at 1. Within 12 m of water a second
+-- grid, offset half a cell, adds as many again, so banks are twice as thick.
+-- A tree stands where its base column and the eight round it are clear of
+-- roads, lots, water, lava, the scorched ring and set pieces, on ground no
+-- steeper than 3 height steps a column; its kind and quarter turn are drawn
+-- by a hash. A low-density settlement (density under 0.5: an exurb) also
+-- gets street trees on its verges every 10 m. Open ground keeps its grass
+-- (the generator's default surface).
+mod StrataMaps.GreenStage do
+
+  alias StrataMaps.Data as GrD
+
+  -- 1 where a tree may not stand: roads, lots, water, lava, scorch, pieces
+  pfn blocked(d : StrataMaps.Data.MapData, px : Int, pz : Int, n : Int) : NativeIntArr do
+    let roads = Strata.Roads.mask(d.md_roads, px, pz, n, StrataMaps.Settings.scale())
+    let a0 = List.fold_left(List.range(0, n * n), NativeArray.make_int(Math.max_int(1, n * n), 0), fn (a, i) ->
+      let x = px + i % n
+      let z = pz + i / n
+      if NativeArray.get_int(roads, i) == 1 || GrD.water_at(d, x, z) >= 0 || GrD.lava_at(d, x, z) >= 0 || GrD.scorched_at(d, x, z) do NativeArray.set_int(a, i, 1) else a end)
+    let a1 = List.fold_left(d.md_lots, a0, fn (a, l) -> match Strata.Lots.lot_box(l) do (x0, z0, x1, z1) -> fill(a, n, px, pz, x0, z0, x1, z1) end)
+    List.fold_left(d.md_placed, a1, fn (a, p) -> match p.mpl_origin do
+      (ox, oy, oz) -> match Strata.Template.bounds(p.mpl_template, ox, oy, oz, p.mpl_rot) do (x0, _, z0, x1, _, z1) -> fill(a, n, px, pz, x0, z0, x1, z1) end
+    end)
+  end
+  pfn fill(a : NativeIntArr, n : Int, px : Int, pz : Int, x0 : Int, z0 : Int, x1 : Int, z1 : Int) : NativeIntArr do
+    let w = x1 - x0 + 1
+    if w <= 0 || z1 < z0 do a else List.fold_left(List.range(0, w * (z1 - z0 + 1)), a, fn (b, k) -> set_in(b, n, x0 + k % w - px, z0 + k / w - pz)) end
+  end
+  pfn set_in(a : NativeIntArr, n : Int, i : Int, j : Int) : NativeIntArr do if i < 0 || j < 0 || i >= n || j >= n do a else NativeArray.set_int(a, j * n + i, 1) end end
+  pfn at(a : NativeIntArr, n : Int, i : Int, j : Int) : Int do if i < 0 || j < 0 || i >= n || j >= n do 1 else NativeArray.get_int(a, j * n + i) end end
+
+  -- the mask grown by r columns, by running counts along each row, then each column
+  pfn grow(a : NativeIntArr, n : Int, r : Int) : NativeIntArr do along(along(a, n, r, true), n, r, false) end
+  pfn along(a : NativeIntArr, n : Int, r : Int, rows : Bool) : NativeIntArr do
+    List.fold_left(List.range(0, n), NativeArray.make_int(Math.max_int(1, n * n), 0), fn (out, line) -> grow_line(a, out, n, r, rows, line))
+  end
+  pfn grow_line(a : NativeIntArr, out : NativeIntArr, n : Int, r : Int, rows : Bool, line : Int) : NativeIntArr do
+    let idx = fn k -> if rows do line * n + k else k * n + line end
+    -- prefix counts along the line
+    let pre = List.fold_left(List.range(0, n), NativeArray.make_int(n + 1, 0), fn (p, k) -> NativeArray.set_int(p, k + 1, NativeArray.get_int(p, k) + NativeArray.get_int(a, idx(k))))
+    List.fold_left(List.range(0, n), out, fn (o, k) ->
+      let lo = Math.max_int(0, k - r)
+      let hi = Math.min_int(n, k + r + 1)
+      if NativeArray.get_int(pre, hi) - NativeArray.get_int(pre, lo) > 0 do NativeArray.set_int(o, idx(k), 1) else o end)
+  end
+
+  -- a tree at column (x, z) if it may stand there
+  pfn tree_at(d : StrataMaps.Data.MapData, block : NativeIntArr, px : Int, pz : Int, n : Int, trees : List(Strata.Template.Template), x : Int, z : Int, h : Int) : Option(StrataMaps.Data.MapPlaced) do
+    let i = x - px
+    let j = z - pz
+    let clear = List.all(List.range(0, 9), fn k -> at(block, n, i - 1 + k % 3, j - 1 + k / 3) == 0)
+    if !clear || Strata.Heights.slope(d.md_heights, x, z) > 3 * d.md_settings.ms_step do None
+    else
+      let t = List.nth(trees, int_mod_euclid(h, List.length(trees)))
+      let half = Strata.Trees.half(t)
+      Some({ mpl_template: t, mpl_origin: (x - half, Strata.Heights.get(d.md_heights, x, z), z - half), mpl_rot: int_mod_euclid(h / 7, 4), mpl_kind: 1 })
+    end
+  end
+
+  -- one grid's trees: cells of c columns from (ox, oz); only where [where] allows the point
+  pfn grid(d : StrataMaps.Data.MapData, block : NativeIntArr, wet : NativeIntArr, px : Int, pz : Int, n : Int, trees : List(Strata.Template.Template), c : Int, off : Int, salt : Int, only_wet : Bool) : List(StrataMaps.Data.MapPlaced) do
+    let m = (n - off) / c
+    List.filter_map(List.range(0, m * m), fn k -> cell(d, block, wet, px, pz, n, trees, c, off, salt, only_wet, k % m, k / m))
+  end
+  pfn cell(d : StrataMaps.Data.MapData, block : NativeIntArr, wet : NativeIntArr, px : Int, pz : Int, n : Int, trees : List(Strata.Template.Template), c : Int, off : Int, salt : Int, only_wet : Bool, ci : Int, cj : Int) : Option(StrataMaps.Data.MapPlaced) do
+    let h = Strata.Seed.mix(Strata.Seed.mix(d.md_settings.ms_seed, salt + ci * 7919), cj)
+    let i = off + ci * c + int_mod_euclid(h, c)
+    let j = off + cj * c + int_mod_euclid(h / c, c)
+    if i >= n || j >= n || (only_wet && NativeArray.get_int(wet, j * n + i) == 0) do None
+    else tree_at(d, block, px, pz, n, trees, px + i, pz + j, h) end
+  end
+
+  -- street trees: every 10 m along both verges of each segment
+  pfn street(d : StrataMaps.Data.MapData, block : NativeIntArr, px : Int, pz : Int, n : Int, trees : List(Strata.Template.Template)) : List(StrataMaps.Data.MapPlaced) do
+    let g = d.md_roads
+    List.flat_map(List.range(0, List.length(Strata.Roads.segments(g))), fn i -> verge(d, block, px, pz, n, trees, i))
+  end
+  pfn verge(d : StrataMaps.Data.MapData, block : NativeIntArr, px : Int, pz : Int, n : Int, trees : List(Strata.Template.Template), i : Int) : List(StrataMaps.Data.MapPlaced) do
+    match List.nth(Strata.Roads.segments(d.md_roads), i) do
+      (a, b, w, _) -> match (Strata.Roads.node_at(d.md_roads, a), Strata.Roads.node_at(d.md_roads, b)) do
+        ((ax, az), (bx, bz)) ->
+          let l = Math.sqrt((bx -. ax) *. (bx -. ax) +. (bz -. az) *. (bz -. az))
+          let k = float_to_int(l /. 10.0)
+          let ux = if l > 0.0 do (bx -. ax) /. l else 0.0 end
+          let uz = if l > 0.0 do (bz -. az) /. l else 0.0 end
+          let side = w /. 2.0 +. 1.2
+          let spots = List.flat_map(List.range(1, k), fn s -> [(ax +. ux *. int_to_float(s) *. 10.0 -. uz *. side, az +. uz *. int_to_float(s) *. 10.0 +. ux *. side), (ax +. ux *. int_to_float(s) *. 10.0 +. uz *. side, az +. uz *. int_to_float(s) *. 10.0 -. ux *. side)])
+          List.filter_map(spots, fn p -> spot_tree(d, block, px, pz, n, trees, p))
+      end
+    end
+  end
+
+  pfn spot_tree(d : StrataMaps.Data.MapData, block : NativeIntArr, px : Int, pz : Int, n : Int, trees : List(Strata.Template.Template), p : (Float, Float)) : Option(StrataMaps.Data.MapPlaced) do
+    match p do
+      (mx, mz) ->
+        let sc = StrataMaps.Settings.scale()
+        let x = float_to_int(Math.floor(mx /. sc))
+        let z = float_to_int(Math.floor(mz /. sc))
+        if x < px || z < pz || x >= px + n || z >= pz + n do None else tree_at(d, block, px, pz, n, trees, x, z, Strata.Seed.mix(d.md_settings.ms_seed, x * 31 + z)) end
+    end
+  end
+
+  doc "Trees for the data's vegetation knob, from the templates given (by a hash), placed as `MapPlaced` of kind 1. Vegetation 0 or no templates: none."
+  fn run(d : StrataMaps.Data.MapData, trees : List(Strata.Template.Template)) : StrataMaps.Data.MapData do
+    let v = d.md_settings.ms_knobs.mk_vegetation
+    if v <= 0.0 || List.is_empty(trees) do d
+    else
+      match GrD.playable(d) do
+        (px, pz, n) ->
+          let block = blocked(d, px, pz, n)
+          let water = List.fold_left(List.range(0, n * n), NativeArray.make_int(Math.max_int(1, n * n), 0), fn (a, i) -> if GrD.water_at(d, px + i % n, pz + i / n) >= 0 do NativeArray.set_int(a, i, 1) else a end)
+          let wet = grow(water, n, 30)
+          let c = Math.max_int(8, float_to_int((14.0 -. 10.8 *. v) /. StrataMaps.Settings.scale()))
+          let base = grid(d, block, wet, px, pz, n, trees, c, 0, 1301, false)
+          let bank = grid(d, block, wet, px, pz, n, trees, c, c / 2, 2707, true)
+          let s = d.md_settings.ms_knobs
+          let lining = if s.mk_settlement > 0.0 && s.mk_density < 0.5 do street(d, block, px, pz, n, trees) else Nil end
+          { d with md_placed: List.append(d.md_placed, List.append(base, List.append(bank, lining))) }
+      end
+    end
+  end
+end

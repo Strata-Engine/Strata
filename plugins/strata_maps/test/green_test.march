@@ -1,0 +1,78 @@
+-- Vegetation: trees by a hashed-cell scatter, thicker by water, never on roads or footprints.
+mod StrataMaps.Test.Green do
+
+  needs IO.Clock
+  needs IO.Console
+  needs IO.FileRead
+  needs IO.FileWrite
+  needs IO.Process
+  import Test
+  alias StrataMaps.GreenStage as MapGr
+  alias StrataMaps.Test.Blocks as MapGrb
+
+  -- a 3 x 6 x 3 tree: a trunk up the middle (wood 21), a crown of leaves (22)
+  pfn tree() : Strata.Template.Template do
+    Strata.Template.make(3, 6, 3, List.fold_left(List.range(0, 54), NativeArray.make_i32(54, 0), fn (a, i) ->
+      let x = i % 3
+      let y = (i / 3) % 6
+      let z = i / 18
+      if x == 1 && z == 1 && y < 4 do NativeArray.set_i32(a, i, 21) else if y >= 3 do NativeArray.set_i32(a, i, 22) else a end end), 0.4)
+  end
+  pfn made(seed : Int, base : Int, water : Float, settle : Float, veg : Float) : StrataMaps.Data.MapData do
+    let d0 = MapGrb.data_for(seed, 16, base, 0.2, water)
+    let k = StrataMaps.Settings.with_knob(StrataMaps.Settings.with_knob(d0.md_settings.ms_knobs, "settlement", settle), "vegetation", veg)
+    let d1 = { d0 with md_settings: { d0.md_settings with ms_knobs: k } }
+    let st = { Strata.Building.style(6, 2, 3, 6, 5) with bs_coverage: 0.6 }
+    MapGr.run(StrataMaps.BuildStage.run(StrataMaps.SettleStage.run(StrataMaps.WaterStage.run(StrataMaps.TerrainStage.run(d1))), [st]), [tree()])
+  end
+  pfn bases(d : StrataMaps.Data.MapData) : List((Int, Int)) do
+    List.filter_map(d.md_placed, fn p -> if p.mpl_kind != 1 do None else match p.mpl_origin do (x, _, z) -> Some((x + Strata.Trees.half(p.mpl_template), z + Strata.Trees.half(p.mpl_template))) end end)
+  end
+  pfn on_road(d : StrataMaps.Data.MapData, x : Int, z : Int) : Bool do Option.is_some(Strata.Roads.at(d.md_roads, (int_to_float(x) +. 0.5) *. 0.4, (int_to_float(z) +. 0.5) *. 0.4)) end
+  pfn in_lot(d : StrataMaps.Data.MapData, x : Int, z : Int) : Bool do
+    List.any(d.md_lots, fn l -> match Strata.Lots.lot_box(l) do (x0, z0, x1, z1) -> x >= x0 && x <= x1 && z >= z0 && z <= z1 end)
+  end
+  pfn near_water(d : StrataMaps.Data.MapData, x : Int, z : Int) : Bool do
+    List.any(List.range(0, 61), fn k -> StrataMaps.Data.water_at(d, x - 30 + k, z) >= 0 || StrataMaps.Data.water_at(d, x, z - 30 + k) >= 0)
+  end
+  pfn open_tile(d : StrataMaps.Data.MapData, tx : Int, tz : Int) : Bool do
+    List.all(List.range(0, 64), fn i -> match (tx + i % 8, tz + i / 8) do (x, z) -> StrataMaps.Data.water_at(d, x, z) < 0 && !on_road(d, x, z) && !in_lot(d, x, z) end)
+  end
+
+  describe "GreenStage" do
+    test "vegetation 0 places no trees" do
+      Test.assert_true(List.is_empty(bases(made(3, 0, 0.0, 0.3, 0.0))), "none")
+    end
+    test "no tree on a road, a lot or water" do
+      let d = made(4, 1, 0.4, 0.5, 0.8)
+      let bs = bases(d)
+      Test.assert_true(!List.is_empty(bs), "some trees")
+      Test.assert_true(List.all(bs, fn b -> match b do (x, z) -> !on_road(d, x, z) && !in_lot(d, x, z) && StrataMaps.Data.water_at(d, x, z) < 0 end), "clear")
+    end
+    test "vegetation 1 puts a tree on most tiles of open ground" do
+      let d = made(5, 0, 0.0, 0.0, 1.0)
+      match StrataMaps.Data.playable(d) do
+        (px, pz, n) ->
+          let bs = bases(d)
+          let tiles = List.filter(List.map(List.range(0, (n / 8) * (n / 8)), fn k -> (px + (k % (n / 8)) * 8, pz + (k / (n / 8)) * 8)), fn t -> match t do (tx, tz) -> open_tile(d, tx, tz) end)
+          let treed = List.filter(tiles, fn t -> match t do (tx, tz) -> List.any(bs, fn b -> match b do (x, z) -> x >= tx && x < tx + 8 && z >= tz && z < tz + 8 end) end)
+          Test.assert_true(List.length(treed) * 2 > List.length(tiles), "over half the open tiles")
+      end
+    end
+    test "trees are thicker by water" do
+      let d = made(6, 1, 0.5, 0.0, 0.3)
+      match StrataMaps.Data.playable(d) do
+        (px, pz, n) ->
+          let bs = bases(d)
+          let cols = List.map(List.range(0, (n / 4) * (n / 4)), fn k -> (px + (k % (n / 4)) * 4, pz + (k / (n / 4)) * 4))
+          let dry = List.filter(cols, fn c -> match c do (x, z) -> StrataMaps.Data.water_at(d, x, z) < 0 end)
+          let wet_side = List.length(List.filter(dry, fn c -> match c do (x, z) -> near_water(d, x, z) end))
+          let far_side = List.length(dry) - wet_side
+          let by = List.length(List.filter(bs, fn b -> match b do (x, z) -> near_water(d, x, z) end))
+          let far = List.length(bs) - by
+          -- trees per sampled column, near water against away from it
+          Test.assert_true(wet_side > 0 && far_side > 0 && by * far_side > far * wet_side, "denser by the river")
+      end
+    end
+  end
+end
