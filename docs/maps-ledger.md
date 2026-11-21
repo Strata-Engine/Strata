@@ -20,3 +20,4 @@
 - Task 13: settled disc, road patterns, bridges, lots. Rulings: buildable = a tile varying by 2 steps at most; Lots.blocks takes largest rectangles first (the greedy cover made strips); the settled area is a disc; stage order 11-14, 17 (lava), 15, 16; MapData carries all Part 2 fields.
 - Task 14: a hollow building on every lot, storeys pinned by density; footprints set to their mean height with no easing ring (neighbours keep their levels).
 - Task 17: lava pools in the lowest open ground, 3 clear of water/roads/lots, level surface, 3-wide scorch, report when short. The settled disc reaches the square's corners at settlement 1.
+- Task 15: set pieces by zone; Ruling: yard = a lot's ground outside its building; high ground = the highest fifth of open ground.
