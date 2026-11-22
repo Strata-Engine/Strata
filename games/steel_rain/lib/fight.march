@@ -277,11 +277,150 @@ mod SteelRain.Fight do
       (f1, ev1) -> List.fold_left(r.rd_near, (f1, Cons(ERound(id, r), ev1)), fn (acc, u) -> near_step(n.rn_near_delay, acc, u))
     end
   end
-  doc "The fight with a blast of [radius] at voxel (x, y, z) from [seed], what fell, the grid re-read where the world changed."
+  doc "The fight with a blast of [radius] at voxel (x, y, z) from [seed]: what fell, the grid re-read where the world changed, debris on the units it lands on, and every mech whose ground went falling."
   fn carve_at(f : Fight, x : Int, y : Int, z : Int, radius : Int, seed : Int) : (Fight, List(Event)) do
+    let olds = floors(f)
     match SteelRain.Ground.carve(f.fg_world, x, y, z, radius, seed, f.fg_map.md_blocks.mb_rubble) do
       (w, cs, fell) -> match FgG.refresh(f.fg_grid, w, cs) do
-        (g, _) -> ({ f with fg_world: w, fg_grid: g }, List.append([ECarved(cs)], if List.is_empty(fell) do Nil else [EFell(fell)] end))
+        (g, _) ->
+          let ev0 = List.append([ECarved(cs)], if List.is_empty(fell) do Nil else [EFell(fell)] end)
+          match debris({ f with fg_world: w, fg_grid: g }, fell) do
+            (f1, ev1) -> match List.fold_left(olds, (f1, Nil), fn (acc, o) -> footing_step(acc, o)) do
+              (f2, ev2) -> (f2, List.append(ev0, List.append(ev1, ev2)))
+            end
+          end
+      end
+    end
+  end
+
+  -- ── Footing, falls, debris, wrecks ───────────────────────────────────────
+  -- every mech that is in (not emplacements) and its tile's floor now
+  pfn floors(f : Fight) : List((Int, Int)) do
+    List.map(List.filter(f.fg_mechs, fn m -> m.mc_state == 0 && m.mc_kind == 0), fn m -> (m.mc_id, FgG.floor(f.fg_grid, m.mc_tile)))
+  end
+  pfn footing_step(acc : (Fight, List(Event)), o : (Int, Int)) : (Fight, List(Event)) do
+    match (acc, o) do ((fa, ea), (id, old)) -> adding(ea, footing(fa, id, old)) end
+  end
+  pfn height_of(f : Fight, m : Mech) : Int do (SteelRain.Rules.mover(f.fg_parts, m.mc_build)).mv_height end
+  pfn holds(f : Fight, m : Mech, t : (Int, Int)) : Bool do FgG.inside(f.fg_grid, t) && FgG.fits(f.fg_grid, t, height_of(f, m)) end
+  pfn held_by_other(f : Fight, id : Int, t : (Int, Int)) : Bool do List.any(f.fg_mechs, fn x -> x.mc_state == 0 && x.mc_id != id && x.mc_tile == t) end
+  pfn neighbours(t : (Int, Int)) : List((Int, Int)) do match t do (x, z) -> [(x + 1, z), (x - 1, z), (x, z + 1), (x, z - 1)] end end
+  -- the lowest of [ts] that holds mech [m] and passes [ok], the first of equals
+  pfn lowest(f : Fight, m : Mech, ts : List((Int, Int)), ok : (Int, Int) -> Bool) : Option((Int, Int)) do
+    List.fold_left(ts, None, fn (best, t) -> if holds(f, m, t) && ok(t) do lower(f, best, t) else best end)
+  end
+  pfn lower(f : Fight, best : Option((Int, Int)), t : (Int, Int)) : Option((Int, Int)) do
+    match best do Some(b) -> if FgG.floor(f.fg_grid, t) < FgG.floor(f.fg_grid, b) do Some(t) else best end | None -> Some(t) end
+  end
+  doc "Mech [id] after the world changed under it, its tile's floor having been [old]: still held, it stays (or drops with a floor that fell); no longer held, it slides to the lowest neighbouring tile that holds it, and onto a tile another unit holds it takes that tile's lowest free neighbour, both units bumped."
+  fn footing(f : Fight, id : Int, old : Int) : (Fight, List(Event)) do
+    match mech(f, id) do
+      None -> (f, Nil)
+      Some(m) ->
+        let t = m.mc_tile
+        if m.mc_state != 0 do (f, Nil)
+        else if holds(f, m, t) do (if FgG.floor(f.fg_grid, t) < old do fall(f, id, t, old) else (f, Nil) end)
+        else
+          match lowest(f, m, neighbours(t), fn _ -> true) do
+            None -> (f, Nil)
+            Some(land) ->
+              if !held_by_other(f, id, land) do fall(f, id, land, old)
+              else
+                match lowest(f, m, neighbours(land), fn u -> u != t && !held_by_other(f, id, u)) do
+                  None -> fall(f, id, land, old)
+                  Some(free) -> match bump(f, id, land) do (f1, ev1) -> adding(ev1, fall(f1, id, free, old)) end
+                end
+            end
+          end
+        end end
+    end
+  end
+  -- mech [id] and whoever holds tile [t] bumped
+  pfn bump(f : Fight, id : Int, t : (Int, Int)) : (Fight, List(Event)) do
+    let n = SteelRain.Rules.numbers()
+    let others = List.filter(f.fg_mechs, fn x -> x.mc_state == 0 && x.mc_id != id && x.mc_tile == t)
+    List.fold_left(others, damage(f, id, Nil, n.rn_bump), fn (acc, x) -> bump_step(n.rn_bump, acc, x))
+  end
+  pfn bump_step(amount : Int, acc : (Fight, List(Event)), x : Mech) : (Fight, List(Event)) do
+    match acc do (fa, ea) -> adding(ea, damage(fa, x.mc_id, Nil, amount)) end
+  end
+  doc "Mech [id] falls from floor [old] onto tile [t]: past the safe drop its movement piece is hurt by the steps fallen, its core too past the core height, and it loses CT by the steps."
+  fn fall(f : Fight, id : Int, t : (Int, Int), old : Int) : (Fight, List(Event)) do
+    let n = SteelRain.Rules.numbers()
+    let step = Math.max_int(1, f.fg_map.md_settings.ms_step)
+    let steps = Math.max_int(0, old - FgG.floor(f.fg_grid, t)) / step
+    let f0 = update(f, id, fn x -> { x with mc_tile: t })
+    let ev0 = [EMechFell(id, t, steps)]
+    if steps <= n.rn_fall_safe do (f0, ev0)
+    else
+      match mech(f0, id) do
+        None -> (f0, ev0)
+        Some(m) ->
+          let legs = movement_node(f0, m)
+          match (if steps > n.rn_fall_safe do damage(f0, id, legs, n.rn_fall_per_step * (steps - n.rn_fall_safe)) else (f0, Nil) end) do
+            (f1, ev1) -> match (if steps > n.rn_fall_core do damage(f1, id, Nil, n.rn_fall_per_step * (steps - n.rn_fall_core)) else (f1, Nil) end) do
+              (f2, ev2) -> match delay(f2, id, n.rn_fall_ct_per_step * steps) do
+                (f3, ev3) -> (f3, List.append(ev0, List.append(ev1, List.append(ev2, ev3))))
+              end
+            end
+          end
+      end
+    end
+  end
+  doc "The node of mech [m] that moves it (its part has a \"move\" tag), the core if none."
+  fn movement_node(f : Fight, m : Mech) : List(String) do
+    match List.find(StrataKit.Build.paths(m.mc_build), fn p -> StrataKit.Part.tag(part_at(f, m, p), "move") > 0.0) do Some(p) -> p | None -> Nil end
+  end
+  -- what fell landing on units' tiles: each unit's core takes damage by the voxels landing on its tile
+  pfn debris(f : Fight, fell : List((Int, Int, Int, Int))) : (Fight, List(Event)) do
+    let n = SteelRain.Rules.numbers()
+    let sc = Strata.World.scale(f.fg_world)
+    let landed = List.filter_map(fell, fn c -> match c do (x, _, z, id) -> if id == 0 do None else FgG.tile_of(f.fg_grid, (int_to_float(x) +. 0.5) *. sc, (int_to_float(z) +. 0.5) *. sc) end end)
+    let hits = List.filter_map(List.filter(f.fg_mechs, fn m -> m.mc_state == 0), fn m -> on_tile(m, landed, n.rn_debris_per_voxel))
+    List.fold_left(hits, (f, Nil), fn (acc, h) -> debris_step(acc, h))
+  end
+  pfn on_tile(m : Mech, landed : List((Int, Int)), per : Float) : Option((Int, Int)) do
+    let k = List.length(List.filter(landed, fn t -> t == m.mc_tile))
+    let dmg = float_to_int(Math.round(int_to_float(k) *. per))
+    if dmg > 0 do Some((m.mc_id, dmg)) else None end
+  end
+  pfn debris_step(acc : (Fight, List(Event)), h : (Int, Int)) : (Fight, List(Event)) do
+    match (acc, h) do ((fa, ea), (id, dmg)) -> adding(ea, damage(fa, id, Nil, dmg)) end
+  end
+  -- the bottom third of box [b] as world voxels (their centres inside it): what a wreck or a lost part leaves as rubble
+  pfn rubble_cells(b : StrataTactics.Shot.ShotBox, sc : Float) : List((Int, Int, Int)) do
+    match (b.bx_centre, b.bx_half) do
+      ((cx, cy, cz), (hx, hy, hz)) ->
+        let r = Math.sqrt(hx *. hx +. hz *. hz)
+        let x0 = float_to_int(Math.floor((cx -. r) /. sc))
+        let z0 = float_to_int(Math.floor((cz -. r) /. sc))
+        let y0 = float_to_int(Math.floor((cy -. hy) /. sc))
+        let n = float_to_int(Math.ceil(2.0 *. r /. sc)) + 1
+        let ny = Math.max_int(1, float_to_int(Math.ceil(2.0 *. hy /. 3.0 /. sc)))
+        List.filter(List.map(List.range(0, n * n * ny), fn i -> (x0 + i % n, y0 + i / (n * n), z0 + (i / n) % n)), fn v -> inside_box(b, v, sc))
+    end
+  end
+  pfn inside_box(b : StrataTactics.Shot.ShotBox, v : (Int, Int, Int), sc : Float) : Bool do
+    match (v, b.bx_centre, b.bx_half) do
+      ((x, y, z), (cx, cy, cz), (hx, hy, hz)) ->
+        let dx = (int_to_float(x) +. 0.5) *. sc -. cx
+        let dy = (int_to_float(y) +. 0.5) *. sc -. cy
+        let dz = (int_to_float(z) +. 0.5) *. sc -. cz
+        let c = Math.cos(b.bx_yaw)
+        let s = Math.sin(b.bx_yaw)
+        Math.abs(dx *. c +. dz *. s) <= hx && Math.abs(dy) <= hy && Math.abs(0.0 -. dx *. s +. dz *. c) <= hz
+    end
+  end
+  -- the boxes of nodes [paths] of mech [m] dropped as rubble (the grid re-read; no further falls)
+  pfn wreck(f : Fight, m : Mech, paths : List(List(String))) : (Fight, List(Event)) do
+    let sc = Strata.World.scale(f.fg_world)
+    let cells = List.flat_map(SteelRain.Hull.boxes(m.mc_hull, m.mc_id, pos(f, m), m.mc_yaw, paths), fn b -> rubble_cells(b, sc))
+    if List.is_empty(cells) do (f, Nil)
+    else
+      match SteelRain.Ground.drop(f.fg_world, cells, f.fg_map.md_blocks.mb_rubble) do
+        (w, set) ->
+          let cs = Strata.Edit.changes(Strata.Edit.set_many(f.fg_world, set))
+          match FgG.refresh(f.fg_grid, w, cs) do (g, _) -> ({ f with fg_world: w, fg_grid: g }, [EFell(set)]) end
       end
     end
   end
@@ -328,9 +467,15 @@ mod SteelRain.Fight do
   fn lose(f : Fight, u : Int, p : List(String)) : (Fight, List(Event)) do
     if List.is_empty(p) do out(f, u)
     else
-      (update(f, u, fn x -> without(x, p)), [EPartLost(u, p)])
+      match mech(f, u) do
+        Some(m0) ->
+          let gone = List.filter(StrataKit.Build.paths(m0.mc_build), fn q -> starts_with(q, p))
+          match wreck(update(f, u, fn x -> without(x, p)), m0, gone) do (f1, ev) -> (f1, Cons(EPartLost(u, p), ev)) end
+        None -> (f, Nil)
+      end
     end
   end
+  pfn starts_with(q : List(String), p : List(String)) : Bool do List.take(q, List.length(p)) == p end
   -- mech [x] without node [p] and what it carries
   pfn without(x : Mech, p : List(String)) : Mech do
     match StrataKit.Build.detach(x.mc_build, p) do
@@ -340,9 +485,14 @@ mod SteelRain.Fight do
   pfn kept(armour : List((List(String), Int)), keep : List(List(String))) : List((List(String), Int)) do
     List.filter(armour, fn a -> match a do (q, _) -> List.member(keep, q) end)
   end
-  doc "Unit [u] out of the fight: off the clock, its watch gone."
+  doc "Unit [u] out of the fight: off the clock, its watch gone, its wreck dropped as rubble."
   fn out(f : Fight, u : Int) : (Fight, List(Event)) do
-    let f1 = update(f, u, fn x -> { x with mc_state: 2 })
-    ({ f1 with fg_clock: FgC.remove(f1.fg_clock, u), fg_watches: List.filter(f1.fg_watches, fn a -> a.wa_owner != u) }, [EState(u, 2)])
+    match mech(f, u) do
+      None -> (f, Nil)
+      Some(m) ->
+        let f1 = update(f, u, fn x -> { x with mc_state: 2 })
+        let f2 = { f1 with fg_clock: FgC.remove(f1.fg_clock, u), fg_watches: List.filter(f1.fg_watches, fn a -> a.wa_owner != u) }
+        match wreck(f2, m, StrataKit.Build.paths(m.mc_build)) do (f3, ev) -> (f3, Cons(EState(u, 2), ev)) end
+    end
   end
 end
