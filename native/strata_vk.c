@@ -2603,12 +2603,31 @@ int64_t sv_typed(int64_t i) { return (i >= 0 && i < g.ntyped) ? g.typed[i] : 0; 
 int64_t sv_pad_connected(int64_t p) { return (p >= 0 && p < SV_MAX_PADS) ? g.pad[p].on : 0; }
 int64_t sv_pad_button(int64_t p, int64_t b) { return (p >= 0 && p < SV_MAX_PADS && b >= 0 && b < 15) ? g.pad[p].button[b] : 0; }
 double sv_pad_axis(int64_t p, int64_t a) { return (p >= 0 && p < SV_MAX_PADS && a >= 0 && a < 6) ? (double)g.pad[p].axis[a] : 0.0; }
-int64_t sv_key(int64_t k) { return (k >= 0 && k < SV_MAX_KEYS) ? g.keys[k] : 0; }
+/* Virtual input for Strata.Devtools' key, mouse, scroll and release commands: keys and
+ * buttons held here count as held alongside the real ones, a pointer position set here
+ * replaces the real one (its moves feed sv_mouse_dx/dy), and scroll lands on this frame's
+ * sv_scroll_y. A script can play an app in a window that never has focus. Devtools handles
+ * requests after the frame's sv_poll, so input set by one takes effect that frame. */
+static unsigned char sv_vkeys[SV_MAX_KEYS], sv_vbuttons[8];
+static int sv_vmouse;
+static double sv_vmx, sv_vmy;
+void sv_input_key(int64_t k, int64_t down) { if (k >= 0 && k < SV_MAX_KEYS) sv_vkeys[k] = down ? 1 : 0; }
+void sv_input_button(int64_t b, int64_t down) { if (b >= 0 && b < 8) sv_vbuttons[b] = down ? 1 : 0; }
+void sv_input_mouse(double x, double y) {
+    if (sv_vmouse) { g.mdx += x - sv_vmx; g.mdy += y - sv_vmy; }
+    sv_vmouse = 1; sv_vmx = x; sv_vmy = y;
+}
+void sv_input_scroll(double dy) { g.scroll_y += dy; }
+void sv_input_release(void) { memset(sv_vkeys, 0, sizeof sv_vkeys); memset(sv_vbuttons, 0, sizeof sv_vbuttons); sv_vmouse = 0; }
+int64_t sv_key(int64_t k) { return (k >= 0 && k < SV_MAX_KEYS) ? (g.keys[k] | sv_vkeys[k]) : 0; }
 /* Is mouse button b (0 left, 1 right, 2 middle) held? */
 int64_t sv_open(int64_t w, int64_t h, int64_t capture_mouse, int64_t quad_capacity) {
     return sv_open_slots(w, h, capture_mouse, quad_capacity, SV_DEFAULT_SLOTS);
 }
-int64_t sv_mouse_button(int64_t b) { return (g.win && b >= 0 && b <= 7 && glfwGetMouseButton(g.win, (int)b) == GLFW_PRESS) ? 1 : 0; }
+int64_t sv_mouse_button(int64_t b) {
+    if (b >= 0 && b <= 7 && sv_vbuttons[b]) return 1;
+    return (g.win && b >= 0 && b <= 7 && glfwGetMouseButton(g.win, (int)b) == GLFW_PRESS) ? 1 : 0;
+}
 /* Capture the cursor (hidden and locked, for looking) or free it (shown, for pointing at an interface). The
  * motion delta restarts so the switch is not read as a jump. */
 void sv_set_cursor(int64_t captured) {
@@ -2616,8 +2635,8 @@ void sv_set_cursor(int64_t captured) {
     glfwSetInputMode(g.win, GLFW_CURSOR, captured ? GLFW_CURSOR_DISABLED : GLFW_CURSOR_NORMAL);
     g.have_mouse = 0; g.mdx = 0; g.mdy = 0;
 }
-double sv_mouse_x(void) { if (g.win && g.have_mouse) return g.mx; double x = 0, y = 0; if (g.win) glfwGetCursorPos(g.win, &x, &y); return x; }
-double sv_mouse_y(void) { if (g.win && g.have_mouse) return g.my; double x = 0, y = 0; if (g.win) glfwGetCursorPos(g.win, &x, &y); return y; }
+double sv_mouse_x(void) { if (sv_vmouse) return sv_vmx; if (g.win && g.have_mouse) return g.mx; double x = 0, y = 0; if (g.win) glfwGetCursorPos(g.win, &x, &y); return x; }
+double sv_mouse_y(void) { if (sv_vmouse) return sv_vmy; if (g.win && g.have_mouse) return g.my; double x = 0, y = 0; if (g.win) glfwGetCursorPos(g.win, &x, &y); return y; }
 double sv_scroll_y(void) { return g.scroll_y; }
 double sv_mouse_dx(void) { return g.mdx; }
 double sv_mouse_dy(void) { return g.mdy; }
