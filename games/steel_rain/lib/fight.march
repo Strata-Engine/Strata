@@ -1,0 +1,145 @@
+-- SteelRain.Fight — one battle as a value, changed only by `step`.
+--
+-- A fight holds the map, its own world (no window: the screen keeps its own
+-- streamed copy in step from the events), the tactical grid, the mechs, the
+-- FFT clock, the watches, the mission, a seed and a shot counter. `step`
+-- takes one order for the mech whose turn it is and answers the new fight
+-- and what happened, in order, or why the order was refused (the fight is
+-- then unchanged). The same fight, orders and seed give the same result:
+-- every draw comes from Strata.Seed.mix(seed, shot counter).
+--
+-- A mech moves once and acts once a turn, in either order. Side 0 is the
+-- player, side 1 the enemy. Mechs face along yaw (0 is +x, a quarter turn
+-- +z).
+mod SteelRain.Fight do
+
+  alias StrataTactics.Clock as FgC
+  alias StrataTactics.Grid as FgG
+
+  -- a mech: id, side, kind (0 mech, 1 emplacement), build, hull, armour per node still on it, tile, facing, heat,
+  -- state (0 in, 1 withdrawn, 2 out), this turn's move and act, hit since its last turn, braced
+  type Mech = { mc_id : Int, mc_side : Int, mc_kind : Int, mc_build : StrataKit.Build.KitBuild, mc_hull : SteelRain.Hull.Hull, mc_armour : List((List(String), Int)),
+                mc_tile : (Int, Int), mc_yaw : Float, mc_heat : Int, mc_state : Int, mc_moved : Bool, mc_acted : Bool, mc_hit_this_round : Bool, mc_braced : Bool }
+  -- the mission (Task 9 adds Destroy)
+  type Mission = MNone
+  -- how a fight ended: won, and each mech's id, state and build at the end
+  type Result_ = { rs_won : Bool, rs_mechs : List((Int, Int, StrataKit.Build.KitBuild)) }
+  -- the fight
+  type Fight = { fg_map : StrataMaps.Data.MapData, fg_world : Strata.World.World, fg_grid : StrataTactics.Grid.TileGrid, fg_parts : List(StrataKit.Part.KitPart), fg_mechs : List(Mech),
+                 fg_clock : StrataTactics.Clock.TurnClock, fg_watches : List(StrataTactics.Watch.Arc), fg_mission : Mission, fg_seed : Int, fg_shots : Int, fg_result : Option(Result_) }
+  -- an order: move along a path; fire a volley (weapon node, aim in metres); brace; watch (weapon node, direction); withdraw; end the turn facing yaw
+  type Order = OMove(List((Int, Int))) | OFire(List((List(String), (Float, Float, Float)))) | OBrace | OWatch(List(String), Float) | OWithdraw | OEnd(Float)
+  -- what happened
+  type Event = EMoved(Int, (Int, Int)) | ERound(Int, StrataTactics.Shot.ShotRound) | ECarved(List(Strata.Edit.Change)) | EFell(List((Int, Int, Int, Int))) | EPartHit(Int, List(String), Int)
+             | EPartLost(Int, List(String)) | EDelayed(Int, Int) | EHeat(Int, Int) | EOverheated(Int) | EMechFell(Int, (Int, Int), Int) | EWatchSet(Int) | EWatchFired(Int, Int)
+             | EState(Int, Int) | ETurn(Int) | EEnded(Result_)
+
+  -- ── Setup ────────────────────────────────────────────────────────────────
+  pfn site_tiles(d : StrataMaps.Data.MapData, name : String) : List((Int, Int)) do
+    match List.find(d.md_sites, fn s -> s.st_name == name) do Some(s) -> s.st_tiles | None -> Nil end
+  end
+  pfn centre_of(ts : List((Int, Int))) : (Float, Float) do
+    let n = int_to_float(Math.max_int(1, List.length(ts)))
+    List.fold_left(ts, (0.0, 0.0), fn (acc, t) -> match (acc, t) do ((ax, az), (x, z)) -> (ax +. int_to_float(x) /. n, az +. int_to_float(z) /. n) end)
+  end
+  pfn yaw_to(from : (Int, Int), to : (Float, Float)) : Float do
+    match (from, to) do ((fx, fz), (tx, tz)) -> Math.atan2(tz -. int_to_float(fz), tx -. int_to_float(fx)) end
+  end
+  doc "A mech of [side] and [kind] built as [b] from [parts], on tile [t] facing [yaw]."
+  fn new_mech(parts : List(StrataKit.Part.KitPart), id : Int, side : Int, kind : Int, b : StrataKit.Build.KitBuild, hull : SteelRain.Hull.Hull, t : (Int, Int), yaw : Float) : Mech do
+    { mc_id: id, mc_side: side, mc_kind: kind, mc_build: b, mc_hull: hull, mc_armour: armour_of(parts, b), mc_tile: t, mc_yaw: yaw, mc_heat: 0, mc_state: 0,
+      mc_moved: false, mc_acted: false, mc_hit_this_round: false, mc_braced: false }
+  end
+  pfn armour_of(parts : List(StrataKit.Part.KitPart), b : StrataKit.Build.KitBuild) : List((List(String), Int)) do
+    List.map(StrataKit.Build.paths(b), fn p -> (p, match StrataKit.Build.at(b, p) do
+      Some(n) -> match List.nth_opt(parts, StrataKit.Build.part_of(n)) do Some(pt) -> float_to_int(StrataKit.Part.tag(pt, "armour")) | None -> 0 end
+      None -> 0
+    end))
+  end
+  doc "The hull of build [b] (assembled with the Warden's settings and fitting rule)."
+  fn hull_of(parts : List(StrataKit.Part.KitPart), b : StrataKit.Build.KitBuild) : SteelRain.Hull.Hull do
+    match StrataKit.Assemble.assemble(parts, b, SteelRain.Mech.fits, SteelRain.Mech.settings()) do (rig, m, _) -> SteelRain.Hull.of(rig, m, SteelRain.Mech.stand()) end
+  end
+  pfn side_mechs(parts : List(StrataKit.Part.KitPart), first : Int, side : Int, bs : List(StrataKit.Build.KitBuild), tiles : List((Int, Int)), face : (Float, Float)) : List(Mech) do
+    List.filter_map(List.enumerate(bs), fn e -> match e do
+      (i, b) -> match List.nth_opt(tiles, i) do
+        Some(t) -> Some(new_mech(parts, first + i, side, 0, b, hull_of(parts, b), t, yaw_to(t, face)))
+        None -> None
+      end
+    end)
+  end
+
+  doc "A fight on map [d] in world [w] (built from it): side 0's builds [side0] on the \"spawn north\" site's tiles, side 1's [side1] on \"spawn south\"'s, facing each other, ids from 1; every mech on the clock at its speed; the clock run to the first turn."
+  fn start(d : StrataMaps.Data.MapData, w : Strata.World.World, parts : List(StrataKit.Part.KitPart), side0 : List(StrataKit.Build.KitBuild), side1 : List(StrataKit.Build.KitBuild), seed : Int) : Fight do
+    let north = site_tiles(d, "spawn north")
+    let south = site_tiles(d, "spawn south")
+    let ms = List.append(side_mechs(parts, 1, 0, side0, north, centre_of(south)), side_mechs(parts, 1 + List.length(side0), 1, side1, south, centre_of(north)))
+    from_mechs(d, w, parts, ms, seed)
+  end
+  doc "A fight on map [d] in world [w] with the mechs [ms] as they are, every one that is in put on the clock at its speed; the clock run to the first turn."
+  fn from_mechs(d : StrataMaps.Data.MapData, w : Strata.World.World, parts : List(StrataKit.Part.KitPart), ms : List(Mech), seed : Int) : Fight do
+    let clock = List.fold_left(ms, FgC.start(FgC.settings()), fn (c, m) -> if m.mc_state == 0 do FgC.add(c, m.mc_id, speed_of(parts, m), 0) else c end)
+    let f = { fg_map: d, fg_world: w, fg_grid: StrataMaps.grid(d, w), fg_parts: parts, fg_mechs: ms, fg_clock: clock, fg_watches: Nil, fg_mission: MNone, fg_seed: seed, fg_shots: 0, fg_result: None }
+    match next_turn(f, Nil) do (f2, _) -> f2 end
+  end
+  doc "Mech [m]'s speed on the clock (emplacements: the rules' emplacement speed)."
+  fn speed_of(parts : List(StrataKit.Part.KitPart), m : Mech) : Int do
+    if m.mc_kind == 1 do (SteelRain.Rules.numbers()).rn_emplacement_speed else SteelRain.Rules.speed(parts, m.mc_build) end
+  end
+
+  -- ── Reading ──────────────────────────────────────────────────────────────
+  doc "The mech whose turn it is."
+  fn active(f : Fight) : Option(Int) do FgC.active(f.fg_clock) end
+  doc "Mech [id]."
+  fn mech(f : Fight, id : Int) : Option(Mech) do List.find(f.fg_mechs, fn m -> m.mc_id == id) end
+  doc "The fight with mech [id] replaced by what [g] makes of it."
+  fn update(f : Fight, id : Int, g : Mech -> Mech) : Fight do { f with fg_mechs: List.map(f.fg_mechs, fn m -> if m.mc_id == id do g(m) else m end) } end
+
+  -- ── Turns ────────────────────────────────────────────────────────────────
+  -- the clock run until a turn starts (ETurn appended); a fight with nobody on the clock stays as it is
+  pfn next_turn(f : Fight, evs : List(Event)) : (Fight, List(Event)) do next_go(f, evs, 64) end
+  pfn next_go(f : Fight, evs : List(Event), left : Int) : (Fight, List(Event)) do
+    match FgC.active(f.fg_clock) do
+      Some(id) -> (update(f, id, fn m -> { m with mc_moved: false, mc_acted: false, mc_braced: false }), List.append(evs, [ETurn(id)]))
+      None ->
+        if left <= 0 do (f, evs)
+        else
+          match FgC.advance(f.fg_clock) do
+            (c2, ces) -> if List.is_empty(ces) && Option.is_none(FgC.active(c2)) do ({ f with fg_clock: c2 }, evs) else next_go({ f with fg_clock: c2 }, evs, left - 1) end
+          end
+        end
+    end
+  end
+
+  -- the order's checks that do not depend on what it is: a fight still running, a mech to act
+  pfn ready(f : Fight) : Result(Mech, String) do
+    match f.fg_result do
+      Some(_) -> Err("the fight is over")
+      None -> match active(f) do
+        None -> Err("no mech has its turn")
+        Some(id) -> match mech(f, id) do Some(m) -> Ok(m) | None -> Err("the active unit is not in the fight") end
+      end
+    end
+  end
+
+  doc "Apply order [o] for the mech whose turn it is: the new fight and what happened, in order; or why the order was refused (the fight is then unchanged)."
+  fn step(f : Fight, o : Order) : Result((Fight, List(Event)), String) do
+    match ready(f) do
+      Err(e) -> Err(e)
+      Ok(m) -> match o do
+        OEnd(yaw) -> Ok(end_turn(f, m, yaw))
+        OBrace -> if m.mc_acted do Err("it has already acted this turn") else Ok((update(f, m.mc_id, fn x -> { x with mc_acted: true, mc_braced: true }), Nil)) end
+        _ -> Err("not yet")
+      end
+    end
+  end
+
+  -- the end of mech [m]'s turn: its facing, heat shed, the clock charged, the next turn
+  pfn end_turn(f : Fight, m : Mech, yaw : Float) : (Fight, List(Event)) do
+    let shed = if m.mc_kind == 1 do 0 else SteelRain.Rules.shed(f.fg_parts, m.mc_build) end
+    let heat = Math.max_int(0, m.mc_heat - shed)
+    let f1 = update(f, m.mc_id, fn x -> { x with mc_yaw: yaw, mc_heat: heat, mc_hit_this_round: false })
+    let f2 = { f1 with fg_clock: FgC.end_turn(f1.fg_clock, m.mc_moved, m.mc_acted) }
+    next_turn(f2, if heat != m.mc_heat do [EHeat(m.mc_id, heat)] else Nil end)
+  end
+end
