@@ -1,0 +1,135 @@
+-- SteelRain.Hull — a mech's parts as boxes, without the animator.
+--
+-- The fight never poses figures: it hits boxes. A hull is worked out once
+-- per build from its rig at rest (Strata.Rig: a part's point v sits at its
+-- parent's transform of its pivot plus its turned (v - anchor); the root's
+-- pivot is in the figure's space). Each build node's box is the union of
+-- its rig parts' grids, in metres, in the mech's frame: origin on the floor
+-- under the figure's origin, facing +x (the figure faces +z, so figure
+-- (x, z) is mech (z, -x)), raised by the stand height and cut off at the floor.
+-- Muzzles are the "muzzle" effect markers' sockets, placed the same way.
+mod SteelRain.Hull do
+
+  alias Strata.Math.Quat as HlQ
+  alias Strata.Math.Vec3 as HlV
+
+  -- per node: path, box centre and half extents (metres, the mech's frame); muzzles by node; the standing height
+  type Hull = { hl_parts : List((List(String), (Float, Float, Float), (Float, Float, Float))), hl_muzzles : List((List(String), (Float, Float, Float))), hl_height : Float }
+
+  pfn quat(q : (Float, Float, Float, Float)) : Strata.Math.Quat.Quat do match q do (x, y, z, w) -> Quat(x, y, z, w) end end
+  pfn turn(q : Strata.Math.Quat.Quat, v : (Float, Float, Float)) : (Float, Float, Float) do
+    match v do (x, y, z) -> let r = HlQ.rotate(q, HlV.new(x, y, z))
+      (HlV.x(r), HlV.y(r), HlV.z(r)) end
+  end
+  pfn add(a : (Float, Float, Float), b : (Float, Float, Float)) : (Float, Float, Float) do match (a, b) do ((ax, ay, az), (bx, by, bz)) -> (ax +. bx, ay +. by, az +. bz) end end
+  pfn sub(a : (Float, Float, Float), b : (Float, Float, Float)) : (Float, Float, Float) do match (a, b) do ((ax, ay, az), (bx, by, bz)) -> (ax -. bx, ay -. by, az -. bz) end end
+
+  -- part p's rest frame in the figure's voxels: (origin of its anchor, turn); a point v of its grid sits at origin + turn(v - anchor)
+  pfn frame(r : Strata.Rig.Rig, parents : List(Int), rests : List((Float, Float, Float, Float)), p : Int) : ((Float, Float, Float), Strata.Math.Quat.Quat) do
+    let par = List.nth(parents, p)
+    let rq = quat(List.nth(rests, p))
+    if par < 0 do (Strata.Rig.pivot_at(r, p), rq)
+    else
+      match frame(r, parents, rests, par) do
+        (po, pq) -> (place(r, par, po, pq, Strata.Rig.pivot_at(r, p)), HlQ.mul(pq, rq))
+      end
+    end
+  end
+  -- a point of part p's grid (its voxels) in the figure's voxels, given p's frame
+  pfn place(r : Strata.Rig.Rig, p : Int, o : (Float, Float, Float), q : Strata.Math.Quat.Quat, v : (Float, Float, Float)) : (Float, Float, Float) do
+    add(o, turn(q, sub(v, Strata.Rig.anchor_at(r, p))))
+  end
+
+  -- figure voxels to the mech's frame in metres: figure +z is forward (+x), figure +x is the mech's -z; raised by [stand]
+  pfn to_mech(v : (Float, Float, Float), vox : Float, stand : Float) : (Float, Float, Float) do
+    match v do (x, y, z) -> (z *. vox, y *. vox +. stand, 0.0 -. x *. vox) end
+  end
+
+  -- the corners of part p's grid in the mech's frame
+  pfn corners(r : Strata.Rig.Rig, parents : List(Int), rests : List((Float, Float, Float, Float)), p : Int, stand : Float) : List((Float, Float, Float)) do
+    match (Strata.Rig.size(r, p), frame(r, parents, rests, p)) do
+      ((sx, sy, sz), (o, q)) ->
+        if sx == 0 || sy == 0 || sz == 0 do Nil
+        else
+          List.map(List.range(0, 8), fn i -> to_mech(place(r, p, o, q, (if i % 2 == 0 do 0.0 else int_to_float(sx) end, if (i / 2) % 2 == 0 do 0.0 else int_to_float(sy) end, if i / 4 == 0 do 0.0 else int_to_float(sz) end)), Strata.Rig.voxel_size(r), stand))
+        end
+    end
+  end
+  -- the box (centre, half extents) round points, or None for none
+  pfn bound(ps : List((Float, Float, Float))) : Option(((Float, Float, Float), (Float, Float, Float))) do
+    match ps do
+      Nil -> None
+      Cons(p0, _) ->
+        match List.fold_left(ps, (p0, p0), fn (acc, p) -> grow(acc, p)) do
+          ((x0, y0, z0), (x1, y1, z1)) -> Some((((x0 +. x1) /. 2.0, (y0 +. y1) /. 2.0, (z0 +. z1) /. 2.0), ((x1 -. x0) /. 2.0, (y1 -. y0) /. 2.0, (z1 -. z0) /. 2.0)))
+        end
+    end
+  end
+  pfn grow(acc : ((Float, Float, Float), (Float, Float, Float)), p : (Float, Float, Float)) : ((Float, Float, Float), (Float, Float, Float)) do
+    match (acc, p) do
+      (((x0, y0, z0), (x1, y1, z1)), (x, y, z)) -> ((Math.min_float(x0, x), Math.min_float(y0, y), Math.min_float(z0, z)), (Math.max_float(x1, x), Math.max_float(y1, y), Math.max_float(z1, z)))
+    end
+  end
+
+  pfn distinct_paths(es : List((Int, List(String), String))) : List(List(String)) do
+    List.reverse(List.fold_left(es, Nil, fn (acc, e) -> match e do (_, p, _) -> if List.member(acc, p) do acc else Cons(p, acc) end end))
+  end
+
+  doc "The hull of an assembled mech: rig [r] and its kit map [m] (StrataKit.Assemble.assemble), standing [stand] metres (the root's height over the floor)."
+  fn of(r : Strata.Rig.Rig, m : StrataKit.Assemble.KitMap, stand : Float) : Hull do
+    let parents = NativeArray.to_list_i32(Strata.Rig.parents(r))
+    let rests = Strata.Rig.rests(r)
+    let es = StrataKit.Assemble.entries(m)
+    let parts = List.map(List.filter_map(distinct_paths(es), fn path -> node_box(r, parents, rests, es, path, stand)), on_floor)
+    let socks = Strata.Rig.sockets(r)
+    let muzzles = List.filter_map(StrataKit.Assemble.markers(m, "muzzle"), fn e -> muzzle_at(r, parents, rests, socks, e, stand))
+    let top = List.fold_left(parts, 0.0, fn (t, p) -> match p do (_, (_, cy, _), (_, hy, _)) -> Math.max_float(t, cy +. hy) end)
+    { hl_parts: parts, hl_muzzles: muzzles, hl_height: top }
+  end
+  pfn node_box(r : Strata.Rig.Rig, parents : List(Int), rests : List((Float, Float, Float, Float)), es : List((Int, List(String), String)), path : List(String), stand : Float) : Option((List(String), (Float, Float, Float), (Float, Float, Float))) do
+    let ps = List.flat_map(List.filter(es, fn e -> match e do (_, p, _) -> p == path end), fn e -> match e do (rp, _, _) -> corners(r, parents, rests, rp, stand) end)
+    match bound(ps) do Some((c, h)) -> Some((path, c, h)) | None -> None end
+  end
+  -- a box cut off at the floor: the rig rests with straight legs, the mech stands with its knees bent, so its feet would sink
+  pfn on_floor(p : (List(String), (Float, Float, Float), (Float, Float, Float))) : (List(String), (Float, Float, Float), (Float, Float, Float)) do
+    match p do
+      (path, (cx, cy, cz), (hx, hy, hz)) ->
+        if cy -. hy >= 0.0 do p
+        else let top = cy +. hy
+          (path, (cx, top /. 2.0, cz), (hx, Math.max_float(0.0, top /. 2.0), hz)) end
+    end
+  end
+  pfn muzzle_at(r : Strata.Rig.Rig, parents : List(Int), rests : List((Float, Float, Float, Float)), socks : List((Int, Float, Float, Float, (Float, Float, Float, Float))), e : (List(String), Int), stand : Float) : Option((List(String), (Float, Float, Float))) do
+    match e do
+      (path, si) -> match List.nth_opt(socks, si) do
+        Some((p, x, y, z, _)) -> match frame(r, parents, rests, p) do (o, q) -> Some((path, to_mech(place(r, p, o, q, (x, y, z)), Strata.Rig.voxel_size(r), stand))) end
+        None -> None
+      end
+    end
+  end
+
+  -- a point of the mech's frame placed at [at] turned by [yaw] (0 faces +x, a quarter +z)
+  pfn put(v : (Float, Float, Float), at : (Float, Float, Float), yaw : Float) : (Float, Float, Float) do
+    match v do (x, y, z) -> let c = Math.cos(yaw)
+      let s = Math.sin(yaw)
+      add(at, (x *. c -. z *. s, y, x *. s +. z *. c)) end
+  end
+
+  doc "The boxes of the nodes [paths] still on the mech, for unit [unit] standing at [at] (metres, on its floor) facing [yaw]; a box's part is its node's index in the hull."
+  fn boxes(h : Hull, unit : Int, at : (Float, Float, Float), yaw : Float, paths : List(List(String))) : List(StrataTactics.Shot.ShotBox) do
+    List.filter_map(List.enumerate(h.hl_parts), fn e -> match e do
+      (i, (path, c, hf)) -> if List.member(paths, path) do Some({ bx_unit: unit, bx_part: i, bx_centre: put(c, at, yaw), bx_half: hf, bx_yaw: yaw }) else None end
+    end)
+  end
+
+  doc "Where node [path]'s weapon fires from, for a mech at [at] facing [yaw]: its muzzle marker, or its box's centre if it has none."
+  fn muzzle(h : Hull, path : List(String), at : (Float, Float, Float), yaw : Float) : (Float, Float, Float) do
+    match List.find(h.hl_muzzles, fn mz -> match mz do (p, _) -> p == path end) do
+      Some((_, v)) -> put(v, at, yaw)
+      None -> match List.find(h.hl_parts, fn p -> match p do (q, _, _) -> q == path end) do
+        Some((_, c, _)) -> put(c, at, yaw)
+        None -> put((0.0, h.hl_height /. 2.0, 0.0), at, yaw)
+      end
+    end
+  end
+end
