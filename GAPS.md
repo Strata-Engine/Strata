@@ -145,6 +145,10 @@ module in the program (which changes the order modules are compiled in)
 the code generator laid `Strata.Blocks.Box` out with the test's integer
 fields, and clang rejected the LLVM ("floating point constant invalid for
 type" in `Strata.Query.lim_cells`). Renamed to `LakeBox`.
+Met again in `StrataTactics.Shot` (2026-11-22): its `type Box` and a
+constructor `Struck` (Strata.Query.Hit's) gave a type mismatch inside
+`strata/query.march` when the tactics tests compiled. Renamed to
+`ShotBox`, `ShotSpec`, `Strike`, `ShotRound`.
 
 ## S19: a record field typed by a short type name another module also defines breaks a consumer
 

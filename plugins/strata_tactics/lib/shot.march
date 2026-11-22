@@ -1,0 +1,142 @@
+-- Shot — rounds traced through the voxel world and units' boxes, inside a cone.
+--
+-- A shot leaves a muzzle aimed at a point. Each round takes a direction
+-- inside the cone round the aim (its half-angle, radians, is the caller's:
+-- widened already for range, movement and the like), drawn from the seed, so
+-- the same seed gives the same rounds. A round is traced to whichever it
+-- meets first: a voxel that collides (Strata.Query.raycast) or a unit's box
+-- (a box turned about +y by its yaw: yaw 0 leaves its x along +x, a quarter
+-- turn lays it along +z). Rounds passing within the near distance of a
+-- unit's box without striking it are near misses on that unit. Boxes belong
+-- to any side: a round strikes whatever is in its way. Metres throughout.
+mod StrataTactics.Shot do
+
+  -- a unit's part as a box: unit, part, centre, half extents, yaw
+  type ShotBox = { bx_unit : Int, bx_part : Int, bx_centre : (Float, Float, Float), bx_half : (Float, Float, Float), bx_yaw : Float }
+  -- a shot: muzzle, aim, rounds, the cone's half-angle, the farthest a round goes, the near-miss distance
+  type ShotSpec = { sp_from : (Float, Float, Float), sp_at : (Float, Float, Float), sp_rounds : Int, sp_spread : Float, sp_max : Float, sp_near : Float }
+  -- what a round struck: a voxel; a unit's part and the point; nothing
+  type Strike = SVoxel(Int, Int, Int) | SBox(Int, Int, (Float, Float, Float)) | SNone
+  -- a round: its direction, where it ended, what it struck, the units it passed near
+  type ShotRound = { rd_dir : (Float, Float, Float), rd_end : (Float, Float, Float), rd_struck : Strike, rd_near : List(Int) }
+
+  pfn absf(v : Float) : Float do if v < 0.0 do 0.0 -. v else v end end
+  pfn norm(v : (Float, Float, Float)) : (Float, Float, Float) do
+    match v do (x, y, z) -> let l = Math.sqrt(x *. x +. y *. y +. z *. z)
+      if l < 0.000000001 do (1.0, 0.0, 0.0) else (x /. l, y /. l, z /. l) end end
+  end
+  pfn cross(a : (Float, Float, Float), b : (Float, Float, Float)) : (Float, Float, Float) do
+    match (a, b) do ((ax, ay, az), (bx, by, bz)) -> (ay *. bz -. az *. by, az *. bx -. ax *. bz, ax *. by -. ay *. bx) end
+  end
+  pfn add(a : (Float, Float, Float), b : (Float, Float, Float)) : (Float, Float, Float) do match (a, b) do ((ax, ay, az), (bx, by, bz)) -> (ax +. bx, ay +. by, az +. bz) end end
+  pfn scale(a : (Float, Float, Float), k : Float) : (Float, Float, Float) do match a do (x, y, z) -> (x *. k, y *. k, z *. k) end end
+  pfn sub(a : (Float, Float, Float), b : (Float, Float, Float)) : (Float, Float, Float) do match (a, b) do ((ax, ay, az), (bx, by, bz)) -> (ax -. bx, ay -. by, az -. bz) end end
+
+  -- the direction off aim [a] at angle [theta] from it, turned [phi] round it
+  pfn off_aim(a : (Float, Float, Float), theta : Float, phi : Float) : (Float, Float, Float) do
+    match a do
+      (_, ay, _) ->
+        let up = if absf(ay) > 0.99 do (1.0, 0.0, 0.0) else (0.0, 1.0, 0.0) end
+        let u = norm(cross(a, up))
+        let v = cross(u, a)
+        norm(add(scale(a, Math.cos(theta)), scale(add(scale(u, Math.cos(phi)), scale(v, Math.sin(phi))), Math.sin(theta))))
+    end
+  end
+
+  -- the slab test of a ray (origin o, unit direction d, both in the box's frame) against half extents h: the entry distance, or -1
+  pfn slab(o : Float, d : Float, h : Float, lo : Float, hi : Float) : (Float, Float) do
+    if absf(d) < 0.000000001 do (if o < 0.0 -. h || o > h do (1.0, 0.0) else (lo, hi) end)
+    else
+      let t1 = (0.0 -. h -. o) /. d
+      let t2 = (h -. o) /. d
+      let a = if t1 < t2 do t1 else t2 end
+      let b = if t1 < t2 do t2 else t1 end
+      (if a > lo do a else lo end, if b < hi do b else hi end)
+    end
+  end
+  -- where a ray from [o] along unit [d] enters box [b] grown by [grow], within [max]: the distance, or -1
+  pfn enter(b : ShotBox, o : (Float, Float, Float), d : (Float, Float, Float), grow : Float, max : Float) : Float do
+    match (sub(o, b.bx_centre), d, b.bx_half) do
+      ((wx, wy, wz), (dx, dy, dz), (hx, hy, hz)) ->
+        let c = Math.cos(b.bx_yaw)
+        let s = Math.sin(b.bx_yaw)
+        -- into the box's frame: undo the yaw (local x = world x cos + world z sin)
+        let lx = wx *. c +. wz *. s
+        let lz = 0.0 -. wx *. s +. wz *. c
+        let ex = dx *. c +. dz *. s
+        let ez = 0.0 -. dx *. s +. dz *. c
+        match slab(lx, ex, hx +. grow, 0.0, max) do
+          (a1, b1) -> match slab(wy, dy, hy +. grow, a1, b1) do
+            (a2, b2) -> match slab(lz, ez, hz +. grow, a2, b2) do
+              (a3, b3) -> if a3 <= b3 do a3 else -1.0 end
+            end
+          end
+        end
+    end
+  end
+
+  -- the nearest box a ray enters within [max]: (distance, box), distance -1 for none
+  pfn nearest(bs : List(ShotBox), o : (Float, Float, Float), d : (Float, Float, Float), max : Float) : (Float, Option(ShotBox)) do
+    List.fold_left(bs, (-1.0, None), fn (acc, b) -> nearer(acc, enter(b, o, d, 0.0, max), b))
+  end
+  pfn nearer(acc : (Float, Option(ShotBox)), t : Float, b : ShotBox) : (Float, Option(ShotBox)) do
+    match acc do (bt, _) -> if t >= 0.0 && (bt < 0.0 || t < bt) do (t, Some(b)) else acc end end
+  end
+
+  -- one round along unit direction [d]
+  pfn trace(w : Strata.World.World, bs : List(ShotBox), s : ShotSpec, d : (Float, Float, Float)) : ShotRound do
+    let reg = Strata.World.registry(w)
+    match (s.sp_from, d) do
+      ((ox, oy, oz), (dx, dy, dz)) ->
+        let h = Strata.Query.raycast(w, ox, oy, oz, dx, dy, dz, s.sp_max, fn id -> Strata.Blocks.collides(reg, id))
+        let tv = if Strata.Query.is_hit(h) do Strata.Query.hit_dist(h) else -1.0 end
+        match nearest(bs, s.sp_from, d, s.sp_max) do
+          (tb, ob) ->
+            let box_first = tb >= 0.0 && (tv < 0.0 || tb < tv)
+            let t_end = if box_first do tb else if tv >= 0.0 do tv else s.sp_max end end
+            let at = add(s.sp_from, scale(d, t_end))
+            let struck = if box_first do (match ob do Some(b) -> SBox(b.bx_unit, b.bx_part, at) | None -> SNone end)
+              else if tv >= 0.0 do SVoxel(Strata.Query.hit_x(h), Strata.Query.hit_y(h), Strata.Query.hit_z(h)) else SNone end end
+            let hit_unit = match struck do SBox(u, _, _) -> u | _ -> -1 end
+            { rd_dir: d, rd_end: at, rd_struck: struck, rd_near: near_units(bs, s, d, t_end, hit_unit) }
+        end
+    end
+  end
+  -- the units whose boxes, grown by the near distance, the round passes within [t_end], other than [hit_unit]; each once, in box order
+  pfn near_units(bs : List(ShotBox), s : ShotSpec, d : (Float, Float, Float), t_end : Float, hit_unit : Int) : List(Int) do
+    if s.sp_near <= 0.0 do Nil
+    else
+      List.reverse(List.fold_left(bs, Nil, fn (acc, b) -> if b.bx_unit != hit_unit && !List.member(acc, b.bx_unit) && enter(b, s.sp_from, d, s.sp_near, t_end) >= 0.0 do Cons(b.bx_unit, acc) else acc end))
+    end
+  end
+
+  doc "The rounds of shot [s] through world [w] and boxes [bs], their directions drawn from [seed]: round k is off the aim by spread times the square root of one draw, turned round it by a full turn times another (Strata.Seed.mix(seed, 2k) and 2k + 1). A round that leaves the loaded world, or goes the shot's whole length, struck nothing."
+  fn fire(w : Strata.World.World, bs : List(ShotBox), s : ShotSpec, seed : Int) : List(ShotRound) do
+    let a = norm(sub(s.sp_at, s.sp_from))
+    List.map(List.range(0, Math.max_int(0, s.sp_rounds)), fn k ->
+      let u1 = Strata.Seed.unit(Strata.Seed.mix(seed, 2 * k))
+      let u2 = Strata.Seed.unit(Strata.Seed.mix(seed, 2 * k + 1))
+      trace(w, bs, s, off_aim(a, s.sp_spread *. Math.sqrt(u2), 2.0 *. Math.pi() *. u1)))
+  end
+
+  doc "What shot [s] would strike, without chance: the aim and three rings of eight directions at a third, two thirds and all of the spread (25 rays), grouped by what they strike, each with its share of the 25 (a voxel struck by several rays is one entry)."
+  fn preview(w : Strata.World.World, bs : List(ShotBox), s : ShotSpec) : List((Strike, Float)) do
+    let a = norm(sub(s.sp_at, s.sp_from))
+    let dirs = Cons(a, List.map(List.range(0, 24), fn i -> off_aim(a, s.sp_spread *. int_to_float(i / 8 + 1) /. 3.0, 2.0 *. Math.pi() *. int_to_float(i % 8) /. 8.0)))
+    let hits = List.map(dirs, fn d -> (trace(w, bs, s, d)).rd_struck)
+    List.reverse(List.fold_left(hits, Nil, fn (acc, h) -> tally(acc, h)))
+  end
+  pfn same(a : Strike, b : Strike) : Bool do
+    match (a, b) do
+      (SVoxel(x1, y1, z1), SVoxel(x2, y2, z2)) -> x1 == x2 && y1 == y2 && z1 == z2
+      (SBox(u1, p1, _), SBox(u2, p2, _)) -> u1 == u2 && p1 == p2
+      (SNone, SNone) -> true
+      _ -> false
+    end
+  end
+  pfn tally(acc : List((Strike, Float)), h : Strike) : List((Strike, Float)) do
+    if List.any(acc, fn e -> match e do (k, _) -> same(k, h) end) do List.map(acc, fn e -> bump(e, h))
+    else Cons((h, 0.04), acc) end
+  end
+  pfn bump(e : (Strike, Float), h : Strike) : (Strike, Float) do match e do (k, v) -> if same(k, h) do (k, v +. 0.04) else e end end end
+end
