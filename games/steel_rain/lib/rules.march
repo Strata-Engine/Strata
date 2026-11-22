@@ -1,0 +1,76 @@
+-- SteelRain.Rules — the battle's numbers, as data, and the formulas over a build.
+--
+-- Parts carry tags (StrataKit.Part.tag): every part "weight", "power" and
+-- "armour"; the core (the build's root) "core", "speed", "weight_limit",
+-- "power_limit", "heat_sink", "sight" (metres) and "height" (metres
+-- standing); the movement piece "move", "climb", "drop" and "speed";
+-- weapons "weapon" (an id into `weapon`); parts that burn when the mech
+-- overheats "heat_damage". Everything else is here, to be tuned from
+-- headless fights.
+mod SteelRain.Rules do
+
+  -- a weapon: name; best and farthest range (metres); the cone's half-angle at best range and its growth per metre past it (radians);
+  -- rounds a shot; damage a round; the radius a round carves (world voxels); heat a shot; CT a round takes off a unit it hits
+  type Weapon = { wp_name : String, wp_best : Float, wp_max : Float, wp_spread : Float, wp_grow : Float, wp_rounds : Int, wp_damage : Int, wp_carve : Int, wp_heat : Int, wp_delay : Int }
+
+  doc "The weapon with id [id]: 1 autocannon, 2 missile rack, 3 emplacement gun."
+  fn weapon(id : Int) : Option(Weapon) do
+    if id == 1 do Some({ wp_name: "autocannon", wp_best: 20.0, wp_max: 60.0, wp_spread: 0.03, wp_grow: 0.002, wp_rounds: 4, wp_damage: 6, wp_carve: 1, wp_heat: 6, wp_delay: 6 })
+    else if id == 2 do Some({ wp_name: "missile rack", wp_best: 30.0, wp_max: 90.0, wp_spread: 0.08, wp_grow: 0.001, wp_rounds: 6, wp_damage: 8, wp_carve: 2, wp_heat: 12, wp_delay: 8 })
+    else if id == 3 do Some({ wp_name: "emplacement gun", wp_best: 30.0, wp_max: 80.0, wp_spread: 0.04, wp_grow: 0.002, wp_rounds: 3, wp_damage: 8, wp_carve: 1, wp_heat: 0, wp_delay: 8 })
+    else None end end end
+  end
+
+  -- the fight's other numbers
+  type Numbers = { rn_near_delay : Int, rn_near_metres : Float, rn_moved_spread : Float, rn_suppressed_spread : Float, rn_hot_spread : Float, rn_heat_warn : Int, rn_heat_cap : Int, rn_overheat_ct : Int, rn_move_heat : Int, rn_side : Float, rn_rear : Float, rn_fall_safe : Int, rn_fall_core : Int, rn_fall_per_step : Int, rn_fall_ct_per_step : Int, rn_debris_per_voxel : Float, rn_bump : Int, rn_watch_width : Float, rn_watch_range : Int, rn_emplacement_armour : Int, rn_emplacement_speed : Int }
+
+  doc "The fight's numbers: delay and spread, heat, facing, falling, watches, emplacements."
+  fn numbers() : Numbers do
+    { rn_near_delay: 2, rn_near_metres: 0.6, rn_moved_spread: 0.03, rn_suppressed_spread: 0.04, rn_hot_spread: 0.04, rn_heat_warn: 30, rn_heat_cap: 50, rn_overheat_ct: 40, rn_move_heat: 2,
+      rn_side: 1.25, rn_rear: 1.6, rn_fall_safe: 1, rn_fall_core: 4, rn_fall_per_step: 8, rn_fall_ct_per_step: 10, rn_debris_per_voxel: 0.5, rn_bump: 4,
+      rn_watch_width: 1.5708, rn_watch_range: 10, rn_emplacement_armour: 60, rn_emplacement_speed: 5 }
+  end
+
+  pfn root_tag(parts : List(StrataKit.Part.KitPart), b : StrataKit.Build.KitBuild, key : String) : Float do
+    match List.nth_opt(parts, StrataKit.Build.part_of(b)) do Some(p) -> StrataKit.Part.tag(p, key) | None -> 0.0 end
+  end
+  pfn sum(parts : List(StrataKit.Part.KitPart), b : StrataKit.Build.KitBuild, key : String) : Float do StrataKit.Build.sum(parts, b, key) end
+  -- the largest of a tag over the build's parts
+  pfn most(parts : List(StrataKit.Part.KitPart), b : StrataKit.Build.KitBuild, key : String) : Float do
+    List.fold_left(StrataKit.Build.children(b), root_tag(parts, b, key), fn (m, c) -> match c do (_, x) -> let v = most(parts, x, key)
+      if v > m do v else m end end)
+  end
+
+  doc "Speed on the clock: the build's \"speed\" tags (core and movement piece), less 1 for each full 10% of the core's weight limit the build's weight is over 60% of it; at least 1."
+  fn speed(parts : List(StrataKit.Part.KitPart), b : StrataKit.Build.KitBuild) : Int do
+    let limit = root_tag(parts, b, "weight_limit")
+    let over = sum(parts, b, "weight") -. 0.6 *. limit
+    let penalty = if limit <= 0.0 || over <= 0.0 do 0 else float_to_int(over /. (0.1 *. limit)) end
+    Math.max_int(1, float_to_int(sum(parts, b, "speed")) - penalty)
+  end
+
+  doc "Heat shed each turn: the build's \"heat_sink\" tags, less a quarter when its \"power\" is over 90% of the core's power limit."
+  fn shed(parts : List(StrataKit.Part.KitPart), b : StrataKit.Build.KitBuild) : Int do
+    let sink = sum(parts, b, "heat_sink")
+    let limit = root_tag(parts, b, "power_limit")
+    float_to_int(if limit > 0.0 && sum(parts, b, "power") > 0.9 *. limit do sink *. 0.75 else sink end)
+  end
+
+  doc "The damage factor for a shot from [shooter] at a target at [target] facing [target_yaw] (x, z metres; yaw 0 faces +x, a quarter turn +z): 1 from in front (within 60 degrees of where it faces), the rear factor from behind (within 60 degrees of straight behind), the side factor otherwise."
+  fn facing_factor(n : Numbers, shooter : (Float, Float), target : (Float, Float), target_yaw : Float) : Float do
+    match (shooter, target) do
+      ((sx, sz), (tx, tz)) ->
+        let a = Math.atan2(sz -. tz, sx -. tx) -. target_yaw
+        let tau = 2.0 *. Math.pi()
+        let d = a -. tau *. Math.floor((a +. Math.pi()) /. tau)
+        let ad = if d < 0.0 do 0.0 -. d else d end
+        if ad <= Math.pi() /. 3.0 do 1.0 else if ad >= 2.0 *. Math.pi() /. 3.0 do n.rn_rear else n.rn_side end end
+    end
+  end
+
+  doc "The build's mover for StrataTactics.Reach: move, climb and drop from its movement piece's tags (the largest in the build), its height from the core's \"height\" tag (metres) in world voxels of 0.4 m, rounded up."
+  fn mover(parts : List(StrataKit.Part.KitPart), b : StrataKit.Build.KitBuild) : StrataTactics.Reach.Mover do
+    let h = float_to_int(Math.ceil(root_tag(parts, b, "height") /. 0.4))
+    StrataTactics.Reach.mover(float_to_int(most(parts, b, "move")), float_to_int(most(parts, b, "climb")), float_to_int(most(parts, b, "drop")), Math.max_int(1, h))
+  end
+end
