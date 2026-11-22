@@ -20,8 +20,8 @@ mod SteelRain.Fight do
   -- state (0 in, 1 withdrawn, 2 out), this turn's move and act, hit since its last turn, braced
   type Mech = { mc_id : Int, mc_side : Int, mc_kind : Int, mc_build : StrataKit.Build.KitBuild, mc_hull : SteelRain.Hull.Hull, mc_armour : List((List(String), Int)),
                 mc_tile : (Int, Int), mc_yaw : Float, mc_heat : Int, mc_state : Int, mc_moved : Bool, mc_acted : Bool, mc_hit_this_round : Bool, mc_braced : Bool }
-  -- the mission (Task 9 adds Destroy)
-  type Mission = MNone
+  -- the mission: none; Destroy (emplacement ids, the depot's cells, how many it started with)
+  type Mission = MNone | MDestroy(List(Int), List((Int, Int, Int)), Int)
   -- how a fight ended: won, and each mech's id, state and build at the end
   type Result_ = { rs_won : Bool, rs_mechs : List((Int, Int, StrataKit.Build.KitBuild)) }
   -- the fight
@@ -77,9 +77,10 @@ mod SteelRain.Fight do
     from_mechs(d, w, parts, ms, seed)
   end
   doc "A fight on map [d] in world [w] with the mechs [ms] as they are, every one that is in put on the clock at its speed; the clock run to the first turn."
-  fn from_mechs(d : StrataMaps.Data.MapData, w : Strata.World.World, parts : List(StrataKit.Part.KitPart), ms : List(Mech), seed : Int) : Fight do
+  fn from_mechs(d : StrataMaps.Data.MapData, w : Strata.World.World, parts : List(StrataKit.Part.KitPart), ms : List(Mech), seed : Int) : Fight do begin(d, w, parts, ms, seed, MNone) end
+  pfn begin(d : StrataMaps.Data.MapData, w : Strata.World.World, parts : List(StrataKit.Part.KitPart), ms : List(Mech), seed : Int, mission : Mission) : Fight do
     let clock = List.fold_left(ms, FgC.start(FgC.settings()), fn (c, m) -> if m.mc_state == 0 do FgC.add(c, m.mc_id, speed_of(parts, m), 0) else c end)
-    let f = { fg_map: d, fg_world: w, fg_grid: StrataMaps.grid(d, w), fg_parts: parts, fg_mechs: ms, fg_clock: clock, fg_watches: Nil, fg_watch_weapons: Nil, fg_mission: MNone, fg_seed: seed, fg_shots: 0, fg_result: None }
+    let f = { fg_map: d, fg_world: w, fg_grid: StrataMaps.grid(d, w), fg_parts: parts, fg_mechs: ms, fg_clock: clock, fg_watches: Nil, fg_watch_weapons: Nil, fg_mission: mission, fg_seed: seed, fg_shots: 0, fg_result: None }
     match next_turn(f, Nil) do (f2, _) -> f2 end
   end
   doc "Mech [m]'s speed on the clock (emplacements: the rules' emplacement speed)."
@@ -100,7 +101,16 @@ mod SteelRain.Fight do
   pfn next_turn(f : Fight, evs : List(Event)) : (Fight, List(Event)) do next_go(f, evs, 64) end
   pfn next_go(f : Fight, evs : List(Event), left : Int) : (Fight, List(Event)) do
     match FgC.active(f.fg_clock) do
-      Some(id) -> (drop_watch(update(f, id, fn x -> { x with mc_moved: false, mc_acted: false, mc_braced: false }), id), List.append(evs, [ETurn(id)]))
+      Some(id) -> match conclude(f, evs) do
+        (fc, ec) -> if Option.is_some(fc.fg_result) do (fc, ec)
+          else
+            let f1 = drop_watch(update(fc, id, fn x -> { x with mc_moved: false, mc_acted: false, mc_braced: false }), id)
+            match mech(f1, id) do
+              Some(m) -> if m.mc_kind == 1 do emplacement_turn(f1, m, List.append(ec, [ETurn(id)])) else (f1, List.append(ec, [ETurn(id)])) end
+              None -> (f1, ec)
+            end
+          end
+      end
       None ->
         if left <= 0 do (f, evs)
         else
@@ -126,7 +136,26 @@ mod SteelRain.Fight do
   fn step(f : Fight, o : Order) : Result((Fight, List(Event)), String) do
     match ready(f) do
       Err(e) -> Err(e)
-      Ok(m) -> match o do
+      Ok(m) -> match order(f, m, o) do
+        Err(e) -> Err(e)
+        Ok((f2, evs)) -> Ok(after_order(f2, evs))
+      end
+    end
+  end
+  -- after an order: the fight decided, or a turn whose mech left the fight passed on
+  pfn after_order(f : Fight, evs : List(Event)) : (Fight, List(Event)) do
+    match conclude(f, evs) do
+      (f1, e1) -> if Option.is_some(f1.fg_result) do (f1, e1)
+        else match active(f1) do
+          Some(id) -> match mech(f1, id) do Some(m) -> if m.mc_state == 0 do (f1, e1) else next_turn({ f1 with fg_clock: FgC.end_turn(f1.fg_clock, false, false) }, e1) end | None -> (f1, e1) end
+          None -> next_turn(f1, e1)
+        end end
+    end
+  end
+  pfn order(f : Fight, m : Mech, o : Order) : Result((Fight, List(Event)), String) do
+    match f.fg_result do
+      Some(_) -> Err("the fight is over")
+      None -> match o do
         OEnd(yaw) -> Ok(end_turn(f, m, yaw))
         OBrace -> if m.mc_acted do Err("it has already acted this turn") else Ok((update(f, m.mc_id, fn x -> { x with mc_acted: true, mc_braced: true }), Nil)) end
         OFire(shots) -> match fire_check(f, m, shots) do
@@ -177,6 +206,94 @@ mod SteelRain.Fight do
   pfn burn_of(f : Fight, m : Mech, p : List(String)) : Option((List(String), Int)) do
     let v = float_to_int(StrataKit.Part.tag(part_at(f, m, p), "heat_damage"))
     if v > 0 do Some((p, v)) else None end
+  end
+
+  -- ── Destroy, emplacements, results ───────────────────────────────────────
+  doc "An emplacement's hull: one box 2.4 m across and 2 m high, its gun 1.8 m up."
+  fn emplacement_hull() : SteelRain.Hull.Hull do
+    { hl_parts: [(Nil, (0.0, 1.0, 0.0), (1.2, 1.0, 1.2))], hl_muzzles: [(Nil, (0.6, 1.8, 0.0))], hl_height: 2.0 }
+  end
+  doc "An emplacement of side 1 on tile [t] facing [yaw]: one node (the core part, for its sight), the rules' armour."
+  fn new_emplacement(id : Int, t : (Int, Int), yaw : Float) : Mech do
+    { mc_id: id, mc_side: 1, mc_kind: 1, mc_build: StrataKit.Build.leaf(0), mc_hull: emplacement_hull(), mc_armour: [(Nil, (SteelRain.Rules.numbers()).rn_emplacement_armour)], mc_tile: t, mc_yaw: yaw, mc_heat: 0, mc_state: 0,
+      mc_moved: false, mc_acted: false, mc_hit_this_round: false, mc_braced: false }
+  end
+  pfn sites_named(d : StrataMaps.Data.MapData, name : String) : List(List((Int, Int))) do
+    List.map(List.filter(d.md_sites, fn s -> s.st_name == name), fn s -> s.st_tiles)
+  end
+  doc "A Destroy fight on map [d] (its sites from SteelRain.Missions.destroy_rules) in world [w]: side 0's builds [side0] on the north spawn, an emplacement on each battery site facing them, the depot built on the supply site."
+  fn start_destroy(d : StrataMaps.Data.MapData, w : Strata.World.World, parts : List(StrataKit.Part.KitPart), side0 : List(StrataKit.Build.KitBuild), seed : Int) : Fight do
+    let north = site_tiles(d, "spawn north")
+    let ours = side_mechs(parts, 1, 0, side0, north, centre_of(site_tiles(d, "spawn south")))
+    let first = 1 + List.length(ours)
+    let ems = List.filter_map(List.enumerate(sites_named(d, "battery")), fn e -> match e do (i, ts) -> match ts do Cons(t, _) -> Some(new_emplacement(first + i, t, yaw_to(t, centre_of(north)))) | Nil -> None end end)
+    let cells = match site_tiles(d, "supply") do
+      Cons((tx, tz), _) -> match StrataMaps.Data.playable(d) do (px, pz, _) -> let x = px + tx * 8 + 2
+        let z = pz + tz * 8 + 2
+        SteelRain.Missions.depot_cells(x, Strata.Heights.get(d.md_heights, x, z), z) end
+      Nil -> Nil
+    end
+    let w2 = Strata.Edit.world(Strata.Edit.set_many(w, List.map(cells, fn c -> match c do (x, y, z) -> (x, y, z, d.md_blocks.mb_concrete) end)))
+    begin(d, w2, parts, List.append(ours, ems), seed, MDestroy(List.map(ems, fn e -> e.mc_id), cells, List.length(cells)))
+  end
+  doc "How many of the depot's cells still stand (0 with no depot)."
+  fn depot_left(f : Fight) : Int do
+    match f.fg_mission do
+      MDestroy(_, cells, _) -> List.length(List.filter(cells, fn c -> match c do (x, y, z) -> Strata.World.get_block(f.fg_world, x, y, z) == f.fg_map.md_blocks.mb_concrete end))
+      MNone -> 0
+    end
+  end
+  doc "How many cells the depot started with."
+  fn depot_start(f : Fight) : Int do match f.fg_mission do MDestroy(_, _, n) -> n | MNone -> 0 end end
+  doc "The middle of a depot cell still standing (metres), if any."
+  fn depot_point(f : Fight) : Option((Float, Float, Float)) do
+    let sc = Strata.World.scale(f.fg_world)
+    match f.fg_mission do
+      MDestroy(_, cells, _) -> match List.find(cells, fn c -> match c do (x, y, z) -> Strata.World.get_block(f.fg_world, x, y, z) == f.fg_map.md_blocks.mb_concrete end) do
+        Some((x, y, z)) -> Some(((int_to_float(x) +. 0.5) *. sc, (int_to_float(y) +. 0.5) *. sc, (int_to_float(z) +. 0.5) *. sc))
+        None -> None
+      end
+      MNone -> None
+    end
+  end
+  pfn any_in(f : Fight, side : Int) : Bool do List.any(f.fg_mechs, fn m -> m.mc_side == side && m.mc_state == 0) end
+  doc "How the fight has ended, if it has: Destroy is won when every emplacement is out, half the depot is down, and the player's mechs have all left or no enemy is in; lost when no player mech is in and it is not won."
+  fn decide(f : Fight) : Option(Result_) do
+    match f.fg_mission do
+      MNone -> None
+      MDestroy(ems, _, _) ->
+        let targets_down = List.all(ems, fn id -> match mech(f, id) do Some(e) -> e.mc_state == 2 | None -> true end) && depot_left(f) * 2 <= depot_start(f)
+        let won = targets_down && (!any_in(f, 0) || !any_in(f, 1))
+        if won do Some(result(f, true)) else if !any_in(f, 0) do Some(result(f, false)) else None end end
+    end
+  end
+  pfn result(f : Fight, won : Bool) : Result_ do
+    { rs_won: won, rs_mechs: List.map(List.filter(f.fg_mechs, fn m -> m.mc_side == 0), fn m -> (m.mc_id, m.mc_state, m.mc_build)) }
+  end
+  -- the fight with its result set, if it has ended
+  pfn conclude(f : Fight, evs : List(Event)) : (Fight, List(Event)) do
+    if Option.is_some(f.fg_result) do (f, evs)
+    else match decide(f) do Some(r) -> ({ f with fg_result: Some(r) }, List.append(evs, [EEnded(r)])) | None -> (f, evs) end end
+  end
+  -- an emplacement's turn, on its own: it fires at the nearest player mech it sees inside its arc, else holds a watch over the arc; then its turn ends
+  pfn emplacement_turn(f : Fight, e : Mech, evs : List(Event)) : (Fight, List(Event)) do
+    let n = SteelRain.Rules.numbers()
+    let tiles = match SteelRain.Rules.weapon(3) do Some(w) -> float_to_int(w.wp_max /. (8.0 *. Strata.World.scale(f.fg_world))) | None -> n.rn_watch_range end
+    let arc = StrataTactics.Watch.arc(e.mc_id, e.mc_tile, e.mc_yaw, n.rn_watch_width, tiles)
+    let seen = List.filter(f.fg_mechs, fn m -> m.mc_side == 0 && m.mc_state == 0 && StrataTactics.Watch.covers(arc, m.mc_tile) && sees(f, e, m.mc_tile))
+    let near = List.fold_left(seen, None, fn (best, m) -> nearer_mech(f, e, best, m))
+    match (match near do Some(m) -> shoot(f, e.mc_id, Nil, torso_point(f, m)) | None -> set_watch(f, e, Nil, e.mc_yaw) end) do
+      (f1, ev1) -> match mech(f1, e.mc_id) do
+        Some(e2) -> if e2.mc_state != 0 do next_turn(f1, List.append(evs, ev1)) else adding(List.append(evs, ev1), end_turn(f1, { e2 with mc_acted: true }, e.mc_yaw)) end
+        None -> (f1, List.append(evs, ev1))
+      end
+    end
+  end
+  pfn nearer_mech(f : Fight, e : Mech, best : Option(Mech), m : Mech) : Option(Mech) do
+    match best do
+      Some(b) -> if flat_dist(pos(f, e), pos(f, m)) < flat_dist(pos(f, e), pos(f, b)) do Some(m) else best end
+      None -> Some(m)
+    end
   end
 
   -- ── Moving ───────────────────────────────────────────────────────────────
@@ -235,10 +352,10 @@ mod SteelRain.Fight do
   pfn drop_watch(f : Fight, id : Int) : Fight do
     { f with fg_watches: List.filter(f.fg_watches, fn a -> a.wa_owner != id), fg_watch_weapons: List.filter(f.fg_watch_weapons, fn w -> match w do (o, _) -> o != id end) }
   end
-  doc "Can mech [o] see tile [t]: a clear or partial line from its eyes to a mech's height over it, within its sight?"
+  doc "Can mech [o] see tile [t]: a clear or partial line from its eyes to a mech's height over it, within its sight (its core's \"sight\" tag; an emplacement sees as far as its gun reaches)?"
   fn sees(f : Fight, o : Mech, t : (Int, Int)) : Bool do
     let eye = Math.max_int(1, height_of(f, o) - 1)
-    let range = StrataKit.Part.tag(part_at(f, o, Nil), "sight")
+    let range = if o.mc_kind == 1 do (match SteelRain.Rules.weapon(3) do Some(w) -> w.wp_max | None -> 0.0 end) else StrataKit.Part.tag(part_at(f, o, Nil), "sight") end
     let d = flat_dist(pos(f, o), FgG.centre(f.fg_grid, t))
     (range <= 0.0 || d <= range) && StrataTactics.Sight.line(f.fg_world, f.fg_grid, o.mc_tile, eye, t, eye) != StrataTactics.Sight.blocked()
   end
