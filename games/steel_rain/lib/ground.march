@@ -1,0 +1,64 @@
+-- SteelRain.Ground — terrain carved by rounds, and what it no longer holds
+-- dropped as rubble.
+--
+-- There is no physics in the fight. After a blast, every loose piece in a
+-- box round it (Strata.Support.loose_box: the whole box is checked, its edge
+-- counting as held) is removed and its voxels fall straight down, column
+-- by column, onto the first solid voxel below, as rubble: a column that lost
+-- n voxels gains n rubble voxels on what is under it. The same fall serves
+-- wrecks and parts that break off (`drop`).
+mod SteelRain.Ground do
+
+  doc "How far round a blast loose pieces are looked for (voxels)."
+  fn reach() : Int do 12 end
+
+  doc "World [w] with a blast of [radius] at (x, y, z) from [seed], then what it left without support dropped as [rubble] blocks: the world, every change (the blast's and the fall's), and the cells the fall set (x, y, z, id; 0 where a voxel left)."
+  fn carve(w : Strata.World.World, x : Int, y : Int, z : Int, radius : Int, seed : Int, rubble : Int) : (Strata.World.World, List(Strata.Edit.Change), List((Int, Int, Int, Int))) do
+    let o = Strata.Edit.blast(w, x, y, z, radius, seed, 0)
+    let w1 = Strata.Edit.world(o)
+    let g = reach() + radius
+    let loose = List.concat(Strata.Support.pieces(Strata.Support.loose_box(Strata.World.registry(w1), w1, x - g, y - g, z - g, x + g, y + g, z + g, y - g - 1, Strata.World.scale(w1))))
+    match drop_with(w1, loose, rubble) do
+      (w2, cs, cells) -> (w2, List.append(Strata.Edit.changes(o), cs), cells)
+    end
+  end
+
+  doc "World [w] with [cells] removed and dropped as [rubble] blocks, column by column, onto the first solid voxel under each column: the world and the cells set."
+  fn drop(w : Strata.World.World, cells : List((Int, Int, Int)), rubble : Int) : (Strata.World.World, List((Int, Int, Int, Int))) do
+    match drop_with(w, cells, rubble) do (w2, _, set) -> (w2, set) end
+  end
+
+  -- the columns of [cells]: (x, z, lowest y, how many), in first-seen order
+  pfn columns(cells : List((Int, Int, Int))) : List((Int, Int, Int, Int)) do
+    List.reverse(List.fold_left(cells, Nil, fn (acc, c) -> add_cell(acc, c)))
+  end
+  pfn add_cell(acc : List((Int, Int, Int, Int)), c : (Int, Int, Int)) : List((Int, Int, Int, Int)) do
+    match c do
+      (x, y, z) ->
+        if List.any(acc, fn e -> match e do (ex, ez, _, _) -> ex == x && ez == z end) do
+          List.map(acc, fn e -> match e do (ex, ez, ey, n) -> if ex == x && ez == z do (ex, ez, Math.min_int(ey, y), n + 1) else e end end)
+        else Cons((x, z, y, 1), acc) end
+    end
+  end
+  -- the highest solid voxel at or below y in column (x, z), searching at most 64 down (y - 65 if none)
+  pfn solid_below(w : Strata.World.World, reg : Strata.Blocks.Registry, x : Int, y : Int, z : Int, left : Int) : Int do
+    if left <= 0 do y
+    else if Strata.Blocks.collides(reg, Strata.World.get_block(w, x, y, z)) do y
+    else solid_below(w, reg, x, y - 1, z, left - 1) end end
+  end
+  pfn drop_with(w : Strata.World.World, cells : List((Int, Int, Int)), rubble : Int) : (Strata.World.World, List(Strata.Edit.Change), List((Int, Int, Int, Int))) do
+    if List.is_empty(cells) do (w, Nil, Nil)
+    else
+      let o1 = Strata.Edit.set_many(w, List.map(cells, fn c -> match c do (x, y, z) -> (x, y, z, 0) end))
+      let w1 = Strata.Edit.world(o1)
+      let reg = Strata.World.registry(w1)
+      let landed = List.flat_map(columns(cells), fn col -> match col do
+        (x, z, ylo, n) -> let base = solid_below(w1, reg, x, ylo - 1, z, 64)
+          List.map(List.range(1, n + 1), fn k -> (x, base + k, z, rubble))
+      end)
+      let o2 = Strata.Edit.set_many(w1, landed)
+      let removed = List.map(cells, fn c -> match c do (x, y, z) -> (x, y, z, 0) end)
+      (Strata.Edit.world(o2), List.append(Strata.Edit.changes(o1), Strata.Edit.changes(o2)), List.append(removed, landed))
+    end
+  end
+end

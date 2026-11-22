@@ -129,17 +129,220 @@ mod SteelRain.Fight do
       Ok(m) -> match o do
         OEnd(yaw) -> Ok(end_turn(f, m, yaw))
         OBrace -> if m.mc_acted do Err("it has already acted this turn") else Ok((update(f, m.mc_id, fn x -> { x with mc_acted: true, mc_braced: true }), Nil)) end
+        OFire(shots) -> match fire_check(f, m, shots) do
+          Some(why) -> Err(why)
+          None -> Ok(volley(f, m, shots))
+        end
         _ -> Err("not yet")
       end
     end
   end
 
-  -- the end of mech [m]'s turn: its facing, heat shed, the clock charged, the next turn
+  -- the end of mech [m]'s turn: its facing, heat shed, overheating, the clock charged, the next turn
   pfn end_turn(f : Fight, m : Mech, yaw : Float) : (Fight, List(Event)) do
+    let n = SteelRain.Rules.numbers()
     let shed = if m.mc_kind == 1 do 0 else SteelRain.Rules.shed(f.fg_parts, m.mc_build) end
     let heat = Math.max_int(0, m.mc_heat - shed)
     let f1 = update(f, m.mc_id, fn x -> { x with mc_yaw: yaw, mc_heat: heat, mc_hit_this_round: false })
-    let f2 = { f1 with fg_clock: FgC.end_turn(f1.fg_clock, m.mc_moved, m.mc_acted) }
-    next_turn(f2, if heat != m.mc_heat do [EHeat(m.mc_id, heat)] else Nil end)
+    let ev1 = if heat != m.mc_heat do [EHeat(m.mc_id, heat)] else Nil end
+    match (if heat > n.rn_heat_warn + (n.rn_heat_cap - n.rn_heat_warn) / 2 do overheat(f1, m.mc_id) else (f1, Nil) end) do
+      (f2, ev2) ->
+        let f3 = { f2 with fg_clock: FgC.end_turn(f2.fg_clock, m.mc_moved, m.mc_acted) }
+        next_turn(f3, List.append(ev1, ev2))
+    end
+  end
+  -- overheating: CT lost, and parts that burn take their heat damage
+  pfn overheat(f : Fight, id : Int) : (Fight, List(Event)) do
+    let n = SteelRain.Rules.numbers()
+    let f1 = { f with fg_clock: FgC.delay(f.fg_clock, id, n.rn_overheat_ct) }
+    match mech(f1, id) do
+      None -> (f1, Nil)
+      Some(m) ->
+        let burns = List.filter_map(StrataKit.Build.paths(m.mc_build), fn p -> burn_of(f1, m, p))
+        List.fold_left(burns, (f1, [EOverheated(id)]), fn (acc, b) -> burn_step(id, acc, b))
+    end
+  end
+  pfn burn_step(id : Int, acc : (Fight, List(Event)), b : (List(String), Int)) : (Fight, List(Event)) do
+    match (acc, b) do ((fa, ea), (p, dmg)) -> adding(ea, damage(fa, id, p, dmg)) end
+  end
+  -- events [ea], then what [r] adds
+  pfn adding(ea : List(Event), r : (Fight, List(Event))) : (Fight, List(Event)) do match r do (fb, eb) -> (fb, List.append(ea, eb)) end end
+  pfn burn_of(f : Fight, m : Mech, p : List(String)) : Option((List(String), Int)) do
+    let v = float_to_int(StrataKit.Part.tag(part_at(f, m, p), "heat_damage"))
+    if v > 0 do Some((p, v)) else None end
+  end
+
+  -- ── Volleys ──────────────────────────────────────────────────────────────
+  pfn empty_part() : StrataKit.Part.KitPart do StrataKit.Part.from_grid(0, 0, 0, NativeArray.make_u8(0, 0), StrataKit.Part.marker("attach", "part", 0.0, 0.0, 0.0, (0.0, 0.0, 1.0), (0.0, 1.0, 0.0)), Nil, Nil, Nil, "", "", Nil) end
+  doc "The part at node [p] of mech [m]'s build (an empty part if there is none)."
+  fn part_at(f : Fight, m : Mech, p : List(String)) : StrataKit.Part.KitPart do
+    match StrataKit.Build.at(m.mc_build, p) do
+      Some(n) -> match List.nth_opt(f.fg_parts, StrataKit.Build.part_of(n)) do Some(pt) -> pt | None -> empty_part() end
+      None -> empty_part()
+    end
+  end
+  doc "The weapon at node [p] of mech [m], if the node is on it and carries one."
+  fn weapon_at(f : Fight, m : Mech, p : List(String)) : Option(SteelRain.Rules.Weapon) do
+    if Option.is_none(StrataKit.Build.at(m.mc_build, p)) do None
+    else if m.mc_kind == 1 do SteelRain.Rules.weapon(3)
+    else SteelRain.Rules.weapon(float_to_int(StrataKit.Part.tag(part_at(f, m, p), "weapon"))) end end
+  end
+  doc "Where mech [m] stands (metres, on its tile's floor)."
+  fn pos(f : Fight, m : Mech) : (Float, Float, Float) do FgG.centre(f.fg_grid, m.mc_tile) end
+  pfn dist(a : (Float, Float, Float), b : (Float, Float, Float)) : Float do
+    match (a, b) do ((ax, ay, az), (bx, by, bz)) -> Math.sqrt((ax -. bx) *. (ax -. bx) +. (ay -. by) *. (ay -. by) +. (az -. bz) *. (az -. bz)) end
+  end
+  pfn heat_of_volley(f : Fight, m : Mech, shots : List((List(String), (Float, Float, Float)))) : Int do
+    List.fold_left(shots, 0, fn (h, s) -> match s do (p, _) -> match weapon_at(f, m, p) do Some(w) -> h + w.wp_heat | None -> h end end)
+  end
+  -- why a volley cannot be fired, if it cannot
+  pfn fire_check(f : Fight, m : Mech, shots : List((List(String), (Float, Float, Float)))) : Option(String) do
+    let paths = List.map(shots, fn s -> match s do (p, _) -> p end)
+    if m.mc_acted do Some("it has already acted this turn")
+    else if List.is_empty(shots) do Some("a volley needs a weapon")
+    else if List.length(List.dedup(paths)) != List.length(paths) do Some("each weapon fires once a volley")
+    else if List.any(shots, fn s -> match s do (p, _) -> Option.is_none(weapon_at(f, m, p)) end) do Some("that is not a weapon it carries")
+    else if List.any(shots, fn s -> out_of_range(f, m, s)) do Some("out of range")
+    else if m.mc_heat + heat_of_volley(f, m, shots) > (SteelRain.Rules.numbers()).rn_heat_cap do Some("too hot to fire all of that")
+    else None end end end end end end
+  end
+  pfn out_of_range(f : Fight, m : Mech, s : (List(String), (Float, Float, Float))) : Bool do
+    match s do
+      (p, aim) -> match weapon_at(f, m, p) do
+        Some(w) -> dist(SteelRain.Hull.muzzle(m.mc_hull, p, pos(f, m), m.mc_yaw), aim) > w.wp_max
+        None -> true
+      end
+    end
+  end
+  -- the yaw from [a] towards [b] (x, z)
+  pfn yaw_between(a : (Float, Float, Float), b : (Float, Float, Float)) : Float do
+    match (a, b) do ((ax, _, az), (bx, _, bz)) -> if Math.abs(bx -. ax) +. Math.abs(bz -. az) < 0.000001 do 0.0 else Math.atan2(bz -. az, bx -. ax) end end
+  end
+  -- a checked volley: the mech turns to its first aim, each weapon fires in turn, then it has acted
+  pfn volley(f : Fight, m : Mech, shots : List((List(String), (Float, Float, Float)))) : (Fight, List(Event)) do
+    let yaw = match shots do Cons((_, aim), _) -> yaw_between(pos(f, m), aim) | Nil -> m.mc_yaw end
+    let f0 = update(f, m.mc_id, fn x -> { x with mc_yaw: yaw })
+    match List.fold_left(shots, (f0, Nil), fn (acc, s) -> shot_step(m.mc_id, acc, s)) do
+      (f1, evs) -> (update(f1, m.mc_id, fn x -> { x with mc_acted: true }), evs)
+    end
+  end
+
+  pfn shot_step(id : Int, acc : (Fight, List(Event)), s : (List(String), (Float, Float, Float))) : (Fight, List(Event)) do
+    match (acc, s) do ((fa, ea), (p, aim)) -> adding(ea, shoot(fa, id, p, aim)) end
+  end
+  doc "Every box of every mech that is in, but [skip]'s."
+  fn boxes_but(f : Fight, skip : Int) : List(StrataTactics.Shot.ShotBox) do
+    List.flat_map(List.filter(f.fg_mechs, fn x -> x.mc_state == 0 && x.mc_id != skip), fn x -> SteelRain.Hull.boxes(x.mc_hull, x.mc_id, pos(f, x), x.mc_yaw, StrataKit.Build.paths(x.mc_build)))
+  end
+  doc "The cone's half-angle for mech [m] firing [w] [d] metres: the weapon's, grown past its best range, wider if it moved this turn, was hit since its last turn, or is hot."
+  fn spread(m : Mech, w : SteelRain.Rules.Weapon, d : Float) : Float do
+    let n = SteelRain.Rules.numbers()
+    w.wp_spread +. w.wp_grow *. Math.max_float(0.0, d -. w.wp_best)
+      +. (if m.mc_moved do n.rn_moved_spread else 0.0 end) +. (if m.mc_hit_this_round do n.rn_suppressed_spread else 0.0 end) +. (if m.mc_heat >= n.rn_heat_warn do n.rn_hot_spread else 0.0 end)
+  end
+  -- one weapon of mech [id] at [aim]: its rounds, then its heat
+  pfn shoot(f : Fight, id : Int, p : List(String), aim : (Float, Float, Float)) : (Fight, List(Event)) do
+    match mech(f, id) do
+      None -> (f, Nil)
+      Some(m) -> match weapon_at(f, m, p) do
+        None -> (f, Nil)
+        Some(w) ->
+          let muzzle = SteelRain.Hull.muzzle(m.mc_hull, p, pos(f, m), m.mc_yaw)
+          let spec = { sp_from: muzzle, sp_at: aim, sp_rounds: w.wp_rounds, sp_spread: spread(m, w, dist(muzzle, aim)), sp_max: w.wp_max, sp_near: (SteelRain.Rules.numbers()).rn_near_metres }
+          let shot = f.fg_shots
+          let rounds = StrataTactics.Shot.fire(f.fg_world, boxes_but(f, id), spec, Strata.Seed.mix(f.fg_seed, shot))
+          let f1 = { f with fg_shots: shot + 1 }
+          match List.fold_left(List.enumerate(rounds), (f1, Nil), fn (acc, e) -> round_step(id, w, shot, acc, e)) do
+            (f2, evs) ->
+              let heat = (match mech(f2, id) do Some(x) -> x.mc_heat | None -> 0 end) + w.wp_heat
+              (update(f2, id, fn x -> { x with mc_heat: heat }), List.append(evs, [EHeat(id, heat)]))
+          end
+      end
+    end
+  end
+  pfn round_step(id : Int, w : SteelRain.Rules.Weapon, shot : Int, acc : (Fight, List(Event)), e : (Int, StrataTactics.Shot.ShotRound)) : (Fight, List(Event)) do
+    match (acc, e) do ((fa, ea), (k, r)) -> adding(ea, land(fa, id, w, shot, k, r)) end
+  end
+  pfn near_step(amount : Int, acc : (Fight, List(Event)), u : Int) : (Fight, List(Event)) do
+    match acc do (fa, ea) -> adding(ea, delay(fa, u, amount)) end
+  end
+  -- a round of [w] from mech [id] (the [k]th of shot [shot]) arriving: what it struck, then the near misses
+  pfn land(f : Fight, id : Int, w : SteelRain.Rules.Weapon, shot : Int, k : Int, r : StrataTactics.Shot.ShotRound) : (Fight, List(Event)) do
+    let n = SteelRain.Rules.numbers()
+    match (match r.rd_struck do
+      SVoxel(x, y, z) -> carve_at(f, x, y, z, w.wp_carve, Strata.Seed.mix(f.fg_seed, 1000003 + shot * 64 + k))
+      SBox(u, part, _) -> hit(f, id, u, part, w)
+      SNone -> (f, Nil)
+    end) do
+      (f1, ev1) -> List.fold_left(r.rd_near, (f1, Cons(ERound(id, r), ev1)), fn (acc, u) -> near_step(n.rn_near_delay, acc, u))
+    end
+  end
+  doc "The fight with a blast of [radius] at voxel (x, y, z) from [seed], what fell, the grid re-read where the world changed."
+  fn carve_at(f : Fight, x : Int, y : Int, z : Int, radius : Int, seed : Int) : (Fight, List(Event)) do
+    match SteelRain.Ground.carve(f.fg_world, x, y, z, radius, seed, f.fg_map.md_blocks.mb_rubble) do
+      (w, cs, fell) -> match FgG.refresh(f.fg_grid, w, cs) do
+        (g, _) -> ({ f with fg_world: w, fg_grid: g }, List.append([ECarved(cs)], if List.is_empty(fell) do Nil else [EFell(fell)] end))
+      end
+    end
+  end
+  -- unit [u] pushed back [amount] CT (halved when braced)
+  pfn delay(f : Fight, u : Int, amount : Int) : (Fight, List(Event)) do
+    match mech(f, u) do
+      Some(t) -> if t.mc_state != 0 do (f, Nil)
+        else let a = if t.mc_braced do amount / 2 else amount end
+          ({ f with fg_clock: FgC.delay(f.fg_clock, u, a) }, [EDelayed(u, a)]) end
+      None -> (f, Nil)
+    end
+  end
+  -- a round of [w] from mech [sid] striking part [part] (a hull index) of unit [u]
+  pfn hit(f : Fight, sid : Int, u : Int, part : Int, w : SteelRain.Rules.Weapon) : (Fight, List(Event)) do
+    match (mech(f, sid), mech(f, u)) do
+      (Some(s), Some(t)) -> match List.nth_opt(t.mc_hull.hl_parts, part) do
+        Some((p, _, _)) ->
+          let factor = match (pos(f, s), pos(f, t)) do ((sx, _, sz), (tx, _, tz)) -> SteelRain.Rules.facing_factor(SteelRain.Rules.numbers(), (sx, sz), (tx, tz), t.mc_yaw) end
+          let dmg = float_to_int(Math.round(int_to_float(w.wp_damage) *. factor))
+          match delay(update(f, u, fn x -> { x with mc_hit_this_round: true }), u, w.wp_delay) do
+            (f1, ev1) -> match damage(f1, u, p, dmg) do (f2, ev2) -> (f2, List.append(ev2, ev1)) end
+          end
+        None -> (f, Nil)
+      end
+      _ -> (f, Nil)
+    end
+  end
+  doc "Unit [u]'s node [p] takes [dmg]: its armour falls; at 0 the node and all it carries are lost, and losing the core takes the unit out."
+  fn damage(f : Fight, u : Int, p : List(String), dmg : Int) : (Fight, List(Event)) do
+    match mech(f, u) do
+      None -> (f, Nil)
+      Some(t) ->
+        if t.mc_state != 0 || Option.is_none(StrataKit.Build.at(t.mc_build, p)) do (f, Nil)
+        else
+          let left = Math.max_int(0, armour_left(t, p) - dmg)
+          let f1 = update(f, u, fn x -> { x with mc_armour: List.map(x.mc_armour, fn a -> match a do (q, v) -> if q == p do (q, left) else (q, v) end end) })
+          if left > 0 do (f1, [EPartHit(u, p, left)])
+          else match lose(f1, u, p) do (f2, ev) -> (f2, Cons(EPartHit(u, p, 0), ev)) end end
+        end
+    end
+  end
+  pfn armour_left(t : Mech, p : List(String)) : Int do match List.find(t.mc_armour, fn a -> match a do (q, _) -> q == p end) do Some((_, v)) -> v | None -> 0 end end
+  doc "Unit [u] loses node [p] and everything on it; losing the core (the root) takes it out."
+  fn lose(f : Fight, u : Int, p : List(String)) : (Fight, List(Event)) do
+    if List.is_empty(p) do out(f, u)
+    else
+      (update(f, u, fn x -> without(x, p)), [EPartLost(u, p)])
+    end
+  end
+  -- mech [x] without node [p] and what it carries
+  pfn without(x : Mech, p : List(String)) : Mech do
+    match StrataKit.Build.detach(x.mc_build, p) do
+      (b, _) -> { x with mc_build: b, mc_armour: kept(x.mc_armour, StrataKit.Build.paths(b)) }
+    end
+  end
+  pfn kept(armour : List((List(String), Int)), keep : List(List(String))) : List((List(String), Int)) do
+    List.filter(armour, fn a -> match a do (q, _) -> List.member(keep, q) end)
+  end
+  doc "Unit [u] out of the fight: off the clock, its watch gone."
+  fn out(f : Fight, u : Int) : (Fight, List(Event)) do
+    let f1 = update(f, u, fn x -> { x with mc_state: 2 })
+    ({ f1 with fg_clock: FgC.remove(f1.fg_clock, u), fg_watches: List.filter(f1.fg_watches, fn a -> a.wa_owner != u) }, [EState(u, 2)])
   end
 end
