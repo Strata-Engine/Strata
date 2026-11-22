@@ -22,6 +22,9 @@
 -- whenever nothing is playing, the mech whose turn it is walks up to 3 tiles
 -- south, fires both weapons at the nearest emplacement and ends its turn;
 -- the camera starts further out; frame n - 3 is written to STRATA_SHOT.
+-- STRATA_BENCH=1 opens no window: it times a Destroy fight on a map of
+-- STRATA_TILES (default 48; at 64 the maps plugin cannot yet place the north
+-- spawn) played to its end by SteelRain.Script.
 mod SteelRain do
 
   needs IO
@@ -31,6 +34,7 @@ mod SteelRain do
   needs Audio
   needs IO.FileSystem
   needs Anim
+  needs IO.Clock
 
   alias StrataKit.Motion as SrMo
   alias Strata.Blocks as SrBl
@@ -392,21 +396,43 @@ mod SteelRain do
     match Strata.Input.merge([("game", mine), ("tactics", tac_bindings)]) do (bs, _) -> bs end
   end
 
-  doc "The map for a Destroy fight from [seed]: rolling ground and a river, checked for routes, with the mission's sites; its generator and a world built from it."
-  fn destroy_map(seed : Int, reg : Strata.Blocks.Registry) : (Strata.Terrain.Gen, StrataMaps.Data.MapData, Strata.World.World) do
-    let s0 = StrataMaps.Settings.settings(seed, 16)
+  doc "The map for a Destroy fight from [seed], [tiles] a side: rolling ground and a river, checked for routes, with landings on the north and south edges and the mission's sites; its generator and a world built from it."
+  fn destroy_map(seed : Int, tiles : Int, reg : Strata.Blocks.Registry) : (Strata.Terrain.Gen, StrataMaps.Data.MapData, Strata.World.World) do
+    let s0 = StrataMaps.Settings.settings(seed, tiles)
     let ms = { s0 with ms_base: 1, ms_knobs: StrataMaps.Settings.with_knob(StrataMaps.Settings.with_knob(s0.ms_knobs, "relief", 0.4), "water", 0.5) }
     match StrataMaps.generate_ground(ms, blocks(), 4, 2) do
-      (gen, d, _) ->
+      (_, d0, _) ->
+        -- landings on the north and south edges (and trails where no route crosses), so the spawns have level ground
+        let d = StrataMaps.TrailStage.run(d0, SteelRain.Rules.mover(SteelRain.Mech.parts(), SteelRain.Mech.build()))
         let w = StrataMaps.RuinStage.scratch(d, reg)
-        (gen, StrataMaps.Sites.place(d, StrataMaps.grid(d, w), SteelRain.Missions.destroy_rules()), w)
+        (StrataMaps.WorldGen.gen(d), StrataMaps.Sites.place(d, StrataMaps.grid(d, w), SteelRain.Missions.destroy_rules()), w)
+    end
+  end
+
+  pfn now_ms() : Int do System.monotonic_time() end
+  -- the battle's budget, measured without a window: a Destroy map of [tiles], two Wardens, the scripted player to the end
+  pfn bench(seed : Int, tiles : Int) : Unit do
+    let t0 = now_ms()
+    match destroy_map(seed, tiles, registry()) do
+      (_, d, w) ->
+        let t1 = now_ms()
+        let _said = List.map(List.filter(d.md_reports, fn r -> String.starts_with(r, "sites")), fn r -> Authority.must(println("steel_rain bench: " ++ r)))
+        let f0 = SteelRain.Fight.start_destroy(d, w, SteelRain.Mech.parts(), [SteelRain.Mech.build(), SteelRain.Mech.build()], seed)
+        let t2 = now_ms()
+        match SteelRain.Script.play(f0, 2000) do
+          (f, orders, refused) ->
+            let t3 = now_ms()
+            let outcome = match f.fg_result do Some(r) -> if r.rs_won do "won" else "lost" end | None -> "no result" end
+            Authority.must(println("steel_rain bench: " ++ int_to_string(tiles) ++ " tiles, seed " ++ int_to_string(seed) ++ ": map " ++ int_to_string(t1 - t0) ++ " ms, setup " ++ int_to_string(t2 - t1) ++ " ms, fight " ++ int_to_string(t3 - t2) ++ " ms over " ++ int_to_string(orders) ++ " orders (" ++ int_to_string(refused) ++ " refused), " ++ outcome))
+        end
     end
   end
 
   fn main(_cap : Cap(IO)) : Unit do
     let frames = Authority.must(Env.get_int("STRATA_FRAMES", 0))
     let seed = Authority.must(Env.get_int("STRATA_MAP_SEED", 5))
-    if !Strata.Ffi.Vk.open(1280, 800, false, 0) do Authority.must(println("steel_rain: could not open a Vulkan window"))
+    if Authority.must(Env.get_int("STRATA_BENCH", 0)) == 1 do bench(seed, Authority.must(Env.get_int("STRATA_TILES", 48)))
+    else if !Strata.Ffi.Vk.open(1280, 800, false, 0) do Authority.must(println("steel_rain: could not open a Vulkan window"))
     else
       Strata.Ffi.Vk.set_offscreen(Authority.must(Env.get_int("STRATA_OFFSCREEN", 0)) == 1)
       Strata.Ffi.Vk.set_lighting(4)
@@ -415,7 +441,7 @@ mod SteelRain do
       if textures(reg) do () else Authority.must(println("steel_rain: could not upload textures")) end
       Strata.Render.set_sun(0.45, 0.82, 0.35, 1.0, 0.92, 0.8)
       Strata.Ffi.Vk.set_fog(160.0, 320.0)
-      match destroy_map(seed, reg) do
+      match destroy_map(seed, 16, reg) do
         (gen, d, w) ->
           let fight = SteelRain.Fight.start_destroy(d, w, SteelRain.Mech.parts(), List.map(List.range(0, 4), fn _ -> SteelRain.Mech.build()), seed)
           Authority.must(println("steel_rain: Destroy on seed " ++ int_to_string(seed) ++ ": " ++ int_to_string(List.length(fight.fg_mechs)) ++ " units, depot of " ++ int_to_string(SteelRain.Fight.depot_start(fight)) ++ " cells"))
@@ -450,6 +476,6 @@ mod SteelRain do
           end
       end
       Strata.Ffi.Vk.close()
-    end
+    end end
   end
 end

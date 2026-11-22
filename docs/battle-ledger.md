@@ -1,0 +1,40 @@
+# Battle ledger
+
+Stage 1 of docs/2026-11-22-battle-design.md (plan: docs/2026-11-22-battle-plan.md). The full working ledger, rulings included, is reproduced here.
+
+Spec: docs/2026-11-22-battle-design.md
+Pre-flight: T5 consumes T3 (speed, mover, shed) and T4 (Hull.of) — consistent. T6 consumes T2 Shot.fire/Box/Round and T4 boxes/muzzle — consistent (bx_part = node index). T6 consumes T1 Clock.delay — consistent. T8 consumes T1 Watch.triggered (sees: Arc -> Bool) — consistent. T9 Mission extends T5's MNone; Result_ defined in T5 — consistent after self-review fix. T7 consumes T6 Ground.drop — consistent. T10/T11 consume Fight/Event — consistent.
+Task 1: Ruling: docs/plugins.md has no per-module list (it documents the plugin shape), so no lines added for Clock.delay/Watch; their docs are in the modules — cost: none.
+Task 1: complete (commits 6b043da..1e0e92d, tests: sh -c '. scripts/env.sh && cd plugins/strata_tactics && forge test' → Finished: 91 tests, 0 failures)
+Task 2: Ruling: Shot's types are ShotBox, ShotSpec, Strike (SVoxel/SBox/SNone), ShotRound, not Box/Spec/Struck/Round — March type and constructor names collide across modules (GAPS S18, met again: Strata.Query/Blocks have Box and Struck) — later tasks use these names; cost: names only.
+Task 2: complete (commits 1e0e92d..0fb459e, tests: sh -c '. scripts/env.sh && cd plugins/strata_tactics && forge test' → Finished: 99 tests, 0 failures)
+Task 3: Ruling: the mover's height comes from a core "height" tag (metres; the Warden's is Mech.height()) — Rules has no hull; and Numbers gains rn_emplacement_armour/rn_emplacement_speed for Task 9 — cost: none.
+Task 3: complete (commits 0fb459e..43d8264, tests: sh -c '. scripts/env.sh && cd games/steel_rain && forge test' → Finished: 21 tests, 0 failures)
+Task 4: Ruling: hull boxes are cut off at the floor — the rig rests with straight legs (0.2 m below the floor) while the mech stands with knees bent — cost: the legs' box is slightly short at the bottom. Muzzles: the 'muzzle' marker sockets, placed through the same rest frames.
+Task 4: complete (commits 43d8264..c6a1c35, tests: sh -c '. scripts/env.sh && cd games/steel_rain && forge test' → Finished: 26 tests, 0 failures)
+Task 5: Ruling: test fights are flat maps (StrataMaps.Data.empty: every column 8 high, no water) with spawn sites set by hand, not generated maps — tests need exact ground; generated maps come in Task 9/11 — cost: none. SteelRain.registry()/blocks() made public for them.
+Task 5: Ruling: Fight.from_mechs(d, w, parts, mechs, seed) added beside start, so fixtures and Task 9 can set up mechs as they like — cost: none. Constructors are written bare in tests (OEnd, not SrF.OEnd): March does not reach constructors through an alias.
+Task 5: complete (commits c6a1c35..0dd2f91, tests: sh -c '. scripts/env.sh && cd games/steel_rain && forge test' → Finished: 31 tests, 0 failures)
+Task 6: Ruling: a weapon's rounds are traced together against the world as it was when it fired; carving happens round by round after — rounds of one shot fly together — cost: a round cannot pass through a hole an earlier round of the same shot opened.
+Task 6: Ruling: Ground.carve returns every change (the blast's and the fall's), not only the blast's, so the grid is re-read wherever the world changed — cost: none.
+Task 6: Ruling: the shooter's own boxes are left out of its shots (its muzzle sits inside them) — cost: none. The wall fixture is 16 voxels high, not 3 (a 1.2 m wall does not cover a 4.5 m mech) — cost: none.
+Task 6: complete (commits 0dd2f91..0e82edd, tests: sh -c '. scripts/env.sh && cd games/steel_rain && forge test' → Finished: 39 tests, 0 failures)
+Task 7: Ruling: "a tile no longer holds a mech" is the grid's own test (Grid.fits: standable with room for its height), not a count of columns; and a sliding mech goes to the lowest neighbour that holds it (ties +x, -x, +z, -z), since the fight does not keep neighbours' old floors — cost: it may slide away from, not towards, the side that was lost.
+Task 7: Ruling: a wreck or lost part leaves the bottom third of its boxes as rubble; wrecks and lost parts re-read the grid but cause no further falls or debris damage (no cascades) — cost: a wreck landing on a ledge cannot knock a mech off it.
+Task 7: complete (commits 0e82edd..fcc2dd4, tests: sh -c '. scripts/env.sh && cd games/steel_rain && forge test' → Finished: 42 tests, 0 failures)
+Task 8: Ruling: a watch's weapon is kept beside its arc (Fight.fg_watch_weapons: owner, weapon path), since StrataTactics.Watch.Arc carries no weapon — cost: none. Water and sink tiles are closed to movement until stage 5 (floods and wading) — cost: hover cannot cross water yet.
+Task 8: complete (commits fcc2dd4..12e658e, tests: sh -c '. scripts/env.sh && cd games/steel_rain && forge test' → Finished: 48 tests, 0 failures)
+Task 9: Ruling: the depot is a list of cells (Missions.depot_cells: a 12 x 12 concrete shed with a doorway and roof) set with Edit.set_many, not a Template — its cells are what the win check counts — cost: none. Mission state readers (depot_left/start/point, decide) live in Fight, Missions holds only rules and the depot's shape (the two modules would otherwise need each other).
+Task 9: Ruling: an emplacement sees as far as its gun reaches (80 m), not its core part's 40 m sight tag — found when a frail Warden outranged the battery and won untouched — cost: emplacements see further than mechs.
+Task 9: Ruling: emplacements are boxes in the fight, not voxels in the world (the screen draws them) — cost: they block rounds but not sight lines or movement onto their tiles beyond being units.
+Task 9: complete (commits 12e658e..d034efb, tests: sh -c '. scripts/env.sh && cd games/steel_rain && forge test' → Finished: 52 tests, 0 failures)
+Task 10: Ruling: keys: 1 / 2 pick weapons, Enter fires, T watches (W is the camera's pan), B braces, X withdraws, Space ends — cost: none.
+Task 10: Ruling: each figure's rig is uploaded by id (Render.refresh_rig): Render.figures finds rigs by value, so four equal Warden rigs all mapped to the first id and only one was drawn — a Strata pitfall worth a doc line later — cost: none.
+Task 10: Ruling: the scripted run is driven by fight state (walk up to 3 tiles south, fire at the nearest emplacement, end) whenever nothing plays, not at fixed frames; the record picture is frame 432 at yaw 225 (STRATA_FRAMES=435), a tracer arriving at the battery — cost: none.
+Task 10: not done by me: playing the screen windowed with mouse and keys (a person at the keyboard). Checked by the scripted run's pictures: four Wardens, the battery, a tracer, a crater.
+Task 10: complete (commits d034efb..a576af3, tests: sh -c '. scripts/env.sh && cd games/steel_rain && forge test' → Finished: 54 tests, 0 failures)
+Task 11: Ruling: the scripted player is a library module (SteelRain.Script), shared by the test and the bench; the bench is STRATA_BENCH=1 on the game's release binary, not a separate package (a package depending on the app would bring a second main) — cost: none.
+Task 11: Ruling: the game's Destroy map runs StrataMaps.TrailStage (landings) after generate_ground and rebuilds its generator, so spawns have level ground — cost: none.
+Task 11: FINDING (not fixed): on generated 64-tile maps (seeds 5, 7) StrataMaps.Sites.place cannot place "spawn north" although every north-row tile is standable and dry: the mainland choice drops them. The bench defaults to 48 tiles meanwhile. Needs a look in strata_maps (Sites.mainland).
+Task 11: timings, release, seed 5, two Wardens, scripted to the end, 0 orders refused: 16 tiles map 104 ms / setup 33 ms / fight 77 ms (15 orders); 32 tiles 494 / 78 / 4151 ms (274 orders, about 15 ms an order); 48 tiles 633 / 139 / 168 ms (24 orders). All under the minute budget. Every fight was lost: three emplacements' delay pins the Wardens (each gun hit takes 8 CT; three guns outpace a Warden's turns) — balance for stage 2.
+Task 11: gate: game 55/55, tactics 99/99, maps 77/77, root 1017/1017, lint clean, verify.sh PASS (golden).
