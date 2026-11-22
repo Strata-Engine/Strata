@@ -1,6 +1,6 @@
 # Battle ledger
 
-Stage 1 of docs/2026-11-22-battle-design.md (plan: docs/2026-11-22-battle-plan.md). The full working ledger, rulings included, is reproduced here.
+Stage 1 of docs/2026-11-22-battle-design.md (plan: docs/2026-11-22-battle-plan.md). The working ledger, rulings, review and fixes included.
 
 Spec: docs/2026-11-22-battle-design.md
 Pre-flight: T5 consumes T3 (speed, mover, shed) and T4 (Hull.of) — consistent. T6 consumes T2 Shot.fire/Box/Round and T4 boxes/muzzle — consistent (bx_part = node index). T6 consumes T1 Clock.delay — consistent. T8 consumes T1 Watch.triggered (sees: Arc -> Bool) — consistent. T9 Mission extends T5's MNone; Result_ defined in T5 — consistent after self-review fix. T7 consumes T6 Ground.drop — consistent. T10/T11 consume Fight/Event — consistent.
@@ -38,3 +38,22 @@ Task 11: Ruling: the game's Destroy map runs StrataMaps.TrailStage (landings) af
 Task 11: FINDING (not fixed): on generated 64-tile maps (seeds 5, 7) StrataMaps.Sites.place cannot place "spawn north" although every north-row tile is standable and dry: the mainland choice drops them. The bench defaults to 48 tiles meanwhile. Needs a look in strata_maps (Sites.mainland).
 Task 11: timings, release, seed 5, two Wardens, scripted to the end, 0 orders refused: 16 tiles map 104 ms / setup 33 ms / fight 77 ms (15 orders); 32 tiles 494 / 78 / 4151 ms (274 orders, about 15 ms an order); 48 tiles 633 / 139 / 168 ms (24 orders). All under the minute budget. Every fight was lost: three emplacements' delay pins the Wardens (each gun hit takes 8 CT; three guns outpace a Warden's turns) — balance for stage 2.
 Task 11: gate: game 55/55, tactics 99/99, maps 77/77, root 1017/1017, lint clean, verify.sh PASS (golden).
+Task 11: complete (commits a576af3..c62ff53, tests: sh -c '. scripts/env.sh && cd games/steel_rain && forge test' → Finished: 55 tests, 0 failures)
+Final review: fresh reviewer (opus). 0 Critical, 5 Important, 12 Minor. Assessment: ready with fixes.
+Final: fixed a move ending on an ally's tile — "a move cannot end on an ally's tile" RED→GREEN, suite 62/62
+Final: fixed units that are out still firing (shoot gated on state; out() clears the watch weapon) — "a unit that is out fires nothing", "a unit taken out leaves no watch weapon behind" RED→GREEN, suite 62/62
+Final: fixed the aiming cone/preview and range check traced from the old facing (Fight.volley_yaw used for both) — "the aiming cone starts at the muzzle the shot will fire from" RED→GREEN, suite 62/62
+Final: fixed the left-arm autocannon unreachable by hand (keys 1-4 pick the build's weapons in order: Screen.weapons) — "every weapon a mech carries can be picked" RED→GREEN, suite 62/62
+Final: fixed Destroy unwinnable with default numbers (emplacement gun damage 8 to 6, delay 8 to 3, armour 60 to 40, speed 5 to 3) — "the scripted player can win a Destroy fight with the default numbers and the game's four Wardens" RED→GREEN, suite 62/62. Bench, four Wardens, release: 16 tiles seeds 5/7 won (fight 337 / 1988 ms), 32 tiles won (2292 / 2525 ms), 48 tiles lost (1045 / 857 ms); 0 refused anywhere.
+Final: fixed (promoted from Minor: the owner's falling rule, spec "more than the mech's drop") the safe fall is the mech's own drop, not a global step — "a fall no deeper than the mech's own drop does not hurt its legs" RED→GREEN, suite 62/62; the slab fixture raised to 10 voxels so the old falling test still falls past the drop.
+Final: Ruling: slide direction stays "lowest neighbour that holds it" rather than "towards the side the ground was lost" (the reviewer notes the old grid is at hand in carve_at) — the slide still lands somewhere legal and lower — cost: shooting a ridge out may tip a mech off the far side, making the drop-it-in-the-river tactic less predictable.
+Final: minor (deferred): debris counts rubble landing anywhere in the tile column (below the mech too) and hits only the core, not "core and top parts"
+Final: minor (deferred): a faller with no free neighbour shares the held tile with no bump
+Final: minor (deferred): emplacements are not moved/evented when ground under them is carved; wreck rubble raises neighbours' floors with no footing check; a watcher that falls keeps its arc on its old tile
+Final: minor (deferred): rounds do not stop at the map's edge (they carve terrain outside the playable square)
+Final: minor (deferred): events of turns before the first player turn are dropped by begin (latent while mechs act first)
+Final: minor (deferred): emplacement auto-turns recurse without one shared guard (no loop found today; deep stack under long pins; a mission-less fight of only emplacements would recurse)
+Final: minor (deferred): emplacement watch range (10 tiles) differs from its own-turn range (25); its eye height comes from the Warden core tag; its own-turn shot has no range check
+Final: minor (deferred): moving after firing, and watch fire, can push heat past the cap; a hit taken during a unit's own turn suppresses the rest of that turn, not its next
+Final: minor (deferred): move_check wants Reach's exact path, not any walkable one (a stage-2 AI will meet this)
+Final: minor (deferred): no determinism test replays a fight with shots, carving and watches; the knockout test does not check later watches stay quiet

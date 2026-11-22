@@ -316,7 +316,8 @@ mod SteelRain.Fight do
     else if !mobile(f, m) do Some("it cannot move")
     else match List.reverse(path) do
       Nil -> Some("a move needs a path")
-      Cons(last, _) -> if List.length(path) < 2 || StrataTactics.Reach.path(reach(f, m), last) != path do Some("it cannot walk that path") else None end
+      Cons(last, _) -> let r = reach(f, m)
+        if List.length(path) < 2 || !List.member(StrataTactics.Reach.tiles(r), last) || StrataTactics.Reach.path(r, last) != path do Some("it cannot walk that path") else None end
     end end end
   end
   -- mech [id] walks [path] tile by tile; enemies' watches covering a tile it enters fire on it; it stops where it is knocked out or loses its legs
@@ -430,14 +431,14 @@ mod SteelRain.Fight do
     else if List.is_empty(shots) do Some("a volley needs a weapon")
     else if List.length(List.dedup(paths)) != List.length(paths) do Some("each weapon fires once a volley")
     else if List.any(shots, fn s -> match s do (p, _) -> Option.is_none(weapon_at(f, m, p)) end) do Some("that is not a weapon it carries")
-    else if List.any(shots, fn s -> out_of_range(f, m, s)) do Some("out of range")
+    else if List.any(shots, fn s -> out_of_range(f, m, volley_yaw(f, m, shots), s)) do Some("out of range")
     else if m.mc_heat + heat_of_volley(f, m, shots) > (SteelRain.Rules.numbers()).rn_heat_cap do Some("too hot to fire all of that")
     else None end end end end end end
   end
-  pfn out_of_range(f : Fight, m : Mech, s : (List(String), (Float, Float, Float))) : Bool do
+  pfn out_of_range(f : Fight, m : Mech, yaw : Float, s : (List(String), (Float, Float, Float))) : Bool do
     match s do
       (p, aim) -> match weapon_at(f, m, p) do
-        Some(w) -> dist(SteelRain.Hull.muzzle(m.mc_hull, p, pos(f, m), m.mc_yaw), aim) > w.wp_max
+        Some(w) -> dist(SteelRain.Hull.muzzle(m.mc_hull, p, pos(f, m), yaw), aim) > w.wp_max
         None -> true
       end
     end
@@ -446,9 +447,13 @@ mod SteelRain.Fight do
   pfn yaw_between(a : (Float, Float, Float), b : (Float, Float, Float)) : Float do
     match (a, b) do ((ax, _, az), (bx, _, bz)) -> if Math.abs(bx -. ax) +. Math.abs(bz -. az) < 0.000001 do 0.0 else Math.atan2(bz -. az, bx -. ax) end end
   end
+  doc "The facing mech [m] fires volley [shots] from: towards its first aim."
+  fn volley_yaw(f : Fight, m : Mech, shots : List((List(String), (Float, Float, Float)))) : Float do
+    match shots do Cons((_, aim), _) -> yaw_between(pos(f, m), aim) | Nil -> m.mc_yaw end
+  end
   -- a checked volley: the mech turns to its first aim, each weapon fires in turn, then it has acted
   pfn volley(f : Fight, m : Mech, shots : List((List(String), (Float, Float, Float)))) : (Fight, List(Event)) do
-    let yaw = match shots do Cons((_, aim), _) -> yaw_between(pos(f, m), aim) | Nil -> m.mc_yaw end
+    let yaw = volley_yaw(f, m, shots)
     let f0 = update(f, m.mc_id, fn x -> { x with mc_yaw: yaw })
     match List.fold_left(shots, (f0, Nil), fn (acc, s) -> shot_step(m.mc_id, acc, s)) do
       (f1, evs) -> (update(f1, m.mc_id, fn x -> { x with mc_acted: true }), evs)
@@ -469,10 +474,11 @@ mod SteelRain.Fight do
       +. (if m.mc_moved do n.rn_moved_spread else 0.0 end) +. (if m.mc_hit_this_round do n.rn_suppressed_spread else 0.0 end) +. (if m.mc_heat >= n.rn_heat_warn do n.rn_hot_spread else 0.0 end)
   end
   -- one weapon of mech [id] at [aim]: its rounds, then its heat
-  pfn shoot(f : Fight, id : Int, p : List(String), aim : (Float, Float, Float)) : (Fight, List(Event)) do
+  doc "One weapon [p] of unit [id] fired at [aim]: its rounds land, then its heat."
+  fn shoot(f : Fight, id : Int, p : List(String), aim : (Float, Float, Float)) : (Fight, List(Event)) do
     match mech(f, id) do
       None -> (f, Nil)
-      Some(m) -> match weapon_at(f, m, p) do
+      Some(m) -> if m.mc_state != 0 do (f, Nil) else match weapon_at(f, m, p) do
         None -> (f, Nil)
         Some(w) ->
           let muzzle = SteelRain.Hull.muzzle(m.mc_hull, p, pos(f, m), m.mc_yaw)
@@ -485,7 +491,7 @@ mod SteelRain.Fight do
               let heat = (match mech(f2, id) do Some(x) -> x.mc_heat | None -> 0 end) + w.wp_heat
               (update(f2, id, fn x -> { x with mc_heat: heat }), List.append(evs, [EHeat(id, heat)]))
           end
-      end
+      end end
     end
   end
   pfn round_step(id : Int, w : SteelRain.Rules.Weapon, shot : Int, acc : (Fight, List(Event)), e : (Int, StrataTactics.Shot.ShotRound)) : (Fight, List(Event)) do
@@ -572,20 +578,21 @@ mod SteelRain.Fight do
   pfn bump_step(amount : Int, acc : (Fight, List(Event)), x : Mech) : (Fight, List(Event)) do
     match acc do (fa, ea) -> adding(ea, damage(fa, x.mc_id, Nil, amount)) end
   end
-  doc "Mech [id] falls from floor [old] onto tile [t]: past the safe drop its movement piece is hurt by the steps fallen, its core too past the core height, and it loses CT by the steps."
+  doc "Mech [id] falls from floor [old] onto tile [t]: past its own drop (its mover's) its movement piece is hurt by the steps fallen, its core too past the core height, and it loses CT by the steps."
   fn fall(f : Fight, id : Int, t : (Int, Int), old : Int) : (Fight, List(Event)) do
     let n = SteelRain.Rules.numbers()
     let step = Math.max_int(1, f.fg_map.md_settings.ms_step)
     let steps = Math.max_int(0, old - FgG.floor(f.fg_grid, t)) / step
     let f0 = update(f, id, fn x -> { x with mc_tile: t })
     let ev0 = [EMechFell(id, t, steps)]
-    if steps <= n.rn_fall_safe do (f0, ev0)
+    let safe = match mech(f, id) do Some(x) -> (SteelRain.Rules.mover(f.fg_parts, x.mc_build)).mv_drop | None -> n.rn_fall_safe end
+    if steps <= safe do (f0, ev0)
     else
       match mech(f0, id) do
         None -> (f0, ev0)
         Some(m) ->
           let legs = movement_node(f0, m)
-          match (if steps > n.rn_fall_safe do damage(f0, id, legs, n.rn_fall_per_step * (steps - n.rn_fall_safe)) else (f0, Nil) end) do
+          match (if steps > safe do damage(f0, id, legs, n.rn_fall_per_step * (steps - safe)) else (f0, Nil) end) do
             (f1, ev1) -> match (if steps > n.rn_fall_core do damage(f1, id, Nil, n.rn_fall_per_step * (steps - n.rn_fall_core)) else (f1, Nil) end) do
               (f2, ev2) -> match delay(f2, id, n.rn_fall_ct_per_step * steps) do
                 (f3, ev3) -> (f3, List.append(ev0, List.append(ev1, List.append(ev2, ev3))))
@@ -719,7 +726,7 @@ mod SteelRain.Fight do
       None -> (f, Nil)
       Some(m) ->
         let f1 = update(f, u, fn x -> { x with mc_state: 2 })
-        let f2 = { f1 with fg_clock: FgC.remove(f1.fg_clock, u), fg_watches: List.filter(f1.fg_watches, fn a -> a.wa_owner != u) }
+        let f2 = drop_watch({ f1 with fg_clock: FgC.remove(f1.fg_clock, u) }, u)
         match wreck(f2, m, StrataKit.Build.paths(m.mc_build)) do (f3, ev) -> (f3, Cons(EState(u, 2), ev)) end
     end
   end
