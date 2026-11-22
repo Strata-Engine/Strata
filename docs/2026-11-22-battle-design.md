@@ -1,6 +1,6 @@
 # Steel Rain's battle
 
-Status: design, for approval. Nothing is built.
+Status: approved 2026-11-22. Nothing is built.
 Date: 2026-11-22
 Follows: `2026-11-20-plugins-tactics-design.md` (the plugin shape and
 `strata_tactics`), `2026-11-20-mech-construction-design.md` (`strata_kit` and
@@ -168,7 +168,7 @@ Firing one weapon at a point (a tile, a voxel, or a part of a seen enemy):
    strikes a solid voxel or a unit's hit volume, or leaves the map.
 4. A round that strikes **terrain** carves it (a small blast at that point,
    `Strata.Edit.blast` with the weapon's radius) and loose pieces fall
-   (see Falling, below). Cover wears away this way, and buildings come
+   (see Falling, below); any mech whose footing went falls (Mechs falling). Cover wears away this way, and buildings come
    down.
 5. A round that strikes a **unit**, of either side, hits the part whose box
    it entered first (below), dealing its damage to that part. There is no
@@ -194,11 +194,38 @@ pieces are found (`Strata.Support.loose`, over a box round the change, as
 the ruin pass does with `loose_box`) and handled the same way every time:
 the piece is removed and its voxels drop straight down, column by column,
 onto the first solid below, as rubble blocks (the ruin pass's rubble heap,
-generalised). A unit whose tile's floor drops falls with it to the new
-floor and its movement piece takes damage by the height fallen; debris
-landing on a unit's tile damages its core and top parts by the debris's
-volume. The screen may animate the fall, but the voxels end where the
-fight put them.
+generalised). Debris landing on a unit's tile damages its core and top
+parts by the debris's volume. The screen may animate the fall, but the
+voxels end where the fight put them.
+
+### Mechs falling (the owner's change)
+
+Ground a mech stands on can be shot out from under it: an embankment, a
+ledge, a roof, a bridge deck. After every change to the world, each unit's
+footing is checked:
+
+- **its tile's floor dropped**: the mech falls straight down to the new
+  floor of its tile;
+- **its tile no longer holds it** (no floor left within its height of
+  where it stood, or what is left is too narrow or too steep to stand on:
+  less than half the tile's columns within one step of its old floor):
+  it slides off to the lowest tile next to it it can stand on, towards
+  the side the ground was lost, and falls to that tile's floor.
+
+A fall of more than the mech's drop:
+- damages its movement piece by the height fallen, and its core as well
+  past a second, larger height (rules numbers);
+- knocks it down: it loses CT by the height fallen, so it acts later;
+- may put it in water or lava, with their rules.
+
+A mech that lands on another unit's tile takes the lowest free tile next
+to it instead, and both take a small amount of damage.
+
+This is a tactic in its own right: shooting the bank out from under an
+enemy on high ground drops it, delayed and damaged, into the open or into
+the river. The AI knows it both ways: standing on ground that can be shot
+away under it (thin banks, ledges, decks over a drop) counts as exposure,
+and dropping an enemy is a shot it can value.
 
 ### Damage
 
@@ -327,6 +354,8 @@ the game supplies, and return the best few. Steel Rain's terms:
 - shots available from the tile (seen targets in range, with the cone's
   expected hits and the facing bonus, less allies inside the cone);
 - water and lava: depth against wade, rising floods, heat from lava;
+- footing: how much of the ground holding the tile could be shot away, and
+  the drop below it;
 - exposure: known enemies and watches that could see it;
 - distance to the unit's goal (its squad role's target);
 - heat and damage: a hot or badly damaged unit weighs cover and distance
@@ -410,7 +439,8 @@ The project is big; it is built in stages, each ending with something that
 plays:
 
 1. **Core rules and Destroy, both sides played by hand.** Fight state,
-   `step`, moving, cone shots against terrain and parts, falling, damage,
+   `step`, moving, cone shots against terrain and parts, falling terrain
+   and mechs falling, damage,
    delay, heat, withdrawal, emplacements, the Destroy mission, the screen
    for all of it. Headless tests play scripted fights to the end.
 2. **Fog of war and the enemy AI**: per-side sight first (so the AI never
