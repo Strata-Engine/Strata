@@ -173,6 +173,10 @@ static SaAlloc g_bbytes;       /* ranges of the body class buffer, in 32-bit wor
 #define SV_LOOSE_QUADS 262144  /* 16 MB of 64-byte loose quads */
 #define SV_MAX_MODELS 4096
 
+/* One batched slot as prepare_mesh_batches culls it (see batch_cull_refresh). */
+#define BATCH_CULL_HIDDEN 0x80000000u
+struct BatchCull { float lo[3], hi[3]; uint32_t proto, quads; };
+
 static struct {
     GLFWwindow *win;
     VkInstance inst;
@@ -281,6 +285,7 @@ static struct {
     uint32_t tile_px, layers; unsigned char *tex_staging; int aniso;
     int batch_shared;
     uint32_t *batch_slots, *batch_at;        /* dense list of active shared slots, and positions plus one */
+    struct BatchCull *batch_cull;            /* what the CPU cull reads of each, in batch_slots' order */
     uint32_t *motion;                        /* each slot's motion record (SV_MOTION_WORDS words) */
     int16_t *motion_box;                     /* each moving slot's low and high corner, voxels from its origin */
     double motion_epoch; int motion_epoch_set;
@@ -2313,12 +2318,13 @@ int64_t sv_open_slots(int64_t w, int64_t h, int64_t capture_mouse, int64_t quad_
     if (g.batch_shared) {
         g.batch_slots = malloc(g.slot_cap * sizeof *g.batch_slots);
         g.batch_at = calloc(g.slot_cap, sizeof *g.batch_at);
+        g.batch_cull = malloc(g.slot_cap * sizeof *g.batch_cull);
         g.batch_visible = malloc(g.slot_cap * sizeof *g.batch_visible);
         g.batch_keys = malloc(g.slot_cap * sizeof *g.batch_keys);
         g.batches = calloc(g.slot_cap, sizeof *g.batches);
         g.motion = calloc((size_t)g.slot_cap * SV_MOTION_WORDS, sizeof *g.motion);
         g.motion_box = calloc((size_t)g.slot_cap * 6, sizeof *g.motion_box);
-        if (!g.batch_slots || !g.batch_at || !g.batch_visible || !g.batch_keys || !g.batches || !g.motion || !g.motion_box) return 0;
+        if (!g.batch_slots || !g.batch_at || !g.batch_cull || !g.batch_visible || !g.batch_keys || !g.batches || !g.motion || !g.motion_box) return 0;
     }
     g.trans = calloc(g.slot_cap, sizeof *g.trans);
     g.trans_at = malloc(g.slot_cap * sizeof *g.trans_at);
@@ -2574,7 +2580,7 @@ void sv_close(void) {
     if (g.win) glfwDestroyWindow(g.win);
     glfwTerminate();
     free(g.trans); free(g.trans_at); free(g.trans_keys); free(g.trans_ord);
-    free(g.batch_slots); free(g.batch_at); free(g.motion); free(g.motion_box); g.motion = NULL; g.motion_box = NULL; free(g.batch_visible); free(g.batch_keys); free(g.batches);
+    free(g.batch_slots); free(g.batch_at); free(g.batch_cull); g.batch_cull = NULL; free(g.motion); free(g.motion_box); g.motion = NULL; g.motion_box = NULL; free(g.batch_visible); free(g.batch_keys); free(g.batches);
     free(g.spray_births); g.spray_births = NULL;
     free(g.ui_cpu); g.ui_cpu = NULL; g.ui_n = 0;
     free(g.ovl_cpu); g.ovl_cpu = NULL; g.ovl_n = 0;
@@ -3414,15 +3420,40 @@ static void release_mesh(const ChunkEntry *e) {
     sa_release(&g_loose, (Range){ e->first[4], e->count[4] }, g.frame_no);
 }
 
+/* What prepare_mesh_batches reads of a batched slot, kept beside batch_slots in the same
+ * order so its per-frame cull streams one array instead of chasing each slot's ChunkEntry,
+ * prototype and motion box (at 300k batched slots that chase was ~11ms of CPU a frame).
+ * lo/hi are the slot's box in voxels before its prototype's extent is added (origin - 1 +
+ * the motion box's low corner, origin + its high corner); proto carries BATCH_CULL_HIDDEN
+ * while the slot is hidden. batch_cull_refresh rewrites a slot's record wherever what it
+ * reads changes: sv_chunk_instance, sv_chunk_motion and sv_chunk_show; track_batch moves it
+ * with its slot. */
+static void batch_cull_refresh(uint32_t slot) {
+    uint32_t at = g.batch_shared ? g.batch_at[slot] : 0;
+    if (!at) return;
+    const ChunkEntry *e = &g.entries[slot];
+    static const int16_t none[6] = { 0, 0, 0, 0, 0, 0 };
+    const int16_t *box = (e->level_flags & SV_MOTION) ? g.motion_box + (size_t)slot * 6 : none;
+    struct BatchCull *r = &g.batch_cull[at - 1];
+    for (int k = 0; k < 3; k++) {
+        r->lo[k] = e->origin[k] - 1 + box[k];
+        r->hi[k] = e->origin[k] + box[3 + k];
+    }
+    r->proto = e->first[5] | ((e->level_flags & SV_HIDDEN) ? BATCH_CULL_HIDDEN : 0);
+    r->quads = e->count[0];
+}
+
 static void track_batch(uint32_t slot, int batched) {
     if (!g.batch_shared) return;
     uint32_t at = g.batch_at[slot];
     if (batched && !at) {
         g.batch_slots[g.num_batch_slots++] = slot;
         g.batch_at[slot] = g.num_batch_slots;
+        batch_cull_refresh(slot);
     } else if (!batched && at) {
         uint32_t last = g.batch_slots[--g.num_batch_slots];
         g.batch_slots[at - 1] = last;
+        g.batch_cull[at - 1] = g.batch_cull[g.num_batch_slots];
         g.batch_at[last] = at;
         g.batch_at[slot] = 0;
     }
@@ -3467,6 +3498,7 @@ int64_t sv_chunk_instance(int64_t slot, int64_t prototype, double x, double y, d
     track_batch((uint32_t)slot, batched);
     target->first[5] = (uint32_t)prototype;
     target->level_flags = SV_IN_USE | SV_SHARED | hidden | (batched ? SV_BATCHED : 0);
+    batch_cull_refresh((uint32_t)slot);
     if ((uint32_t)slot + 1 > g.hi_slot) g.hi_slot = (uint32_t)slot + 1;
     touch((uint32_t)slot);
     return 1;
@@ -3536,6 +3568,7 @@ int64_t sv_chunk_motion(int64_t slot, int64_t prototype, double t0, double t1, d
     memcpy(g.motion + (size_t)slot * SV_MOTION_WORDS, rec, sizeof rec);
     memcpy(g.motion_box + (size_t)slot * 6, box, sizeof box);
     e->level_flags = (e->level_flags | SV_MOTION) & ~SV_HIDDEN;
+    batch_cull_refresh((uint32_t)slot);
     touch((uint32_t)slot);
     return 1;
 }
@@ -3661,7 +3694,7 @@ void sv_chunk_show(int64_t slot, int64_t shown) {
     ChunkEntry *e = &g.entries[slot];
     int32_t was = e->level_flags;
     if (shown) e->level_flags &= ~SV_HIDDEN; else e->level_flags |= SV_HIDDEN;
-    if (e->level_flags != was) touch((uint32_t)slot);
+    if (e->level_flags != was) { batch_cull_refresh((uint32_t)slot); touch((uint32_t)slot); }
 }
 
 /* Give model [index] its drawing geometry: [nquads] quads of 21 floats
@@ -3859,24 +3892,6 @@ static void heal_fence(Frame *F) {
 }
 
 /* The OpenGL clip planes used by the chunk culler, tested against the mesh bounds. */
-static int batch_in_view(uint32_t slot, const ChunkEntry *entry, const MeshBatch *batch, float scale,
-                         const float planes[6][4]) {
-    /* a moving slot can be anywhere in its motion's box */
-    const int16_t *box = (entry->level_flags & SV_MOTION) ? g.motion_box + (size_t)slot * 6 : NULL;
-    const float lo[3] = { (entry->origin[0] - 1 + (box ? box[0] : 0)) * scale, (entry->origin[1] - 1 + (box ? box[1] : 0)) * scale,
-                          (entry->origin[2] - 1 + (box ? box[2] : 0)) * scale };
-    const float hi[3] = { (entry->origin[0] + batch->extent[0] + (box ? box[3] : 0)) * scale,
-                          (entry->origin[1] + batch->extent[1] + (box ? box[4] : 0)) * scale,
-                          (entry->origin[2] + batch->extent[2] + (box ? box[5] : 0)) * scale };
-    for (int i = 0; i < 6; i++) {
-        const float *p = planes[i];
-        float d = p[0] * (p[0] < 0 ? lo[0] : hi[0]) + p[1] * (p[1] < 0 ? lo[1] : hi[1]) +
-                  p[2] * (p[2] < 0 ? lo[2] : hi[2]) + p[3];
-        if (d < -0.0001f) return 0;
-    }
-    return 1;
-}
-
 static void prepare_mesh_batches(Frame *F, uint32_t base) {
     F->batch_instances = F->batch_quads = 0;
     g.num_batch_keys = g.batch_visible_count = g.batch_draws = 0;
@@ -3888,15 +3903,27 @@ static void prepare_mesh_batches(Frame *F, uint32_t base) {
             planes[axis * 2][col] = vp[col * 4 + 3] + vp[col * 4 + axis];
             planes[axis * 2 + 1][col] = vp[col * 4 + 3] - vp[col * 4 + axis];
         }
+    const float scale = vp[31];
     for (uint32_t i = 0; i < g.num_batch_slots; i++) {
-        uint32_t slot = g.batch_slots[i];
-        const ChunkEntry *entry = &g.entries[slot];
-        uint32_t prototype = entry->first[5];
+        const struct BatchCull *r = &g.batch_cull[i];
+        if (r->proto & BATCH_CULL_HIDDEN) continue;
+        uint32_t prototype = r->proto;
         MeshBatch *batch = &g.batches[prototype];
-        if ((entry->level_flags & SV_HIDDEN) || !batch_in_view(slot, entry, batch, vp[31], planes)) continue;
+        /* batch_in_view's box, from the record */
+        const float lo[3] = { r->lo[0] * scale, r->lo[1] * scale, r->lo[2] * scale };
+        const float hi[3] = { (r->hi[0] + batch->extent[0]) * scale, (r->hi[1] + batch->extent[1]) * scale,
+                              (r->hi[2] + batch->extent[2]) * scale };
+        int in = 1;
+        for (int k = 0; k < 6 && in; k++) {
+            const float *p = planes[k];
+            float d = p[0] * (p[0] < 0 ? lo[0] : hi[0]) + p[1] * (p[1] < 0 ? lo[1] : hi[1]) +
+                      p[2] * (p[2] < 0 ? lo[2] : hi[2]) + p[3];
+            if (d < -0.0001f) in = 0;
+        }
+        if (!in) continue;
         if (!batch->count++) g.batch_keys[g.num_batch_keys++] = prototype;
-        g.batch_visible[g.batch_visible_count++] = slot;
-        F->batch_quads += entry->count[0];
+        g.batch_visible[g.batch_visible_count++] = g.batch_slots[i];
+        F->batch_quads += r->quads;
     }
     F->batch_instances = g.batch_visible_count;
     uint32_t next = base;
