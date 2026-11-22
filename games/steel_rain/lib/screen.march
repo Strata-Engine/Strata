@@ -1,0 +1,134 @@
+-- SteelRain.Screen — what the fight screen shows, kept apart from its loop.
+--
+-- The screen decides nothing: the fight's events become beats played one
+-- after another (a tile walked, a tracer per round, ground carved and
+-- fallen, a part struck, a part lost, a mech falling, a mech out), and the
+-- views (the aiming cone, the expected spread of hits, watch arcs) are
+-- drawn from the fight as it is. Nothing here needs a window.
+mod SteelRain.Screen do
+
+  -- a beat: walk mech to a tile; a tracer (shooter, where the round ended, its direction); ground carved; cells fallen;
+  -- a part struck on a unit (where, the round's direction); a part lost; a mech set down on a tile; a unit out
+  type Beat = BWalk(Int, (Int, Int)) | BTracer(Int, (Float, Float, Float), (Float, Float, Float)) | BCarve(List(Strata.Edit.Change)) | BFell(List((Int, Int, Int, Int)))
+            | BHit(Int, (Float, Float, Float), (Float, Float, Float)) | BLost(Int) | BPlace(Int, (Int, Int)) | BOut(Int)
+
+  doc "The beats that play the events [evs], in their order."
+  fn queue(evs : List(SteelRain.Fight.Event)) : List(Beat) do List.flat_map(evs, beats_of) end
+  pfn beats_of(e : SteelRain.Fight.Event) : List(Beat) do
+    match e do
+      EMoved(id, t) -> [BWalk(id, t)]
+      ERound(id, r) -> Cons(BTracer(id, r.rd_end, r.rd_dir), match r.rd_struck do SBox(u, _, at) -> [BHit(u, at, r.rd_dir)] | _ -> Nil end)
+      ECarved(cs) -> [BCarve(cs)]
+      EFell(cells) -> [BFell(cells)]
+      EPartLost(u, _) -> [BLost(u)]
+      EMechFell(u, t, _) -> [BPlace(u, t)]
+      EState(u, s) -> if s == 2 do [BOut(u)] else Nil end
+      _ -> Nil
+    end
+  end
+  doc "How long a beat holds the queue (seconds): a walk until the figure arrives (the loop waits for it), the rest these."
+  fn beat_time(b : Beat) : Float do
+    match b do BTracer(_, _, _) -> 0.06 | BOut(_) -> 0.3 | BLost(_) -> 0.15 | _ -> 0.0 end
+  end
+
+  doc "The colour of something the player should not shoot: an ally inside a cone."
+  fn warning() : (Float, Float, Float, Float) do (1.0, 0.25, 0.15, 0.9) end
+  doc "The colour of the cone's edge lines."
+  fn cone_colour() : (Float, Float, Float, Float) do (1.0, 0.85, 0.3, 0.7) end
+  doc "The colour of an expected hit on an enemy."
+  fn hit_colour() : (Float, Float, Float, Float) do (1.0, 0.95, 0.4, 0.95) end
+  doc "The colour of an expected hit on terrain."
+  fn ground_colour() : (Float, Float, Float, Float) do (0.75, 0.75, 0.75, 0.8) end
+
+  pfn add(a : (Float, Float, Float), b : (Float, Float, Float)) : (Float, Float, Float) do match (a, b) do ((ax, ay, az), (bx, by, bz)) -> (ax +. bx, ay +. by, az +. bz) end end
+  pfn sub(a : (Float, Float, Float), b : (Float, Float, Float)) : (Float, Float, Float) do match (a, b) do ((ax, ay, az), (bx, by, bz)) -> (ax -. bx, ay -. by, az -. bz) end end
+  pfn scale(a : (Float, Float, Float), k : Float) : (Float, Float, Float) do match a do (x, y, z) -> (x *. k, y *. k, z *. k) end end
+  pfn len(a : (Float, Float, Float)) : Float do match a do (x, y, z) -> Math.sqrt(x *. x +. y *. y +. z *. z) end end
+  pfn cross(a : (Float, Float, Float), b : (Float, Float, Float)) : (Float, Float, Float) do
+    match (a, b) do ((ax, ay, az), (bx, by, bz)) -> (ay *. bz -. az *. by, az *. bx -. ax *. bz, ax *. by -. ay *. bx) end
+  end
+  pfn unit(a : (Float, Float, Float)) : (Float, Float, Float) do let l = len(a)
+    if l < 0.000001 do (1.0, 0.0, 0.0) else scale(a, 1.0 /. l) end end
+  -- a small square marker facing up at [p]
+  pfn marker(p : (Float, Float, Float), r : Float, c : (Float, Float, Float, Float)) : Strata.Overlay.Item do
+    match p do (x, y, z) -> Strata.Overlay.quad([(x -. r, y, z -. r), (x +. r, y, z -. r), (x -. r, y, z +. r), (x +. r, y, z +. r)], c, true) end
+  end
+
+  doc "What mech [id] firing weapon [weapon] at [aim] shows: eight lines from the muzzle round the cone's edge at the aim's distance, and a marker where each part of the expected spread lands (StrataTactics.Shot.preview), an ally's in the warning colour."
+  fn cone_items(f : SteelRain.Fight.Fight, id : Int, weapon : List(String), aim : (Float, Float, Float)) : List(Strata.Overlay.Item) do
+    match SteelRain.Fight.mech(f, id) do
+      None -> Nil
+      Some(m) -> match SteelRain.Fight.weapon_at(f, m, weapon) do
+        None -> Nil
+        Some(w) ->
+          let from = SteelRain.Hull.muzzle(m.mc_hull, weapon, SteelRain.Fight.pos(f, m), m.mc_yaw)
+          let d = len(sub(aim, from))
+          let spread = SteelRain.Fight.spread(m, w, d)
+          let a = unit(sub(aim, from))
+          let u = unit(cross(a, (0.0, 1.0, 0.0)))
+          let v = cross(u, a)
+          let r = d *. Math.tan(spread)
+          let edges = List.map(List.range(0, 8), fn k -> edge_line(from, aim, u, v, r, k))
+          let spec = { sp_from: from, sp_at: aim, sp_rounds: 1, sp_spread: spread, sp_max: w.wp_max, sp_near: 0.0 }
+          let marks = List.map(StrataTactics.Shot.preview(f.fg_world, SteelRain.Fight.boxes_but(f, id), spec), fn e -> strike_mark(f, m, e))
+          List.append(edges, marks)
+      end
+    end
+  end
+  pfn edge_line(from : (Float, Float, Float), aim : (Float, Float, Float), u : (Float, Float, Float), v : (Float, Float, Float), r : Float, k : Int) : Strata.Overlay.Item do
+    let t = 2.0 *. Math.pi() *. int_to_float(k) /. 8.0
+    Strata.Overlay.line(from, add(aim, add(scale(u, r *. Math.cos(t)), scale(v, r *. Math.sin(t)))), 0.03, cone_colour(), true)
+  end
+  pfn strike_mark(f : SteelRain.Fight.Fight, m : SteelRain.Fight.Mech, e : (StrataTactics.Shot.Strike, Float)) : Strata.Overlay.Item do
+    let sc = Strata.World.scale(f.fg_world)
+    match e do
+      (SBox(u, _, at), share) ->
+        let ally = match SteelRain.Fight.mech(f, u) do Some(t) -> t.mc_side == m.mc_side | None -> false end
+        marker(at, 0.15 +. 0.6 *. share, if ally do warning() else hit_colour() end)
+      (SVoxel(x, y, z), share) -> marker(((int_to_float(x) +. 0.5) *. sc, (int_to_float(y) +. 1.02) *. sc, (int_to_float(z) +. 0.5) *. sc), 0.1 +. 0.4 *. share, ground_colour())
+      (SNone, _) -> marker(m.mc_hull.hl_muzzles |> muzzle_or_zero, 0.0, ground_colour())
+    end
+  end
+  pfn muzzle_or_zero(ms : List((List(String), (Float, Float, Float)))) : (Float, Float, Float) do match ms do Cons((_, p), _) -> p | Nil -> (0.0, 0.0, 0.0) end end
+
+  doc "The tracer of a round that ended at [at] travelling [dir]: a streak 4 m long behind it."
+  fn tracer(at : (Float, Float, Float), dir : (Float, Float, Float)) : Strata.Overlay.Item do
+    Strata.Overlay.line(sub(at, scale(unit(dir), 4.0)), at, 0.06, (1.0, 0.8, 0.35, 1.0), true)
+  end
+  doc "An emplacement drawn as its box: four upright sides and a top (quads' corners in strip order: two low, then two high)."
+  fn box_items(b : StrataTactics.Shot.ShotBox, c : (Float, Float, Float, Float)) : List(Strata.Overlay.Item) do
+    match (b.bx_centre, b.bx_half) do
+      ((x, y, z), (hx, hy, hz)) ->
+        let lo = y -. hy
+        let hi = y +. hy
+        [Strata.Overlay.quad([(x -. hx, lo, z -. hz), (x +. hx, lo, z -. hz), (x -. hx, hi, z -. hz), (x +. hx, hi, z -. hz)], c, false),
+         Strata.Overlay.quad([(x -. hx, lo, z +. hz), (x +. hx, lo, z +. hz), (x -. hx, hi, z +. hz), (x +. hx, hi, z +. hz)], c, false),
+         Strata.Overlay.quad([(x -. hx, lo, z -. hz), (x -. hx, lo, z +. hz), (x -. hx, hi, z -. hz), (x -. hx, hi, z +. hz)], c, false),
+         Strata.Overlay.quad([(x +. hx, lo, z -. hz), (x +. hx, lo, z +. hz), (x +. hx, hi, z -. hz), (x +. hx, hi, z +. hz)], c, false),
+         Strata.Overlay.quad([(x -. hx, hi, z -. hz), (x +. hx, hi, z -. hz), (x -. hx, hi, z +. hz), (x +. hx, hi, z +. hz)], c, false)]
+    end
+  end
+
+  doc "A unit's name on the turn bar: W and its id for a mech, G for a gun emplacement; the enemy's in brackets."
+  fn tag_of(f : SteelRain.Fight.Fight, id : Int) : String do
+    match SteelRain.Fight.mech(f, id) do
+      Some(m) -> let n = (if m.mc_kind == 1 do "G" else "W" end) ++ int_to_string(id)
+        if m.mc_side == 1 do "[" ++ n ++ "]" else n end
+      None -> "?"
+    end
+  end
+  doc "The turn order to come (the clock's forecast), as a line."
+  fn turn_line(f : SteelRain.Fight.Fight) : String do
+    let ids = List.filter_map(StrataTactics.Clock.forecast(f.fg_clock, 8), fn e -> StrataTactics.Clock.turn_of(e))
+    "Turns: " ++ String.join(List.map(ids, fn id -> tag_of(f, id)), " ")
+  end
+  doc "Mech [id]'s heat and armour, as a line."
+  fn status_line(f : SteelRain.Fight.Fight, id : Int) : String do
+    let n = SteelRain.Rules.numbers()
+    match SteelRain.Fight.mech(f, id) do
+      Some(m) -> tag_of(f, id) ++ "  heat " ++ int_to_string(m.mc_heat) ++ "/" ++ int_to_string(n.rn_heat_cap) ++ "  "
+        ++ String.join(List.map(m.mc_armour, fn a -> match a do (p, v) -> (if List.is_empty(p) do "core" else String.join(p, "/") end) ++ " " ++ int_to_string(v) end), "  ")
+      None -> ""
+    end
+  end
+end

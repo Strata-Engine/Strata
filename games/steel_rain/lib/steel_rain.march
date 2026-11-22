@@ -1,18 +1,27 @@
--- Steel Rain, the first prototype: one mech on a generated map.
+-- Steel Rain: a Destroy fight, both sides played at the keyboard.
 --
--- The map comes from strata_maps (rolling ground and a river with weirs and
--- fords, checked for routes); strata_tactics lays its grid over the playable
--- square and runs the camera; the mech is the Warden (SteelRain.Mech), built from strata_kit
--- parts sculpted in code. Hovering a
--- tile the mech can reach shows the way; a click sends it walking there tile
--- by tile, its legs stepping, the camera following; when it arrives its reach
--- is shown again. Camera: W A S D pan, Q E turn, R F zoom, the right mouse
--- button drags it round, Page Up / Down move the floor cut. Escape quits.
+-- The map comes from strata_maps (rolling ground and a river, checked for
+-- routes), with the Destroy mission's sites; the fight (SteelRain.Fight)
+-- runs headless and this screen plays its events back: mechs walking, a
+-- tracer per round, ground carved and falling, parts struck and lost.
+-- Four Wardens (SteelRain.Mech) start on the north edge; a battery of gun
+-- emplacements and a depot stand to the south. Turn order is the FFT clock.
 --
--- STRATA_MAP_SEED (default 5) picks the map; STRATA_CLOSE=1 starts the camera
--- close and low, STRATA_YAW its angle in degrees (default 45). STRATA_FRAMES=n runs n frames
--- without input, sending the mech to the reachable tile furthest north at
--- frame 20, and writes frame n - 3 to STRATA_SHOT.
+-- On a mech's turn: hover a tile to see its reach and the way; click to
+-- walk there. 1 / 2 pick the autocannon / missile rack into a volley (the
+-- cone and the expected spread of hits show under the pointer); a click
+-- aims the picked weapons at the tile (or the unit on it); Enter fires.
+-- T holds a watch towards the pointer with the first picked weapon (or the
+-- autocannon); B braces; X withdraws (from the north edge); Space ends the
+-- turn facing the pointer. Camera: W A S D pan, Q E turn, R F zoom, the
+-- right mouse button drags it round, Page Up / Down move the floor cut.
+-- Escape quits.
+--
+-- STRATA_MAP_SEED (default 5) picks the map; STRATA_YAW the camera's angle
+-- (default 45). STRATA_FRAMES=n runs n frames without input: from frame 20,
+-- whenever nothing is playing, the mech whose turn it is walks up to 3 tiles
+-- south, fires both weapons at the nearest emplacement and ends its turn;
+-- the camera starts further out; frame n - 3 is written to STRATA_SHOT.
 mod SteelRain do
 
   needs IO
@@ -47,8 +56,6 @@ mod SteelRain do
   fn blocks() : StrataMaps.Settings.MapBlocks do
     { mb_stone: 1, mb_dirt: 2, mb_grass: 3, mb_sand: 4, mb_asphalt: 5, mb_concrete: 6, mb_water: 19, mb_sink: 11, mb_weir: 6, mb_lava: 7, mb_rubble: 8, mb_scorched: 9, mb_deck: 10 }
   end
-  -- the grid's terrain kinds: 1 ground, 2 water (the sink and the fluid)
-  pfn kind(id : Int) : Int do if id == 11 || id >= 12 do 2 else 1 end end
 
   pfn tile_px(a : NativeU8Arr, i : Int, r : Int, g : Int, b : Int) : NativeU8Arr do
     if i >= 256 do a
@@ -73,115 +80,326 @@ mod SteelRain do
       if Strata.Stream.settled(s2) do s2 else settle(s2, n + 1) end end
   end
 
-  -- ── The mech: SteelRain.Mech (the Warden) ────────────────────────────────
-  pfn stand() : Float do SteelRain.Mech.stand() end
+  -- ── Figures ──────────────────────────────────────────────────────────────
+  -- a mech's figure: its id, rig number, figure, rig, kit map, walk, gait
+  type Fig = { fi_id : Int, fi_rig_id : Int, fi_fig : Int, fi_rig : Strata.Rig.Rig, fi_map : StrataKit.Assemble.KitMap, fi_walk : SteelRain.Walk.Walk, fi_gait : StrataKit.Motion.KitGait }
 
-  -- ── The game ─────────────────────────────────────────────────────────────
-  -- the mech's tile, its walk, gait, figure; input; the last view-projection
-  type Game = { gm_tile : (Int, Int), gm_walk : SteelRain.Walk.Walk, gm_gait : StrataKit.Motion.KitGait, gm_f : Int, gm_input : Strata.Input.Input, gm_vp : NativeFloatArr }
-
-  pfn mover() : StrataTactics.Reach.Mover do StrataTactics.Reach.mover(5, 2, 3, 10) end
-  pfn cost(k : Int) : Int do if k == 2 do 2 else 1 end end
-  pfn reach_of(gr : StrataTactics.Grid.TileGrid, t : (Int, Int)) : StrataTactics.Reach.Reach do
-    StrataTactics.Reach.find(gr, t, mover(), cost, fn _ -> StrataTactics.Reach.pass_open())
+  pfn assembled(f : SteelRain.Fight.Fight, b : StrataKit.Build.KitBuild) : (Strata.Rig.Rig, StrataKit.Assemble.KitMap) do
+    match StrataKit.Assemble.assemble(f.fg_parts, b, SteelRain.Mech.fits, SteelRain.Mech.settings()) do (rig, m, _) -> (rig, m) end
   end
-  pfn walking(g : Game) : Bool do !SteelRain.Walk.done(g.gm_walk) end
-
-  -- the first standable tile from the south edge's middle
-  pfn home_tile(gr : StrataTactics.Grid.TileGrid, n : Int) : (Int, Int) do
-    let order = List.flat_map(List.range(0, n), fn tz -> List.map(List.range(0, n), fn k -> ((n / 2 + (if k % 2 == 0 do k / 2 else 0 - (k + 1) / 2 end) + n) % n, tz)))
-    match List.find(order, fn t -> StrataTactics.Grid.standable(gr, t)) do Some(t) -> t | None -> (n / 2, 0) end
+  -- figures for the fight's mechs (not emplacements)
+  pfn figures(f : SteelRain.Fight.Fight, a0 : Strata.Anim.Anim) : (Strata.Anim.Anim, List(Fig), List(Strata.Rig.Rig)) do
+    List.fold_left(List.filter(f.fg_mechs, fn m -> m.mc_kind == 0), (a0, Nil, Nil), fn (acc, m) -> add_fig(f, acc, m))
   end
-  -- the scripted target: the reachable tile furthest north (the largest z)
-  pfn furthest(r : StrataTactics.Reach.Reach) : Option((Int, Int)) do
-    List.fold_left(StrataTactics.Reach.tiles(r), None, fn (best, t) -> match (best, t) do
-      (None, _) -> Some(t)
-      (Some((bx, bz)), (_, tz)) -> if tz > bz do Some(t) else best end
-    end)
+  pfn add_fig(f : SteelRain.Fight.Fight, acc : (Strata.Anim.Anim, List(Fig), List(Strata.Rig.Rig)), m : SteelRain.Fight.Mech) : (Strata.Anim.Anim, List(Fig), List(Strata.Rig.Rig)) do
+    match (acc, assembled(f, m.mc_build)) do
+      ((a, figs, rigs), (rig, km)) -> match Strata.Anim.finish_rig(a, rig) do
+        (a1, rid) -> match SteelRain.Fight.pos(f, m) do
+          (x, y, z) -> match Strata.Anim.spawn_at(a1, rid, x, y +. SteelRain.Mech.stand(), z, SrQ.identity()) do
+            (a2, fig) -> (a2, List.append(figs, [{ fi_id: m.mc_id, fi_rig_id: rid, fi_fig: fig, fi_rig: rig, fi_map: km, fi_walk: SteelRain.Walk.start([(x, y, z)]), fi_gait: SrMo.gait(rig) }]), List.append(rigs, [rig]))
+          end
+        end
+      end
+    end
   end
+  -- the figure's heading for a fight yaw (yaw 0 faces +x; a figure's heading 0 faces +z)
+  pfn heading_of(yaw : Float) : Float do Math.pi() /. 2.0 -. yaw end
 
-  -- the marks: the reach and the way to the hovered tile while standing; the way still ahead while walking
-  pfn marks(tac : StrataTactics.TacticsState, g : Game, hovered : Option((Int, Int))) : StrataTactics.TacticsState do
-    let gr = StrataTactics.grid(tac)
-    let col = StrataTactics.Marks.colours()
-    if walking(g) do tac
-    else
-      let r = reach_of(gr, g.gm_tile)
-      let ts = StrataTactics.Reach.tiles(r)
-      let way = match hovered do Some(t) -> StrataTactics.Marks.path(gr, StrataTactics.Reach.path(r, t), col.mc_path) | None -> Nil end
-      StrataTactics.show(tac, List.append(StrataTactics.Marks.tiles(gr, ts, col.mc_reach), List.append(StrataTactics.Marks.outline(gr, ts, col.mc_outline), way)))
+  -- ── The screen's state ───────────────────────────────────────────────────
+  type Scr = { sc_fight : SteelRain.Fight.Fight, sc_figs : List(Fig), sc_beats : List(SteelRain.Screen.Beat), sc_hold : Float, sc_wait : Option(Int),
+               sc_tracers : List((Strata.Overlay.Item, Float)), sc_picked : List(List(String)), sc_volley : List((List(String), (Float, Float, Float))), sc_msg : String,
+               sc_input : Strata.Input.Input, sc_vp : NativeFloatArr }
+
+  pfn fig_of(sc : Scr, id : Int) : Option(Fig) do List.find(sc.sc_figs, fn g -> g.fi_id == id) end
+  pfn with_fig(sc : Scr, g : Fig) : Scr do { sc with sc_figs: List.map(sc.sc_figs, fn x -> if x.fi_id == g.fi_id do g else x end) } end
+
+  -- an order given to the fight: its events queued to play, or why it was refused
+  pfn give(sc : Scr, o : SteelRain.Fight.Order) : Scr do
+    match SteelRain.Fight.step(sc.sc_fight, o) do
+      Ok((f2, evs)) -> { sc with sc_fight: f2, sc_beats: List.append(sc.sc_beats, SteelRain.Screen.queue(evs)), sc_picked: Nil, sc_volley: Nil, sc_msg: "" }
+      Err(why) -> { sc with sc_msg: why }
     end
   end
 
-  pfn tile_name(t : (Int, Int)) : String do match t do (x, z) -> "(" ++ int_to_string(x) ++ ", " ++ int_to_string(z) ++ ")" end end
+  -- the streamed world kept in step with the fight's: every cell in the changes' boxes copied from the fight's world
+  pfn mirror(s : Strata.Stream.Stream, fw : Strata.World.World, cs : List(Strata.Edit.Change)) : Strata.Stream.Stream do
+    let cells = List.flat_map(cs, fn c -> box_cells(fw, Strata.Edit.low(c), Strata.Edit.high(c)))
+    if List.is_empty(cells) do s else Strata.Stream.apply(s, Strata.Edit.set_many(Strata.Stream.world(s), cells)) end
+  end
+  pfn box_cells(fw : Strata.World.World, lo : (Int, Int, Int), hi : (Int, Int, Int)) : List((Int, Int, Int, Int)) do
+    match (lo, hi) do
+      ((x0, y0, z0), (x1, y1, z1)) -> let nx = x1 - x0 + 1
+        let ny = y1 - y0 + 1
+        let nz = z1 - z0 + 1
+        List.map(List.range(0, nx * ny * nz), fn i -> cell_of(fw, x0 + i % nx, y0 + (i / nx) % ny, z0 + i / (nx * ny)))
+    end
+  end
+  pfn cell_of(fw : Strata.World.World, x : Int, y : Int, z : Int) : (Int, Int, Int, Int) do (x, y, z, Strata.World.get_block(fw, x, y, z)) end
 
-  -- send the mech to tile t if it can get there
-  pfn order_move(tac : StrataTactics.TacticsState, g : Game, t : (Int, Int)) : (StrataTactics.TacticsState, Game) do
-    let gr = StrataTactics.grid(tac)
-    let r = reach_of(gr, g.gm_tile)
-    if walking(g) || t == g.gm_tile || Option.is_none(StrataTactics.Reach.cost_to(r, t)) do (tac, g)
-    else
-      let way = StrataTactics.Reach.path(r, t)
-      let centres = List.map(way, fn p -> StrataTactics.Grid.centre(gr, p))
-      Authority.must(println("steel_rain: walking " ++ tile_name(g.gm_tile) ++ " to " ++ tile_name(t) ++ " over " ++ int_to_string(List.length(way) - 1) ++ " tiles (reach " ++ int_to_string(List.length(StrataTactics.Reach.tiles(r))) ++ " tiles; from there " ++ int_to_string(List.length(StrataTactics.Reach.tiles(reach_of(gr, t)))) ++ ")"))
-      (StrataTactics.with_camera(tac, StrataTactics.Camera.follow(StrataTactics.camera(tac), StrataTactics.Grid.centre(gr, t))), { g with gm_tile: t, gm_walk: SteelRain.Walk.start(centres) })
+  -- ── Playing beats ────────────────────────────────────────────────────────
+  type Play = Play(Scr, Strata.Stream.Stream, Strata.Anim.Anim, Strata.Render.Render)
+
+  pfn walking(sc : Scr, id : Int) : Bool do match fig_of(sc, id) do Some(g) -> !SteelRain.Walk.done(g.fi_walk) | None -> false end end
+  -- the next beat, when the last one's time is up and no walk is being waited for
+  pfn play(p : Play, dt : Float) : Play do
+    match p do
+      Play(sc, s, a, sl) ->
+        let waiting = match sc.sc_wait do Some(id) -> walking(sc, id) | None -> false end
+        if waiting do p
+        else if sc.sc_hold > 0.0 do Play({ sc with sc_hold: sc.sc_hold -. dt, sc_wait: None }, s, a, sl)
+        else match sc.sc_beats do
+          Nil -> Play({ sc with sc_wait: None }, s, a, sl)
+          Cons(b, rest) -> beat(Play({ sc with sc_beats: rest, sc_hold: SteelRain.Screen.beat_time(b), sc_wait: None }, s, a, sl), b)
+        end end end
+    end
+  end
+  pfn tile_centre(sc : Scr, t : (Int, Int)) : (Float, Float, Float) do StrataTactics.Grid.centre(sc.sc_fight.fg_grid, t) end
+  pfn beat(p : Play, b : SteelRain.Screen.Beat) : Play do
+    match p do
+      Play(sc, s, a, sl) -> match b do
+        BWalk(id, t) -> match fig_of(sc, id) do
+          Some(g) -> Play({ with_fig(sc, { g with fi_walk: SteelRain.Walk.start([SteelRain.Walk.pos(g.fi_walk), tile_centre(sc, t)]) }) with sc_wait: Some(id) }, s, a, sl)
+          None -> p
+        end
+        BPlace(id, t) -> match fig_of(sc, id) do Some(g) -> Play(with_fig(sc, { g with fi_walk: SteelRain.Walk.start([tile_centre(sc, t)]) }), s, a, sl) | None -> p end
+        BTracer(_, at, dir) -> Play({ sc with sc_tracers: Cons((SteelRain.Screen.tracer(at, dir), 0.15), sc.sc_tracers) }, s, a, sl)
+        BCarve(cs) -> Play(sc, mirror(s, sc.sc_fight.fg_world, cs), a, sl)
+        BFell(cells) -> Play(sc, Strata.Stream.apply(s, Strata.Edit.set_many(Strata.Stream.world(s), cells)), a, sl)
+        BHit(u, at, dir) -> carve_fig(p, u, at, dir)
+        BLost(u) -> rebuild(p, u)
+        BOut(u) -> match fig_of(sc, u) do Some(g) -> Play({ sc with sc_figs: List.filter(sc.sc_figs, fn x -> x.fi_id != u) }, s, Strata.Anim.remove(a, g.fi_fig), sl) | None -> p end
+      end
+    end
+  end
+  -- a round's mark carved into the figure it struck
+  pfn carve_fig(p : Play, u : Int, at : (Float, Float, Float), dir : (Float, Float, Float)) : Play do
+    match p do
+      Play(sc, s, a, sl) -> match (fig_of(sc, u), at, dir) do
+        (Some(g), (x, y, z), (dx, dy, dz)) -> match Strata.Anim.hit_ray(a, x -. dx, y -. dy, z -. dz, dx, dy, dz, 3.0, -1) do
+          Some(h) -> if h.fig != g.fi_fig do p else carved(p, g, StrataKit.Damage.carve_hit(g.fi_rig, h, 2.0, StrataKit.Damage.carve_settings(9))) end
+          None -> p
+        end
+        _ -> p
+      end
+    end
+  end
+  pfn carved(p : Play, g : Fig, r : (Strata.Rig.Rig, Int)) : Play do
+    match (p, r) do
+      (Play(sc, s, a, sl), (rig2, n)) -> if n == 0 do p
+        else match Strata.Anim.replace_rig(a, g.fi_rig_id, rig2) do
+          (a2, _) -> Play(with_fig(sc, { g with fi_rig: rig2 }), s, a2, Strata.Render.refresh_rig(sl, a2, g.fi_rig_id))
+        end end
+    end
+  end
+  -- a figure rebuilt from its mech's build as the fight has it now (a part lost), its carving kept
+  pfn rebuild(p : Play, u : Int) : Play do
+    match p do
+      Play(sc, s, a, sl) -> match (fig_of(sc, u), SteelRain.Fight.mech(sc.sc_fight, u)) do
+        (Some(g), Some(m)) -> match assembled(sc.sc_fight, m.mc_build) do
+          (rig0, km) ->
+            let rig = StrataKit.Assemble.carry_damage(g.fi_rig, g.fi_map, rig0, km)
+            match Strata.Anim.replace_rig(a, g.fi_rig_id, rig) do
+              (a2, _) -> Play(with_fig(sc, { g with fi_rig: rig, fi_map: km, fi_gait: SrMo.gait(rig) }), s, a2, Strata.Render.refresh_rig(sl, a2, g.fi_rig_id))
+            end
+        end
+        _ -> p
+      end
     end
   end
 
-  -- the mech placed where its walk is, its legs stepping
-  pfn pose(a : Strata.Anim.Anim, g : Game, dt : Float) : (Strata.Anim.Anim, Game) do
-    let w = SteelRain.Walk.step(g.gm_walk, dt, 2.5)
-    let speed = if SteelRain.Walk.moving(w) do 2.5 else 0.0 end
-    let h = SteelRain.Walk.heading(w)
-    match SteelRain.Walk.pos(w) do
-      (x, y, z) ->
-        let a1 = Strata.Anim.place(a, g.gm_f, x, y +. stand(), z, SrQ.from_axis_angle(0.0, 1.0, 0.0, h))
-        match SrMo.gait_step(g.gm_gait, dt, (x, y, z), h, speed, 0.0) do
-          (g2, targets, bob) -> (Strata.Anim.update(SrMo.gait_apply(a1, g.gm_f, g2, targets, bob, (x, y, z), h), dt), { g with gm_walk: w, gm_gait: g2 })
+  -- every figure placed where its walk is, its legs stepping
+  pfn pose_all(sc : Scr, a : Strata.Anim.Anim, dt : Float) : (Scr, Strata.Anim.Anim) do
+    List.fold_left(sc.sc_figs, (sc, a), fn (acc, g) -> pose_one(acc, g, dt))
+  end
+  pfn pose_one(acc : (Scr, Strata.Anim.Anim), g : Fig, dt : Float) : (Scr, Strata.Anim.Anim) do
+    match acc do
+      (sc, a) ->
+        let w = SteelRain.Walk.step(g.fi_walk, dt, 2.5)
+        let speed = if SteelRain.Walk.moving(w) do 2.5 else 0.0 end
+        let h = if SteelRain.Walk.moving(w) do SteelRain.Walk.heading(w) else (match SteelRain.Fight.mech(sc.sc_fight, g.fi_id) do Some(m) -> heading_of(m.mc_yaw) | None -> SteelRain.Walk.heading(w) end) end
+        match SteelRain.Walk.pos(w) do
+          (x, y, z) ->
+            let a1 = Strata.Anim.place(a, g.fi_fig, x, y +. SteelRain.Mech.stand(), z, SrQ.from_axis_angle(0.0, 1.0, 0.0, h))
+            match SrMo.gait_step(g.fi_gait, dt, (x, y, z), h, speed, 0.0) do
+              (g2, targets, bob) -> (with_fig(sc, { g with fi_walk: w, fi_gait: g2 }), SrMo.gait_apply(a1, g.fi_fig, g2, targets, bob, (x, y, z), h))
+            end
         end
     end
   end
 
-  pfn frame_loop(s : Strata.Stream.Stream, sl : Strata.Render.Render, a : Strata.Anim.Anim, tac : StrataTactics.TacticsState, g : Game, frame : Int, frames : Int, t_prev : Float, vpbuf : NativeF32Arr) : Unit do
+  -- ── Orders from the keyboard and pointer ─────────────────────────────────
+  pfn yaw_to_tile(f : SteelRain.Fight.Fight, m : SteelRain.Fight.Mech, t : (Int, Int)) : Float do
+    match (SteelRain.Fight.pos(f, m), StrataTactics.Grid.centre(f.fg_grid, t)) do ((ax, _, az), (bx, _, bz)) -> if Math.abs(bx -. ax) +. Math.abs(bz -. az) < 0.001 do m.mc_yaw else Math.atan2(bz -. az, bx -. ax) end end
+  end
+  -- where a click on tile [t] aims: the torso of a unit standing there, else a metre over the tile's middle
+  pfn aim_at(f : SteelRain.Fight.Fight, t : (Int, Int)) : (Float, Float, Float) do
+    match List.find(f.fg_mechs, fn x -> x.mc_state == 0 && x.mc_tile == t) do
+      Some(x) -> SteelRain.Fight.torso_point(f, x)
+      None -> match StrataTactics.Grid.centre(f.fg_grid, t) do (x, y, z) -> (x, y +. 1.0, z) end
+    end
+  end
+  pfn pick(sc : Scr, p : List(String)) : Scr do
+    if List.member(sc.sc_picked, p) do { sc with sc_picked: List.filter(sc.sc_picked, fn q -> q != p) } else { sc with sc_picked: List.append(sc.sc_picked, [p]) } end
+  end
+  pfn human(sc : Scr, inp : Strata.Input.Input, clicked : Option((Int, Int)), hovered : Option((Int, Int))) : Scr do
+    match SteelRain.Fight.active(sc.sc_fight) do
+      None -> sc
+      Some(id) -> match SteelRain.Fight.mech(sc.sc_fight, id) do
+        None -> sc
+        Some(m) ->
+          let f = sc.sc_fight
+          let sc1 = if Strata.Input.pressed(inp, "game.arm") do pick(sc, ["arm_r"]) else if Strata.Input.pressed(inp, "game.rack") do pick(sc, ["shoulder_l"]) else sc end end
+          let sc2 = match clicked do
+            Some(t) -> if List.is_empty(sc1.sc_picked) do give(sc1, OMove(StrataTactics.Reach.path(SteelRain.Fight.reach(f, m), t)))
+              else { sc1 with sc_volley: List.map(sc1.sc_picked, fn p -> (p, aim_at(f, t))), sc_msg: "aimed: Enter fires" } end
+            None -> sc1
+          end
+          let dir = match hovered do Some(t) -> yaw_to_tile(f, m, t) | None -> m.mc_yaw end
+          if Strata.Input.pressed(inp, "game.fire") && !List.is_empty(sc2.sc_volley) do give(sc2, OFire(sc2.sc_volley))
+          else if Strata.Input.pressed(inp, "game.watch") do give(sc2, OWatch(match sc2.sc_picked do Cons(p, _) -> p | Nil -> ["arm_r"] end, dir))
+          else if Strata.Input.pressed(inp, "game.brace") do give(sc2, OBrace)
+          else if Strata.Input.pressed(inp, "game.withdraw") do give(sc2, OWithdraw)
+          else if Strata.Input.pressed(inp, "game.end") do give(sc2, OEnd(dir))
+          else sc2 end end end end end
+      end
+    end
+  end
+  -- the scripted run's orders, from frame 20 whenever nothing is playing: the mech whose turn it is walks up to 3 tiles south, fires both weapons at the nearest emplacement, ends its turn
+  pfn scripted(sc : Scr, frame : Int) : Scr do
+    let f = sc.sc_fight
+    if frame < 20 do sc
+    else match SteelRain.Fight.active(f) do
+      None -> sc
+      Some(id) -> match SteelRain.Fight.mech(f, id) do
+        None -> sc
+        Some(m) ->
+          let r = SteelRain.Fight.reach(f, m)
+          let near = match m.mc_tile do (_, z0) -> List.filter(StrataTactics.Reach.tiles(r), fn t -> match t do (_, tz) -> tz <= z0 + 3 end) end
+          if !m.mc_moved do
+            match List.fold_left(near, None, fn (best, t) -> southmost(best, t)) do
+              Some(t) -> give(sc, OMove(StrataTactics.Reach.path(r, t)))
+              None -> give(sc, OEnd(m.mc_yaw))
+            end
+          else if !m.mc_acted do
+            match List.find(f.fg_mechs, fn x -> x.mc_kind == 1 && x.mc_state == 0) do
+              Some(e) -> let aim = SteelRain.Fight.torso_point(f, e)
+                give(sc, OFire([(["arm_r"], aim), (["shoulder_l"], aim)]))
+              None -> give(sc, OEnd(m.mc_yaw))
+            end
+          else give(sc, OEnd(m.mc_yaw)) end end
+      end
+    end end
+  end
+  pfn southmost(best : Option((Int, Int)), t : (Int, Int)) : Option((Int, Int)) do
+    match (best, t) do (Some((_, bz)), (_, tz)) -> if tz > bz do Some(t) else best end | (None, _) -> Some(t) end
+  end
+
+  -- ── Views ────────────────────────────────────────────────────────────────
+  pfn views(sc : Scr, hovered : Option((Int, Int))) : List(Strata.Overlay.Item) do
+    let f = sc.sc_fight
+    let col = StrataTactics.Marks.colours()
+    let gr = f.fg_grid
+    let ems = List.flat_map(List.filter(f.fg_mechs, fn x -> x.mc_kind == 1 && x.mc_state == 0), fn x -> List.flat_map(SteelRain.Hull.boxes(x.mc_hull, x.mc_id, SteelRain.Fight.pos(f, x), x.mc_yaw, [Nil]), fn b -> SteelRain.Screen.box_items(b, (0.55, 0.2, 0.18, 1.0))))
+    let arcs = List.flat_map(f.fg_watches, fn a -> StrataTactics.Marks.outline(gr, StrataTactics.Watch.tiles(gr, a), (0.95, 0.45, 0.2, 0.8)))
+    let tracers = List.map(sc.sc_tracers, fn t -> match t do (i, _) -> i end)
+    let own = if !List.is_empty(sc.sc_beats) || Option.is_some(f.fg_result) do Nil
+      else match SteelRain.Fight.active(f) do
+        Some(id) -> match SteelRain.Fight.mech(f, id) do
+          Some(m) -> if List.is_empty(sc.sc_picked) do
+              let r = SteelRain.Fight.reach(f, m)
+              let ts = if m.mc_moved do Nil else StrataTactics.Reach.tiles(r) end
+              let way = match hovered do Some(t) -> if m.mc_moved do Nil else StrataTactics.Marks.path(gr, StrataTactics.Reach.path(r, t), col.mc_path) end | None -> Nil end
+              List.append(StrataTactics.Marks.tiles(gr, ts, col.mc_reach), List.append(StrataTactics.Marks.outline(gr, ts, col.mc_outline), way))
+            else match hovered do
+              Some(t) -> List.flat_map(sc.sc_picked, fn p -> SteelRain.Screen.cone_items(f, id, p, aim_at(f, t)))
+              None -> Nil
+            end end
+          None -> Nil
+        end
+        None -> Nil
+      end end
+    List.append(ems, List.append(arcs, List.append(tracers, own)))
+  end
+  pfn ui_lines(sc : Scr) : String do
+    let f = sc.sc_fight
+    let top = match f.fg_result do
+      Some(r) -> if r.rs_won do "Mission won" else "Mission lost" end
+      None -> SteelRain.Screen.turn_line(f) ++ "\n" ++ (match SteelRain.Fight.active(f) do Some(id) -> SteelRain.Screen.status_line(f, id) | None -> "" end)
+    end
+    let picked = if List.is_empty(sc.sc_picked) do "" else "\nvolley: " ++ String.join(List.map(sc.sc_picked, fn p -> String.join(p, "/")), ", ") end
+    top ++ picked ++ (if sc.sc_msg == "" do "" else "\n" ++ sc.sc_msg end)
+  end
+
+  -- ── The loop ─────────────────────────────────────────────────────────────
+  pfn frame_loop(s : Strata.Stream.Stream, sl : Strata.Render.Render, a : Strata.Anim.Anim, tac : StrataTactics.TacticsState, sc : Scr, frame : Int, frames : Int, t_prev : Float, vpbuf : NativeF32Arr) : Unit do
     Strata.Ffi.Vk.poll()
-    let scripted = frames > 0
+    let scripted_run = frames > 0
     let now = Strata.Ffi.Vk.time()
-    let dt = if scripted do 1.0 /. 60.0 else (if now -. t_prev > 0.1 do 0.1 else now -. t_prev end) end
-    let inp = Strata.Input.step(g.gm_input, if scripted do Strata.Input.idle() else Strata.Render.input(g.gm_input, 0) end)
-    if Strata.Ffi.Vk.should_close() || Strata.Input.held(inp, "game.quit") || (scripted && frame >= frames) do ()
+    let dt = if scripted_run do 1.0 /. 60.0 else (if now -. t_prev > 0.1 do 0.1 else now -. t_prev end) end
+    let inp = Strata.Input.step(sc.sc_input, if scripted_run do Strata.Input.idle() else Strata.Render.input(sc.sc_input, 0) end)
+    if Strata.Ffi.Vk.should_close() || Strata.Input.held(inp, "game.quit") || (scripted_run && frame >= frames) do ()
     else
       let ww = int_to_float(Strata.Ffi.Vk.win_w())
       let wh = int_to_float(Strata.Ffi.Vk.win_h())
-      let pointer = if scripted do None else Some((Strata.Ffi.Vk.mouse_x(), Strata.Ffi.Vk.mouse_y())) end
-      let f = Strata.Plugin.frame(Strata.Stream.world(s), inp, pointer, if scripted do 0.0 else Strata.Ffi.Vk.scroll_y() end, dt, ww, wh, g.gm_vp)
-      match StrataTactics.update(tac, f) do
-        (tac1, _, evs) ->
-          let target = if scripted do (if frame == 20 do furthest(reach_of(StrataTactics.grid(tac1), g.gm_tile)) else None end)
-            else List.head_opt(List.filter_map(evs, fn e -> if StrataTactics.event_index(e) == 2 do StrataTactics.event_tile(e) else None end)) end
-          let (tac2, g1) = match target do Some(t) -> order_move(tac1, g, t) | None -> (tac1, g) end
-          let hovered = if scripted do None else StrataTactics.hovered(tac2) end
-          let (a2, g2) = pose(a, g1, dt)
-          -- while it walks the camera keeps it in view
-          let tac2b = if walking(g1) do StrataTactics.with_camera(tac2, StrataTactics.Camera.follow(StrataTactics.camera(tac2), SteelRain.Walk.pos(g2.gm_walk))) else tac2 end
-          let tac3 = marks(tac2b, g2, hovered)
-          match Strata.Render.sync(sl, Strata.Stream.tick(s)) do
-            (sl2, s2) ->
-              let subject = match SteelRain.Walk.pos(g2.gm_walk) do (x, y, z) -> Some((x, y +. 2.0, z)) end
-              if Strata.Render.overlay(StrataTactics.overlay(tac3, subject)) do () else () end
-              let aspect = if wh > 0.0 do ww /. wh else 1.6 end
-              let vp = StrataTactics.view_proj(tac3, aspect)
-              let vpb = SrM.write_f32(vp, vpbuf)
-              Strata.Ffi.Vk.set_camera(vpb)
-              match StrataTactics.Camera.eye(StrataTactics.camera(tac3)) do (ex, ey, ez) -> Strata.Ffi.Vk.set_eye(ex, ey, ez, 0.4) end
-              let u0 = Strata.Render.ui_begin(1.0)
-              let u1 = Strata.Text.text(u0, Strata.Ui.bottom_left(), 12.0, 12.0, Strata.Text.default_font(), 14.0, (1.0, 1.0, 1.0, 1.0), "click a blue tile: move   WASD QE RF, right drag: camera   Esc: quit")
-              if Strata.Render.draw_ui(u1) do () else () end
-              Strata.Render.set_time(if scripted do int_to_float(frame) /. 60.0 else now end)
-              if scripted && frame == frames - 3 do Strata.Ffi.Vk.request_shot() else () end
-              let next = if Strata.Render.draw(1.0) do frame + 1 else frame end
-              frame_loop(s2, sl2, a2, tac3, { g2 with gm_input: inp, gm_vp: vp }, next, frames, now, vpb)
+      let pointer = if scripted_run do None else Some((Strata.Ffi.Vk.mouse_x(), Strata.Ffi.Vk.mouse_y())) end
+      let pf = Strata.Plugin.frame(Strata.Stream.world(s), inp, pointer, if scripted_run do 0.0 else Strata.Ffi.Vk.scroll_y() end, dt, ww, wh, sc.sc_vp)
+      match StrataTactics.update(tac, pf) do
+        (tac1, _, tevs) ->
+          let clicked = if scripted_run do None else List.head_opt(List.filter_map(tevs, fn e -> if StrataTactics.event_index(e) == 2 do StrataTactics.event_tile(e) else None end)) end
+          let hovered = if scripted_run do None else StrataTactics.hovered(tac1) end
+          match play(Play(sc, s, a, sl), dt) do
+            Play(sc1, s1, a1, sl1) ->
+              let idle = List.is_empty(sc1.sc_beats) && Option.is_none(sc1.sc_wait) && sc1.sc_hold <= 0.0
+              let sc2 = if !idle || Option.is_some(sc1.sc_fight.fg_result) do sc1 else if scripted_run do scripted(sc1, frame) else human(sc1, inp, clicked, hovered) end end
+              let sc3 = { sc2 with sc_tracers: List.filter_map(sc2.sc_tracers, fn t -> match t do (i, l) -> if l -. dt > 0.0 do Some((i, l -. dt)) else None end end) }
+              match pose_all(sc3, a1, dt) do
+                (sc4, a2) ->
+                  let a3 = Strata.Anim.update(a2, dt)
+                  -- the camera follows the mech whose turn it is
+                  let focus = match SteelRain.Fight.active(sc4.sc_fight) do
+                    Some(id) -> match fig_of(sc4, id) do Some(g) -> Some(SteelRain.Walk.pos(g.fi_walk)) | None -> None end
+                    None -> None
+                  end
+                  let tac2 = match focus do Some(p) -> StrataTactics.with_camera(tac1, StrataTactics.Camera.follow(StrataTactics.camera(tac1), p)) | None -> tac1 end
+                  let tac3 = StrataTactics.show(tac2, views(sc4, hovered))
+                  match Strata.Render.sync(sl1, Strata.Stream.tick(s1)) do
+                    (sl2, s2) ->
+                      let subject = match focus do Some((x, y, z)) -> Some((x, y +. 2.0, z)) | None -> None end
+                      if Strata.Render.overlay(StrataTactics.overlay(tac3, subject)) do () else () end
+                      let aspect = if wh > 0.0 do ww /. wh else 1.6 end
+                      let vp = StrataTactics.view_proj(tac3, aspect)
+                      let vpb = SrM.write_f32(vp, vpbuf)
+                      Strata.Ffi.Vk.set_camera(vpb)
+                      match StrataTactics.Camera.eye(StrataTactics.camera(tac3)) do (ex, ey, ez) -> Strata.Ffi.Vk.set_eye(ex, ey, ez, 0.4) end
+                      let u0 = Strata.Render.ui_begin(1.0)
+                      let u1 = Strata.Text.text(u0, Strata.Ui.top_left(), 12.0, 12.0, Strata.Text.default_font(), 15.0, (1.0, 1.0, 1.0, 1.0), ui_lines(sc4))
+                      let u2 = Strata.Text.text(u1, Strata.Ui.bottom_left(), 12.0, 12.0, Strata.Text.default_font(), 13.0, (0.9, 0.9, 0.9, 1.0), "click: move   1 2: pick weapons, click: aim, Enter: fire   T watch  B brace  X withdraw  Space end   WASD QE RF: camera   Esc: quit")
+                      if Strata.Render.draw_ui(u2) do () else () end
+                      Strata.Render.set_time(if scripted_run do int_to_float(frame) /. 60.0 else now end)
+                      if scripted_run && frame == frames - 3 do Strata.Ffi.Vk.request_shot() else () end
+                      let next = if Strata.Render.draw(1.0) do frame + 1 else frame end
+                      frame_loop(s2, sl2, a3, tac3, { sc4 with sc_input: inp, sc_vp: vp }, next, frames, now, vpb)
+                  end
+              end
           end
       end
+    end
+  end
+
+  pfn bindings_of(tac_bindings : List((String, Strata.Input.Source, Float))) : List((String, Strata.Input.Source, Float)) do
+    let mine = [("game.quit", Strata.Input.Key(256), 1.0), ("game.arm", Strata.Input.Key(49), 1.0), ("game.rack", Strata.Input.Key(50), 1.0), ("game.fire", Strata.Input.Key(257), 1.0),
+                ("game.watch", Strata.Input.Key(84), 1.0), ("game.brace", Strata.Input.Key(66), 1.0), ("game.withdraw", Strata.Input.Key(88), 1.0), ("game.end", Strata.Input.Key(32), 1.0)]
+    match Strata.Input.merge([("game", mine), ("tactics", tac_bindings)]) do (bs, _) -> bs end
+  end
+
+  doc "The map for a Destroy fight from [seed]: rolling ground and a river, checked for routes, with the mission's sites; its generator and a world built from it."
+  fn destroy_map(seed : Int, reg : Strata.Blocks.Registry) : (Strata.Terrain.Gen, StrataMaps.Data.MapData, Strata.World.World) do
+    let s0 = StrataMaps.Settings.settings(seed, 16)
+    let ms = { s0 with ms_base: 1, ms_knobs: StrataMaps.Settings.with_knob(StrataMaps.Settings.with_knob(s0.ms_knobs, "relief", 0.4), "water", 0.5) }
+    match StrataMaps.generate_ground(ms, blocks(), 4, 2) do
+      (gen, d, _) ->
+        let w = StrataMaps.RuinStage.scratch(d, reg)
+        (gen, StrataMaps.Sites.place(d, StrataMaps.grid(d, w), SteelRain.Missions.destroy_rules()), w)
     end
   end
 
@@ -197,49 +415,36 @@ mod SteelRain do
       if textures(reg) do () else Authority.must(println("steel_rain: could not upload textures")) end
       Strata.Render.set_sun(0.45, 0.82, 0.35, 1.0, 0.92, 0.8)
       Strata.Ffi.Vk.set_fog(160.0, 320.0)
-      let s0 = StrataMaps.Settings.settings(seed, 16)
-      let ms = { s0 with ms_base: 1, ms_knobs: StrataMaps.Settings.with_knob(StrataMaps.Settings.with_knob(s0.ms_knobs, "relief", 0.4), "water", 0.5) }
-      match StrataMaps.generate_ground(ms, blocks(), 4, 2) do
-        (gen, d, rep) ->
-          Authority.must(println("steel_rain: map " ++ (if rep.cr_ok do "passed" else "failed" end) ++ " with " ++ int_to_string(rep.cr_routes) ++ " routes"))
-          let (hi, lo) = StrataMaps.TerrainStage.span(d)
-          let mid_y = int_to_float((hi + lo) / 2) *. 0.4
+      match destroy_map(seed, reg) do
+        (gen, d, w) ->
+          let fight = SteelRain.Fight.start_destroy(d, w, SteelRain.Mech.parts(), List.map(List.range(0, 4), fn _ -> SteelRain.Mech.build()), seed)
+          Authority.must(println("steel_rain: Destroy on seed " ++ int_to_string(seed) ++ ": " ++ int_to_string(List.length(fight.fg_mechs)) ++ " units, depot of " ++ int_to_string(SteelRain.Fight.depot_start(fight)) ++ " cells"))
+          let mid_y = match StrataMaps.WorldGen.bounds(d) do (lo, hi) -> int_to_float((lo + hi) / 2) *. 0.4 end
           let w0 = Strata.World.new(reg, gen, d.md_settings.ms_seed, 0.4)
-          let st = settle(Strata.Stream.set_focus(Strata.Stream.start(w0, Strata.Stream.config(7, 3, 64, 8)), [(0.0, mid_y, 0.0)]), 0)
-          -- the grid over the playable square: 16 x 16 tiles of 8 voxels, height steps of 2
-          let x0 = StrataMaps.Data.corner(d.md_settings) + StrataMaps.Settings.ring_voxels()
-          let n = d.md_settings.ms_tiles
-          let gs = StrataTactics.Grid.settings(x0, x0, n, n, 8, 2, lo - 8, hi + 24, 10, kind)
-          let cfg0 = StrataTactics.config(gs)
+          let st0 = settle(Strata.Stream.set_focus(Strata.Stream.start(w0, Strata.Stream.config(7, 3, 64, 8)), [(0.0, mid_y, 0.0)]), 0)
+          -- the depot, built in the fight's world, built in the shown one too
+          let depot = match fight.fg_mission do MDestroy(_, cells, _) -> List.map(cells, fn c -> match c do (x, y, z) -> (x, y, z, d.md_blocks.mb_concrete) end) | MNone -> Nil end
+          let st = Strata.Stream.apply(st0, Strata.Edit.set_many(Strata.Stream.world(st0), depot))
+          let cfg0 = StrataTactics.config(StrataTactics.Grid.settings_of(fight.fg_grid))
           let cs = cfg0.tx_camera
-          -- the cut keeps 2.5 m round the Warden's middle (its chest and guns reach forward of it)
-          let close = Authority.must(Env.get_int("STRATA_CLOSE", 0)) == 1
-          let cfg = { cfg0 with tx_camera: if close do { cs with cm_near: 15.0, cm_far: 17.0, cm_pitch_near_deg: 24.0, cm_pitch_far_deg: 24.0, cm_cut_clear: 2.5 } else { cs with cm_near: 12.0, cm_far: 60.0, cm_cut_clear: 2.5 } end }
+          let cfg = { cfg0 with tx_camera: { cs with cm_near: 12.0, cm_far: 60.0, cm_cut_clear: 2.5 } }
           match StrataTactics.setup(cfg, reg, Strata.Stream.world(st)) do
             (tac0, _, tac_bindings) ->
-              match Strata.Input.merge([("game", [("game.quit", Strata.Input.Key(256), 1.0)]), ("tactics", tac_bindings)]) do
-                (bindings, _) ->
-                  let gr = StrataTactics.grid(tac0)
-                  let home = home_tile(gr, n)
-                  match SteelRain.Mech.assemble() do
-                    (rig, _, _) ->
-                      match Strata.Anim.finish_rig(Strata.Anim.open(16), rig) do
-                        (a0, id) ->
-                          match StrataTactics.Grid.centre(gr, home) do
-                            (hx, hy, hz) ->
-                              match Strata.Anim.spawn_at(a0, id, hx, hy +. stand(), hz, SrQ.identity()) do
-                                (a1, fig) ->
-                                  let g0 = { gm_tile: home, gm_walk: SteelRain.Walk.start([(hx, hy, hz)]), gm_gait: SrMo.gait(rig), gm_f: fig, gm_input: Strata.Input.start(Strata.Input.new(bindings)), gm_vp: SrM.identity() }
-                                  -- the floor cut starts four levels up (12 m over the focus): open ground keeps its hills; Page Down lowers it into buildings
-                                  let yaw = int_to_float(Authority.must(Env.get_int("STRATA_YAW", 45)))
-                                  let c0 = StrataTactics.camera(tac0)
-                                  let tac1 = StrataTactics.with_camera(tac0, StrataTactics.Camera.follow(StrataTactics.Camera.set_level({ c0 with tc_yaw: yaw, tc_yaw_to: yaw }, 4), (hx, hy, hz)))
-                                  match Strata.Render.sync(Strata.Render.new(16384), st) do
-                                    (sl, st2) -> frame_loop(st2, Strata.Render.figures(sl, a1, [rig]), a1, tac1, g0, 0, frames, Strata.Ffi.Vk.time(), NativeArray.make_f32(16, 0.0))
-                                  end
-                              end
-                          end
-                      end
+              match figures(fight, Strata.Anim.open(16)) do
+                (a1, figs, rigs) ->
+                  let sc0 = { sc_fight: fight, sc_figs: figs, sc_beats: Nil, sc_hold: 0.0, sc_wait: None, sc_tracers: Nil, sc_picked: Nil, sc_volley: Nil, sc_msg: "",
+                              sc_input: Strata.Input.start(Strata.Input.new(bindings_of(tac_bindings))), sc_vp: SrM.identity() }
+                  let yaw = int_to_float(Authority.must(Env.get_int("STRATA_YAW", 45)))
+                  let c0 = StrataTactics.camera(tac0)
+                  let start_at = match SteelRain.Fight.active(fight) do
+                    Some(id) -> match SteelRain.Fight.mech(fight, id) do Some(m) -> SteelRain.Fight.pos(fight, m) | None -> (0.0, mid_y, 0.0) end
+                    None -> (0.0, mid_y, 0.0)
+                  end
+                  let far = if frames > 0 do 55.0 else c0.tc_dist end
+                  let tac1 = StrataTactics.with_camera(tac0, StrataTactics.Camera.follow(StrataTactics.Camera.set_level({ c0 with tc_yaw: yaw, tc_yaw_to: yaw, tc_dist: far, tc_dist_to: far }, 4), start_at))
+                  match Strata.Render.sync(Strata.Render.new(16384), st) do
+                    -- each figure's rig uploaded by its id: Render.figures finds rigs by value, and the Wardens' rigs start out equal
+                    (sl, st2) -> frame_loop(st2, List.fold_left(figs, sl, fn (r, g) -> Strata.Render.refresh_rig(r, a1, g.fi_rig_id)), a1, tac1, sc0, 0, frames, Strata.Ffi.Vk.time(), NativeArray.make_f32(16, 0.0))
                   end
               end
           end
