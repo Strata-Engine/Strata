@@ -1,0 +1,80 @@
+-- Shot: rounds traced through voxels and unit boxes inside a cone.
+-- Worlds are 1 m a voxel; the wall is stone, voxels x = 10, y 0..2, z -10..10.
+mod StrataTactics.Test.Shot do
+
+  needs IO.Clock      -- charged to every test module once any uses Check.all (GAPS S3)
+
+  needs IO.Console
+
+  needs IO.FileRead
+
+  needs IO.FileWrite
+  needs IO.Process
+  import Test
+  alias StrataTactics.Shot as TcS
+  alias StrataTactics.Test.Worlds as TcSw
+
+  pfn walled() : Strata.World.World do TcSw.box(TcSw.ground(), 10, 0, -10, 10, 2, 10, 1) end
+  pfn spec_at(from : (Float, Float, Float), at : (Float, Float, Float), rounds : Int, spread : Float) : StrataTactics.Shot.ShotSpec do
+    { sp_from: from, sp_at: at, sp_rounds: rounds, sp_spread: spread, sp_max: 100.0, sp_near: 0.0 }
+  end
+  pfn struck_x(r : StrataTactics.Shot.ShotRound) : Int do match r.rd_struck do SVoxel(x, _, _) -> x | _ -> -1000 end end
+  pfn struck_unit(r : StrataTactics.Shot.ShotRound) : Int do match r.rd_struck do SBox(u, _, _) -> u | _ -> -1 end end
+  pfn is_none(r : StrataTactics.Shot.ShotRound) : Bool do match r.rd_struck do SNone -> true | _ -> false end end
+  pfn key(r : StrataTactics.Shot.ShotRound) : String do
+    match r.rd_struck do
+      SVoxel(x, y, z) -> int_to_string(x) ++ "," ++ int_to_string(y) ++ "," ++ int_to_string(z)
+      SBox(u, p, _) -> "u" ++ int_to_string(u) ++ "p" ++ int_to_string(p)
+      SNone -> "none"
+    end
+  end
+  pfn same_rounds(a : List(StrataTactics.Shot.ShotRound), b : List(StrataTactics.Shot.ShotRound)) : Bool do List.map(a, fn r -> key(r)) == List.map(b, fn r -> key(r)) end
+  pfn distinct(a : List(StrataTactics.Shot.ShotRound)) : Int do List.length(List.dedup(List.sort_by(List.map(a, fn r -> key(r)), fn (x, y) -> x < y))) end
+  pfn share_sum(p : List((StrataTactics.Shot.Strike, Float))) : Float do List.fold_left(p, 0.0, fn (s, e) -> match e do (_, v) -> s +. v end) end
+  pfn share_of_unit(p : List((StrataTactics.Shot.Strike, Float)), u : Int) : Float do
+    List.fold_left(p, 0.0, fn (s, e) -> match e do (SBox(x, _, _), v) -> if x == u do s +. v else s end | _ -> s end)
+  end
+
+  describe "Shot" do
+    test "a round aimed at a wall strikes the wall" do
+      let rs = TcS.fire(walled(), Nil, spec_at((2.0, 0.6, 4.0), (8.0, 0.6, 4.0), 1, 0.0), 7)
+      Test.assert_eq_int(struck_x(List.head(rs)), 10, "the wall")
+    end
+    test "a round passes over a wall from high ground" do
+      let rs = TcS.fire(walled(), Nil, spec_at((2.0, 3.0, 4.0), (8.0, 0.0, 4.0), 1, 0.0), 7)
+      Test.assert_true(struck_x(List.head(rs)) != 10, "over it")
+    end
+    test "a box between shooter and wall takes the round, whoever owns it" do
+      let ally = { bx_unit: 1, bx_part: 0, bx_centre: (3.0, 0.6, 4.0), bx_half: (0.3, 0.6, 0.3), bx_yaw: 0.0 }
+      let rs = TcS.fire(walled(), [ally], spec_at((2.0, 0.6, 4.0), (8.0, 0.6, 4.0), 1, 0.0), 7)
+      Test.assert_eq_int(struck_unit(List.head(rs)), 1, "the ally")
+    end
+    test "a turned box is struck where it is, not where it would be unturned" do
+      -- 2 m long along x, turned a quarter: it lies along z, so a ray along z at x = 5.9 misses it
+      let b = { bx_unit: 2, bx_part: 3, bx_centre: (5.0, 0.6, 4.0), bx_half: (1.0, 0.3, 0.2), bx_yaw: 1.5708 }
+      let along = TcS.fire(walled(), [b], spec_at((5.0, 0.6, 0.0), (5.0, 0.6, 8.0), 1, 0.0), 1)
+      let past = TcS.fire(walled(), [b], spec_at((5.9, 0.6, 0.0), (5.9, 0.6, 8.0), 1, 0.0), 1)
+      Test.assert_true(struck_unit(List.head(along)) == 2 && struck_unit(List.head(past)) != 2, "turned")
+    end
+    test "a round passing close by a box reports a near miss" do
+      let b = { bx_unit: 4, bx_part: 0, bx_centre: (5.0, 0.6, 4.6), bx_half: (0.2, 0.2, 0.2), bx_yaw: 0.0 }
+      let rs = TcS.fire(walled(), [b], { spec_at((2.0, 0.6, 4.0), (8.0, 0.6, 4.0), 1, 0.0) with sp_near: 0.5 }, 7)
+      Test.assert_true(List.member((List.head(rs)).rd_near, 4) && struck_unit(List.head(rs)) != 4, "near, not struck")
+    end
+    test "the same seed gives the same rounds; a wider cone spreads them" do
+      let s = spec_at((2.0, 0.6, 4.0), (8.0, 0.6, 4.0), 6, 0.2)
+      Test.assert_true(same_rounds(TcS.fire(walled(), Nil, s, 3), TcS.fire(walled(), Nil, s, 3)), "deterministic")
+      Test.assert_true(distinct(TcS.fire(walled(), Nil, s, 3)) > 1, "spread")
+    end
+    test "rounds that leave the world miss" do
+      let rs = TcS.fire(walled(), Nil, spec_at((2.0, 0.6, 4.0), (2.0, 50.0, 4.0), 4, 0.1), 1)
+      Test.assert_true(List.length(rs) == 4 && List.all(rs, fn r -> is_none(r)), "no strike, no crash")
+    end
+    test "the preview shares add up to 1 and see an ally in the cone" do
+      let ally = { bx_unit: 1, bx_part: 0, bx_centre: (5.0, 0.6, 4.0), bx_half: (0.3, 0.6, 0.3), bx_yaw: 0.0 }
+      let p = TcS.preview(walled(), [ally], spec_at((2.0, 0.6, 4.0), (8.0, 0.6, 4.0), 1, 0.1))
+      Test.assert_true(share_sum(p) > 0.999 && share_sum(p) < 1.001, "shares add up")
+      Test.assert_true(share_of_unit(p, 1) > 0.0, "the ally is in it")
+    end
+  end
+end

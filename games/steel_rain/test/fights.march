@@ -1,0 +1,275 @@
+-- Fights for the battle's tests: flat maps (every column 8 voxels high, no
+-- water), the spawn sites on the north and south rows, worlds built from the
+-- map, and helpers that place mechs and read the fight.
+mod SteelRain.Test.Fights do
+
+  alias SteelRain.Fight as SrFx
+
+  doc "A flat map of [tiles] tiles with spawn north on row 0 (tiles 1..4) and spawn south on the last row."
+  fn flat_map(tiles : Int) : StrataMaps.Data.MapData do
+    let d = StrataMaps.Data.empty(StrataMaps.Settings.settings(3, tiles), SteelRain.blocks())
+    { d with md_sites: [{ st_name: "spawn north", st_tiles: [(1, 0), (2, 0), (3, 0), (4, 0)] }, { st_name: "spawn south", st_tiles: [(1, tiles - 1), (2, tiles - 1), (3, tiles - 1), (4, tiles - 1)] }] }
+  end
+  doc "The world for map [d]."
+  fn world_of(d : StrataMaps.Data.MapData) : Strata.World.World do StrataMaps.RuinStage.scratch(d, SteelRain.registry()) end
+
+  doc "A 16-tile flat fight, two Wardens a side, seed 3."
+  fn small() : SteelRain.Fight.Fight do
+    let d = flat_map(16)
+    SrFx.start(d, world_of(d), SteelRain.Mech.parts(), [SteelRain.Mech.build(), SteelRain.Mech.build()], [SteelRain.Mech.build(), SteelRain.Mech.build()], 3)
+  end
+  doc "Fight [f] with the active mech's heat set to [h]."
+  fn with_heat(f : SteelRain.Fight.Fight, h : Int) : SteelRain.Fight.Fight do
+    match SrFx.active(f) do
+      Some(id) -> { f with fg_mechs: List.map(f.fg_mechs, fn m -> if m.mc_id == id do { m with mc_heat: h } else m end) }
+      None -> f
+    end
+  end
+  doc "Mech [id]'s heat (-1 if none)."
+  fn heat_of(f : SteelRain.Fight.Fight, id : Int) : Int do match SrFx.mech(f, id) do Some(m) -> m.mc_heat | None -> -1 end end
+  doc "The id whose turn it is (-1 if none)."
+  fn first_active(f : SteelRain.Fight.Fight) : Int do match SrFx.active(f) do Some(id) -> id | None -> -1 end end
+  doc "Fight [f] after [os], stopping at the first refused order."
+  fn run_orders(f : SteelRain.Fight.Fight, os : List(SteelRain.Fight.Order)) : SteelRain.Fight.Fight do
+    List.fold_left(os, f, fn (acc, o) -> match SrFx.step(acc, o) do Ok((f2, _)) -> f2 | Err(_) -> acc end)
+  end
+  doc "The fight's mechs and clock, as a string, for comparing two fights."
+  fn summary(f : SteelRain.Fight.Fight) : String do
+    String.join(List.map(f.fg_mechs, fn m -> match m.mc_tile do (x, z) -> int_to_string(m.mc_id) ++ ":" ++ int_to_string(x) ++ "," ++ int_to_string(z) ++ " h" ++ int_to_string(m.mc_heat) ++ " ct" ++ int_to_string(StrataTactics.Clock.ct(f.fg_clock, m.mc_id)) ++ " s" ++ int_to_string(m.mc_state) end), ";")
+      ++ " active " ++ int_to_string(first_active(f))
+  end
+
+  -- ── Placed fights ────────────────────────────────────────────────────────
+  doc "The world voxel at the middle of tile [t]'s floor top (the first air cell's y) on map [d]."
+  fn tile_voxel(d : StrataMaps.Data.MapData, t : (Int, Int)) : (Int, Int, Int) do
+    match (StrataMaps.Data.playable(d), t) do ((px, pz, _), (tx, tz)) -> (px + tx * 8 + 4, Strata.Heights.get(d.md_heights, px + tx * 8 + 4, pz + tz * 8 + 4), pz + tz * 8 + 4) end
+  end
+  doc "A fight on [d] and [w] with Wardens (side, tile, yaw) as given, ids from 1, and mech [first]'s turn."
+  fn placed(d : StrataMaps.Data.MapData, w : Strata.World.World, ms : List((Int, (Int, Int), Float)), first : Int) : SteelRain.Fight.Fight do
+    let parts = SteelRain.Mech.parts()
+    let b = SteelRain.Mech.build()
+    let h = SrFx.hull_of(parts, b)
+    let mechs = List.map(List.enumerate(ms), fn e -> match e do (i, (side, t, yaw)) -> SrFx.new_mech(parts, i + 1, side, 0, b, h, t, yaw) end)
+    give_turn(SrFx.from_mechs(d, w, parts, mechs, 3), first)
+  end
+  doc "Fight [f] with the clock reset so that mech [id] has the turn now (the others at 0 CT)."
+  fn give_turn(f : SteelRain.Fight.Fight, id : Int) : SteelRain.Fight.Fight do
+    let c0 = List.fold_left(f.fg_mechs, StrataTactics.Clock.start(StrataTactics.Clock.settings()), fn (c, m) -> if m.mc_state == 0 do StrataTactics.Clock.add(c, m.mc_id, SrFx.speed_of(f.fg_parts, m), if m.mc_id == id do 100 else 0 end) else c end)
+    match StrataTactics.Clock.advance(c0) do
+      (c1, _) -> { f with fg_clock: c1, fg_mechs: List.map(f.fg_mechs, fn m -> if m.mc_id == id do { m with mc_moved: false, mc_acted: false } else m end) }
+    end
+  end
+  doc "Two Wardens 6 tiles apart on open flat ground, mech 1 (side 0, tile (5, 4)) to act, mech 2 (side 1, tile (5, 10))."
+  fn facing_pair() : SteelRain.Fight.Fight do
+    let d = flat_map(16)
+    placed(d, world_of(d), [(0, (5, 4), 1.5708), (1, (5, 10), -1.5708)], 1)
+  end
+  doc "The world with the box of voxels (corners inclusive) set to [id]."
+  fn wall(w : Strata.World.World, x0 : Int, y0 : Int, z0 : Int, x1 : Int, y1 : Int, z1 : Int, id : Int) : Strata.World.World do
+    Strata.Edit.world(Strata.Edit.fill_box(w, x0, y0, z0, x1, y1, z1, id))
+  end
+  doc "The wall of `behind_wall`: across tiles 3..7 at tile row 7, 2 voxels thick, 16 high from the floor."
+  fn wall_box(d : StrataMaps.Data.MapData) : (Int, Int, Int, Int, Int, Int) do
+    match (StrataMaps.Data.playable(d), tile_voxel(d, (5, 7))) do ((px, _, _), (_, y, z)) -> (px + 24, y, z - 1, px + 63, y + 15, z) end
+  end
+  doc "The facing pair with a stone wall between them, taller than either."
+  fn behind_wall() : SteelRain.Fight.Fight do
+    let d = flat_map(16)
+    match wall_box(d) do (x0, y0, z0, x1, y1, z1) -> placed(d, wall(world_of(d), x0, y0, z0, x1, y1, z1, 1), [(0, (5, 4), 1.5708), (1, (5, 10), -1.5708)], 1) end
+  end
+  doc "The facing pair with a side-0 ally (mech 3) standing between them, on tile (5, 7)."
+  fn ally_between() : SteelRain.Fight.Fight do
+    let d = flat_map(16)
+    placed(d, world_of(d), [(0, (5, 4), 1.5708), (1, (5, 10), -1.5708), (0, (5, 7), 1.5708)], 1)
+  end
+  doc "Solid voxels left in the wall of `behind_wall`."
+  fn wall_voxels(f : SteelRain.Fight.Fight) : Int do
+    match wall_box(f.fg_map) do
+      (x0, y0, z0, x1, y1, z1) -> let nx = x1 - x0 + 1
+        let ny = y1 - y0 + 1
+        List.length(List.filter(List.range(0, nx * ny * (z1 - z0 + 1)), fn i -> Strata.World.get_block(f.fg_world, x0 + i % nx, y0 + (i / nx) % ny, z0 + i / (nx * ny)) != 0))
+    end
+  end
+  doc "Where mech [id] stands (metres)."
+  fn at_of(f : SteelRain.Fight.Fight, id : Int) : (Float, Float, Float) do
+    match SrFx.mech(f, id) do Some(m) -> StrataTactics.Grid.centre(f.fg_grid, m.mc_tile) | None -> (0.0, 0.0, 0.0) end
+  end
+  doc "The middle of mech [id]'s torso box (metres)."
+  fn torso_point_of(f : SteelRain.Fight.Fight, id : Int) : (Float, Float, Float) do
+    match SrFx.mech(f, id) do
+      Some(m) -> match List.find(SteelRain.Hull.boxes(m.mc_hull, id, at_of(f, id), m.mc_yaw, [Nil]), fn _ -> true) do Some(b) -> b.bx_centre | None -> at_of(f, id) end
+      None -> (0.0, 0.0, 0.0)
+    end
+  end
+  doc "The Warden's right arm (its autocannon)."
+  fn arm_path() : List(String) do ["arm_r"] end
+  doc "The Warden's missile rack."
+  fn rack_path() : List(String) do ["shoulder_l"] end
+  doc "Mech [id]'s CT (0 off the clock)."
+  fn ct_of(f : SteelRain.Fight.Fight, id : Int) : Int do StrataTactics.Clock.ct(f.fg_clock, id) end
+  doc "Mech [id]'s state (-1 if none)."
+  fn state_of(f : SteelRain.Fight.Fight, id : Int) : Int do match SrFx.mech(f, id) do Some(m) -> m.mc_state | None -> -1 end end
+  doc "Fight [f] with the active mech's heat set so that [k] is left under the cap."
+  fn with_heat_left(f : SteelRain.Fight.Fight, k : Int) : SteelRain.Fight.Fight do with_heat(f, (SteelRain.Rules.numbers()).rn_heat_cap - k) end
+  doc "The heat of a volley of the Warden's autocannon and missile rack."
+  fn volley_heat() : Int do
+    match (SteelRain.Rules.weapon(1), SteelRain.Rules.weapon(2)) do (Some(a), Some(b)) -> a.wp_heat + b.wp_heat | _ -> 0 end
+  end
+  doc "A volley of both weapons at mech 2's torso."
+  fn both_weapons(f : SteelRain.Fight.Fight) : SteelRain.Fight.Order do OFire([(arm_path(), torso_point_of(f, 2)), (rack_path(), torso_point_of(f, 2))]) end
+  doc "Mech 1 firing both weapons at mech 2, cool each time, until mech 2 is out (at most 40 volleys)."
+  fn fire_until_core_lost(f0 : SteelRain.Fight.Fight) : SteelRain.Fight.Fight do
+    List.fold_left(List.range(0, 40), f0, fn (f, _) -> if state_of(f, 2) == 2 do f else volley_again(f) end)
+  end
+  pfn volley_again(f : SteelRain.Fight.Fight) : SteelRain.Fight.Fight do
+    let f1 = with_heat(give_turn(f, 1), 0)
+    match SrFx.step(f1, both_weapons(f1)) do Ok((f2, _)) -> f2 | Err(_) -> f1 end
+  end
+
+  -- ── Ground that can be shot away ─────────────────────────────────────────
+  doc "Tile (5, 10)'s low corner voxel (x, z) on map [d]."
+  fn slab_corner(d : StrataMaps.Data.MapData) : (Int, Int) do match StrataMaps.Data.playable(d) do (px, pz, _) -> (px + 40, pz + 80) end end
+  doc "The facing pair with mech 2 on a slab over tile (5, 10), its top 10 voxels up (5 steps, past the Warden's drop of 3) on a one-voxel pillar; with [rock], stone 4 high under the slab's west half; with [third], a side-1 mech 3 on tile (6, 10)."
+  fn slab_fight(rock : Bool, third : Bool) : SteelRain.Fight.Fight do slab_with(10, rock, third) end
+  doc "The slab fight with the slab's top [h] voxels over the ground, no rock, no third mech."
+  fn slab_at(h : Int) : SteelRain.Fight.Fight do slab_with(h, false, false) end
+  pfn slab_with(h : Int, rock : Bool, third : Bool) : SteelRain.Fight.Fight do
+    let d = flat_map(16)
+    match slab_corner(d) do
+      (x0, z0) ->
+        let w1 = wall(wall(world_of(d), x0, 7 + h, z0, x0 + 7, 7 + h, z0 + 7, 1), x0 + 6, 8, z0 + 4, x0 + 6, 6 + h, z0 + 4, 1)
+        let w2 = if rock do wall(w1, x0, 8, z0, x0 + 3, 11, z0 + 7, 1) else w1 end
+        let ms = if third do [(0, (5, 4), 1.5708), (1, (5, 10), -1.5708), (1, (6, 10), -1.5708)] else [(0, (5, 4), 1.5708), (1, (5, 10), -1.5708)] end
+        placed(d, w2, ms, 1)
+    end
+  end
+  doc "Both weapons at the slab's pillar."
+  fn fire_at_pillar(f : SteelRain.Fight.Fight) : SteelRain.Fight.Order do
+    match slab_corner(f.fg_map) do
+      (x0, z0) -> let p = ((int_to_float(x0 + 6) +. 0.5) *. 0.4, 10.5 *. 0.4, (int_to_float(z0 + 4) +. 0.5) *. 0.4)
+        OFire([(arm_path(), p), (rack_path(), p)])
+    end
+  end
+  doc "Mech [id]'s tile."
+  fn tile_of(f : SteelRain.Fight.Fight, id : Int) : (Int, Int) do match SrFx.mech(f, id) do Some(m) -> m.mc_tile | None -> (-1, -1) end end
+  doc "Mech [id]'s armour on node [p] (0 if gone)."
+  fn armour_on(f : SteelRain.Fight.Fight, id : Int, p : List(String)) : Int do
+    match SrFx.mech(f, id) do
+      Some(m) -> match List.find(m.mc_armour, fn a -> match a do (q, _) -> q == p end) do Some((_, v)) -> v | None -> 0 end
+      None -> 0
+    end
+  end
+  doc "Rubble voxels (id 8) on tile [t] from its floor up 24."
+  fn rubble_on_tile(f : SteelRain.Fight.Fight, t : (Int, Int)) : Int do
+    match tile_voxel(f.fg_map, t) do
+      (cx, y, cz) -> List.length(List.filter(List.range(0, 8 * 8 * 24), fn i -> Strata.World.get_block(f.fg_world, cx - 4 + i % 8, y - 2 + i / 64, cz - 4 + (i / 8) % 8) == 8))
+    end
+  end
+
+  -- ── Moving and watches ───────────────────────────────────────────────────
+  doc "Mech 1's walk from (5, 4) to (5, 9)."
+  fn path6() : List((Int, Int)) do [(5, 4), (5, 5), (5, 6), (5, 7), (5, 8), (5, 9)] end
+  doc "Fight [f] with mech [owner] holding a watch from its tile facing [dir], 90 degrees wide, [range] tiles, with its autocannon."
+  fn watching(f : SteelRain.Fight.Fight, owner : Int, dir : Float, range : Int) : SteelRain.Fight.Fight do
+    { f with fg_watches: List.append(f.fg_watches, [StrataTactics.Watch.arc(owner, tile_of(f, owner), dir, 1.5708, range)]), fg_watch_weapons: List.append(f.fg_watch_weapons, [(owner, arm_path())]) }
+  end
+  doc "The facing pair with mech 2 watching the lane: (5, 7) to (5, 9)."
+  fn lane_watched() : SteelRain.Fight.Fight do watching(facing_pair(), 2, -1.5708, 3) end
+  doc "The lane watched by mech 2 and by mech 3 from (8, 7), facing -x."
+  fn lane_watched_twice() : SteelRain.Fight.Fight do
+    let d = flat_map(16)
+    watching(watching(placed(d, world_of(d), [(0, (5, 4), 1.5708), (1, (5, 10), -1.5708), (1, (8, 7), 3.1416)], 1), 2, -1.5708, 3), 3, 3.1416, 3)
+  end
+  doc "The watched lane with mech 1 so frail that any hit breaks what it strikes."
+  fn lane_lethal() : SteelRain.Fight.Fight do
+    let f = lane_watched()
+    { f with fg_mechs: List.map(f.fg_mechs, fn m -> if m.mc_id == 1 do { m with mc_armour: List.map(m.mc_armour, fn a -> match a do (p, _) -> (p, 1) end) } else m end) }
+  end
+  doc "Mech 1 alone on its spawn edge at (2, 0), mech 2 far off."
+  fn on_spawn() : SteelRain.Fight.Fight do
+    let d = flat_map(16)
+    placed(d, world_of(d), [(0, (2, 0), 1.5708), (1, (5, 10), -1.5708)], 1)
+  end
+  doc "Has mech [id] lost its legs?"
+  fn legless(f : SteelRain.Fight.Fight, id : Int) : Bool do armour_on(f, id, ["hip"]) == 0 end
+
+  -- ── Destroy ──────────────────────────────────────────────────────────────
+  doc "A flat 16-tile map with the Destroy mission's sites placed by its rules, and its world."
+  fn destroy_map() : (StrataMaps.Data.MapData, Strata.World.World) do
+    let d0 = { flat_map(16) with md_sites: Nil }
+    let w = world_of(d0)
+    (StrataMaps.Sites.place(d0, StrataMaps.grid(d0, w), SteelRain.Missions.destroy_rules()), w)
+  end
+  doc "A Destroy fight with [n] Wardens."
+  fn destroy_with(n : Int) : SteelRain.Fight.Fight do
+    match destroy_map() do (d, w) -> SrFx.start_destroy(d, w, SteelRain.Mech.parts(), List.map(List.range(0, n), fn _ -> SteelRain.Mech.build()), 3) end
+  end
+  doc "A Destroy fight with two Wardens."
+  fn destroy_small() : SteelRain.Fight.Fight do destroy_with(2) end
+  doc "How many units of [kind] the fight has."
+  fn count_kind(f : SteelRain.Fight.Fight, kind : Int) : Int do List.length(List.filter(f.fg_mechs, fn m -> m.mc_kind == kind)) end
+  doc "How many of the depot's cells still stand."
+  fn depot_cells(f : SteelRain.Fight.Fight) : Int do SrFx.depot_left(f) end
+  doc "The ids whose turns [f] offers over [n] turns ended at once (stopping when the fight ends)."
+  fn turns_seen(f : SteelRain.Fight.Fight, n : Int) : List(Int) do
+    match List.fold_left(List.range(0, n), (f, Nil), fn (acc, _) -> seen_step(acc)) do (_, ids) -> List.reverse(ids) end
+  end
+  pfn seen_step(acc : (SteelRain.Fight.Fight, List(Int))) : (SteelRain.Fight.Fight, List(Int)) do
+    match acc do
+      (f, ids) -> if Option.is_some(f.fg_result) do acc
+        else match SrFx.step(f, OEnd(0.0)) do
+          Ok((f2, _)) -> (f2, if Option.is_some(f2.fg_result) do ids else match SrFx.active(f2) do Some(id) -> Cons(id, ids) | None -> ids end end)
+          Err(_) -> acc
+        end end
+    end
+  end
+  doc "The kind of unit [id] (-1 if none)."
+  fn kind_of(f : SteelRain.Fight.Fight, id : Int) : Int do match SrFx.mech(f, id) do Some(m) -> m.mc_kind | None -> -1 end end
+  doc "Did the fight end won?"
+  fn won(f : SteelRain.Fight.Fight) : Bool do match f.fg_result do Some(r) -> r.rs_won | None -> false end end
+  doc "Did the fight end lost?"
+  fn lost(f : SteelRain.Fight.Fight) : Bool do match f.fg_result do Some(r) -> !r.rs_won | None -> false end end
+  doc "Fight [f] with every emplacement's armour [a]."
+  fn emplacements_at(f : SteelRain.Fight.Fight, a : Int) : SteelRain.Fight.Fight do
+    { f with fg_mechs: List.map(f.fg_mechs, fn m -> if m.mc_kind == 1 do { m with mc_armour: List.map(m.mc_armour, fn x -> match x do (p, _) -> (p, a) end) } else m end) }
+  end
+  doc "A scripted player: each Warden fires at the nearest emplacement still in, then at the depot until half of it is down, then withdraws; at most [left] orders."
+  fn play_destroy(f : SteelRain.Fight.Fight, left : Int) : SteelRain.Fight.Fight do
+    if left <= 0 || Option.is_some(f.fg_result) do f
+    else match SrFx.active(f) do
+      None -> f
+      Some(id) -> match SrFx.mech(f, id) do
+        None -> f
+        Some(m) -> play_destroy(scripted_turn(f, m), left - 1)
+      end
+    end end
+  end
+  pfn scripted_turn(f : SteelRain.Fight.Fight, m : SteelRain.Fight.Mech) : SteelRain.Fight.Fight do
+    let ems = List.filter(f.fg_mechs, fn x -> x.mc_kind == 1 && x.mc_state == 0)
+    let target = match ems do
+      Cons(e, _) -> Some(SrFx.torso_point(f, e))
+      Nil -> if SrFx.depot_left(f) * 2 > SrFx.depot_start(f) do SrFx.depot_point(f) else None end
+    end
+    match target do
+      None -> match SrFx.step(f, OWithdraw) do Ok((f2, _)) -> f2 | Err(_) -> end_now(f) end
+      Some(aim) -> end_now(fire_what_it_can(f, aim))
+    end
+  end
+  pfn fire_what_it_can(f : SteelRain.Fight.Fight, aim : (Float, Float, Float)) : SteelRain.Fight.Fight do
+    match SrFx.step(f, OFire([(arm_path(), aim), (rack_path(), aim)])) do
+      Ok((f2, _)) -> f2
+      Err(_) -> match SrFx.step(f, OFire([(rack_path(), aim)])) do
+        Ok((f3, _)) -> f3
+        Err(_) -> match SrFx.step(f, OFire([(arm_path(), aim)])) do Ok((f4, _)) -> f4 | Err(_) -> f end
+      end
+    end
+  end
+  pfn end_now(f : SteelRain.Fight.Fight) : SteelRain.Fight.Fight do
+    if Option.is_some(f.fg_result) do f else match SrFx.step(f, OEnd(1.5708)) do Ok((f2, _)) -> f2 | Err(_) -> f end end
+  end
+  doc "A Destroy fight with one Warden so frail that any hit breaks what it strikes."
+  fn destroy_frail() : SteelRain.Fight.Fight do
+    let f = destroy_with(1)
+    { f with fg_mechs: List.map(f.fg_mechs, fn m -> if m.mc_kind == 0 do { m with mc_armour: List.map(m.mc_armour, fn x -> match x do (p, _) -> (p, 1) end) } else m end) }
+  end
+end

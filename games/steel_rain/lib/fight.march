@@ -1,0 +1,733 @@
+-- SteelRain.Fight — one battle as a value, changed only by `step`.
+--
+-- A fight holds the map, its own world (no window: the screen keeps its own
+-- streamed copy in step from the events), the tactical grid, the mechs, the
+-- FFT clock, the watches, the mission, a seed and a shot counter. `step`
+-- takes one order for the mech whose turn it is and answers the new fight
+-- and what happened, in order, or why the order was refused (the fight is
+-- then unchanged). The same fight, orders and seed give the same result:
+-- every draw comes from Strata.Seed.mix(seed, shot counter).
+--
+-- A mech moves once and acts once a turn, in either order. Side 0 is the
+-- player, side 1 the enemy. Mechs face along yaw (0 is +x, a quarter turn
+-- +z).
+mod SteelRain.Fight do
+
+  alias StrataTactics.Clock as FgC
+  alias StrataTactics.Grid as FgG
+
+  -- a mech: id, side, kind (0 mech, 1 emplacement), build, hull, armour per node still on it, tile, facing, heat,
+  -- state (0 in, 1 withdrawn, 2 out), this turn's move and act, hit since its last turn, braced
+  type Mech = { mc_id : Int, mc_side : Int, mc_kind : Int, mc_build : StrataKit.Build.KitBuild, mc_hull : SteelRain.Hull.Hull, mc_armour : List((List(String), Int)),
+                mc_tile : (Int, Int), mc_yaw : Float, mc_heat : Int, mc_state : Int, mc_moved : Bool, mc_acted : Bool, mc_hit_this_round : Bool, mc_braced : Bool }
+  -- the mission: none; Destroy (emplacement ids, the depot's cells, how many it started with)
+  type Mission = MNone | MDestroy(List(Int), List((Int, Int, Int)), Int)
+  -- how a fight ended: won, and each mech's id, state and build at the end
+  type Result_ = { rs_won : Bool, rs_mechs : List((Int, Int, StrataKit.Build.KitBuild)) }
+  -- the fight
+  type Fight = { fg_map : StrataMaps.Data.MapData, fg_world : Strata.World.World, fg_grid : StrataTactics.Grid.TileGrid, fg_parts : List(StrataKit.Part.KitPart), fg_mechs : List(Mech),
+                 fg_clock : StrataTactics.Clock.TurnClock, fg_watches : List(StrataTactics.Watch.Arc), fg_watch_weapons : List((Int, List(String))), fg_mission : Mission, fg_seed : Int, fg_shots : Int, fg_result : Option(Result_) }
+  -- an order: move along a path; fire a volley (weapon node, aim in metres); brace; watch (weapon node, direction); withdraw; end the turn facing yaw
+  type Order = OMove(List((Int, Int))) | OFire(List((List(String), (Float, Float, Float)))) | OBrace | OWatch(List(String), Float) | OWithdraw | OEnd(Float)
+  -- what happened
+  type Event = EMoved(Int, (Int, Int)) | ERound(Int, StrataTactics.Shot.ShotRound) | ECarved(List(Strata.Edit.Change)) | EFell(List((Int, Int, Int, Int))) | EPartHit(Int, List(String), Int)
+             | EPartLost(Int, List(String)) | EDelayed(Int, Int) | EHeat(Int, Int) | EOverheated(Int) | EMechFell(Int, (Int, Int), Int) | EWatchSet(Int) | EWatchFired(Int, Int)
+             | EState(Int, Int) | ETurn(Int) | EEnded(Result_)
+
+  -- ── Setup ────────────────────────────────────────────────────────────────
+  pfn site_tiles(d : StrataMaps.Data.MapData, name : String) : List((Int, Int)) do
+    match List.find(d.md_sites, fn s -> s.st_name == name) do Some(s) -> s.st_tiles | None -> Nil end
+  end
+  pfn centre_of(ts : List((Int, Int))) : (Float, Float) do
+    let n = int_to_float(Math.max_int(1, List.length(ts)))
+    List.fold_left(ts, (0.0, 0.0), fn (acc, t) -> match (acc, t) do ((ax, az), (x, z)) -> (ax +. int_to_float(x) /. n, az +. int_to_float(z) /. n) end)
+  end
+  pfn yaw_to(from : (Int, Int), to : (Float, Float)) : Float do
+    match (from, to) do ((fx, fz), (tx, tz)) -> Math.atan2(tz -. int_to_float(fz), tx -. int_to_float(fx)) end
+  end
+  doc "A mech of [side] and [kind] built as [b] from [parts], on tile [t] facing [yaw]."
+  fn new_mech(parts : List(StrataKit.Part.KitPart), id : Int, side : Int, kind : Int, b : StrataKit.Build.KitBuild, hull : SteelRain.Hull.Hull, t : (Int, Int), yaw : Float) : Mech do
+    { mc_id: id, mc_side: side, mc_kind: kind, mc_build: b, mc_hull: hull, mc_armour: armour_of(parts, b), mc_tile: t, mc_yaw: yaw, mc_heat: 0, mc_state: 0,
+      mc_moved: false, mc_acted: false, mc_hit_this_round: false, mc_braced: false }
+  end
+  pfn armour_of(parts : List(StrataKit.Part.KitPart), b : StrataKit.Build.KitBuild) : List((List(String), Int)) do
+    List.map(StrataKit.Build.paths(b), fn p -> (p, match StrataKit.Build.at(b, p) do
+      Some(n) -> match List.nth_opt(parts, StrataKit.Build.part_of(n)) do Some(pt) -> float_to_int(StrataKit.Part.tag(pt, "armour")) | None -> 0 end
+      None -> 0
+    end))
+  end
+  doc "The hull of build [b] (assembled with the Warden's settings and fitting rule)."
+  fn hull_of(parts : List(StrataKit.Part.KitPart), b : StrataKit.Build.KitBuild) : SteelRain.Hull.Hull do
+    match StrataKit.Assemble.assemble(parts, b, SteelRain.Mech.fits, SteelRain.Mech.settings()) do (rig, m, _) -> SteelRain.Hull.of(rig, m, SteelRain.Mech.stand()) end
+  end
+  pfn side_mechs(parts : List(StrataKit.Part.KitPart), first : Int, side : Int, bs : List(StrataKit.Build.KitBuild), tiles : List((Int, Int)), face : (Float, Float)) : List(Mech) do
+    List.filter_map(List.enumerate(bs), fn e -> match e do
+      (i, b) -> match List.nth_opt(tiles, i) do
+        Some(t) -> Some(new_mech(parts, first + i, side, 0, b, hull_of(parts, b), t, yaw_to(t, face)))
+        None -> None
+      end
+    end)
+  end
+
+  doc "A fight on map [d] in world [w] (built from it): side 0's builds [side0] on the \"spawn north\" site's tiles, side 1's [side1] on \"spawn south\"'s, facing each other, ids from 1; every mech on the clock at its speed; the clock run to the first turn."
+  fn start(d : StrataMaps.Data.MapData, w : Strata.World.World, parts : List(StrataKit.Part.KitPart), side0 : List(StrataKit.Build.KitBuild), side1 : List(StrataKit.Build.KitBuild), seed : Int) : Fight do
+    let north = site_tiles(d, "spawn north")
+    let south = site_tiles(d, "spawn south")
+    let ms = List.append(side_mechs(parts, 1, 0, side0, north, centre_of(south)), side_mechs(parts, 1 + List.length(side0), 1, side1, south, centre_of(north)))
+    from_mechs(d, w, parts, ms, seed)
+  end
+  doc "A fight on map [d] in world [w] with the mechs [ms] as they are, every one that is in put on the clock at its speed; the clock run to the first turn."
+  fn from_mechs(d : StrataMaps.Data.MapData, w : Strata.World.World, parts : List(StrataKit.Part.KitPart), ms : List(Mech), seed : Int) : Fight do begin(d, w, parts, ms, seed, MNone) end
+  pfn begin(d : StrataMaps.Data.MapData, w : Strata.World.World, parts : List(StrataKit.Part.KitPart), ms : List(Mech), seed : Int, mission : Mission) : Fight do
+    let clock = List.fold_left(ms, FgC.start(FgC.settings()), fn (c, m) -> if m.mc_state == 0 do FgC.add(c, m.mc_id, speed_of(parts, m), 0) else c end)
+    let f = { fg_map: d, fg_world: w, fg_grid: StrataMaps.grid(d, w), fg_parts: parts, fg_mechs: ms, fg_clock: clock, fg_watches: Nil, fg_watch_weapons: Nil, fg_mission: mission, fg_seed: seed, fg_shots: 0, fg_result: None }
+    match next_turn(f, Nil) do (f2, _) -> f2 end
+  end
+  doc "Mech [m]'s speed on the clock (emplacements: the rules' emplacement speed)."
+  fn speed_of(parts : List(StrataKit.Part.KitPart), m : Mech) : Int do
+    if m.mc_kind == 1 do (SteelRain.Rules.numbers()).rn_emplacement_speed else SteelRain.Rules.speed(parts, m.mc_build) end
+  end
+
+  -- ── Reading ──────────────────────────────────────────────────────────────
+  doc "The mech whose turn it is."
+  fn active(f : Fight) : Option(Int) do FgC.active(f.fg_clock) end
+  doc "Mech [id]."
+  fn mech(f : Fight, id : Int) : Option(Mech) do List.find(f.fg_mechs, fn m -> m.mc_id == id) end
+  doc "The fight with mech [id] replaced by what [g] makes of it."
+  fn update(f : Fight, id : Int, g : Mech -> Mech) : Fight do { f with fg_mechs: List.map(f.fg_mechs, fn m -> if m.mc_id == id do g(m) else m end) } end
+
+  -- ── Turns ────────────────────────────────────────────────────────────────
+  -- the clock run until a turn starts (ETurn appended); a fight with nobody on the clock stays as it is
+  pfn next_turn(f : Fight, evs : List(Event)) : (Fight, List(Event)) do next_go(f, evs, 64) end
+  pfn next_go(f : Fight, evs : List(Event), left : Int) : (Fight, List(Event)) do
+    match FgC.active(f.fg_clock) do
+      Some(id) -> match conclude(f, evs) do
+        (fc, ec) -> if Option.is_some(fc.fg_result) do (fc, ec)
+          else
+            let f1 = drop_watch(update(fc, id, fn x -> { x with mc_moved: false, mc_acted: false, mc_braced: false }), id)
+            match mech(f1, id) do
+              Some(m) -> if m.mc_kind == 1 do emplacement_turn(f1, m, List.append(ec, [ETurn(id)])) else (f1, List.append(ec, [ETurn(id)])) end
+              None -> (f1, ec)
+            end
+          end
+      end
+      None ->
+        if left <= 0 do (f, evs)
+        else
+          match FgC.advance(f.fg_clock) do
+            (c2, ces) -> if List.is_empty(ces) && Option.is_none(FgC.active(c2)) do ({ f with fg_clock: c2 }, evs) else next_go({ f with fg_clock: c2 }, evs, left - 1) end
+          end
+        end
+    end
+  end
+
+  -- the order's checks that do not depend on what it is: a fight still running, a mech to act
+  pfn ready(f : Fight) : Result(Mech, String) do
+    match f.fg_result do
+      Some(_) -> Err("the fight is over")
+      None -> match active(f) do
+        None -> Err("no mech has its turn")
+        Some(id) -> match mech(f, id) do Some(m) -> Ok(m) | None -> Err("the active unit is not in the fight") end
+      end
+    end
+  end
+
+  doc "Apply order [o] for the mech whose turn it is: the new fight and what happened, in order; or why the order was refused (the fight is then unchanged)."
+  fn step(f : Fight, o : Order) : Result((Fight, List(Event)), String) do
+    match ready(f) do
+      Err(e) -> Err(e)
+      Ok(m) -> match order(f, m, o) do
+        Err(e) -> Err(e)
+        Ok((f2, evs)) -> Ok(after_order(f2, evs))
+      end
+    end
+  end
+  -- after an order: the fight decided, or a turn whose mech left the fight passed on
+  pfn after_order(f : Fight, evs : List(Event)) : (Fight, List(Event)) do
+    match conclude(f, evs) do
+      (f1, e1) -> if Option.is_some(f1.fg_result) do (f1, e1)
+        else match active(f1) do
+          Some(id) -> match mech(f1, id) do Some(m) -> if m.mc_state == 0 do (f1, e1) else next_turn({ f1 with fg_clock: FgC.end_turn(f1.fg_clock, false, false) }, e1) end | None -> (f1, e1) end
+          None -> next_turn(f1, e1)
+        end end
+    end
+  end
+  pfn order(f : Fight, m : Mech, o : Order) : Result((Fight, List(Event)), String) do
+    match f.fg_result do
+      Some(_) -> Err("the fight is over")
+      None -> match o do
+        OEnd(yaw) -> Ok(end_turn(f, m, yaw))
+        OBrace -> if m.mc_acted do Err("it has already acted this turn") else Ok((update(f, m.mc_id, fn x -> { x with mc_acted: true, mc_braced: true }), Nil)) end
+        OFire(shots) -> match fire_check(f, m, shots) do
+          Some(why) -> Err(why)
+          None -> Ok(volley(f, m, shots))
+        end
+        OMove(path) -> match move_check(f, m, path) do
+          Some(why) -> Err(why)
+          None -> Ok(walk(f, m.mc_id, path))
+        end
+        OWatch(p, dir) -> if m.mc_acted do Err("it has already acted this turn")
+          else if Option.is_none(weapon_at(f, m, p)) do Err("that is not a weapon it carries")
+          else Ok(set_watch(f, m, p, dir)) end end
+        OWithdraw -> if !List.member(own_edge(f, m), m.mc_tile) do Err("it can only withdraw from its own spawn edge") else Ok(withdraw(f, m)) end
+      end
+    end
+  end
+
+  -- the end of mech [m]'s turn: its facing, heat shed, overheating, the clock charged, the next turn
+  pfn end_turn(f : Fight, m : Mech, yaw : Float) : (Fight, List(Event)) do
+    let n = SteelRain.Rules.numbers()
+    let shed = if m.mc_kind == 1 do 0 else SteelRain.Rules.shed(f.fg_parts, m.mc_build) end
+    let heat = Math.max_int(0, m.mc_heat - shed)
+    let f1 = update(f, m.mc_id, fn x -> { x with mc_yaw: yaw, mc_heat: heat, mc_hit_this_round: false })
+    let ev1 = if heat != m.mc_heat do [EHeat(m.mc_id, heat)] else Nil end
+    match (if heat > n.rn_heat_warn + (n.rn_heat_cap - n.rn_heat_warn) / 2 do overheat(f1, m.mc_id) else (f1, Nil) end) do
+      (f2, ev2) ->
+        let f3 = { f2 with fg_clock: FgC.end_turn(f2.fg_clock, m.mc_moved, m.mc_acted) }
+        next_turn(f3, List.append(ev1, ev2))
+    end
+  end
+  -- overheating: CT lost, and parts that burn take their heat damage
+  pfn overheat(f : Fight, id : Int) : (Fight, List(Event)) do
+    let n = SteelRain.Rules.numbers()
+    let f1 = { f with fg_clock: FgC.delay(f.fg_clock, id, n.rn_overheat_ct) }
+    match mech(f1, id) do
+      None -> (f1, Nil)
+      Some(m) ->
+        let burns = List.filter_map(StrataKit.Build.paths(m.mc_build), fn p -> burn_of(f1, m, p))
+        List.fold_left(burns, (f1, [EOverheated(id)]), fn (acc, b) -> burn_step(id, acc, b))
+    end
+  end
+  pfn burn_step(id : Int, acc : (Fight, List(Event)), b : (List(String), Int)) : (Fight, List(Event)) do
+    match (acc, b) do ((fa, ea), (p, dmg)) -> adding(ea, damage(fa, id, p, dmg)) end
+  end
+  -- events [ea], then what [r] adds
+  pfn adding(ea : List(Event), r : (Fight, List(Event))) : (Fight, List(Event)) do match r do (fb, eb) -> (fb, List.append(ea, eb)) end end
+  pfn burn_of(f : Fight, m : Mech, p : List(String)) : Option((List(String), Int)) do
+    let v = float_to_int(StrataKit.Part.tag(part_at(f, m, p), "heat_damage"))
+    if v > 0 do Some((p, v)) else None end
+  end
+
+  -- ── Destroy, emplacements, results ───────────────────────────────────────
+  doc "An emplacement's hull: one box 2.4 m across and 2 m high, its gun 1.8 m up."
+  fn emplacement_hull() : SteelRain.Hull.Hull do
+    { hl_parts: [(Nil, (0.0, 1.0, 0.0), (1.2, 1.0, 1.2))], hl_muzzles: [(Nil, (0.6, 1.8, 0.0))], hl_height: 2.0 }
+  end
+  doc "An emplacement of side 1 on tile [t] facing [yaw]: one node (the core part, for its sight), the rules' armour."
+  fn new_emplacement(id : Int, t : (Int, Int), yaw : Float) : Mech do
+    { mc_id: id, mc_side: 1, mc_kind: 1, mc_build: StrataKit.Build.leaf(0), mc_hull: emplacement_hull(), mc_armour: [(Nil, (SteelRain.Rules.numbers()).rn_emplacement_armour)], mc_tile: t, mc_yaw: yaw, mc_heat: 0, mc_state: 0,
+      mc_moved: false, mc_acted: false, mc_hit_this_round: false, mc_braced: false }
+  end
+  pfn sites_named(d : StrataMaps.Data.MapData, name : String) : List(List((Int, Int))) do
+    List.map(List.filter(d.md_sites, fn s -> s.st_name == name), fn s -> s.st_tiles)
+  end
+  doc "A Destroy fight on map [d] (its sites from SteelRain.Missions.destroy_rules) in world [w]: side 0's builds [side0] on the north spawn, an emplacement on each battery site facing them, the depot built on the supply site."
+  fn start_destroy(d : StrataMaps.Data.MapData, w : Strata.World.World, parts : List(StrataKit.Part.KitPart), side0 : List(StrataKit.Build.KitBuild), seed : Int) : Fight do
+    let north = site_tiles(d, "spawn north")
+    let ours = side_mechs(parts, 1, 0, side0, north, centre_of(site_tiles(d, "spawn south")))
+    let first = 1 + List.length(ours)
+    let ems = List.filter_map(List.enumerate(sites_named(d, "battery")), fn e -> match e do (i, ts) -> match ts do Cons(t, _) -> Some(new_emplacement(first + i, t, yaw_to(t, centre_of(north)))) | Nil -> None end end)
+    let cells = match site_tiles(d, "supply") do
+      Cons((tx, tz), _) -> match StrataMaps.Data.playable(d) do (px, pz, _) -> let x = px + tx * 8 + 2
+        let z = pz + tz * 8 + 2
+        SteelRain.Missions.depot_cells(x, Strata.Heights.get(d.md_heights, x, z), z) end
+      Nil -> Nil
+    end
+    let w2 = Strata.Edit.world(Strata.Edit.set_many(w, List.map(cells, fn c -> match c do (x, y, z) -> (x, y, z, d.md_blocks.mb_concrete) end)))
+    begin(d, w2, parts, List.append(ours, ems), seed, MDestroy(List.map(ems, fn e -> e.mc_id), cells, List.length(cells)))
+  end
+  doc "How many of the depot's cells still stand (0 with no depot)."
+  fn depot_left(f : Fight) : Int do
+    match f.fg_mission do
+      MDestroy(_, cells, _) -> List.length(List.filter(cells, fn c -> match c do (x, y, z) -> Strata.World.get_block(f.fg_world, x, y, z) == f.fg_map.md_blocks.mb_concrete end))
+      MNone -> 0
+    end
+  end
+  doc "How many cells the depot started with."
+  fn depot_start(f : Fight) : Int do match f.fg_mission do MDestroy(_, _, n) -> n | MNone -> 0 end end
+  doc "The middle of a depot cell still standing (metres), if any."
+  fn depot_point(f : Fight) : Option((Float, Float, Float)) do
+    let sc = Strata.World.scale(f.fg_world)
+    match f.fg_mission do
+      MDestroy(_, cells, _) -> match List.find(cells, fn c -> match c do (x, y, z) -> Strata.World.get_block(f.fg_world, x, y, z) == f.fg_map.md_blocks.mb_concrete end) do
+        Some((x, y, z)) -> Some(((int_to_float(x) +. 0.5) *. sc, (int_to_float(y) +. 0.5) *. sc, (int_to_float(z) +. 0.5) *. sc))
+        None -> None
+      end
+      MNone -> None
+    end
+  end
+  pfn any_in(f : Fight, side : Int) : Bool do List.any(f.fg_mechs, fn m -> m.mc_side == side && m.mc_state == 0) end
+  doc "How the fight has ended, if it has: Destroy is won when every emplacement is out, half the depot is down, and the player's mechs have all left or no enemy is in; lost when no player mech is in and it is not won."
+  fn decide(f : Fight) : Option(Result_) do
+    match f.fg_mission do
+      MNone -> None
+      MDestroy(ems, _, _) ->
+        let targets_down = List.all(ems, fn id -> match mech(f, id) do Some(e) -> e.mc_state == 2 | None -> true end) && depot_left(f) * 2 <= depot_start(f)
+        let won = targets_down && (!any_in(f, 0) || !any_in(f, 1))
+        if won do Some(result(f, true)) else if !any_in(f, 0) do Some(result(f, false)) else None end end
+    end
+  end
+  pfn result(f : Fight, won : Bool) : Result_ do
+    { rs_won: won, rs_mechs: List.map(List.filter(f.fg_mechs, fn m -> m.mc_side == 0), fn m -> (m.mc_id, m.mc_state, m.mc_build)) }
+  end
+  -- the fight with its result set, if it has ended
+  pfn conclude(f : Fight, evs : List(Event)) : (Fight, List(Event)) do
+    if Option.is_some(f.fg_result) do (f, evs)
+    else match decide(f) do Some(r) -> ({ f with fg_result: Some(r) }, List.append(evs, [EEnded(r)])) | None -> (f, evs) end end
+  end
+  -- an emplacement's turn, on its own: it fires at the nearest player mech it sees inside its arc, else holds a watch over the arc; then its turn ends
+  pfn emplacement_turn(f : Fight, e : Mech, evs : List(Event)) : (Fight, List(Event)) do
+    let n = SteelRain.Rules.numbers()
+    let tiles = match SteelRain.Rules.weapon(3) do Some(w) -> float_to_int(w.wp_max /. (8.0 *. Strata.World.scale(f.fg_world))) | None -> n.rn_watch_range end
+    let arc = StrataTactics.Watch.arc(e.mc_id, e.mc_tile, e.mc_yaw, n.rn_watch_width, tiles)
+    let seen = List.filter(f.fg_mechs, fn m -> m.mc_side == 0 && m.mc_state == 0 && StrataTactics.Watch.covers(arc, m.mc_tile) && sees(f, e, m.mc_tile))
+    let near = List.fold_left(seen, None, fn (best, m) -> nearer_mech(f, e, best, m))
+    match (match near do Some(m) -> shoot(f, e.mc_id, Nil, torso_point(f, m)) | None -> set_watch(f, e, Nil, e.mc_yaw) end) do
+      (f1, ev1) -> match mech(f1, e.mc_id) do
+        Some(e2) -> if e2.mc_state != 0 do next_turn(f1, List.append(evs, ev1)) else adding(List.append(evs, ev1), end_turn(f1, { e2 with mc_acted: true }, e.mc_yaw)) end
+        None -> (f1, List.append(evs, ev1))
+      end
+    end
+  end
+  pfn nearer_mech(f : Fight, e : Mech, best : Option(Mech), m : Mech) : Option(Mech) do
+    match best do
+      Some(b) -> if flat_dist(pos(f, e), pos(f, m)) < flat_dist(pos(f, e), pos(f, b)) do Some(m) else best end
+      None -> Some(m)
+    end
+  end
+
+  -- ── Moving ───────────────────────────────────────────────────────────────
+  doc "The tiles a mech of [side] may withdraw from: its spawn site's."
+  fn own_edge(f : Fight, m : Mech) : List((Int, Int)) do site_tiles(f.fg_map, if m.mc_side == 0 do "spawn north" else "spawn south" end) end
+  doc "Can mech [m] move: it has a movement piece and is a mech, not an emplacement?"
+  fn mobile(f : Fight, m : Mech) : Bool do m.mc_kind == 0 && StrataKit.Part.tag(part_at(f, m, movement_node(f, m)), "move") > 0.0 end
+  doc "Where mech [m] can go this turn (StrataTactics.Reach): its rules mover; water and sink tiles closed; allies passed through, enemies blocking."
+  fn reach(f : Fight, m : Mech) : StrataTactics.Reach.Reach do
+    StrataTactics.Reach.find(f.fg_grid, m.mc_tile, SteelRain.Rules.mover(f.fg_parts, m.mc_build), fn k -> if k == f.fg_map.md_blocks.mb_sink || k >= 12 do 0 else 1 end, fn t -> pass_for(f, m, t))
+  end
+  pfn pass_for(f : Fight, m : Mech, t : (Int, Int)) : Int do
+    match List.find(f.fg_mechs, fn x -> x.mc_state == 0 && x.mc_id != m.mc_id && x.mc_tile == t) do
+      Some(x) -> if x.mc_side == m.mc_side do StrataTactics.Reach.pass_through() else StrataTactics.Reach.pass_blocked() end
+      None -> StrataTactics.Reach.pass_open()
+    end
+  end
+  pfn move_check(f : Fight, m : Mech, path : List((Int, Int))) : Option(String) do
+    if m.mc_moved do Some("it has already moved this turn")
+    else if !mobile(f, m) do Some("it cannot move")
+    else match List.reverse(path) do
+      Nil -> Some("a move needs a path")
+      Cons(last, _) -> let r = reach(f, m)
+        if List.length(path) < 2 || !List.member(StrataTactics.Reach.tiles(r), last) || StrataTactics.Reach.path(r, last) != path do Some("it cannot walk that path") else None end
+    end end end
+  end
+  -- mech [id] walks [path] tile by tile; enemies' watches covering a tile it enters fire on it; it stops where it is knocked out or loses its legs
+  pfn walk(f : Fight, id : Int, path : List((Int, Int))) : (Fight, List(Event)) do
+    match walk_go(f, id, List.drop(path, 1), Nil) do
+      (f1, evs) ->
+        let n = SteelRain.Rules.numbers()
+        let heat = (match mech(f1, id) do Some(x) -> x.mc_heat | None -> 0 end) + n.rn_move_heat
+        (update(f1, id, fn x -> { x with mc_moved: true, mc_heat: heat }), List.append(evs, [EHeat(id, heat)]))
+    end
+  end
+  pfn walk_go(f : Fight, id : Int, rest : List((Int, Int)), evs : List(Event)) : (Fight, List(Event)) do
+    match (rest, mech(f, id)) do
+      (Cons(t, more), Some(m)) ->
+        if m.mc_state != 0 || !mobile(f, m) do (f, evs)
+        else
+          let yaw = step_yaw(m.mc_tile, t)
+          let f1 = update(f, id, fn x -> { x with mc_tile: t, mc_yaw: yaw })
+          match watch_fire(f1, id, t) do (f2, ev2) -> walk_go(f2, id, more, List.append(evs, Cons(EMoved(id, t), ev2))) end
+        end
+      _ -> (f, evs)
+    end
+  end
+  pfn step_yaw(a : (Int, Int), b : (Int, Int)) : Float do match (a, b) do ((ax, az), (bx, bz)) -> Math.atan2(int_to_float(bz - az), int_to_float(bx - ax)) end end
+
+  -- ── Watches ──────────────────────────────────────────────────────────────
+  pfn set_watch(f : Fight, m : Mech, p : List(String), dir : Float) : (Fight, List(Event)) do
+    let n = SteelRain.Rules.numbers()
+    let f1 = drop_watch(f, m.mc_id)
+    let arc = StrataTactics.Watch.arc(m.mc_id, m.mc_tile, dir, n.rn_watch_width, n.rn_watch_range)
+    (update({ f1 with fg_watches: List.append(f1.fg_watches, [arc]), fg_watch_weapons: List.append(f1.fg_watch_weapons, [(m.mc_id, p)]) }, m.mc_id, fn x -> { x with mc_acted: true, mc_yaw: dir }), [EWatchSet(m.mc_id)])
+  end
+  pfn drop_watch(f : Fight, id : Int) : Fight do
+    { f with fg_watches: List.filter(f.fg_watches, fn a -> a.wa_owner != id), fg_watch_weapons: List.filter(f.fg_watch_weapons, fn w -> match w do (o, _) -> o != id end) }
+  end
+  doc "Can mech [o] see tile [t]: a clear or partial line from its eyes to a mech's height over it, within its sight (its core's \"sight\" tag; an emplacement sees as far as its gun reaches)?"
+  fn sees(f : Fight, o : Mech, t : (Int, Int)) : Bool do
+    let eye = Math.max_int(1, height_of(f, o) - 1)
+    let range = if o.mc_kind == 1 do (match SteelRain.Rules.weapon(3) do Some(w) -> w.wp_max | None -> 0.0 end) else StrataKit.Part.tag(part_at(f, o, Nil), "sight") end
+    let d = flat_dist(pos(f, o), FgG.centre(f.fg_grid, t))
+    (range <= 0.0 || d <= range) && StrataTactics.Sight.line(f.fg_world, f.fg_grid, o.mc_tile, eye, t, eye) != StrataTactics.Sight.blocked()
+  end
+  pfn flat_dist(a : (Float, Float, Float), b : (Float, Float, Float)) : Float do
+    match (a, b) do ((ax, _, az), (bx, _, bz)) -> Math.sqrt((ax -. bx) *. (ax -. bx) +. (az -. bz) *. (az -. bz)) end
+  end
+  -- is arc [a]'s owner an enemy of [mv] that is in and sees tile [t]?
+  pfn enemy_sees(f : Fight, mv : Mech, t : (Int, Int), a : StrataTactics.Watch.Arc) : Bool do
+    match mech(f, a.wa_owner) do Some(o) -> o.mc_state == 0 && o.mc_side != mv.mc_side && sees(f, o, t) | None -> false end
+  end
+  -- the watches of mech [id]'s enemies that see it step into [t] fire on it, each once
+  pfn watch_fire(f : Fight, id : Int, t : (Int, Int)) : (Fight, List(Event)) do
+    match mech(f, id) do
+      None -> (f, Nil)
+      Some(mv) -> List.fold_left(StrataTactics.Watch.triggered(f.fg_watches, t, fn a -> enemy_sees(f, mv, t, a)), (f, Nil), fn (acc, a) -> watch_step(id, acc, a))
+    end
+  end
+  pfn watch_step(id : Int, acc : (Fight, List(Event)), a : StrataTactics.Watch.Arc) : (Fight, List(Event)) do
+    match acc do
+      (fa, ea) -> match (mech(fa, id), weapon_of_watch(fa, a.wa_owner)) do
+        (Some(mv), Some(p)) ->
+          if mv.mc_state != 0 do acc
+          else
+            let fb = drop_watch(fa, a.wa_owner)
+            adding(List.append(ea, [EWatchFired(a.wa_owner, id)]), shoot(fb, a.wa_owner, p, torso_point(fb, mv)))
+          end
+        _ -> acc
+      end
+    end
+  end
+  pfn weapon_of_watch(f : Fight, owner : Int) : Option(List(String)) do
+    match List.find(f.fg_watch_weapons, fn w -> match w do (o, _) -> o == owner end) do Some((_, p)) -> Some(p) | None -> None end
+  end
+  doc "The middle of mech [m]'s core box (metres)."
+  fn torso_point(f : Fight, m : Mech) : (Float, Float, Float) do
+    match List.find(SteelRain.Hull.boxes(m.mc_hull, m.mc_id, pos(f, m), m.mc_yaw, [Nil]), fn _ -> true) do Some(b) -> b.bx_centre | None -> pos(f, m) end
+  end
+
+  -- ── Withdrawing ──────────────────────────────────────────────────────────
+  pfn withdraw(f : Fight, m : Mech) : (Fight, List(Event)) do
+    let f1 = drop_watch(update(f, m.mc_id, fn x -> { x with mc_state: 1 }), m.mc_id)
+    next_turn({ f1 with fg_clock: FgC.remove(f1.fg_clock, m.mc_id) }, [EState(m.mc_id, 1)])
+  end
+
+  -- ── Volleys ──────────────────────────────────────────────────────────────
+  pfn empty_part() : StrataKit.Part.KitPart do StrataKit.Part.from_grid(0, 0, 0, NativeArray.make_u8(0, 0), StrataKit.Part.marker("attach", "part", 0.0, 0.0, 0.0, (0.0, 0.0, 1.0), (0.0, 1.0, 0.0)), Nil, Nil, Nil, "", "", Nil) end
+  doc "The part at node [p] of mech [m]'s build (an empty part if there is none)."
+  fn part_at(f : Fight, m : Mech, p : List(String)) : StrataKit.Part.KitPart do
+    match StrataKit.Build.at(m.mc_build, p) do
+      Some(n) -> match List.nth_opt(f.fg_parts, StrataKit.Build.part_of(n)) do Some(pt) -> pt | None -> empty_part() end
+      None -> empty_part()
+    end
+  end
+  doc "The weapon at node [p] of mech [m], if the node is on it and carries one."
+  fn weapon_at(f : Fight, m : Mech, p : List(String)) : Option(SteelRain.Rules.Weapon) do
+    if Option.is_none(StrataKit.Build.at(m.mc_build, p)) do None
+    else if m.mc_kind == 1 do SteelRain.Rules.weapon(3)
+    else SteelRain.Rules.weapon(float_to_int(StrataKit.Part.tag(part_at(f, m, p), "weapon"))) end end
+  end
+  doc "Where mech [m] stands (metres, on its tile's floor)."
+  fn pos(f : Fight, m : Mech) : (Float, Float, Float) do FgG.centre(f.fg_grid, m.mc_tile) end
+  pfn dist(a : (Float, Float, Float), b : (Float, Float, Float)) : Float do
+    match (a, b) do ((ax, ay, az), (bx, by, bz)) -> Math.sqrt((ax -. bx) *. (ax -. bx) +. (ay -. by) *. (ay -. by) +. (az -. bz) *. (az -. bz)) end
+  end
+  pfn heat_of_volley(f : Fight, m : Mech, shots : List((List(String), (Float, Float, Float)))) : Int do
+    List.fold_left(shots, 0, fn (h, s) -> match s do (p, _) -> match weapon_at(f, m, p) do Some(w) -> h + w.wp_heat | None -> h end end)
+  end
+  -- why a volley cannot be fired, if it cannot
+  pfn fire_check(f : Fight, m : Mech, shots : List((List(String), (Float, Float, Float)))) : Option(String) do
+    let paths = List.map(shots, fn s -> match s do (p, _) -> p end)
+    if m.mc_acted do Some("it has already acted this turn")
+    else if List.is_empty(shots) do Some("a volley needs a weapon")
+    else if List.length(List.dedup(paths)) != List.length(paths) do Some("each weapon fires once a volley")
+    else if List.any(shots, fn s -> match s do (p, _) -> Option.is_none(weapon_at(f, m, p)) end) do Some("that is not a weapon it carries")
+    else if List.any(shots, fn s -> out_of_range(f, m, volley_yaw(f, m, shots), s)) do Some("out of range")
+    else if m.mc_heat + heat_of_volley(f, m, shots) > (SteelRain.Rules.numbers()).rn_heat_cap do Some("too hot to fire all of that")
+    else None end end end end end end
+  end
+  pfn out_of_range(f : Fight, m : Mech, yaw : Float, s : (List(String), (Float, Float, Float))) : Bool do
+    match s do
+      (p, aim) -> match weapon_at(f, m, p) do
+        Some(w) -> dist(SteelRain.Hull.muzzle(m.mc_hull, p, pos(f, m), yaw), aim) > w.wp_max
+        None -> true
+      end
+    end
+  end
+  -- the yaw from [a] towards [b] (x, z)
+  pfn yaw_between(a : (Float, Float, Float), b : (Float, Float, Float)) : Float do
+    match (a, b) do ((ax, _, az), (bx, _, bz)) -> if Math.abs(bx -. ax) +. Math.abs(bz -. az) < 0.000001 do 0.0 else Math.atan2(bz -. az, bx -. ax) end end
+  end
+  doc "The facing mech [m] fires volley [shots] from: towards its first aim."
+  fn volley_yaw(f : Fight, m : Mech, shots : List((List(String), (Float, Float, Float)))) : Float do
+    match shots do Cons((_, aim), _) -> yaw_between(pos(f, m), aim) | Nil -> m.mc_yaw end
+  end
+  -- a checked volley: the mech turns to its first aim, each weapon fires in turn, then it has acted
+  pfn volley(f : Fight, m : Mech, shots : List((List(String), (Float, Float, Float)))) : (Fight, List(Event)) do
+    let yaw = volley_yaw(f, m, shots)
+    let f0 = update(f, m.mc_id, fn x -> { x with mc_yaw: yaw })
+    match List.fold_left(shots, (f0, Nil), fn (acc, s) -> shot_step(m.mc_id, acc, s)) do
+      (f1, evs) -> (update(f1, m.mc_id, fn x -> { x with mc_acted: true }), evs)
+    end
+  end
+
+  pfn shot_step(id : Int, acc : (Fight, List(Event)), s : (List(String), (Float, Float, Float))) : (Fight, List(Event)) do
+    match (acc, s) do ((fa, ea), (p, aim)) -> adding(ea, shoot(fa, id, p, aim)) end
+  end
+  doc "Every box of every mech that is in, but [skip]'s."
+  fn boxes_but(f : Fight, skip : Int) : List(StrataTactics.Shot.ShotBox) do
+    List.flat_map(List.filter(f.fg_mechs, fn x -> x.mc_state == 0 && x.mc_id != skip), fn x -> SteelRain.Hull.boxes(x.mc_hull, x.mc_id, pos(f, x), x.mc_yaw, StrataKit.Build.paths(x.mc_build)))
+  end
+  doc "The cone's half-angle for mech [m] firing [w] [d] metres: the weapon's, grown past its best range, wider if it moved this turn, was hit since its last turn, or is hot."
+  fn spread(m : Mech, w : SteelRain.Rules.Weapon, d : Float) : Float do
+    let n = SteelRain.Rules.numbers()
+    w.wp_spread +. w.wp_grow *. Math.max_float(0.0, d -. w.wp_best)
+      +. (if m.mc_moved do n.rn_moved_spread else 0.0 end) +. (if m.mc_hit_this_round do n.rn_suppressed_spread else 0.0 end) +. (if m.mc_heat >= n.rn_heat_warn do n.rn_hot_spread else 0.0 end)
+  end
+  -- one weapon of mech [id] at [aim]: its rounds, then its heat
+  doc "One weapon [p] of unit [id] fired at [aim]: its rounds land, then its heat."
+  fn shoot(f : Fight, id : Int, p : List(String), aim : (Float, Float, Float)) : (Fight, List(Event)) do
+    match mech(f, id) do
+      None -> (f, Nil)
+      Some(m) -> if m.mc_state != 0 do (f, Nil) else match weapon_at(f, m, p) do
+        None -> (f, Nil)
+        Some(w) ->
+          let muzzle = SteelRain.Hull.muzzle(m.mc_hull, p, pos(f, m), m.mc_yaw)
+          let spec = { sp_from: muzzle, sp_at: aim, sp_rounds: w.wp_rounds, sp_spread: spread(m, w, dist(muzzle, aim)), sp_max: w.wp_max, sp_near: (SteelRain.Rules.numbers()).rn_near_metres }
+          let shot = f.fg_shots
+          let rounds = StrataTactics.Shot.fire(f.fg_world, boxes_but(f, id), spec, Strata.Seed.mix(f.fg_seed, shot))
+          let f1 = { f with fg_shots: shot + 1 }
+          match List.fold_left(List.enumerate(rounds), (f1, Nil), fn (acc, e) -> round_step(id, w, shot, acc, e)) do
+            (f2, evs) ->
+              let heat = (match mech(f2, id) do Some(x) -> x.mc_heat | None -> 0 end) + w.wp_heat
+              (update(f2, id, fn x -> { x with mc_heat: heat }), List.append(evs, [EHeat(id, heat)]))
+          end
+      end end
+    end
+  end
+  pfn round_step(id : Int, w : SteelRain.Rules.Weapon, shot : Int, acc : (Fight, List(Event)), e : (Int, StrataTactics.Shot.ShotRound)) : (Fight, List(Event)) do
+    match (acc, e) do ((fa, ea), (k, r)) -> adding(ea, land(fa, id, w, shot, k, r)) end
+  end
+  pfn near_step(amount : Int, acc : (Fight, List(Event)), u : Int) : (Fight, List(Event)) do
+    match acc do (fa, ea) -> adding(ea, delay(fa, u, amount)) end
+  end
+  -- a round of [w] from mech [id] (the [k]th of shot [shot]) arriving: what it struck, then the near misses
+  pfn land(f : Fight, id : Int, w : SteelRain.Rules.Weapon, shot : Int, k : Int, r : StrataTactics.Shot.ShotRound) : (Fight, List(Event)) do
+    let n = SteelRain.Rules.numbers()
+    match (match r.rd_struck do
+      SVoxel(x, y, z) -> carve_at(f, x, y, z, w.wp_carve, Strata.Seed.mix(f.fg_seed, 1000003 + shot * 64 + k))
+      SBox(u, part, _) -> hit(f, id, u, part, w)
+      SNone -> (f, Nil)
+    end) do
+      (f1, ev1) -> List.fold_left(r.rd_near, (f1, Cons(ERound(id, r), ev1)), fn (acc, u) -> near_step(n.rn_near_delay, acc, u))
+    end
+  end
+  doc "The fight with a blast of [radius] at voxel (x, y, z) from [seed]: what fell, the grid re-read where the world changed, debris on the units it lands on, and every mech whose ground went falling."
+  fn carve_at(f : Fight, x : Int, y : Int, z : Int, radius : Int, seed : Int) : (Fight, List(Event)) do
+    let olds = floors(f)
+    match SteelRain.Ground.carve(f.fg_world, x, y, z, radius, seed, f.fg_map.md_blocks.mb_rubble) do
+      (w, cs, fell) -> match FgG.refresh(f.fg_grid, w, cs) do
+        (g, _) ->
+          let ev0 = List.append([ECarved(cs)], if List.is_empty(fell) do Nil else [EFell(fell)] end)
+          match debris({ f with fg_world: w, fg_grid: g }, fell) do
+            (f1, ev1) -> match List.fold_left(olds, (f1, Nil), fn (acc, o) -> footing_step(acc, o)) do
+              (f2, ev2) -> (f2, List.append(ev0, List.append(ev1, ev2)))
+            end
+          end
+      end
+    end
+  end
+
+  -- ── Footing, falls, debris, wrecks ───────────────────────────────────────
+  -- every mech that is in (not emplacements) and its tile's floor now
+  pfn floors(f : Fight) : List((Int, Int)) do
+    List.map(List.filter(f.fg_mechs, fn m -> m.mc_state == 0 && m.mc_kind == 0), fn m -> (m.mc_id, FgG.floor(f.fg_grid, m.mc_tile)))
+  end
+  pfn footing_step(acc : (Fight, List(Event)), o : (Int, Int)) : (Fight, List(Event)) do
+    match (acc, o) do ((fa, ea), (id, old)) -> adding(ea, footing(fa, id, old)) end
+  end
+  pfn height_of(f : Fight, m : Mech) : Int do (SteelRain.Rules.mover(f.fg_parts, m.mc_build)).mv_height end
+  pfn holds(f : Fight, m : Mech, t : (Int, Int)) : Bool do FgG.inside(f.fg_grid, t) && FgG.fits(f.fg_grid, t, height_of(f, m)) end
+  pfn held_by_other(f : Fight, id : Int, t : (Int, Int)) : Bool do List.any(f.fg_mechs, fn x -> x.mc_state == 0 && x.mc_id != id && x.mc_tile == t) end
+  pfn neighbours(t : (Int, Int)) : List((Int, Int)) do match t do (x, z) -> [(x + 1, z), (x - 1, z), (x, z + 1), (x, z - 1)] end end
+  -- the lowest of [ts] that holds mech [m] and passes [ok], the first of equals
+  pfn lowest(f : Fight, m : Mech, ts : List((Int, Int)), ok : (Int, Int) -> Bool) : Option((Int, Int)) do
+    List.fold_left(ts, None, fn (best, t) -> if holds(f, m, t) && ok(t) do lower(f, best, t) else best end)
+  end
+  pfn lower(f : Fight, best : Option((Int, Int)), t : (Int, Int)) : Option((Int, Int)) do
+    match best do Some(b) -> if FgG.floor(f.fg_grid, t) < FgG.floor(f.fg_grid, b) do Some(t) else best end | None -> Some(t) end
+  end
+  doc "Mech [id] after the world changed under it, its tile's floor having been [old]: still held, it stays (or drops with a floor that fell); no longer held, it slides to the lowest neighbouring tile that holds it, and onto a tile another unit holds it takes that tile's lowest free neighbour, both units bumped."
+  fn footing(f : Fight, id : Int, old : Int) : (Fight, List(Event)) do
+    match mech(f, id) do
+      None -> (f, Nil)
+      Some(m) ->
+        let t = m.mc_tile
+        if m.mc_state != 0 do (f, Nil)
+        else if holds(f, m, t) do (if FgG.floor(f.fg_grid, t) < old do fall(f, id, t, old) else (f, Nil) end)
+        else
+          match lowest(f, m, neighbours(t), fn _ -> true) do
+            None -> (f, Nil)
+            Some(land) ->
+              if !held_by_other(f, id, land) do fall(f, id, land, old)
+              else
+                match lowest(f, m, neighbours(land), fn u -> u != t && !held_by_other(f, id, u)) do
+                  None -> fall(f, id, land, old)
+                  Some(free) -> match bump(f, id, land) do (f1, ev1) -> adding(ev1, fall(f1, id, free, old)) end
+                end
+            end
+          end
+        end end
+    end
+  end
+  -- mech [id] and whoever holds tile [t] bumped
+  pfn bump(f : Fight, id : Int, t : (Int, Int)) : (Fight, List(Event)) do
+    let n = SteelRain.Rules.numbers()
+    let others = List.filter(f.fg_mechs, fn x -> x.mc_state == 0 && x.mc_id != id && x.mc_tile == t)
+    List.fold_left(others, damage(f, id, Nil, n.rn_bump), fn (acc, x) -> bump_step(n.rn_bump, acc, x))
+  end
+  pfn bump_step(amount : Int, acc : (Fight, List(Event)), x : Mech) : (Fight, List(Event)) do
+    match acc do (fa, ea) -> adding(ea, damage(fa, x.mc_id, Nil, amount)) end
+  end
+  doc "Mech [id] falls from floor [old] onto tile [t]: past its own drop (its mover's) its movement piece is hurt by the steps fallen, its core too past the core height, and it loses CT by the steps."
+  fn fall(f : Fight, id : Int, t : (Int, Int), old : Int) : (Fight, List(Event)) do
+    let n = SteelRain.Rules.numbers()
+    let step = Math.max_int(1, f.fg_map.md_settings.ms_step)
+    let steps = Math.max_int(0, old - FgG.floor(f.fg_grid, t)) / step
+    let f0 = update(f, id, fn x -> { x with mc_tile: t })
+    let ev0 = [EMechFell(id, t, steps)]
+    let safe = match mech(f, id) do Some(x) -> (SteelRain.Rules.mover(f.fg_parts, x.mc_build)).mv_drop | None -> n.rn_fall_safe end
+    if steps <= safe do (f0, ev0)
+    else
+      match mech(f0, id) do
+        None -> (f0, ev0)
+        Some(m) ->
+          let legs = movement_node(f0, m)
+          match (if steps > safe do damage(f0, id, legs, n.rn_fall_per_step * (steps - safe)) else (f0, Nil) end) do
+            (f1, ev1) -> match (if steps > n.rn_fall_core do damage(f1, id, Nil, n.rn_fall_per_step * (steps - n.rn_fall_core)) else (f1, Nil) end) do
+              (f2, ev2) -> match delay(f2, id, n.rn_fall_ct_per_step * steps) do
+                (f3, ev3) -> (f3, List.append(ev0, List.append(ev1, List.append(ev2, ev3))))
+              end
+            end
+          end
+      end
+    end
+  end
+  doc "The node of mech [m] that moves it (its part has a \"move\" tag), the core if none."
+  fn movement_node(f : Fight, m : Mech) : List(String) do
+    match List.find(StrataKit.Build.paths(m.mc_build), fn p -> StrataKit.Part.tag(part_at(f, m, p), "move") > 0.0) do Some(p) -> p | None -> Nil end
+  end
+  -- what fell landing on units' tiles: each unit's core takes damage by the voxels landing on its tile
+  pfn debris(f : Fight, fell : List((Int, Int, Int, Int))) : (Fight, List(Event)) do
+    let n = SteelRain.Rules.numbers()
+    let sc = Strata.World.scale(f.fg_world)
+    let landed = List.filter_map(fell, fn c -> match c do (x, _, z, id) -> if id == 0 do None else FgG.tile_of(f.fg_grid, (int_to_float(x) +. 0.5) *. sc, (int_to_float(z) +. 0.5) *. sc) end end)
+    let hits = List.filter_map(List.filter(f.fg_mechs, fn m -> m.mc_state == 0), fn m -> on_tile(m, landed, n.rn_debris_per_voxel))
+    List.fold_left(hits, (f, Nil), fn (acc, h) -> debris_step(acc, h))
+  end
+  pfn on_tile(m : Mech, landed : List((Int, Int)), per : Float) : Option((Int, Int)) do
+    let k = List.length(List.filter(landed, fn t -> t == m.mc_tile))
+    let dmg = float_to_int(Math.round(int_to_float(k) *. per))
+    if dmg > 0 do Some((m.mc_id, dmg)) else None end
+  end
+  pfn debris_step(acc : (Fight, List(Event)), h : (Int, Int)) : (Fight, List(Event)) do
+    match (acc, h) do ((fa, ea), (id, dmg)) -> adding(ea, damage(fa, id, Nil, dmg)) end
+  end
+  -- the bottom third of box [b] as world voxels (their centres inside it): what a wreck or a lost part leaves as rubble
+  pfn rubble_cells(b : StrataTactics.Shot.ShotBox, sc : Float) : List((Int, Int, Int)) do
+    match (b.bx_centre, b.bx_half) do
+      ((cx, cy, cz), (hx, hy, hz)) ->
+        let r = Math.sqrt(hx *. hx +. hz *. hz)
+        let x0 = float_to_int(Math.floor((cx -. r) /. sc))
+        let z0 = float_to_int(Math.floor((cz -. r) /. sc))
+        let y0 = float_to_int(Math.floor((cy -. hy) /. sc))
+        let n = float_to_int(Math.ceil(2.0 *. r /. sc)) + 1
+        let ny = Math.max_int(1, float_to_int(Math.ceil(2.0 *. hy /. 3.0 /. sc)))
+        List.filter(List.map(List.range(0, n * n * ny), fn i -> (x0 + i % n, y0 + i / (n * n), z0 + (i / n) % n)), fn v -> inside_box(b, v, sc))
+    end
+  end
+  pfn inside_box(b : StrataTactics.Shot.ShotBox, v : (Int, Int, Int), sc : Float) : Bool do
+    match (v, b.bx_centre, b.bx_half) do
+      ((x, y, z), (cx, cy, cz), (hx, hy, hz)) ->
+        let dx = (int_to_float(x) +. 0.5) *. sc -. cx
+        let dy = (int_to_float(y) +. 0.5) *. sc -. cy
+        let dz = (int_to_float(z) +. 0.5) *. sc -. cz
+        let c = Math.cos(b.bx_yaw)
+        let s = Math.sin(b.bx_yaw)
+        Math.abs(dx *. c +. dz *. s) <= hx && Math.abs(dy) <= hy && Math.abs(0.0 -. dx *. s +. dz *. c) <= hz
+    end
+  end
+  -- the boxes of nodes [paths] of mech [m] dropped as rubble (the grid re-read; no further falls)
+  pfn wreck(f : Fight, m : Mech, paths : List(List(String))) : (Fight, List(Event)) do
+    let sc = Strata.World.scale(f.fg_world)
+    let cells = List.flat_map(SteelRain.Hull.boxes(m.mc_hull, m.mc_id, pos(f, m), m.mc_yaw, paths), fn b -> rubble_cells(b, sc))
+    if List.is_empty(cells) do (f, Nil)
+    else
+      match SteelRain.Ground.drop(f.fg_world, cells, f.fg_map.md_blocks.mb_rubble) do
+        (w, set) ->
+          let cs = Strata.Edit.changes(Strata.Edit.set_many(f.fg_world, set))
+          match FgG.refresh(f.fg_grid, w, cs) do (g, _) -> ({ f with fg_world: w, fg_grid: g }, [EFell(set)]) end
+      end
+    end
+  end
+  -- unit [u] pushed back [amount] CT (halved when braced)
+  pfn delay(f : Fight, u : Int, amount : Int) : (Fight, List(Event)) do
+    match mech(f, u) do
+      Some(t) -> if t.mc_state != 0 do (f, Nil)
+        else let a = if t.mc_braced do amount / 2 else amount end
+          ({ f with fg_clock: FgC.delay(f.fg_clock, u, a) }, [EDelayed(u, a)]) end
+      None -> (f, Nil)
+    end
+  end
+  -- a round of [w] from mech [sid] striking part [part] (a hull index) of unit [u]
+  pfn hit(f : Fight, sid : Int, u : Int, part : Int, w : SteelRain.Rules.Weapon) : (Fight, List(Event)) do
+    match (mech(f, sid), mech(f, u)) do
+      (Some(s), Some(t)) -> match List.nth_opt(t.mc_hull.hl_parts, part) do
+        Some((p, _, _)) ->
+          let factor = match (pos(f, s), pos(f, t)) do ((sx, _, sz), (tx, _, tz)) -> SteelRain.Rules.facing_factor(SteelRain.Rules.numbers(), (sx, sz), (tx, tz), t.mc_yaw) end
+          let dmg = float_to_int(Math.round(int_to_float(w.wp_damage) *. factor))
+          match delay(update(f, u, fn x -> { x with mc_hit_this_round: true }), u, w.wp_delay) do
+            (f1, ev1) -> match damage(f1, u, p, dmg) do (f2, ev2) -> (f2, List.append(ev2, ev1)) end
+          end
+        None -> (f, Nil)
+      end
+      _ -> (f, Nil)
+    end
+  end
+  doc "Unit [u]'s node [p] takes [dmg]: its armour falls; at 0 the node and all it carries are lost, and losing the core takes the unit out."
+  fn damage(f : Fight, u : Int, p : List(String), dmg : Int) : (Fight, List(Event)) do
+    match mech(f, u) do
+      None -> (f, Nil)
+      Some(t) ->
+        if t.mc_state != 0 || Option.is_none(StrataKit.Build.at(t.mc_build, p)) do (f, Nil)
+        else
+          let left = Math.max_int(0, armour_left(t, p) - dmg)
+          let f1 = update(f, u, fn x -> { x with mc_armour: List.map(x.mc_armour, fn a -> match a do (q, v) -> if q == p do (q, left) else (q, v) end end) })
+          if left > 0 do (f1, [EPartHit(u, p, left)])
+          else match lose(f1, u, p) do (f2, ev) -> (f2, Cons(EPartHit(u, p, 0), ev)) end end
+        end
+    end
+  end
+  pfn armour_left(t : Mech, p : List(String)) : Int do match List.find(t.mc_armour, fn a -> match a do (q, _) -> q == p end) do Some((_, v)) -> v | None -> 0 end end
+  doc "Unit [u] loses node [p] and everything on it; losing the core (the root) takes it out."
+  fn lose(f : Fight, u : Int, p : List(String)) : (Fight, List(Event)) do
+    if List.is_empty(p) do out(f, u)
+    else
+      match mech(f, u) do
+        Some(m0) ->
+          let gone = List.filter(StrataKit.Build.paths(m0.mc_build), fn q -> starts_with(q, p))
+          match wreck(update(f, u, fn x -> without(x, p)), m0, gone) do (f1, ev) -> (f1, Cons(EPartLost(u, p), ev)) end
+        None -> (f, Nil)
+      end
+    end
+  end
+  pfn starts_with(q : List(String), p : List(String)) : Bool do List.take(q, List.length(p)) == p end
+  -- mech [x] without node [p] and what it carries
+  pfn without(x : Mech, p : List(String)) : Mech do
+    match StrataKit.Build.detach(x.mc_build, p) do
+      (b, _) -> { x with mc_build: b, mc_armour: kept(x.mc_armour, StrataKit.Build.paths(b)) }
+    end
+  end
+  pfn kept(armour : List((List(String), Int)), keep : List(List(String))) : List((List(String), Int)) do
+    List.filter(armour, fn a -> match a do (q, _) -> List.member(keep, q) end)
+  end
+  doc "Unit [u] out of the fight: off the clock, its watch gone, its wreck dropped as rubble."
+  fn out(f : Fight, u : Int) : (Fight, List(Event)) do
+    match mech(f, u) do
+      None -> (f, Nil)
+      Some(m) ->
+        let f1 = update(f, u, fn x -> { x with mc_state: 2 })
+        let f2 = drop_watch({ f1 with fg_clock: FgC.remove(f1.fg_clock, u) }, u)
+        match wreck(f2, m, StrataKit.Build.paths(m.mc_build)) do (f3, ev) -> (f3, Cons(EState(u, 2), ev)) end
+    end
+  end
+end

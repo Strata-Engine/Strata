@@ -1,0 +1,105 @@
+-- SteelRain.Script — a scripted player for Destroy, for headless runs.
+--
+-- Not the enemy AI (stage 2): a fixed plan, legal by construction. On each
+-- mech's turn: while targets stand (an emplacement still in, else the depot
+-- until half of it is down), fire every weapon that reaches the nearest
+-- target and fits under the heat cap, else walk towards it; once the targets
+-- are down, withdraw from the spawn edge, walking there first. Every order
+-- it gives is one the fight should take: a refused order is a finding.
+mod SteelRain.Script do
+
+  pfn dist(a : (Float, Float, Float), b : (Float, Float, Float)) : Float do
+    match (a, b) do ((ax, ay, az), (bx, by, bz)) -> Math.sqrt((ax -. bx) *. (ax -. bx) +. (ay -. by) *. (ay -. by) +. (az -. bz) *. (az -. bz)) end
+  end
+  pfn tile_dist(a : (Int, Int), b : (Int, Int)) : Int do match (a, b) do ((ax, az), (bx, bz)) -> int_abs(ax - bx) + int_abs(az - bz) end end
+
+  doc "What mech [m] aims at: the nearest emplacement still in, else a standing cell of the depot while half of it stands; None once the targets are down."
+  fn target(f : SteelRain.Fight.Fight, m : SteelRain.Fight.Mech) : Option((Float, Float, Float)) do
+    let at = SteelRain.Fight.pos(f, m)
+    let ems = List.filter(f.fg_mechs, fn x -> x.mc_kind == 1 && x.mc_state == 0)
+    match List.fold_left(ems, None, fn (best, e) -> nearer(f, at, best, e)) do
+      Some(e) -> Some(SteelRain.Fight.torso_point(f, e))
+      None -> if SteelRain.Fight.depot_left(f) * 2 > SteelRain.Fight.depot_start(f) do SteelRain.Fight.depot_point(f) else None end
+    end
+  end
+  pfn nearer(f : SteelRain.Fight.Fight, at : (Float, Float, Float), best : Option(SteelRain.Fight.Mech), e : SteelRain.Fight.Mech) : Option(SteelRain.Fight.Mech) do
+    match best do
+      Some(b) -> if dist(at, SteelRain.Fight.pos(f, e)) < dist(at, SteelRain.Fight.pos(f, b)) do Some(e) else best end
+      None -> Some(e)
+    end
+  end
+
+  -- the weapons of [m] that reach [aim], taken in build order while they fit under the heat cap
+  pfn volley(f : SteelRain.Fight.Fight, m : SteelRain.Fight.Mech, aim : (Float, Float, Float)) : List((List(String), (Float, Float, Float))) do
+    let cap = (SteelRain.Rules.numbers()).rn_heat_cap
+    match List.fold_left(StrataKit.Build.paths(m.mc_build), (m.mc_heat, Nil), fn (acc, p) -> take(f, m, aim, cap, acc, p)) do (_, shots) -> List.reverse(shots) end
+  end
+  pfn take(f : SteelRain.Fight.Fight, m : SteelRain.Fight.Mech, aim : (Float, Float, Float), cap : Int, acc : (Int, List((List(String), (Float, Float, Float)))), p : List(String)) : (Int, List((List(String), (Float, Float, Float)))) do
+    match (acc, SteelRain.Fight.weapon_at(f, m, p)) do
+      ((h, shots), Some(w)) ->
+        let reaches = dist(SteelRain.Hull.muzzle(m.mc_hull, p, SteelRain.Fight.pos(f, m), m.mc_yaw), aim) <= w.wp_max
+        if reaches && h + w.wp_heat <= cap do (h + w.wp_heat, Cons((p, aim), shots)) else acc end
+      _ -> acc
+    end
+  end
+  -- a walk towards the reachable tile nearest [goal], if it gets closer
+  pfn towards(f : SteelRain.Fight.Fight, m : SteelRain.Fight.Mech, goal : (Int, Int)) : Option(SteelRain.Fight.Order) do
+    let r = SteelRain.Fight.reach(f, m)
+    match List.fold_left(StrataTactics.Reach.tiles(r), None, fn (best, t) -> closer(goal, best, t)) do
+      Some(t) -> if tile_dist(t, goal) < tile_dist(m.mc_tile, goal) do Some(OMove(StrataTactics.Reach.path(r, t))) else None end
+      None -> None
+    end
+  end
+  pfn closer(goal : (Int, Int), best : Option((Int, Int)), t : (Int, Int)) : Option((Int, Int)) do
+    match best do Some(b) -> if tile_dist(t, goal) < tile_dist(b, goal) do Some(t) else best end | None -> Some(t) end
+  end
+  pfn tile_at(f : SteelRain.Fight.Fight, p : (Float, Float, Float)) : (Int, Int) do
+    match p do (x, _, z) -> match StrataTactics.Grid.tile_of(f.fg_grid, x, z) do Some(t) -> t | None -> (0, 0) end end
+  end
+
+  doc "The id whose turn it is (-1 if none)."
+  fn active_id(f : SteelRain.Fight.Fight) : Int do match SteelRain.Fight.active(f) do Some(i) -> i | None -> -1 end end
+  doc "The scripted player's next order for the mech whose turn it is."
+  fn turn(f : SteelRain.Fight.Fight) : Option(SteelRain.Fight.Order) do
+    match SteelRain.Fight.active(f) do
+      None -> None
+      Some(id) -> match SteelRain.Fight.mech(f, id) do
+        None -> None
+        Some(m) -> Some(order_for(f, m))
+      end
+    end
+  end
+  pfn order_for(f : SteelRain.Fight.Fight, m : SteelRain.Fight.Mech) : SteelRain.Fight.Order do
+    match target(f, m) do
+      Some(aim) ->
+        let shots = if m.mc_acted do Nil else volley(f, m, aim) end
+        if !List.is_empty(shots) do OFire(shots)
+        else if m.mc_moved || !SteelRain.Fight.mobile(f, m) do OEnd(m.mc_yaw)
+        else match towards(f, m, tile_at(f, aim)) do Some(o) -> o | None -> OEnd(m.mc_yaw) end end end
+      None ->
+        let edge = SteelRain.Fight.own_edge(f, m)
+        if List.member(edge, m.mc_tile) do OWithdraw
+        else if m.mc_moved || !SteelRain.Fight.mobile(f, m) do OEnd(m.mc_yaw)
+        else match List.fold_left(edge, None, fn (best, t) -> closer(m.mc_tile, best, t)) do
+          Some(goal) -> match towards(f, m, goal) do Some(o) -> o | None -> OEnd(m.mc_yaw) end
+          None -> OEnd(m.mc_yaw)
+        end end end
+    end
+  end
+
+  doc "Fight [f] played by the script until it ends or [max] orders: the fight, the orders given, and how many the fight refused."
+  fn play(f : SteelRain.Fight.Fight, max : Int) : (SteelRain.Fight.Fight, Int, Int) do play_go(f, max, 0, 0) end
+  pfn play_go(f : SteelRain.Fight.Fight, left : Int, n : Int, refused : Int) : (SteelRain.Fight.Fight, Int, Int) do
+    if left <= 0 || Option.is_some(f.fg_result) do (f, n, refused)
+    else match turn(f) do
+      None -> (f, n, refused)
+      Some(o) -> match SteelRain.Fight.step(f, o) do
+        Ok((f2, _)) -> play_go(f2, left - 1, n + 1, refused)
+        Err(_) -> match SteelRain.Fight.step(f, OEnd(0.0)) do
+          Ok((f3, _)) -> play_go(f3, left - 1, n + 1, refused + 1)
+          Err(_) -> (f, n, refused + 1)
+        end
+      end
+    end end
+  end
+end
