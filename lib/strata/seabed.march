@@ -1,0 +1,118 @@
+-- Seabed — a sea floor a game can reshape: dredge it deeper, raise reefs
+-- and shoals, and hand the result to the waves (Strata.Waves) or to anything
+-- that needs the water's depth (a ship's keel, a mesh of the floor).
+--
+-- A floor is a w x h grid of cells (x fastest), each the water's depth in
+-- voxels (0 is land). Its base comes from the coastline: a shelf that starts
+-- [shore] voxels deep beside land and deepens with the distance from it (a
+-- 3-4 chamfer distance over the cells) to a deepest depth. A game's edits go
+-- on top: dig makes a rectangle at least so deep, raise makes it no deeper,
+-- each easing back to the floor around it over a margin of cells, so the
+-- result is channels and mounds, not pits and pillars. A game keeps its own
+-- short list of edits and replays them over the regenerated base, so what it
+-- saves is small and the base is the same every time.
+mod Strata.Seabed do
+
+  -- The water's depth in voxels a cell (x fastest; 0 is land), over w x h cells.
+  type Seafloor = { depth : NativeIntArr, w : Int, h : Int }
+
+  -- An edit to a floor, in cells: Dig(x0, z0, x1, z1, depth, margin) makes the rectangle x0..x1, z0..z1 at least [depth] voxels deep; Raise(..., depth, margin) makes it no deeper than [depth] (a reef's top). Either eases back to the floor around it over [margin] cells and never turns land to water or water to land.
+  type Edit = Dig(Int, Int, Int, Int, Int, Int) | Raise(Int, Int, Int, Int, Int, Int)
+
+  pfn far() : Int do 1000000 end
+  pfn least(a : Int, b : Int) : Int do if a < b do a else b end end
+  pfn most(a : Int, b : Int) : Int do if a > b do a else b end end
+  pfn clampi(v : Int, lo : Int, hi : Int) : Int do if v < lo do lo else if v > hi do hi else v end end end
+
+  -- ── The shelf ────────────────────────────────────────────────────────────
+  pfn seed(land : NativeIntArr, a : NativeIntArr, i : Int, n : Int) : NativeIntArr do
+    if i >= n do a else seed(land, NativeArray.set_int(a, i, if NativeArray.get_int(land, i) != 0 do 0 else far() end), i + 1, n) end
+  end
+  pfn at(a : NativeIntArr, w : Int, h : Int, x : Int, z : Int) : Int do
+    if x < 0 || z < 0 || x >= w || z >= h do far() else NativeArray.get_int(a, z * w + x) end
+  end
+  pfn forward(a : NativeIntArr, w : Int, h : Int, i : Int) : NativeIntArr do
+    if i >= w * h do a else
+      let x = i % w
+      let z = i / w
+      let d = least(least(NativeArray.get_int(a, i), at(a, w, h, x - 1, z) + 3), least(at(a, w, h, x, z - 1) + 3,
+        least(at(a, w, h, x - 1, z - 1) + 4, at(a, w, h, x + 1, z - 1) + 4)))
+      forward(NativeArray.set_int(a, i, d), w, h, i + 1)
+    end
+  end
+  pfn backward(a : NativeIntArr, w : Int, h : Int, i : Int) : NativeIntArr do
+    if i < 0 do a else
+      let x = i % w
+      let z = i / w
+      let d = least(least(NativeArray.get_int(a, i), at(a, w, h, x + 1, z) + 3), least(at(a, w, h, x, z + 1) + 3,
+        least(at(a, w, h, x + 1, z + 1) + 4, at(a, w, h, x - 1, z + 1) + 4)))
+      backward(NativeArray.set_int(a, i, d), w, h, i - 1)
+    end
+  end
+  doc "The 3-4 chamfer distance of every cell from the nearest land cell of [land] (non-zero is land; x fastest, w x h): 3 a cell across, 4 a cell diagonally. Cells with no land anywhere stay at a million."
+  fn coast_distance(land : NativeIntArr, w : Int, h : Int) : NativeIntArr do
+    let n = w * h
+    backward(forward(seed(land, NativeArray.make_int(n, 0), 0, n), w, h, 0), w, h, n - 1)
+  end
+  pfn depths(dist : NativeIntArr, cell_vox : Int, shore : Int, num : Int, den : Int, deepest : Int, a : NativeIntArr, i : Int, n : Int) : NativeIntArr do
+    if i >= n do a else
+      let d = NativeArray.get_int(dist, i)
+      let v = if d == 0 do 0 else if d >= far() do deepest else clampi(shore + d * cell_vox / 3 * num / den, shore, deepest) end end
+      depths(dist, cell_vox, shore, num, den, deepest, NativeArray.set_int(a, i, v), i + 1, n)
+    end
+  end
+  doc "A floor from a coastline: [land] (non-zero is land, x fastest, w x h cells of [cell_vox] voxels). Beside land the water is [shore] voxels deep, deepening [num]/[den] voxels a voxel of distance from land, to [deepest]."
+  fn shelf(land : NativeIntArr, w : Int, h : Int, cell_vox : Int, shore : Int, num : Int, den : Int, deepest : Int) : Seafloor do
+    let n = w * h
+    { depth: depths(coast_distance(land, w, h), cell_vox, shore, num, den, deepest, NativeArray.make_int(n, 0), 0, n), w: w, h: h }
+  end
+
+  -- ── Edits ────────────────────────────────────────────────────────────────
+  -- how many cells outside the rectangle (x0..x1, z0..z1) a cell is, the larger axis
+  pfn outside(x : Int, z : Int, x0 : Int, z0 : Int, x1 : Int, z1 : Int) : Int do
+    most(most(x0 - x, x - x1), most(most(z0 - z, z - z1), 0))
+  end
+  pfn edit_go(f : Seafloor, deepen : Bool, x0 : Int, z0 : Int, x1 : Int, z1 : Int, target : Int, margin : Int, a : NativeIntArr, x : Int, z : Int) : NativeIntArr do
+    if z > z1 + margin do a
+    else if x > x1 + margin do edit_go(f, deepen, x0, z0, x1, z1, target, margin, a, x0 - margin, z + 1)
+    else if x < 0 || z < 0 || x >= f.w || z >= f.h do edit_go(f, deepen, x0, z0, x1, z1, target, margin, a, x + 1, z)
+    else
+      let i = z * f.w + x
+      let now = NativeArray.get_int(a, i)
+      let a = if now == 0 do a else
+        -- the target, easing back to the cell's own depth over the margin
+        let k = outside(x, z, x0, z0, x1, z1)
+        let eased = target + (now - target) * k / (margin + 1)
+        NativeArray.set_int(a, i, if deepen do most(now, eased) else most(1, least(now, eased)) end)
+      end
+      edit_go(f, deepen, x0, z0, x1, z1, target, margin, a, x + 1, z)
+    end end end
+  end
+  doc "The floor with cells x0..x1, z0..z1 at least [depth] voxels deep, easing back over [margin] cells. Land stays land."
+  fn dig(f : Seafloor, x0 : Int, z0 : Int, x1 : Int, z1 : Int, depth : Int, margin : Int) : Seafloor do
+    { f with depth: edit_go(f, true, x0, z0, x1, z1, depth, most(margin, 0), f.depth, x0 - most(margin, 0), z0 - most(margin, 0)) }
+  end
+  doc "The floor with cells x0..x1, z0..z1 no deeper than [depth] voxels (and never above 1: water stays water), easing back over [margin] cells: a reef or a shoal."
+  fn raise(f : Seafloor, x0 : Int, z0 : Int, x1 : Int, z1 : Int, depth : Int, margin : Int) : Seafloor do
+    { f with depth: edit_go(f, false, x0, z0, x1, z1, most(depth, 1), most(margin, 0), f.depth, x0 - most(margin, 0), z0 - most(margin, 0)) }
+  end
+  doc "The floor with [edits] applied in order."
+  fn apply(f : Seafloor, edits : List(Edit)) : Seafloor do
+    match edits do
+      Nil -> f
+      Cons(Dig(x0, z0, x1, z1, d, m), rest) -> apply(dig(f, x0, z0, x1, z1, d, m), rest)
+      Cons(Raise(x0, z0, x1, z1, d, m), rest) -> apply(raise(f, x0, z0, x1, z1, d, m), rest)
+    end
+  end
+
+  -- ── Reading it ───────────────────────────────────────────────────────────
+  doc "The water's depth in voxels at cell (x, z); 0 off the floor or on land."
+  fn depth_at(f : Seafloor, x : Int, z : Int) : Int do
+    if x < 0 || z < 0 || x >= f.w || z >= f.h do 0 else NativeArray.get_int(f.depth, z * f.w + x) end
+  end
+  pfn metres_go(f : Seafloor, voxel_m : Float, a : NativeF32Arr, i : Int) : NativeF32Arr do
+    if i >= f.w * f.h do a else metres_go(f, voxel_m, NativeArray.set_f32(a, i, int_to_float(NativeArray.get_int(f.depth, i)) *. voxel_m), i + 1) end
+  end
+  doc "Every cell's depth in metres ([voxel_m] metres a voxel), x fastest: the depth grid Strata.Waves.solve takes."
+  fn depths_m(f : Seafloor, voxel_m : Float) : NativeF32Arr do metres_go(f, voxel_m, NativeArray.make_f32(f.w * f.h, 0.0), 0) end
+end
