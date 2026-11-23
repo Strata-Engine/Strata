@@ -30,6 +30,8 @@ layout(set = 0, binding = 0) uniform U {
     vec4 sea;        // sv_set_sea: xy the wind's direction along x and z (unit), z the open sea's wave height in metres (0: no sea state), w whitecaps 0..1
     vec4 sea_map;    // sv_set_sea_map: xy its low corner, z its cell size (metres)
     vec4 sea_grid;   // its cells across and down (x 0: no map)
+    vec4 sea_waves[9];  // sv_set_sea: the sea's nine waves, xy a direction (unit), z the wavenumber (radians a metre), w the angular speed (radians a second)
+    vec4 sea_amps[3];   // their shares of the amplitude, in order (x, y, z, w of each)
 } u;
 
 // The cutaway: is the surface at p (metres) hidden this frame? Above the

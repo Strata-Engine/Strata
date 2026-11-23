@@ -28,7 +28,7 @@
 /* Rewritten by build_shaders.sh whenever the shaders change: forge decides
  * whether to recompile this file from its text alone, not from the headers
  * it includes (GAPS S14). */
-#define STRATA_SHADERS_STAMP "e482d1b4da2e84ba"
+#define STRATA_SHADERS_STAMP "5833f6329bd1ca9b"
 #include "strata_shaders.h"
 #include "strata_particles.h"
 #include "strata_alloc.h"
@@ -361,7 +361,9 @@ static struct {
 #define UBO_SEA_MAP 444        /* vec4: x0, z0 the sea map's low corner and its cell size, in metres (sv_set_sea_map) */
 #define UBO_SEA_GRID 448       /* vec4: the sea map's cells across and down (0: no map) */
 #define SV_SEA_CELLS 16384     /* the sea map's cells at most */
-#define UBO_FLOATS 452
+#define UBO_SEA_WAVES 452      /* 9 vec4: the sea's waves (sv_set_sea): x, z a direction (unit), its wavenumber (radians a metre), its angular speed (radians a second) */
+#define UBO_SEA_AMPS 488       /* 3 vec4: the nine waves' shares of the sea's amplitude, in order */
+#define UBO_FLOATS 500
 #define UBO_CLOUD 180          /* vec4: x blobs, y their darkness (sv_set_cloud_shadows) */
 #define UBO_BLOBS 184          /* 64 vec4: the clouds' shadow blobs, centre and radius in metres */
 #define SV_CLOUD_BLOBS 64
@@ -4201,6 +4203,26 @@ void sv_set_sea(double wind_x, double wind_z, double height, double whitecaps) {
     v[1] = l < 1e-6f ? 0.0f : (float)wind_z / l;
     v[2] = height > 0.0 ? (float)height : 0.0f;
     v[3] = whitecaps < 0.0 ? 0.0f : (whitecaps > 1.0 ? 1.0f : (float)whitecaps);
+    /* The waves: nine in three layers (swell, chop, ripples) spread round the
+     * wind, worked out once here rather than in every pixel. The swell's
+     * wavelength follows Pierson-Moskowitz from the wave height: lambda ~
+     * 2 pi U^2 / g with U^2 / g ~ Hs / 0.21, kept to 6..60 m. Each row is a
+     * wavelength share, an amplitude share and an angle off the wind. */
+    static const float layer[9][3] = {
+        { 1.00f, 0.50f,  0.00f }, { 0.80f, 0.30f,  0.21f }, { 1.25f, 0.25f, -0.30f },
+        { 0.33f, 0.12f,  0.52f }, { 0.27f, 0.10f, -0.66f }, { 0.40f, 0.09f,  0.96f },
+        { 0.12f, 0.03f, -1.05f }, { 0.09f, 0.03f,  1.22f }, { 0.15f, 0.03f,  0.35f } };
+    float lam = 29.9f * v[2];
+    lam = lam < 6.0f ? 6.0f : (lam > 60.0f ? 60.0f : lam);
+    float ang = atan2f(v[1], v[0]);
+    float *wv = g.ubo_map + UBO_SEA_WAVES, *am = g.ubo_map + UBO_SEA_AMPS;
+    for (int i = 0; i < 9; i++) {
+        float a = ang + layer[i][2];
+        float k = 6.2831853f / (lam * layer[i][0]);
+        wv[i * 4 + 0] = cosf(a); wv[i * 4 + 1] = sinf(a);
+        wv[i * 4 + 2] = k;       wv[i * 4 + 3] = sqrtf(9.81f * k);
+        am[i] = layer[i][1];
+    }
 }
 
 /* The sea map: [w] x [h] cells (x fastest) of how exposed open water is to
