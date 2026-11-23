@@ -43,6 +43,7 @@ layout(location = 2) flat out uint v_w1;
 layout(location = 3) flat out uint v_face;        // 0..5; plus 8 for a chunk above level 0, lit without rays
 layout(location = 5) flat out vec4 v_rot;        // the rotation of the body drawn; identity for the world
 layout(location = 6) out vec3 v_keep;            // the translucent pass: a fragment with a negative component is not drawn
+layout(location = 7) flat out vec2 v_size;        // the quad's width and height in its unit faces (an ocean quad interpolates its corner depths across them)
 
 void main() {
 #ifdef STRATA_BATCHED_QUADS
@@ -116,6 +117,7 @@ void main() {
     // side faces have v running up the world; an image's rows run down
     v_tex = (face < 2u ? vec2(du, dv) : vec2(du, h - up)) * lod;
     v_uv = vec2(du, dv);
+    v_size = vec2(w, h);
     v_world = world;
     // a side face of a chunk above level 0 takes its block's top texture: a riser there is many voxels tall,
     // and a grass side's dirt would brown the far hills
