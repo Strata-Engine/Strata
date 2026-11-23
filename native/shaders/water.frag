@@ -58,14 +58,53 @@ vec3 ocean_colour(float d) {
     return d < 4.0 ? mix(shallow, mid, smoothstep(0.0, 4.0, d)) : mix(mid, deep, smoothstep(4.0, 12.0, d));
 }
 // Rolling waves: two crossing swells and a chop, on a quarter-voxel grid so they keep the world's grain.
+// How rough the sea is here under the sea state (sv_set_sea), 0.15..1; -1 when there is none.
+float sea_scale(vec2 xz) {
+    if (u.sea.z <= 0.0) return -1.0;
+    return clamp(u.sea.z / 3.0, 0.15, 1.0) * mix(0.25, 1.0, sea_exposure(xz));
+}
+// The wind's swell: its wavenumber and speed at roughness s (longer and faster as the sea builds).
+vec2 swell(float s) { return vec2(6.2831 / mix(6.0, 9.0, s), 0.6 + 0.4 * s); }
+// Where the wind's swell crests, 0..1, at q (metres, quarter-voxel stepped).
+float sea_crest(vec2 q, float s) {
+    vec2 k = swell(s);
+    float bend = 3.0 * ocean_noise(q * 0.045 + vec2(7.0, 3.0));
+    return smoothstep(0.88, 0.99, cos(dot(q, u.sea.xy) * k.x + bend - u.light.y * k.y));
+}
+// How the water's depth falls away here, metres per metre along x and z, from the corners.
+vec2 ocean_slope() {
+    vec2 f = clamp(v_uv / max(v_size, vec2(1.0)), 0.0, 1.0);
+    vec4 c = vec4(uvec4(v_w1, v_w1 >> 6, v_w1 >> 12, v_w1 >> 18) & 63u);
+    vec2 g = vec2(mix(c.y - c.x, c.w - c.z, f.y), mix(c.z - c.x, c.w - c.y, f.x)) / max(v_size, vec2(1.0));
+    return g;   // depth voxels per voxel: the same in metres per metre
+}
+
 vec3 ocean_normal(vec3 world, float d) {
     vec2 q = floor(world.xz / u.eye.w * 4.0) / 4.0 * u.eye.w;
     float t = u.light.y;
-    float k1 = 6.2831 / 6.0, k2 = 6.2831 / 2.5;
-    vec2 a = vec2(0.8, 0.6), b = vec2(-0.45, 0.89);
-    vec2 g = a * cos(dot(q, a) * k1 + t * 0.6) + 0.5 * b * cos(dot(q, b) * k2 + t * 1.1)
-           + 0.25 * vec2(0.3, -0.95) * cos(dot(q, vec2(0.3, -0.95)) * 4.1 + t * 1.7);
-    float amp = 0.06 * smoothstep(0.0, 3.0, d);
+    float s = sea_scale(world.xz);
+    vec2 g;
+    float amp;
+    if (s < 0.0) {
+        float k1 = 6.2831 / 6.0, k2 = 6.2831 / 2.5;
+        vec2 a = vec2(0.8, 0.6), b = vec2(-0.45, 0.89);
+        g = a * cos(dot(q, a) * k1 + t * 0.6) + 0.5 * b * cos(dot(q, b) * k2 + t * 1.1)
+          + 0.25 * vec2(0.3, -0.95) * cos(dot(q, vec2(0.3, -0.95)) * 4.1 + t * 1.7);
+        amp = 0.06 * smoothstep(0.0, 3.0, d);
+    } else {
+        // the wind's swell runs with it; two shorter trains 35 degrees either side break it up
+        vec2 w = u.sea.xy;
+        vec2 l = vec2(w.x * 0.819 - w.y * 0.574, w.x * 0.574 + w.y * 0.819);
+        vec2 r = vec2(w.x * 0.819 + w.y * 0.574, -w.x * 0.574 + w.y * 0.819);
+        vec2 k = swell(s);
+        // crests bend and the swell comes in groups, so it never lines up into stripes
+        float bend = 3.0 * ocean_noise(q * 0.045 + vec2(7.0, 3.0));
+        float group = 0.45 + 0.55 * ocean_noise(q * 0.06 - w * t * 0.08);
+        g = group * w * cos(dot(q, w) * k.x + bend - t * k.y)
+          + 0.45 * l * cos(dot(q, l) * k.x * 1.9 + bend * 0.7 - t * k.y * 1.4)
+          + 0.45 * r * cos(dot(q, r) * k.x * 2.3 - bend * 0.5 - t * k.y * 1.6);
+        amp = (0.03 + 0.07 * s) * smoothstep(0.0, 3.0, d);
+    }
     // each voxel's facet tilts its own way a little, slowly, so light breaks up rather than banding along the swells
     vec2 cell = floor(world.xz / u.eye.w);
     float phase = floor(t * 0.7);
@@ -242,6 +281,33 @@ void main() {
     }
     // water that never goes black or grey: at least a dim tint of its own colour, in any light or weather
     if (ocean) col = max(col, base.rgb * vec3(0.06, 0.12, 0.25) + vec3(0.010, 0.020, 0.040));
+    float sea = ocean ? sea_scale(v_world.xz) : -1.0;
+    if (ocean && sea > 0.0) {
+        vec2 q = floor(v_world.xz / u.eye.w * 4.0) / 4.0 * u.eye.w;
+        vec2 cell = floor(v_world.xz / (u.eye.w * 2.0));   // whitecaps and breakers fleck in 2-voxel blotches
+        float lit = clamp(0.25 + 0.85 * max(u.sun.y, 0.0), 0.12, 1.0);
+        vec3 white = vec3(0.93, 0.96, 0.97) * lit * (u.sun_color.rgb * 0.5 + 0.5);
+        // whitecaps: flecks on the crests, more as the wind rises
+        // a whitecap is a blotch on a crest that lasts a moment; the noise keeps them in patches, not lines
+        float patchy = smoothstep(0.45, 0.8, ocean_noise(q * 0.12 + u.sea.xy * u.light.y * 0.3));
+        float cap = sea_crest(q, sea) * patchy * step(1.0 - 0.5 * u.sea.w * sea, ocean_hash(cell + floor(u.light.y * 2.0) * vec2(13.0, 7.0)));
+        col = mix(col, white, 0.8 * cap * smoothstep(1.0, 3.0, ocean_d));
+        // breakers: bands of white water rolling shoreward, hardest where the shore faces the wind
+        vec2 slope = ocean_slope();
+        float steep = length(slope);
+        if (steep > 0.002) {
+            vec2 shoreward = -slope / steep;
+            float facing = clamp(dot(shoreward, u.sea.xy), 0.0, 1.0);
+            float roll = fract(dot(q, shoreward) / 5.0 - u.light.y * (0.25 + 0.2 * sea));
+            // a band narrows and whitens as it reaches the shallows
+            float width = mix(0.10, 0.22, 1.0 - smoothstep(0.5, 2.5, ocean_d));
+            float band = (1.0 - smoothstep(0.0, width, roll)) * smoothstep(0.2, 0.6, ocean_d) * (1.0 - smoothstep(1.8, 3.0, ocean_d));
+            float strength = sqrt(facing) * smoothstep(0.08, 0.45, sea);
+            float breaker = band * strength * step(0.25, ocean_hash(cell + floor(u.light.y * 1.5)));
+            col = mix(col, white, breaker);
+            alpha = max(alpha, mix(alpha, 0.92, breaker));
+        }
+    }
     if (ocean) {
         // foam where the water thins against the shore, in voxel-sized flecks that wash in and out
         vec2 q = floor(v_world.xz / u.eye.w) * u.eye.w;
