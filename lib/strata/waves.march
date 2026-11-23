@@ -13,9 +13,30 @@
 --
 -- Each cell's amplitude factor is the product of shoaling (sqrt(cg0 / cg),
 -- energy kept as the group speed falls), refraction (rays converging on a
--- headland raise the sea, rays spreading into a bay or a lee lower it, from
--- the divergence of the crests' normals) and a lee shadow (land straight
--- upwind of a cell shelters it). Pure and deterministic: build it on a worker.
+-- headland raise the sea, rays spreading into a bay lower it, from the
+-- divergence of the crests' normals) and shelter. Shelter is what gets past
+-- what lies straight upwind: land lets 0.4 through, water too shallow for the
+-- sea lets through what does not break (0.78 d / height), each recovering
+-- over 240 m behind; it is spread along the crests over half a wavelength,
+-- so a lee fills in toward an obstacle's ends, and inside a lee the crests
+-- (bent round, not rays) neither focus nor fan out. Last, no cell's sea
+-- stands higher than its depth lets it before breaking (0.78 d). Pure and
+-- deterministic: build it on a worker.
+--
+-- Obstacles are depth; a game marks them in the grid it passes:
+--   * Breakwaters, moles, seawalls, solid piers and quays: depth 0, solid.
+--     Mark the cells the structure covers. One cell thick is enough for a
+--     wall along x or z; make a diagonal one two cells thick, so the
+--     straight-upwind look for shelter cannot step through it. The sea
+--     behind is calm, and fills in round the ends over about half a
+--     wavelength; the crests that reach it arrive late, bent round.
+--   * Piers on piles, jetties, moorings: leave them water. They do not stop
+--     a swell (mark them solid only if the game wants them to).
+--   * Reefs, bars, shoals, sunken wrecks: shallow water (depth > 0). The
+--     swell slows and grows climbing them (shoaling), breaks on them when
+--     the water is shallower than about 1.3 times its height, and is lower
+--     behind for it. `solve_sea` takes the sea's height for this; `solve`
+--     assumes the height the shader's sea state pairs with the wavelength.
 mod Strata.Waves do
 
   -- A swell refracted over a depth grid: per cell (x fastest) its phase in radians and its amplitude factor (0 on land, 1 open sea, up to 2 where it focuses); the grid's size, low corner and cell size in metres; the swell's angular frequency w, so the sea there is amp * cos(phase - w t); and its deep-water direction (dx, dz), unit. Cells the swell never reaches (land, enclosed water) carry the incoming plane wave's phase with no amplitude.
@@ -198,19 +219,55 @@ mod Strata.Waves do
     let (_, nz) = normal(g, p, x, z - 1)
     ((ex -. wx) +. (sz -. nz)) /. (2.0 *. g.cell)
   end
-  -- metres of water straight upwind of a cell before land, up to [reach]
-  pfn open_upwind(g : SeaGrid, x : Float, z : Float, dx : Float, dz : Float, run : Float, reach : Float) : Float do
-    if run >= reach do reach else
-      let px = float_to_int(Math.floor((x -. g.x0) /. g.cell))
-      let pz = float_to_int(Math.floor((z -. g.z0) /. g.cell))
-      if px < 0 || pz < 0 || px >= g.w || pz >= g.h do reach
-      else if !wet(g, px + pz * g.w) do run
-      else open_upwind(g, x -. dx *. g.cell, z -. dz *. g.cell, dx, dz, run +. g.cell, reach) end end
+  -- How much of the swell gets past what lies straight upwind of a cell, up
+  -- to [reach] metres: land lets 0.4 through (the rest only arrives round
+  -- it), water too shallow for the sea lets through what does not break
+  -- there (0.78 d / height, the depth-limited breaker, kept to 0.4..1), and
+  -- either recovers over [reach] metres behind it. The least over the way.
+  pfn breaker(d : Float, sea : Float) : Float do
+    if d <= 0.0 do 0.4 else
+      let b = 0.78 *. d /. sea
+      if b < 0.4 do 0.4 else if b > 1.0 do 1.0 else b end end
     end
   end
-  pfn amplitude(g : SeaGrid, p : NativeF32Arr, omega : Float, dx : Float, dz : Float, a : NativeF32Arr, i : Int) : NativeF32Arr do
+  pfn shelter_upwind(g : SeaGrid, x : Float, z : Float, dx : Float, dz : Float, sea : Float, run : Float, reach : Float, best : Float) : Float do
+    if run >= reach || best <= 0.4 do best else
+      let px = float_to_int(Math.floor((x -. g.x0) /. g.cell))
+      let pz = float_to_int(Math.floor((z -. g.z0) /. g.cell))
+      if px < 0 || pz < 0 || px >= g.w || pz >= g.h do best else
+        let d = NativeArray.get_f32(g.depth, px + pz * g.w)
+        let b = breaker(d, sea)
+        let v = b +. (1.0 -. b) *. run /. reach
+        let best = least(best, v)
+        if d <= 0.0 do best else shelter_upwind(g, x -. dx *. g.cell, z -. dz *. g.cell, dx, dz, sea, run +. g.cell, reach, best) end
+      end
+    end
+  end
+  pfn reached(g : SeaGrid, p : NativeF32Arr, i : Int) : Bool do wet(g, i) && NativeArray.get_f32(p, i) < far() end
+  -- pass 1: each reached cell's shelter, straight upwind
+  pfn shelters(g : SeaGrid, p : NativeF32Arr, dx : Float, dz : Float, sea : Float, out : NativeF32Arr, i : Int) : NativeF32Arr do
+    if i >= g.w * g.h do out else
+      let v = if !reached(g, p, i) do 1.0 else shelter_upwind(g, cx(g, i) -. dx *. g.cell, cz(g, i) -. dz *. g.cell, dx, dz, sea, 0.0, 240.0, 1.0) end
+      shelters(g, p, dx, dz, sea, NativeArray.set_f32(out, i, v), i + 1)
+    end
+  end
+  -- the mean shelter of the reached cells along the crests (across the swell, (-dz, dx)) within [r] cells of cell (x, z)
+  pfn along_crest(g : SeaGrid, p : NativeF32Arr, sh : NativeF32Arr, x : Int, z : Int, dx : Float, dz : Float, r : Int, o : Int, sum : Float, n : Int) : Float do
+    if o > r do (if n == 0 do 1.0 else sum /. int_to_float(n) end) else
+      let qx = float_to_int(Math.floor(int_to_float(x) -. dz *. int_to_float(o) +. 0.5))
+      let qz = float_to_int(Math.floor(int_to_float(z) +. dx *. int_to_float(o) +. 0.5))
+      if qx < 0 || qz < 0 || qx >= g.w || qz >= g.h do along_crest(g, p, sh, x, z, dx, dz, r, o + 1, sum, n)
+      else
+        let j = qx + qz * g.w
+        if reached(g, p, j) do along_crest(g, p, sh, x, z, dx, dz, r, o + 1, sum +. NativeArray.get_f32(sh, j), n + 1)
+        else along_crest(g, p, sh, x, z, dx, dz, r, o + 1, sum, n) end
+      end
+    end
+  end
+  -- pass 2: the amplitude factor, from shoaling, refraction, the shelter spread along the crests, and breaking
+  pfn amplitudes(g : SeaGrid, p : NativeF32Arr, sh : NativeF32Arr, omega : Float, dx : Float, dz : Float, sea : Float, r : Int, a : NativeF32Arr, i : Int) : NativeF32Arr do
     if i >= g.w * g.h do a else
-      let value = if !wet(g, i) || NativeArray.get_f32(p, i) >= far() do 0.0 else
+      let value = if !reached(g, p, i) do 0.0 else
         let x = i % g.w
         let z = i / g.w
         let d = NativeArray.get_f32(g.depth, i)
@@ -218,13 +275,19 @@ mod Strata.Waves do
         -- rays spreading over about 25 m change the sea by exp(-spread * 25 / 2): focus on headlands, calm in bays
         let refr = Math.exp(0.0 -. 12.5 *. spread(g, p, x, z))
         let refr = if refr < 0.3 do 0.3 else if refr > 1.8 do 1.8 else refr end end
-        -- straight in the lee of land the swell only arrives round it, weakened
-        let open = open_upwind(g, cx(g, i) -. dx *. g.cell, cz(g, i) -. dz *. g.cell, dx, dz, 0.0, 240.0)
-        let lee = 0.4 +. 0.6 *. (open /. 240.0)
+        -- in a lee the crests arrive bent round an obstacle, not as rays: there they neither focus nor fan out
+        let open = (NativeArray.get_f32(sh, i) -. 0.4) /. 0.6
+        let open = if open < 0.0 do 0.0 else if open > 1.0 do 1.0 else open end end
+        let refr = 1.0 +. (refr -. 1.0) *. open
+        -- the lee's edge is no sharp line: round an obstacle's ends the swell spreads in along the crests, over about half a wavelength
+        let lee = along_crest(g, p, sh, x, z, dx, dz, r, 0 - r, 0.0, 0)
         let v = shoal *. refr *. lee
+        -- and no higher than the depth lets it stand before breaking
+        let cap = 0.78 *. d /. sea
+        let v = if v > cap do cap else v end
         if v > 2.0 do 2.0 else v end
       end
-      amplitude(g, p, omega, dx, dz, NativeArray.set_f32(a, i, value), i + 1)
+      amplitudes(g, p, sh, omega, dx, dz, sea, r, NativeArray.set_f32(a, i, value), i + 1)
     end
   end
   -- cells the march never reached take the incoming plane wave's phase, so filtering next to them stays sane
@@ -237,8 +300,12 @@ mod Strata.Waves do
     if i >= n do k else wavenumbers(depth, omega, NativeArray.set_f32(k, i, wavenumber(omega, NativeArray.get_f32(depth, i))), i + 1, n) end
   end
 
-  doc "Refract a swell over a depth grid: [depth] metres a cell (x fastest, w x h cells of [cell] metres, low corner (x0, z0); land is 0 or less), the swell's deep-water direction ([dx], [dz], any length) and wavelength [wavelength] metres. Its crests start straight on the grid's upwind edges and bend, slow, shoal and wrap round land by first arrival."
+  doc "Refract a swell over a depth grid: [depth] metres a cell (x fastest, w x h cells of [cell] metres, low corner (x0, z0); land is 0 or less), the swell's deep-water direction ([dx], [dz], any length) and wavelength [wavelength] metres. Its crests start straight on the grid's upwind edges and bend, slow, shoal and wrap round land by first arrival. The sea is taken to be as high as the shader's sea state pairs with that wavelength (wavelength / 29.9 m); `solve_sea` gives it a height of its own."
   fn solve(depth : NativeF32Arr, w : Int, h : Int, x0 : Float, z0 : Float, cell : Float, dx : Float, dz : Float, wavelength : Float) : Swell do
+    solve_sea(depth, w, h, x0, z0, cell, dx, dz, wavelength, wavelength /. 29.9)
+  end
+  doc "Refract a sea [height] metres high (crest to trough) over a depth grid, as `solve`: [height] also sets where it breaks, on reefs and bars too shallow for it, and how much less comes over them."
+  fn solve_sea(depth : NativeF32Arr, w : Int, h : Int, x0 : Float, z0 : Float, cell : Float, dx : Float, dz : Float, wavelength : Float, height : Float) : Swell do
     let l = Math.sqrt(dx *. dx +. dz *. dz)
     let ux = if l < 1.0e-6 do 1.0 else dx /. l end
     let uz = if l < 1.0e-6 do 0.0 else dz /. l end
@@ -251,8 +318,18 @@ mod Strata.Waves do
     let vs = NativeArray.make_int(5 * n + 4, 0)
     let (p, ks, vs, size) = seed(g, ux, uz, k0, 0, NativeArray.make_f32(n, far()), ks, vs, 0)
     let p = march(g, p, NativeArray.make_int(n, 0), ks, vs, size)
-    let amp = amplitude(g, p, omega, ux, uz, NativeArray.make_f32(n, 0.0), 0)
+    let sea = if height > 0.01 do height else 0.01 end
+    let sh = shelters(g, p, ux, uz, sea, NativeArray.make_f32(n, 1.0), 0)
+    let r = float_to_int(Math.floor(0.5 *. wavelength /. cell +. 0.5))
+    let r = if r < 1 do 1 else if r > 12 do 12 else r end end
+    let amp = amplitudes(g, p, sh, omega, ux, uz, sea, r, NativeArray.make_f32(n, 0.0), 0)
     { phase: tidy(g, p, k0, ux, uz, 0), amp: amp, w: w, h: h, x0: x0, z0: z0, cell: cell, omega: omega, dx: ux, dz: uz }
+  end
+
+  doc "The swell's deep-water wavelength in metres for a sea [height] metres high, as the shader's sea state pairs them (Pierson-Moskowitz, kept to 6..60 m): what to give `solve` for the swell `sea_state` draws."
+  fn swell_wavelength(height : Float) : Float do
+    let l = 29.9 *. height
+    if l < 6.0 do 6.0 else if l > 60.0 do 60.0 else l end end
   end
 
   doc "The field's phase and amplitude at a cell (x, z) of its grid; (0, 0) off it or on land."
@@ -262,4 +339,181 @@ mod Strata.Waves do
       (NativeArray.get_f32(f.phase, i), NativeArray.get_f32(f.amp, i))
     end
   end
+
+  -- ── The sea's surface, for game code ────────────────────────────────────
+  -- What the ocean shader draws, worked out on the CPU so a game can float a
+  -- boat, splash a wake or flood a quay on the same waves the player sees.
+  --
+  -- The correspondence, line for line:
+  --   sea_state       sv_set_sea (native/strata_vk.c): nine waves from the
+  --                   wind, the `layer[9][3]` table of wavelength share,
+  --                   amplitude share and angle off the wind; the swell's
+  --                   wavelength clamp(29.9 Hs, 6, 60) m; each wavevector
+  --                   snapped to whole cycles across the 256 m height tile
+  --                   (a zero one becomes one cycle along x); w = sqrt(g k).
+  --   surface         sea.comp + water.frag's sea_column: the waves summed
+  --                   with golden-angle phases i * 2.399, each crest shaped
+  --                   2 pow(0.5 s + 0.5, 1 + 1.5 chop) - 1; with a refracted
+  --                   swell (sv_set_sea_field) waves 3..8 stay plane and the
+  --                   first three are replaced by sea_swell: the field's phase
+  --                   and amplitude bilinearly, cos(phase - w t), faded over
+  --                   the grid's outer 8 cells into the plane wave the solve
+  --                   began from, weighted by the first three shares.
+  --   amplitude       water.frag's amp: 0.5 Hs, times mix(0.3, 1, exposure)
+  --                   (the sea map, sv_set_sea_map: the game knows its own
+  --                   exposure and passes it) and mix(0.35, 1.3, patch), the
+  --                   slow swell patches of ocean_noise.
+  --   height          amplitude * surface: metres above still water.
+  -- Differences from the screen, all small: the shader reads the chop from a
+  -- tile of 0.5 m cells (this is continuous); it works in 32-bit floats,
+  -- clock included (so keep the water clock under a few hours); its patch
+  -- noise hashes with a 32-bit sin, so far from the origin `patch` may drift
+  -- from the GPU's (pass exposure 1 and use `surface` to avoid relying on it);
+  -- and the shader steps the result into voxel terraces, which this does not.
+  -- Without a compute pipeline the shader ignores the swell field; this
+  -- follows the usual path, where it is used.
+
+  -- A sea state's waves (sv_set_sea): the wind's unit direction, the open sea's wave height (metres), the chop (whitecaps, 0..1), and per wave i (0..8) its wavevector (radians a metre), angular speed (radians a second) and share of the amplitude.
+  type SeaWaves = { wind_x : Float, wind_z : Float, height : Float, chop : Float, kx : NativeF32Arr, kz : NativeF32Arr, omega : NativeF32Arr, share : NativeF32Arr }
+
+  -- sv_set_sea's layer table: wavelength share, amplitude share, angle off the wind
+  pfn layer_length(i : Int) : Float do
+    if i == 0 do 1.0 else if i == 1 do 0.8 else if i == 2 do 1.25 else if i == 3 do 0.33 else if i == 4 do 0.27
+    else if i == 5 do 0.4 else if i == 6 do 0.12 else if i == 7 do 0.09 else 0.15 end end end end end end end end
+  end
+  pfn layer_share(i : Int) : Float do
+    if i == 0 do 0.5 else if i == 1 do 0.3 else if i == 2 do 0.25 else if i == 3 do 0.12 else if i == 4 do 0.1
+    else if i == 5 do 0.09 else 0.03 end end end end end end
+  end
+  pfn layer_angle(i : Int) : Float do
+    if i == 0 do 0.0 else if i == 1 do 0.21 else if i == 2 do -0.3 else if i == 3 do 0.52 else if i == 4 do -0.66
+    else if i == 5 do 0.96 else if i == 6 do -1.05 else if i == 7 do 1.22 else 0.35 end end end end end end end end
+  end
+  -- C's roundf: halves away from zero
+  pfn round_away(x : Float) : Float do if x >= 0.0 do Math.floor(x +. 0.5) else 0.0 -. Math.floor(0.5 -. x) end end
+  pfn tile_metres() : Float do 256.0 end
+  pfn fill_waves(ang : Float, lam : Float, i : Int, kx : NativeF32Arr, kz : NativeF32Arr, om : NativeF32Arr, sh : NativeF32Arr) : (NativeF32Arr, NativeF32Arr, NativeF32Arr, NativeF32Arr) do
+    if i >= 9 do (kx, kz, om, sh) else
+      let a = ang +. layer_angle(i)
+      let k = 6.2831853 /. (lam *. layer_length(i))
+      -- whole cycles across the 256 m tile, so the tile repeats seamlessly
+      let cyc = tile_metres() /. 6.2831853
+      let x0 = round_away(k *. Math.cos(a) *. cyc) /. cyc
+      let z = round_away(k *. Math.sin(a) *. cyc) /. cyc
+      let x = if x0 == 0.0 && z == 0.0 do 1.0 /. cyc else x0 end
+      let kk = Math.sqrt(x *. x +. z *. z)
+      fill_waves(ang, lam, i + 1, NativeArray.set_f32(kx, i, x), NativeArray.set_f32(kz, i, z),
+        NativeArray.set_f32(om, i, Math.sqrt(gravity() *. kk)), NativeArray.set_f32(sh, i, layer_share(i)))
+    end
+  end
+
+  doc "The waves of a sea state, exactly as `Strata.Render`'s sea state (Vk.set_sea) works them out for the shader: wind toward ([wind_x], [wind_z], any length), the open sea's wave [height] in metres (0: no sea state, a flat sea) and [whitecaps] 0..1, which also sharpens the crests."
+  fn sea_state(wind_x : Float, wind_z : Float, height : Float, whitecaps : Float) : SeaWaves do
+    let l = Math.sqrt(wind_x *. wind_x +. wind_z *. wind_z)
+    let ux = if l < 1.0e-6 do 1.0 else wind_x /. l end
+    let uz = if l < 1.0e-6 do 0.0 else wind_z /. l end
+    let hs = if height > 0.0 do height else 0.0 end
+    let lam = 29.9 *. hs
+    let lam = if lam < 6.0 do 6.0 else if lam > 60.0 do 60.0 else lam end end
+    let (kx, kz, om, sh) = fill_waves(Math.atan2(uz, ux), lam, 0, NativeArray.make_f32(9, 0.0), NativeArray.make_f32(9, 0.0), NativeArray.make_f32(9, 0.0), NativeArray.make_f32(9, 0.0))
+    { wind_x: ux, wind_z: uz, height: hs, chop: if whitecaps < 0.0 do 0.0 else if whitecaps > 1.0 do 1.0 else whitecaps end end,
+      kx: kx, kz: kz, omega: om, share: sh }
+  end
+  doc "Wave [i] (0..8) of a sea state: its wavevector x and z (radians a metre), its angular speed (radians a second) and its share of the amplitude. 0..2 are the swell, 3..5 the chop, 6..8 the ripples."
+  fn wave(s : SeaWaves, i : Int) : (Float, Float, Float, Float) do
+    (NativeArray.get_f32(s.kx, i), NativeArray.get_f32(s.kz, i), NativeArray.get_f32(s.omega, i), NativeArray.get_f32(s.share, i))
+  end
+  -- a crest shaped sharper and a trough wider as the chop rises: 2 pow(0.5 s + 0.5, q) - 1
+  pfn crest(s : Float, q : Float) : Float do
+    let b = 0.5 *. s +. 0.5
+    if b <= 0.0 do -1.0 else 2.0 *. Math.pow(b, q) -. 1.0 end
+  end
+  pfn waves_from(s : SeaWaves, x : Float, z : Float, t : Float, q : Float, i : Int, acc : Float) : Float do
+    if i >= 9 do acc else
+      let arg = x *. NativeArray.get_f32(s.kx, i) +. z *. NativeArray.get_f32(s.kz, i) -. NativeArray.get_f32(s.omega, i) *. t +. int_to_float(i) *. 2.399
+      waves_from(s, x, z, t, q, i + 1, acc +. NativeArray.get_f32(s.share, i) *. crest(Math.sin(arg), q))
+    end
+  end
+  pfn clampf(v : Float, lo : Float, hi : Float) : Float do if v < lo do lo else if v > hi do hi else v end end end
+  pfn smoothstep(a : Float, b : Float, x : Float) : Float do
+    let t = clampf((x -. a) /. (b -. a), 0.0, 1.0)
+    t *. t *. (3.0 -. 2.0 *. t)
+  end
+  pfn mixf(a : Float, b : Float, t : Float) : Float do a +. (b -. a) *. t end
+  -- water.frag's sea_swell: the refracted swell at (x, z), for unit amplitude, weighted by the swell waves' shares
+  pfn swell_at(f : Swell, s : SeaWaves, x : Float, z : Float, t : Float, q : Float) : Float do
+    let k0 = f.omega *. f.omega /. gravity()
+    let plane = (x *. f.dx +. z *. f.dz) *. k0
+    let gx = (x -. f.x0) /. f.cell -. 0.5
+    let gz = (z -. f.z0) /. f.cell -. 0.5
+    let wm = int_to_float(f.w - 1)
+    let hm = int_to_float(f.h - 1)
+    let lx = clampf(Math.floor(gx), 0.0, wm)
+    let lz = clampf(Math.floor(gz), 0.0, hm)
+    let hx = if lx +. 1.0 < wm do lx +. 1.0 else wm end
+    let hz = if lz +. 1.0 < hm do lz +. 1.0 else hm end
+    let fx = clampf(gx -. lx, 0.0, 1.0)
+    let fz = clampf(gz -. lz, 0.0, 1.0)
+    let ia = float_to_int(lz) * f.w + float_to_int(lx)
+    let ib = float_to_int(lz) * f.w + float_to_int(hx)
+    let ic = float_to_int(hz) * f.w + float_to_int(lx)
+    let id = float_to_int(hz) * f.w + float_to_int(hx)
+    let pick = fn (a : NativeF32Arr) -> mixf(mixf(NativeArray.get_f32(a, ia), NativeArray.get_f32(a, ib), fx), mixf(NativeArray.get_f32(a, ic), NativeArray.get_f32(a, id), fx), fz)
+    let phase = pick(f.phase)
+    let amp = pick(f.amp)
+    -- inside by how many cells: the field fades in over its outer eight
+    let inside = clampf(gx, -1.0e9, wm -. gx)
+    let inside = if gz < inside do gz else inside end
+    let inside = if hm -. gz < inside do hm -. gz else inside end
+    let in_field = smoothstep(0.0, 8.0, inside)
+    let hf = amp *. crest(Math.cos(phase -. f.omega *. t), q)
+    let hp = crest(Math.cos(plane -. f.omega *. t), q)
+    (NativeArray.get_f32(s.share, 0) +. NativeArray.get_f32(s.share, 1) +. NativeArray.get_f32(s.share, 2)) *. mixf(hp, hf, in_field)
+  end
+
+  doc "The sea's surface at (x, z) metres at time [t] (the clock `Strata.Render.set_time` gives), for unit amplitude: the shape the shader multiplies by its amplitude (`amplitude`). With a refracted swell [field] (the one handed to `Strata.Render.set_sea_field`) its swell bends round land as the screen's does; None is the plain spectrum."
+  fn surface(s : SeaWaves, field : Option(Swell), x : Float, z : Float, t : Float) : Float do
+    let q = 1.0 +. 1.5 *. s.chop
+    match field do
+      None -> waves_from(s, x, z, t, q, 0, 0.0)
+      Some(f) -> if f.w < 1 || f.h < 1 do waves_from(s, x, z, t, q, 0, 0.0) else waves_from(s, x, z, t, q, 3, 0.0) +. swell_at(f, s, x, z, t, q) end
+    end
+  end
+  pfn ocean_hash(x : Float, z : Float) : Float do
+    let v = Math.sin(x *. 127.1 +. z *. 311.7) *. 43758.5453
+    v -. Math.floor(v)
+  end
+  doc "The shader's slow swell patches at (x, z) metres, 0..1 (water.frag's ocean_noise at xz * 0.004 + (3.1, 7.7)): the sea rises and falls across a few hundred metres so its repeating tile never shows."
+  fn patch(x : Float, z : Float) : Float do
+    let px = x *. 0.004 +. 3.1
+    let pz = z *. 0.004 +. 7.7
+    let ix = Math.floor(px)
+    let iz = Math.floor(pz)
+    let fx = px -. ix
+    let fz = pz -. iz
+    let fx = fx *. fx *. (3.0 -. 2.0 *. fx)
+    let fz = fz *. fz *. (3.0 -. 2.0 *. fz)
+    mixf(mixf(ocean_hash(ix, iz), ocean_hash(ix +. 1.0, iz), fx), mixf(ocean_hash(ix, iz +. 1.0), ocean_hash(ix +. 1.0, iz +. 1.0), fx), fz)
+  end
+  doc "The sea's amplitude in metres at (x, z) as the shader works it out: half the wave height, less where the water is sheltered from the wind ([exposure] 0..1, the value the game gave the sea map there, 1 for open sea) and varied by `patch`."
+  fn amplitude(s : SeaWaves, exposure : Float, x : Float, z : Float) : Float do
+    0.5 *. s.height *. mixf(0.3, 1.0, clampf(exposure, 0.0, 1.0)) *. mixf(0.35, 1.3, patch(x, z))
+  end
+  doc "The sea's height in metres above still water at (x, z) metres and time [t]: `amplitude` times `surface`. 0 everywhere with no sea state (height 0)."
+  fn height(s : SeaWaves, field : Option(Swell), exposure : Float, x : Float, z : Float, t : Float) : Float do
+    amplitude(s, exposure, x, z) *. surface(s, field, x, z, t)
+  end
+  doc "The sea's slope at (x, z) and time [t]: how many metres it rises a metre along x and along z (central differences over 10 cm of `height`)."
+  fn slope(s : SeaWaves, field : Option(Swell), exposure : Float, x : Float, z : Float, t : Float) : (Float, Float) do
+    let e = 0.05
+    ((height(s, field, exposure, x +. e, z, t) -. height(s, field, exposure, x -. e, z, t)) /. (2.0 *. e),
+     (height(s, field, exposure, x, z +. e, t) -. height(s, field, exposure, x, z -. e, t)) /. (2.0 *. e))
+  end
+  doc "The sea's unit normal (x, y, z) at (x, z) and time [t], y up."
+  fn normal_at(s : SeaWaves, field : Option(Swell), exposure : Float, x : Float, z : Float, t : Float) : (Float, Float, Float) do
+    let (sx, sz) = slope(s, field, exposure, x, z, t)
+    let l = Math.sqrt(sx *. sx +. 1.0 +. sz *. sz)
+    (0.0 -. sx /. l, 1.0 /. l, 0.0 -. sz /. l)
+  end
+
 end
