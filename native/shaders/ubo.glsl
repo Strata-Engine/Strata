@@ -25,6 +25,8 @@ layout(set = 0, binding = 0) uniform U {
     uvec4 lamp_mask[2]; // a bit a light class: its standing lamps cast shadows (sv_set_lamp_shadow)
     vec4 weather;    // sv_set_weather: x overcast 0..1, y how wet surfaces are 0..1, z a lightning flash's brightness 0..1, w rain 0..1 (streaks drawn over the view)
     vec4 rain;       // xyz the direction rain falls (unit, metres), w the rain's own clock in seconds
+    vec4 cloud;      // sv_set_cloud_shadows: x how many blobs, y how much of the sun a blob's middle takes 0..1
+    vec4 blobs[48];  // the clouds' shadow blobs: xyz a centre (metres), w its radius
 } u;
 
 // The cutaway: is the surface at p (metres) hidden this frame? Above the

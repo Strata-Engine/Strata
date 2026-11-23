@@ -28,7 +28,7 @@
 /* Rewritten by build_shaders.sh whenever the shaders change: forge decides
  * whether to recompile this file from its text alone, not from the headers
  * it includes (GAPS S14). */
-#define STRATA_SHADERS_STAMP "65bc24f560499c69"
+#define STRATA_SHADERS_STAMP "868ddbabac0c8e0f"
 #include "strata_shaders.h"
 #include "strata_particles.h"
 #include "strata_alloc.h"
@@ -354,7 +354,10 @@ static struct {
 /* The uniform block, in floats (native/shaders/ubo.glsl): vp 0, sun 16,
  * sky 20, fog 24, eye 28, misc 32 (ints), inv_vp 36, prev_vp 52, light 68,
  * sun colour 72, light volume size 76 (ints). */
-#define UBO_FLOATS 180
+#define UBO_FLOATS 376
+#define UBO_CLOUD 180          /* vec4: x blobs, y their darkness (sv_set_cloud_shadows) */
+#define UBO_BLOBS 184          /* 48 vec4: the clouds' shadow blobs, centre and radius in metres */
+#define SV_CLOUD_BLOBS 48
 #define UBO_WEATHER 172        /* vec4: x overcast, y wetness, z lightning flash, w rain (sv_set_weather) */
 #define UBO_RAIN 176           /* vec4: xyz the direction rain falls, w the rain's clock in seconds (sv_set_rain) */
 #define UBO_LAMPMASK 164       /* 8 uints: a bit a light class, set when its standing lamps cast shadows (lamps.comp) */
@@ -4166,6 +4169,18 @@ void sv_set_weather(double overcast, double wet, double flash, double rain) {
     if (!g.ok) return;
     float *w = g.ubo_map + UBO_WEATHER;
     w[0] = clamp01(overcast); w[1] = clamp01(wet); w[2] = clamp01(flash); w[3] = clamp01(rain);
+}
+/* Clouds' shadows: [n] blobs (at most SV_CLOUD_BLOBS), four floats each in
+ * [blobs]: a centre and a radius in metres. Ground the sun reaches through a
+ * blob loses up to [darkness] (0..1) of the sun's light, softly toward the
+ * blob's edge. n 0 casts none, the default. */
+void sv_set_cloud_shadows(void *blobs, int64_t n, double darkness) {
+    if (!g.ok) return;
+    int k = n < 0 ? 0 : (n > SV_CLOUD_BLOBS ? SV_CLOUD_BLOBS : (int)n);
+    if (k > 0 && (!blobs || narr_len(blobs) < (int64_t)k * 4)) k = blobs ? (int)(narr_len(blobs) / 4) : 0;
+    if (k > SV_CLOUD_BLOBS) k = SV_CLOUD_BLOBS;
+    if (k > 0) memcpy(g.ubo_map + UBO_BLOBS, narr_data(blobs), (size_t)k * 4 * sizeof(float));
+    g.ubo_map[UBO_CLOUD] = (float)k; g.ubo_map[UBO_CLOUD + 1] = clamp01(darkness);
 }
 /* Rain falls along (x, y, z) (any length; wind slants it), and its streaks
  * and rings run on [clock] seconds, which a game may stop while paused. */

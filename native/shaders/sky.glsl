@@ -77,6 +77,25 @@ float caustics(vec3 world) {
     return 0.75 + 0.75 * c * c;
 }
 
+// How much of the sun's light reaches p (metres) past the clouds' shadow
+// blobs (sv_set_cloud_shadows): 1 in the clear, less under a blob's middle.
+float cloud_shadow(vec3 p) {
+    int n = int(u.cloud.x + 0.5);
+    vec3 s = u.sun.xyz;
+    if (n == 0 || s.y <= 0.02) return 1.0;
+    float lit = 1.0;
+    for (int k = 0; k < 48; k++) {
+        if (k >= n) break;
+        vec4 b = u.blobs[k];
+        vec3 cp = b.xyz - p;
+        float t = dot(cp, s);
+        if (t <= 0.0) continue;
+        float d2 = dot(cp, cp) - t * t, r2 = b.w * b.w;
+        lit *= 1.0 - u.cloud.y * (1.0 - smoothstep(0.1 * r2, r2, d2));
+    }
+    return lit;
+}
+
 // Fade a lit colour into the sky with distance; under water, into the water.
 vec3 fogged(vec3 col, vec3 world) {
     vec3 to = world - u.eye.xyz;

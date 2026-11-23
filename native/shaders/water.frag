@@ -74,8 +74,16 @@ void main() {
         float zoom = 1.0 / max(length(vec3(u.vp[0][0], u.vp[1][0], u.vp[2][0])), 0.0001);
         float fade = mix(0.07, 0.96, smoothstep(28.0, 100.0, zoom));
         vec3 n = qrot(v_rot, NORMALS[min(face, 5u)]);
-        float daylight = clamp(0.32 + 0.58 * u.sun.y + 0.18 * max(n.y, 0.0), 0.06, 0.98);
-        vec3 colour = mix(vec3(0.12, 0.15, 0.21), vec3(0.98, 0.97, 0.94), daylight);
+        // lit as the world is: the sun on the faces toward it and some through the cloud, the sky from above;
+        // so they dim and warm with the day, and go grey when the sun is weak
+        float toward_sun = max(dot(n, u.sun.xyz), 0.0);
+        vec3 sky = sky_flat(n);
+        sky = mix(vec3(dot(sky, vec3(0.3, 0.59, 0.11))), sky, 0.35);          // a cloud is grey: it takes the sky's light, not its blue
+        vec3 light = u.sun_color.rgb * (0.45 + 0.55 * toward_sun) + sky * (1.6 + 0.6 * n.y);
+        vec3 colour = tonemap(vec3(0.92, 0.93, 0.95) * light * (0.78 + 0.22 * n.y));
+        // thinner over the middle of the view, where the player is looking
+        vec4 clip = u.vp * vec4(v_world, 1.0);
+        fade *= mix(0.35, 1.0, smoothstep(0.15, 0.65, length(clip.xy / clip.w)));
         // rain clouds are slate grey, storm clouds darker still, and lightning lights them from inside
         colour = mix(colour, colour * vec3(0.46, 0.49, 0.55), smoothstep(0.5, 1.0, u.weather.x) * (0.4 + 0.6 * u.weather.w));
         colour += vec3(0.70, 0.75, 0.95) * u.weather.z;
@@ -179,7 +187,7 @@ void main() {
     // figures move every frame: their shadow is never remembered
     float sun_vis = sun_mem;
     if (u.fshadow.x > 0.5 && sun_vis > 0.0) sun_vis = min(sun_vis, fig_shadow(v_world, n));
-    vec3 col = base.rgb * (u.sun_color.rgb * max(dot(n, u.sun.xyz), 0.0) * sun_vis + sky_flat(n));
+    vec3 col = base.rgb * (u.sun_color.rgb * max(dot(n, u.sun.xyz), 0.0) * sun_vis * cloud_shadow(v_world) + sky_flat(n));
     float alpha = base.a;
     vec3 mirror = vec3(0.0);
     if (u.light.x >= 3.0) {
@@ -212,7 +220,7 @@ void main() {
         vec2 cell = floor(v_world.xz / u.eye.w);
         float sparkle = step(0.72, ocean_hash(cell + floor(u.light.y * 3.0) * vec2(17.0, 31.0)));
         float glare = pow(max(dot(r, u.sun.xyz), 0.0), 160.0);
-        col += u.sun_color.rgb * glare * (0.25 + 2.2 * sparkle) * sun_vis;
+        col += u.sun_color.rgb * glare * (0.25 + 2.2 * sparkle) * sun_vis * cloud_shadow(v_world) * (1.0 - u.weather.x);
         if (u.sun.y < 0.0) {
             // no moon in the sky to trace: a glint where one would stand, opposite the sun, and water that never goes black
             vec3 moon = normalize(vec3(-u.sun.x, 0.45, -u.sun.z));

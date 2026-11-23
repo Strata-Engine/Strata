@@ -53,7 +53,7 @@ void main() {
     // it is not in the light volume, and its rays would start inside the finer world under it
     bool far = !figure && r8 < 16 && nm.g > 0.5;
     if (mode == 1 || far) {
-        vec3 flat_lit = albedo * (u.sun_color.rgb * ndl * dim * ripple + sky_flat(n) * dim);
+        vec3 flat_lit = albedo * (u.sun_color.rgb * ndl * cloud_shadow(world) * dim * ripple + sky_flat(n) * dim);
         o_lit = vec4(fogged(weathered(flat_lit, albedo, n, world, normalize(u.eye.xyz - world), 1.0, figure), world), 1.0);
         return;
     }
@@ -114,6 +114,8 @@ void main() {
     // under cloud the sun's light comes from all over the sky: shadows soften and faces turned from it still get some
     float soft = 0.65 * u.weather.x;
     float sun_term = ndl * sun_vis * (1.0 - soft) + soft * (0.45 + 0.55 * max(n.y, 0.0)) * mix(0.55, 1.0, sun_vis);
+    float clouded = cloud_shadow(world);
+    sun_term *= clouded;
     vec3 col = albedo * (u.sun_color.rgb * sun_term * dim * ripple + sky * dim);
     // the lamps: gathered with their shadows where the gather pass does that (a pixel no gathered one matches takes them unshadowed);
     // else light mode 8 alone, unshadowed
@@ -128,9 +130,9 @@ void main() {
             float share = mirror_share(n, toward_eye, 0.12) * (1.0 - rough);
             col = mix(col, reflected(at + n * 0.02, mirror_dir(toward_eye, n, n), -1000000), share);
         }
-        col += sun_highlight(n, toward_eye, rough, sun_vis);
+        col += sun_highlight(n, toward_eye, rough, sun_vis * clouded);
     }
-    col = weathered(col, albedo, n, world, normalize(u.eye.xyz - world), sun_vis * (1.0 - soft), figure);
+    col = weathered(col, albedo, n, world, normalize(u.eye.xyz - world), sun_vis * (1.0 - soft) * clouded, figure);
     o_lit = vec4(fogged(col, world), 1.0);
     // light mode 5, for finding grain: lit as 4, but each pixel shows its memory: grey by how many past samples it leans on (white 64 and more),
     // red where it was made to start over this frame (an edit near it, a moving body, a moved sun), blue where a moving figure's shadow box is
