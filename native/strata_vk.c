@@ -28,7 +28,7 @@
 /* Rewritten by build_shaders.sh whenever the shaders change: forge decides
  * whether to recompile this file from its text alone, not from the headers
  * it includes (GAPS S14). */
-#define STRATA_SHADERS_STAMP "5833f6329bd1ca9b"
+#define STRATA_SHADERS_STAMP "21d4fa051cc06ec6"
 #include "strata_shaders.h"
 #include "strata_particles.h"
 #include "strata_alloc.h"
@@ -138,6 +138,7 @@ typedef struct {
     uint32_t *src_ver; uint32_t src_epoch, ntodo; int reach_used; uint32_t mask_used[8];
     uint32_t lamp_version;         /* the lamp lists this frame's copy holds */
     VkBuffer sea; VkDeviceMemory sea_mem; float *sea_map; uint32_t sea_version;   /* the sea map (binding 44), and which version of it this copy holds */
+    VkBuffer stile; VkDeviceMemory stile_mem;   /* the sea's height tile (binding 45), written by sea.comp each frame with a sea state */
     int moving_lamps;              /* whether its copy lists any moving lamp */
     uint32_t lamp_cap;             /* the cap its standing lists were laid out for */
     uint32_t *cell_ver;            /* per cell (SV_MAX_CELLS of them): the lamp version (g.cell_lamp_ver + g.lamp_version) its list was built from */
@@ -243,6 +244,7 @@ static struct {
     uint32_t src_epoch;           /* bumped when the volume is made again: every cell's sources are copied again */
     int64_t lamp_total;           /* standing lamps the cells hold */
     VkPipeline pipe_lamps;        /* lamps.comp */
+    VkPipeline pipe_sea;          /* sea.comp */
     int32_t moving_lamps[SV_MOVING_LAMPS][4];
     int lamp_pass;                 /* the gather pass gathers the lamps' light, with shadows where asked (sv_set_lamp_tracing) */
     int lamp_reach;                /* voxels a lamp's light reaches */
@@ -361,7 +363,9 @@ static struct {
 #define UBO_SEA_MAP 444        /* vec4: x0, z0 the sea map's low corner and its cell size, in metres (sv_set_sea_map) */
 #define UBO_SEA_GRID 448       /* vec4: the sea map's cells across and down (0: no map) */
 #define SV_SEA_CELLS 16384     /* the sea map's cells at most */
-#define UBO_SEA_WAVES 452      /* 9 vec4: the sea's waves (sv_set_sea): x, z a direction (unit), its wavenumber (radians a metre), its angular speed (radians a second) */
+#define SV_SEA_TILE 512        /* the sea's height tile: 512 x 512 cells of 0.5 m, 256 m square (sea.comp) */
+#define SV_SEA_TILE_M 256.0f
+#define UBO_SEA_WAVES 452      /* 9 vec4: the sea's waves (sv_set_sea): x, z its wavevector (radians a metre, whole cycles across the height tile), its wavenumber, its angular speed (radians a second) */
 #define UBO_SEA_AMPS 488       /* 3 vec4: the nine waves' shares of the sea's amplitude, in order */
 #define UBO_FLOATS 500
 #define UBO_CLOUD 180          /* vec4: x blobs, y their darkness (sv_set_cloud_shadows) */
@@ -2361,7 +2365,7 @@ int64_t sv_open_slots(int64_t w, int64_t h, int64_t capture_mouse, int64_t quad_
     g.swap_ok = 1;
 
     /* one set layout for every pipeline: 0 uniforms, 1 chunk table, 2 indirect commands, 3 cull statistics, 4 command -> slot */
-    VkDescriptorSetLayoutBinding dslb[45] = {
+    VkDescriptorSetLayoutBinding dslb[46] = {
         { .binding = 0, .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, .descriptorCount = 1,
           .stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT },
         { .binding = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1,
@@ -2429,8 +2433,10 @@ int64_t sv_open_slots(int64_t w, int64_t h, int64_t capture_mouse, int64_t quad_
         { .binding = 42, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT },
         { .binding = 43, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT },
         /* 44 the sea map: how exposed each cell of open water is to the wind (sv_set_sea_map) */
-        { .binding = 44, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT } };
-    VkDescriptorSetLayoutCreateInfo dsli = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 45, .pBindings = dslb };
+        { .binding = 44, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT },
+        /* 45 the sea's height tile: sea.comp writes it, water.frag reads it */
+        { .binding = 45, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT } };
+    VkDescriptorSetLayoutCreateInfo dsli = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 46, .pBindings = dslb };
     VKOK(vkCreateDescriptorSetLayout(g.dev, &dsli, NULL, &g.dsl), "descriptor set layout");
     /* where the call's range starts in draw_slot, and per-call flags (bit 0: cutout, bit 1: a figure);
      * a figure piece's draw adds eight words more (fig_record) */
@@ -2525,7 +2531,7 @@ int64_t sv_open_slots(int64_t w, int64_t h, int64_t capture_mouse, int64_t quad_
     g.blocks_map = map;
     memset(g.blocks_map, 0, (size_t)SV_MAX_BLOCKS * 32);
     for (uint32_t t = 0; t < 65536; t++) ((uint32_t *)g.blocks_map)[SV_TOP_OF + t] = t;
-    VkDescriptorPoolSize dps[4] = { { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, SV_FRAMES }, { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 23 * SV_FRAMES }, { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 17 * SV_FRAMES },
+    VkDescriptorPoolSize dps[4] = { { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, SV_FRAMES }, { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 24 * SV_FRAMES }, { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 17 * SV_FRAMES },
                                     { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 4 * SV_FRAMES } };
     VkDescriptorPoolCreateInfo dpi = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = SV_FRAMES, .poolSizeCount = 4, .pPoolSizes = dps };
     VKOK(vkCreateDescriptorPool(g.dev, &dpi, NULL, &g.dpool), "descriptor pool");
@@ -2552,6 +2558,8 @@ int64_t sv_open_slots(int64_t w, int64_t h, int64_t capture_mouse, int64_t quad_
         F->motion_map = map; memset(F->motion_map, 0, (size_t)g.slot_cap * SV_MOTION_WORDS * 4);
         if (!make_buffer((VkDeviceSize)SV_SEA_CELLS * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &F->sea, &F->sea_mem, &map)) return 0;
         F->sea_map = map; memset(F->sea_map, 0, (size_t)SV_SEA_CELLS * 4); F->sea_version = 0;
+        if (!make_buffer((VkDeviceSize)SV_SEA_TILE * SV_SEA_TILE * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &F->stile, &F->stile_mem, &map)) return 0;
+        memset(map, 0, (size_t)SV_SEA_TILE * SV_SEA_TILE * 4);
         if (!make_buffer((VkDeviceSize)SV_LIGHT_PER_FRAME * SV_LIGHT_WRITE_BYTES, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, &F->lstage, &F->lstage_mem, &map)) return 0;
         F->lstage_map = map;
         if (!make_buffer((VkDeviceSize)SV_TABLE_ROWS * sizeof(BodyRow), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &F->btable, &F->btable_mem, &map)) return 0;
@@ -2590,6 +2598,10 @@ int64_t sv_open_slots(int64_t w, int64_t h, int64_t capture_mouse, int64_t quad_
         VkWriteDescriptorSet sw = { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = F->dset, .dstBinding = 44, .descriptorCount = 1,
             .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &sb };
         vkUpdateDescriptorSets(g.dev, 1, &sw, 0, NULL);
+        VkDescriptorBufferInfo tb = { F->stile, 0, VK_WHOLE_SIZE };
+        VkWriteDescriptorSet tw = { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = F->dset, .dstBinding = 45, .descriptorCount = 1,
+            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &tb };
+        vkUpdateDescriptorSets(g.dev, 1, &tw, 0, NULL);
         VkDescriptorBufferInfo mb = { F->motion, 0, VK_WHOLE_SIZE };
         VkWriteDescriptorSet mw = { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = F->dset, .dstBinding = 38, .descriptorCount = 1,
             .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &mb };
@@ -2669,6 +2681,12 @@ int64_t sv_open_slots(int64_t w, int64_t h, int64_t capture_mouse, int64_t quad_
         cr = vkCreateComputePipelines(g.dev, VK_NULL_HANDLE, 1, &ci, NULL, &g.pipe_lamps);
         vkDestroyShaderModule(g.dev, cs, NULL);
         if (cr != VK_SUCCESS) { die("vkCreateComputePipelines (lamps)", (int)cr); return 0; }
+        /* and the sea's height tile */
+        cs = shader(strata_sea_comp, sizeof(strata_sea_comp));
+        ci.stage.module = cs;
+        cr = vkCreateComputePipelines(g.dev, VK_NULL_HANDLE, 1, &ci, NULL, &g.pipe_sea);
+        vkDestroyShaderModule(g.dev, cs, NULL);
+        if (cr != VK_SUCCESS) { die("vkCreateComputePipelines (sea)", (int)cr); return 0; }
     }
 
     VkCommandPoolCreateInfo cpi = { .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, .queueFamilyIndex = g.qfam };
@@ -4219,8 +4237,13 @@ void sv_set_sea(double wind_x, double wind_z, double height, double whitecaps) {
     for (int i = 0; i < 9; i++) {
         float a = ang + layer[i][2];
         float k = 6.2831853f / (lam * layer[i][0]);
-        wv[i * 4 + 0] = cosf(a); wv[i * 4 + 1] = sinf(a);
-        wv[i * 4 + 2] = k;       wv[i * 4 + 3] = sqrtf(9.81f * k);
+        /* whole cycles across the 256 m tile, so the tile repeats seamlessly */
+        float cyc = SV_SEA_TILE_M / 6.2831853f;
+        float kx = roundf(k * cosf(a) * cyc) / cyc, kz = roundf(k * sinf(a) * cyc) / cyc;
+        if (kx == 0.0f && kz == 0.0f) kx = 1.0f / cyc;
+        float kk = sqrtf(kx * kx + kz * kz);
+        wv[i * 4 + 0] = kx; wv[i * 4 + 1] = kz;
+        wv[i * 4 + 2] = kk; wv[i * 4 + 3] = sqrtf(9.81f * kk);
         am[i] = layer[i][1];
     }
 }
@@ -4539,7 +4562,8 @@ int64_t sv_frame(void) {
         memcpy(F->sea_map, g.sea_cells, (size_t)SV_SEA_CELLS * 4);
         F->sea_version = g.sea_version;
     }
-        memcpy(F->ubo_map, g.ubo_map, UBO_FLOATS * 4);
+    g.ubo_map[UBO_SEA_GRID + 2] = (g.pipe_sea && g.ubo_map[UBO_SEA + 2] > 0.0f) ? 1.0f : 0.0f;   /* sea.comp writes the height tile this frame */
+    memcpy(F->ubo_map, g.ubo_map, UBO_FLOATS * 4);
     g.churn[3] += F->npending;
     for (uint32_t i = 0; i < F->npending; i++) {
         uint32_t slot = F->pending[i];
@@ -4576,6 +4600,13 @@ int64_t sv_frame(void) {
         vkCmdDispatch(F->cmd, (F->ntodo + 63) / 64, 1, 1);
         VkMemoryBarrier lb = { .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT, .dstAccessMask = VK_ACCESS_SHADER_READ_BIT };
         vkCmdPipelineBarrier(F->cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 1, &lb, 0, NULL, 0, NULL);
+    }
+    /* the sea's height tile for this frame's time (sea.comp), before the water reads it */
+    if (g.pipe_sea && g.ubo_map[UBO_SEA + 2] > 0.0f) {
+        vkCmdBindPipeline(F->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g.pipe_sea);
+        vkCmdDispatch(F->cmd, (SV_SEA_TILE * SV_SEA_TILE + 63) / 64, 1, 1);
+        VkMemoryBarrier sbar = { .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT, .dstAccessMask = VK_ACCESS_SHADER_READ_BIT };
+        vkCmdPipelineBarrier(F->cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 1, &sbar, 0, NULL, 0, NULL);
     }
     /* particles that meet the world: what each one born since the last frame will meet, found once
      * (collide.comp), after the light volume has this frame's chunks. Nothing is bound or run in a
