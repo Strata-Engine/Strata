@@ -1,0 +1,83 @@
+// The lamp lists. One invocation per light-volume cell whose list must be
+// built again (strata_vk.c, lamps_to_frame): of the glowing voxels its own
+// chunk and the chunks round it keep, those whose light reaches its box,
+// the nearest [cap] when more do. The chunks are looked at in the order of
+// their cells and each chunk's lamps in its own order, the order the lists
+// have always been built in, which the light pass's choice among a cell's
+// lamps (and so the stored pictures) follows. strata_vk.c's lamp_ref_cell
+// is the same in C (STRATA_LAMPCHECK=1 compares the two).
+layout(local_size_x = 64) in;
+
+// per cell, as the CPU last saw it: xyz its chunk, w its lamp count, with bit 30 set while it holds a chunk
+layout(std430, set = 0, binding = 41) readonly buffer LampHeads { ivec4 head[]; } src;
+// per cell, 64 lamps: x | y << 5 | z << 10 within its chunk, the light class << 16
+layout(std430, set = 0, binding = 42) readonly buffer LampWords { uint word[]; } lamps;
+// the cells to build
+layout(std430, set = 0, binding = 43) readonly buffer LampTodo { uint cell[]; } todo;
+// what the light pass reads: per cell (first, count); and the lamps, 4 ints each (sky.glsl)
+layout(std430, set = 0, binding = 32) writeonly buffer LampCellsOut { uvec2 cells[]; } outc;
+layout(std430, set = 0, binding = 33) writeonly buffer LampListOut { ivec4 lamps[]; } outl;
+
+const int CHUNK_LAMPS = 64;
+const int LAMP_SHADOW = 1 << 26;
+
+int wrapi(int v, int n) { int m = v % n; return m < 0 ? m + n : m; }
+
+// the offset in -r..r whose wrapped coordinate is the smallest: starting there and going round, the wrapped coordinates rise
+int first_offset(int c, int r, int n) {
+    int best = -r, low = wrapi(c - r, n);
+    for (int d = -r + 1; d <= r; d++) { int w = wrapi(c + d, n); if (w < low) { low = w; best = d; } }
+    return best;
+}
+
+bool shadows(int cls) { return (u.lamp_mask[cls >> 7][(cls >> 5) & 3] & (1u << uint(cls & 31))) != 0u; }
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= uint(u.lamps.w)) return;
+    uint c = todo.cell[i];
+    uint cap = uint(u.lamps.z);
+    int reach = int(u.lamps.y);
+    ivec3 vn = u.vol.xyz;
+    ivec4 h = src.head[c];
+    uint k = 0u;
+    if ((h.w & (1 << 30)) != 0) {
+        int r = (reach + 31) >> 5, span = 2 * r + 1;
+        ivec3 d0 = ivec3(first_offset(h.x, r, vn.x), first_offset(h.y, r, vn.y), first_offset(h.z, r, vn.z));
+        int d2s[32];
+        uint far = 0u; int fd = -1;
+        for (int iz = 0; iz < span; iz++) {
+            int dz = d0.z + iz; if (dz > r) dz -= span;
+            for (int iy = 0; iy < span; iy++) {
+                int dy = d0.y + iy; if (dy > r) dy -= span;
+                for (int ix = 0; ix < span; ix++) {
+                    int dx = d0.x + ix; if (dx > r) dx -= span;
+                    ivec3 ch = h.xyz + ivec3(dx, dy, dz);
+                    uint nc = uint(wrapi(ch.x, vn.x) + vn.x * (wrapi(ch.y, vn.y) + vn.y * wrapi(ch.z, vn.z)));
+                    ivec4 nh = src.head[nc];
+                    if ((nh.w & (1 << 30)) == 0 || nh.xyz != ch) continue;
+                    int count = nh.w & 255;
+                    for (int j = 0; j < count; j++) {
+                        uint w = lamps.word[nc * uint(CHUNK_LAMPS) + uint(j)];
+                        ivec3 l = ch * 32 + ivec3(int(w & 31u), int((w >> 5) & 31u), int((w >> 10) & 31u));
+                        int cls = int((w >> 16) & 255u);
+                        // within reach along each axis of the cell's box
+                        ivec3 lo = h.xyz * 32 - reach, hi = h.xyz * 32 + 31 + reach;
+                        if (any(lessThan(l, lo)) || any(greaterThan(l, hi))) continue;
+                        ivec3 box_lo = h.xyz * 32, box_hi = box_lo + 31;
+                        ivec3 dd = max(box_lo - l, ivec3(0)) + max(l - box_hi, ivec3(0));
+                        int d2 = dd.x * dd.x + dd.y * dd.y + dd.z * dd.z;
+                        uint at;
+                        if (k < cap) at = k++;
+                        else if (d2 < fd) at = far;
+                        else continue;
+                        outl.lamps[c * cap + at] = ivec4(l, cls | (shadows(cls) ? LAMP_SHADOW : 0));
+                        d2s[at] = d2;
+                        if (k == cap) { fd = -1; for (uint q = 0u; q < cap; q++) if (d2s[q] > fd) { fd = d2s[q]; far = q; } }
+                    }
+                }
+            }
+        }
+    }
+    outc.cells[c] = uvec2(c * cap, k);
+}
