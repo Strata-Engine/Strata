@@ -10,12 +10,14 @@ layout(location = 0) in vec2 v_uv;
 
 layout(location = 0) out vec4 o_hist;
 layout(location = 1) out vec4 o_meta;
+layout(location = 2) out vec4 o_lamp;   // rgb the lamps' light, a the samples behind it (when u.lamps.x is 1)
+layout(set = 0, binding = 39) uniform sampler2D lamp_prev;
 // boxes (voxels, low and high corners) round bodies that moved this frame, then round traced figures that moved lately (strata_vk.c, fig_trace_prepare):
 // the low corner's w 1 for a figure's shadow box (the sun term alone), 0 for the rest (every term)
 layout(std430, set = 0, binding = 21) readonly buffer Movers { vec4 boxes[]; } movers;
 
 void main() {
-    o_hist = vec4(0.0); o_meta = vec4(0.0);
+    o_hist = vec4(0.0); o_meta = vec4(0.0); o_lamp = vec4(0.0);
     int s = int(u.trace.x);
     ivec2 px = ivec2(gl_FragCoord.xy);                    // this pass's pixel: the schedules and random numbers run on it
     ivec2 full = textureSize(gb_depth, 0);
@@ -113,6 +115,24 @@ void main() {
     if (rays > 0 && sky_now) {
         sky = mix(old.rgb, sky_light(at, n, px, frame, rays), full_sky ? 1.0 / (kept + 1.0) : 1.0 / (skyc + 1.0));
         skyc = min(skyc + 1.0, 64.0);
+    }
+    // The lamps' light, where it is gathered here: every lamp its cell lists, one of the shadow-casting ones by a ray (lamp_gather).
+    // Its memory is its own. Where a lamp moves it leans on 3 past samples and takes one every frame, so a headlight's pool
+    // follows the car; under standing lamps alone it settles like the sun's shadow and keeps the sun's turn.
+    if (u.lamps.x > 0.5 && u.water2.z > 0.5) {
+        ivec3 cell = wrap(ivec3(floor(at)) >> 5, u.vol.xyz);
+        uint standing = lamp_entry(cell, false).y, roving = lamp_entry(cell, true).y;
+        if (standing + roving > 0u) {
+            vec4 lold = had ? texture(lamp_prev, puv) : vec4(0.0);
+            float lc = lold.a;
+            if (settling || sky_settling) lc = min(lc, 1.0);
+            if (roving > 0u) lc = min(lc, 3.0);
+            if (!had || lc < 4.0 || settling || sky_settling || turn) {
+                bool any_moving;
+                vec3 now = lamp_gather(at, n, px, frame, any_moving);
+                o_lamp = vec4(mix(lold.rgb, now, 1.0 / (min(lc, 32.0) + 1.0)), min(lc + 1.0, 64.0));
+            } else o_lamp = lold;
+        }
     }
     o_hist = vec4(sky, sun_vis);
     o_meta = vec4(count, view_depth, float(face), mode == 5 ? (settling ? 1.0 : (shade_moves ? 2.0 : 0.0)) : skyc);

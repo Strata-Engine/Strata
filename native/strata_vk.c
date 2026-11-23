@@ -27,7 +27,7 @@
 /* Rewritten by build_shaders.sh whenever the shaders change: forge decides
  * whether to recompile this file from its text alone, not from the headers
  * it includes (GAPS S14). */
-#define STRATA_SHADERS_STAMP "6c0380c913143049"
+#define STRATA_SHADERS_STAMP "978617aa45aa5114"
 #include "strata_shaders.h"
 #include "strata_particles.h"
 #include "strata_alloc.h"
@@ -133,6 +133,10 @@ typedef struct {
     /* lamps near each cell of the light volume, for the light pass to aim at: per cell (first, count), then the list */
     VkBuffer lcells, llist; VkDeviceMemory lcells_mem, llist_mem; uint32_t *lcells_map; int32_t *llist_map;
     uint32_t lamp_version;         /* the lamp lists this frame's copy holds */
+    int moving_lamps;              /* whether its copy lists any moving lamp */
+    int64_t still_listed;          /* standing lamps listed in its copy, over all cells */
+    uint32_t lamp_cap, lamp_cursor; /* the cap its standing lists were laid out for; where the next frame's rebuilding starts */
+    uint32_t *cell_ver;            /* per cell (SV_MAX_CELLS of them): the lamp version (g.cell_lamp_ver + g.lamp_version) its list was built from */
     uint32_t *pending; uint32_t npending; unsigned char *is_pending;   /* slots changed since this Frame's table was last brought up to date */
     VkBuffer lstage; VkDeviceMemory lstage_mem; unsigned char *lstage_map;   /* this frame's light-volume writes, before they are copied in */
     VkBuffer stats; VkDeviceMemory stats_mem; uint32_t *stats_map;   /* written by the cull pass: commands per range [6], chunks, quads */
@@ -163,11 +167,14 @@ static SaAlloc g_bbytes;       /* ranges of the body class buffer, in 32-bit wor
 #define SV_MOVERS       16               /* boxes a frame where moving bodies unsettle light history */
 #define SV_MAX_CELLS    65536            /* light volume cells (chunks) the body lists can cover */
 #define SV_CHUNK_LAMPS  64               /* glowing voxels a chunk keeps for the light pass to aim at */
-#define SV_LAMP_LIST    65536            /* entries in all cells' lists of nearby lamps, together */
-#define SV_LAMP_REACH   16               /* voxels a lamp's light reaches (the light pass fades it out from 12) */
+#define SV_LAMP_LIST    1048576          /* entries in all cells' lists of nearby lamps, together: a cell's standing lamps at its index times the cap */
+#define SV_MOVING_LIST  16384            /* of those, the last ones: the moving lamps' lists, written each frame */
+#define SV_CELL_MOVING  8                /* moving lamps a cell lists at most */
+#define SV_LAMP_REACH   16               /* voxels a lamp's light reaches unless sv_set_lamp_reach says otherwise */
 #define SV_MOVING_LAMPS 1024
 #define SV_LAMP_MOVING  (1 << 24)
 #define SV_LAMP_BEAM    (1 << 25)
+#define SV_LAMP_SHADOW  (1 << 26)        /* the gather pass traces a ray to it: what stands between is in its shadow */
 #define SV_CELL_LAMPS   16               /* lamps a cell lists at most */
 
 #define SV_LOOSE_QUADS 262144  /* 16 MB of 64-byte loose quads */
@@ -200,6 +207,7 @@ static struct {
      * are written by the gather pass, one pixel for each trace_scale x
      * trace_scale block of the screen (STRATA_TRACE_FULL=1: one for each). */
     Target hist[SV_FRAMES], hmeta[SV_FRAMES];
+    Target lampm[SV_FRAMES];       /* the lamps' light the gather pass found, rgb, and a the samples behind it: its own memory, short where lamps move */
     int trace_scale; VkExtent2D trace_extent;
     /* What the translucent pass remembers between frames, one pair per frame
      * in flight, read and written by the water shader as storage images:
@@ -223,8 +231,13 @@ static struct {
     VkBuffer ltable; VkDeviceMemory ltable_mem; int32_t *ltable_map;
     float *tex_mean; uint32_t tex_mean_n;   /* each texture layer's mean colour, linear, three floats a layer */
     struct LightCell { int32_t chunk[3]; int valid; int uniform; uint32_t hash, solid, shade; int nlamps; int32_t *lamps; } *cells;   /* lamps: nlamps glowing voxels, 4 ints each (x, y, z voxels, class) */
-    uint32_t lamp_version;        /* bumped whenever the lamp lists change */
+    uint32_t lamp_version;        /* bumped when every cell's lamp list must be built again */
+    uint32_t cell_lamp_ver[SV_MAX_CELLS];   /* per cell: bumped when a lamp within reach of it changed */
     int32_t moving_lamps[SV_MOVING_LAMPS][4];
+    int lamp_pass;                 /* the gather pass gathers the lamps' light, with shadows where asked (sv_set_lamp_tracing) */
+    int lamp_reach;                /* voxels a lamp's light reaches */
+    int moving_shadows;            /* moving lamps cast shadows */
+    unsigned char lamp_shadow[256]; /* per light class: its standing lamps cast shadows */
     int moving_lamp_count, headlights;
     int vn_old_cells;             /* how many cells g.cells has */   /* per cell, as last queued: its chunk, and its class if it is one class throughout, else -1 */
     struct LightWrite { int cell[3]; int32_t chunk[3]; int valid; int uniform; int edit; unsigned char *bytes; } *lq;   /* writes waiting to be copied in, oldest first */
@@ -332,7 +345,8 @@ static struct {
 /* The uniform block, in floats (native/shaders/ubo.glsl): vp 0, sun 16,
  * sky 20, fog 24, eye 28, misc 32 (ints), inv_vp 36, prev_vp 52, light 68,
  * sun colour 72, light volume size 76 (ints). */
-#define UBO_FLOATS 160
+#define UBO_FLOATS 164
+#define UBO_LAMPS 160          /* vec4: x 1 when the gather pass gathers the lamps' light, y the voxels a lamp's light reaches */
 #define UBO_CUT 124           /* 9 vec4: the cutaway (Strata.Overlay.cut_floats) */
 #define UBO_TRACE 120         /* vec4: x screen pixels along each side of one the gather pass traces for; y the motion clock; z, w how many past samples the sun's and the sky's light may lean on (64: all) */
 #define UBO_SUN_VP 100         /* mat4: world to the figure shadow map's clip space */
@@ -400,7 +414,7 @@ static void destroy_swapchain(void) {
     g.off_fb = VK_NULL_HANDLE; g.off_view = VK_NULL_HANDLE; g.off = VK_NULL_HANDLE; g.off_mem = VK_NULL_HANDLE;
     if (g.fb_g) vkDestroyFramebuffer(g.dev, g.fb_g, NULL);
     for (int f = 0; f < SV_FRAMES; f++) { if (g.fb_l[f]) vkDestroyFramebuffer(g.dev, g.fb_l[f], NULL); g.fb_l[f] = VK_NULL_HANDLE;
-        if (g.fb_t[f]) vkDestroyFramebuffer(g.dev, g.fb_t[f], NULL); g.fb_t[f] = VK_NULL_HANDLE; drop_target(&g.hist[f]); drop_target(&g.hmeta[f]); drop_target(&g.whist[f]); drop_target(&g.wdist[f]); }
+        if (g.fb_t[f]) vkDestroyFramebuffer(g.dev, g.fb_t[f], NULL); g.fb_t[f] = VK_NULL_HANDLE; drop_target(&g.hist[f]); drop_target(&g.hmeta[f]); drop_target(&g.lampm[f]); drop_target(&g.whist[f]); drop_target(&g.wdist[f]); }
     g.fb_g = VK_NULL_HANDLE;
     drop_target(&g.gb_albedo); drop_target(&g.gb_nm); drop_target(&g.lit);
     if (g.depth_view) vkDestroyImageView(g.dev, g.depth_view, NULL);
@@ -496,6 +510,7 @@ static int make_swapchain(void) {
     for (int f = 0; f < SV_FRAMES; f++) {
         if (!make_image_sized(g.trace_extent, FMT_LIT, tu, VK_IMAGE_ASPECT_COLOR_BIT, &g.hist[f].img, &g.hist[f].mem, &g.hist[f].view)) return 0;
         if (!make_image_sized(g.trace_extent, FMT_LIT, tu, VK_IMAGE_ASPECT_COLOR_BIT, &g.hmeta[f].img, &g.hmeta[f].mem, &g.hmeta[f].view)) return 0;
+        if (!make_image_sized(g.trace_extent, FMT_LIT, tu, VK_IMAGE_ASPECT_COLOR_BIT, &g.lampm[f].img, &g.lampm[f].mem, &g.lampm[f].view)) return 0;
         VkImageUsageFlags su = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
         if (!make_image(FMT_LIT, su, VK_IMAGE_ASPECT_COLOR_BIT, &g.whist[f].img, &g.whist[f].mem, &g.whist[f].view)) return 0;
         if (!make_image(VK_FORMAT_R32_SFLOAT, su, VK_IMAGE_ASPECT_COLOR_BIT, &g.wdist[f].img, &g.wdist[f].mem, &g.wdist[f].view)) return 0;
@@ -540,6 +555,15 @@ static void bind_targets(void) {
             cw[b] = (VkWriteDescriptorSet){ .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = g.frames[f].dset, .dstBinding = 35 + b, .descriptorCount = 1,
                 .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .pImageInfo = &ci[b] };
         vkUpdateDescriptorSets(g.dev, 2, cw, 0, NULL);
+        /* the lamps' light: the other frame's to remember (39), this frame's for its light pass (40) */
+        VkDescriptorImageInfo li2[2] = {
+            { g.nearest, g.lampm[o].view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL },
+            { g.nearest, g.lampm[f].view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL } };
+        VkWriteDescriptorSet lw3[2];
+        for (uint32_t b = 0; b < 2; b++)
+            lw3[b] = (VkWriteDescriptorSet){ .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = g.frames[f].dset, .dstBinding = 39 + b, .descriptorCount = 1,
+                .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .pImageInfo = &li2[b] };
+        vkUpdateDescriptorSets(g.dev, 2, lw3, 0, NULL);
         /* the water's memory: the other frame's to read, this frame's to write */
         VkDescriptorImageInfo wi[4] = {
             { VK_NULL_HANDLE, g.whist[o].view, VK_IMAGE_LAYOUT_GENERAL }, { VK_NULL_HANDLE, g.wdist[o].view, VK_IMAGE_LAYOUT_GENERAL },
@@ -571,8 +595,8 @@ static int make_framebuffers(void) {
         .pAttachments = ga, .width = g.extent.width, .height = g.extent.height, .layers = 1 };
     VKOK(vkCreateFramebuffer(g.dev, &gi, NULL, &g.fb_g), "geometry framebuffer");
     for (int f = 0; f < SV_FRAMES; f++) {
-        VkImageView ta[2] = { g.hist[f].view, g.hmeta[f].view };
-        VkFramebufferCreateInfo ti = { .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO, .renderPass = g.pass_t, .attachmentCount = 2,
+        VkImageView ta[3] = { g.hist[f].view, g.hmeta[f].view, g.lampm[f].view };
+        VkFramebufferCreateInfo ti = { .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO, .renderPass = g.pass_t, .attachmentCount = 3,
             .pAttachments = ta, .width = g.trace_extent.width, .height = g.trace_extent.height, .layers = 1 };
         VKOK(vkCreateFramebuffer(g.dev, &ti, NULL, &g.fb_t[f]), "gather framebuffer");
         VkFramebufferCreateInfo li = { .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO, .renderPass = g.pass_l, .attachmentCount = 1,
@@ -745,7 +769,7 @@ static int make_pipeline(int kind, VkPipeline *out) {
         .srcAlphaBlendFactor = glow ? VK_BLEND_FACTOR_ZERO : VK_BLEND_FACTOR_ONE, .dstAlphaBlendFactor = glow ? VK_BLEND_FACTOR_ONE : VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA, .alphaBlendOp = VK_BLEND_OP_ADD,
         .colorWriteMask = 0xF };
     cba[1] = cba[0]; cba[2] = cba[0];
-    VkPipelineColorBlendStateCreateInfo cb = { .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO, .attachmentCount = (geom || kind == 10) ? 2 : 1, .pAttachments = cba };
+    VkPipelineColorBlendStateCreateInfo cb = { .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO, .attachmentCount = kind == 10 ? 3 : geom ? 2 : 1, .pAttachments = cba };
     VkDynamicState dyn[2] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
     VkPipelineDynamicStateCreateInfo dsi = { .sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, .dynamicStateCount = 2, .pDynamicStates = dyn };
     VkGraphicsPipelineCreateInfo pi = { .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, .stageCount = 2, .pStages = stages,
@@ -1193,6 +1217,17 @@ static struct LightCell *cell_of(const int32_t *chunk, int *cell) {
     return &g.cells[cell[0] + g.vn * (cell[1] + g.vnv * cell[2])];
 }
 
+/* The lamps of [chunk] changed: every cell within the lamps' reach of it lists them again (lamps_to_frame). */
+static void lamps_dirty(const int32_t *chunk) {
+    if (!g.cells || g.vn <= 0 || g.vnv <= 0) return;
+    int r = (g.lamp_reach + 31) >> 5;
+    for (int dz = -r; dz <= r; dz++) for (int dy = -r; dy <= r; dy++) for (int dx = -r; dx <= r; dx++) {
+        int cx = wrapi(chunk[0] + dx, g.vn), cy = wrapi(chunk[1] + dy, g.vnv), cz = wrapi(chunk[2] + dz, g.vn);
+        uint32_t i = (uint32_t)(cx + g.vn * (cy + g.vnv * cz));
+        if (i < SV_MAX_CELLS) g.cell_lamp_ver[i]++;
+    }
+}
+
 /* Queue a write of one chunk's worth of the volume: [bytes] (32768, taken
  * over by the queue) or, when bytes is NULL, [uniform] throughout. valid 0
  * marks the cell as holding no chunk. Copied in at the start of a frame. */
@@ -1246,7 +1281,7 @@ static void light_queue(const int32_t *chunk, int valid, int uniform, unsigned c
         if (nf != c->nlamps || (nf && memcmp(found, c->lamps, (size_t)nf * 16) != 0)) {
             free(c->lamps); c->lamps = NULL; c->nlamps = 0;
             if (nf) { c->lamps = malloc((size_t)nf * 16); if (c->lamps) { memcpy(c->lamps, found, (size_t)nf * 16); c->nlamps = nf; } }
-            g.lamp_version++;
+            lamps_dirty(chunk);
         }
     }
     /* new voxels for a chunk the volume already held: an edit, whose lighting must be re-estimated.
@@ -1262,6 +1297,8 @@ static void light_queue(const int32_t *chunk, int valid, int uniform, unsigned c
     w->cell[0] = cell[0]; w->cell[1] = cell[1]; w->cell[2] = cell[2];
     w->chunk[0] = chunk[0]; w->chunk[1] = chunk[1]; w->chunk[2] = chunk[2];
     w->valid = valid; w->uniform = bytes ? -1 : uniform; w->bytes = bytes; w->edit = edit;
+    /* a cell that takes another chunk, or gains or loses one, lists other lamps */
+    if (!same_owner || valid != c->valid) g.cell_lamp_ver[cell[0] + g.vn * (cell[1] + g.vnv * cell[2])]++;
     c->chunk[0] = chunk[0]; c->chunk[1] = chunk[1]; c->chunk[2] = chunk[2];
     c->valid = valid; c->uniform = w->uniform; c->hash = hash; c->solid = solid; c->shade = shade;
 }
@@ -2183,7 +2220,7 @@ int64_t sv_open_slots(int64_t w, int64_t h, int64_t capture_mouse, int64_t quad_
     if (!make_swapchain()) return 0;
     if (!make_render_pass(VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, &g.pass)) return 0;
     if (!make_render_pass(VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, &g.pass_off)) return 0;
-    if (!make_pass_g() || !make_pass_l(2, &g.pass_t) || !make_pass_l(1, &g.pass_l)) return 0;
+    if (!make_pass_g() || !make_pass_l(3, &g.pass_t) || !make_pass_l(1, &g.pass_l)) return 0;
     VkSamplerCreateInfo nsi = { .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO, .magFilter = VK_FILTER_NEAREST, .minFilter = VK_FILTER_NEAREST,
         .mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST, .addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
         .addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, .addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE };
@@ -2192,7 +2229,7 @@ int64_t sv_open_slots(int64_t w, int64_t h, int64_t capture_mouse, int64_t quad_
     g.swap_ok = 1;
 
     /* one set layout for every pipeline: 0 uniforms, 1 chunk table, 2 indirect commands, 3 cull statistics, 4 command -> slot */
-    VkDescriptorSetLayoutBinding dslb[39] = {
+    VkDescriptorSetLayoutBinding dslb[41] = {
         { .binding = 0, .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, .descriptorCount = 1,
           .stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT },
         { .binding = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1,
@@ -2251,8 +2288,11 @@ int64_t sv_open_slots(int64_t w, int64_t h, int64_t capture_mouse, int64_t quad_
         /* 37 the particles' ring, for the pass that looks for what each new particle will meet (collide.comp) */
         { .binding = 37, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT },
         /* 38 the motion records of moving batched slots */
-        { .binding = 38, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_VERTEX_BIT } };
-    VkDescriptorSetLayoutCreateInfo dsli = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 39, .pBindings = dslb };
+        { .binding = 38, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_VERTEX_BIT },
+        /* 39 and 40 the lamps' light: last frame's for the gather pass, this frame's for the light pass */
+        { .binding = 39, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT },
+        { .binding = 40, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT } };
+    VkDescriptorSetLayoutCreateInfo dsli = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 41, .pBindings = dslb };
     VKOK(vkCreateDescriptorSetLayout(g.dev, &dsli, NULL, &g.dsl), "descriptor set layout");
     /* where the call's range starts in draw_slot, and per-call flags (bit 0: cutout, bit 1: a figure);
      * a figure piece's draw adds eight words more (fig_record) */
@@ -2300,7 +2340,7 @@ int64_t sv_open_slots(int64_t w, int64_t h, int64_t capture_mouse, int64_t quad_
     if (!make_buffer((VkDeviceSize)g.quad_cap * 8, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &g.giga, &g.giga_mem, &map)) return 0;
     g.giga_map = map;
     g.ubo_map = calloc(UBO_FLOATS, sizeof(float));
-    g.sky_rays = 2; g.reflections = 1; g.light_mode = 4;
+    g.sky_rays = 2; g.reflections = 1; g.light_mode = 4; g.lamp_reach = SV_LAMP_REACH;
     for (int k = 0; k < 4; k++) g.sun_caps[k] = 64.0f;
     for (int k = 0; k < 16; k++) g.sky_caps[k] = 64.0f;
     if (g.ubo_map) {
@@ -2347,7 +2387,7 @@ int64_t sv_open_slots(int64_t w, int64_t h, int64_t capture_mouse, int64_t quad_
     g.blocks_map = map;
     memset(g.blocks_map, 0, (size_t)SV_MAX_BLOCKS * 32);
     for (uint32_t t = 0; t < 65536; t++) ((uint32_t *)g.blocks_map)[SV_TOP_OF + t] = t;
-    VkDescriptorPoolSize dps[4] = { { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, SV_FRAMES }, { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 19 * SV_FRAMES }, { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 15 * SV_FRAMES },
+    VkDescriptorPoolSize dps[4] = { { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, SV_FRAMES }, { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 19 * SV_FRAMES }, { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 17 * SV_FRAMES },
                                     { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 4 * SV_FRAMES } };
     VkDescriptorPoolCreateInfo dpi = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = SV_FRAMES, .poolSizeCount = 4, .pPoolSizes = dps };
     VKOK(vkCreateDescriptorPool(g.dev, &dpi, NULL, &g.dpool), "descriptor pool");
@@ -2382,10 +2422,13 @@ int64_t sv_open_slots(int64_t w, int64_t h, int64_t capture_mouse, int64_t quad_
         F->blist_map = map;
         if (!make_buffer((VkDeviceSize)(SV_MOVERS + SV_FIG_BOXES) * 32, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &F->bmovers, &F->bmovers_mem, &map)) return 0;
         F->bmovers_map = map; memset(F->bmovers_map, 0, (SV_MOVERS + SV_FIG_BOXES) * 32);
-        if (!make_buffer((VkDeviceSize)SV_MAX_CELLS * 8, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &F->lcells, &F->lcells_mem, &map)) return 0;
-        F->lcells_map = map; memset(F->lcells_map, 0, (size_t)SV_MAX_CELLS * 8);
+        /* two entries a cell: its standing lamps' list, then (from the cell count on) its moving lamps' */
+        if (!make_buffer((VkDeviceSize)SV_MAX_CELLS * 16, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &F->lcells, &F->lcells_mem, &map)) return 0;
+        F->lcells_map = map; memset(F->lcells_map, 0, (size_t)SV_MAX_CELLS * 16);
         if (!make_buffer((VkDeviceSize)SV_LAMP_LIST * 16, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &F->llist, &F->llist_mem, &map)) return 0;
-        F->llist_map = map; F->lamp_version = (uint32_t)-1;
+        F->llist_map = map; F->lamp_version = (uint32_t)-1; F->lamp_cap = 0;
+        if (!F->cell_ver) F->cell_ver = calloc(SV_MAX_CELLS, sizeof *F->cell_ver);
+        if (!F->cell_ver) return 0;
         F->pending = calloc(g.slot_cap, sizeof *F->pending);
         F->is_pending = calloc(g.slot_cap, 1);
         if (!F->pending || !F->is_pending) return 0;
@@ -3251,15 +3294,15 @@ double sv_footprint_bound(int64_t set, int64_t index, int64_t which) {
     }
 }
 
-/* Immediate, unshadowed lights. A new batch replaces the previous frame's batch. */
+/* Immediate lights: unshadowed in light mode 8, and with shadows where the gather pass gathers lamps and
+ * sv_set_lamp_tracing asked for theirs. A new batch replaces the previous frame's batch. */
 void sv_moving_lights_begin(int64_t headlights) {
-    if (g.moving_lamp_count) g.lamp_version++;
     g.moving_lamp_count = 0;
     g.headlights = headlights != 0;
 }
 
 static void moving_lamp(double x, double y, double z, int64_t cls, int flags) {
-    if (g.light_mode != 8 || cls <= 0 || cls > 255 || g.moving_lamp_count >= SV_MOVING_LAMPS) return;
+    if (!(g.light_mode == 8 || g.lamp_pass) || cls <= 0 || cls > 255 || g.moving_lamp_count >= SV_MOVING_LAMPS) return;
     /* Store positions to an eighth of a voxel to keep moving beams smooth. */
     if (!isfinite(x) || !isfinite(y) || !isfinite(z) ||
         fabs(x) > 1000000 || fabs(y) > 1000000 || fabs(z) > 1000000) return;
@@ -3268,7 +3311,6 @@ static void moving_lamp(double x, double y, double z, int64_t cls, int flags) {
     lamp[1] = (int32_t)lround(y * 8.0);
     lamp[2] = (int32_t)lround(z * 8.0);
     lamp[3] = (int32_t)cls | SV_LAMP_MOVING | flags;
-    if (g.moving_lamp_count == 1) g.lamp_version++;
 }
 
 int64_t sv_headlight(double x, double y, double z, double dx, double dz, int64_t cls) {
@@ -3285,95 +3327,150 @@ void sv_beacon(double x, double y, double z, int64_t cls) {
     moving_lamp(x, y, z, cls, 0);
 }
 
-/* lamp_keep for a stationary lamp in a list that may also hold moving ones:
- * past the cap it replaces only the farthest stationary lamp, so a vehicle's
- * light (its position in eighths of a voxel) is never weighed as a voxel's. */
-static void lamp_keep_still(int32_t *list, uint32_t *k, uint32_t cap, const int32_t *l, int cx, int cy, int cz) {
-    if (*k < cap) { lamp_keep(list, k, cap, l, cx, cy, cz); return; }
-    uint32_t far = cap; int64_t fd = -1;
-    for (uint32_t i = 0; i < cap; i++) {
-        if (list[i * 4 + 3] & SV_LAMP_MOVING) continue;
-        int64_t d = lamp_cell_d2(list + i * 4, cx, cy, cz);
-        if (d > fd) { fd = d; far = i; }
-    }
-    if (far < cap && lamp_cell_d2(l, cx, cy, cz) < fd)
-        for (int a = 0; a < 4; a++) list[far * 4 + a] = l[a];
-}
-
-/* List a lamp for each cell whose chunk comes within SV_LAMP_REACH voxels of
- * it; pass 0 counts, pass 1 writes. Moving lamps are listed first and take at
- * most half a cell's list, keeping space for stationary lamps on streets
- * packed with vehicles. Past the cap a cell keeps its nearest stationary
- * lamps (strata_lamps.h): a cell never loses its own lamp to its neighbours'
- * (scene 17's post did, to generated ones). */
-static void list_lamp(Frame *F, const int32_t *lamp, int pass, int moving) {
-    int lo[3], hi[3];
-    for (int a = 0; a < 3; a++) {
-        int voxel = moving ? lamp[a] >> 3 : lamp[a];
-        lo[a] = (voxel - SV_LAMP_REACH) >> 5;
-        hi[a] = (voxel + SV_LAMP_REACH) >> 5;
-    }
-    for (int z = lo[2]; z <= hi[2]; z++) {
-        for (int y = lo[1]; y <= hi[1]; y++) {
-            for (int x = lo[0]; x <= hi[0]; x++) {
-                int cell = wrapi(x, g.vn) + g.vn * (wrapi(y, g.vnv) + g.vnv * wrapi(z, g.vn));
-                uint32_t *entry = F->lcells_map + cell * 2;
-                if (moving) {
-                    if (entry[1] >= SV_CELL_LAMPS / 2) continue;
-                    if (pass == 0) { entry[1]++; continue; }
-                    if (entry[0] + entry[1] >= SV_LAMP_LIST) continue;
-                    memcpy(F->llist_map + (entry[0] + entry[1]) * 4, lamp, 16);
-                    entry[1]++;
-                    continue;
-                }
-                if (pass == 0) { entry[1]++; continue; }
-                uint32_t k = entry[1];
-                if (entry[0] + (k < SV_CELL_LAMPS ? k : SV_CELL_LAMPS - 1) >= SV_LAMP_LIST) continue;
-                lamp_keep_still(F->llist_map + entry[0] * 4, &k, SV_CELL_LAMPS, lamp, x, y, z);
-                entry[1] = k;
+/* A cell's standing lamps, into this frame's copy: of the glowing voxels its
+ * own chunk and the chunks round it keep, those whose light reaches its box,
+ * the nearest [cap] when more do (so a cell never loses its own lamp to its
+ * neighbours'). Its list is at its index times the cap. Returns
+ * how many it lists; [work] counts the lamps looked at. */
+static uint32_t lamps_for_cell(Frame *F, uint32_t c, uint32_t cap, int64_t *work) {
+    struct LightCell *lc = &g.cells[c];
+    int32_t *list = F->llist_map + (size_t)c * cap * 4;
+    int64_t d2s[2 * SV_CELL_LAMPS];
+    uint32_t k = 0, far = 0; int64_t fd = -1;
+    if (lc->valid) {
+        /* the chunks round it that the volume holds, in the order of their cells: the order lamps were always listed in,
+         * which the light pass's choice among a cell's lamps (and so the stored pictures) follows */
+        int r = (g.lamp_reach + 31) >> 5, nn = 0;
+        static uint32_t near[1331];
+        for (int dz = -r; dz <= r; dz++) for (int dy = -r; dy <= r; dy++) for (int dx = -r; dx <= r; dx++) {
+            int32_t ch[3] = { lc->chunk[0] + dx, lc->chunk[1] + dy, lc->chunk[2] + dz }; int cell[3];
+            struct LightCell *n = cell_of(ch, cell);
+            if (!n->valid || n->nlamps == 0 || n->chunk[0] != ch[0] || n->chunk[1] != ch[1] || n->chunk[2] != ch[2] || nn >= 1331) continue;
+            uint32_t idx = (uint32_t)(n - g.cells); int at = nn++;
+            while (at > 0 && near[at - 1] > idx) { near[at] = near[at - 1]; at--; }
+            near[at] = idx;
+        }
+        for (int q = 0; q < nn; q++) {
+            struct LightCell *n = &g.cells[near[q]];
+            *work += n->nlamps;
+            for (int i = 0; i < n->nlamps; i++) {
+                const int32_t *l = n->lamps + i * 4;
+                /* within reach along each axis of the cell's box, as a lamp's reach has always been taken for listing */
+                int out = 0;
+                for (int a = 0; a < 3; a++) { int64_t lo = (int64_t)lc->chunk[a] * 32 - g.lamp_reach, hi = (int64_t)lc->chunk[a] * 32 + 31 + g.lamp_reach; if (l[a] < lo || l[a] > hi) out = 1; }
+                if (out) continue;
+                int64_t d2 = lamp_cell_d2(l, lc->chunk[0], lc->chunk[1], lc->chunk[2]);
+                uint32_t at;
+                if (k < cap) at = k++;
+                else if (d2 < fd) at = far;
+                else continue;
+                list[at * 4] = l[0]; list[at * 4 + 1] = l[1]; list[at * 4 + 2] = l[2];
+                list[at * 4 + 3] = l[3] | (g.lamp_shadow[l[3] & 255] ? SV_LAMP_SHADOW : 0);
+                d2s[at] = d2;
+                if (k == cap) { fd = -1; for (uint32_t j = 0; j < cap; j++) if (d2s[j] > fd) { fd = d2s[j]; far = j; } }
             }
         }
     }
+    F->lcells_map[c * 2] = c * cap; F->lcells_map[c * 2 + 1] = k;
+    return k;
 }
 
-/* The lamps near each cell of the light volume, into this frame's copy when
- * they have changed: every glowing voxel a chunk keeps is listed for each
- * cell whose chunk comes within SV_LAMP_REACH voxels of it, at most
- * SV_CELL_LAMPS a cell, the nearest when more can reach it (strata_lamps.h),
- * so a point finds every lamp whose light reaches it while a cell has room. */
+/* List a moving lamp for each cell whose chunk comes within the lamps' reach
+ * of it, at most SV_CELL_MOVING a cell; pass 0 counts, pass 1 writes. */
+static void list_moving_lamp(Frame *F, const int32_t *lamp, int pass) {
+    int lo[3], hi[3];
+    uint32_t ncells = (uint32_t)(g.vn * g.vn * g.vnv);
+    int32_t l[4] = { lamp[0], lamp[1], lamp[2], lamp[3] | (g.moving_shadows ? SV_LAMP_SHADOW : 0) };
+    for (int a = 0; a < 3; a++) {
+        int voxel = lamp[a] >> 3;
+        lo[a] = (voxel - g.lamp_reach) >> 5;
+        hi[a] = (voxel + g.lamp_reach) >> 5;
+    }
+    for (int z = lo[2]; z <= hi[2]; z++) for (int y = lo[1]; y <= hi[1]; y++) for (int x = lo[0]; x <= hi[0]; x++) {
+        uint32_t cell = (uint32_t)(wrapi(x, g.vn) + g.vn * (wrapi(y, g.vnv) + g.vnv * wrapi(z, g.vn)));
+        uint32_t *entry = F->lcells_map + (ncells + cell) * 2;
+        if (entry[1] >= SV_CELL_MOVING) continue;
+        if (pass == 0) { entry[1]++; continue; }
+        if (entry[0] + entry[1] >= SV_LAMP_LIST) continue;
+        memcpy(F->llist_map + (entry[0] + entry[1]) * 4, l, 16);
+        entry[1]++;
+    }
+}
+
+/* The lamps near each cell of the light volume, into this frame's copy. A
+ * cell's standing lamps are listed again when a lamp within reach of it has
+ * changed (lamps_dirty) or a setting has; a frame looks at no more than a few
+ * million lamps, and the cells left over wait for the next, so lights that
+ * come on across a town do not hold a frame up. The moving lamps are listed
+ * each frame there are any. */
 static void lamps_to_frame(Frame *F) {
-    float *wt = g.ubo_map + UBO_WATER;
+    float *wt = g.ubo_map + UBO_WATER, *lu = g.ubo_map + UBO_LAMPS;
     const char *enabled = getenv("STRATA_LAMPS");
     wt[6] = 0.0f;
+    lu[0] = g.lamp_pass ? 1.0f : 0.0f; lu[1] = (float)g.lamp_reach; lu[2] = lu[3] = 0.0f;
     if ((enabled && *enabled == '0') || !g.cells || g.vn <= 0 || g.vnv <= 0) return;
     uint32_t ncells = (uint32_t)(g.vn * g.vn * g.vnv);
     if (ncells > SV_MAX_CELLS) return;
-    if (F->lamp_version != g.lamp_version) {
-        memset(F->lcells_map, 0, (size_t)ncells * 8);
-        for (int pass = 0; pass < 2; pass++) {
+    uint32_t cap = g.lamp_pass ? 2 * SV_CELL_LAMPS : SV_CELL_LAMPS;
+    while (cap > 1 && (uint64_t)ncells * cap > SV_LAMP_LIST - SV_MOVING_LIST) cap /= 2;
+    if (F->lamp_cap != cap) {   /* laid out for another cap: every list is built again */
+        for (uint32_t c = 0; c < ncells; c++) { F->lcells_map[c * 2 + 1] = 0; F->cell_ver[c] = g.cell_lamp_ver[c] + g.lamp_version - 1; }
+        F->still_listed = 0; F->lamp_cap = cap;
+    }
+    int64_t work = 0; uint32_t built = 0, waiting = 0;
+    for (uint32_t n = 0; n < ncells; n++) {
+        uint32_t c = (F->lamp_cursor + n) % ncells, want = g.cell_lamp_ver[c] + g.lamp_version;
+        if (F->cell_ver[c] == want) continue;
+        if (work > 3000000) { if (!waiting) F->lamp_cursor = c; waiting++; continue; }
+        F->still_listed -= F->lcells_map[c * 2 + 1];
+        F->still_listed += lamps_for_cell(F, c, cap, &work);
+        F->cell_ver[c] = want; built++;
+    }
+    if (built && getenv("STRATA_LAMPLOG")) {
+        int by[256] = { 0 }, total = 0;
+        for (uint32_t c = 0; c < ncells; c++) { struct LightCell *lc = &g.cells[c]; if (!lc->valid) continue; for (int i = 0; i < lc->nlamps; i++) { by[lc->lamps[i * 4 + 3] & 255]++; total++; } }
+        fprintf(stderr, "lamps: %d standing (class 27: %d, 28: %d, 29: %d), %u cells listed again (%lld lamps looked at), %u waiting, %lld listed in all, cap %u, reach %d, moving %d\n",
+            total, by[27], by[28], by[29], built, (long long)work, waiting, (long long)F->still_listed, cap, g.lamp_reach, g.moving_lamp_count);
+    }
+    int nm = (g.light_mode == 8 || g.lamp_pass) ? g.moving_lamp_count : 0;
+    if (nm > 0 || F->moving_lamps) {
+        uint32_t *mc = F->lcells_map + (size_t)ncells * 2;
+        memset(mc, 0, (size_t)ncells * 8);
+        for (int pass = 0; pass < 2 && nm > 0; pass++) {
             if (pass == 1) {
-                uint32_t at = 0;
-                for (uint32_t c = 0; c < ncells; c++) {
-                    uint32_t *entry = F->lcells_map + c * 2;
-                    entry[0] = at;
-                    at += entry[1] < SV_CELL_LAMPS ? entry[1] : SV_CELL_LAMPS;
-                    entry[1] = 0;
-                }
+                uint32_t at = SV_LAMP_LIST - SV_MOVING_LIST;
+                for (uint32_t c = 0; c < ncells; c++) { mc[c * 2] = at; at += mc[c * 2 + 1]; mc[c * 2 + 1] = 0; }
             }
-            if (g.light_mode == 8) {
-                for (int i = 0; i < g.moving_lamp_count; i++) list_lamp(F, g.moving_lamps[i], pass, 1);
-            }
-            for (uint32_t c = 0; c < ncells; c++) {
-                struct LightCell *lc = &g.cells[c];
-                if (!lc->valid) continue;
-                for (int i = 0; i < lc->nlamps; i++) list_lamp(F, lc->lamps + i * 4, pass, 0);
-            }
+            for (int i = 0; i < nm; i++) list_moving_lamp(F, g.moving_lamps[i], pass);
         }
-        F->lamp_version = g.lamp_version;
+        F->moving_lamps = nm > 0;
     }
-    for (uint32_t c = 0; c < ncells; c++) {
-        if (F->lcells_map[c * 2 + 1]) { wt[6] = 1.0f; break; }
-    }
+    if (F->still_listed > 0 || F->moving_lamps) wt[6] = 1.0f;
+}
+
+/* Lamp light with shadows. [on]: the gather pass gathers the lamps' light (in
+ * any light mode from 2 up) and keeps its own memory of it, short where lamps
+ * move; the lamps asked for with sv_set_lamp_shadow, and the moving ones when
+ * [moving_shadows], each get a ray, so what stands between is in shadow. Off
+ * (the default): lamps light as before (mode 8 without shadows, the traced
+ * modes by a ray inside the sky light's sample). Traced, a cell lists twice
+ * as many standing lamps. */
+void sv_set_lamp_tracing(int64_t on, int64_t moving_shadows) {
+    int was = g.lamp_pass, wasm = g.moving_shadows;
+    g.lamp_pass = on != 0; g.moving_shadows = moving_shadows != 0;
+    if (was != g.lamp_pass || wasm != g.moving_shadows) { g.lamp_version++; g.hist_reset = SV_FRAMES; }
+}
+/* Whether light class [cls]'s standing lamps cast shadows while lamp tracing is on. */
+void sv_set_lamp_shadow(int64_t cls, int64_t on) {
+    if (cls < 0 || cls > 255 || g.lamp_shadow[cls] == (on != 0)) return;
+    g.lamp_shadow[cls] = on != 0; g.lamp_version++;
+}
+int64_t sv_lamp_shadow(int64_t cls) { return cls >= 0 && cls <= 255 && g.lamp_pass && g.lamp_shadow[cls]; }
+/* How far a lamp's light reaches, in voxels (8..128; 16 unless set). */
+void sv_set_lamp_reach(int64_t voxels) {
+    int r = voxels < 8 ? 8 : (voxels > 128 ? 128 : (int)voxels);
+    if (r == g.lamp_reach) return;
+    g.lamp_reach = r; g.lamp_version++;
 }
 
 /* Begin uploading one part of a body (a 32-cubed piece of its grid) into

@@ -6,41 +6,14 @@ layout(location = 0) out vec4 o_lit;
 // what the gather pass wrote this frame (gather.frag): rgb sky light, a sun visibility; and r samples, g view depth, b face, a its state
 layout(set = 0, binding = 35) uniform sampler2D hist_cur;
 layout(set = 0, binding = 36) uniform sampler2D hmeta_cur;
+// the lamps' light the gather pass gathered this frame, when it does (u.lamps.x)
+layout(set = 0, binding = 40) uniform sampler2D lamp_cur;
 
 // A colour for a light class, for looking at the volume.
 vec3 class_tint(uint c) {
     vec3 p = fract(vec3(float(c)) * vec3(0.1031, 0.1030, 0.0973) + vec3(0.33, 0.71, 0.19));
     p += dot(p, p.yzx + 33.33);
     return 0.25 + 0.75 * fract((p.xxy + p.yzz) * p.zyx);
-}
-
-// Mode 8 uses the same local lamp lists as traced lighting, with analytic
-// falloff and no visibility rays. The lists bound the work per pixel.
-vec3 direct_lamps(vec3 at, vec3 normal) {
-    ivec3 cell = wrap(ivec3(floor(at)) >> 5, u.vol.xyz);
-    uvec2 entry = lamp_cells.cells[cell.x + u.vol.x * (cell.y + u.vol.y * cell.z)];
-    vec3 light = vec3(0.0);
-    for (uint i = 0u; i < entry.y; ++i) {
-        ivec4 lamp = lamp_list.lamps[entry.x + i];
-        bool moving = (lamp.w & (1 << 24)) != 0;
-        bool beam = (lamp.w & (1 << 25)) != 0;
-        vec3 position = moving ? vec3(lamp.xyz) * 0.125 : vec3(lamp.xyz) + 0.5;
-        vec3 to_lamp = position - at;
-        float distance2 = dot(to_lamp, to_lamp);
-        float facing = dot(normal, to_lamp);
-        if (distance2 >= 256.0 || facing <= 0.0) continue;
-        float inverse_distance = inversesqrt(max(distance2, 0.25));
-        float cone = 1.0;
-        if (beam) {
-            vec2 heading = (vec2((lamp.w >> 8) & 255, (lamp.w >> 16) & 255) - 128.0) / 127.0;
-            vec3 aim = vec3(heading.x * 0.97, -0.24, heading.y * 0.97);
-            cone = smoothstep(0.70, 0.94, dot(aim, -to_lamp) * inverse_distance);
-        }
-        float power = moving ? (beam ? 140.0 : 48.0) : 140.0;
-        float falloff = (1.0 - smoothstep(64.0, 256.0, distance2)) * power / (distance2 + 16.0);
-        light += class_emission(uint(lamp.w & 255)) * facing * inverse_distance * falloff * cone;
-    }
-    return light;
 }
 
 void main() {
@@ -94,6 +67,8 @@ void main() {
     // which spreads each one's few samples over the screen pixels it stands for and its neighbours'
     int r = s > 1.0 ? 1 : 0;
     vec4 acc = vec4(0.0); float wsum = 0.0; vec4 meta = vec4(0.0); float wbest = 0.0;
+    bool lamps_gathered = u.lamps.x > 0.5 && u.water2.z > 0.5;
+    vec3 lacc = vec3(0.0);
     for (int dy = -r; dy <= r; dy++)
         for (int dx = -r; dx <= r; dx++) {
             ivec2 hq = clamp(hc + ivec2(dx, dy), ivec2(0), hsize - 1);
@@ -103,6 +78,7 @@ void main() {
             vec4 m = texelFetch(hmeta_cur, hq, 0);
             if (m.g <= 0.0 || int(m.b + 0.5) != face || abs(m.g - view_depth) > 0.03 * view_depth + 0.05) continue;
             acc += wb * texelFetch(hist_cur, hq, 0); wsum += wb;
+            if (lamps_gathered) lacc += wb * texelFetch(lamp_cur, hq, 0).rgb;
             if (wb > wbest) { wbest = wb; meta = m; }
         }
     // none: a face thinner than a gathered pixel; look two further out, at any distance along the same face's plane
@@ -114,6 +90,7 @@ void main() {
                 if (m.g <= 0.0 || int(m.b + 0.5) != face || abs(m.g - view_depth) > 0.1 * view_depth + 0.5) continue;
                 float wb = 1.0 / (1.0 + float(dx * dx + dy * dy));
                 acc += wb * texelFetch(hist_cur, hq, 0); wsum += wb;
+                if (lamps_gathered) lacc += wb * texelFetch(lamp_cur, hq, 0).rgb;
                 if (wb > wbest) { wbest = wb; meta = m; }
             }
     int rays = mode >= 4 && mode != 8 ? int(abs(u.light.w)) : 0;   // mode 8 lights by direct_lamps, without rays
@@ -131,7 +108,10 @@ void main() {
     uint cls = figure ? 0u : uint(nm.b * 255.0 + 0.5);
     if (cls == 0u && !figure) cls = class_at(at - n * 0.01);
     vec3 col = albedo * (u.sun_color.rgb * ndl * sun_vis * dim * ripple + sky * dim);
-    if (mode == 8 && u.water2.z > 0.5) col += albedo * direct_lamps(at, n) * dim;
+    // the lamps: gathered with their shadows where the gather pass does that (a pixel no gathered one matches takes them unshadowed);
+    // else light mode 8 alone, unshadowed
+    if (lamps_gathered) col += albedo * (wsum > 0.0 ? lacc / wsum : lamps_unshadowed(at, n)) * dim;
+    else if (mode == 8 && u.water2.z > 0.5) col += albedo * lamps_unshadowed(at, n) * dim;
     if (mode >= 4) col += figure ? albedo * (float(fcode & 63) / 63.0) * GLOW : albedo * class_emission(cls) * GLOW;
     if (mode >= 3) {
         // the sun's highlight on anything not fully rough; a mirror ray for what is smooth

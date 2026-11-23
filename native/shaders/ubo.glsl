@@ -21,6 +21,7 @@ layout(set = 0, binding = 0) uniform U {
     vec4 fshadow;    // x 1 when the map holds figures this frame (else it is not read), y one texel in its 0..1 coordinates, z depth per metre toward the sun
     vec4 trace;      // x screen pixels along each side of one the gather pass traces for (1..4); y the motion clock; z, w how many past samples the sun's and the sky's light may lean on (64: all, a sun standing still)
     vec4 cut[9];     // the cutaway (Strata.Overlay.cut_floats): has height, y, x0, z0, x1, z1, capsules, 0, then four capsules of 7 floats
+    vec4 lamps;      // x 1 when the gather pass gathers the lamps' light (sv_set_lamp_tracing); y the voxels a lamp's light reaches
 } u;
 
 // The cutaway: is the surface at p (metres) hidden this frame? Above the

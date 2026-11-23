@@ -103,6 +103,85 @@ const float GLOW = 5.0;   // strata_vk.c's SV_GLOW (a figure's glow reach for hi
 layout(std430, set = 0, binding = 32) readonly buffer LampCells { uvec2 cells[]; } lamp_cells;
 layout(std430, set = 0, binding = 33) readonly buffer LampList { ivec4 lamps[]; } lamp_list;
 
+// A lamp's fourth int: its light class in the low byte; bit 24 a moving lamp (its position in eighths of a voxel), bit 25 a beam
+// (its heading in bytes 1 and 2), bit 26 a lamp the gather pass traces a ray to (strata_vk.c, SV_LAMP_*).
+const int LAMP_MOVING = 1 << 24, LAMP_BEAM = 1 << 25, LAMP_SHADOW = 1 << 26;
+const float LAMP_FIXTURE = 2.5;   // voxels round a lamp that never shadow it
+
+// A cell's standing lamps (first, count), or its moving ones: those are listed after every cell's standing entry.
+uvec2 lamp_entry(ivec3 cell, bool moving) {
+    int i = cell.x + u.vol.x * (cell.y + u.vol.y * cell.z);
+    return lamp_cells.cells[moving ? i + u.vol.x * u.vol.y * u.vol.z : i];
+}
+
+// What a lamp gives a point at [at] facing [normal] with nothing between: light mode 8's lamps, and the traced ones' (lamp_gather).
+// It falls off with the square of the distance and fades out over the last half of [reach]; a beam lights a cone ahead of it.
+vec3 lamp_direct(ivec4 lamp, vec3 at, vec3 normal, float reach, out vec3 dir, out float dist) {
+    bool moving = (lamp.w & LAMP_MOVING) != 0;
+    bool beam = (lamp.w & LAMP_BEAM) != 0;
+    vec3 position = moving ? vec3(lamp.xyz) * 0.125 : vec3(lamp.xyz) + 0.5;
+    vec3 to_lamp = position - at;
+    float distance2 = dot(to_lamp, to_lamp), reach2 = reach * reach;
+    float facing = dot(normal, to_lamp);
+    dist = sqrt(distance2);
+    dir = to_lamp / max(dist, 1.0e-4);
+    if (distance2 >= reach2 || facing <= 0.0) return vec3(0.0);
+    float inverse_distance = inversesqrt(max(distance2, 0.25));
+    float cone = 1.0;
+    if (beam) {
+        vec2 heading = (vec2((lamp.w >> 8) & 255, (lamp.w >> 16) & 255) - 128.0) / 127.0;
+        vec3 aim = vec3(heading.x * 0.97, -0.24, heading.y * 0.97);
+        cone = smoothstep(0.70, 0.94, dot(aim, -to_lamp) * inverse_distance);
+    }
+    float power = moving ? (beam ? 140.0 : 48.0) : 140.0;
+    float falloff = (1.0 - smoothstep(0.25 * reach2, reach2, distance2)) * power / (distance2 + 16.0);
+    return class_emission(uint(lamp.w & 255)) * facing * inverse_distance * falloff * cone;
+}
+
+// Every lamp listed for [at]'s cell, with nothing between: light mode 8, which traces no rays to them.
+vec3 lamps_unshadowed(vec3 at, vec3 normal) {
+    ivec3 cell = wrap(ivec3(floor(at)) >> 5, u.vol.xyz);
+    vec3 light = vec3(0.0), dir; float d;
+    for (int part = 0; part < 2; part++) {
+        uvec2 entry = lamp_entry(cell, part == 1);
+        for (uint i = 0u; i < entry.y; ++i) light += lamp_direct(lamp_list.lamps[entry.x + i], at, normal, u.lamps.y, dir, d);
+    }
+    return light;
+}
+
+// The lamps' light at a point, gathered (gather.frag, when u.lamps.x is 1): every listed lamp that casts no shadow in full, and of
+// those that do, one, chosen in proportion to what it would give, with a ray to see whether anything stands between; divided by
+// the chance of choosing it, so that on average all of them are counted. [any_moving]: the cell lists a moving lamp.
+vec3 lamp_gather(vec3 at, vec3 normal, ivec2 px, int frame, out bool any_moving) {
+    ivec3 cell = wrap(ivec3(floor(at)) >> 5, u.vol.xyz);
+    vec3 sum = vec3(0.0), held = vec3(0.0), held_dir = vec3(0.0), dir;
+    float d, held_d = 0.0, held_w = 0.0, total = 0.0;
+    float u0 = rand2(px, frame, 97).x;
+    any_moving = false;
+    for (int part = 0; part < 2; part++) {
+        uvec2 entry = lamp_entry(cell, part == 1);
+        if (part == 1 && entry.y > 0u) any_moving = true;
+        for (uint i = 0u; i < entry.y; ++i) {
+            ivec4 l = lamp_list.lamps[entry.x + i];
+            vec3 g = lamp_direct(l, at, normal, u.lamps.y, dir, d);
+            float w = g.r + g.g + g.b;
+            if (w <= 0.0) continue;
+            if ((l.w & LAMP_SHADOW) == 0) { sum += g; continue; }
+            total += w;
+            float p = w / total;
+            if (u0 < p) { held = g; held_w = w; held_dir = dir; held_d = d; u0 = u0 / p; }
+            else u0 = (u0 - p) / (1.0 - p);
+        }
+    }
+    if (held_w > 0.0) {
+        Hit h;
+        // stop short of the lamp's fixture: a lamp is one glowing voxel, often set in a housing a few voxels across (a lamp
+        // head, a window's frame) that the volume holds as solid, and the housing must not shadow its own lamp
+        if (!(held_d > LAMP_FIXTURE + 0.1 && trace_steps(at + normal * 0.02, held_dir, held_d - LAMP_FIXTURE, false, 96, 1.0e9, -1000000, h))) sum += held * (total / held_w);
+    }
+    return sum;
+}
+
 // What lamp [l] would give a point at [at] facing [n] if nothing stood
 // between, as sky_light counts light (cosine-weighted, over pi), and how far
 // away it is and in what direction. A lamp's light reaches 16 voxels,
@@ -160,8 +239,10 @@ vec3 lamp_light(vec3 at, vec3 n, ivec2 px, int frame) {
 // so its light would take many frames to settle. A traced figure's glowing
 // voxels are in no lamp list, so the hemisphere's rays keep them.
 vec3 sky_light(vec3 at, vec3 n, ivec2 px, int frame, int rays) {
-    bool aimed = u.water2.z > 0.5;
-    float own = aimed ? 0.0 : 1.0;
+    // where the gather pass gathers the lamps' light itself (lamp_gather), these rays leave lamps out and none is aimed at one
+    bool gathered = u.lamps.x > 0.5;
+    bool aimed = u.water2.z > 0.5 && !gathered;
+    float own = aimed || (gathered && u.water2.z > 0.5) ? 0.0 : 1.0;
     vec3 a = normalize(cross(n, abs(n.y) < 0.9 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0)));
     vec3 b = cross(n, a);
     vec3 sum = vec3(0.0);
