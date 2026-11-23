@@ -28,7 +28,7 @@
 /* Rewritten by build_shaders.sh whenever the shaders change: forge decides
  * whether to recompile this file from its text alone, not from the headers
  * it includes (GAPS S14). */
-#define STRATA_SHADERS_STAMP "8c5e872b35c33f5e"
+#define STRATA_SHADERS_STAMP "817393cedf9fc996"
 #include "strata_shaders.h"
 #include "strata_particles.h"
 #include "strata_alloc.h"
@@ -354,7 +354,9 @@ static struct {
 /* The uniform block, in floats (native/shaders/ubo.glsl): vp 0, sun 16,
  * sky 20, fog 24, eye 28, misc 32 (ints), inv_vp 36, prev_vp 52, light 68,
  * sun colour 72, light volume size 76 (ints). */
-#define UBO_FLOATS 172
+#define UBO_FLOATS 180
+#define UBO_WEATHER 172        /* vec4: x overcast, y wetness, z lightning flash, w rain (sv_set_weather) */
+#define UBO_RAIN 176           /* vec4: xyz the direction rain falls, w the rain's clock in seconds (sv_set_rain) */
 #define UBO_LAMPMASK 164       /* 8 uints: a bit a light class, set when its standing lamps cast shadows (lamps.comp) */
 #define UBO_LAMPS 160          /* vec4: x 1 when the gather pass gathers the lamps' light, y the voxels a lamp's light reaches, z a cell's lamps at most, w cells lamps.comp lists */
 #define UBO_CUT 124           /* 9 vec4: the cutaway (Strata.Overlay.cut_floats) */
@@ -4152,6 +4154,28 @@ void sv_set_fog(double start, double end, double cam_x, double cam_y) {
     (void)cam_x; (void)cam_y;
     if (!g.ok) return;
     g.ubo_map[24] = (float)start; g.ubo_map[25] = (float)end;
+}
+static float clamp01(double v) { return v < 0.0 ? 0.0f : (v > 1.0 ? 1.0f : (float)v); }
+/* The weather the frame is drawn in, each 0..1: [overcast] greys the sky and
+ * hides the sun's disc, and softens the sun's shadows; [wet] darkens surfaces,
+ * makes what faces up glossy and fills puddles; [flash] lights the sky and
+ * everything under it (a lightning flash); [rain] draws falling streaks over
+ * the view and rings drops make in puddles (sv_set_rain gives the way rain
+ * falls). All 0 is clear, dry weather, the default. */
+void sv_set_weather(double overcast, double wet, double flash, double rain) {
+    if (!g.ok) return;
+    float *w = g.ubo_map + UBO_WEATHER;
+    w[0] = clamp01(overcast); w[1] = clamp01(wet); w[2] = clamp01(flash); w[3] = clamp01(rain);
+}
+/* Rain falls along (x, y, z) (any length; wind slants it), and its streaks
+ * and rings run on [clock] seconds, which a game may stop while paused. */
+void sv_set_rain(double x, double y, double z, double clock) {
+    if (!g.ok) return;
+    float l = (float)sqrt(x * x + y * y + z * z);
+    float *r = g.ubo_map + UBO_RAIN;
+    if (l < 1e-6f) { r[0] = 0.0f; r[1] = -1.0f; r[2] = 0.0f; }
+    else { r[0] = (float)x / l; r[1] = (float)y / l; r[2] = (float)z / l; }
+    r[3] = (float)clock;
 }
 /* The eye is under liquid whose surface is at [surface_y] metres: the world
  * is seen through it, in its colour (linear rgb), fading with distance at

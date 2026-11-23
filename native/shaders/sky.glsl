@@ -1,6 +1,22 @@
 // The sky, and the light it and the sun put on a surface. Colours are
 // linear. The sun is u.sun.xyz (the direction to it) and u.sun_color.
 
+// ── Weather (sv_set_weather) ────────────────────────────────────────────
+// A clear sky's colour col in direction d under cloud: an overcast sky is a
+// flat grey, a little lighter overhead and toward the sun, as bright as the
+// day, a cool tint at dusk; a lightning flash lights it from inside.
+vec3 weather_sky(vec3 col, vec3 d, float day, float low) {
+    float oc = u.weather.x, flash = u.weather.z;
+    if (oc <= 0.0 && flash <= 0.0) return col;
+    float up = max(d.y, 0.0);
+    float toward = max(dot(d, u.sun.xyz), 0.0);
+    vec3 grey = mix(vec3(0.006, 0.007, 0.010), vec3(0.26, 0.28, 0.31), day);
+    grey = mix(grey, grey * vec3(0.92, 0.86, 0.84), low * day);              // a dull warm cast as the sun sets behind it
+    grey *= 0.78 + 0.22 * up + 0.25 * day * pow(toward, 3.0);                 // a brighter patch where the sun is
+    col = mix(col, grey, smoothstep(0.0, 1.0, oc));
+    return col + vec3(0.62, 0.66, 0.85) * flash * (0.6 + 0.4 * up);
+}
+
 // The sky's colour in unit direction d, without the sun's disc.
 vec3 sky_base(vec3 d) {
     vec3 s = u.sun.xyz;
@@ -13,14 +29,15 @@ vec3 sky_base(vec3 d) {
     float up = max(d.y, 0.0);
     vec3 col = mix(zenith, horizon, pow(1.0 - up, 4.0));
     float toward = max(dot(d, s), 0.0);
-    col += vec3(1.0, 0.42, 0.12) * low * day * pow(toward, 5.0) * 0.7;       // the glow round a low sun
-    col += u.sun_color.rgb * 0.04 * pow(toward, 96.0);                       // and the haze close to it
-    return col;
+    float clear = 1.0 - u.weather.x;
+    col += vec3(1.0, 0.42, 0.12) * low * day * pow(toward, 5.0) * 0.7 * clear;   // the glow round a low sun
+    col += u.sun_color.rgb * 0.04 * pow(toward, 96.0) * clear;                   // and the haze close to it
+    return weather_sky(col, d, day, low);
 }
 
-// The sky with the sun's disc.
+// The sky with the sun's disc; cloud hides the disc.
 vec3 sky_color(vec3 d) {
-    return sky_base(d) + u.sun_color.rgb * 12.0 * smoothstep(0.99975, 0.99990, dot(d, u.sun.xyz));
+    return sky_base(d) + u.sun_color.rgb * 12.0 * (1.0 - u.weather.x) * smoothstep(0.99975, 0.99990, dot(d, u.sun.xyz));
 }
 
 // What distance fades to: the sky at the horizon, the way the eye is looking.

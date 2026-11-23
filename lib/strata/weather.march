@@ -1,0 +1,123 @@
+-- Strata.Weather — the weather a frame is drawn in, eased over time.
+--
+-- A game says what the sky should be doing (a `Sky`: how overcast, how hard
+-- it rains, how stormy, the wind) whenever its own weather changes, and
+-- calls `step` once a frame; the drawn weather moves toward it at a
+-- believable pace: cloud gathers over about twelve seconds, rain sets in
+-- over about five, and the ground stays wet, its puddles slowly drying,
+-- long after rain stops. A stormy sky throws lightning at random, each
+-- strike a bright flash and a fainter second flicker; `strikes` counts
+-- them, so a game can time thunder. `apply` hands the frame's weather to
+-- the renderer (sv_set_weather, sv_set_rain), and `light` and `fog` say how
+-- much to dim the sun and draw in the fog. Pure but for `apply`, and the
+-- same calls give the same lightning.
+mod Strata.Weather do
+
+  -- what the sky is doing: overcast, rain and storm (how often lightning strikes) each 0..1, and the wind along x and z in m/s
+  type Sky = { overcast : Float, rain : Float, storm : Float, wind_x : Float, wind_z : Float }
+
+  -- the weather drawn now, the weather wanted, how wet the ground is, the
+  -- flash's brightness, the second flicker's countdown (0: none owed), the
+  -- rain's clock, seconds to the next strike, strikes so far, the seed, and
+  -- the pace: seconds for cloud and for rain to come most of the way, and for
+  -- soaked ground to dry
+  type Weather = { now : Sky, want : Sky, wet : Float, flash : Float, echo : Float, clock : Float,
+                   bolt : Float, strikes : Int, seed : Int, cloud_s : Float, rain_s : Float, dry_s : Float }
+
+  doc "A clear, still sky."
+  fn clear() : Sky do { overcast: 0.0, rain: 0.0, storm: 0.0, wind_x: 0.0, wind_z: 0.0 } end
+
+  pfn unit(v : Float) : Float do if v < 0.0 do 0.0 else if v > 1.0 do 1.0 else v end end end
+  pfn tidy(s : Sky) : Sky do { s with overcast: unit(s.overcast), rain: unit(s.rain), storm: unit(s.storm) } end
+
+  doc "Weather that is already [s], with nothing to ease toward: a game's first frame, or a loaded save. The ground is as wet as the rain makes it."
+  fn settled(seed : Int, s : Sky) : Weather do
+    let sky = tidy(s)
+    { now: sky, want: sky, wet: if sky.rain > 0.05 do unit(0.35 +. sky.rain) else 0.0 end, flash: 0.0, echo: 0.0, clock: 0.0,
+      bolt: 3.0, strikes: 0, seed: seed, cloud_s: 12.0, rain_s: 5.0, dry_s: 80.0 }
+  end
+
+  doc "[w] changing at another pace: [cloud] and [rain] seconds for cloud and rain to come most of the way (about 63%) to what is wanted, [dry] seconds for soaked ground to dry. The default is 12, 5 and 80; a game whose days pass in seconds wants far less. These are the seconds `step_eased` is given, not necessarily the real ones."
+  fn paced(w : Weather, cloud : Float, rain : Float, dry : Float) : Weather do
+    { w with cloud_s: if cloud > 0.01 do cloud else 0.01 end, rain_s: if rain > 0.01 do rain else 0.01 end, dry_s: if dry > 0.01 do dry else 0.01 end }
+  end
+
+  doc "Clear weather, seeded with [seed]."
+  fn new(seed : Int) : Weather do settled(seed, clear()) end
+
+  doc "Ease toward [s] from what is drawn now."
+  fn want(w : Weather, s : Sky) : Weather do { w with want: tidy(s) } end
+
+  doc "The weather drawn now."
+  fn now(w : Weather) : Sky do w.now end
+  doc "How wet the ground is, 0..1."
+  fn wet(w : Weather) : Float do w.wet end
+  doc "The lightning flash's brightness now, 0..1."
+  fn flash(w : Weather) : Float do w.flash end
+  doc "How many times lightning has struck: a game that remembers the last count hears a new strike when it grows."
+  fn strikes(w : Weather) : Int do w.strikes end
+
+  -- a moved toward b, a share 1 - e^(-dt / tau) of the way
+  pfn ease(a : Float, b : Float, tau : Float, dt : Float) : Float do a +. (b -. a) *. (1.0 -. Math.exp(0.0 -. dt /. tau)) end
+
+  -- a number in 0..1 for strike [k]
+  pfn chance(seed : Int, k : Int) : Float do int_to_float(Strata.Seed.cell(seed, 71, k, 0, 0) % 1000) /. 1000.0 end
+
+  -- the ground: soaked by rain toward a level the rain sets, dried slowly when
+  -- it stops, more slowly under cloud
+  pfn soak(w : Weather, rain : Float, overcast : Float, dt : Float) : Float do
+    if rain > 0.05 do
+      let level = unit(0.35 +. rain)
+      if w.wet < level do unit(w.wet +. (0.25 +. 1.25 *. rain) *. dt /. w.rain_s) else w.wet end
+    else unit(w.wet -. (1.0 -. 0.6 *. overcast) *. dt /. w.dry_s) end
+  end
+
+  pfn lightning(w : Weather, dt : Float) : Weather do
+    let echo = if w.echo > 0.0 do w.echo -. dt else 0.0 end
+    let faded = w.flash *. Math.exp(0.0 -. 9.0 *. dt)
+    let flickered = if w.echo > 0.0 && echo <= 0.0 do { w with flash: if faded > 0.7 do faded else 0.7 end, echo: 0.0 } else { w with flash: faded, echo: echo } end
+    if w.now.storm <= 0.02 do { flickered with bolt: if flickered.bolt < 2.0 do 2.0 else flickered.bolt end }
+    else
+      let bolt = flickered.bolt -. dt
+      if bolt > 0.0 do { flickered with bolt: bolt }
+      else
+        let k = flickered.strikes
+        { flickered with flash: 1.0, echo: 0.08 +. 0.1 *. chance(w.seed, k * 2 + 1), strikes: k + 1,
+          bolt: 1.5 +. chance(w.seed, k * 2) *. 12.0 /. w.now.storm }
+      end
+    end
+  end
+
+  doc "Let [dt] seconds pass: the drawn sky eases toward the one wanted, the ground soaks or dries, and lightning may strike."
+  fn step(w : Weather, dt : Float) : Weather do step_eased(w, dt, dt) end
+
+  doc "Let [dt] real seconds pass for falling rain and lightning, and [eased] seconds of the game's own clock for the sky's changes and the ground soaking and drying: 0 while a game is paused holds the weather where it is, rain still falling."
+  fn step_eased(w : Weather, dt : Float, eased : Float) : Weather do
+    let real = if dt > 0.0 do dt else 0.0 end
+    let e = if eased > 0.0 do eased else 0.0 end
+    let n = w.now
+    let t = w.want
+    let sky = if e <= 0.0 do n else
+      { overcast: ease(n.overcast, t.overcast, w.cloud_s, e),
+        rain: ease(n.rain, t.rain, w.rain_s, e),
+        storm: ease(n.storm, t.storm, w.rain_s, e),
+        wind_x: ease(n.wind_x, t.wind_x, w.rain_s, e), wind_z: ease(n.wind_z, t.wind_z, w.rain_s, e) } end
+    let moved = { w with now: sky, wet: if e <= 0.0 do w.wet else soak(w, sky.rain, sky.overcast, e) end, clock: w.clock +. real }
+    if real <= 0.0 do moved else lightning(moved, real) end
+  end
+
+  doc "How much of the sun's light gets through, 0..1: dimmed by cloud, and more by rain."
+  fn light(w : Weather) : Float do unit(1.0 -. 0.6 *. w.now.overcast -. 0.12 *. w.now.rain) end
+
+  doc "A clear day's fog [start] and [stop] (metres) drawn in by rain and, a little, by cloud."
+  fn fog(w : Weather, start : Float, stop : Float) : (Float, Float) do
+    let k = 1.0 -. 0.12 *. w.now.overcast -. 0.42 *. w.now.rain
+    (start *. k, stop *. (0.2 +. 0.8 *. k))
+  end
+
+  doc "Draw this frame in [w]: the sky, wet surfaces, the flash, and rain falling at 9 m/s slanted by the wind. Light modes 1 and up."
+  fn apply(w : Weather) : Unit do
+    Strata.Ffi.Vk.set_weather(w.now.overcast, w.wet, w.flash, w.now.rain)
+    Strata.Ffi.Vk.set_rain(w.now.wind_x, -9.0, w.now.wind_z, w.clock)
+  end
+end

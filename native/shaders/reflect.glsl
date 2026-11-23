@@ -55,3 +55,58 @@ vec3 reflected(vec3 at, vec3 dir, int skip_y) {
     vec3 col = albedo * (u.sun_color.rgb * max(dot(hn, u.sun.xyz), 0.0) * vis + sky_flat(hn)) + (hit_emission(h.cls) + h.glow) * GLOW;
     return fogged(col, hp);
 }
+
+// ── Rain on surfaces (sv_set_weather) ───────────────────────────────────
+// Smooth value noise in 0..1 over the plane, one feature about every cell.
+float wet_hash(vec2 c) { return fract(sin(dot(c, vec2(127.1, 311.7))) * 43758.5453); }
+float wet_noise(vec2 p) {
+    vec2 i = floor(p), f = fract(p);
+    f = f * f * (3.0 - 2.0 * f);
+    return mix(mix(wet_hash(i), wet_hash(i + vec2(1.0, 0.0)), f.x), mix(wet_hash(i + vec2(0.0, 1.0)), wet_hash(i + vec2(1.0, 1.0)), f.x), f.y);
+}
+// How much of the ground at p (metres) stands under a puddle when it is [wet]: none
+// below a third, then low spots fill first, the larger the wetter.
+float puddle_at(vec2 p, float wet) {
+    float n = 0.65 * wet_noise(p * 0.6) + 0.35 * wet_noise(p * 1.7 + 17.0);
+    float level = 1.0 - smoothstep(0.3, 1.0, wet) * 0.45;
+    return smoothstep(level, level + 0.05, n);
+}
+// Rings falling drops make on a puddle: 0..1, a few at a time, each a quarter
+// of a second, while it rains.
+float rain_rings(vec2 p, float rain) {
+    if (rain <= 0.0) return 0.0;
+    vec2 cell = floor(p * 2.5), f = fract(p * 2.5);
+    float h = wet_hash(cell);
+    float t = fract(u.rain.w * (1.2 + 2.0 * h) + h * 7.0);
+    vec2 at = vec2(wet_hash(cell + 3.1), wet_hash(cell + 5.7)) * 0.6 + 0.2;
+    float r = length(f - at);
+    float ring = 1.0 - smoothstep(0.0, 0.06, abs(r - t * 0.4));
+    return ring * (1.0 - t) * step(h, 0.25 + 0.6 * rain);
+}
+// A lit colour col at [world] (metres) with normal n, seen along [toward_eye],
+// made wet: darker (wet stone and earth soak up light), glossy on what faces
+// up, the sky mirrored in puddles, drops ringing them; and lit by a flash.
+// [figure]: a moving figure, which takes the flash but no puddles. Green
+// surfaces (grass, leaves) drink the rain: they darken but hold no puddles.
+vec3 weathered(vec3 col, vec3 albedo, vec3 n, vec3 world, vec3 toward_eye, float sun_vis, bool figure) {
+    float wet = u.weather.y, flash = u.weather.z;
+    if (wet > 0.0) {
+        float up = smoothstep(0.55, 0.95, n.y);
+        col *= 1.0 - wet * (0.30 * up + 0.16 * (1.0 - up));
+        float green = clamp((albedo.g - max(albedo.r, albedo.b)) * 6.0, 0.0, 1.0);
+        float puddle = figure ? 0.0 : up * (1.0 - green) * puddle_at(world.xz, wet);
+        float fres = mirror_share(n, toward_eye, 0.04);
+        vec3 m = n;
+        if (puddle > 0.0) {
+            float ring = rain_rings(world.xz, u.weather.w);
+            m = normalize(n + vec3(ring * 0.18, 0.0, ring * 0.11));
+        }
+        vec3 seen = sky_base(mirror_dir(toward_eye, m, n));
+        col *= 1.0 - 0.25 * puddle;                                          // standing water is darker than the wet ground round it
+        float share = max(up * wet * (1.0 - green) * (0.08 + 0.40 * fres), puddle * (0.30 + 0.60 * fres));
+        col = mix(col, seen, share);
+        col += sun_highlight(m, toward_eye, mix(0.45, 0.08, puddle), sun_vis) * up * wet;
+    }
+    if (flash > 0.0) col += albedo * vec3(0.75, 0.80, 1.0) * flash * (0.35 + 0.65 * max(n.y, 0.0)) * 1.4;
+    return col;
+}

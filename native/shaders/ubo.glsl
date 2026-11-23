@@ -23,6 +23,8 @@ layout(set = 0, binding = 0) uniform U {
     vec4 cut[9];     // the cutaway (Strata.Overlay.cut_floats): has height, y, x0, z0, x1, z1, capsules, 0, then four capsules of 7 floats
     vec4 lamps;      // x 1 when the gather pass gathers the lamps' light (sv_set_lamp_tracing); y the voxels a lamp's light reaches; z a cell's lamps at most, w cells to list (lamps.comp)
     uvec4 lamp_mask[2]; // a bit a light class: its standing lamps cast shadows (sv_set_lamp_shadow)
+    vec4 weather;    // sv_set_weather: x overcast 0..1, y how wet surfaces are 0..1, z a lightning flash's brightness 0..1, w rain 0..1 (streaks drawn over the view)
+    vec4 rain;       // xyz the direction rain falls (unit, metres), w the rain's own clock in seconds
 } u;
 
 // The cutaway: is the surface at p (metres) hidden this frame? Above the

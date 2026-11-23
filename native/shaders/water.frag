@@ -69,8 +69,11 @@ void main() {
         float zoom = 1.0 / max(length(vec3(u.vp[0][0], u.vp[1][0], u.vp[2][0])), 0.0001);
         float fade = mix(0.07, 0.96, smoothstep(28.0, 100.0, zoom));
         vec3 n = qrot(v_rot, NORMALS[min(face, 5u)]);
-        float daylight = clamp(0.32 + 0.58 * u.sun.y + 0.18 * max(n.y, 0.0), 0.20, 0.98);
-        vec3 colour = mix(vec3(0.42, 0.50, 0.63), vec3(0.98, 0.97, 0.94), daylight);
+        float daylight = clamp(0.32 + 0.58 * u.sun.y + 0.18 * max(n.y, 0.0), 0.06, 0.98);
+        vec3 colour = mix(vec3(0.12, 0.15, 0.21), vec3(0.98, 0.97, 0.94), daylight);
+        // rain clouds are slate grey, storm clouds darker still, and lightning lights them from inside
+        colour = mix(colour, colour * vec3(0.46, 0.49, 0.55), smoothstep(0.5, 1.0, u.weather.x) * (0.4 + 0.6 * u.weather.w));
+        colour += vec3(0.70, 0.75, 0.95) * u.weather.z;
         o_color = vec4(colour, fade);
         return;
     }
