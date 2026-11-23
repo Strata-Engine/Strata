@@ -128,13 +128,19 @@ void main() {
         float zoom = 1.0 / max(length(vec3(u.vp[0][0], u.vp[1][0], u.vp[2][0])), 0.0001);
         float fade = mix(0.07, 0.96, smoothstep(28.0, 100.0, zoom));
         vec3 n = qrot(v_rot, NORMALS[min(face, 5u)]);
-        // lit as the world is: the sun on the faces toward it and some through the cloud, the sky from above;
-        // so they dim and warm with the day, and go grey when the sun is weak
+        // lit as the world is: the sun and a grey share of the sky's light, so clouds dim and warm with the day.
+        // The game may say, in the shade byte, how high up the cloud a face is (0 its base, 255 its top) and,
+        // in the texture field's low byte, how far out from its middle: the base is darker and the outskirts
+        // thinner, so the cloud reads as one heaped mass rather than faces shaded by direction.
         float toward_sun = max(dot(n, u.sun.xyz), 0.0);
-        vec3 sky = sky_flat(n);
+        vec3 sky = sky_flat(vec3(0.0, 1.0, 0.0));
         sky = mix(vec3(dot(sky, vec3(0.3, 0.59, 0.11))), sky, 0.35);          // a cloud is grey: it takes the sky's light, not its blue
-        vec3 light = u.sun_color.rgb * (0.45 + 0.55 * toward_sun) + sky * (1.6 + 0.6 * n.y);
-        vec3 colour = tonemap(vec3(0.92, 0.93, 0.95) * light * (0.78 + 0.22 * n.y));
+        float height = float((v_w1 >> 16) & 255u) / 255.0;
+        float outskirts = float(v_w1 & 255u) / 255.0;
+        vec3 light = u.sun_color.rgb * (0.62 + 0.38 * toward_sun) + sky * 1.9;
+        float shape = 0.52 + 0.48 * smoothstep(0.0, 0.85, height) + 0.05 * n.y;
+        vec3 colour = tonemap(vec3(0.93, 0.94, 0.96) * light * shape);
+        fade *= 1.0 - 0.6 * smoothstep(0.5, 1.0, outskirts);
         // thinner over the middle of the view, where the player is looking
         vec4 clip = u.vp * vec4(v_world, 1.0);
         fade *= mix(0.35, 1.0, smoothstep(0.15, 0.65, length(clip.xy / clip.w)));

@@ -84,7 +84,7 @@ float cloud_shadow(vec3 p) {
     vec3 s = u.sun.xyz;
     if (n == 0 || s.y <= 0.02) return 1.0;
     float lit = 1.0;
-    for (int k = 0; k < 48; k++) {
+    for (int k = 0; k < 64; k++) {
         if (k >= n) break;
         vec4 b = u.blobs[k];
         vec3 cp = b.xyz - p;

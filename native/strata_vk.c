@@ -28,7 +28,7 @@
 /* Rewritten by build_shaders.sh whenever the shaders change: forge decides
  * whether to recompile this file from its text alone, not from the headers
  * it includes (GAPS S14). */
-#define STRATA_SHADERS_STAMP "12f3e672570ea489"
+#define STRATA_SHADERS_STAMP "8af33f2c15bb065c"
 #include "strata_shaders.h"
 #include "strata_particles.h"
 #include "strata_alloc.h"
@@ -356,14 +356,14 @@ static struct {
 /* The uniform block, in floats (native/shaders/ubo.glsl): vp 0, sun 16,
  * sky 20, fog 24, eye 28, misc 32 (ints), inv_vp 36, prev_vp 52, light 68,
  * sun colour 72, light volume size 76 (ints). */
-#define UBO_SEA 376            /* vec4: x, z the wind's direction (unit), the open sea's wave height in metres (0: no sea state), whitecaps 0..1 (sv_set_sea) */
-#define UBO_SEA_MAP 380        /* vec4: x0, z0 the sea map's low corner and its cell size, in metres (sv_set_sea_map) */
-#define UBO_SEA_GRID 384       /* vec4: the sea map's cells across and down (0: no map) */
+#define UBO_SEA 440            /* vec4: x, z the wind's direction (unit), the open sea's wave height in metres (0: no sea state), whitecaps 0..1 (sv_set_sea) */
+#define UBO_SEA_MAP 444        /* vec4: x0, z0 the sea map's low corner and its cell size, in metres (sv_set_sea_map) */
+#define UBO_SEA_GRID 448       /* vec4: the sea map's cells across and down (0: no map) */
 #define SV_SEA_CELLS 16384     /* the sea map's cells at most */
-#define UBO_FLOATS 388
+#define UBO_FLOATS 452
 #define UBO_CLOUD 180          /* vec4: x blobs, y their darkness (sv_set_cloud_shadows) */
-#define UBO_BLOBS 184          /* 48 vec4: the clouds' shadow blobs, centre and radius in metres */
-#define SV_CLOUD_BLOBS 48
+#define UBO_BLOBS 184          /* 64 vec4: the clouds' shadow blobs, centre and radius in metres */
+#define SV_CLOUD_BLOBS 64
 #define UBO_WEATHER 172        /* vec4: x overcast, y wetness, z lightning flash, w rain (sv_set_weather) */
 #define UBO_RAIN 176           /* vec4: xyz the direction rain falls, w the rain's clock in seconds (sv_set_rain) */
 #define UBO_LAMPMASK 164       /* 8 uints: a bit a light class, set when its standing lamps cast shadows (lamps.comp) */
@@ -3003,7 +3003,7 @@ static uint32_t order_translucent(uint32_t region) {
         float cx, cy, cz;
         if (e->level_flags & SV_BODY) {
             float c[3];
-            if (culled_body(g.ubo_map, e, 32.0f * scale, c)) continue;
+            if (culled_body(g.ubo_map, e, 32.0f * (e->pos[3] > 0.0f ? e->pos[3] : scale), c)) continue;   /* the body's own voxel size */
             cx = c[0] - eye[0]; cy = c[1] - eye[1]; cz = c[2] - eye[2];
         } else {
             if (culled(g.ubo_map, e->origin, side, scale)) continue;
