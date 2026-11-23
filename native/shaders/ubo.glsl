@@ -34,6 +34,8 @@ layout(set = 0, binding = 0) uniform U {
     vec4 sea_amps[3];   // their shares of the amplitude, in order (x, y, z, w of each)
     vec4 sea_field;     // sv_set_sea_field: xy the refracted swell's low corner, z its cell size (metres), w its angular frequency
     vec4 sea_fgrid;     // its cells across and down (x 0: no field), zw its deep-water direction (unit)
+    vec4 rain_meta;  // sv_set_rain_cells: x how many cells, y the rain falling everywhere 0..1, z 1 when rain is local (else u.weather.w and .y hold everywhere)
+    vec4 rain_cells[16]; // two a cell: (x, z, radius m, rain 0..1), (trail x, z: back along its path, m; 0, 0)
 } u;
 
 // The cutaway: is the surface at p (metres) hidden this frame? Above the
@@ -54,6 +56,39 @@ bool cut_hidden(vec3 p) {
         if (length(p - (a + t * ab)) < r) return true;
     }
     return false;
+}
+
+// ── Local rain (sv_set_rain_cells) ─────────────────────────────────────
+// How hard it rains at ground point xz (metres), 0..1: the rain falling
+// everywhere, or more under a cell, softly toward its edge. Without local
+// rain, the weather's single value.
+float rain_here(vec2 xz) {
+    if (u.rain_meta.z < 0.5) return u.weather.w;
+    float r = u.rain_meta.y;
+    int n = int(u.rain_meta.x + 0.5);
+    for (int k = 0; k < 8; k++) {
+        if (k >= n) break;
+        vec4 c = u.rain_cells[2 * k];
+        r = max(r, c.w * (1.0 - smoothstep(0.75 * c.z, c.z, distance(xz, c.xy))));
+    }
+    return r;
+}
+// How wet the ground at xz is, 0..1: the weather's wetness, or more where a
+// cell is raining or has just passed (along its trail).
+float wet_here(vec2 xz) {
+    if (u.rain_meta.z < 0.5) return u.weather.y;
+    float w = u.weather.y;
+    int n = int(u.rain_meta.x + 0.5);
+    for (int k = 0; k < 8; k++) {
+        if (k >= n) break;
+        vec4 c = u.rain_cells[2 * k];
+        vec2 trail = u.rain_cells[2 * k + 1].xy;
+        vec2 rel = xz - c.xy;
+        float t = clamp(dot(rel, trail) / max(dot(trail, trail), 1.0e-4), 0.0, 1.0);
+        float d = length(rel - trail * t);
+        w = max(w, 0.9 * c.w * (1.0 - 0.5 * t) * (1.0 - smoothstep(0.6 * c.z, c.z, d)));
+    }
+    return w;
 }
 
 // OpenGL clip space to Vulkan's: y points down, depth runs 0..1.

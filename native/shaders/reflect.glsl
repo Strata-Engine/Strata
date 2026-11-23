@@ -89,7 +89,7 @@ float rain_rings(vec2 p, float rain) {
 // [figure]: a moving figure, which takes the flash but no puddles. Green
 // surfaces (grass, leaves) drink the rain: they darken but hold no puddles.
 vec3 weathered(vec3 col, vec3 albedo, vec3 n, vec3 world, vec3 toward_eye, float sun_vis, bool figure) {
-    float wet = u.weather.y, flash = u.weather.z;
+    float wet = wet_here(world.xz), flash = u.weather.z;
     if (wet > 0.0) {
         float up = smoothstep(0.55, 0.95, n.y);
         col *= 1.0 - wet * (0.30 * up + 0.16 * (1.0 - up));
@@ -98,7 +98,7 @@ vec3 weathered(vec3 col, vec3 albedo, vec3 n, vec3 world, vec3 toward_eye, float
         float fres = mirror_share(n, toward_eye, 0.04);
         vec3 m = n;
         if (puddle > 0.0) {
-            float ring = rain_rings(world.xz, u.weather.w);
+            float ring = rain_rings(world.xz, rain_here(world.xz));
             m = normalize(n + vec3(ring * 0.18, 0.0, ring * 0.11));
         }
         vec3 seen = sky_base(mirror_dir(toward_eye, m, n));

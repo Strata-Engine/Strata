@@ -28,7 +28,7 @@
 /* Rewritten by build_shaders.sh whenever the shaders change: forge decides
  * whether to recompile this file from its text alone, not from the headers
  * it includes (GAPS S14). */
-#define STRATA_SHADERS_STAMP "21329c602a07aaff"
+#define STRATA_SHADERS_STAMP "59f1a904a0a09e9b"
 #include "strata_shaders.h"
 #include "strata_particles.h"
 #include "strata_alloc.h"
@@ -372,7 +372,10 @@ static struct {
 #define UBO_SEA_FIELD 500      /* vec4: the refracted swell's grid (sv_set_sea_field): x0, z0 its low corner and its cell size (metres), its angular frequency */
 #define UBO_SEA_FGRID 504      /* vec4: its cells across and down (0: no field), and its deep-water direction x, z (unit) */
 #define SV_SEA_FIELD_CELLS 262144  /* the refracted swell's cells at most */
-#define UBO_FLOATS 508
+#define UBO_RAIN_META 508      /* vec4: cells, rain everywhere, 1 when rain is local (sv_set_rain_cells) */
+#define UBO_RAIN_CELLS 512     /* 16 vec4: two a cell */
+#define SV_RAIN_CELLS 8
+#define UBO_FLOATS 576
 #define UBO_CLOUD 180          /* vec4: x blobs, y their darkness (sv_set_cloud_shadows) */
 #define UBO_BLOBS 184          /* 64 vec4: the clouds' shadow blobs, centre and radius in metres */
 #define SV_CLOUD_BLOBS 64
@@ -4309,6 +4312,22 @@ void sv_set_cloud_shadows(void *blobs, int64_t n, double darkness) {
     if (k > SV_CLOUD_BLOBS) k = SV_CLOUD_BLOBS;
     if (k > 0) memcpy(g.ubo_map + UBO_BLOBS, narr_data(blobs), (size_t)k * 4 * sizeof(float));
     g.ubo_map[UBO_CLOUD] = (float)k; g.ubo_map[UBO_CLOUD + 1] = clamp01(darkness);
+}
+/* Local rain: [n] cells (at most SV_RAIN_CELLS), eight floats each in [f32]:
+ * x, z, radius (metres), rain 0..1, trail x, z (metres back along the path it
+ * came; the ground stays wet under it), 0, 0; and [baseline], the rain
+ * falling everywhere 0..1. Rain streaks, puddle rings and wet ground then
+ * follow the cells. n 0 with a negative baseline goes back to the weather's
+ * single rain and wetness everywhere, the default. */
+void sv_set_rain_cells(void *f32, int64_t n, double baseline) {
+    if (!g.ok) return;
+    float *m = g.ubo_map + UBO_RAIN_META;
+    if (n <= 0 && baseline < 0.0) { m[0] = 0.0f; m[1] = 0.0f; m[2] = 0.0f; m[3] = 0.0f; return; }
+    int k = n < 0 ? 0 : (n > SV_RAIN_CELLS ? SV_RAIN_CELLS : (int)n);
+    if (k > 0 && (!f32 || narr_len(f32) < (int64_t)k * 8)) k = f32 ? (int)(narr_len(f32) / 8) : 0;
+    if (k > SV_RAIN_CELLS) k = SV_RAIN_CELLS;
+    if (k > 0) memcpy(g.ubo_map + UBO_RAIN_CELLS, narr_data(f32), (size_t)k * 8 * sizeof(float));
+    m[0] = (float)k; m[1] = clamp01(baseline); m[2] = 1.0f; m[3] = 0.0f;
 }
 /* Rain falls along (x, y, z) (any length; wind slants it), and its streaks
  * and rings run on [clock] seconds, which a game may stop while paused. */

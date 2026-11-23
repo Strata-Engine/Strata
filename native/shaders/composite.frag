@@ -35,7 +35,10 @@ float rain_layer(vec2 px, vec2 dir, float width, float speed, float density, flo
 }
 
 vec3 rained(vec3 c, vec2 px, vec2 size) {
-    float rain = u.weather.w;
+    // the rain falling on the ground under this pixel (the view's ray meeting y = 5 m)
+    vec3 near = world_at(px / size, 0.0), far = world_at(px / size, 1.0);
+    float along = clamp((5.0 - near.y) / min(far.y - near.y, -1.0e-4), 0.0, 1.0);
+    float rain = rain_here(mix(near, far, along).xz);
     if (rain <= 0.0) return c;
     vec2 dir = rain_screen_dir(size);
     float scale = size.y / 900.0;                     // keep the streaks' size steady across resolutions
