@@ -56,7 +56,7 @@ float ocean_depth() {
 }
 // The water's own colour by depth: turquoise shallows, teal, deep blue.
 vec3 ocean_colour(float d) {
-    vec3 shallow = vec3(0.16, 0.74, 0.70), mid = vec3(0.05, 0.42, 0.55), deep = vec3(0.02, 0.13, 0.30);
+    vec3 shallow = vec3(0.10, 0.52, 0.54), mid = vec3(0.04, 0.34, 0.47), deep = vec3(0.02, 0.13, 0.30);
     return d < 4.0 ? mix(shallow, mid, smoothstep(0.0, 4.0, d)) : mix(mid, deep, smoothstep(4.0, 12.0, d));
 }
 // Rolling waves: two crossing swells and a chop, on a quarter-voxel grid so they keep the world's grain.
@@ -127,6 +127,12 @@ float sea_column(vec2 p, float amp, float chop) {
     if (u.sea_grid.z < 0.5) return sea_height(p, amp, chop);
     ivec2 c = ivec2(floor(p / 0.5)) & 511;   // the tile repeats every 256 m
     return amp * sea_tile.h[c.y * 512 + c.x];
+}
+// The same colours without the bands, for a sea seen from high up.
+vec3 sea_gradient(float t) {
+    vec3 c0 = vec3(0.015, 0.07, 0.16), c1 = vec3(0.02, 0.17, 0.33), c2 = vec3(0.05, 0.33, 0.50), c3 = vec3(0.20, 0.55, 0.68), c4 = vec3(0.50, 0.80, 0.85);
+    float x = clamp(t, 0.0, 1.0) * 4.0;
+    return x < 1.0 ? mix(c0, c1, x) : x < 2.0 ? mix(c1, c2, x - 1.0) : x < 3.0 ? mix(c2, c3, x - 2.0) : mix(c3, c4, x - 3.0);
 }
 // The colour of water [t] of the way from trough (0) to crest (1), in five bands.
 vec3 sea_band(float t) {
@@ -217,11 +223,13 @@ void main() {
         return;
     }
     if (tex >= uint(u.misc.z)) tex = 0u;
-    vec4 base = ocean ? vec4(ocean_colour(ocean_d), mix(0.35, 0.97, 1.0 - exp(-0.35 * ocean_d))) : texture(tiles, vec3(v_tex, float(tex)));
+    vec4 base = ocean ? vec4(ocean_colour(ocean_d), mix(0.6, 0.97, 1.0 - exp(-0.35 * ocean_d))) : texture(tiles, vec3(v_tex, float(tex)));
     float open_sea = 0.0;   // how much of the voxel sea shows here: none without a sea state or in the shallows
     float sea_foam = 0.0;
     if (ocean && u.sea.z > 0.0) {
-        float amp = 0.5 * u.sea.z * mix(0.3, 1.0, sea_exposure(v_world.xz));
+        // the height tile repeats every 256 m: a slow, non-repeating rise and fall of the sea across a few hundred metres hides it
+        float swell_patch = ocean_noise(v_world.xz * 0.004 + vec2(3.1, 7.7));
+        float amp = 0.5 * u.sea.z * mix(0.3, 1.0, sea_exposure(v_world.xz)) * mix(0.35, 1.3, swell_patch);
         float chop = clamp(u.sea.w, 0.0, 1.0);
         // A column is two voxels across and steps a voxel at a time, doubling
         // in both as the view pulls back so it never shrinks under about 2.5
@@ -233,9 +241,12 @@ void main() {
         vec2 cell = floor(v_world.xz / cs);
         vec2 c = (cell + 0.5) * cs;
         float lv = floor(sea_column(c, amp, chop) / rise);
-        float t = clamp(lv * rise / (2.2 * max(amp, 0.05)) + 0.5, 0.0, 1.0);
-        vec3 sea = sea_band(t) * (0.93 + 0.14 * ocean_hash(cell));   // each column a touch lighter or darker
-        float detail = 1.0;
+        float t = clamp(lv * rise / (2.2 * max(amp, 0.05)) + 0.5 + 0.18 * (ocean_noise(v_world.xz * 0.0067 + 1.3) - 0.5), 0.0, 1.0);
+        // seen from high up the columns are big: the bands soften into one smooth sea, the steps and foam fade
+        float smooth_sea = smoothstep(1.5, 4.0, grow);
+        t = mix(t, 0.5 + (t - 0.5) * 0.45, smooth_sea);   // and their contrast eases, so a long swell reads as a sea, not stripes
+        vec3 sea = mix(sea_band(t), sea_gradient(t), smooth_sea) * (0.93 + 0.14 * ocean_hash(cell) * (1.0 - smooth_sea));   // each column a touch lighter or darker
+        float detail = 1.0 - 0.8 * smooth_sea;
         if (detail > 0.0) {
             float lx = floor(sea_column(c + vec2(cs, 0.0), amp, chop) / rise);
             float lz = floor(sea_column(c + vec2(0.0, cs), amp, chop) / rise);
@@ -329,7 +340,7 @@ void main() {
                 mirror = (far || open_sea > 0.5) ? sky_color(mirror_dir(toward_eye, m, sign(dot(n, toward_eye)) * n)) : now ? reflected(at + sign(dot(n, toward_eye)) * n * 0.02, mirror_dir(toward_eye, m, sign(dot(n, toward_eye)) * n), int(floor(at.y - 0.001))) : old.rgb;
                 col = mix(col, mirror, share);
             }
-            col += ocean ? 0.45 * sun_highlight(m, toward_eye, 0.16, sun_vis) : sun_highlight(m, toward_eye, rough, sun_vis);
+            col += ocean ? 0.45 * (1.0 - open_sea) * sun_highlight(m, toward_eye, 0.16, sun_vis) : sun_highlight(m, toward_eye, rough, sun_vis);
             alpha = mix(alpha, 1.0, share);
         }
     }
@@ -340,7 +351,7 @@ void main() {
         vec2 cell = floor(v_world.xz / u.eye.w);
         float sparkle = step(0.72, ocean_hash(cell + floor(u.light.y * 3.0) * vec2(17.0, 31.0)));
         float glare = pow(max(dot(r, u.sun.xyz), 0.0), 160.0);
-        col += u.sun_color.rgb * glare * (0.25 + 2.2 * sparkle) * sun_vis * cloud_shadow(v_world) * (1.0 - u.weather.x);
+        col += u.sun_color.rgb * glare * (0.15 + 1.2 * sparkle) * sun_vis * cloud_shadow(v_world) * (1.0 - u.weather.x);
         // no moon in the sky to trace: a glint where one would stand, opposite the sun, fading in through dusk
         vec3 moon = normalize(vec3(-u.sun.x, 0.45, -u.sun.z));
         col += vec3(0.55, 0.62, 0.80) * 0.6 * smoothstep(0.05, -0.15, u.sun.y) * pow(max(dot(r, moon), 0.0), 220.0);
@@ -381,7 +392,7 @@ void main() {
         float edge = 1.0 - smoothstep(0.15, 0.9, ocean_d);
         float foam = edge * step(0.45, wash + 0.35 * edge);
         float lit = clamp(0.25 + 0.85 * max(u.sun.y, 0.0), 0.12, 1.0);
-        col = mix(col, vec3(0.93, 0.96, 0.97) * lit * (u.sun_color.rgb * 0.5 + 0.5), foam);
+        col = mix(col, vec3(0.80, 0.85, 0.86) * lit * (u.sun_color.rgb * 0.5 + 0.5), foam);
         alpha = max(alpha, mix(alpha, 0.9, foam));
     }
     if (memory) { imageStore(wh_now, px, vec4(mirror, sun_mem)); imageStore(wd_now, px, vec4(view_depth)); }

@@ -28,7 +28,7 @@
 /* Rewritten by build_shaders.sh whenever the shaders change: forge decides
  * whether to recompile this file from its text alone, not from the headers
  * it includes (GAPS S14). */
-#define STRATA_SHADERS_STAMP "21d4fa051cc06ec6"
+#define STRATA_SHADERS_STAMP "a870520d3dd1d985"
 #include "strata_shaders.h"
 #include "strata_particles.h"
 #include "strata_alloc.h"
