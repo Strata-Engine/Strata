@@ -71,6 +71,11 @@ void main() {
     // which spreads each one's few samples over the screen pixels it stands for and its neighbours'
     int r = s > 1.0 ? 1 : 0;
     vec4 acc = vec4(0.0); float wsum = 0.0; vec4 meta = vec4(0.0); float wbest = 0.0;
+    // of the gathered pixels looked at that are another face at about this one's distance, the nearest in depth: where neither these
+    // nor the wider search below find this surface (a face thinner than a gathered pixel: a window frame's side), its sun visibility
+    // stands in, read from what is already fetched, instead of a ray of the pixel's own. Those rays had cost the light pass about a
+    // sixth of its time in a city, as the rest of each group of pixels waited on the few that traced.
+    ivec2 back = ivec2(-1); float back_d = 1.0e9;
     bool lamps_gathered = u.lamps.x > 0.5 && u.water2.z > 0.5;
     vec3 lacc = vec3(0.0);
     for (int dy = -r; dy <= r; dy++)
@@ -80,12 +85,18 @@ void main() {
             float wb = max(1.5 - d.x, 0.0) * max(1.5 - d.y, 0.0);
             if (wb <= 0.0) continue;
             vec4 m = texelFetch(hmeta_cur, hq, 0);
-            if (m.g <= 0.0 || int(m.b + 0.5) != face || abs(m.g - view_depth) > 0.03 * view_depth + 0.05) continue;
+            if (m.g <= 0.0) continue;
+            float dd = abs(m.g - view_depth);
+            if (int(m.b + 0.5) != face || dd > 0.03 * view_depth + 0.05) {
+                if (dd <= 0.1 * view_depth + 0.5 && dd < back_d) { back_d = dd; back = hq; }
+                continue;
+            }
             acc += wb * texelFetch(hist_cur, hq, 0); wsum += wb;
             if (lamps_gathered) lacc += wb * texelFetch(lamp_cur, hq, 0).rgb;
             if (wb > wbest) { wbest = wb; meta = m; }
         }
-    // none: a face thinner than a gathered pixel; look two further out, at any distance along the same face's plane
+    // none: a face thinner than a gathered pixel, or a floor seen so low that its distance changes fast; look two further out, at any
+    // distance along the same face's plane
     if (wsum == 0.0 && r > 0)
         for (int dy = -2; dy <= 2; dy++)
             for (int dx = -2; dx <= 2; dx++) {
@@ -100,6 +111,8 @@ void main() {
     int rays = mode >= 4 && mode != 8 ? int(abs(u.light.w)) : 0;   // mode 8 lights by direct_lamps, without rays
     vec3 sky; float sun_vis;
     if (wsum > 0.0) { sky = acc.rgb / wsum; sun_vis = acc.a / wsum; }
+    else if (back.x >= 0) { sky = sky_flat(n); sun_vis = texelFetch(hist_cur, back, 0).a; }   // another face beside it stands in
+    // nothing near at all (an edge against the sky, say): a ray of its own
     else { sky = sky_flat(n); sun_vis = sun_visible(at, n, sun_toward(rand2(ivec2(gl_FragCoord.xy), int(u.light.z), 0))); }
     if (rays == 0) sky = sky_flat(n);
     float count = meta.r;

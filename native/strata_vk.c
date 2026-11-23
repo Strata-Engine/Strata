@@ -28,7 +28,7 @@
 /* Rewritten by build_shaders.sh whenever the shaders change: forge decides
  * whether to recompile this file from its text alone, not from the headers
  * it includes (GAPS S14). */
-#define STRATA_SHADERS_STAMP "8af33f2c15bb065c"
+#define STRATA_SHADERS_STAMP "e482d1b4da2e84ba"
 #include "strata_shaders.h"
 #include "strata_particles.h"
 #include "strata_alloc.h"
@@ -333,6 +333,7 @@ static struct {
     int ok, swap_ok, resized;
     int vsync_off;                 /* ask for the immediate present mode */
     double pass_ms[4];             /* last frame's GPU ms by pass: before the geometry, geometry, light, after the light */
+    double light_split[2];         /* the light pass's ms in two: the figure shadow map and the gather pass (its rays), then spreading them over the screen */
     double stat[6];                /* last frame: CPU ms, ms waiting, draw calls, GPU ms, translucent chunks drawn, microseconds ordering them */
     /* a chunk being assembled by sv_chunk_begin .. sv_chunk_commit */
     struct { int64_t slot; int32_t origin[3]; uint32_t *part[4]; uint32_t n[4], cap[4], ord[8]; int open; int body; int fig; int32_t rp; int level; } stage;
@@ -2912,6 +2913,7 @@ double sv_stat(int64_t which) {
     if (which == 34) return (double)g.meet_total;
     if (which == 35) return (double)g.ovl_dropped;
     if (which >= 36 && which <= 39) return (double)g.churn_last[which - 36];
+    if (which == 40 || which == 41) return g.light_split[which - 40];   /* the light pass in two: tracing (with the figure shadow map), spreading */
     return (which >= 0 && which < 6) ? g.stat[which] : -1.0;
 }
 int64_t sv_drawn_chunks(void) { return g.drawn_chunks; }
@@ -4388,6 +4390,11 @@ int64_t sv_frame(void) {
                 g.pass_ms[1] = (double)(tp[1] - tp[0]) * ms;   /* geometry, figures included */
                 g.pass_ms[2] = (double)(tp[2] - tp[1]) * ms;   /* figure shadow map and the light pass */
                 g.pass_ms[3] = (double)(ts[1] - tp[2]) * ms;   /* water, composite, translucent, particles, interface */
+                uint64_t t7 = 0;
+                if (vkGetQueryPoolResults(g.dev, g.qpool, q0 + 7, 1, sizeof t7, &t7, sizeof t7, VK_QUERY_RESULT_64_BIT) == VK_SUCCESS && t7 >= tp[1] && t7 <= tp[2]) {
+                    g.light_split[0] = (double)(t7 - tp[1]) * ms;   /* figure shadow map and the gather pass */
+                    g.light_split[1] = (double)(tp[2] - t7) * ms;   /* the light pass: spreading the gathered light, and shading */
+                }
             }
         }
         fg.shadow_ms = 0.0;
@@ -4421,7 +4428,8 @@ int64_t sv_frame(void) {
     invert4(g.ubo_map, g.ubo_map + UBO_INV_VP);
     memcpy(g.ubo_map + UBO_PREV_VP, g.prev_vp, sizeof g.prev_vp);
     memcpy(g.prev_vp, g.ubo_map, sizeof g.prev_vp);
-    g.ubo_map[UBO_LIGHT + 0] = (float)g.light_mode; g.ubo_map[UBO_LIGHT + 1] = (float)g.time_s;
+    g.ubo_map[UBO_LIGHT + 0] = (float)g.light_mode;
+ g.ubo_map[UBO_LIGHT + 1] = (float)g.time_s;
     g.ubo_map[UBO_LIGHT + 2] = (float)(g.frame_no & 0xFFFFFF);
     /* STRATA_SKY_FULL=1: the sky light sampled on the schedule of before the fast paths (every new pixel each frame, a settled one in four),
      * sent as a negative ray count; the stored pictures (scripts/golden.sh) are taken this way, so they compare at frame 60 as they did */
@@ -4509,7 +4517,7 @@ int64_t sv_frame(void) {
         memcpy(F->sea_map, g.sea_cells, (size_t)SV_SEA_CELLS * 4);
         F->sea_version = g.sea_version;
     }
-    memcpy(F->ubo_map, g.ubo_map, UBO_FLOATS * 4);
+        memcpy(F->ubo_map, g.ubo_map, UBO_FLOATS * 4);
     g.churn[3] += F->npending;
     for (uint32_t i = 0; i < F->npending; i++) {
         uint32_t slot = F->pending[i];
@@ -4609,6 +4617,7 @@ int64_t sv_frame(void) {
     vkCmdBindPipeline(F->cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g.pipe_gather);
     vkCmdDraw(F->cmd, 3, 1, 0, 0);
     vkCmdEndRenderPass(F->cmd);
+    if (g.have_ts) vkCmdWriteTimestamp(F->cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, g.qpool, q0 + 7);   /* the rays traced; the spreading follows */
 
     /* 2b. light: one full-screen triangle reads those buffers and what the gather pass found, and writes the lit image */
     VkRenderPassBeginInfo lbi = { .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO, .renderPass = g.pass_l, .framebuffer = g.fb_l[g.frame_no % SV_FRAMES],
