@@ -27,6 +27,9 @@ layout(set = 0, binding = 0) uniform U {
     vec4 rain;       // xyz the direction rain falls (unit, metres), w the rain's own clock in seconds
     vec4 cloud;      // sv_set_cloud_shadows: x how many blobs, y how much of the sun a blob's middle takes 0..1
     vec4 blobs[48];  // the clouds' shadow blobs: xyz a centre (metres), w its radius
+    vec4 sea;        // sv_set_sea: xy the wind's direction along x and z (unit), z the open sea's wave height in metres (0: no sea state), w whitecaps 0..1
+    vec4 sea_map;    // sv_set_sea_map: xy its low corner, z its cell size (metres)
+    vec4 sea_grid;   // its cells across and down (x 0: no map)
 } u;
 
 // The cutaway: is the surface at p (metres) hidden this frame? Above the

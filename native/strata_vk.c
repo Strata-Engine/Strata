@@ -28,7 +28,7 @@
 /* Rewritten by build_shaders.sh whenever the shaders change: forge decides
  * whether to recompile this file from its text alone, not from the headers
  * it includes (GAPS S14). */
-#define STRATA_SHADERS_STAMP "420ab2bb6350a84b"
+#define STRATA_SHADERS_STAMP "2cf332a6e7c92f38"
 #include "strata_shaders.h"
 #include "strata_particles.h"
 #include "strata_alloc.h"
@@ -137,6 +137,7 @@ typedef struct {
     VkBuffer lhead, lwords, ltodo; VkDeviceMemory lhead_mem, lwords_mem, ltodo_mem; int32_t *lhead_map; uint32_t *lwords_map, *ltodo_map;
     uint32_t *src_ver; uint32_t src_epoch, ntodo; int reach_used; uint32_t mask_used[8];
     uint32_t lamp_version;         /* the lamp lists this frame's copy holds */
+    VkBuffer sea; VkDeviceMemory sea_mem; float *sea_map; uint32_t sea_version;   /* the sea map (binding 44), and which version of it this copy holds */
     int moving_lamps;              /* whether its copy lists any moving lamp */
     uint32_t lamp_cap;             /* the cap its standing lists were laid out for */
     uint32_t *cell_ver;            /* per cell (SV_MAX_CELLS of them): the lamp version (g.cell_lamp_ver + g.lamp_version) its list was built from */
@@ -327,6 +328,7 @@ static struct {
     uint64_t frame_no;         /* frames begun; frame_no % SV_FRAMES picks the Frame */
     VkBuffer giga; VkDeviceMemory giga_mem; uint32_t *giga_map; uint32_t quad_cap;
     float *ubo_map;                /* the uniform block as the CPU keeps it; each Frame has the GPU's copy */
+    float *sea_cells; uint32_t sea_version;   /* the sea map as the CPU keeps it (sv_set_sea_map), bumped on every change */
     uint32_t rebuilds;             /* swapchain rebuilds so far */
     int ok, swap_ok, resized;
     int vsync_off;                 /* ask for the immediate present mode */
@@ -354,7 +356,11 @@ static struct {
 /* The uniform block, in floats (native/shaders/ubo.glsl): vp 0, sun 16,
  * sky 20, fog 24, eye 28, misc 32 (ints), inv_vp 36, prev_vp 52, light 68,
  * sun colour 72, light volume size 76 (ints). */
-#define UBO_FLOATS 376
+#define UBO_SEA 376            /* vec4: x, z the wind's direction (unit), the open sea's wave height in metres (0: no sea state), whitecaps 0..1 (sv_set_sea) */
+#define UBO_SEA_MAP 380        /* vec4: x0, z0 the sea map's low corner and its cell size, in metres (sv_set_sea_map) */
+#define UBO_SEA_GRID 384       /* vec4: the sea map's cells across and down (0: no map) */
+#define SV_SEA_CELLS 16384     /* the sea map's cells at most */
+#define UBO_FLOATS 388
 #define UBO_CLOUD 180          /* vec4: x blobs, y their darkness (sv_set_cloud_shadows) */
 #define UBO_BLOBS 184          /* 48 vec4: the clouds' shadow blobs, centre and radius in metres */
 #define SV_CLOUD_BLOBS 48
@@ -2352,7 +2358,7 @@ int64_t sv_open_slots(int64_t w, int64_t h, int64_t capture_mouse, int64_t quad_
     g.swap_ok = 1;
 
     /* one set layout for every pipeline: 0 uniforms, 1 chunk table, 2 indirect commands, 3 cull statistics, 4 command -> slot */
-    VkDescriptorSetLayoutBinding dslb[44] = {
+    VkDescriptorSetLayoutBinding dslb[45] = {
         { .binding = 0, .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, .descriptorCount = 1,
           .stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT },
         { .binding = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1,
@@ -2418,8 +2424,10 @@ int64_t sv_open_slots(int64_t w, int64_t h, int64_t capture_mouse, int64_t quad_
         /* 41..43 what lamps.comp builds the lamp lists from: per cell its chunk and lamps, and the cells to build */
         { .binding = 41, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT },
         { .binding = 42, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT },
-        { .binding = 43, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT } };
-    VkDescriptorSetLayoutCreateInfo dsli = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 44, .pBindings = dslb };
+        { .binding = 43, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT },
+        /* 44 the sea map: how exposed each cell of open water is to the wind (sv_set_sea_map) */
+        { .binding = 44, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT } };
+    VkDescriptorSetLayoutCreateInfo dsli = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 45, .pBindings = dslb };
     VKOK(vkCreateDescriptorSetLayout(g.dev, &dsli, NULL, &g.dsl), "descriptor set layout");
     /* where the call's range starts in draw_slot, and per-call flags (bit 0: cutout, bit 1: a figure);
      * a figure piece's draw adds eight words more (fig_record) */
@@ -2514,7 +2522,7 @@ int64_t sv_open_slots(int64_t w, int64_t h, int64_t capture_mouse, int64_t quad_
     g.blocks_map = map;
     memset(g.blocks_map, 0, (size_t)SV_MAX_BLOCKS * 32);
     for (uint32_t t = 0; t < 65536; t++) ((uint32_t *)g.blocks_map)[SV_TOP_OF + t] = t;
-    VkDescriptorPoolSize dps[4] = { { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, SV_FRAMES }, { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 22 * SV_FRAMES }, { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 17 * SV_FRAMES },
+    VkDescriptorPoolSize dps[4] = { { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, SV_FRAMES }, { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 23 * SV_FRAMES }, { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 17 * SV_FRAMES },
                                     { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 4 * SV_FRAMES } };
     VkDescriptorPoolCreateInfo dpi = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = SV_FRAMES, .poolSizeCount = 4, .pPoolSizes = dps };
     VKOK(vkCreateDescriptorPool(g.dev, &dpi, NULL, &g.dpool), "descriptor pool");
@@ -2539,6 +2547,8 @@ int64_t sv_open_slots(int64_t w, int64_t h, int64_t capture_mouse, int64_t quad_
         F->table_map = map; memset(F->table_map, 0, (size_t)g.slot_cap * sizeof(ChunkEntry));
         if (!make_buffer((VkDeviceSize)g.slot_cap * SV_MOTION_WORDS * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &F->motion, &F->motion_mem, &map)) return 0;
         F->motion_map = map; memset(F->motion_map, 0, (size_t)g.slot_cap * SV_MOTION_WORDS * 4);
+        if (!make_buffer((VkDeviceSize)SV_SEA_CELLS * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &F->sea, &F->sea_mem, &map)) return 0;
+        F->sea_map = map; memset(F->sea_map, 0, (size_t)SV_SEA_CELLS * 4); F->sea_version = 0;
         if (!make_buffer((VkDeviceSize)SV_LIGHT_PER_FRAME * SV_LIGHT_WRITE_BYTES, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, &F->lstage, &F->lstage_mem, &map)) return 0;
         F->lstage_map = map;
         if (!make_buffer((VkDeviceSize)SV_TABLE_ROWS * sizeof(BodyRow), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &F->btable, &F->btable_mem, &map)) return 0;
@@ -2573,6 +2583,10 @@ int64_t sv_open_slots(int64_t w, int64_t h, int64_t capture_mouse, int64_t quad_
             wds[b] = (VkWriteDescriptorSet){ .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = F->dset, .dstBinding = b, .descriptorCount = 1,
                 .descriptorType = b == 0 ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &bufs[b] };
         vkUpdateDescriptorSets(g.dev, 6, wds, 0, NULL);
+        VkDescriptorBufferInfo sb = { F->sea, 0, VK_WHOLE_SIZE };
+        VkWriteDescriptorSet sw = { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = F->dset, .dstBinding = 44, .descriptorCount = 1,
+            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &sb };
+        vkUpdateDescriptorSets(g.dev, 1, &sw, 0, NULL);
         VkDescriptorBufferInfo mb = { F->motion, 0, VK_WHOLE_SIZE };
         VkWriteDescriptorSet mw = { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = F->dset, .dstBinding = 38, .descriptorCount = 1,
             .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &mb };
@@ -4174,6 +4188,36 @@ void sv_set_weather(double overcast, double wet, double flash, double rain) {
  * [blobs]: a centre and a radius in metres. Ground the sun reaches through a
  * blob loses up to [darkness] (0..1) of the sun's light, softly toward the
  * blob's edge. n 0 casts none, the default. */
+/* The sea state ocean quads are drawn in: the wind's direction along x and z
+ * (any length), the open sea's wave height in metres, and whitecaps 0..1.
+ * A height of 0 (the default) is no sea state: the ocean as it always was. */
+void sv_set_sea(double wind_x, double wind_z, double height, double whitecaps) {
+    if (!g.ok) return;
+    float l = (float)sqrt(wind_x * wind_x + wind_z * wind_z);
+    float *v = g.ubo_map + UBO_SEA;
+    v[0] = l < 1e-6f ? 1.0f : (float)wind_x / l;
+    v[1] = l < 1e-6f ? 0.0f : (float)wind_z / l;
+    v[2] = height > 0.0 ? (float)height : 0.0f;
+    v[3] = whitecaps < 0.0 ? 0.0f : (whitecaps > 1.0 ? 1.0f : (float)whitecaps);
+}
+
+/* The sea map: [w] x [h] cells (x fastest) of how exposed open water is to
+ * the wind, 0..1, the grid's low corner at (x0, z0) metres with [cell]-metre
+ * cells. Ocean quads outside it count as fully exposed. 0 when the grid is
+ * empty, too large, has no cell size, or [cells] is short. */
+int64_t sv_set_sea_map(void *cells, int64_t w, int64_t h, double x0, double z0, double cell) {
+    if (!g.ok || !cells || w < 1 || h < 1 || w * h > SV_SEA_CELLS || cell <= 0.0 || narr_len(cells) < w * h) return 0;
+    if (!g.sea_cells) g.sea_cells = calloc(SV_SEA_CELLS, sizeof(float));
+    if (!g.sea_cells) return 0;
+    memcpy(g.sea_cells, narr_data(cells), (size_t)(w * h) * sizeof(float));
+    g.sea_version++;
+    float *m = g.ubo_map + UBO_SEA_MAP;
+    m[0] = (float)x0; m[1] = (float)z0; m[2] = (float)cell; m[3] = 0.0f;
+    float *gr = g.ubo_map + UBO_SEA_GRID;
+    gr[0] = (float)w; gr[1] = (float)h; gr[2] = 0.0f; gr[3] = 0.0f;
+    return 1;
+}
+
 void sv_set_cloud_shadows(void *blobs, int64_t n, double darkness) {
     if (!g.ok) return;
     int k = n < 0 ? 0 : (n > SV_CLOUD_BLOBS ? SV_CLOUD_BLOBS : (int)n);
@@ -4461,6 +4505,10 @@ int64_t sv_frame(void) {
     bodies_to_frame(F);
     lamps_to_frame(F);
     g.ubo_map[UBO_WATER + 5] = g.water_mem ? 1.0f : 0.0f;
+    if (g.sea_cells && F->sea_version != g.sea_version) {
+        memcpy(F->sea_map, g.sea_cells, (size_t)SV_SEA_CELLS * 4);
+        F->sea_version = g.sea_version;
+    }
     memcpy(F->ubo_map, g.ubo_map, UBO_FLOATS * 4);
     g.churn[3] += F->npending;
     for (uint32_t i = 0; i < F->npending; i++) {

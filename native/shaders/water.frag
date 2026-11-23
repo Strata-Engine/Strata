@@ -20,6 +20,8 @@ layout(set = 0, binding = 29, r32f) uniform readonly image2D wd_prev;
 layout(set = 0, binding = 30, rgba16f) uniform writeonly image2D wh_now;
 layout(set = 0, binding = 31, r32f) uniform writeonly image2D wd_now;
 layout(std430, set = 0, binding = 21) readonly buffer Movers { vec4 boxes[]; } movers;
+// the sea map (sv_set_sea_map): how exposed each cell of open water is to the wind, 0..1
+layout(std430, set = 0, binding = 44) readonly buffer SeaMap { float v[]; } sea_map_buf;
 
 
 // ── Ocean ───────────────────────────────────────────────────────────────
@@ -30,6 +32,19 @@ float ocean_noise(vec2 p) {
     vec2 i = floor(p), f = fract(p);
     f = f * f * (3.0 - 2.0 * f);
     return mix(mix(ocean_hash(i), ocean_hash(i + vec2(1, 0)), f.x), mix(ocean_hash(i + vec2(0, 1)), ocean_hash(i + vec2(1, 1)), f.x), f.y);
+}
+// How exposed open water at xz (metres) is to the wind: the sea map's cells
+// bilinearly, clamped at its edges; fully exposed when there is no map.
+float sea_exposure(vec2 xz) {
+    int w = int(u.sea_grid.x), h = int(u.sea_grid.y);
+    if (w < 1 || h < 1) return 1.0;
+    vec2 g = (xz - u.sea_map.xy) / u.sea_map.z - 0.5;
+    vec2 lo = clamp(floor(g), vec2(0.0), vec2(w - 1, h - 1));
+    vec2 hi = min(lo + 1.0, vec2(w - 1, h - 1));
+    vec2 f = clamp(g - lo, 0.0, 1.0);
+    float a = sea_map_buf.v[int(lo.y) * w + int(lo.x)], b = sea_map_buf.v[int(lo.y) * w + int(hi.x)];
+    float c = sea_map_buf.v[int(hi.y) * w + int(lo.x)], d = sea_map_buf.v[int(hi.y) * w + int(hi.x)];
+    return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
 }
 // The depth in metres here, from the corners.
 float ocean_depth() {
