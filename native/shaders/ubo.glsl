@@ -13,13 +13,13 @@ layout(set = 0, binding = 0) uniform U {
     vec4 sun_color;  // rgb the sun's colour; w 1 when mirror rays are on
     ivec4 vol;       // xyz the light volume's size in chunks; w how many past samples a pixel may lean on
     vec4 edit_lo;    // xyz the low corner (voxels) of what an edit just changed; w 1 while it settles
-    vec4 edit_hi;    // xyz its high corner
+    vec4 edit_hi;    // xyz its high corner; w 1 when it changed only what glows or a colour, not what stops the sun
     ivec4 bodies;    // x moving bodies' boxes in the movers buffer, y bodies in the body table
     vec4 water;      // the liquid the eye is under: rgb its colour, w how fast it swallows light per metre (0: the eye is in air)
     vec4 water2;     // x the height of that liquid's surface (metres); y 1 when water may keep its memory between frames (storage images); z 1 when there are lamps for the light pass to aim at
     mat4 sun_vp;     // the plain figures' shadow map: world (metres) to its clip space, orthographic from the sun, OpenGL conventions
     vec4 fshadow;    // x 1 when the map holds figures this frame (else it is not read), y one texel in its 0..1 coordinates, z depth per metre toward the sun
-    vec4 trace;      // x screen pixels along each side of one the gather pass traces for (1 or 2)
+    vec4 trace;      // x screen pixels along each side of one the gather pass traces for (1..4); y the motion clock; z, w how many past samples the sun's and the sky's light may lean on (64: all, a sun standing still)
     vec4 cut[9];     // the cutaway (Strata.Overlay.cut_floats): has height, y, x0, z0, x1, z1, capsules, 0, then four capsules of 7 floats
 } u;
 

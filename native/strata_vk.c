@@ -27,7 +27,7 @@
 /* Rewritten by build_shaders.sh whenever the shaders change: forge decides
  * whether to recompile this file from its text alone, not from the headers
  * it includes (GAPS S14). */
-#define STRATA_SHADERS_STAMP "a80d1c93ee360292"
+#define STRATA_SHADERS_STAMP "6c0380c913143049"
 #include "strata_shaders.h"
 #include "strata_particles.h"
 #include "strata_alloc.h"
@@ -222,7 +222,7 @@ static struct {
     int vn, vnv;                   /* its size in chunks: vn across (x and z), vnv up */
     VkBuffer ltable; VkDeviceMemory ltable_mem; int32_t *ltable_map;
     float *tex_mean; uint32_t tex_mean_n;   /* each texture layer's mean colour, linear, three floats a layer */
-    struct LightCell { int32_t chunk[3]; int valid; int uniform; uint32_t hash, solid; int nlamps; int32_t *lamps; } *cells;   /* lamps: nlamps glowing voxels, 4 ints each (x, y, z voxels, class) */
+    struct LightCell { int32_t chunk[3]; int valid; int uniform; uint32_t hash, solid, shade; int nlamps; int32_t *lamps; } *cells;   /* lamps: nlamps glowing voxels, 4 ints each (x, y, z voxels, class) */
     uint32_t lamp_version;        /* bumped whenever the lamp lists change */
     int32_t moving_lamps[SV_MOVING_LAMPS][4];
     int moving_lamp_count, headlights;
@@ -230,8 +230,10 @@ static struct {
     struct LightWrite { int cell[3]; int32_t chunk[3]; int valid; int uniform; int edit; unsigned char *bytes; } *lq;   /* writes waiting to be copied in, oldest first */
     uint32_t nlq, lq_cap;
     int32_t edit_lo[3], edit_hi[3];   /* the chunks an edit changed, while light_edit counts down */
-    int32_t last_lo[3], last_hi[3]; int last_edit;   /* the chunks the last frame's edits changed, if any */
-    int light_relax;               /* frames left in which memory is capped short: the sun moved */
+    int32_t last_lo[3], last_hi[3]; int last_edit;   /* the chunks the last frame's edits changed, if any (last_edit 1: they changed shadows; 2: glow or colour alone) */
+    int edit_kind;                 /* the same, of the box in edit_lo and edit_hi */
+    float sun_col_seen[3];         /* the sun's colour last frame */
+    float sun_caps[4], sky_caps[16];   /* how many past samples the sun's and the sky's light could lean on in each of the last frames (64: all) */
     float sun_seen[3];             /* the sun direction the light pass's memory was gathered under */
     int light_edit;                /* frames left in which the light pass must lean on new samples: an edit just reached the volume */
     unsigned char *stage_light; int stage_light_n;   /* the light bytes of the chunk being assembled */
@@ -332,7 +334,7 @@ static struct {
  * sun colour 72, light volume size 76 (ints). */
 #define UBO_FLOATS 160
 #define UBO_CUT 124           /* 9 vec4: the cutaway (Strata.Overlay.cut_floats) */
-#define UBO_TRACE 120         /* vec4: x screen pixels along each side of one the gather pass traces for */
+#define UBO_TRACE 120         /* vec4: x screen pixels along each side of one the gather pass traces for; y the motion clock; z, w how many past samples the sun's and the sky's light may lean on (64: all) */
 #define UBO_SUN_VP 100         /* mat4: world to the figure shadow map's clip space */
 #define UBO_FSHADOW 116        /* vec4: x the map holds figures this frame, y a texel in its 0..1 coordinates, z its depth per metre */
 #define UBO_BODIES 88          /* ints: x moving bodies' boxes in the movers buffer, y bodies in the body table */
@@ -1201,20 +1203,25 @@ static void light_queue(const int32_t *chunk, int valid, int uniform, unsigned c
     /* nothing to do when the cell already holds exactly this: an air chunk re-uploaded, say */
     if (valid == c->valid && (!valid || same_owner) && !bytes && uniform >= 0 && c->uniform == uniform) return;
     /* the same voxels for the chunk the cell already holds (a neighbour's edit remeshed it): nothing to write */
-    /* Two fingerprints of the voxels: all of them, and only those that block
-     * or emit light. A see-through block (water) does neither, so water
-     * moving changes the first and not the second, and the light pass keeps
-     * what it remembers. */
-    uint32_t hash = 2166136261u, solid = 2166136261u;
+    /* Three fingerprints of the voxels: all of them; only those that block
+     * or emit light; and only what stops the sun's rays (a full block as
+     * such, a cutout block by its class, whose texture is its shape). A
+     * see-through block (water) is in neither of the last two, so water
+     * moving changes the first alone and the light pass keeps what it
+     * remembers. A lamp lit or put out, or a block recoloured, changes the
+     * second and not the third: the shadows stand, the light round it does not. */
+    uint32_t hash = 2166136261u, solid = 2166136261u, shade = 2166136261u;
     if (bytes) for (int i = 0; i < 32768; i++) {
         unsigned char c = bytes[i];
         hash = (hash ^ c) * 16777619u;
         const int32_t *row = g.ltable_map ? g.ltable_map + c * 8 : NULL;
         int matters = row && (row[0] == 1 || row[0] == 2 || row[0] == 4 || row[3] != 0);
         solid = (solid ^ (matters ? c : 0)) * 16777619u;
+        shade = (shade ^ (row ? (row[0] == 1 ? 1u : row[0] == 2 ? 256u + c : 0u) : 0u)) * 16777619u;
     } else if (uniform > 0 && g.ltable_map) {
         const int32_t *row = g.ltable_map + uniform * 8;
         solid = (row[0] == 1 || row[0] == 2 || row[0] == 4 || row[3] != 0) ? (uint32_t)uniform * 16777619u : 2166136261u;
+        shade = row[0] == 1 ? 16777619u : row[0] == 2 ? (256u + (uint32_t)uniform) * 16777619u : 2166136261u;
     }
     if (valid && same_owner && bytes && c->uniform < 0 && c->hash == hash) { free(bytes); return; }
     /* the chunk's glowing voxels, at most SV_CHUNK_LAMPS of them, spread over all it has */
@@ -1242,8 +1249,9 @@ static void light_queue(const int32_t *chunk, int valid, int uniform, unsigned c
             g.lamp_version++;
         }
     }
-    /* new voxels for a chunk the volume already held: an edit, whose lighting must be re-estimated */
-    int edit = valid && same_owner && c->solid != solid;
+    /* new voxels for a chunk the volume already held: an edit, whose lighting must be re-estimated.
+     * 1: what stops the sun changed, so shadows and the light round it; 2: only what glows or its colour, so the light round it alone */
+    int edit = valid && same_owner ? (c->shade != shade ? 1 : (c->solid != solid ? 2 : 0)) : 0;
     if (g.nlq == g.lq_cap) {
         uint32_t cap = g.lq_cap ? g.lq_cap * 2 : 256;
         struct LightWrite *grown = realloc(g.lq, cap * sizeof *grown);
@@ -1255,7 +1263,7 @@ static void light_queue(const int32_t *chunk, int valid, int uniform, unsigned c
     w->chunk[0] = chunk[0]; w->chunk[1] = chunk[1]; w->chunk[2] = chunk[2];
     w->valid = valid; w->uniform = bytes ? -1 : uniform; w->bytes = bytes; w->edit = edit;
     c->chunk[0] = chunk[0]; c->chunk[1] = chunk[1]; c->chunk[2] = chunk[2];
-    c->valid = valid; c->uniform = w->uniform; c->hash = hash; c->solid = solid;
+    c->valid = valid; c->uniform = w->uniform; c->hash = hash; c->solid = solid; c->shade = shade;
 }
 
 /* Is light class [c] see-through (kind 3: water, glass)? Rays that pass
@@ -2293,6 +2301,8 @@ int64_t sv_open_slots(int64_t w, int64_t h, int64_t capture_mouse, int64_t quad_
     g.giga_map = map;
     g.ubo_map = calloc(UBO_FLOATS, sizeof(float));
     g.sky_rays = 2; g.reflections = 1; g.light_mode = 4;
+    for (int k = 0; k < 4; k++) g.sun_caps[k] = 64.0f;
+    for (int k = 0; k < 16; k++) g.sky_caps[k] = 64.0f;
     if (g.ubo_map) {
         /* light mode 0's flat sky (sRGB 0.53, 0.72, 0.92) and ambient share; a sun until the game sets one */
         g.ubo_map[19] = 0.30f;
@@ -4075,14 +4085,17 @@ int64_t sv_frame(void) {
        * box was last empty: with edits every frame (fire, freezing, flowing water) a
        * box kept growing came to cover the whole field, and every pixel in it kept
        * sampling afresh with a memory of 2, so shadows stayed grainy (13 November) */
+      /* an edit that changed only what glows, or a colour, matters only where sky rays are traced: with none (light mode 8, or no rays asked
+       * for) nothing the light pass remembers depends on it */
+      int sky_traced = g.light_mode >= 4 && g.light_mode != 8 && g.sky_rays > 0;
       { int32_t lo[3], hi[3]; int any = 0;
-        for (uint32_t i = 0; i < g.nlq && i < SV_LIGHT_PER_FRAME; i++) if (g.lq[i].edit) {
+        for (uint32_t i = 0; i < g.nlq && i < SV_LIGHT_PER_FRAME; i++) if (g.lq[i].edit == 1 || (g.lq[i].edit == 2 && sky_traced)) {
             const int32_t *ch = g.lq[i].chunk;
             for (int k = 0; k < 3; k++) {
                 if (!any || ch[k] < lo[k]) lo[k] = ch[k];
                 if (!any || ch[k] > hi[k]) hi[k] = ch[k];
             }
-            any = 1;
+            if (!any || g.lq[i].edit < any) any = g.lq[i].edit;
         }
         if (any) {
             for (int k = 0; k < 3; k++) {
@@ -4090,24 +4103,46 @@ int64_t sv_frame(void) {
                 g.edit_hi[k] = g.last_edit ? (hi[k] > g.last_hi[k] ? hi[k] : g.last_hi[k]) : hi[k];
                 g.last_lo[k] = lo[k]; g.last_hi[k] = hi[k];
             }
+            g.edit_kind = g.last_edit == 1 ? 1 : any;
             g.light_edit = 2;
         }
-        g.last_edit = any;
+        g.last_edit = any; }
+      /* A sun that moves: what the light pass remembers was gathered under another sun, so it leans on less of it, the less the faster
+       * the sun goes. A settled pixel traces the sun one frame in four and the sky one in sixteen; its memory is kept to the samples
+       * gathered while the sun crossed 3 degrees (shadows) or 20 (sky light, which is soft), or while its colour changed by a quarter.
+       * The shortest of the last 4 frames' (16 for the sky) holds, so that after one jump every pixel takes a sample before memory grows
+       * again. Before, any move wiped the memory to 2 samples and made every pixel trace every frame: with a sun that moves each frame
+       * (a game's clock running) the light pass never settled. */
+      { const float *sn = g.ubo_map + 16, *sc = g.ubo_map + UBO_SUN_COLOR;
+        float sun_cap = 64.0f, sky_cap = 64.0f;
+        float had = g.sun_seen[0] * g.sun_seen[0] + g.sun_seen[1] * g.sun_seen[1] + g.sun_seen[2] * g.sun_seen[2];
+        if (had > 0.0f) {
+            float cx = sn[1] * g.sun_seen[2] - sn[2] * g.sun_seen[1], cy = sn[2] * g.sun_seen[0] - sn[0] * g.sun_seen[2], cz = sn[0] * g.sun_seen[1] - sn[1] * g.sun_seen[0];
+            float sine = sqrtf(cx * cx + cy * cy + cz * cz), dotp = sn[0] * g.sun_seen[0] + sn[1] * g.sun_seen[1] + sn[2] * g.sun_seen[2];
+            float deg = dotp <= 0.0f ? 180.0f : asinf(sine > 1.0f ? 1.0f : sine) * 57.29578f;
+            float shift = 0.0f;
+            for (int k = 0; k < 3; k++) { float dc = fabsf(sc[k] - g.sun_col_seen[k]) / (fabsf(g.sun_col_seen[k]) > 0.05f ? fabsf(g.sun_col_seen[k]) : 0.05f); if (dc > shift) shift = dc; }
+            if (deg > 1.0e-4f) { sun_cap = 3.0f / (4.0f * deg); sky_cap = 20.0f / (16.0f * deg); }
+            if (shift > 1.0e-5f && 0.25f / (16.0f * shift) < sky_cap) sky_cap = 0.25f / (16.0f * shift);
+            if (sun_cap > 64.0f) sun_cap = 64.0f;
+            if (sky_cap > 64.0f) sky_cap = 64.0f;
+        }
+        memcpy(g.sun_seen, sn, sizeof g.sun_seen); memcpy(g.sun_col_seen, sc, sizeof g.sun_col_seen);
+        g.sun_caps[g.frame_no & 3] = sun_cap; g.sky_caps[g.frame_no & 15] = sky_cap;
+        for (int k = 0; k < 4; k++) if (g.sun_caps[k] < sun_cap) sun_cap = g.sun_caps[k];
+        for (int k = 0; k < 16; k++) if (g.sky_caps[k] < sky_cap) sky_cap = g.sky_caps[k];
+        g.ubo_map[UBO_TRACE + 2] = sun_cap; g.ubo_map[UBO_TRACE + 3] = sky_cap;
         if (getenv("STRATA_LIGHTLOG")) {
-            static int frames, edited, relaxed; static int64_t vol_sum;
-            frames++; if (g.light_edit > 0) { edited++; vol_sum += (int64_t)(g.edit_hi[0] - g.edit_lo[0] + 1) * (g.edit_hi[1] - g.edit_lo[1] + 1) * (g.edit_hi[2] - g.edit_lo[2] + 1); }
-            if (g.light_relax > 0 || g.hist_reset > 0) relaxed++;
-            if (frames == 240) { fprintf(stderr, "light: of 240 frames %d had an edit box (mean %.1f chunks), %d a relaxed or reset memory\n", edited, edited ? (double)vol_sum / edited : 0.0, relaxed); frames = edited = relaxed = 0; vol_sum = 0; }
+            static int frames, edited, glow, moving; static int64_t vol_sum; static double cap_sum;
+            frames++; cap_sum += sun_cap; if (sun_cap < 64.0f) moving++;
+            if (g.light_edit > 0) { edited++; if (g.edit_kind == 2) glow++; vol_sum += (int64_t)(g.edit_hi[0] - g.edit_lo[0] + 1) * (g.edit_hi[1] - g.edit_lo[1] + 1) * (g.edit_hi[2] - g.edit_lo[2] + 1); }
+            if (frames == 240) { fprintf(stderr, "light: of 240 frames %d had an edit box (mean %.1f chunks; %d of glow or colour alone), %d a moving sun (mean sun memory %.1f samples)\n", edited, edited ? (double)vol_sum / edited : 0.0, glow, moving, cap_sum / 240.0); frames = edited = glow = moving = 0; vol_sum = 0; cap_sum = 0.0; }
         } }
-      /* a sun that has moved more than a fraction of a degree since the memory was gathered: lean on it less */
-      float sd = g.ubo_map[16] * g.sun_seen[0] + g.ubo_map[17] * g.sun_seen[1] + g.ubo_map[18] * g.sun_seen[2];
-      if (sd < 0.99999f) { g.light_relax = 2; memcpy(g.sun_seen, g.ubo_map + 16, sizeof g.sun_seen); }
-      vol[3] = g.hist_reset > 0 ? 0 : (g.light_relax > 0 ? 2 : 255);
+      vol[3] = g.hist_reset > 0 ? 0 : 255;
       float *ed = g.ubo_map + UBO_EDIT;
       for (int k = 0; k < 3; k++) { ed[k] = (float)(g.edit_lo[k] * 32); ed[4 + k] = (float)(g.edit_hi[k] * 32 + 32); }
-      ed[3] = g.light_edit > 0 ? 1.0f : 0.0f; ed[7] = 0.0f;
+      ed[3] = g.light_edit > 0 ? 1.0f : 0.0f; ed[7] = g.light_edit > 0 && g.edit_kind == 2 ? 1.0f : 0.0f;
       if (g.hist_reset > 0) g.hist_reset--;
-      if (g.light_relax > 0) g.light_relax--;
       if (g.light_edit > 0) g.light_edit--; }
     /* this Frame's fence has been waited on, so the GPU is done with its
      * copies: bring them up to date. From here to the next time this Frame

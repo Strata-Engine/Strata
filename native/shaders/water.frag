@@ -124,7 +124,8 @@ void main() {
             if (od > 0.0 && abs(od - pc.w) < 0.02 * pc.w + 0.05) { have = true; old = imageLoad(wh_prev, pp); }
         }
     }
-    bool settling = u.vol.w <= 2 || u.edit_lo.w > 0.5 && all(greaterThan(at, u.edit_lo.xyz - 32.0)) && all(lessThan(at, u.edit_hi.xyz + 32.0));
+    // an edit to what glows or a colour alone (edit_hi.w 1) leaves the sun's shadow on the water as it was
+    bool settling = u.vol.w <= 2 || u.edit_lo.w > 0.5 && u.edit_hi.w < 0.5 && all(greaterThan(at, u.edit_lo.xyz - 32.0)) && all(lessThan(at, u.edit_hi.xyz + 32.0));
     // the moving bodies' boxes, then the traced figures' (shadow and glow): any of them unsettles the remembered sun and mirror
     for (int b = 0; b < u.bodies.x && b < 144; b++)
         if (all(greaterThan(at, movers.boxes[2 * b].xyz)) && all(lessThan(at, movers.boxes[2 * b + 1].xyz))) settling = true;

@@ -2,8 +2,9 @@
 // u.trace.x along each side (strata_vk.c, STRATA_TRACE_FULL). It writes, for
 // the pixel at the top left of its block, the sky light and sun visibility
 // it has gathered over the frames (hist) and what they belong to (meta: r
-// samples behind them, g view depth, b face, a 1 where an edit or a moving
-// body made it start over, 2 in a moving figure's shadow box, for light mode 5).
+// sun samples behind them, g view depth, b face, a the sky samples behind
+// them; in light mode 5, a is instead 1 where an edit or a moving body made
+// it start over, 2 in a moving figure's shadow box).
 // The light pass (light.frag) spreads them over the full-sized screen.
 layout(location = 0) in vec2 v_uv;
 
@@ -40,21 +41,33 @@ void main() {
     float view_depth = (u.vp * vec4(world, 1.0)).w;
     vec4 pc = u.prev_vp * vec4(world, 1.0);
     vec2 puv = vec2(pc.x / pc.w * 0.5 + 0.5, 0.5 - pc.y / pc.w * 0.5);
-    float kept = 0.0;
+    float kept = 0.0, skyc = 0.0;   // samples behind the remembered sun visibility, and behind the remembered sky light
+    bool had = false;
     vec4 old = vec4(0.0);
     if (u.vol.w > 0 && pc.w > 0.0 && all(greaterThanEqual(puv, vec2(0.0))) && all(lessThan(puv, vec2(1.0)))) {
         vec4 om = texture(meta_prev, puv);
         if (abs(om.g - pc.w) < 0.02 * pc.w + 0.05 && int(om.b + 0.5) == face) {
             kept = min(om.r, float(u.vol.w));
+            skyc = mode == 5 ? kept * 0.25 : om.a;
             old = texture(hist_prev, puv);
+            had = true;
         }
     }
+    // A sun that moves (strata_vk.c): memory gathered under another sun is leaned on less, the less the faster the sun goes.
+    // It is shortened, not thrown away, and the pixel keeps its turn: one ray in four frames still follows the sun.
+    float sun_cap = u.trace.z, sky_cap = u.trace.w;
+    bool moving = sun_cap < 64.0;
+    if (moving) kept = min(kept, sun_cap);
+    skyc = min(skyc, sky_cap);
     // A pixel with a settled memory takes a new sample one frame in four, in
     // a pattern that moves round each 2 x 2 block; a pixel with little
     // memory, and every pixel while an edit settles, samples every frame.
     // An edit unsettles the pixels it can reach: those within 32 voxels of the chunks it changed.
     // So does a sun that has just moved, everywhere.
-    bool settling = u.vol.w <= 2 || u.edit_lo.w > 0.5 && all(greaterThan(at, u.edit_lo.xyz - 32.0)) && all(lessThan(at, u.edit_hi.xyz + 32.0));
+    // An edit that changed only what glows or a colour (edit_hi.w 1) unsettles the sky light alone: the shadows stand.
+    bool edited = u.edit_lo.w > 0.5 && all(greaterThan(at, u.edit_lo.xyz - 32.0)) && all(lessThan(at, u.edit_hi.xyz + 32.0));
+    bool settling = u.vol.w <= 2 || edited && u.edit_hi.w < 0.5;
+    bool sky_settling = edited && u.edit_hi.w > 0.5;
     // so does a body moving near it (its own surface, its shadow), or a glowing traced figure (the light it gives);
     // a moving traced figure's shadow box (w 1) samples the sun alone every frame, the sky keeping its schedule and memory
     bool shade_moves = false;
@@ -65,18 +78,26 @@ void main() {
     // and a figure that moved since the last frame, on its own surface
     if (figure && (fcode & 64) != 0) settling = true;
     if (settling) kept = min(kept, 2.0);
-    bool sample_now = kept < 4.0 || settling || (((px.x >> 3) & 1) + 2 * ((px.y >> 3) & 1)) == (frame & 3);
+    if (settling || sky_settling) skyc = min(skyc, 0.5);
+    // under a moving sun the turns go round single pixels, not 8-pixel tiles: neighbours of different ages blend (light.frag) where tiles would show
+    bool turn = moving ? ((px.x & 1) + 2 * (px.y & 1)) == (frame & 3) : (((px.x >> 3) & 1) + 2 * ((px.y >> 3) & 1)) == (frame & 3);
+    // little memory: under 4 samples; or, under a moving sun, under half of what it lets a pixel keep (half, because the cap
+    // changes from frame to frame with the sun's pace: against the cap itself every pixel was short whenever it rose)
+    bool sample_now = !had || kept < (moving ? 0.5 * min(4.0, sun_cap) : 4.0) || settling || turn;
     // sky light changes slowly and costs most (its rays go far): a settled pixel traces it one frame in sixteen, in a pattern that moves round each
     // 4 x 4 block of 8-pixel tiles, against the sun's one in four
     // A pixel with little memory, or one settling, traces sky light one frame in four, a pixel of each 2 x 2 block in turn (so a quarter of the
     // pixels newly in view trace it each frame, not all of them: turning the view had made the light pass three times as slow); until its first
     // sample it is lit by the flat sky term. The sun's ray, which is cheaper, it still traces every frame.
-    bool fresh = kept < 4.0 || settling;
+    // The sky's turn is its own, not a share of the sun's: taken only on the sun's turn, half the tiles' turns never came and their sky light
+    // stood still until an edit (the two patterns meet in half the tiles).
+    bool fresh = skyc < (sky_cap < 64.0 ? 0.5 * min(1.0, sky_cap) : 1.0) || settling || sky_settling;
     bool full_sky = u.light.w < 0.0;   // STRATA_SKY_FULL: the schedule of before (stored pictures)
-    bool sky_now = full_sky ? sample_now : fresh ? ((px.x & 1) + 2 * (px.y & 1)) == (frame & 3) : (((px.x >> 3) & 3) + 4 * ((px.y >> 3) & 3)) == (frame & 15);
+    bool sky_turn = moving ? ((px.x & 3) + 4 * (px.y & 3)) == (frame & 15) : (((px.x >> 3) & 3) + 4 * ((px.y >> 3) & 3)) == (frame & 15);
+    bool sky_now = full_sky ? sample_now : fresh ? ((px.x & 1) + 2 * (px.y & 1)) == (frame & 3) : sky_turn;
     float sun_vis = old.a;
     int rays = mode >= 4 && mode != 8 ? int(abs(u.light.w)) : 0;   // mode 8: no rays (light.frag, direct_lamps)
-    vec3 sky = rays > 0 ? (kept > 0.0 || u.light.w < 0.0 ? old.rgb : sky_flat(n)) : sky_flat(n);
+    vec3 sky = rays > 0 ? (had || full_sky ? old.rgb : sky_flat(n)) : sky_flat(n);
     float count = kept;
     if (sample_now || shade_moves) {
         float sun_now = sun_visible(at, n, sun_toward(rand2(px, frame, 0)));
@@ -87,11 +108,12 @@ void main() {
         if (shade_moves && abs(old.a - sun_now) > 0.6) ks = 0.0;
         // shadows lean on 64 past samples at most, so they follow a moving sun; sky light on all of them, since a small bright thing is found by few rays
         sun_vis = mix(old.a, sun_now, 1.0 / (min(ks, 64.0) + 1.0));
-        if (sample_now) {
-            if (rays > 0 && sky_now) sky = mix(old.rgb, sky_light(at, n, px, frame, rays), full_sky ? 1.0 / (kept + 1.0) : 1.0 / (min(kept, 255.0) / 4.0 + 1.0));
-            count = kept + 1.0;
-        }
+        if (sample_now) count = kept + 1.0;
+    }
+    if (rays > 0 && sky_now) {
+        sky = mix(old.rgb, sky_light(at, n, px, frame, rays), full_sky ? 1.0 / (kept + 1.0) : 1.0 / (skyc + 1.0));
+        skyc = min(skyc + 1.0, 64.0);
     }
     o_hist = vec4(sky, sun_vis);
-    o_meta = vec4(count, view_depth, float(face), settling ? 1.0 : (shade_moves ? 2.0 : 0.0));
+    o_meta = vec4(count, view_depth, float(face), mode == 5 ? (settling ? 1.0 : (shade_moves ? 2.0 : 0.0)) : skyc);
 }
