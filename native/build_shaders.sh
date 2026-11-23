@@ -28,6 +28,7 @@ build() { # file, then the shared files to put in front of it
 }
 build cull.comp
 build lamps.comp
+build sea.comp
 build collide.comp fx.glsl tiles.glsl trace.glsl
 build quad.vert
 build_named strata_quad_batch_vert quad.vert

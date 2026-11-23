@@ -22,6 +22,8 @@ layout(set = 0, binding = 31, r32f) uniform writeonly image2D wd_now;
 layout(std430, set = 0, binding = 21) readonly buffer Movers { vec4 boxes[]; } movers;
 // the sea map (sv_set_sea_map): how exposed each cell of open water is to the wind, 0..1
 layout(std430, set = 0, binding = 44) readonly buffer SeaMap { float v[]; } sea_map_buf;
+// the sea's height tile (sea.comp): 512 x 512 cells of 0.5 m, the waves' height for unit amplitude
+layout(std430, set = 0, binding = 45) readonly buffer SeaTile { float h[]; } sea_tile;
 
 
 // ── Ocean ───────────────────────────────────────────────────────────────
@@ -88,7 +90,7 @@ vec3 ocean_normal(vec3 world, float d) {
         g = vec2(0.0);
         for (int i = 0; i < 3; i++) {
             vec4 wv = u.sea_waves[i];
-            g += u.sea_amps[0][i] * 2.0 * wv.xy * cos(dot(q, wv.xy) * wv.z - t * wv.w + float(i) * 2.399);
+            g += u.sea_amps[0][i] * 2.0 * (wv.xy / wv.z) * cos(dot(q, wv.xy) - t * wv.w + float(i) * 2.399);
         }
         amp = (0.03 + 0.07 * s) * smoothstep(0.0, 3.0, d);
     }
@@ -107,16 +109,24 @@ vec3 ocean_normal(vec3 world, float d) {
 // five bands, shaded along each step and foaming where it steepens near the
 // crests, so the sea reads as moving voxels. It fades into clear water over
 // the shallows.
+// A column's height at p (metres) for amplitude amp: read from the tile when
+// sea.comp wrote it this frame, else summed here.
+float sea_column(vec2 p, float amp, float chop);
 float sea_height(vec2 p, float amp, float chop) {
     float h = 0.0;
     float t = u.light.y;
     float sharp = 1.0 + 1.5 * chop;
     for (int i = 0; i < 9; i++) {
         vec4 wv = u.sea_waves[i];
-        float s = sin(dot(p, wv.xy) * wv.z - wv.w * t + float(i) * 2.399);   // golden-angle phases, never in step
+        float s = sin(dot(p, wv.xy) - wv.w * t + float(i) * 2.399);   // golden-angle phases, never in step
         h += u.sea_amps[i >> 2][i & 3] * (2.0 * pow(0.5 * s + 0.5, sharp) - 1.0);  // sharper crests, wider troughs
     }
     return amp * h;
+}
+float sea_column(vec2 p, float amp, float chop) {
+    if (u.sea_grid.z < 0.5) return sea_height(p, amp, chop);
+    ivec2 c = ivec2(floor(p / 0.5)) & 511;   // the tile repeats every 256 m
+    return amp * sea_tile.h[c.y * 512 + c.x];
 }
 // The colour of water [t] of the way from trough (0) to crest (1), in five bands.
 vec3 sea_band(float t) {
@@ -222,13 +232,13 @@ void main() {
         float rise = u.eye.w * grow;
         vec2 cell = floor(v_world.xz / cs);
         vec2 c = (cell + 0.5) * cs;
-        float lv = floor(sea_height(c, amp, chop) / rise);
+        float lv = floor(sea_column(c, amp, chop) / rise);
         float t = clamp(lv * rise / (2.2 * max(amp, 0.05)) + 0.5, 0.0, 1.0);
         vec3 sea = sea_band(t) * (0.93 + 0.14 * ocean_hash(cell));   // each column a touch lighter or darker
         float detail = 1.0;
         if (detail > 0.0) {
-            float lx = floor(sea_height(c + vec2(cs, 0.0), amp, chop) / rise);
-            float lz = floor(sea_height(c + vec2(0.0, cs), amp, chop) / rise);
+            float lx = floor(sea_column(c + vec2(cs, 0.0), amp, chop) / rise);
+            float lz = floor(sea_column(c + vec2(0.0, cs), amp, chop) / rise);
             vec2 f = fract(v_world.xz / cs);
             // the riser up to a higher neighbour stands in shadow: a dark line along the step
             float shade = (lx > lv ? smoothstep(0.55, 1.0, f.x) : 0.0) + (lz > lv ? smoothstep(0.55, 1.0, f.y) : 0.0);
