@@ -51,6 +51,11 @@ vec3 ocean_normal(vec3 world, float d) {
     vec2 g = a * cos(dot(q, a) * k1 + t * 0.6) + 0.5 * b * cos(dot(q, b) * k2 + t * 1.1)
            + 0.25 * vec2(0.3, -0.95) * cos(dot(q, vec2(0.3, -0.95)) * 4.1 + t * 1.7);
     float amp = 0.06 * smoothstep(0.0, 3.0, d);
+    // each voxel's facet tilts its own way a little, slowly, so light breaks up rather than banding along the swells
+    vec2 cell = floor(world.xz / u.eye.w);
+    float phase = floor(t * 0.7);
+    vec2 jitter = vec2(ocean_hash(cell + phase), ocean_hash(cell.yx + phase + 7.0)) - 0.5;
+    g += jitter * 1.6;
     return normalize(vec3(-g.x * amp, 1.0, -g.y * amp));
 }
 
@@ -196,15 +201,18 @@ void main() {
                 mirror = far ? sky_color(mirror_dir(toward_eye, m, sign(dot(n, toward_eye)) * n)) : now ? reflected(at + sign(dot(n, toward_eye)) * n * 0.02, mirror_dir(toward_eye, m, sign(dot(n, toward_eye)) * n), int(floor(at.y - 0.001))) : old.rgb;
                 col = mix(col, mirror, share);
             }
-            col += sun_highlight(m, toward_eye, rough, sun_vis);
+            col += ocean ? 0.45 * sun_highlight(m, toward_eye, 0.16, sun_vis) : sun_highlight(m, toward_eye, rough, sun_vis);
             alpha = mix(alpha, 1.0, share);
         }
     }
     if (ocean && u.light.x >= 3.0) {
         vec3 m = ocean_normal(v_world, ocean_d);
         vec3 r = reflect(-toward, m);
-        // the sun glittering on the crests
-        col += u.sun_color.rgb * pow(max(dot(r, u.sun.xyz), 0.0), 400.0) * 2.5 * sun_vis;
+        // the sun glittering on the crests: voxel-sized sparkles that come and go, not a band
+        vec2 cell = floor(v_world.xz / u.eye.w);
+        float sparkle = step(0.72, ocean_hash(cell + floor(u.light.y * 3.0) * vec2(17.0, 31.0)));
+        float glare = pow(max(dot(r, u.sun.xyz), 0.0), 160.0);
+        col += u.sun_color.rgb * glare * (0.25 + 2.2 * sparkle) * sun_vis;
         if (u.sun.y < 0.0) {
             // no moon in the sky to trace: a glint where one would stand, opposite the sun, and water that never goes black
             vec3 moon = normalize(vec3(-u.sun.x, 0.45, -u.sun.z));
