@@ -221,13 +221,12 @@ void main() {
         float sparkle = step(0.72, ocean_hash(cell + floor(u.light.y * 3.0) * vec2(17.0, 31.0)));
         float glare = pow(max(dot(r, u.sun.xyz), 0.0), 160.0);
         col += u.sun_color.rgb * glare * (0.25 + 2.2 * sparkle) * sun_vis * cloud_shadow(v_world) * (1.0 - u.weather.x);
-        if (u.sun.y < 0.0) {
-            // no moon in the sky to trace: a glint where one would stand, opposite the sun, and water that never goes black
-            vec3 moon = normalize(vec3(-u.sun.x, 0.45, -u.sun.z));
-            col += vec3(0.55, 0.62, 0.80) * 0.6 * pow(max(dot(r, moon), 0.0), 220.0);
-            col = max(col, base.rgb * vec3(0.06, 0.12, 0.25) + vec3(0.010, 0.020, 0.040));
-        }
+        // no moon in the sky to trace: a glint where one would stand, opposite the sun, fading in through dusk
+        vec3 moon = normalize(vec3(-u.sun.x, 0.45, -u.sun.z));
+        col += vec3(0.55, 0.62, 0.80) * 0.6 * smoothstep(0.05, -0.15, u.sun.y) * pow(max(dot(r, moon), 0.0), 220.0);
     }
+    // water that never goes black or grey: at least a dim tint of its own colour, in any light or weather
+    if (ocean) col = max(col, base.rgb * vec3(0.06, 0.12, 0.25) + vec3(0.010, 0.020, 0.040));
     if (ocean) {
         // foam where the water thins against the shore, in voxel-sized flecks that wash in and out
         vec2 q = floor(v_world.xz / u.eye.w) * u.eye.w;
