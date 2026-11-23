@@ -32,6 +32,8 @@ layout(set = 0, binding = 0) uniform U {
     vec4 sea_grid;   // its cells across and down (x 0: no map)
     vec4 sea_waves[9];  // sv_set_sea: the sea's nine waves, xy a direction (unit), z the wavenumber (radians a metre), w the angular speed (radians a second)
     vec4 sea_amps[3];   // their shares of the amplitude, in order (x, y, z, w of each)
+    vec4 sea_field;     // sv_set_sea_field: xy the refracted swell's low corner, z its cell size (metres), w its angular frequency
+    vec4 sea_fgrid;     // its cells across and down (x 0: no field), zw its deep-water direction (unit)
 } u;
 
 // The cutaway: is the surface at p (metres) hidden this frame? Above the

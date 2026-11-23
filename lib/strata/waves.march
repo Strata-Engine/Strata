@@ -1,0 +1,265 @@
+-- Waves — how a swell bends round land: refraction, shoaling and shadow over
+-- a depth grid, for the ocean shader (Vk.set_sea_field) and for any game
+-- whose world is water.
+--
+-- A swell of deep-water wavelength l0 has angular frequency w, w^2 = g k0.
+-- In water d deep its wavenumber k solves w^2 = g k tanh(k d): it shortens
+-- and slows as the sea shoals. Its phase P obeys the eikonal equation
+-- |grad P| = k(d), solved here by fast marching: water cells on the grid's
+-- upwind edges start as the incoming plane wave, P = k0 (x . dir), and the
+-- march spreads by first arrival, never across land. Crests (P - w t
+-- constant) so bend toward shallow water, swing round to run along the shore
+-- and wrap round islands into their lee.
+--
+-- Each cell's amplitude factor is the product of shoaling (sqrt(cg0 / cg),
+-- energy kept as the group speed falls), refraction (rays converging on a
+-- headland raise the sea, rays spreading into a bay or a lee lower it, from
+-- the divergence of the crests' normals) and a lee shadow (land straight
+-- upwind of a cell shelters it). Pure and deterministic: build it on a worker.
+mod Strata.Waves do
+
+  -- A swell refracted over a depth grid: per cell (x fastest) its phase in radians and its amplitude factor (0 on land, 1 open sea, up to 2 where it focuses); the grid's size, low corner and cell size in metres; the swell's angular frequency w, so the sea there is amp * cos(phase - w t); and its deep-water direction (dx, dz), unit. Cells the swell never reaches (land, enclosed water) carry the incoming plane wave's phase with no amplitude.
+  type Swell = { phase : NativeF32Arr, amp : NativeF32Arr, w : Int, h : Int, x0 : Float, z0 : Float, cell : Float, omega : Float, dx : Float, dz : Float }
+
+  pfn gravity() : Float do 9.81 end
+
+  doc "The wavenumber (radians a metre) of a swell of angular frequency [omega] in water [depth] metres deep: the root of omega^2 = g k tanh(k d), deep water's k0 = omega^2 / g where depth is great."
+  fn wavenumber(omega : Float, depth : Float) : Float do
+    let k0 = omega *. omega /. gravity()
+    if depth <= 0.0 do k0 *. 40.0 else
+      -- Newton from the shallow-water guess k = omega / sqrt(g d), no less than deep water's
+      let shallow = omega /. Math.sqrt(gravity() *. depth)
+      newton(omega, depth, if shallow > k0 do shallow else k0 end, 0)
+    end
+  end
+  pfn newton(omega : Float, d : Float, k : Float, n : Int) : Float do
+    if n >= 8 do k else
+      let t = tanh(k *. d)
+      let f = gravity() *. k *. t -. omega *. omega
+      let df = gravity() *. (t +. k *. d *. (1.0 -. t *. t))
+      let next = k -. f /. df
+      newton(omega, d, if next > 0.0 do next else k *. 0.5 end, n + 1)
+    end
+  end
+  pfn tanh(x : Float) : Float do
+    if x > 20.0 do 1.0 else
+      let e = Math.exp(2.0 *. x)
+      (e -. 1.0) /. (e +. 1.0)
+    end
+  end
+  doc "The group speed (metres a second) at which a swell's energy travels: half its phase speed in deep water, all of it in the shallows."
+  fn group_speed(omega : Float, depth : Float) : Float do
+    let k = wavenumber(omega, depth)
+    let c = omega /. k
+    if depth <= 0.0 do 0.0 else
+      let kd2 = 2.0 *. k *. depth
+      let n = if kd2 > 30.0 do 0.5 else 0.5 *. (1.0 +. kd2 /. sinh(kd2)) end
+      n *. c
+    end
+  end
+  pfn sinh(x : Float) : Float do 0.5 *. (Math.exp(x) -. Math.exp(0.0 -. x)) end
+
+  -- ── A binary heap of (key, cell), smallest key at 0 ─────────────────────
+  pfn before(ks : NativeF32Arr, vs : NativeIntArr, a : Int, b : Int) : Bool do
+    let ka = NativeArray.get_f32(ks, a)
+    let kb = NativeArray.get_f32(ks, b)
+    if ka < kb do true else if ka > kb do false else NativeArray.get_int(vs, a) < NativeArray.get_int(vs, b) end end
+  end
+  pfn swap(ks : NativeF32Arr, vs : NativeIntArr, a : Int, b : Int) : (NativeF32Arr, NativeIntArr) do
+    let ka = NativeArray.get_f32(ks, a)
+    let va = NativeArray.get_int(vs, a)
+    (NativeArray.set_f32(NativeArray.set_f32(ks, a, NativeArray.get_f32(ks, b)), b, ka),
+     NativeArray.set_int(NativeArray.set_int(vs, a, NativeArray.get_int(vs, b)), b, va))
+  end
+  pfn up(ks : NativeF32Arr, vs : NativeIntArr, i : Int) : (NativeF32Arr, NativeIntArr) do
+    if i == 0 do (ks, vs) else
+      let p = (i - 1) / 2
+      if before(ks, vs, i, p) do (match swap(ks, vs, i, p) do (k1, v1) -> up(k1, v1, p) end) else (ks, vs) end
+    end
+  end
+  pfn down(ks : NativeF32Arr, vs : NativeIntArr, i : Int, size : Int) : (NativeF32Arr, NativeIntArr) do
+    let l = 2 * i + 1
+    let r = l + 1
+    let m1 = if l < size do (if before(ks, vs, l, i) do l else i end) else i end
+    let m = if r < size do (if before(ks, vs, r, m1) do r else m1 end) else m1 end
+    if m == i do (ks, vs) else (match swap(ks, vs, i, m) do (k1, v1) -> down(k1, v1, m, size) end) end
+  end
+  pfn push(ks : NativeF32Arr, vs : NativeIntArr, size : Int, key : Float, id : Int) : (NativeF32Arr, NativeIntArr) do
+    up(NativeArray.set_f32(ks, size, key), NativeArray.set_int(vs, size, id), size)
+  end
+  pfn drop_top(ks : NativeF32Arr, vs : NativeIntArr, size : Int) : (NativeF32Arr, NativeIntArr) do
+    let last = size - 1
+    down(NativeArray.set_f32(ks, 0, NativeArray.get_f32(ks, last)), NativeArray.set_int(vs, 0, NativeArray.get_int(vs, last)), 0, last)
+  end
+
+  -- ── The march ────────────────────────────────────────────────────────────
+  -- What the solve carries: the grid, the depths, each cell's wavenumber,
+  -- its phase so far (a huge value until reached) and whether it is final.
+  type SeaGrid = { w : Int, h : Int, x0 : Float, z0 : Float, cell : Float, depth : NativeF32Arr, k : NativeF32Arr }
+  pfn far() : Float do 1.0e30 end
+  pfn wet(g : SeaGrid, i : Int) : Bool do NativeArray.get_f32(g.depth, i) > 0.0 end
+  pfn cx(g : SeaGrid, i : Int) : Float do g.x0 +. (int_to_float(i % g.w) +. 0.5) *. g.cell end
+  pfn cz(g : SeaGrid, i : Int) : Float do g.z0 +. (int_to_float(i / g.w) +. 0.5) *. g.cell end
+  pfn least(a : Float, b : Float) : Float do if a < b do a else b end end
+  -- a final neighbour's phase, or far
+  pfn known(g : SeaGrid, p : NativeF32Arr, done : NativeIntArr, x : Int, z : Int) : Float do
+    if x < 0 || z < 0 || x >= g.w || z >= g.h do far() else
+      let j = x + z * g.w
+      if NativeArray.get_int(done, j) == 1 do NativeArray.get_f32(p, j) else far() end
+    end
+  end
+  -- the first-order eikonal update of cell i from its final neighbours
+  pfn update(g : SeaGrid, p : NativeF32Arr, done : NativeIntArr, i : Int) : Float do
+    let x = i % g.w
+    let z = i / g.w
+    let a = least(known(g, p, done, x - 1, z), known(g, p, done, x + 1, z))
+    let b = least(known(g, p, done, x, z - 1), known(g, p, done, x, z + 1))
+    let f = NativeArray.get_f32(g.k, i) *. g.cell
+    if a >= far() && b >= far() do far()
+    else if a >= far() do b +. f
+    else if b >= far() do a +. f
+    else
+      let d = a -. b
+      if d *. d >= f *. f do least(a, b) +. f
+      else 0.5 *. (a +. b +. Math.sqrt(2.0 *. f *. f -. d *. d)) end
+    end end end
+  end
+  pfn seed(g : SeaGrid, dx : Float, dz : Float, k0 : Float, i : Int, p : NativeF32Arr, ks : NativeF32Arr, vs : NativeIntArr, size : Int) : (NativeF32Arr, NativeF32Arr, NativeIntArr, Int) do
+    if i >= g.w * g.h do (p, ks, vs, size) else
+      let x = i % g.w
+      let z = i / g.w
+      -- an edge the swell comes in across: its outward normal points against the swell
+      let upwind = (x == 0 && dx > 0.01) || (x == g.w - 1 && dx < -0.01) || (z == 0 && dz > 0.01) || (z == g.h - 1 && dz < -0.01)
+      if upwind && wet(g, i) do
+        let v = k0 *. (cx(g, i) *. dx +. cz(g, i) *. dz)
+        match push(ks, vs, size, v, i) do
+          (k1, v1) -> seed(g, dx, dz, k0, i + 1, NativeArray.set_f32(p, i, v), k1, v1, size + 1)
+        end
+      else seed(g, dx, dz, k0, i + 1, p, ks, vs, size) end
+    end
+  end
+  pfn relax(g : SeaGrid, p : NativeF32Arr, done : NativeIntArr, c : Int, n : Int, ks : NativeF32Arr, vs : NativeIntArr, size : Int) : (NativeF32Arr, NativeF32Arr, NativeIntArr, Int) do
+    if n >= 4 do (p, ks, vs, size) else
+      let x = c % g.w + (if n == 0 do 1 else if n == 1 do 0 - 1 else 0 end end)
+      let z = c / g.w + (if n == 2 do 1 else if n == 3 do 0 - 1 else 0 end end)
+      if x < 0 || z < 0 || x >= g.w || z >= g.h do relax(g, p, done, c, n + 1, ks, vs, size) else
+        let j = x + z * g.w
+        if NativeArray.get_int(done, j) == 1 do relax(g, p, done, c, n + 1, ks, vs, size)
+        else if !wet(g, j) do relax(g, p, done, c, n + 1, ks, vs, size)
+        else
+          let v = update(g, p, done, j)
+          if v < NativeArray.get_f32(p, j) do
+            match push(ks, vs, size, v, j) do
+              (k1, v1) -> relax(g, NativeArray.set_f32(p, j, v), done, c, n + 1, k1, v1, size + 1)
+            end
+          else relax(g, p, done, c, n + 1, ks, vs, size) end
+        end end
+      end
+    end
+  end
+  pfn march(g : SeaGrid, p : NativeF32Arr, done : NativeIntArr, ks : NativeF32Arr, vs : NativeIntArr, size : Int) : NativeF32Arr do
+    if size <= 0 do p else
+      let key = NativeArray.get_f32(ks, 0)
+      let c = NativeArray.get_int(vs, 0)
+      match drop_top(ks, vs, size) do
+        (k1, v1) ->
+          -- a cell's stale heap entries (it was pushed again with a lower phase) are passed over
+          if NativeArray.get_int(done, c) == 1 || key > NativeArray.get_f32(p, c) do march(g, p, done, k1, v1, size - 1)
+          else
+            let done = NativeArray.set_int(done, c, 1)
+            match relax(g, p, done, c, 0, k1, v1, size - 1) do
+              (p2, k2, v2, s2) -> march(g, p2, done, k2, v2, s2)
+            end
+          end
+      end
+    end
+  end
+
+  -- ── Amplitude ────────────────────────────────────────────────────────────
+  pfn at(g : SeaGrid, p : NativeF32Arr, x : Int, z : Int, fallback : Float) : Float do
+    if x < 0 || z < 0 || x >= g.w || z >= g.h do fallback else
+      let j = x + z * g.w
+      if wet(g, j) do NativeArray.get_f32(p, j) else fallback end
+    end
+  end
+  -- the crests' unit normal at a cell, from the phase's central differences
+  pfn normal(g : SeaGrid, p : NativeF32Arr, x : Int, z : Int) : (Float, Float) do
+    let here = at(g, p, x, z, 0.0)
+    let gx = at(g, p, x + 1, z, here) -. at(g, p, x - 1, z, here)
+    let gz = at(g, p, x, z + 1, here) -. at(g, p, x, z - 1, here)
+    let l = Math.sqrt(gx *. gx +. gz *. gz)
+    if l < 1.0e-6 do (0.0, 0.0) else (gx /. l, gz /. l) end
+  end
+  -- how fast the rays spread here (1 / metres): positive into bays and lees, negative onto headlands
+  pfn spread(g : SeaGrid, p : NativeF32Arr, x : Int, z : Int) : Float do
+    let (ex, _) = normal(g, p, x + 1, z)
+    let (wx, _) = normal(g, p, x - 1, z)
+    let (_, sz) = normal(g, p, x, z + 1)
+    let (_, nz) = normal(g, p, x, z - 1)
+    ((ex -. wx) +. (sz -. nz)) /. (2.0 *. g.cell)
+  end
+  -- metres of water straight upwind of a cell before land, up to [reach]
+  pfn open_upwind(g : SeaGrid, x : Float, z : Float, dx : Float, dz : Float, run : Float, reach : Float) : Float do
+    if run >= reach do reach else
+      let px = float_to_int(Math.floor((x -. g.x0) /. g.cell))
+      let pz = float_to_int(Math.floor((z -. g.z0) /. g.cell))
+      if px < 0 || pz < 0 || px >= g.w || pz >= g.h do reach
+      else if !wet(g, px + pz * g.w) do run
+      else open_upwind(g, x -. dx *. g.cell, z -. dz *. g.cell, dx, dz, run +. g.cell, reach) end end
+    end
+  end
+  pfn amplitude(g : SeaGrid, p : NativeF32Arr, omega : Float, dx : Float, dz : Float, a : NativeF32Arr, i : Int) : NativeF32Arr do
+    if i >= g.w * g.h do a else
+      let value = if !wet(g, i) || NativeArray.get_f32(p, i) >= far() do 0.0 else
+        let x = i % g.w
+        let z = i / g.w
+        let d = NativeArray.get_f32(g.depth, i)
+        let shoal = Math.sqrt((0.5 *. gravity() /. omega) /. group_speed(omega, d))
+        -- rays spreading over about 25 m change the sea by exp(-spread * 25 / 2): focus on headlands, calm in bays
+        let refr = Math.exp(0.0 -. 12.5 *. spread(g, p, x, z))
+        let refr = if refr < 0.3 do 0.3 else if refr > 1.8 do 1.8 else refr end end
+        -- straight in the lee of land the swell only arrives round it, weakened
+        let open = open_upwind(g, cx(g, i) -. dx *. g.cell, cz(g, i) -. dz *. g.cell, dx, dz, 0.0, 240.0)
+        let lee = 0.4 +. 0.6 *. (open /. 240.0)
+        let v = shoal *. refr *. lee
+        if v > 2.0 do 2.0 else v end
+      end
+      amplitude(g, p, omega, dx, dz, NativeArray.set_f32(a, i, value), i + 1)
+    end
+  end
+  -- cells the march never reached take the incoming plane wave's phase, so filtering next to them stays sane
+  pfn tidy(g : SeaGrid, p : NativeF32Arr, k0 : Float, dx : Float, dz : Float, i : Int) : NativeF32Arr do
+    if i >= g.w * g.h do p else
+      tidy(g, if NativeArray.get_f32(p, i) >= far() do NativeArray.set_f32(p, i, k0 *. (cx(g, i) *. dx +. cz(g, i) *. dz)) else p end, k0, dx, dz, i + 1)
+    end
+  end
+  pfn wavenumbers(depth : NativeF32Arr, omega : Float, k : NativeF32Arr, i : Int, n : Int) : NativeF32Arr do
+    if i >= n do k else wavenumbers(depth, omega, NativeArray.set_f32(k, i, wavenumber(omega, NativeArray.get_f32(depth, i))), i + 1, n) end
+  end
+
+  doc "Refract a swell over a depth grid: [depth] metres a cell (x fastest, w x h cells of [cell] metres, low corner (x0, z0); land is 0 or less), the swell's deep-water direction ([dx], [dz], any length) and wavelength [wavelength] metres. Its crests start straight on the grid's upwind edges and bend, slow, shoal and wrap round land by first arrival."
+  fn solve(depth : NativeF32Arr, w : Int, h : Int, x0 : Float, z0 : Float, cell : Float, dx : Float, dz : Float, wavelength : Float) : Swell do
+    let l = Math.sqrt(dx *. dx +. dz *. dz)
+    let ux = if l < 1.0e-6 do 1.0 else dx /. l end
+    let uz = if l < 1.0e-6 do 0.0 else dz /. l end
+    let k0 = 6.283185307 /. wavelength
+    let omega = Math.sqrt(gravity() *. k0)
+    let n = w * h
+    let g : SeaGrid = { w: w, h: h, x0: x0, z0: z0, cell: cell, depth: depth, k: wavenumbers(depth, omega, NativeArray.make_f32(n, 0.0), 0, n) }
+    -- a cell goes into the heap as a seed and each time a neighbour's finishing lowers it: five times at most
+    let ks = NativeArray.make_f32(5 * n + 4, 0.0)
+    let vs = NativeArray.make_int(5 * n + 4, 0)
+    let (p, ks, vs, size) = seed(g, ux, uz, k0, 0, NativeArray.make_f32(n, far()), ks, vs, 0)
+    let p = march(g, p, NativeArray.make_int(n, 0), ks, vs, size)
+    let amp = amplitude(g, p, omega, ux, uz, NativeArray.make_f32(n, 0.0), 0)
+    { phase: tidy(g, p, k0, ux, uz, 0), amp: amp, w: w, h: h, x0: x0, z0: z0, cell: cell, omega: omega, dx: ux, dz: uz }
+  end
+
+  doc "The field's phase and amplitude at a cell (x, z) of its grid; (0, 0) off it or on land."
+  fn sample(f : Swell, x : Int, z : Int) : (Float, Float) do
+    if x < 0 || z < 0 || x >= f.w || z >= f.h do (0.0, 0.0) else
+      let i = x + z * f.w
+      (NativeArray.get_f32(f.phase, i), NativeArray.get_f32(f.amp, i))
+    end
+  end
+end

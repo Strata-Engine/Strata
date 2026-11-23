@@ -24,6 +24,8 @@ layout(std430, set = 0, binding = 21) readonly buffer Movers { vec4 boxes[]; } m
 layout(std430, set = 0, binding = 44) readonly buffer SeaMap { float v[]; } sea_map_buf;
 // the sea's height tile (sea.comp): 512 x 512 cells of 0.5 m, the waves' height for unit amplitude
 layout(std430, set = 0, binding = 45) readonly buffer SeaTile { float h[]; } sea_tile;
+// the refracted swell (sv_set_sea_field): phase and amplitude a cell
+layout(std430, set = 0, binding = 46) readonly buffer SeaField { vec2 c[]; } sea_field_buf;
 
 
 // ── Ocean ───────────────────────────────────────────────────────────────
@@ -123,10 +125,36 @@ float sea_height(vec2 p, float amp, float chop) {
     }
     return amp * h;
 }
+// The swell refracted by the land (Strata.Waves through sv_set_sea_field), for
+// unit amplitude: the field's phase and amplitude bilinearly; outside the
+// field, and fading into it over its last cells, the straight swell the
+// field's upwind edges began from.
+float sea_swell(vec2 p, float chop) {
+    float omega = u.sea_field.w;
+    float k0 = omega * omega / 9.81;
+    float plane = dot(p, u.sea_fgrid.zw) * k0;   // the direction the field began from
+    int w = int(u.sea_fgrid.x), h = int(u.sea_fgrid.y);
+    vec2 g = (p - u.sea_field.xy) / u.sea_field.z - 0.5;
+    vec2 lo = clamp(floor(g), vec2(0.0), vec2(w - 1, h - 1));
+    vec2 hi = min(lo + 1.0, vec2(w - 1, h - 1));
+    vec2 f = clamp(g - lo, 0.0, 1.0);
+    vec2 a = sea_field_buf.c[int(lo.y) * w + int(lo.x)], b = sea_field_buf.c[int(lo.y) * w + int(hi.x)];
+    vec2 c = sea_field_buf.c[int(hi.y) * w + int(lo.x)], d = sea_field_buf.c[int(hi.y) * w + int(hi.x)];
+    vec2 v = mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
+    // inside by how many cells: the field fades in over its outer eight
+    float inside = min(min(g.x, float(w - 1) - g.x), min(g.y, float(h - 1) - g.y));
+    float in_field = smoothstep(0.0, 8.0, inside);
+    float q = 1.0 + 1.5 * chop;
+    float sf = cos(v.x - omega * u.light.y), sp = cos(plane - omega * u.light.y);
+    float hf = v.y * (2.0 * pow(0.5 * sf + 0.5, q) - 1.0), hp = 2.0 * pow(0.5 * sp + 0.5, q) - 1.0;
+    // the swell's share of the waves (sv_set_sea's first three)
+    return (u.sea_amps[0].x + u.sea_amps[0].y + u.sea_amps[0].z) * mix(hp, hf, in_field);
+}
 float sea_column(vec2 p, float amp, float chop) {
     if (u.sea_grid.z < 0.5) return sea_height(p, amp, chop);
     ivec2 c = ivec2(floor(p / 0.5)) & 511;   // the tile repeats every 256 m
-    return amp * sea_tile.h[c.y * 512 + c.x];
+    float swell = u.sea_fgrid.x > 0.5 ? sea_swell(p, chop) : 0.0;
+    return amp * (sea_tile.h[c.y * 512 + c.x] + swell);
 }
 // The same colours without the bands, for a sea seen from high up.
 vec3 sea_gradient(float t) {

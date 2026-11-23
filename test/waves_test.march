@@ -1,0 +1,79 @@
+-- Waves: dispersion, and a swell refracting over a beach and round an island.
+mod Strata.Test.Waves do
+
+  needs IO.Clock      -- charged to every test module once any uses Check.all (GAPS S3)
+
+  needs IO.Console
+
+  needs IO.FileRead
+
+  needs IO.FileWrite
+  needs IO.Process
+  import Test
+  alias Strata.Waves as W
+
+  -- the test seas' depths: 0 a sloping beach (land below z = 4, deepening 0.3 m a cell to 12 m),
+  -- 1 deep water round a 12 x 12-cell island, 2 a bed rising steadily from 20 m eastward
+  pfn depth_of(kind : Int, x : Int, z : Int) : Float do
+    if kind == 0 do (if z < 4 do 0.0 else beach(0.3 *. int_to_float(z - 4)) end)
+    else if kind == 1 do (if x >= 24 && x < 36 && z >= 24 && z < 36 do 0.0 else 20.0 end)
+    else 20.0 -. 0.32 *. int_to_float(x) end end
+  end
+  pfn beach(d : Float) : Float do if d > 12.0 do 12.0 else d end end
+  -- a w x h grid of 2 m cells of sea [kind]
+  pfn grid(w : Int, h : Int, kind : Int, a : NativeF32Arr, i : Int) : NativeF32Arr do
+    if i >= w * h do a else grid(w, h, kind, NativeArray.set_f32(a, i, depth_of(kind, i % w, i / w)), i + 1) end
+  end
+  pfn angle(f : Strata.Waves.Swell, x : Int, z : Int) : Float do
+    let (pe, _) = W.sample(f, x + 1, z)
+    let (pw, _) = W.sample(f, x - 1, z)
+    let (ps, _) = W.sample(f, x, z + 1)
+    let (pn, _) = W.sample(f, x, z - 1)
+    Math.atan2(ps -. pn, pe -. pw)
+  end
+
+  describe "Waves.wavenumber" do
+    test "deep water keeps k0 = w^2 / g and shallow water k = w / sqrt(g d)" do
+      let omega = Math.sqrt(9.81 *. 6.283185307 /. 50.0)
+      let deep = W.wavenumber(omega, 1000.0)
+      Test.assert_true(Math.abs(deep -. 6.283185307 /. 50.0) < 0.0001, "deep water: the deep-water wavenumber")
+      let shallow = W.wavenumber(omega, 0.5)
+      let expect = omega /. Math.sqrt(9.81 *. 0.5)
+      Test.assert_true(Math.abs(shallow -. expect) /. expect < 0.03, "half a metre: the shallow-water wavenumber, within 3%")
+    end
+  end
+
+  describe "Waves.solve" do
+    test "on a sloping beach the crests swing round to face the shore" do
+      -- the swell comes in at 45 degrees toward the beach
+      let d = grid(60, 60, 0, NativeArray.make_f32(3600, 0.0), 0)
+      let f = W.solve(d, 60, 60, 0.0, 0.0, 2.0, 1.0, -1.0, 40.0)
+      let off_shore = Math.abs(angle(f, 30, 50) +. 1.5708)
+      let near_shore = Math.abs(angle(f, 30, 6) +. 1.5708)
+      Test.assert_true(near_shore < off_shore, "the crests' normal turns toward straight onshore as the water shoals")
+    end
+    test "a swell wraps round an island into its lee, later and weaker" do
+      -- the swell comes from the west
+      let d = grid(60, 60, 1, NativeArray.make_f32(3600, 0.0), 0)
+      let f = W.solve(d, 60, 60, 0.0, 0.0, 2.0, 1.0, 0.0, 40.0)
+      let k0 = 6.283185307 /. 40.0
+      let (lee_p, lee_a) = W.sample(f, 40, 30)
+      let (open_p, open_a) = W.sample(f, 40, 5)
+      Test.assert_true(lee_p < 1.0e29, "the lee is reached")
+      Test.assert_true(lee_p > open_p +. 0.5, "the lee's crests arrive later than the open sea's, having gone round")
+      Test.assert_true(lee_a < open_a, "the lee's sea is lower")
+      Test.assert_true(Math.abs(open_p -. k0 *. (81.0)) < 1.5, "the open sea stays the plane wave")
+      let (_, land_a) = W.sample(f, 30, 30)
+      Test.assert_true(land_a == 0.0, "land has no sea")
+      let (land_p, _) = W.sample(f, 30, 30)
+      Test.assert_true(Math.abs(land_p -. k0 *. 61.0) < 0.001, "land carries the plane wave's phase, not a far marker")
+    end
+    test "shoaling raises the swell in shallow water" do
+      let d = grid(60, 10, 2, NativeArray.make_f32(600, 0.0), 0)
+      let f = W.solve(d, 60, 10, 0.0, 0.0, 2.0, 1.0, 0.0, 40.0)
+      let (_, deep_a) = W.sample(f, 5, 5)
+      let (_, shallow_a) = W.sample(f, 58, 5)
+      Test.assert_true(shallow_a > deep_a, "a swell running into shallow water grows")
+    end
+  end
+end
