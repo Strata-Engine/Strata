@@ -137,10 +137,14 @@ void main() {
         sky = mix(vec3(dot(sky, vec3(0.3, 0.59, 0.11))), sky, 0.35);          // a cloud is grey: it takes the sky's light, not its blue
         float height = float((v_w1 >> 16) & 255u) / 255.0;
         float outskirts = float(v_w1 & 255u) / 255.0;
+        // and, in the texture field's high byte, how thin its kind of cloud is (low four bits: a veil of
+        // cirrus or altostratus lets most light through) and how dark (high four: a rain cloud's grey)
+        float thin = float((v_w1 >> 8) & 15u) / 15.0;
+        float dark = float((v_w1 >> 12) & 15u) / 15.0;
         vec3 light = u.sun_color.rgb * (0.62 + 0.38 * toward_sun) + sky * 1.9;
         float shape = 0.52 + 0.48 * smoothstep(0.0, 0.85, height) + 0.05 * n.y;
-        vec3 colour = tonemap(vec3(0.93, 0.94, 0.96) * light * shape);
-        fade *= 1.0 - 0.6 * smoothstep(0.5, 1.0, outskirts);
+        vec3 colour = tonemap(vec3(0.93, 0.94, 0.96) * light * shape * (1.0 - 0.6 * dark));
+        fade *= (1.0 - 0.6 * smoothstep(0.5, 1.0, outskirts)) * (1.0 - 0.8 * thin);
         // thinner over the middle of the view, where the player is looking
         vec4 clip = u.vp * vec4(v_world, 1.0);
         fade *= mix(0.35, 1.0, smoothstep(0.15, 0.65, length(clip.xy / clip.w)));
