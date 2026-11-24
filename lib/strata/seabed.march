@@ -13,7 +13,7 @@
 -- saves is small and the base is the same every time.
 mod Strata.Seabed do
 
-  -- The water's depth in voxels a cell (x fastest; 0 is land), over w x h cells.
+  -- The water's depth in voxels a cell (x fastest; 0 is land, -2..-1 dry sand above the surface that is still not land), over w x h cells.
   type Seafloor = { depth : NativeIntArr, w : Int, h : Int }
 
   -- An edit to a floor, in cells: Dig(x0, z0, x1, z1, depth, margin) makes the rectangle x0..x1, z0..z1 at least [depth] voxels deep; Raise(..., depth, margin) makes it no deeper than [depth] (a reef's top). Either eases back to the floor around it over [margin] cells and never turns land to water or water to land.
@@ -83,7 +83,8 @@ mod Strata.Seabed do
         -- the target, easing back to the cell's own depth over the margin
         let k = outside(x, z, x0, z0, x1, z1)
         let eased = target + (now - target) * k / (margin + 1)
-        NativeArray.set_int(a, i, if deepen do most(now, eased) else most(1, least(now, eased)) end)
+        -- dry sand (below 0) is already shallower than any reef: raising leaves it be
+        NativeArray.set_int(a, i, if deepen do most(now, eased) else if now < 0 do now else most(1, least(now, eased)) end end)
       end
       edit_go(f, deepen, x0, z0, x1, z1, target, margin, a, x + 1, z)
     end end end
@@ -105,8 +106,110 @@ mod Strata.Seabed do
     end
   end
 
+  -- ── Natural features ─────────────────────────────────────────────────────
+  -- A floor with what each cell is made of: 0 open floor (sand or mud, which a
+  -- storm may move), 1 reef (fixed), 2 sand bar (movable; for drawing and for
+  -- what lives there). Reefs and bars only ever make the water shallower, and
+  -- never touch land.
+  type Features = { floor : Seafloor, kind : NativeIntArr }
+
+  doc "Features over floor [f]: every cell open floor (kind 0)."
+  fn features(f : Seafloor) : Features do { floor: f, kind: NativeArray.make_int(f.w * f.h, 0) } end
+
+  doc "What cell (x, z) of [ft] is made of: 0 open floor, 1 reef, 2 sand bar; 0 off the floor."
+  fn kind_at(ft : Features, x : Int, z : Int) : Int do
+    if x < 0 || z < 0 || x >= ft.floor.w || z >= ft.floor.h do 0 else NativeArray.get_int(ft.kind, z * ft.floor.w + x) end
+  end
+
+  pfn band_go(depth : NativeIntArr, kind : NativeIntArr, dist : NativeIntArr, w : Int, x0 : Int, z0 : Int, x1 : Int, z1 : Int, near : Int, far : Int, top : Int, x : Int, z : Int) : (NativeIntArr, NativeIntArr) do
+    if z > z1 do (depth, kind)
+    else if x > x1 do band_go(depth, kind, dist, w, x0, z0, x1, z1, near, far, top, x0, z + 1)
+    else
+      let i = z * w + x
+      let now = NativeArray.get_int(depth, i)
+      let d = NativeArray.get_int(dist, i)
+      if now >= 1 && d >= near * 3 && d <= far * 3 do
+        band_go(NativeArray.set_int(depth, i, least(now, top)), NativeArray.set_int(kind, i, 1), dist, w, x0, z0, x1, z1, near, far, top, x + 1, z)
+      else band_go(depth, kind, dist, w, x0, z0, x1, z1, near, far, top, x + 1, z) end
+    end end
+  end
+  doc "A fringing reef: the water cells of rectangle x0..x1, z0..z1 that lie [near] to [far] cells from [land] (non-zero is land) become reef, no deeper than [top] voxels."
+  fn reef_band(ft : Features, land : NativeIntArr, x0 : Int, z0 : Int, x1 : Int, z1 : Int, near : Int, far : Int, top : Int) : Features do
+    let f = ft.floor
+    let (depth, kind) = band_go(f.depth, ft.kind, coast_distance(land, f.w, f.h), f.w, most(x0, 0), most(z0, 0), least(x1, f.w - 1), least(z1, f.h - 1), near, far, most(top, 1), most(x0, 0), most(z0, 0))
+    { floor: { f with depth: depth }, kind: kind }
+  end
+
+  pfn mound_go(depth : NativeIntArr, kind : NativeIntArr, w : Int, h : Int, cx : Int, cz : Int, r : Int, top : Int, x : Int, z : Int) : (NativeIntArr, NativeIntArr) do
+    if z > cz + r do (depth, kind)
+    else if x > cx + r do mound_go(depth, kind, w, h, cx, cz, r, top, cx - r, z + 1)
+    else if x < 0 || z < 0 || x >= w || z >= h do mound_go(depth, kind, w, h, cx, cz, r, top, x + 1, z)
+    else
+      let i = z * w + x
+      let now = NativeArray.get_int(depth, i)
+      let d2 = (x - cx) * (x - cx) + (z - cz) * (z - cz)
+      if now < 1 || d2 > r * r do mound_go(depth, kind, w, h, cx, cz, r, top, x + 1, z) else
+        -- the top, easing back to the floor toward the rim
+        let eased = top + (now - top) * d2 / (r * r + 1)
+        if eased < now do mound_go(NativeArray.set_int(depth, i, most(eased, 1)), NativeArray.set_int(kind, i, 1), w, h, cx, cz, r, top, x + 1, z)
+        else mound_go(depth, kind, w, h, cx, cz, r, top, x + 1, z) end
+      end
+    end end end
+  end
+  doc "A patch reef: a mound of reef [radius] cells round (cx, cz), its top [top] voxels down at the centre, easing back to the floor at its rim. Land and dry sand stay as they are."
+  fn patch_reef(ft : Features, cx : Int, cz : Int, radius : Int, top : Int) : Features do
+    let f = ft.floor
+    let r = most(radius, 1)
+    let (depth, kind) = mound_go(f.depth, ft.kind, f.w, f.h, cx, cz, r, most(top, 1), cx - r, cz - r)
+    { floor: { f with depth: depth }, kind: kind }
+  end
+
+  -- how far (cells) (x, z) is from segment a-b, and how far along it (0..1) its nearest point lies
+  pfn along(x : Int, z : Int, ax : Int, az : Int, bx : Int, bz : Int) : (Float, Float) do
+    let dx = int_to_float(bx - ax)
+    let dz = int_to_float(bz - az)
+    let px = int_to_float(x - ax)
+    let pz = int_to_float(z - az)
+    let len2 = dx *. dx +. dz *. dz
+    let t0 = if len2 <= 0.0 do 0.0 else (px *. dx +. pz *. dz) /. len2 end
+    let t = if t0 < 0.0 do 0.0 else if t0 > 1.0 do 1.0 else t0 end end
+    let ex = px -. t *. dx
+    let ez = pz -. t *. dz
+    (Math.sqrt(ex *. ex +. ez *. ez), t)
+  end
+  pfn bar_go(depth : NativeIntArr, kind : NativeIntArr, w : Int, h : Int, ax : Int, az : Int, bx : Int, bz : Int, width : Int, crest : Int, x0 : Int, x1 : Int, z1 : Int, x : Int, z : Int) : (NativeIntArr, NativeIntArr) do
+    if z > z1 do (depth, kind)
+    else if x > x1 do bar_go(depth, kind, w, h, ax, az, bx, bz, width, crest, x0, x1, z1, x0, z + 1)
+    else if x < 0 || z < 0 || x >= w || z >= h do bar_go(depth, kind, w, h, ax, az, bx, bz, width, crest, x0, x1, z1, x + 1, z)
+    else
+      let i = z * w + x
+      let now = NativeArray.get_int(depth, i)
+      let (dist, t) = along(x, z, ax, az, bx, bz)
+      let wf = int_to_float(width)
+      if now < 1 || dist > wf do bar_go(depth, kind, w, h, ax, az, bx, bz, width, crest, x0, x1, z1, x + 1, z) else
+        -- across: the crest easing to the floor over the width; along: the last quarter at each end tapers away
+        let across = dist /. (wf +. 1.0)
+        let end_t = if t < 0.5 do t else 1.0 -. t end
+        let taper = if end_t >= 0.25 do 0.0 else 1.0 -. end_t /. 0.25 end
+        let ease = if across > taper do across else taper end
+        let eased = crest + float_to_int(int_to_float(now - crest) *. ease)
+        if eased < now do
+          bar_go(NativeArray.set_int(depth, i, eased), if now - eased > 2 do NativeArray.set_int(kind, i, 2) else kind end, w, h, ax, az, bx, bz, width, crest, x0, x1, z1, x + 1, z)
+        else bar_go(depth, kind, w, h, ax, az, bx, bz, width, crest, x0, x1, z1, x + 1, z) end
+      end
+    end end end
+  end
+  doc "A sand bar: a ridge along the segment (ax, az)-(bx, bz) whose spine is [crest] voxels deep (-2..2: below 0 it pokes out as dry sand), easing back to the floor over [width] cells either side and tapering away over the last quarter of its length at each end. Cells it raised more than 2 voxels are sand bar (kind 2). Only ever shallower; land stays land."
+  fn bar(ft : Features, ax : Int, az : Int, bx : Int, bz : Int, width : Int, crest : Int) : Features do
+    let f = ft.floor
+    let wd = most(width, 1)
+    let (depth, kind) = bar_go(f.depth, ft.kind, f.w, f.h, ax, az, bx, bz, wd, clampi(crest, -2, 2),
+      least(ax, bx) - wd, most(ax, bx) + wd, most(az, bz) + wd, least(ax, bx) - wd, least(az, bz) - wd)
+    { floor: { f with depth: depth }, kind: kind }
+  end
+
   -- ── Reading it ───────────────────────────────────────────────────────────
-  doc "The water's depth in voxels at cell (x, z); 0 off the floor or on land."
+  doc "The water's depth in voxels at cell (x, z): -2..-1 dry sand, 0 off the floor or on land."
   fn depth_at(f : Seafloor, x : Int, z : Int) : Int do
     if x < 0 || z < 0 || x >= f.w || z >= f.h do 0 else NativeArray.get_int(f.depth, z * f.w + x) end
   end
