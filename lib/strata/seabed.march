@@ -186,7 +186,8 @@ mod Strata.Seabed do
       let now = NativeArray.get_int(depth, i)
       let (dist, t) = along(x, z, ax, az, bx, bz)
       let wf = int_to_float(width)
-      if now < 1 || dist > wf do bar_go(depth, kind, w, h, ax, az, bx, bz, width, crest, x0, x1, z1, x + 1, z) else
+      -- sand does not pile on a reef
+      if now < 1 || dist > wf || NativeArray.get_int(kind, i) == 1 do bar_go(depth, kind, w, h, ax, az, bx, bz, width, crest, x0, x1, z1, x + 1, z) else
         -- across: the crest easing to the floor over the width; along: the last quarter at each end tapers away
         let across = dist /. (wf +. 1.0)
         let end_t = if t < 0.5 do t else 1.0 -. t end
@@ -199,13 +200,273 @@ mod Strata.Seabed do
       end
     end end end
   end
-  doc "A sand bar: a ridge along the segment (ax, az)-(bx, bz) whose spine is [crest] voxels deep (-2..2: below 0 it pokes out as dry sand), easing back to the floor over [width] cells either side and tapering away over the last quarter of its length at each end. Cells it raised more than 2 voxels are sand bar (kind 2). Only ever shallower; land stays land."
+  doc "A sand bar: a ridge along the segment (ax, az)-(bx, bz) whose spine is [crest] voxels deep (-2..2: below 0 it pokes out as dry sand), easing back to the floor over [width] cells either side and tapering away over the last quarter of its length at each end. Cells it raised more than 2 voxels are sand bar (kind 2). Only ever shallower; land and reef stay as they are."
   fn bar(ft : Features, ax : Int, az : Int, bx : Int, bz : Int, width : Int, crest : Int) : Features do
     let f = ft.floor
     let wd = most(width, 1)
     let (depth, kind) = bar_go(f.depth, ft.kind, f.w, f.h, ax, az, bx, bz, wd, clampi(crest, -2, 2),
       least(ax, bx) - wd, most(ax, bx) + wd, most(az, bz) + wd, least(ax, bx) - wd, least(az, bz) - wd)
     { floor: { f with depth: depth }, kind: kind }
+  end
+
+  -- ── Generating features from a seed ──────────────────────────────────────
+  pfn flood_label(land : NativeIntArr, labels : NativeIntArr, w : Int, h : Int, label : Int, stack : List(Int)) : NativeIntArr do
+    match stack do
+      Nil -> labels
+      Cons(i, rest) ->
+        if i < 0 || i >= w * h || NativeArray.get_int(land, i) == 0 || NativeArray.get_int(labels, i) != 0 do flood_label(land, labels, w, h, label, rest) else
+          let x = i % w
+          let more = Cons(if x > 0 do i - 1 else -1 end, Cons(if x < w - 1 do i + 1 else -1 end, Cons(i - w, Cons(i + w, rest))))
+          flood_label(land, NativeArray.set_int(labels, i, label), w, h, label, more)
+        end
+    end
+  end
+  pfn label_go(land : NativeIntArr, labels : NativeIntArr, w : Int, h : Int, i : Int, next : Int) : NativeIntArr do
+    if i >= w * h do labels
+    else if NativeArray.get_int(land, i) != 0 && NativeArray.get_int(labels, i) == 0 do
+      label_go(land, flood_label(land, labels, w, h, next, Cons(i, Nil)), w, h, i + 1, next + 1)
+    else label_go(land, labels, w, h, i + 1, next) end end
+  end
+  doc "The islands of [land] (non-zero is land, x fastest, w x h): each cell's island, 1.. for 4-connected land, 0 for water."
+  fn islands(land : NativeIntArr, w : Int, h : Int) : NativeIntArr do label_go(land, NativeArray.make_int(w * h, 0), w, h, 0, 1) end
+
+  -- How a seed's features are placed: [reef_share] percent of islands get a fringing reef; up to [patch_max] patch reefs; [bar_min]..[bar_max] sand bars; the islands under any cell in [forced] always get a fringing reef.
+  type FeatureRecipe = { reef_share : Int, patch_max : Int, bar_min : Int, bar_max : Int, forced : List((Int, Int)) }
+  doc "About 40% of islands with a fringing reef, up to 3 patch reefs and 2 to 5 sand bars."
+  fn default_recipe() : FeatureRecipe do { reef_share: 40, patch_max: 3, bar_min: 2, bar_max: 5, forced: Nil } end
+
+  -- an island's extent: cells, and its bounding box
+  type IslandBox = { label : Int, cells : Int, x0 : Int, z0 : Int, x1 : Int, z1 : Int }
+  pfn boxes_go(labels : NativeIntArr, w : Int, i : Int, n : Int, cells : NativeIntArr, x0 : NativeIntArr, z0 : NativeIntArr, x1 : NativeIntArr, z1 : NativeIntArr) : (NativeIntArr, NativeIntArr, NativeIntArr, NativeIntArr, NativeIntArr) do
+    if i >= n do (cells, x0, z0, x1, z1) else
+      let l = NativeArray.get_int(labels, i)
+      if l == 0 do boxes_go(labels, w, i + 1, n, cells, x0, z0, x1, z1) else
+        let x = i % w
+        let z = i / w
+        boxes_go(labels, w, i + 1, n, NativeArray.set_int(cells, l, NativeArray.get_int(cells, l) + 1),
+          NativeArray.set_int(x0, l, least(NativeArray.get_int(x0, l), x)), NativeArray.set_int(z0, l, least(NativeArray.get_int(z0, l), z)),
+          NativeArray.set_int(x1, l, most(NativeArray.get_int(x1, l), x)), NativeArray.set_int(z1, l, most(NativeArray.get_int(z1, l), z)))
+      end
+    end
+  end
+  pfn max_label(labels : NativeIntArr, i : Int, best : Int) : Int do
+    if i >= NativeArray.length_int(labels) do best else max_label(labels, i + 1, most(best, NativeArray.get_int(labels, i))) end
+  end
+  -- islands of at least 30 cells (a speck of rock is not an island), in label order
+  pfn island_boxes(labels : NativeIntArr, w : Int, h : Int) : List(IslandBox) do
+    let m = max_label(labels, 0, 0)
+    let (cells, x0, z0, x1, z1) = boxes_go(labels, w, 0, w * h, NativeArray.make_int(m + 1, 0), NativeArray.make_int(m + 1, far()),
+      NativeArray.make_int(m + 1, far()), NativeArray.make_int(m + 1, -1), NativeArray.make_int(m + 1, -1))
+    List.filter(List.map(List.range(1, m + 1), fn l -> { label: l, cells: NativeArray.get_int(cells, l), x0: NativeArray.get_int(x0, l),
+      z0: NativeArray.get_int(z0, l), x1: NativeArray.get_int(x1, l), z1: NativeArray.get_int(z1, l) }), fn b -> b.cells >= 30)
+  end
+
+  pfn roll(seed : Int, salt : Int) : Float do Strata.Seed.unit(Strata.Seed.mix(seed, salt)) end
+  pfn pick(seed : Int, salt : Int, n : Int) : Int do clampi(float_to_int(roll(seed, salt) *. int_to_float(n)), 0, most(n - 1, 0)) end
+
+  pfn forced_label(labels : NativeIntArr, w : Int, h : Int, forced : List((Int, Int)), label : Int) : Bool do
+    match forced do
+      Nil -> false
+      Cons((x, z), rest) ->
+        if x >= 0 && z >= 0 && x < w && z < h && NativeArray.get_int(labels, z * w + x) == label do true else forced_label(labels, w, h, rest, label) end
+    end
+  end
+
+  -- one side (0 north, 1 east, 2 south, 3 west) of an island's coast, out to [reach] cells: the rectangle a fringing reef stretch is laid in
+  pfn side_rect(b : IslandBox, side : Int, reach : Int) : (Int, Int, Int, Int) do
+    let mx = (b.x0 + b.x1) / 2
+    let mz = (b.z0 + b.z1) / 2
+    match side do
+      0 -> (b.x0 - reach, b.z0 - reach, b.x1 + reach, mz)
+      1 -> (mx, b.z0 - reach, b.x1 + reach, b.z1 + reach)
+      2 -> (b.x0 - reach, mz, b.x1 + reach, b.z1 + reach)
+      _ -> (b.x0 - reach, b.z0 - reach, mx, b.z1 + reach)
+    end
+  end
+  pfn fringe(ft : Features, dist : NativeIntArr, seed : Int, b : IslandBox, sides : Int, start : Int, k : Int) : Features do
+    if k >= sides do ft else
+      let side = (start + k) % 4
+      let far_cells = 12 + pick(seed, 4100 + b.label * 8 + side, 9)
+      let top = 4 + pick(seed, 4000 + b.label * 8 + side, 9)
+      let (x0, z0, x1, z1) = side_rect(b, side, far_cells)
+      let f = ft.floor
+      let (depth, kind) = band_go(f.depth, ft.kind, dist, f.w, most(x0, 0), most(z0, 0), least(x1, f.w - 1), least(z1, f.h - 1), 6, far_cells, top, most(x0, 0), most(z0, 0))
+      fringe({ floor: { f with depth: depth }, kind: kind }, dist, seed, b, sides, start, k + 1)
+    end
+  end
+  pfn fringes(ft : Features, dist : NativeIntArr, labels : NativeIntArr, seed : Int, r : FeatureRecipe, isles : List(IslandBox)) : Features do
+    match isles do
+      Nil -> ft
+      Cons(b, rest) ->
+        let chosen = forced_label(labels, ft.floor.w, ft.floor.h, r.forced, b.label) || roll(seed, 1000 + b.label) *. 100.0 < int_to_float(r.reef_share)
+        let ft = if chosen do fringe(ft, dist, seed, b, 1 + pick(seed, 2000 + b.label, 3), pick(seed, 3000 + b.label, 4), 0) else ft end
+        fringes(ft, dist, labels, seed, r, rest)
+    end
+  end
+
+  pfn patches(ft : Features, dist : NativeIntArr, bare : Option(IslandBox), seed : Int, n : Int, j : Int, k : Int) : Features do
+    if j >= n do ft
+    else if k >= 30 do patches(ft, dist, bare, seed, n, j + 1, 0)
+    else
+      let f = ft.floor
+      let i = pick(seed, 6000 + j * 40 + k, f.w * f.h)
+      let d = NativeArray.get_int(f.depth, i)
+      if d >= 12 && d <= 60 && NativeArray.get_int(ft.kind, i) == 0 && NativeArray.get_int(dist, i) >= 24 && !near_bare(bare, i % f.w, i / f.w, 27) do
+        patches(patch_reef(ft, i % f.w, i / f.w, 3 + pick(seed, 6500 + j, 4), 4 + pick(seed, 6600 + j, 9)), dist, bare, seed, n, j + 1, 0)
+      else patches(ft, dist, bare, seed, n, j, k + 1) end
+    end end
+  end
+
+  -- ── Where sand bars go ──
+  -- A candidate: its centre, the direction its spine runs (unit), and its kind (1 bay mouth, 2 gentle shore, 3 channel).
+  type BarSite = { x : Int, z : Int, dx : Float, dz : Float, kind : Int }
+  pfn land_at(land : NativeIntArr, w : Int, h : Int, x : Int, z : Int) : Bool do
+    if x < 0 || z < 0 || x >= w || z >= h do false else NativeArray.get_int(land, z * w + x) != 0 end
+  end
+  -- land within 12 cells of (x, z), sampled every other cell: (land samples, all samples, sum of their offsets x, z)
+  pfn bay_go(land : NativeIntArr, w : Int, h : Int, x : Int, z : Int, u : Int, v : Int, hits : Int, all : Int, sx : Int, sz : Int) : (Int, Int, Int, Int) do
+    if v > 12 do (hits, all, sx, sz)
+    else if u > 12 do bay_go(land, w, h, x, z, -12, v + 2, hits, all, sx, sz)
+    else if u * u + v * v > 144 do bay_go(land, w, h, x, z, u + 2, v, hits, all, sx, sz)
+    else if land_at(land, w, h, x + u, z + v) do bay_go(land, w, h, x, z, u + 2, v, hits + 1, all + 1, sx + u, sz + v)
+    else bay_go(land, w, h, x, z, u + 2, v, hits, all + 1, sx, sz) end end end end
+  end
+  -- the first island met walking from (x, z) along (ux, uz) for up to 12 cells, 0 for none
+  pfn probe(labels : NativeIntArr, w : Int, h : Int, x : Int, z : Int, ux : Int, uz : Int, k : Int) : Int do
+    if k > 12 do 0 else
+      let px = x + ux * k
+      let pz = z + uz * k
+      if px < 0 || pz < 0 || px >= w || pz >= h do 0
+      else if NativeArray.get_int(labels, pz * w + px) != 0 do NativeArray.get_int(labels, pz * w + px)
+      else probe(labels, w, h, x, z, ux, uz, k + 1) end end
+    end
+  end
+  pfn unit_dir(dx : Float, dz : Float) : (Float, Float) do
+    let l = Math.sqrt(dx *. dx +. dz *. dz)
+    if l <= 0.0 do (1.0, 0.0) else (dx /. l, dz /. l) end
+  end
+  pfn channel_dir(labels : NativeIntArr, w : Int, h : Int, x : Int, z : Int) : Option((Float, Float)) do
+    let a = probe(labels, w, h, x, z, 1, 0, 1)
+    let b = probe(labels, w, h, x, z, -1, 0, 1)
+    let c = probe(labels, w, h, x, z, 0, 1, 1)
+    let d = probe(labels, w, h, x, z, 0, -1, 1)
+    if a > 0 && b > 0 && a != b do Some((1.0, 0.0))
+    else if c > 0 && d > 0 && c != d do Some((0.0, 1.0)) else None end end
+  end
+  pfn site_at(f : Seafloor, land : NativeIntArr, labels : NativeIntArr, dist : NativeIntArr, x : Int, z : Int) : Option(BarSite) do
+    let i = z * f.w + x
+    let d = NativeArray.get_int(f.depth, i)
+    let cd = NativeArray.get_int(dist, i)
+    if d < 8 || d > 20 || cd >= far() do None else
+      let (hits, all, sx, sz) = bay_go(land, f.w, f.h, x, z, -12, -12, 0, 0, 0, 0)
+      if all > 0 && hits * 100 >= all * 45 do
+        -- across the bay's mouth: square to the way the land lies
+        let (ux, uz) = unit_dir(int_to_float(sx), int_to_float(sz))
+        Some({ x: x, z: z, dx: 0.0 -. uz, dz: ux, kind: 1 })
+      else
+        match channel_dir(labels, f.w, f.h, x, z) do
+          Some((ux, uz)) -> Some({ x: x, z: z, dx: ux, dz: uz, kind: 3 })
+          None ->
+            if cd >= 24 && cd <= 48 do
+              -- along the shore: square to the way the distance from land grows
+              let gx = int_to_float(NativeArray.get_int(dist, i + (if x < f.w - 1 do 1 else 0 end)) - NativeArray.get_int(dist, i - (if x > 0 do 1 else 0 end)))
+              let gz = int_to_float(NativeArray.get_int(dist, i + (if z < f.h - 1 do f.w else 0 end)) - NativeArray.get_int(dist, i - (if z > 0 do f.w else 0 end)))
+              let (ux, uz) = unit_dir(0.0 -. gz, gx)
+              Some({ x: x, z: z, dx: ux, dz: uz, kind: 2 })
+            else None end
+        end
+      end
+    end
+  end
+  pfn sites_go(f : Seafloor, land : NativeIntArr, labels : NativeIntArr, dist : NativeIntArr, x : Int, z : Int, out : List(BarSite)) : List(BarSite) do
+    if z >= f.h do out
+    else if x >= f.w do sites_go(f, land, labels, dist, 2, z + 5, out)
+    else match site_at(f, land, labels, dist, x, z) do
+      Some(s) -> sites_go(f, land, labels, dist, x + 5, z, Cons(s, out))
+      None -> sites_go(f, land, labels, dist, x + 5, z, out)
+    end end end
+  end
+  pfn clear_of(placed : List(BarSite), x : Int, z : Int) : Bool do
+    List.all(placed, fn p -> (p.x - x) * (p.x - x) + (p.z - z) * (p.z - z) >= 900)
+  end
+  -- choose up to [want] sites of [kind] from [sites] in seeded order, 30 cells apart from each other and from [placed]
+  pfn pick_sites(sites : List(BarSite), kind : Int, seed : Int, want : Int, placed : List(BarSite), tries : Int) : List(BarSite) do
+    let pool = List.filter(sites, fn s -> s.kind == kind)
+    let n = List.length(pool)
+    if n == 0 || tries >= 40 || List.length(placed) >= want do placed else
+      let s = List.nth(pool, pick(seed, 7000 + kind * 100 + tries, n))
+      pick_sites(sites, kind, seed, want, if clear_of(placed, s.x, s.z) do Cons(s, placed) else placed end, tries + 1)
+    end
+  end
+  pfn lay_bars(ft : Features, seed : Int, placed : List(BarSite), j : Int) : Features do
+    match placed do
+      Nil -> ft
+      Cons(s, rest) ->
+        let half = int_to_float(if s.kind == 3 do 5 + pick(seed, 7600 + j, 4) else 6 + pick(seed, 7600 + j, 7) end)
+        let ax = s.x + float_to_int(s.dx *. half)
+        let az = s.z + float_to_int(s.dz *. half)
+        let bx = s.x - float_to_int(s.dx *. half)
+        let bz = s.z - float_to_int(s.dz *. half)
+        lay_bars(bar(ft, ax, az, bx, bz, 2 + pick(seed, 7700 + j, 2), -2 + pick(seed, 7800 + j, 5)), seed, rest, j + 1)
+    end
+  end
+
+  -- whether any reef or bar lies within 20 cells of island [b]'s box
+  pfn featured_go(ft : Features, x0 : Int, z0 : Int, x1 : Int, z1 : Int, x : Int, z : Int) : Bool do
+    if z > z1 do false
+    else if x > x1 do featured_go(ft, x0, z0, x1, z1, x0, z + 1)
+    else if kind_at(ft, x, z) != 0 do true
+    else featured_go(ft, x0, z0, x1, z1, x + 1, z) end end end
+  end
+  pfn featured(ft : Features, b : IslandBox) : Bool do
+    let x0 = most(b.x0 - 20, 0)
+    let z0 = most(b.z0 - 20, 0)
+    featured_go(ft, x0, z0, least(b.x1 + 20, ft.floor.w - 1), least(b.z1 + 20, ft.floor.h - 1), x0, z0)
+  end
+  pfn clear_go(ft : Features, base : Seafloor, x0 : Int, x1 : Int, z1 : Int, x : Int, z : Int) : Features do
+    if z > z1 do ft
+    else if x > x1 do clear_go(ft, base, x0, x1, z1, x0, z + 1)
+    else
+      let i = z * base.w + x
+      let f = ft.floor
+      clear_go({ floor: { f with depth: NativeArray.set_int(f.depth, i, NativeArray.get_int(base.depth, i)) }, kind: NativeArray.set_int(ft.kind, i, 0) }, base, x0, x1, z1, x + 1, z)
+    end end
+  end
+  -- the island left bare: when there are two or more islands, the smallest that is not forced and got no fringing reef;
+  -- if every island got one, the smallest that is not forced, its reef taken back
+  pfn bare_island(ft : Features, base : Seafloor, labels : NativeIntArr, r : FeatureRecipe, isles : List(IslandBox)) : (Features, Option(IslandBox)) do
+    let free = List.filter(isles, fn b -> !forced_label(labels, base.w, base.h, r.forced, b.label))
+    if List.length(isles) < 2 || List.is_empty(free) do (ft, None) else
+      let smallest = fn (bs : List(IslandBox)) -> List.fold_left(bs, List.head(bs), fn (a, b) -> if b.cells < a.cells do b else a end)
+      let unreefed = List.filter(free, fn b -> !featured(ft, b))
+      if !List.is_empty(unreefed) do (ft, Some(smallest(unreefed))) else
+        let small = smallest(free)
+        let x0 = most(small.x0 - 20, 0)
+        (clear_go(ft, base, x0, least(small.x1 + 20, base.w - 1), least(small.z1 + 20, base.h - 1), x0, most(small.z0 - 20, 0)), Some(small))
+      end
+    end
+  end
+  -- whether (x, z) lies within [margin] cells of island [bare]'s box
+  pfn near_bare(bare : Option(IslandBox), x : Int, z : Int, margin : Int) : Bool do
+    match bare do
+      None -> false
+      Some(b) -> x >= b.x0 - margin && x <= b.x1 + margin && z >= b.z0 - margin && z <= b.z1 + margin
+    end
+  end
+
+  doc "Natural features for floor [f] round [land] (non-zero is land), from [seed] as recipe [r] says: fringing reefs along stretches of some islands' coasts (6 cells out to 12..20, tops 4..12 voxels down), patch reefs on the open shelf in 12..60 voxels of water, and sand bars (crests -2..2) across bay mouths, along shores and in channels between islands, 30 cells apart. At least one island is left bare when there are two or more. With no land there are none. The same inputs always give the same features."
+  fn generate(f : Seafloor, land : NativeIntArr, seed : Int, r : FeatureRecipe) : Features do
+    let labels = islands(land, f.w, f.h)
+    let isles = island_boxes(labels, f.w, f.h)
+    if List.is_empty(isles) do features(f) else
+      let dist = coast_distance(land, f.w, f.h)
+      let (ft, bare) = bare_island(fringes(features(f), dist, labels, seed, r, isles), f, labels, r, isles)
+      let ft = patches(ft, dist, bare, seed, pick(seed, 5000, r.patch_max + 1), 0, 0)
+      let want = r.bar_min + pick(seed, 7500, r.bar_max - r.bar_min + 1)
+      -- a bar reaches up to 15 cells from its centre: none starts within 36 of the bare island's box
+      let sites = List.filter(sites_go(ft.floor, land, labels, dist, 2, 2, Nil), fn st -> !near_bare(bare, st.x, st.z, 36))
+      lay_bars(ft, seed, pick_sites(sites, 3, seed, want, pick_sites(sites, 2, seed, want, pick_sites(sites, 1, seed, want, Nil, 0), 0), 0), 0)
+    end
   end
 
   -- ── Reading it ───────────────────────────────────────────────────────────

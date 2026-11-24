@@ -78,6 +78,74 @@ mod Strata.Test.Seabed do
     if x >= 40 do false else if Sb.kind_at(ft, x, z) == kind do true else any_kind_in_row(ft, z, kind, x + 1) end end
   end
 
+-- four islands on a 120 x 120 grid: two round ones, a C-shaped one with a bay opening east, and a small one
+pfn isle_at(x : Int, z : Int) : Bool do
+  let r1 = (x - 30) * (x - 30) + (z - 30) * (z - 30) <= 144
+  let r2 = (x - 85) * (x - 85) + (z - 30) * (z - 30) <= 100
+  let c = (x - 30) * (x - 30) + (z - 85) * (z - 85) <= 196
+  let bay = x > 28 && z > 79 && z < 91
+  let r4 = (x - 88) * (x - 88) + (z - 88) * (z - 88) <= 64
+  if r1 do true else if r2 do true else if c && !bay do true else r4 end end end
+end
+pfn isles(a : NativeIntArr, i : Int) : NativeIntArr do
+  if i >= 14400 do a else isles(NativeArray.set_int(a, i, if isle_at(i % 120, i / 120) do 1 else 0 end), i + 1) end
+end
+pfn isle_land() : NativeIntArr do isles(NativeArray.make_int(14400, 0), 0) end
+pfn isle_floor() : Strata.Seabed.Seafloor do Sb.shelf(isle_land(), 120, 120, 4, 2, 3, 20, 63) end
+pfn generated(seed : Int, r : Strata.Seabed.FeatureRecipe) : Strata.Seabed.Features do Sb.generate(isle_floor(), isle_land(), seed, r) end
+pfn same_arrays(a : NativeIntArr, b : NativeIntArr, i : Int) : Bool do
+  if i >= NativeArray.length_int(a) do true else if NativeArray.get_int(a, i) != NativeArray.get_int(b, i) do false else same_arrays(a, b, i + 1) end end
+end
+-- every cell's kind and depth agree: reef tops 4..12 deep, sand bar 2 deep at most... (bar cells may sit on its flanks, so only the range -2..63), nothing but open floor on land
+pfn ranges_ok(ft : Strata.Seabed.Features, land : NativeIntArr, i : Int) : Bool do
+  if i >= 14400 do true else
+    let k = NativeArray.get_int(ft.kind, i)
+    let d = NativeArray.get_int(ft.floor.depth, i)
+    let bad = (NativeArray.get_int(land, i) != 0 && (k != 0 || d != 0)) || (k == 1 && (d < 1 || d > 63)) || d < -2
+    if bad do false else ranges_ok(ft, land, i + 1) end
+  end
+end
+pfn least_reef_top(ft : Strata.Seabed.Features, i : Int, best : Int) : Int do
+  if i >= 14400 do best else
+    let d = NativeArray.get_int(ft.floor.depth, i)
+    least_reef_top(ft, i + 1, if NativeArray.get_int(ft.kind, i) == 1 && d < best do d else best end)
+  end
+end
+-- 4-connected groups of cells of [kind]
+pfn flood(ft : Strata.Seabed.Features, seen : NativeIntArr, kind : Int, stack : List(Int)) : NativeIntArr do
+  match stack do
+    Nil -> seen
+    Cons(i, rest) ->
+      if i < 0 || i >= 14400 || NativeArray.get_int(seen, i) != 0 || NativeArray.get_int(ft.kind, i) != kind do flood(ft, seen, kind, rest) else
+        let x = i % 120
+        let more = Cons(if x > 0 do i - 1 else -1 end, Cons(if x < 119 do i + 1 else -1 end, Cons(i - 120, Cons(i + 120, rest))))
+        flood(ft, NativeArray.set_int(seen, i, 1), kind, more)
+      end
+  end
+end
+pfn groups_go(ft : Strata.Seabed.Features, seen : NativeIntArr, kind : Int, i : Int, n : Int) : Int do
+  if i >= 14400 do n
+  else if NativeArray.get_int(seen, i) == 0 && NativeArray.get_int(ft.kind, i) == kind do groups_go(ft, flood(ft, seen, kind, Cons(i, Nil)), kind, i + 1, n + 1)
+  else groups_go(ft, seen, kind, i + 1, n) end end
+end
+pfn groups(ft : Strata.Seabed.Features, kind : Int) : Int do groups_go(ft, NativeArray.make_int(14400, 0), kind, 0, 0) end
+-- any reef or bar within [r] cells of (cx, cz)'s box of half-size [half]
+pfn featured_near(ft : Strata.Seabed.Features, cx : Int, cz : Int, half : Int, kind : Int, i : Int) : Bool do
+  if i >= 14400 do false else
+    let x = i % 120
+    let z = i / 120
+    let k = NativeArray.get_int(ft.kind, i)
+    let hit = int_abs(x - cx) <= half && int_abs(z - cz) <= half && (if kind == 0 do k != 0 else k == kind end)
+    if hit do true else featured_near(ft, cx, cz, half, kind, i + 1) end
+  end
+end
+pfn bare_islands(ft : Strata.Seabed.Features) : Int do
+  (if featured_near(ft, 30, 30, 32, 0, 0) do 0 else 1 end) + (if featured_near(ft, 85, 30, 30, 0, 0) do 0 else 1 end) +
+  (if featured_near(ft, 30, 85, 34, 0, 0) do 0 else 1 end) + (if featured_near(ft, 88, 88, 28, 0, 0) do 0 else 1 end)
+end
+pfn every_seed(seed : Int, check : Int -> Bool) : Bool do
+  if seed > 8 do true else if !check(seed) do false else every_seed(seed + 1, check) end end
+end
   describe "Seabed features" do
     test "a bar's crest pokes out and its ends taper" do
       let ft = bar_floor()
@@ -113,6 +181,54 @@ mod Strata.Test.Seabed do
       Test.assert_eq_int(Sb.depth_at(ft.floor, 20, 30), 8, "its top is 8 down")
       Test.assert_eq_int(Sb.kind_at(ft, 20, 30), 1, "reef at its centre")
       Test.assert_eq_int(Sb.kind_at(ft, 20, 37), 0, "open floor beyond it")
+    end
+  end
+
+  describe "Seabed.generate" do
+    test "the same seed gives the same features" do
+      let a = generated(5, Sb.default_recipe())
+      let b = generated(5, Sb.default_recipe())
+      Test.assert_true(same_arrays(a.kind, b.kind, 0) && same_arrays(a.floor.depth, b.floor.depth, 0), "identical")
+    end
+    test "features stay in their ranges" do
+      Test.assert_true(every_seed(1, fn s ->
+        let ft = generated(s, Sb.default_recipe())
+        ranges_ok(ft, isle_land(), 0) && least_reef_top(ft, 0, 100) >= 4), "reef tops 4.. deep, nothing on land")
+    end
+    test "the counts land in the recipe" do
+      Test.assert_true(every_seed(1, fn s ->
+        let ft = generated(s, Sb.default_recipe())
+        let bars = groups(ft, 2)
+        bars >= 2 && bars <= 5), "2 to 5 bars")
+      Test.assert_true(every_seed(1, fn s ->
+        let ft = generated(s, { Sb.default_recipe() with reef_share: 0 })
+        groups(ft, 1) <= 3), "with no fringing reefs, at most 3 patch reefs")
+      Test.assert_true(every_seed(1, fn s -> bare_islands(generated(s, { Sb.default_recipe() with reef_share: 100 })) >= 1), "at least one island has neither, even when every island would get a reef")
+    end
+    test "a forced island always gets a reef" do
+      Test.assert_true(every_seed(1, fn s ->
+        let ft = generated(s, { Sb.default_recipe() with reef_share: 0, forced: [(85, 30)] })
+        featured_near(ft, 85, 30, 30, 1, 0)), "the island at (85, 30) has reef")
+    end
+    test "no land, no features" do
+      let sea = NativeArray.make_int(14400, 0)
+      let ft = Sb.generate(Sb.shelf(sea, 120, 120, 4, 2, 3, 20, 63), sea, 3, Sb.default_recipe())
+      Test.assert_eq_int(groups(ft, 1) + groups(ft, 2), 0, "nothing")
+    end
+    test "islands are labelled apart" do
+      let labels = Sb.islands(isle_land(), 120, 120)
+      Test.assert_true(NativeArray.get_int(labels, 30 * 120 + 30) > 0, "an island is labelled")
+      Test.assert_true(NativeArray.get_int(labels, 30 * 120 + 30) != NativeArray.get_int(labels, 30 * 120 + 85), "two islands differ")
+      Test.assert_eq_int(NativeArray.get_int(labels, 60 * 120 + 60), 0, "water is 0")
+    end
+    test "a bar breaks the swell" do
+      let open = Sb.dig(beach(), 0, 4, 39, 39, 24, 0)
+      let barred = Sb.bar(Sb.features(open), 0, 20, 39, 20, 2, 0)
+      let plain = Strata.Waves.solve_sea(Sb.depths_m(open, 0.25), 40, 40, 0.0, 0.0, 1.0, 0.0, -1.0, 12.0, 2.0)
+      let broken = Strata.Waves.solve_sea(Sb.depths_m(barred.floor, 0.25), 40, 40, 0.0, 0.0, 1.0, 0.0, -1.0, 12.0, 2.0)
+      let (_, a0) = Strata.Waves.sample(plain, 20, 12)
+      let (_, a1) = Strata.Waves.sample(broken, 20, 12)
+      Test.assert_true(a1 < a0 *. 0.8, "shoreward of the bar the swell is lower")
     end
   end
 
