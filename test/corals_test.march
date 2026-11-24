@@ -1,0 +1,105 @@
+-- Corals: every species builds a standing, connected piece, each its own shape, the same every time.
+mod Strata.Test.Corals do
+
+  needs IO.Clock      -- charged to every test module once any uses Check.all (GAPS S3)
+
+  needs IO.Console
+
+  needs IO.FileRead
+
+  needs IO.FileWrite
+  needs IO.Process
+  import Test
+  alias Strata.Corals as Co
+  alias Strata.Template as Tp
+
+  pfn coral(sp : Int, seed : Int) : Strata.Template.Template do Co.build(sp, seed, 0.25, 5, 6) end
+  pfn at(t : Strata.Template.Template, x : Int, y : Int, z : Int) : Int do
+    let sx = Tp.t_sx(t)
+    let sy = Tp.t_sy(t)
+    if x < 0 || y < 0 || z < 0 || x >= sx || y >= sy || z >= Tp.t_sz(t) do 0 else NativeArray.get_i32(Tp.t_ids(t), x + sx * (y + sy * z)) end
+  end
+  pfn count_go(t : Strata.Template.Template, id : Int, i : Int, n : Int) : Int do
+    if i >= NativeArray.length_i32(Tp.t_ids(t)) do n else count_go(t, id, i + 1, if NativeArray.get_i32(Tp.t_ids(t), i) == id do n + 1 else n end) end
+  end
+  pfn solid(t : Strata.Template.Template) : Int do NativeArray.length_i32(Tp.t_ids(t)) - count_go(t, 0, 0, 0) end
+  pfn only_ids(t : Strata.Template.Template, i : Int) : Bool do
+    if i >= NativeArray.length_i32(Tp.t_ids(t)) do true else
+      let v = NativeArray.get_i32(Tp.t_ids(t), i)
+      if v != 0 && v != 5 && v != 6 do false else only_ids(t, i + 1) end
+    end
+  end
+  -- solid voxels reached from the base, face to face
+  pfn reach_go(t : Strata.Template.Template, seen : NativeIntArr, stack : List((Int, Int, Int)), n : Int) : Int do
+    match stack do
+      Nil -> n
+      Cons((x, y, z), rest) ->
+        let sx = Tp.t_sx(t)
+        let sy = Tp.t_sy(t)
+        if at(t, x, y, z) == 0 || NativeArray.get_int(seen, x + sx * (y + sy * z)) != 0 do reach_go(t, seen, rest, n) else
+          let more = Cons((x + 1, y, z), Cons((x - 1, y, z), Cons((x, y + 1, z), Cons((x, y - 1, z), Cons((x, y, z + 1), Cons((x, y, z - 1), rest))))))
+          reach_go(t, NativeArray.set_int(seen, x + sx * (y + sy * z), 1), more, n + 1)
+        end
+    end
+  end
+  pfn connected(t : Strata.Template.Template) : Bool do
+    let h = Co.half(t)
+    reach_go(t, NativeArray.make_int(NativeArray.length_i32(Tp.t_ids(t)), 0), Cons((h, 0, h), Nil), 0) == solid(t)
+  end
+  -- the template's solid extent along x, along z, and its top row
+  pfn extent_go(t : Strata.Template.Template, i : Int, x0 : Int, x1 : Int, z0 : Int, z1 : Int, top : Int) : (Int, Int, Int) do
+    if i >= NativeArray.length_i32(Tp.t_ids(t)) do (x1 - x0 + 1, z1 - z0 + 1, top) else
+      let sx = Tp.t_sx(t)
+      let sy = Tp.t_sy(t)
+      if NativeArray.get_i32(Tp.t_ids(t), i) == 0 do extent_go(t, i + 1, x0, x1, z0, z1, top) else
+        let x = i % sx
+        let y = i / sx % sy
+        let z = i / (sx * sy)
+        extent_go(t, i + 1, if x < x0 do x else x0 end, if x > x1 do x else x1 end, if z < z0 do z else z0 end, if z > z1 do z else z1 end, if y > top do y else top end)
+      end
+    end
+  end
+  pfn extent(t : Strata.Template.Template) : (Int, Int, Int) do extent_go(t, 0, 1000, -1, 1000, -1, -1) end
+  pfn same(a : Strata.Template.Template, b : Strata.Template.Template, i : Int) : Bool do
+    if i >= NativeArray.length_i32(Tp.t_ids(a)) do NativeArray.length_i32(Tp.t_ids(a)) == NativeArray.length_i32(Tp.t_ids(b))
+    else if NativeArray.get_i32(Tp.t_ids(a), i) != NativeArray.get_i32(Tp.t_ids(b), i) do false else same(a, b, i + 1) end end
+  end
+  pfn every(sp : Int, seed : Int, check : Strata.Template.Template -> Bool) : Bool do
+    if sp >= Co.species_count() do true
+    else if seed > 6 do every(sp + 1, 1, check)
+    else if !check(coral(sp, seed)) do false else every(sp, seed + 1, check) end end end
+  end
+
+  describe "Corals.build" do
+    test "every species stands on its base and is one piece" do
+      Test.assert_true(every(0, 1, fn t -> at(t, Co.half(t), 0, Co.half(t)) != 0), "the base voxel is solid")
+      Test.assert_true(every(0, 1, fn t -> connected(t)), "every solid voxel is joined face to face to the base")
+      Test.assert_true(every(0, 1, fn t -> solid(t) >= 8), "every coral has some body")
+    end
+    test "only the given colours, and both of them" do
+      Test.assert_true(every(0, 1, fn t -> only_ids(t, 0)), "main 5, accent 6, holes 0")
+      Test.assert_true(every(0, 1, fn t -> count_go(t, 6, 0, 0) > 0), "every coral shows its accent")
+    end
+    test "the same seed builds the same coral; another seed another" do
+      Test.assert_true(same(coral(0, 3), coral(0, 3), 0), "branching, same seed")
+      Test.assert_false(same(coral(0, 3), coral(0, 4), 0), "branching, another seed")
+      Test.assert_false(same(coral(1, 3), coral(1, 4), 0), "brain, another seed")
+    end
+    test "each species has its own shape" do
+      Test.assert_true(every(0, 1, fn t -> Tp.t_sx(t) == Tp.t_sz(t) && Tp.t_sx(t) % 2 == 1), "square and odd")
+      let (bw, _, bh) = extent(coral(1, 2))
+      Test.assert_true(bh + 1 < bw, "a brain coral is wider than tall")
+      let (tw, _, _) = extent(coral(2, 2))
+      Test.assert_true(tw >= 7, "a table coral's plate is wide")
+      let (fx, fz, fh) = extent(coral(3, 2))
+      Test.assert_true((fx <= 1 || fz <= 1) && fh >= 4, "a sea fan is one voxel thin and stands tall")
+      let (_, _, sh) = extent(coral(4, 2))
+      Test.assert_true(sh >= 2, "a tube sponge stands up")
+    end
+    test "a coarser voxel builds a smaller grid of the same size in metres" do
+      let fine = coral(1, 5)
+      let coarse = Co.build(1, 5, 0.5, 5, 6)
+      Test.assert_true(Tp.t_sx(coarse) < Tp.t_sx(fine), "fewer voxels across at 0.5 m")
+    end
+  end
+end

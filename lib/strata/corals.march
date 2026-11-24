@@ -1,0 +1,324 @@
+-- Corals — procedural corals baked into voxel templates, as Strata.Trees
+-- bakes trees: a game stamps them onto a reef (Strata.Seabed kind 1) with
+-- Strata.Template.blit, or reads the template's voxels and meshes them
+-- itself. Every length is in metres, so a coral is the same shape at any
+-- voxel size.
+--
+-- Species:
+--   0 branching (staghorn): forking, tapering branches from a short base,
+--     reaching up and out, their tips in the accent colour.
+--   1 brain (boulder): a squashed, lumpy dome whose surface winds in ridges
+--     of the main colour and grooves of the accent.
+--   2 table: a short stalk under a wide, thin plate with a ragged rim that
+--     turns up a little at the edge.
+--   3 sea fan: a flat lace of branches in one upright plane (x = const or
+--     z = const, picked by the seed; a blit's turn sets which way it faces).
+--   4 tube sponge: a clump of two to four upright tubes, open at the top.
+--
+-- The random draws are hashes of the seed (Strata.Seed), so the same
+-- (species, seed, voxel size) always builds the same template. Every
+-- template is square and odd: its base stands at the middle of the bottom
+-- row (half, 0, half), half = (side - 1) / 2, on the voxel above the floor
+-- it grows from: blit(..., wx - half, floor_top + 1, wz - half, rot, s). Its
+-- solid voxels are one 6-connected piece that includes the base voxel.
+-- Holes are 0; the main colour is [main], the accent [accent].
+mod Strata.Corals do
+
+  pfn u01(s : Int, k : Int) : Float do Strata.Seed.unit(Strata.Seed.mix(s, k)) end
+  pfn uni(s : Int, k : Int, lo : Float, hi : Float) : Float do lo +. (hi -. lo) *. u01(s, k) end
+  pfn rint(s : Int, k : Int, lo : Int, hi : Int) : Int do
+    let v = lo + float_to_int(Math.floor(u01(s, k) *. int_to_float(hi - lo + 1)))
+    if v > hi do hi else v end
+  end
+  pfn clampi(v : Int, lo : Int, hi : Int) : Int do if v < lo do lo else if v > hi do hi else v end end end
+  pfn absf(v : Float) : Float do if v < 0.0 do 0.0 -. v else v end end
+
+  -- ── A grid to draw in: ids, half (the base's x and z), height, side, voxel size ──
+  type CoralGrid = CoralGrid(NativeI32Arr, Int, Int, Float)
+  pfn g_ids(g : CoralGrid) : NativeI32Arr do match g do CoralGrid(v, _, _, _) -> v end end
+  pfn g_half(g : CoralGrid) : Int do match g do CoralGrid(_, v, _, _) -> v end end
+  pfn g_sy(g : CoralGrid) : Int do match g do CoralGrid(_, _, v, _) -> v end end
+  pfn g_vs(g : CoralGrid) : Float do match g do CoralGrid(_, _, _, v) -> v end end
+  pfn g_side(g : CoralGrid) : Int do 2 * g_half(g) + 1 end
+  pfn index(g : CoralGrid, x : Int, y : Int, z : Int) : Int do x + g_side(g) * (y + g_sy(g) * z) end
+  pfn inside(g : CoralGrid, x : Int, y : Int, z : Int) : Bool do
+    x >= 0 && y >= 0 && z >= 0 && x < g_side(g) && y < g_sy(g) && z < g_side(g)
+  end
+  pfn get(g : CoralGrid, x : Int, y : Int, z : Int) : Int do if inside(g, x, y, z) do NativeArray.get_i32(g_ids(g), index(g, x, y, z)) else 0 end end
+  -- put [id] at a voxel; an accent never overwrites the main colour's interior (callers draw main last where it matters)
+  pfn put(g : CoralGrid, x : Int, y : Int, z : Int, id : Int) : CoralGrid do
+    if !inside(g, x, y, z) do g else
+      match g do CoralGrid(a, h, sy, vs) -> CoralGrid(NativeArray.set_i32(a, index(g, x, y, z), id), h, sy, vs) end
+    end
+  end
+  -- the voxel holding the point (x, y, z) metres, the base at the origin
+  pfn vox(g : CoralGrid, x : Float, y : Float, z : Float) : (Int, Int, Int) do
+    let vs = g_vs(g)
+    (g_half(g) + float_to_int(Math.floor(x /. vs +. 0.5)), float_to_int(Math.floor(y /. vs)), g_half(g) + float_to_int(Math.floor(z /. vs +. 0.5)))
+  end
+  -- from voxel a to voxel b one axis at a time, so a drawn line is joined face to face
+  pfn step_to(g : CoralGrid, ax : Int, ay : Int, az : Int, bx : Int, by_ : Int, bz : Int, id : Int) : CoralGrid do
+    if ax == bx && ay == by_ && az == bz do put(g, ax, ay, az, id)
+    else
+      let g = put(g, ax, ay, az, id)
+      if ay != by_ do step_to(g, ax, ay + (if by_ > ay do 1 else -1 end), az, bx, by_, bz, id)
+      else if ax != bx do step_to(g, ax + (if bx > ax do 1 else -1 end), ay, az, bx, by_, bz, id)
+      else step_to(g, ax, ay, az + (if bz > az do 1 else -1 end), bx, by_, bz, id) end end
+    end
+  end
+  -- a solid ball of [r] metres about (x, y, z)
+  pfn ball(g : CoralGrid, x : Float, y : Float, z : Float, r : Float, id : Int) : CoralGrid do
+    let vs = g_vs(g)
+    let n = float_to_int(Math.ceil(r /. vs))
+    ball_go(g, x, y, z, r, id, 0 - n, 0 - n, 0 - n, n)
+  end
+  pfn ball_go(g : CoralGrid, x : Float, y : Float, z : Float, r : Float, id : Int, i : Int, j : Int, k : Int, n : Int) : CoralGrid do
+    if k > n do g
+    else if j > n do ball_go(g, x, y, z, r, id, 0 - n, 0 - n, k + 1, n)
+    else if i > n do ball_go(g, x, y, z, r, id, 0 - n, j + 1, k, n)
+    else
+      let vs = g_vs(g)
+      let px = x +. int_to_float(i) *. vs
+      let py = y +. int_to_float(j) *. vs
+      let pz = z +. int_to_float(k) *. vs
+      let dx = px -. x
+      let dy = py -. y
+      let dz = pz -. z
+      let g = if dx *. dx +. dy *. dy +. dz *. dz <= r *. r do
+        let (vx, vy, vz) = vox(g, px, py, pz)
+        put(g, vx, vy, vz, id)
+      else g end
+      ball_go(g, x, y, z, r, id, i + 1, j, k, n)
+    end end end
+  end
+  -- a limb from (x0, y0, z0) to (x1, y1, z1) metres, [r0] thick at its start and [r1] at its end:
+  -- a ball every half voxel (or the voxel alone where it is under half a voxel thick), joined face to face
+  pfn limb(g : CoralGrid, x0 : Float, y0 : Float, z0 : Float, x1 : Float, y1 : Float, z1 : Float, r0 : Float, r1 : Float, id : Int) : CoralGrid do
+    let dx = x1 -. x0
+    let dy = y1 -. y0
+    let dz = z1 -. z0
+    let len = Math.sqrt(dx *. dx +. dy *. dy +. dz *. dz)
+    let steps = clampi(float_to_int(Math.ceil(len /. (g_vs(g) *. 0.5))), 1, 400)
+    limb_go(g, x0, y0, z0, dx, dy, dz, r0, r1, id, 0, steps, vox(g, x0, y0, z0))
+  end
+  pfn limb_go(g : CoralGrid, x0 : Float, y0 : Float, z0 : Float, dx : Float, dy : Float, dz : Float, r0 : Float, r1 : Float, id : Int, k : Int, n : Int, last : (Int, Int, Int)) : CoralGrid do
+    if k > n do g else
+      let t = int_to_float(k) /. int_to_float(n)
+      let px = x0 +. dx *. t
+      let py = y0 +. dy *. t
+      let pz = z0 +. dz *. t
+      let r = r0 +. (r1 -. r0) *. t
+      let (vx, vy, vz) = vox(g, px, py, pz)
+      let (lx, ly, lz) = last
+      let g = step_to(g, lx, ly, lz, vx, vy, vz, id)
+      let g = if r >= g_vs(g) *. 0.5 do ball(g, px, py, pz, r, id) else g end
+      limb_go(g, x0, y0, z0, dx, dy, dz, r0, r1, id, k + 1, n, (vx, vy, vz))
+    end
+  end
+
+  -- ── Species ─────────────────────────────────────────────────────────────
+  -- how far (metres) a species reaches from its base, and how tall it can be
+  pfn reach(sp : Int) : Float do if sp == 0 do 1.0 else if sp == 1 do 1.2 else if sp == 2 do 1.5 else if sp == 3 do 0.9 else 1.0 end end end end end
+  pfn height(sp : Int) : Float do if sp == 0 do 1.5 else if sp == 1 do 1.0 else if sp == 2 do 1.0 else if sp == 3 do 1.7 else 1.3 end end end end end
+
+  -- branching: 3..5 limbs from the base, each forking up to twice, tips in the accent
+  pfn branch(g : CoralGrid, s : Int, x : Float, y : Float, z : Float, yaw : Float, tilt : Float, len : Float, r : Float, depth : Int, main : Int, accent : Int) : CoralGrid do
+    let ex = x +. Math.cos(yaw) *. Math.sin(tilt) *. len
+    let ey = y +. Math.cos(tilt) *. len
+    let ez = z +. Math.sin(yaw) *. Math.sin(tilt) *. len
+    let tip = r *. 0.7
+    let g = limb(g, x, y, z, ex, ey, ez, r, tip, main)
+    if depth >= 2 do put_tip(g, ex, ey, ez, accent) else
+      let forks = rint(s, 1, 2, 2)
+      let spread = uni(s, 2, 0.35, 0.7)
+      let g = branch(g, Strata.Seed.mix(s, 11), ex, ey, ez, yaw +. spread, clampf(tilt -. 0.15, 0.1, 1.2), len *. uni(s, 3, 0.6, 0.8), tip, depth + 1, main, accent)
+      if forks < 2 do g else branch(g, Strata.Seed.mix(s, 12), ex, ey, ez, yaw -. spread, clampf(tilt +. 0.1, 0.1, 1.2), len *. uni(s, 4, 0.55, 0.75), tip, depth + 1, main, accent) end
+    end
+  end
+  pfn clampf(v : Float, lo : Float, hi : Float) : Float do if v < lo do lo else if v > hi do hi else v end end end
+  pfn put_tip(g : CoralGrid, x : Float, y : Float, z : Float, id : Int) : CoralGrid do
+    let (vx, vy, vz) = vox(g, x, y, z)
+    put(g, vx, vy, vz, id)
+  end
+  pfn branching(g : CoralGrid, s : Int, main : Int, accent : Int) : CoralGrid do
+    let n = rint(s, 1, 3, 5)
+    let g = ball(g, 0.0, 0.12, 0.0, 0.18, main)
+    branching_go(g, s, main, accent, 0, n, uni(s, 2, 0.0, 6.2831853))
+  end
+  pfn branching_go(g : CoralGrid, s : Int, main : Int, accent : Int, k : Int, n : Int, yaw0 : Float) : CoralGrid do
+    if k >= n do g else
+      let bs = Strata.Seed.mix(s, 100 + k)
+      let yaw = yaw0 +. 6.2831853 *. int_to_float(k) /. int_to_float(n) +. uni(bs, 5, -0.3, 0.3)
+      branching_go(branch(g, bs, 0.0, 0.1, 0.0, yaw, uni(bs, 6, 0.25, 0.75), uni(bs, 7, 0.45, 0.65), 0.09, 0, main, accent), s, main, accent, k + 1, n, yaw0)
+    end
+  end
+
+  -- brain: a squashed dome, its surface lumped by a hash and wound in ridges and grooves
+  pfn brain(g : CoralGrid, s : Int, main : Int, accent : Int) : CoralGrid do
+    let r = uni(s, 1, 0.6, 1.1)
+    let squash = uni(s, 2, 0.55, 0.75)
+    let fx = uni(s, 3, 3.0, 5.0)
+    let fz = uni(s, 4, 3.0, 5.0)
+    let ph = uni(s, 5, 0.0, 6.2831853)
+    brain_go(g, s, r, squash, fx, fz, ph, main, accent, 0, 0, 0)
+  end
+  pfn brain_go(g : CoralGrid, s : Int, r : Float, squash : Float, fx : Float, fz : Float, ph : Float, main : Int, accent : Int, x : Int, y : Int, z : Int) : CoralGrid do
+    let side = g_side(g)
+    if z >= side do g
+    else if y >= g_sy(g) do brain_go(g, s, r, squash, fx, fz, ph, main, accent, 0, 0, z + 1)
+    else if x >= side do brain_go(g, s, r, squash, fx, fz, ph, main, accent, 0, y + 1, z)
+    else
+      let vs = g_vs(g)
+      let px = int_to_float(x - g_half(g)) *. vs
+      let py = (int_to_float(y) +. 0.5) *. vs
+      let pz = int_to_float(z - g_half(g)) *. vs
+      let lump = 0.08 *. (Strata.Seed.unit(Strata.Seed.cell(s, 7, x / 2, y / 2, z / 2)) -. 0.5)
+      let d = Math.sqrt(px *. px +. (py /. squash) *. (py /. squash) +. pz *. pz)
+      let g = if d <= r +. lump do
+        -- the outer shell winds in ridges and grooves; the core is the main colour
+        let shell = d >= r +. lump -. vs *. 1.2
+        let groove = Math.sin(px *. fx +. Math.sin(pz *. fz +. ph) *. 1.6) > 0.35
+        put(g, x, y, z, if shell && groove do accent else main end)
+      else g end
+      brain_go(g, s, r, squash, fx, fz, ph, main, accent, x + 1, y, z)
+    end end end
+  end
+
+  -- table: a stalk under a thin plate with a ragged rim that turns up at the edge
+  pfn table(g : CoralGrid, s : Int, main : Int, accent : Int) : CoralGrid do
+    let stalk = uni(s, 1, 0.3, 0.55)
+    let plate = uni(s, 2, 0.9, 1.4)
+    let g = limb(g, 0.0, 0.0, 0.0, 0.0, stalk, 0.0, 0.16, 0.12, main)
+    table_go(g, s, stalk, plate, main, accent, 0, 0)
+  end
+  pfn table_go(g : CoralGrid, s : Int, stalk : Float, plate : Float, main : Int, accent : Int, x : Int, z : Int) : CoralGrid do
+    let side = g_side(g)
+    if z >= side do g
+    else if x >= side do table_go(g, s, stalk, plate, main, accent, 0, z + 1)
+    else
+      let vs = g_vs(g)
+      let px = int_to_float(x - g_half(g)) *. vs
+      let pz = int_to_float(z - g_half(g)) *. vs
+      let d = Math.sqrt(px *. px +. pz *. pz)
+      let ragged = plate *. (0.85 +. 0.15 *. Strata.Seed.unit(Strata.Seed.cell(s, 9, float_to_int(Math.floor(Math.atan2(pz, px) *. 4.0)), 0, 0)))
+      let g = if d > ragged do g else
+        -- the plate lies at the stalk's top, rising a voxel toward the outer third
+        let (_, y0, _) = vox(g, 0.0, stalk, 0.0)
+        let y = if d > ragged *. 0.66 do y0 + 1 else y0 end
+        let rim = d > ragged -. vs *. 1.1
+        let g = put(g, x, y, z, if rim do accent else main end)
+        -- where the plate steps up, the voxel under the step joins it face to face
+        if y > y0 do put(g, x, y0, z, main) else g end
+      end
+      table_go(g, s, stalk, plate, main, accent, x + 1, z)
+    end end
+  end
+
+  -- sea fan: a flat lace of forking limbs in one upright plane
+  pfn fan_limb(g : CoralGrid, s : Int, along_x : Bool, u : Float, y : Float, ang : Float, len : Float, depth : Int, main : Int, accent : Int) : CoralGrid do
+    let eu = u +. Math.sin(ang) *. len
+    let ey = y +. Math.cos(ang) *. len
+    let (x0, z0, x1, z1) = if along_x do (u, 0.0, eu, 0.0) else (0.0, u, 0.0, eu) end
+    let g = limb(g, x0, y, z0, x1, ey, z1, 0.0, 0.0, main)
+    if depth >= 3 do put_tip(g, x1, ey, z1, accent) else
+      let spread = uni(s, 1, 0.25, 0.5)
+      let g = fan_limb(g, Strata.Seed.mix(s, 21), along_x, eu, ey, ang -. spread, len *. uni(s, 2, 0.6, 0.8), depth + 1, main, accent)
+      fan_limb(g, Strata.Seed.mix(s, 22), along_x, eu, ey, ang +. spread, len *. uni(s, 3, 0.6, 0.8), depth + 1, main, accent)
+    end
+  end
+  pfn fan(g : CoralGrid, s : Int, main : Int, accent : Int) : CoralGrid do
+    let along_x = u01(s, 1) < 0.5
+    let trunk = uni(s, 2, 0.2, 0.35)
+    let g = limb(g, 0.0, 0.0, 0.0, 0.0, trunk, 0.0, 0.0, 0.0, main)
+    fan_limb(g, Strata.Seed.mix(s, 3), along_x, 0.0, trunk, uni(s, 4, -0.15, 0.15), uni(s, 5, 0.45, 0.6), 0, main, accent)
+  end
+
+  -- tube sponge: two to four upright tubes from a shared foot, open at the top
+  pfn tube(g : CoralGrid, s : Int, x : Float, z : Float, r : Float, h : Float, main : Int, accent : Int) : CoralGrid do
+    let vs = g_vs(g)
+    let g = limb(g, 0.0, 0.0, 0.0, x, 0.0, z, 0.0, 0.0, main)
+    let g = limb(g, x, 0.0, z, x, h, z, r, r, main)
+    -- hollow it from the top down a third of its height, the rim in the accent
+    let (cx, top, cz) = vox(g, x, h, z)
+    let n = float_to_int(Math.ceil(r /. vs))
+    hollow(g, cx, top, cz, n, r /. vs -. 0.8, top - clampi(float_to_int(h /. vs /. 3.0), 1, 20), accent)
+  end
+  pfn hollow(g : CoralGrid, cx : Int, y : Int, cz : Int, n : Int, inner : Float, bottom : Int, accent : Int) : CoralGrid do
+    if y < bottom do g else hollow(hollow_row(g, cx, y, cz, n, inner, accent, 0 - n, 0 - n), cx, y - 1, cz, n, inner, bottom, accent) end
+  end
+  pfn hollow_row(g : CoralGrid, cx : Int, y : Int, cz : Int, n : Int, inner : Float, accent : Int, i : Int, k : Int) : CoralGrid do
+    if k > n do g
+    else if i > n do hollow_row(g, cx, y, cz, n, inner, accent, 0 - n, k + 1)
+    else
+      let d = Math.sqrt(int_to_float(i * i + k * k))
+      let here = get(g, cx + i, y, cz + k)
+      let g = if here == 0 do g
+        else if d < inner do put(g, cx + i, y, cz + k, 0)
+        else put(g, cx + i, y, cz + k, accent) end end
+      hollow_row(g, cx, y, cz, n, inner, accent, i + 1, k)
+    end end
+  end
+  pfn sponge(g : CoralGrid, s : Int, main : Int, accent : Int) : CoralGrid do
+    let n = rint(s, 1, 2, 4)
+    sponge_go(g, s, main, accent, 0, n, uni(s, 2, 0.0, 6.2831853))
+  end
+  pfn sponge_go(g : CoralGrid, s : Int, main : Int, accent : Int, k : Int, n : Int, yaw0 : Float) : CoralGrid do
+    if k >= n do g else
+      let ts = Strata.Seed.mix(s, 200 + k)
+      let yaw = yaw0 +. 6.2831853 *. int_to_float(k) /. int_to_float(n)
+      let off = if k == 0 do 0.0 else uni(ts, 1, 0.45, 0.6) end
+      sponge_go(tube(g, ts, Math.cos(yaw) *. off, Math.sin(yaw) *. off, uni(ts, 2, 0.3, 0.4), uni(ts, 3, 0.5, 1.2), main, accent), s, main, accent, k + 1, n, yaw0)
+    end
+  end
+
+  -- every solid voxel 6-connected to the base: whatever a rounding left floating is dropped
+  pfn keep_go(g : CoralGrid, seen : NativeIntArr, stack : List(Int)) : NativeIntArr do
+    match stack do
+      Nil -> seen
+      Cons(i, rest) ->
+        if i < 0 || NativeArray.get_int(seen, i) != 0 || NativeArray.get_i32(g_ids(g), i) == 0 do keep_go(g, seen, rest) else
+          let side = g_side(g)
+          let x = i % side
+          let y = i / side % g_sy(g)
+          let z = i / (side * g_sy(g))
+          let nb = fn (dx : Int, dy : Int, dz : Int) -> if inside(g, x + dx, y + dy, z + dz) do index(g, x + dx, y + dy, z + dz) else -1 end
+          keep_go(g, NativeArray.set_int(seen, i, 1), Cons(nb(1, 0, 0), Cons(nb(-1, 0, 0), Cons(nb(0, 1, 0), Cons(nb(0, -1, 0), Cons(nb(0, 0, 1), Cons(nb(0, 0, -1), rest)))))))
+        end
+    end
+  end
+  pfn prune_go(a : NativeI32Arr, seen : NativeIntArr, i : Int, n : Int) : NativeI32Arr do
+    if i >= n do a else prune_go(if NativeArray.get_int(seen, i) == 0 do NativeArray.set_i32(a, i, 0) else a end, seen, i + 1, n) end
+  end
+  pfn connected(g : CoralGrid, main : Int) : CoralGrid do
+    -- the base voxel is always there, so the piece has somewhere to stand
+    let g = put(g, g_half(g), 0, g_half(g), if get(g, g_half(g), 0, g_half(g)) == 0 do main else get(g, g_half(g), 0, g_half(g)) end)
+    let n = g_side(g) * g_sy(g) * g_side(g)
+    let seen = keep_go(g, NativeArray.make_int(n, 0), Cons(index(g, g_half(g), 0, g_half(g)), Nil))
+    match g do CoralGrid(a, h, sy, vs) -> CoralGrid(prune_go(a, seen, 0, n), h, sy, vs) end
+  end
+
+  doc "How many species there are: 0 branching, 1 brain, 2 table, 3 sea fan, 4 tube sponge."
+  fn species_count() : Int do 5 end
+
+  doc "A coral of [species] (0 branching, 1 brain, 2 table, 3 sea fan, 4 tube sponge; clamped) from [seed], at [voxel_size] metres a voxel, in block ids [main] and [accent] (holes 0). Square and odd; its base is the voxel (half, 0, half), half = (side - 1) / 2, and its solid voxels are one 6-connected piece that includes it. The same inputs always give the same template."
+  fn build(species : Int, seed : Int, voxel_size : Float, main : Int, accent : Int) : Strata.Template.Template do
+    let sp = clampi(species, 0, 4)
+    let vs = if voxel_size <= 0.0 do 0.25 else voxel_size end
+    let half = float_to_int(Math.ceil(reach(sp) /. vs)) + 1
+    let sy = float_to_int(Math.ceil(height(sp) /. vs)) + 2
+    let side = 2 * half + 1
+    let g0 = CoralGrid(NativeArray.make_i32(side * sy * side, 0), half, sy, vs)
+    let s = Strata.Seed.mix(seed, 7300 + sp)
+    let g = match sp do
+      0 -> branching(g0, s, main, accent)
+      1 -> brain(g0, s, main, accent)
+      2 -> table(g0, s, main, accent)
+      3 -> fan(g0, s, main, accent)
+      _ -> sponge(g0, s, main, accent)
+    end
+    Strata.Template.make(side, sy, side, g_ids(connected(g, main)), vs)
+  end
+
+  doc "The middle of a coral template's footprint, where its base stands: (side - 1) / 2."
+  fn half(t : Strata.Template.Template) : Int do (Strata.Template.t_sx(t) - 1) / 2 end
+end
