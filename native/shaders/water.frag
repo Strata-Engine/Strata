@@ -219,9 +219,15 @@ void main() {
         o_color = vec4(colour, fade);
         return;
     }
-    if (overlay >= 251u && overlay <= 253u && face == 0u) {
-        // Four six-bit samples of a scalar field on an eight-voxel patch.
-        vec2 uv = clamp(v_uv / 8.0, 0.0, 1.0);
+    if (overlay >= 251u && overlay <= 253u) {
+        // Four six-bit samples of a scalar field at the corners of the
+        // eight-voxel cell a quad lies in, blended by world position, so
+        // quads of any size and the walls of terrain steps share one field.
+        // A wall's cell is the one just behind it.
+        vec3 n = qrot(v_rot, NORMALS[min(face, 5u)]);
+        float cell = 8.0 * u.eye.w;
+        vec2 home = floor((v_world.xz - n.xz * (0.5 * u.eye.w)) / cell) * cell;
+        vec2 uv = clamp((v_world.xz - home) / cell, 0.0, 1.0);
         vec4 corners = vec4(uvec4(v_w1, v_w1 >> 6, v_w1 >> 12, v_w1 >> 18) & 63u) / 63.0;
         float concentration = mix(mix(corners.x, corners.y, uv.x),
                                   mix(corners.z, corners.w, uv.x), uv.y);
