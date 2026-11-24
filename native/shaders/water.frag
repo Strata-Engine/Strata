@@ -156,17 +156,26 @@ float sea_column(vec2 p, float amp, float chop) {
     float swell = u.sea_fgrid.x > 0.5 ? sea_swell(p, chop) : 0.0;
     return amp * (sea_tile.h[c.y * 512 + c.x] + swell);
 }
+// The open sea's five colours, trough to crest: the deep, saturated blue of
+// open ocean seen from the air (sampled from aerial photographs: hardly any
+// red, the green well under the blue), the bands stepping gently, as a
+// wave's face is only a little lighter than its trough. The teal belongs to
+// the shallows, and the crest foam is the one bright thing.
+#define SEA_C0 vec3(0.006, 0.040, 0.140)
+#define SEA_C1 vec3(0.008, 0.054, 0.172)
+#define SEA_C2 vec3(0.011, 0.070, 0.205)
+#define SEA_C3 vec3(0.017, 0.090, 0.236)
+#define SEA_C4 vec3(0.032, 0.118, 0.270)
 // The same colours without the bands, for a sea seen from high up.
 vec3 sea_gradient(float t) {
-    vec3 c0 = vec3(0.015, 0.07, 0.16), c1 = vec3(0.02, 0.17, 0.33), c2 = vec3(0.05, 0.33, 0.50), c3 = vec3(0.20, 0.55, 0.68), c4 = vec3(0.50, 0.80, 0.85);
+    vec3 c0 = SEA_C0, c1 = SEA_C1, c2 = SEA_C2, c3 = SEA_C3, c4 = SEA_C4;
     float x = clamp(t, 0.0, 1.0) * 4.0;
     return x < 1.0 ? mix(c0, c1, x) : x < 2.0 ? mix(c1, c2, x - 1.0) : x < 3.0 ? mix(c2, c3, x - 2.0) : mix(c3, c4, x - 3.0);
 }
 // The colour of water [t] of the way from trough (0) to crest (1), in five bands.
 vec3 sea_band(float t) {
     float b = floor(clamp(t, 0.0, 0.999) * 5.0);
-    return b < 1.0 ? vec3(0.015, 0.07, 0.16) : b < 2.0 ? vec3(0.02, 0.17, 0.33) : b < 3.0 ? vec3(0.05, 0.33, 0.50)
-         : b < 4.0 ? vec3(0.20, 0.55, 0.68) : vec3(0.50, 0.80, 0.85);
+    return b < 1.0 ? SEA_C0 : b < 2.0 ? SEA_C1 : b < 3.0 ? SEA_C2 : b < 4.0 ? SEA_C3 : SEA_C4;
 }
 
 void main() {
@@ -270,11 +279,22 @@ void main() {
         vec2 c = (cell + 0.5) * cs;
         float lv = floor(sea_column(c, amp, chop) / rise);
         float t = clamp(lv * rise / (2.2 * max(amp, 0.05)) + 0.5 + 0.18 * (ocean_noise(v_world.xz * 0.0067 + 1.3) - 0.5), 0.0, 1.0);
+        // the swell shows most near the shore, where it shoals and lines up; offshore it is a
+        // softer, short-crested sea: crests hold for a few tens of metres, then fade and reform
+        float near = 1.0 - smoothstep(4.0, 14.0, ocean_d);
+        float patchy = smoothstep(0.35, 0.75, ocean_noise(v_world.xz * 0.02 + vec2(5.3, 1.9)));
+        t = 0.5 + (t - 0.5) * mix(0.3 + 0.45 * patchy, 1.35, near);
         // seen from high up the columns are big: the bands soften into one smooth sea, the steps and foam fade
         float smooth_sea = smoothstep(1.5, 4.0, grow);
-        t = mix(t, 0.5 + (t - 0.5) * 0.45, smooth_sea);   // and their contrast eases, so a long swell reads as a sea, not stripes
+        // up close the swell stands out; pulling back it eases, and zoomed right out it all but
+        // vanishes into one even sea, as it does from the air (by the metres a pixel spans, so it
+        // eases smoothly with the zoom rather than in the columns' doubling steps)
+        float zoom_fade = smoothstep(0.12, 0.42, px);
+        t = 0.5 + (t - 0.5) * mix(1.3, 1.0, smoothstep(0.05, 0.12, px)) * mix(1.0, 0.1, zoom_fade);
         vec3 sea = mix(sea_band(t), sea_gradient(t), smooth_sea) * (0.93 + 0.14 * ocean_hash(cell) * (1.0 - smooth_sea));   // each column a touch lighter or darker
-        float detail = 1.0 - 0.8 * smooth_sea;
+        // near the shore the bands take the water's own shallow teal, lighter on the faces, darker in the troughs
+        sea = mix(sea, ocean_colour(ocean_d) * (0.55 + 0.75 * t), 0.75 * near);
+        float detail = (1.0 - smooth_sea) * (1.0 - zoom_fade);
         if (detail > 0.0) {
             float lx = floor(sea_column(c + vec2(cs, 0.0), amp, chop) / rise);
             float lz = floor(sea_column(c + vec2(0.0, cs), amp, chop) / rise);
@@ -284,10 +304,11 @@ void main() {
             sea *= 1.0 - 0.55 * detail * min(shade, 1.0);
             // foam in clumps where the sea steepens near the crests, riding them
             float slope = (abs(lx - lv) + abs(lz - lv)) * rise / cs;
-            float clump = step(0.35, ocean_hash(floor(v_world.xz / (cs * 3.0)) + 3.7));
-            sea_foam = detail * step(mix(0.9, 0.45, chop), slope) * step(0.55, t) * clump;
+            float clump = step(mix(0.35, 0.15, near), ocean_hash(floor(v_world.xz / (cs * 3.0)) + 3.7));
+            // near the shore the steepening swell foams more readily; offshore only in scattered patches
+            sea_foam = detail * step(mix(0.9, 0.45, chop) * mix(1.0, 0.65, near), slope) * step(0.55, t) * clump * mix(0.6 * patchy, 1.0, near);
         }
-        open_sea = smoothstep(1.0, 5.0, ocean_d);
+        open_sea = smoothstep(0.6, 3.5, ocean_d);   // the swell carries on into the shallows before the clear water takes over
         base.rgb = mix(base.rgb, sea, open_sea);
         base.a = mix(base.a, 1.0, 0.8 * open_sea);
     }
