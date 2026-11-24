@@ -149,6 +149,37 @@ end
 pfn every_seed(seed : Int, check : Int -> Bool) : Bool do
   if seed > 8 do true else if !check(seed) do false else every_seed(seed + 1, check) end end
 end
+
+-- a storm from the south (the waves run north, toward the beach at z < 4), over floor [f] 1 m a cell
+pfn storm(ft : Strata.Seabed.Features, height : Float, steps : Int) : Strata.Seabed.Features do
+  let sw = Strata.Waves.solve_sea(Sb.depths_m(ft.floor, 0.25), 40, 40, 0.0, 0.0, 1.0, 0.0, -1.0, 12.0, height)
+  Sb.rework(ft, sw, height, steps, 1.0, 0.25, 0.0, 0.0, 24, 4)
+end
+pfn depth_sum(f : Strata.Seabed.Seafloor, i : Int, t : Int) : Int do if i >= 1600 do t else depth_sum(f, i + 1, t + NativeArray.get_int(f.depth, i)) end end
+pfn bounded(a : Strata.Seabed.Seafloor, b : Strata.Seabed.Seafloor, i : Int) : Bool do
+  if i >= 1600 do true else
+    let d0 = NativeArray.get_int(a.depth, i)
+    let d1 = NativeArray.get_int(b.depth, i)
+    if int_abs(d1 - d0) > 4 || d1 < -2 || (d0 != 0 && d1 == 0) do false else bounded(a, b, i + 1) end
+  end
+end
+pfn reef_same(a : Strata.Seabed.Features, b : Strata.Seabed.Features, i : Int) : Bool do
+  if i >= 1600 do true
+  else if NativeArray.get_int(a.kind, i) == 1 && (NativeArray.get_int(b.kind, i) != 1 || NativeArray.get_int(a.floor.depth, i) != NativeArray.get_int(b.floor.depth, i)) do false
+  else reef_same(a, b, i + 1) end end
+end
+pfn floors_same(a : Strata.Seabed.Seafloor, b : Strata.Seabed.Seafloor, i : Int) : Bool do
+  if i >= 1600 do true else if NativeArray.get_int(a.depth, i) != NativeArray.get_int(b.depth, i) do false else floors_same(a, b, i + 1) end end
+end
+-- a trench along the shore, 20 voxels deep, rows 10..12
+pfn trenched() : Strata.Seabed.Features do Sb.features(Sb.dig(beach(), 0, 10, 39, 12, 20, 0)) end
+-- the same with a breakwater (land) just south of its western half: rows 14..16, x 0..19
+pfn walled_land(a : NativeIntArr, i : Int) : NativeIntArr do
+  if i >= 1600 do a else walled_land(NativeArray.set_int(a, i, if i / 40 < 4 || (i / 40 >= 14 && i / 40 <= 16 && i % 40 < 20) do 1 else 0 end), i + 1) end
+end
+pfn walled() : Strata.Seabed.Features do
+  Sb.features(Sb.dig(Sb.shelf(walled_land(NativeArray.make_int(1600, 0), 0), 40, 40, 4, 2, 3, 20, 63), 0, 10, 39, 12, 20, 0))
+end
   describe "Seabed features" do
     test "a bar's crest pokes out and its ends taper" do
       let ft = bar_floor()
@@ -236,6 +267,37 @@ end
       let (_, a0) = Strata.Waves.sample(plain, 20, 12)
       let (_, a1) = Strata.Waves.sample(broken, 20, 12)
       Test.assert_true(a1 < a0 *. 0.8, "shoreward of the bar the swell is lower")
+    end
+  end
+
+  describe "Seabed.rework" do
+    test "sand is conserved" do
+      let before = trenched()
+      let after = storm(trenched(), 3.0, 4)
+      Test.assert_eq_int(depth_sum(after.floor, 0, 0), depth_sum(before.floor, 0, 0), "as much sand after as before")
+    end
+    test "no cell moves past the bound, above -2, or to land" do
+      let t0 = trenched()
+      Test.assert_true(bounded(t0.floor, (storm(trenched(), 4.0, 6)).floor, 0), "within 4 voxels, never above -2 or at 0")
+    end
+    test "reefs never change" do
+      let reefed = Sb.patch_reef(trenched(), 20, 20, 4, 6)
+      Test.assert_true(reef_same(reefed, storm(Sb.patch_reef(trenched(), 20, 20, 4, 6), 3.0, 4), 0), "reef cells keep their depth and kind")
+    end
+    test "the same storm moves the same sand" do
+      Test.assert_true(floors_same((storm(trenched(), 3.0, 4)).floor, (storm(trenched(), 3.0, 4)).floor, 0), "deterministic")
+    end
+    test "a dredged trench across the surf partly refills" do
+      let after = Sb.depth_at((storm(trenched(), 3.0, 4)).floor, 30, 11)
+      Test.assert_true(after < 20 && after > Sb.depth_at(beach(), 30, 11), "between the floor around it and its dredged depth, got " ++ int_to_string(after))
+    end
+    test "a breakwater's lee keeps its trench deeper" do
+      let after = (storm(walled(), 3.0, 4)).floor
+      Test.assert_true(Sb.depth_at(after, 10, 11) > Sb.depth_at(after, 30, 11), "behind the wall " ++ int_to_string(Sb.depth_at(after, 10, 11)) ++ ", exposed " ++ int_to_string(Sb.depth_at(after, 30, 11)))
+    end
+    test "calm water moves nothing" do
+      let t1 = trenched()
+      Test.assert_true(floors_same(t1.floor, (storm(trenched(), 0.2, 4)).floor, 0), "a 0.2 m sea leaves the floor")
     end
   end
 
