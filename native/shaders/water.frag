@@ -56,6 +56,20 @@ float ocean_depth() {
     vec4 c = vec4(uvec4(v_w1, v_w1 >> 6, v_w1 >> 12, v_w1 >> 18) & 63u);
     return mix(mix(c.x, c.y, f.x), mix(c.z, c.w, f.x), f.y) * u.eye.w;
 }
+// The vertex shader passes the four sheltered corners above the face and LOD bits.
+float shelter_weight(uint mask) {
+    vec2 f = clamp(v_uv / max(v_size, vec2(1.0)), 0.0, 1.0);
+    vec4 c = vec4(uvec4(mask, mask >> 1, mask >> 2, mask >> 3) & 1u);
+    return smoothstep(0.0, 1.0, mix(mix(c.x, c.y, f.x), mix(c.z, c.w, f.x), f.y));
+}
+
+vec3 sheltered_normal(vec3 n) {
+    vec2 q = floor(v_world.xz / u.eye.w * 4.0) / 4.0;
+    float t = u.light.y;
+    return normalize(n + 0.010 * vec3(sin(q.x * 2.3 + t * 1.3) + sin(q.y * 1.1 - t * 0.9), 0.0,
+                                      sin(q.y * 2.9 + t * 1.6) + sin(q.x * 0.7 + t * 1.1)));
+}
+
 // The water's own colour by depth: turquoise shallows, teal, deep blue.
 vec3 ocean_colour(float d) {
     vec3 shallow = vec3(0.10, 0.52, 0.54), mid = vec3(0.04, 0.34, 0.47), deep = vec3(0.02, 0.13, 0.30);
@@ -183,11 +197,15 @@ void main() {
     if (any(lessThan(v_keep, vec3(0.0)))) discard;
     if (cut_hidden(v_world)) discard;
     uint face = v_face & 7u;
-    bool far = v_face >= 8u;    // a chunk above level 0: lit by the sun and sky, mirroring the sky, without rays
+    bool far = (v_face & 8u) != 0u;    // a chunk above level 0: lit by the sun and sky, mirroring the sky, without rays
     uint tex = v_w1 & 65535u;
     // Data overlays use the translucent pass but bypass water lighting and history.
     uint overlay = v_w1 >> 24;
     bool ocean = overlay == 249u && face == 0u;
+    uint mask = ocean ? v_face >> 4 : 0u;
+    bool inlet = mask != 0u;
+    float sheltered = inlet ? shelter_weight(mask) : 0.0;
+    float exposed = 1.0 - sheltered;
     float ocean_d = ocean ? ocean_depth() : 0.0;
     if (overlay == 250u) {
         float zoom = 1.0 / max(length(vec3(u.vp[0][0], u.vp[1][0], u.vp[2][0])), 0.0001);
@@ -267,9 +285,14 @@ void main() {
     }
     if (tex >= uint(u.misc.z)) tex = 0u;
     vec4 base = ocean ? vec4(ocean_colour(ocean_d), mix(0.6, 0.97, 1.0 - exp(-0.35 * ocean_d))) : texture(tiles, vec3(v_tex, float(tex)));
+    // Sheltered water keeps the same depth cues as the adjacent sea.
+    if (inlet) {
+        vec3 calm = ocean_colour(max(ocean_d, 1.0)) * vec3(0.55, 0.50, 0.46);
+        base = mix(base, vec4(calm, mix(0.65, 0.82, smoothstep(0.0, 3.0, ocean_d))), sheltered);
+    }
     float open_sea = 0.0;   // how much of the voxel sea shows here: none without a sea state or in the shallows
     float sea_foam = 0.0;
-    if (ocean && u.sea.z > 0.0) {
+    if (ocean && exposed > 0.0 && u.sea.z > 0.0) {
         // the height tile repeats every 256 m: a slow, non-repeating rise and fall of the sea across a few hundred metres hides it
         float swell_patch = ocean_noise(v_world.xz * 0.004 + vec2(3.1, 7.7));
         float amp = 0.5 * u.sea.z * mix(0.3, 1.0, sea_exposure(v_world.xz)) * mix(0.35, 1.3, swell_patch);
@@ -314,14 +337,16 @@ void main() {
             // near the shore the steepening swell foams more readily; offshore only in scattered patches
             sea_foam = detail * step(mix(0.9, 0.45, chop) * mix(1.0, 0.65, near), slope) * step(0.55, t) * clump * mix(0.6 * patchy, 1.0, near);
         }
-        open_sea = smoothstep(0.6, 3.5, ocean_d);   // the swell carries on into the shallows before the clear water takes over
+        sea_foam *= exposed;
+        open_sea = smoothstep(0.6, 3.5, ocean_d) * exposed;   // the swell carries on into the shallows before the clear water takes over
         base.rgb = mix(base.rgb, sea, open_sea);
         base.a = mix(base.a, 1.0, 0.8 * open_sea);
     }
     uint ao = (v_w1 >> 16) & 255u;
     vec2 f = fract(v_uv);
     float a0 = float(ao & 3u), a1 = float((ao >> 2) & 3u), a2 = float((ao >> 4) & 3u), a3 = float((ao >> 6) & 3u);
-    float occ = mix(mix(a0, a1, f.x), mix(a2, a3, f.x), f.y) / 3.0;
+    // The ocean packs depth into these bits. Only textured materials carry corner shade.
+    float occ = ocean ? 1.0 : mix(mix(a0, a1, f.x), mix(a2, a3, f.x), f.y) / 3.0;
     vec3 n = qrot(v_rot, NORMALS[min(face, 5u)]);
     if (u.light.x < 1.0 || u.light.x >= 9.0) { o_color = vec4(shade_flat(base.rgb, n, occ, v_world), base.a); return; }
     vec3 toward = normalize(u.eye.xyz - v_world);
@@ -378,42 +403,52 @@ void main() {
     vec3 mirror = vec3(0.0);
     if (u.light.x >= 3.0) {
         uint cls = (v_w1 >> 24) & 255u;
-        float rough = ocean ? 0.03 : float(class_roughness(cls)) / 255.0;
+        float rough = ocean ? mix(0.03, 28.0 / 255.0, sheltered) : float(class_roughness(cls)) / 255.0;
         if (rough < 0.25) {
             vec3 toward_eye = normalize(u.eye.xyz - v_world);
             // seen from underneath, the surface faces down
             vec3 m = dot(n, toward_eye) < 0.0 ? -n : n;
             // a smooth top face ripples: a small moving tilt, in voxel-sized steps so it keeps the world's grain
-            if (ocean) m = open_sea > 0.5 ? vec3(0.0, 1.0, 0.0) : ocean_normal(v_world, ocean_d);
-            else if (face == 0u) {
-                vec2 q = floor(v_world.xz / u.eye.w * 4.0) / 4.0;
-                float t = u.light.y;
-                m = normalize(m + 0.010 * vec3(sin(q.x * 2.3 + t * 1.3) + sin(q.y * 1.1 - t * 0.9), 0.0, sin(q.y * 2.9 + t * 1.6) + sin(q.x * 0.7 + t * 1.1)));
-            }
+            float sky_reflection = smoothstep(0.4, 0.6, open_sea);
+            if (ocean) {
+                if (exposed == 0.0) m = sheltered_normal(m);
+                else {
+                    vec3 ripple = sky_reflection >= 1.0 ? n : normalize(mix(ocean_normal(v_world, ocean_d), n, sky_reflection));
+                    m = inlet ? normalize(mix(ripple, sheltered_normal(m), sheltered)) : ripple;
+                }
+            } else if (face == 0u) m = sheltered_normal(m);
             float share = mirror_share(m, toward_eye, 0.03) * (1.0 - rough) * (1.0 - 0.65 * open_sea);
             if (u.sun_color.w > 0.5) {
-                mirror = (far || open_sea > 0.5) ? sky_color(mirror_dir(toward_eye, m, sign(dot(n, toward_eye)) * n)) : now ? reflected(at + sign(dot(n, toward_eye)) * n * 0.02, mirror_dir(toward_eye, m, sign(dot(n, toward_eye)) * n), int(floor(at.y - 0.001))) : old.rgb;
+                vec3 facing = sign(dot(n, toward_eye)) * n;
+                vec3 direction = mirror_dir(toward_eye, m, facing);
+                if (far || sky_reflection >= 1.0) mirror = sky_color(direction);
+                else if (now) {
+                    mirror = reflected(at + facing * 0.02, direction, int(floor(at.y - 0.001)));
+                    if (sky_reflection > 0.0) mirror = mix(mirror, sky_color(direction), sky_reflection);
+                } else mirror = old.rgb;
                 col = mix(col, mirror, share);
             }
-            col += ocean ? 0.45 * (1.0 - open_sea) * sun_highlight(m, toward_eye, 0.16, sun_vis) : sun_highlight(m, toward_eye, rough, sun_vis);
+            if (ocean) col += exposed * 0.45 * (1.0 - open_sea) * sun_highlight(m, toward_eye, 0.16, sun_vis);
+            if (!ocean || inlet) col += (inlet ? sheltered : 1.0) * sun_highlight(m, toward_eye, rough, sun_vis);
             alpha = mix(alpha, 1.0, share);
         }
     }
-    if (ocean && u.light.x >= 3.0 && open_sea < 0.5) {
+    float glitter = exposed * (1.0 - smoothstep(0.4, 0.6, open_sea));
+    if (ocean && glitter > 0.0 && u.light.x >= 3.0) {
         vec3 m = ocean_normal(v_world, ocean_d);
         vec3 r = reflect(-toward, m);
         // the sun glittering on the crests: voxel-sized sparkles that come and go, not a band
         vec2 cell = floor(v_world.xz / u.eye.w);
         float sparkle = step(0.72, ocean_hash(cell + floor(u.light.y * 3.0) * vec2(17.0, 31.0)));
         float glare = pow(max(dot(r, u.sun.xyz), 0.0), 160.0);
-        col += u.sun_color.rgb * glare * (0.15 + 1.2 * sparkle) * sun_vis * cloud_shadow(v_world) * (1.0 - u.weather.x);
+        col += glitter * u.sun_color.rgb * glare * (0.15 + 1.2 * sparkle) * sun_vis * cloud_shadow(v_world) * (1.0 - u.weather.x);
         // no moon in the sky to trace: a glint where one would stand, opposite the sun, fading in through dusk
         vec3 moon = normalize(vec3(-u.sun.x, 0.45, -u.sun.z));
-        col += vec3(0.55, 0.62, 0.80) * 0.6 * smoothstep(0.05, -0.15, u.sun.y) * pow(max(dot(r, moon), 0.0), 220.0);
+        col += glitter * vec3(0.55, 0.62, 0.80) * 0.6 * smoothstep(0.05, -0.15, u.sun.y) * pow(max(dot(r, moon), 0.0), 220.0);
     }
     // water that never goes black or grey: at least a dim tint of its own colour, in any light or weather
-    if (ocean) col = max(col, base.rgb * vec3(0.06, 0.12, 0.25) + vec3(0.010, 0.020, 0.040));
-    float sea = ocean ? sea_scale(v_world.xz) : -1.0;
+    if (ocean) col = mix(col, max(col, base.rgb * vec3(0.06, 0.12, 0.25) + vec3(0.010, 0.020, 0.040)), exposed);
+    float sea = ocean && exposed > 0.0 ? sea_scale(v_world.xz) : -1.0;
     if (ocean && sea > 0.0) {
         vec2 q = floor(v_world.xz / u.eye.w * 4.0) / 4.0 * u.eye.w;
         vec2 cell = floor(v_world.xz / (u.eye.w * 2.0));   // whitecaps and breakers fleck in 2-voxel blotches
@@ -430,7 +465,7 @@ void main() {
             float width = mix(0.10, 0.22, 1.0 - smoothstep(0.5, 2.5, ocean_d));
             float band = (1.0 - smoothstep(0.0, width, roll)) * smoothstep(0.2, 0.6, ocean_d) * (1.0 - smoothstep(1.8, 3.0, ocean_d));
             float strength = sqrt(facing) * smoothstep(0.08, 0.45, sea);
-            float breaker = band * strength * step(0.25, ocean_hash(cell + floor(u.light.y * 1.5)));
+            float breaker = exposed * band * strength * step(0.25, ocean_hash(cell + floor(u.light.y * 1.5)));
             col = mix(col, white, breaker);
             alpha = max(alpha, mix(alpha, 0.92, breaker));
         }
@@ -440,12 +475,12 @@ void main() {
         col = mix(col, vec3(0.90, 0.95, 0.97) * lit * (u.sun_color.rgb * 0.5 + 0.5), sea_foam);
         alpha = max(alpha, sea_foam);
     }
-    if (ocean) {
+    if (ocean && exposed > 0.0) {
         // foam where the water thins against the shore, in voxel-sized flecks that wash in and out
         vec2 q = floor(v_world.xz / u.eye.w) * u.eye.w;
         float wash = ocean_noise(q * 1.3 + vec2(u.light.y * 0.4, -u.light.y * 0.3)) * 0.6 + 0.4 * ocean_noise(q * 3.1 - u.light.y * 0.25);
         float edge = 1.0 - smoothstep(0.15, 0.9, ocean_d);
-        float foam = edge * step(0.45, wash + 0.35 * edge);
+        float foam = exposed * edge * step(0.45, wash + 0.35 * edge);
         float lit = clamp(0.25 + 0.85 * max(u.sun.y, 0.0), 0.12, 1.0);
         col = mix(col, vec3(0.80, 0.85, 0.86) * lit * (u.sun_color.rgb * 0.5 + 0.5), foam);
         alpha = max(alpha, mix(alpha, 0.9, foam));

@@ -71,11 +71,12 @@ void main() {
     float du = float(cu) * w, dv = float(cv) * h;
     // A partly full fluid stands [drop] eighths below its voxel's top: its
     // top face is lowered, and the upper edge of its sides with it.
-    float drop = float((w0 >> 28) & 7u) / 8.0;
+    uint shelter = face == 0u && (w1 >> 24) == 249u ? w0 >> 28 : 0u;
+    float drop = shelter == 0u ? float((w0 >> 28) & 7u) / 8.0 : 0.0;
     // A fluid's quad carries no corner shading in that byte. On a top face
     // it holds how far each corner dips (0..3 eighths) to meet a lower
     // neighbour; on a side, how far its top edge is lowered to match.
-    bool fluid = (w0 >> 31) != 0u;
+    bool fluid = shelter == 0u && (w0 >> 31) != 0u;
     uint bits = (w1 >> 16) & 255u;
     float dip = fluid ? float((face == 0u ? (bits >> (2u * (cu + 2u * cv))) : bits) & 3u) / 8.0 : 0.0;
     float up = cv == 1u ? dv - drop - dip : 0.0;          // a side's height along v, as drawn
@@ -123,7 +124,7 @@ void main() {
     // and a grass side's dirt would brown the far hills
     uint w1t = ((ol.w & 255) > 0 && face >= 2u) ? ((w1 & 0xFFFF0000u) | blocks.top_of[w1 & 65535u]) : w1;
     v_w1 = fluid ? (w1t | (255u << 16)) : w1t;           // a fluid is not corner-shaded
-    v_face = face | ((ol.w & 255) > 0 ? 8u : 0u);
+    v_face = face | ((ol.w & 255) > 0 ? 8u : 0u) | (shelter << 4);
     gl_Position = to_clip(u.vp * vec4(world, 1.0));
     v_keep = vec3(1.0);
     if ((pc.flags & 4u) != 0u) {
